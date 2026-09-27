@@ -1,4 +1,5 @@
 """Anthropic count_tokens must report the actual rendered prompt size over HTTP."""
+import base64
 import json
 from pathlib import Path
 import tempfile
@@ -49,6 +50,25 @@ class CountTokensTest(unittest.TestCase):
         self.assertGreater(payload['input_tokens'], self.service.engine.max_context)
         self.assertEqual(payload['input_tokens'], len(self.tokenizer.encode(
             self.template.render(messages=body['messages']), parse_special=True)))
+
+    def test_pdf_document_count_includes_extracted_text(self):
+        pdf = (Path(__file__).with_name('fixtures') / 'sample.pdf').read_bytes()
+        body = {'model': 'qwen3.8-flash-next', 'messages': [{'role': 'user', 'content': [
+            {'type': 'text', 'text': 'Read this: '},
+            {'type': 'document', 'title': 'sample.pdf', 'source': {
+                'type': 'base64', 'media_type': 'application/pdf',
+                'data': base64.b64encode(pdf).decode()}},
+        ]}]}
+        request = urllib.request.Request(
+            f'http://127.0.0.1:{self.http.server_address[1]}/v1/messages/count_tokens',
+            json.dumps(body).encode('utf-8'), {'content-type': 'application/json'})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            count = json.load(response)['input_tokens']
+        messages, tools, kwargs = anthropic_to_messages(body)
+        expected, _ = self.service.prepare(messages, tools, kwargs, None)
+        self.assertEqual(count, len(expected))
+        self.assertIn('Revenue is 42.', messages[0]['content'])
 
     def test_image_count_uses_expanded_tokens_and_removes_request_staging(self):
         class FakeVision:
