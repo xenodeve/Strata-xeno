@@ -465,7 +465,8 @@ class Service:
                           f"({finish}, cancel={cancel.is_set()})", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
-                self.status["busy"] = False
+                    self.status["busy"] = False
+                    self.status["last_stop_reason"] = stop_detail or finish
         for ev in parser.finish():
             yield "event", ev
         done = {"finish": finish, "completion_tokens": n}

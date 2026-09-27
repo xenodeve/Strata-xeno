@@ -30,6 +30,9 @@ class LoopGuardTest(unittest.TestCase):
         self.assertEqual(done.get('stop_detail'), 'loop')
         self.assertEqual(service.status.get('loops_stopped'), 1)
         self.assertEqual(service.status.get('last_stop_reason'), 'loop')
+        service.engine = RepeatingEngine('A normal response.')
+        list(service.run([], False, None, 1000, {}, threading.Event()))
+        self.assertEqual(service.status.get('last_stop_reason'), 'length')
 
     def test_openai_response_marks_loop_in_timings(self):
         service = Service(RepeatingEngine('A' * 800), ByteTokenizer(), None)
