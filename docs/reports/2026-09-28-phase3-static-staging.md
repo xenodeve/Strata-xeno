@@ -32,3 +32,9 @@ Use the verify-window host callback's pinned activation/routing and output seam.
 ## Verification at checkpoint
 
 The dual-architecture `strata` target built. `ctest -R xeno_` passed 8/8 and Python serving tests passed 23/23. The manual device-1 arena smoke test passed after rebuilding. The ordinary single-5060 path with no secondary flag still used its original CUDA-registered/pinned arena and produced the accepted first sky token (`29108`), artifact `%TEMP%\strata-phase3-single-regression1`. These checks do not exercise secondary compute.
+
+## Review and repeatable GPU gate
+
+Standards review found that `PinnedArena` teardown called `cudaHostUnregister` even after the new pageable mode had registered zero bytes. The reviewer also noted that the constructor still attempted OS-locked large pages before claiming the arena was pageable. Both were fixed: no unregister without a recorded registration, and large pages are skipped when CUDA pinning is disabled. The host-arena test went red on the old path, then green; it checks the backing/note and that teardown leaves no CUDA error. The model then ran one token in the reviewed dual-card staging mode and returned the accepted first sky token `29108`, with 48 staged experts and 9.54 GiB lower free on the 4070. The run's 30.6-second load is not directly comparable to earlier cold/warm loads.
+
+The local Q2 GGUF can now be configured through `STRATA_XENO_Q2_GGUF` to register optional `gpu_4070_q2_parity_layer0` and `gpu_4070_q2_parity_layer47` CTests. Both passed on the display 4070 SUPER with CUDA_VISIBLE_DEVICES=0; the source tests cover three entries/two groups and report 0/7,680 differing floats. The 8 machine-targeted `xeno_` tests and 23 Python serving tests also passed after the review correction. These direct kernel tests still do not prove cross-device output ordering.

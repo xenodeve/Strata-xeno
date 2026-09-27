@@ -27,12 +27,14 @@ namespace strata::core {
 namespace {
 
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
-void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
+void* reserve(uint64_t bytes, PageBacking& got, std::string& note, bool allow_large_pages) {
 #ifdef _WIN32
     // MEM_LARGE_PAGES needs SeLockMemoryPrivilege; a normal account does not have it and VirtualAlloc then
     // fails with ERROR_PRIVILEGE_NOT_HELD.  That is the EXPECTED outcome on a desktop, not an error.
-    SIZE_T large = GetLargePageMinimum();
-    if (large > 0) {
+    SIZE_T large = allow_large_pages ? GetLargePageMinimum() : 0;
+    if (!allow_large_pages) {
+        note = "large pages skipped for pageable host arena";
+    } else if (large > 0) {
         void* p = VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
                                PAGE_READWRITE);
         if (p) {
@@ -50,14 +52,18 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
     got = PageBacking::NormalPages;
     return p;
 #else
-    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-    if (p != MAP_FAILED) {
-        got = PageBacking::LargePages;
-        note = "hugetlb 2 MB pages";
-        return p;
+    void* p = MAP_FAILED;
+    if (allow_large_pages) {
+        p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+        if (p != MAP_FAILED) {
+            got = PageBacking::LargePages;
+            note = "hugetlb 2 MB pages";
+            return p;
+        }
     }
-    note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
+    note = allow_large_pages ? "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages"
+                             : "large pages skipped for pageable host arena";
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     got = PageBacking::NormalPages;
     return p == MAP_FAILED ? nullptr : p;
@@ -106,7 +112,7 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, bool pin_for_cuda)
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, bool pin_for_cuda) : capacity(bytes) {
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note);
+    base = reserve(bytes, backing, note, pin_for_cuda);
     if (base != nullptr && !pin_for_cuda) {
         note = "pageable host arena (no CUDA registration or OS lock); " + note;
         return;
@@ -178,10 +184,12 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, bo
 PinnedArena::~PinnedArena() {
     if (base) {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
-        if (slice_bytes) {
-            for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
-        } else {
-            cudaHostUnregister(base);
+        if (registered_bytes != 0) {
+            if (slice_bytes) {
+                for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
+            } else {
+                cudaHostUnregister(base);
+            }
         }
         release(base, capacity);
         base = nullptr;
