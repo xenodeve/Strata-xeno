@@ -25,11 +25,15 @@ int main(int argc, char** argv) {
     int ordinal = 0;
     int secondary_reserve_mib = 0;
     bool secondary_requested = false;
+    int secondary_touch_mib = 0;
+    bool touch_requested = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--device") == 0 ||
-                 std::strcmp(argv[i], "--secondary-reserve-mib") == 0) {
+                 std::strcmp(argv[i], "--secondary-reserve-mib") == 0 ||
+                 std::strcmp(argv[i], "--secondary-touch-mib") == 0) {
             const bool device = std::strcmp(argv[i], "--device") == 0;
+            const bool touch = std::strcmp(argv[i], "--secondary-touch-mib") == 0;
             if (++i == argc) { std::fprintf(stderr, "%s needs an integer\n", argv[i - 1]); return 2; }
             int value = 0;
             const char* end = argv[i] + std::strlen(argv[i]);
@@ -38,10 +42,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "%s needs a non-negative integer\n", argv[i - 1]); return 2;
             }
             if (device) ordinal = value;
+            else if (touch) { secondary_touch_mib = value; touch_requested = true; }
             else { secondary_reserve_mib = value; secondary_requested = true; }
         }
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: strata-device [--selftest] [--device 1 --secondary-reserve-mib 2560]\n");
+            std::printf("usage: strata-device [--selftest] [--device 1 --secondary-reserve-mib 2560 [--secondary-touch-mib 1..64]]\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -49,11 +54,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    if ((ordinal != 0 && !secondary_requested) ||
+    if ((ordinal != 0 && !secondary_requested) || (touch_requested &&
+         (!secondary_requested || secondary_touch_mib == 0 || secondary_touch_mib > 64)) ||
         (secondary_requested &&
          (ordinal != 1 || selftest || secondary_reserve_mib <
           (int) (strata::core::kSecondaryReserveBytes >> 20)))) {
-        std::fprintf(stderr, "secondary probe needs --device 1, reserve >= 2560 MiB, and no --selftest\n");
+        std::fprintf(stderr, "secondary probe needs --device 1, reserve >= 2560 MiB, no --selftest, and touch 1..64 MiB\n");
         return 2;
     }
     try {
@@ -91,6 +97,33 @@ int main(int argc, char** argv) {
             std::printf("secondary VRAM lower free %s, reserve %d MiB, maximum allocatable before touch %s\n",
                         human(effective).c_str(), secondary_reserve_mib,
                         human(effective - reserve).c_str());
+            if (touch_requested) {
+                const uint64_t touch_bytes = (uint64_t) secondary_touch_mib << 20;
+                if (effective < reserve + touch_bytes + (64ull << 20)) {
+                    std::fprintf(stderr, "secondary VRAM: not enough for touch probe plus 64 MiB cushion\n");
+                    return 1;
+                }
+                {
+                    strata::core::DeviceArena arena(touch_bytes, ordinal, /*poison=*/true);
+                    const auto after = strata::core::device_info(ordinal, true);
+                    uint64_t nvml_after = 0;
+                    if (!strata::core::secondary_nvml_free_bytes(ordinal, nvml_after, nvml_err)) {
+                        std::fprintf(stderr, "secondary VRAM after touch: %s\n", nvml_err.c_str());
+                        return 1;
+                    }
+                    const uint64_t lower_after = strata::core::secondary_effective_free(
+                        after.free_bytes, nvml_after);
+                    std::printf("after touching %d MiB: CUDA free %s, NVML free %s, lower free %s\n",
+                                secondary_touch_mib, human(after.free_bytes).c_str(),
+                                human(nvml_after).c_str(), human(lower_after).c_str());
+                    if (lower_after < reserve) {
+                        std::fprintf(stderr, "secondary VRAM reserve breached after touch; releasing probe allocation\n");
+                        return 1;
+                    }
+                }
+                std::printf("touch probe allocation released; secondary reserve held at sampled boundary\n");
+                return 0;
+            }
             std::printf("read-only preflight; allocation must be touched and checked again\n");
             return 0;
         }
