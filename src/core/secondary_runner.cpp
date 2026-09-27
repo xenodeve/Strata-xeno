@@ -123,7 +123,7 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
 bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
                              const float* x, const int32_t* selected_slots, int n_tokens, int k,
                              std::string& err) {
-    if (stream_ == nullptr || pending_ || x == nullptr || selected_slots == nullptr ||
+    if (stream_ == nullptr || pending_ || failed_ || x == nullptr || selected_slots == nullptr ||
         n_tokens <= 0 || n_tokens > max_tokens_ || k <= 0 || k > max_entries_ / n_tokens ||
         layout.n_embd != n_embd_ || layout.n_ff != n_ff_ || layout.gu_type != 42 || layout.d_type != 42) {
         err = "secondary runner: invalid launch geometry or pending work";
@@ -167,6 +167,13 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
         last_free_check_ = now;
     }
     cudaStream_t stream = (cudaStream_t) stream_;
+    auto fail_enqueued = [&]() {
+        failed_ = true;
+        const cudaError_t drained = cudaStreamSynchronize(stream);
+        if (drained != cudaSuccess)
+            err += std::string("; stream drain: ") + cudaGetErrorString(drained);
+        return false;
+    };
     host_count_ = (int32_t) group_slots_.size();
     if (!cuda_ok(cudaMemcpyAsync(device_ptr_, ptr_.data(), ptr_.size() * sizeof(ptr_[0]),
                                   cudaMemcpyHostToDevice, stream),
@@ -186,14 +193,15 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
         !cuda_ok(cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float),
                                  cudaMemcpyHostToDevice, stream), "runner activation H2D", err) ||
         !cuda_ok(cudaMemsetAsync(device_out_, 0, (size_t) entries * n_embd_ * sizeof(float), stream),
-                 "runner clear partials", err)) return false;
+                 "runner clear partials", err)) return fail_enqueued();
     kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
     kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
                                    host_count_, (int) dst_.size(), device_xq_, device_scratch_, device_out_, stream,
                                    device_scales_);
     if (!cuda_ok(cudaMemcpyAsync(host_out_, device_out_, (size_t) entries * n_embd_ * sizeof(float),
                                  cudaMemcpyDeviceToHost, stream), "runner partial D2H", err) ||
-        !cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err)) return false;
+        !cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
+        return fail_enqueued();
     pending_ = true;
     err.clear();
     return true;
@@ -206,7 +214,10 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
     if (!cuda_ok(cudaGetDevice(&previous), "runner current device", err) ||
         !cuda_ok(cudaSetDevice(1), "runner select device", err)) return false;
     const RestoreDevice restore{previous};
-    if (!cuda_ok(cudaEventSynchronize((cudaEvent_t) done_), "runner wait partials", err)) return false;
+    if (!cuda_ok(cudaEventSynchronize((cudaEvent_t) done_), "runner wait partials", err)) {
+        failed_ = true;
+        return false;
+    }
     for (const int32_t row : selected_rows_)
         std::memcpy(output + (size_t) row * n_embd_, host_out_ + (size_t) row * n_embd_,
                     (size_t) n_embd_ * sizeof(float));

@@ -58,6 +58,7 @@ private:
     std::vector<int32_t> start_, dst_, tok_, selected_rows_, group_slots_;
     int32_t host_count_ = 0; ///< async H2D source must outlive launch() until finish()
     bool pending_ = false;
+    bool failed_ = false; ///< async enqueue failure poisons the runner until teardown
     uint64_t served_entries_ = 0, served_groups_ = 0;
     std::atomic<uint64_t> free_checks_{0};
     std::atomic<uint64_t> min_free_bytes_{~uint64_t{0}};
