@@ -13,3 +13,7 @@ The remaining Anthropic behavior, guards, PDF handling, watchdog, hub profile an
 ## Claude Code billing header
 
 The Anthropic converter strips the leading observed `cc_*` and `cch` billing fields from system text before rendering. Two requests whose only difference is the per-request `cch` stamp now produce identical rendered token IDs. The red/green test covers string and text-block system forms, while user text and assignment-shaped system instructions after the header are preserved. Unrecognized billing field names remain in the prompt until their format is established. This is prompt construction behavior; a long-session prefix-cache timing test remains for the final serving gate.
+
+## Anthropic stream and loop guard
+
+The Anthropic stream now emits an empty `signature_delta` before closing a thinking content block. A focused event test was red before the change and green after; the same test confirms streamed tool JSON arrives once before `tool_use` stop. `LoopGuard` was adapted from the existing EXL3 server and is fed only reasoning/content text in `Service.run`. It cancels a degenerate request after a 512-character single-character loop or a 64-character Thai-script micro-loop, increments `loops_stopped` on `/health`, and leaves the tested normal prose running. The mock-engine loop test was red at 800 repeated tokens before the change and green at 512 after. A live model runaway was not induced for validation.

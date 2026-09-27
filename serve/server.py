@@ -39,6 +39,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
+from serve.loop_guard import LoopGuard
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -316,7 +317,7 @@ class Service:
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
-        self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.status = {"busy": False, "queued": 0, "loops_stopped": 0}  # GET /status
         self.status_lock = threading.Lock()
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -397,6 +398,7 @@ class Service:
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        guard = LoopGuard()
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
@@ -427,9 +429,19 @@ class Service:
                         self._note(n, evs)
                         last_print = self._progress(last_print)
                         for ev in evs:
+                            if ev.kind in ("reasoning", "content") and guard.feed(
+                                    ev.text, in_think=ev.kind == "reasoning"):
+                                cancel.set()
+                                finish = "length"
+                                with self.status_lock:
+                                    self.status["loops_stopped"] += 1
+                                print(f"[strata] loop guard stopped generation: {guard.reason}", flush=True)
+                                break
                             yield "event", ev
-                    if cancel.is_set():
-                        finish = "cancel"
+                        if guard.reason:
+                            break
+                        if cancel.is_set():
+                            finish = "cancel"
                 finally:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
                     #                                     fifo, so a stop-token break can't leave the shared engine
@@ -549,7 +561,10 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
     index, open_kind, used_tool = -1, None, False
 
     def close():
-        return ("content_block_stop", {"type": "content_block_stop", "index": index})
+        if open_kind == "thinking":
+            yield "content_block_delta", {"type": "content_block_delta", "index": index,
+                                          "delta": {"type": "signature_delta", "signature": ""}}
+        yield "content_block_stop", {"type": "content_block_stop", "index": index}
 
     streamed = set()
     for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
@@ -572,7 +587,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 used_tool = True
             if open_kind != want or want == "tool_use":
                 if open_kind is not None:
-                    yield close()
+                    yield from close()
                 index += 1
                 open_kind = want
                 block = {"thinking": {"type": "thinking", "thinking": "", "signature": ""},
@@ -594,7 +609,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                     "type": "input_json_delta", "partial_json": json.dumps(ev.call.arguments, ensure_ascii=False)}}
         else:
             if open_kind is not None:
-                yield close()
+                yield from close()
             stop = "tool_use" if used_tool and x["finish"] == "stop" else \
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
@@ -618,6 +633,8 @@ def anthropic_collect(events) -> dict:
                 b["text"] += d["text"]
             elif d["type"] == "thinking_delta":
                 b["thinking"] += d["thinking"]
+            elif d["type"] == "signature_delta":
+                b["signature"] = d["signature"]
             else:                                  # input_json_delta pieces: parsed when complete
                 b["_json"] = b.get("_json", "") + d["partial_json"]
         elif name == "content_block_stop" and blocks and "_json" in blocks[-1]:
@@ -667,7 +684,8 @@ def make_handler(svc: Service):
                 self.wfile.write(body)
             elif path == "/health":
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key)})
+                                     "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                     "loops_stopped": svc.status["loops_stopped"]})
             elif path == "/status":
                 with svc.status_lock:
                     s = dict(svc.status)
