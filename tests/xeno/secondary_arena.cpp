@@ -41,6 +41,12 @@ int main() {
     uint8_t last = 255;
     CHECK(cudaMemcpy(&last, arena.slot_ptr(63) + mib - 1, 1, cudaMemcpyDeviceToHost) == cudaSuccess);
     CHECK(last == 0); // the last page was touched, not just virtually reserved
+    std::vector<uint8_t> blob((size_t) mib, 0x5a);
+    CHECK(!arena.fill_slot(0, blob.data(), mib + 1, err));
+    CHECK(arena.fill_slot(0, blob.data(), mib, err));
+    CHECK(arena.verify_slot(0, blob.data(), mib, err));
+    blob[0] ^= 1;
+    CHECK(!arena.verify_slot(0, blob.data(), mib, err));
     CHECK(arena.close());
     CHECK(arena.slots() == 0 && arena.bytes() == 0);
     InjectedFree readings{{strata::core::kSecondaryReserveBytes + 256 * mib,

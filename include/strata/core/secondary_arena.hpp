@@ -22,6 +22,8 @@ public:
     // Returns false and retains the pointer if CUDA could not release it, so the caller can retry.
     bool close(std::string* err = nullptr);
     uint8_t* slot_ptr(uint64_t slot) const;
+    bool fill_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err);
+    bool verify_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err);
     uint64_t slots() const { return offsets_.empty() ? 0 : offsets_.size() - 1; }
     uint64_t bytes() const { return offsets_.empty() ? 0 : offsets_.back(); }
     uint64_t lower_free_after() const { return lower_free_after_; }

@@ -16,6 +16,8 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/secondary_arena.hpp"
+#include "strata/core/secondary_profile.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -160,6 +162,7 @@ struct Options {
     /// true is that the ADMISSION POLICY gave every slot to the first position, which is why the earlier
     /// measurement found nothing - see `expert_cache_per_layer`.
     int expert_cache = 0;
+    int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -336,6 +339,8 @@ void usage() {
                  "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
                  "                       ms/token, -2.7 ms/token end to end.\n"
                  "  --cache-cpu-only     Diagnostic: prefill normally, then route verify experts to CPU.\n"
+                 "  --secondary-expert-mib N  Phase 3 staging-only probe on RTX 4070 SUPER;\n"
+                 "                            keep >=2560 MiB free. Does not compute there yet.\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
@@ -631,6 +636,14 @@ int main(int argc, char** argv) {
             const std::string v = next("--expert-cache");
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
+        else if (a == "--secondary-expert-mib") {
+            const std::string v = next("--secondary-expert-mib");
+            const auto parsed = std::from_chars(v.data(), v.data() + v.size(), o.secondary_expert_mib);
+            if (parsed.ec != std::errc{} || parsed.ptr != v.data() + v.size()) {
+                std::fprintf(stderr, "strata generate: --secondary-expert-mib needs an integer\n");
+                return 2;
+            }
+        }
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--prefill") o.prefill_chunk = std::atoll(next("--prefill"));
@@ -756,7 +769,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!std::isfinite(o.temperature) || o.temperature < 0 || !std::isfinite(o.top_p) ||
-        o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 || o.pool_workers < 0) {
+        o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 || o.pool_workers < 0 ||
+        o.secondary_expert_mib < 0 || o.secondary_expert_mib > 8192) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
     }
@@ -1092,7 +1106,10 @@ int main(int argc, char** argv) {
         srcp = &src;
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
-        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err)) {
+        const char* pin_override = std::getenv("STRATA_ARENA_PIN");
+        const bool pin_for_cuda = o.secondary_expert_mib == 0 &&
+            !(pin_override != nullptr && std::strcmp(pin_override, "0") == 0);
+        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_for_cuda)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -1264,6 +1281,58 @@ if (o.expert_cache_per_layer) {
         mem_mark("the profile fill");
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
                      (long long) prefilled, (long long) want);
+    }
+
+    // Phase 3 tracer: stage a disjoint, static set on the display GPU, but do not
+    // route computation there until the cross-device partial path passes parity.
+    strata::core::SecondaryArena secondary_arena;
+    if (o.secondary_expert_mib > 0) {
+        if (!native_pack || profile.empty() || o.expert_cache <= 0 || srcp == nullptr) {
+            std::fprintf(stderr, "strata generate: secondary experts need native Q2_0, a profile and a primary cache\n");
+            return 2;
+        }
+        std::vector<int32_t> primary_residency((size_t) (g.n_layers * g.n_expert), -1);
+        for (const auto& [layer, expert] : profile) {
+            if (layer < 0 || layer >= g.n_layers || expert < 0 || expert >= g.n_expert) {
+                std::fprintf(stderr, "strata generate: secondary profile pair outside model geometry\n");
+                return 1;
+            }
+            primary_residency[(size_t) layer * (size_t) g.n_expert + (size_t) expert] =
+                xcache.slot_of(layer, expert);
+        }
+        const auto& layout = strata::kernels::cpu::expert_layout();
+        std::vector<uint64_t> layer_bytes((size_t) g.n_layers);
+        for (int64_t layer = 0; layer < g.n_layers; ++layer)
+            layer_bytes[(size_t) layer] = (uint64_t) layout.blob_bytes(layer);
+        std::vector<strata::core::SecondaryCandidate> candidates;
+        if (!strata::core::secondary_candidates(profile, primary_residency, layer_bytes,
+                                                g.n_expert, candidates, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<uint64_t> bytes;
+        bytes.reserve(candidates.size());
+        for (const auto& pair : candidates) bytes.push_back(pair.bytes);
+        if (!secondary_arena.open(1, bytes, (uint64_t) o.secondary_expert_mib << 20, err)) {
+            std::fprintf(stderr, "strata generate: secondary arena: %s\n", err.c_str());
+            return 1;
+        }
+        for (uint64_t slot = 0; slot < secondary_arena.slots(); ++slot) {
+            const auto& pair = candidates[(size_t) slot];
+            const uint8_t* blob = srcp->blob(pair.layer, pair.expert);
+            if (blob == nullptr ||
+                !secondary_arena.fill_slot(slot, blob, pair.bytes, err) ||
+                !secondary_arena.verify_slot(slot, blob, pair.bytes, err)) {
+                std::fprintf(stderr, "strata generate: secondary expert (%d,%d) slot %llu: %s\n",
+                             pair.layer, pair.expert, (unsigned long long) slot, err.c_str());
+                return 1;
+            }
+        }
+        std::fprintf(stderr, "strata generate: staged %llu next-ranked secondary experts (%.2f GiB); "
+                     "4070 SUPER lower free %.2f GiB (floor 2.5 GiB); STAGING ONLY, no secondary compute\n",
+                     (unsigned long long) secondary_arena.slots(),
+                     (double) secondary_arena.bytes() / 1073741824.0,
+                     (double) secondary_arena.lower_free_after() / 1073741824.0);
     }
 
     Drive drive;

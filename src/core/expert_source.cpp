@@ -616,7 +616,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
 ArenaExpertSource::~ArenaExpertSource() { close(); }
 
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
-                             std::string& err) {
+                             std::string& err, bool pin_for_cuda) {
     close();
     const std::string path = pack_dir + "/experts.bin";
     // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
@@ -657,7 +657,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
-    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds);
+    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, pin_for_cuda);
     if (!a->valid()) {
         delete a;
         err = "ArenaExpertSource: the arena could not be reserved (" + std::to_string(want) + " B)";

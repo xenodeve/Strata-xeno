@@ -28,7 +28,11 @@ def main():
     p.add_argument('--timeout', type=int, default=240)
     p.add_argument('--arm', choices=['off', 'on', 'both'], default='both')
     p.add_argument('--case', choices=['sky', 'thai', 'code', 'long'], default='sky')
+    p.add_argument('--devices', default='1', help='CUDA_VISIBLE_DEVICES order (Phase 3: 1,0)')
+    p.add_argument('--secondary-expert-mib', type=int, default=0)
     args = p.parse_args()
+    if args.secondary_expert_mib < 0 or (args.secondary_expert_mib and args.devices != '1,0'):
+        p.error('secondary experts require --devices 1,0 and non-negative MiB')
     cfg = json.loads(args.config.read_text(encoding='utf-8-sig'))
     args.out.mkdir(parents=True, exist_ok=True)
     tokenizer_dir = Path(cfg['tokenizer'])
@@ -59,11 +63,13 @@ def main():
             base.append(key)
             i += 1
     env = dict(os.environ)
-    env['CUDA_VISIBLE_DEVICES'] = '1'
+    env['CUDA_VISIBLE_DEVICES'] = args.devices
     env['PATH'] = os.pathsep.join(cfg.get('lib_dirs', []) + [env.get('PATH', '')])
     results = {}
     for arm in (['off', 'on'] if args.arm == 'both' else [args.arm]):
         command = [args.exe or cfg['exe'], *base, '--tokens-file', str(prompt_path), '--max-new', str(args.max_new), '--greedy', '--max-context', '4096', '--pool-workers', '6', '--adapt-swaps', '0', '--pcie-frac', '0', '--expert-cache', str(args.slots), '--expert-profile', str(Path(cfg['cwd']) / 'data' / 'expert-profile.bin'), '--no-prefill-borrow']
+        if args.secondary_expert_mib:
+            command += ['--secondary-expert-mib', str(args.secondary_expert_mib)]
         if arm == 'off':
             command.append('--cache-cpu-only')
         (args.out / f'{arm}.command.json').write_text(json.dumps(command, indent=2), encoding='utf-8')

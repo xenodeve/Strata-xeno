@@ -22,9 +22,17 @@ struct RestoreDevice {
 
 bool free_snapshot(int ordinal, uint64_t& lower, std::string& err) {
     size_t cuda_free = 0, cuda_total = 0;
+    int current = -1;
+    (void) cudaGetDevice(&current);
+    const cudaError_t pending = cudaPeekAtLastError();
     const cudaError_t rc = cudaMemGetInfo(&cuda_free, &cuda_total);
     if (rc != cudaSuccess) {
-        err = std::string("secondary cudaMemGetInfo: ") + cudaGetErrorString(rc);
+        uint64_t nvml_free = 0;
+        std::string nvml_err;
+        const bool nvml_ok = secondary_nvml_free_bytes(ordinal, nvml_free, nvml_err);
+        err = std::string("secondary cudaMemGetInfo on CUDA device ") + std::to_string(current) +
+              ": " + cudaGetErrorString(rc) + "; pending before query: " + cudaGetErrorString(pending) +
+              (nvml_ok ? "; NVML free: " + std::to_string(nvml_free) + " B" : "; " + nvml_err);
         return false;
     }
     uint64_t nvml_free = 0;
@@ -178,6 +186,62 @@ bool SecondaryArena::close(std::string* err) {
 
 uint8_t* SecondaryArena::slot_ptr(uint64_t slot) const {
     return base_ != nullptr && slot < slots() ? base_ + offsets_[(size_t) slot] : nullptr;
+}
+
+bool SecondaryArena::fill_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err) {
+    if (blob == nullptr || bytes == 0 || slot >= slots() ||
+        bytes > offsets_[(size_t) slot + 1] - offsets_[(size_t) slot]) {
+        err = "secondary fill needs an open slot and a blob fitting that slot";
+        return false;
+    }
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(ordinal_) != cudaSuccess) {
+        err = "secondary fill cannot select its CUDA device";
+        return false;
+    }
+    const RestoreDevice restore{previous};
+    const cudaError_t copied = cudaMemcpy(slot_ptr(slot), blob, (size_t) bytes, cudaMemcpyHostToDevice);
+    if (copied != cudaSuccess) {
+        err = std::string("secondary fill copy: ") + cudaGetErrorString(copied);
+        return false;
+    }
+    uint64_t lower = 0;
+    if (!free_snapshot(ordinal_, lower, err)) return false;
+    if (lower < kSecondaryReserveBytes) {
+        err = "secondary fill crossed the 2560 MiB display reserve";
+        return false;
+    }
+    lower_free_after_ = lower;
+    err.clear();
+    return true;
+}
+
+bool SecondaryArena::verify_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err) {
+    if (blob == nullptr || bytes == 0 || slot >= slots() ||
+        bytes > offsets_[(size_t) slot + 1] - offsets_[(size_t) slot]) {
+        err = "secondary verify needs an open slot and a blob fitting that slot";
+        return false;
+    }
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(ordinal_) != cudaSuccess) {
+        err = "secondary verify cannot select its CUDA device";
+        return false;
+    }
+    const RestoreDevice restore{previous};
+    std::vector<uint8_t> actual((size_t) bytes);
+    const cudaError_t copied = cudaMemcpy(actual.data(), slot_ptr(slot), (size_t) bytes, cudaMemcpyDeviceToHost);
+    if (copied != cudaSuccess) {
+        err = std::string("secondary verify copy: ") + cudaGetErrorString(copied);
+        return false;
+    }
+    for (uint64_t i = 0; i < bytes; ++i) {
+        if (actual[(size_t) i] != blob[i]) {
+            err = "secondary slot " + std::to_string(slot) + " differs at byte " + std::to_string(i);
+            return false;
+        }
+    }
+    err.clear();
+    return true;
 }
 
 } // namespace strata::core

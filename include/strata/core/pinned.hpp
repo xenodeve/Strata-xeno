@@ -36,10 +36,10 @@ struct PinnedArena {
 
     PinnedArena() = default;
     /// `slice`: the piece size for the per-slice registration fallback (0 = none).
-    explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
+    explicit PinnedArena(uint64_t bytes, uint64_t slice = 0, bool pin_for_cuda = true);
     /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
-    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds);
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, bool pin_for_cuda = true);
     std::vector<uint64_t> slice_starts;
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;

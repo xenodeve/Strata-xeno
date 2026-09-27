@@ -99,13 +99,18 @@ std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
 }
 }  // namespace
 
-PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
+PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, bool pin_for_cuda)
+    : PinnedArena(bytes, uniform_bounds(bytes, slice), pin_for_cuda) {
     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
 }
 
-PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : capacity(bytes) {
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, bool pin_for_cuda) : capacity(bytes) {
     if (bytes == 0) return;
     base = reserve(bytes, backing, note);
+    if (base != nullptr && !pin_for_cuda) {
+        note = "pageable host arena (no CUDA registration or OS lock); " + note;
+        return;
+    }
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
