@@ -23,10 +23,11 @@ struct SecondaryBudget {
 // Profile order is significant: stop at the first pair that does not fit.
 // Every expert slot is 256-byte aligned for the grouped kernel's vector loads.
 inline SecondaryBudget secondary_budget(uint64_t free_bytes, const std::vector<uint64_t>& ranked_blob_bytes,
-                                        uint64_t max_bytes = (std::numeric_limits<uint64_t>::max)()) {
+                                        uint64_t max_bytes = (std::numeric_limits<uint64_t>::max)(),
+                                        uint64_t free_floor_bytes = kSecondaryReserveBytes) {
     SecondaryBudget result;
-    if (free_bytes <= kSecondaryReserveBytes) return result;
-    const uint64_t available = free_bytes - kSecondaryReserveBytes;
+    if (free_bytes <= free_floor_bytes) return result;
+    const uint64_t available = free_bytes - free_floor_bytes;
     const uint64_t usable = available < max_bytes ? available : max_bytes;
     for (const uint64_t raw : ranked_blob_bytes) {
         if (raw == 0 || raw > (std::numeric_limits<uint64_t>::max)() - 255) break;

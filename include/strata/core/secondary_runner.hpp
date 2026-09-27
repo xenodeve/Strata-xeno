@@ -23,14 +23,16 @@ public:
     SecondaryRunner(const SecondaryRunner&) = delete;
     SecondaryRunner& operator=(const SecondaryRunner&) = delete;
 
-    bool init(int max_tokens, int max_entries, int n_embd, int n_ff, std::string& err);
+    bool init(int max_tokens, int max_entries, int n_embd, int n_ff, std::string& err,
+              uint64_t free_floor_bytes = 2560ull << 20);
     bool launch(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
                 const float* x, const int32_t* selected_slots, int n_tokens, int k,
                 std::string& err);
     bool finish(float* output, std::string& err);
     bool start_monitor(int interval_ms, std::string& err,
                        SecondaryArena::FreeReader reader = nullptr,
-                       BreachHandler on_breach = nullptr, void* context = nullptr);
+                       BreachHandler on_breach = nullptr, void* context = nullptr,
+                       uint64_t free_floor_bytes = 2560ull << 20);
     void stop_monitor();
     uint64_t served_entries() const { return served_entries_; }
     uint64_t served_groups() const { return served_groups_; }
@@ -62,6 +64,7 @@ private:
     uint64_t served_entries_ = 0, served_groups_ = 0;
     std::atomic<uint64_t> free_checks_{0};
     std::atomic<uint64_t> min_free_bytes_{~uint64_t{0}};
+    uint64_t free_floor_bytes_ = 2560ull << 20;
     std::atomic<bool> monitor_stop_{false}, monitor_running_{false};
     std::thread monitor_;
     std::chrono::steady_clock::time_point last_free_check_{};

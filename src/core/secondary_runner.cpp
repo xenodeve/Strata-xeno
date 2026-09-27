@@ -25,15 +25,15 @@ bool cuda_ok(cudaError_t result, const char* operation, std::string& err) {
     return false;
 }
 
-bool check_display_free(std::string& err, uint64_t* lower_out = nullptr) {
+bool check_display_free(uint64_t free_floor_bytes, std::string& err, uint64_t* lower_out = nullptr) {
     size_t cuda_free = 0, total = 0;
     if (!cuda_ok(cudaMemGetInfo(&cuda_free, &total), "secondary runner cudaMemGetInfo", err)) return false;
     uint64_t nvml_free = 0;
     if (!secondary_nvml_free_bytes(1, nvml_free, err)) return false;
     const uint64_t lower = secondary_effective_free((uint64_t) cuda_free, nvml_free);
     if (lower_out) *lower_out = lower;
-    if (lower < kSecondaryReserveBytes) {
-        err = "secondary runner: display VRAM below 2560 MiB reserve";
+    if (lower < free_floor_bytes) {
+        err = "secondary runner: display VRAM below configured free floor";
         return false;
     }
     return true;
@@ -48,7 +48,8 @@ void SecondaryRunner::record_free(uint64_t bytes) {
     while (bytes < old && !min_free_bytes_.compare_exchange_weak(old, bytes)) {}
 }
 
-bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff, std::string& err) {
+bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff,
+                           std::string& err, uint64_t free_floor_bytes) {
     if (max_tokens <= 0 || max_tokens > 16 || max_entries <= 0 || max_entries > 128 ||
         n_embd <= 0 || n_embd % 32 != 0 || n_ff <= 0 || n_ff % 32 != 0) {
         err = "secondary runner: invalid verify-window geometry";
@@ -58,6 +59,7 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
         err = "secondary runner is already initialized";
         return false;
     }
+    free_floor_bytes_ = free_floor_bytes;
     max_tokens_ = max_tokens;
     max_entries_ = max_entries;
     n_embd_ = n_embd;
@@ -112,7 +114,7 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     selected_rows_.reserve((size_t) max_entries);
     group_slots_.reserve((size_t) max_entries);
     uint64_t lower = 0;
-    if (!check_display_free(err, &lower)) return false;
+    if (!check_display_free(free_floor_bytes_, err, &lower)) return false;
     record_free(lower);
     ++free_checks_;
     last_free_check_ = std::chrono::steady_clock::now();
@@ -161,7 +163,7 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
     const auto now = std::chrono::steady_clock::now();
     if (!monitor_running_.load() && now - last_free_check_ >= std::chrono::milliseconds(250)) {
         uint64_t lower = 0;
-        if (!check_display_free(err, &lower)) return false;
+        if (!check_display_free(free_floor_bytes_, err, &lower)) return false;
         record_free(lower);
         ++free_checks_;
         last_free_check_ = now;
@@ -230,7 +232,8 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
 
 bool SecondaryRunner::start_monitor(int interval_ms, std::string& err,
                                     SecondaryArena::FreeReader reader,
-                                    BreachHandler on_breach, void* context) {
+                                    BreachHandler on_breach, void* context,
+                                    uint64_t free_floor_bytes) {
     if (stream_ == nullptr || monitor_.joinable() || interval_ms < 10 || interval_ms > 1000) {
         err = "secondary monitor needs an initialized runner and 10..1000 ms interval";
         return false;
@@ -239,7 +242,8 @@ bool SecondaryRunner::start_monitor(int interval_ms, std::string& err,
     if (!cuda_ok(cudaGetDevice(&previous), "monitor current device", err) ||
         !cuda_ok(cudaSetDevice(1), "monitor select device", err)) return false;
     uint64_t lower = 0;
-    const bool safe = check_display_free(err, &lower);
+    free_floor_bytes_ = free_floor_bytes;
+    const bool safe = check_display_free(free_floor_bytes_, err, &lower);
     const cudaError_t restored = cudaSetDevice(previous);
     if (!safe || !cuda_ok(restored, "monitor restore device", err)) return false;
     record_free(lower);
@@ -262,11 +266,11 @@ bool SecondaryRunner::start_monitor(int interval_ms, std::string& err,
                 uint64_t lower = 0;
                 bool safe = false;
                 if (reader != nullptr) {
-                    safe = reader(1, lower, problem, context) && lower >= kSecondaryReserveBytes;
+                    safe = reader(1, lower, problem, context) && lower >= free_floor_bytes_;
                     if (!safe && problem.empty())
-                        problem = "injected display free " + std::to_string(lower) + " B below 2560 MiB";
+                        problem = "injected display free " + std::to_string(lower) + " B below configured floor";
                 } else {
-                    safe = check_display_free(problem, &lower);
+                    safe = check_display_free(free_floor_bytes_, problem, &lower);
                 }
                 record_free(lower);
                 if (!safe) {

@@ -18,6 +18,11 @@ int main() {
 
     CHECK(secondary_budget(reserve, {mib}).slots == 0);
     CHECK(secondary_budget(reserve - 1, {mib}).slots == 0);
+    // A benchmark can reserve 2.5 GiB for other processes in total. If they
+    // already use 2 GiB, the additional free floor is 512 MiB.
+    const auto shared_headroom = secondary_budget(1024 * mib, {256 * mib, 256 * mib, 256 * mib},
+                                                   1024 * mib, 512 * mib);
+    CHECK(shared_headroom.slots == 2 && shared_headroom.bytes == 512 * mib);
     CHECK(secondary_effective_free(11070 * mib, 9812 * mib) == 9812 * mib);
     CHECK(secondary_effective_free(9000 * mib, 9812 * mib) == 9000 * mib);
     CHECK(secondary_effective_free(9000 * mib, 0) == 0);

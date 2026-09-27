@@ -170,6 +170,7 @@ struct Options {
     /// measurement found nothing - see `expert_cache_per_layer`.
     int expert_cache = 0;
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
+    int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
     bool secondary_stage_only = false; ///< A/B arm before routing work to device 1
     bool exclusive_primary_experts = false; ///< Phase 4 static GPU ownership; host pages decommitted after fill
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
@@ -349,10 +350,11 @@ void usage() {
                  "                       ms/token, -2.7 ms/token end to end.\n"
                  "  --cache-cpu-only     Diagnostic: prefill normally, then route verify experts to CPU.\n"
                  "  --secondary-expert-mib N  Phase 3 Q2_0 tier on RTX 4070 SUPER;\n"
+                 "  --secondary-free-floor-mib N  Experimental free floor on 4070; default 2560.\n"
                      "  --secondary-stage-only  Stage/verify weights, but compute all experts as before.\n"
                      "  --exclusive-primary-experts  Phase 4 static primary ownership; decommit host copies.\n"
                      "                               Needs profile, --no-prefill-borrow, --adapt-swaps 0.\n"
-                 "                            keep >=2560 MiB free, requires --pcie-frac 0.\n"
+                 "                            default keeps >=2560 MiB free; requires --pcie-frac 0.\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
@@ -666,6 +668,15 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--secondary-free-floor-mib") {
+            const std::string v = next("--secondary-free-floor-mib");
+            const auto parsed = std::from_chars(v.data(), v.data() + v.size(), o.secondary_free_floor_mib);
+            if (parsed.ec != std::errc{} || parsed.ptr != v.data() + v.size() ||
+                o.secondary_free_floor_mib < 256) {
+                std::fprintf(stderr, "strata generate: --secondary-free-floor-mib needs integer >=256\n");
+                return 2;
+            }
+        }
         else if (a == "--secondary-stage-only") o.secondary_stage_only = true;
         else if (a == "--exclusive-primary-experts") o.exclusive_primary_experts = true;
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
@@ -794,7 +805,7 @@ int main(int argc, char** argv) {
     }
     if (!std::isfinite(o.temperature) || o.temperature < 0 || !std::isfinite(o.top_p) ||
         o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 || o.pool_workers < 0 ||
-        o.secondary_expert_mib < 0 || o.secondary_expert_mib > 8192 ||
+        o.secondary_expert_mib < 0 || o.secondary_expert_mib > 12288 ||
         (o.secondary_stage_only && o.secondary_expert_mib == 0)) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
@@ -1363,11 +1374,13 @@ if (o.expert_cache_per_layer) {
         const bool secondary_compute = !o.secondary_stage_only && !o.cache_cpu_only;
         if (!secondary_runner.init(strata::kernels::cpu::MAXT,
                                    (int) (strata::kernels::cpu::MAXT * K),
-                                   (int) g.n_embd, (int) g.n_ff, err)) {
+                                   (int) g.n_embd, (int) g.n_ff, err,
+                                   (uint64_t) o.secondary_free_floor_mib << 20)) {
             std::fprintf(stderr, "strata generate: secondary runner: %s\n", err.c_str());
             return 1;
         }
-        if (!secondary_arena.open(1, bytes, (uint64_t) o.secondary_expert_mib << 20, err)) {
+        if (!secondary_arena.open(1, bytes, (uint64_t) o.secondary_expert_mib << 20, err,
+                                  nullptr, nullptr, (uint64_t) o.secondary_free_floor_mib << 20)) {
             std::fprintf(stderr, "strata generate: secondary arena: %s\n", err.c_str());
             return 1;
         }
@@ -1385,15 +1398,17 @@ if (o.expert_cache_per_layer) {
                 return 1;
             }
         }
-        if (!secondary_runner.start_monitor(100, err)) {
+        if (!secondary_runner.start_monitor(100, err, nullptr, nullptr, nullptr,
+                                            (uint64_t) o.secondary_free_floor_mib << 20)) {
             std::fprintf(stderr, "strata generate: secondary reserve monitor: %s\n", err.c_str());
             return 1;
         }
         std::fprintf(stderr, "strata generate: staged %llu next-ranked secondary experts (%.2f GiB); "
-                     "4070 SUPER lower free %.2f GiB (floor 2.5 GiB); %s\n",
+                     "4070 SUPER lower free %.2f GiB (free floor %.2f GiB); %s\n",
                      (unsigned long long) secondary_arena.slots(),
                      (double) secondary_arena.bytes() / 1073741824.0,
                      (double) secondary_arena.lower_free_after() / 1073741824.0,
+                     (double) o.secondary_free_floor_mib / 1024.0,
                      secondary_compute ? "SECONDARY COMPUTE" : "STAGING ONLY, no secondary compute");
     }
 

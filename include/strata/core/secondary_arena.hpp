@@ -18,7 +18,7 @@ public:
 
     bool open(int ordinal, const std::vector<uint64_t>& ranked_blob_bytes,
               uint64_t max_bytes, std::string& err, FreeReader reader = nullptr,
-              void* reader_context = nullptr);
+              void* reader_context = nullptr, uint64_t free_floor_bytes = 2560ull << 20);
     // Returns false and retains the pointer if CUDA could not release it, so the caller can retry.
     bool close(std::string* err = nullptr);
     uint8_t* slot_ptr(uint64_t slot) const;
@@ -33,6 +33,7 @@ private:
     uint8_t* base_ = nullptr;
     std::vector<uint64_t> offsets_;
     uint64_t lower_free_after_ = 0;
+    uint64_t free_floor_bytes_ = 2560ull << 20;
 };
 
 } // namespace strata::core

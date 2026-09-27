@@ -55,9 +55,9 @@ SecondaryArena::~SecondaryArena() {
 
 bool SecondaryArena::open(int ordinal, const std::vector<uint64_t>& ranked_blob_bytes,
                           uint64_t max_bytes, std::string& err, FreeReader reader,
-                          void* reader_context) {
+                          void* reader_context, uint64_t free_floor_bytes) {
     if (base_ != nullptr) { err = "secondary arena is already open"; return false; }
-    if (ordinal != 1 || ranked_blob_bytes.empty() || max_bytes == 0) {
+    if (ordinal != 1 || ranked_blob_bytes.empty() || max_bytes == 0 || free_floor_bytes == 0) {
         err = "secondary arena needs CUDA device 1, ranked slots and a positive byte cap";
         return false;
     }
@@ -95,12 +95,13 @@ bool SecondaryArena::open(int ordinal, const std::vector<uint64_t>& ranked_blob_
     for (int attempt = 0; attempt < 8 && limit_slots > 0; ++attempt) {
         uint64_t before = 0;
         if (!snapshot(before)) return false;
-        if (before <= kSecondaryReserveBytes + kAllocationCushion) {
-            err = "display GPU has no space above the 2560 MiB reserve and allocation cushion";
+        if (before <= free_floor_bytes + kAllocationCushion) {
+            err = "display GPU has no space above the free floor and allocation cushion";
             return false;
         }
         const std::vector<uint64_t> prefix(ranked_blob_bytes.begin(), ranked_blob_bytes.begin() + limit_slots);
-        const SecondaryBudget plan = secondary_budget(before - kAllocationCushion, prefix, max_bytes);
+        const SecondaryBudget plan = secondary_budget(before - kAllocationCushion, prefix, max_bytes,
+                                                       free_floor_bytes);
         if (plan.slots == 0 || plan.bytes > std::numeric_limits<size_t>::max()) {
             err = "no ranked secondary expert slot fits while preserving the display reserve";
             return false;
@@ -129,21 +130,22 @@ bool SecondaryArena::open(int ordinal, const std::vector<uint64_t>& ranked_blob_
             release_candidate(candidate);
             return false;
         }
-        if (after >= kSecondaryReserveBytes) {
+        if (after >= free_floor_bytes) {
             base_ = candidate;
             ordinal_ = ordinal;
             offsets_ = std::move(offsets);
             lower_free_after_ = after;
+            free_floor_bytes_ = free_floor_bytes;
             err.clear();
             return true;
         }
-        const uint64_t shortage = kSecondaryReserveBytes - after + kAllocationCushion;
+        const uint64_t shortage = free_floor_bytes - after + kAllocationCushion;
         err = "secondary allocation breached display reserve after touch";
         if (!release_candidate(candidate)) return false;
         limit_slots = secondary_retry_slots(ranked_blob_bytes, plan.slots, shortage);
         err += "; retrying with fewer slots";
     }
-    if (limit_slots == 0) err = "secondary allocation cannot preserve the 2560 MiB display reserve";
+    if (limit_slots == 0) err = "secondary allocation cannot preserve the display free floor";
     return false;
 }
 
@@ -207,8 +209,8 @@ bool SecondaryArena::fill_slot(uint64_t slot, const uint8_t* blob, uint64_t byte
     }
     uint64_t lower = 0;
     if (!free_snapshot(ordinal_, lower, err)) return false;
-    if (lower < kSecondaryReserveBytes) {
-        err = "secondary fill crossed the 2560 MiB display reserve";
+    if (lower < free_floor_bytes_) {
+        err = "secondary fill crossed the display free floor";
         return false;
     }
     lower_free_after_ = lower;

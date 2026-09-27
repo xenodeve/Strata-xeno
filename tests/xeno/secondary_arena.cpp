@@ -48,6 +48,13 @@ int main() {
     blob[0] ^= 1;
     CHECK(!arena.verify_slot(0, blob.data(), mib, err));
     CHECK(arena.close());
+    // The free floor can be lower when existing desktop processes already
+    // consume part of the shared 2.5 GiB headroom.
+    constexpr uint64_t shared_floor = 512 * mib;
+    InjectedFree shared{{shared_floor + 128 * mib, shared_floor + 64 * mib}};
+    CHECK(arena.open(1, ranked, 64 * mib, err, injected_free, &shared, shared_floor));
+    CHECK(arena.slots() == 64 && arena.lower_free_after() == shared_floor + 64 * mib);
+    CHECK(arena.close());
     CHECK(arena.slots() == 0 && arena.bytes() == 0);
     InjectedFree readings{{strata::core::kSecondaryReserveBytes + 256 * mib,
                            strata::core::kSecondaryReserveBytes - 1,
