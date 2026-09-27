@@ -2,7 +2,7 @@
 import threading
 import unittest
 
-from serve.server import ByteTokenizer, Service
+from serve.server import ByteTokenizer, Service, openai_chunks, openai_collect
 from serve.loop_guard import LoopGuard
 
 
@@ -27,7 +27,16 @@ class LoopGuardTest(unittest.TestCase):
         events = list(service.run([], False, None, 1000, {}, threading.Event()))
         done = next(data for kind, data in events if kind == 'done')
         self.assertLess(done['completion_tokens'], 800)
+        self.assertEqual(done.get('stop_detail'), 'loop')
         self.assertEqual(service.status.get('loops_stopped'), 1)
+        self.assertEqual(service.status.get('last_stop_reason'), 'loop')
+
+    def test_openai_response_marks_loop_in_timings(self):
+        service = Service(RepeatingEngine('A' * 800), ByteTokenizer(), None)
+        chunks = list(openai_chunks(service, {}, [], False, None, 1000, threading.Event()))
+        self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'length')
+        self.assertEqual(chunks[-1]['timings']['stop_reason'], 'loop')
+        self.assertEqual(openai_collect(iter(chunks))['timings']['stop_reason'], 'loop')
 
     def test_normal_prose_is_not_stopped(self):
         text = ('The report explains the source, the test, and the measured result. '

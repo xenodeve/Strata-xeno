@@ -400,6 +400,7 @@ class Service:
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         guard = LoopGuard()
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        stop_detail = None
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
         with self.status_lock:
@@ -433,8 +434,10 @@ class Service:
                                     ev.text, in_think=ev.kind == "reasoning"):
                                 cancel.set()
                                 finish = "length"
+                                stop_detail = "loop"
                                 with self.status_lock:
                                     self.status["loops_stopped"] += 1
+                                    self.status["last_stop_reason"] = "loop"
                                 print(f"[strata] loop guard stopped generation: {guard.reason}", flush=True)
                                 break
                             yield "event", ev
@@ -465,7 +468,10 @@ class Service:
                 self.status["busy"] = False
         for ev in parser.finish():
             yield "event", ev
-        yield "done", {"finish": finish, "completion_tokens": n}
+        done = {"finish": finish, "completion_tokens": n}
+        if stop_detail:
+            done["stop_detail"] = stop_detail
+        yield "done", done
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
@@ -522,6 +528,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             last = chunk({}, finish)
             last["usage"] = {"prompt_tokens": len(ids), "completion_tokens": x["completion_tokens"],
                              "total_tokens": len(ids) + x["completion_tokens"]}
+            if x.get("stop_detail"):
+                last["timings"] = {"stop_reason": x["stop_detail"]}
             yield last
 
 
@@ -547,9 +555,12 @@ def openai_collect(chunks) -> dict:
         msg["reasoning_content"] = "".join(reasoning)
     if calls:
         msg["tool_calls"] = calls
-    return {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
-            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
-            "usage": last["usage"]}
+    response = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
+                "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
+                "usage": last["usage"]}
+    if last.get("timings"):
+        response["timings"] = last["timings"]
+    return response
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
