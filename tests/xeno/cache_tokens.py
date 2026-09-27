@@ -5,6 +5,7 @@ by this script; timeout cleanup never targets another process or server.
 """
 import argparse
 import csv
+import ctypes
 import hashlib
 import json
 import os
@@ -29,12 +30,13 @@ def main():
     p.add_argument('--slots', type=int, default=2048)
     p.add_argument('--timeout', type=int, default=240)
     p.add_argument('--arm', choices=['off', 'on', 'both'], default='both')
-    p.add_argument('--case', choices=['sky', 'thai', 'code', 'long'], default='sky')
+    p.add_argument('--case', choices=['sky', 'thai', 'code', 'long', 'prefill'], default='sky')
     p.add_argument('--devices', default='1', help='CUDA_VISIBLE_DEVICES order (Phase 3: 1,0)')
     p.add_argument('--secondary-expert-mib', type=int, default=0)
     p.add_argument('--secondary-free-floor-mib', type=int)
     p.add_argument('--primary-reserve-mib', type=int)
     p.add_argument('--prefill-chunk', type=int)
+    p.add_argument('--max-context', type=int, default=4096)
     p.add_argument('--spec', type=int)
     p.add_argument('--sample-vram', action='store_true')
     p.add_argument('--profile', type=Path)
@@ -61,6 +63,8 @@ def main():
         'thai': 'เขียนย่อหน้าสั้น ๆ อธิบายว่าทำไมการนอนหลับจึงสำคัญต่อสุขภาพ',
         'code': 'Write a Python function that returns the n-th Fibonacci number iteratively.',
         'long': 'Write a detailed technical explanation of how a B-tree works, including insertion, deletion, splitting, and examples.',
+        # ~3.3K prompt tokens: exercises more than one 2048-token prefill chunk.
+        'prefill': '\n\n'.join(f'Section {i}: A B-tree node {i} holds sorted keys; insertion splits a full node at its median, deletion merges or borrows from a sibling, and every leaf stays at the same depth.' for i in range(1, 91)) + '\n\nSummarise the sections above in five bullet points.',
     }
     prompt = template.render([{'role': 'user', 'content': prompts[args.case]}], enable_thinking=False)
     ids = tokenizer.encode(prompt, parse_special=True)
@@ -81,7 +85,7 @@ def main():
     env['PATH'] = os.pathsep.join(cfg.get('lib_dirs', []) + [env.get('PATH', '')])
     results = {}
     for arm in (['off', 'on'] if args.arm == 'both' else [args.arm]):
-        command = [args.exe or cfg['exe'], *base, '--tokens-file', str(prompt_path), '--max-new', str(args.max_new), '--greedy', '--max-context', '4096', '--pool-workers', '6', '--adapt-swaps', '0', '--pcie-frac', '0', '--expert-cache', str(args.slots), '--expert-profile', str(args.profile or Path(cfg['cwd']) / 'data' / 'expert-profile.bin'), '--no-prefill-borrow']
+        command = [args.exe or cfg['exe'], *base, '--tokens-file', str(prompt_path), '--max-new', str(args.max_new), '--greedy', '--max-context', str(args.max_context), '--pool-workers', '6', '--adapt-swaps', '0', '--pcie-frac', '0', '--expert-cache', str(args.slots), '--expert-profile', str(args.profile or Path(cfg['cwd']) / 'data' / 'expert-profile.bin'), '--no-prefill-borrow']
         if args.primary_reserve_mib is not None:
             command += ['--vram-reserve-mib', str(args.primary_reserve_mib)]
         if args.prefill_chunk is not None:
@@ -103,16 +107,28 @@ def main():
         print(f'RUN {arm} pid owner=cache_tokens timeout={args.timeout}s', flush=True)
         samples = []
         stop_sampling = threading.Event()
+        last_cpu = [None]
+        def cpu_busy_pct():
+            """System-wide CPU busy % since the previous sample (GetSystemTimes; kernel time includes idle)."""
+            idle, kern, user = (ctypes.c_ulonglong() for _ in range(3))
+            if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+                return -1
+            now, prev = (idle.value, kern.value + user.value), last_cpu[0]
+            last_cpu[0] = now
+            if prev is None or now[1] == prev[1]:
+                return -1
+            return round(100.0 * (1.0 - (now[0] - prev[0]) / (now[1] - prev[1])), 1)
         def sample_vram():
             while not stop_sampling.is_set():
                 try:
                     probe = subprocess.run(
-                        ['nvidia-smi', '--query-gpu=index,memory.used,memory.free',
+                        ['nvidia-smi', '--query-gpu=index,memory.used,memory.free,utilization.gpu',
                          '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=3)
+                    cpu = cpu_busy_pct()
                     if probe.returncode == 0:
                         for line in probe.stdout.splitlines():
-                            gpu, used, free = (int(part.strip()) for part in line.split(','))
-                            samples.append((round(time.monotonic() - t0, 2), gpu, used, free))
+                            gpu, used, free, util = (int(part.strip()) for part in line.split(','))
+                            samples.append((round(time.monotonic() - t0, 2), gpu, used, free, util, cpu))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     pass
                 stop_sampling.wait(0.5)
@@ -128,7 +144,7 @@ def main():
                 sampler.join(timeout=4)
                 with (args.out / f'{arm}.vram.csv').open('w', newline='', encoding='utf-8') as file:
                     writer = csv.writer(file)
-                    writer.writerow(('elapsed_s', 'gpu', 'used_mib', 'free_mib'))
+                    writer.writerow(('elapsed_s', 'gpu', 'used_mib', 'free_mib', 'gpu_util_pct', 'cpu_busy_pct'))
                     writer.writerows(samples)
         text = (args.out / f'{arm}.stdout').read_text(encoding='utf-8')
         token_line = next((line for line in text.splitlines() if line.startswith('output') and ':' in line), None)
