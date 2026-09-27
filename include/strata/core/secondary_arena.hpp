@@ -19,7 +19,8 @@ public:
     bool open(int ordinal, const std::vector<uint64_t>& ranked_blob_bytes,
               uint64_t max_bytes, std::string& err, FreeReader reader = nullptr,
               void* reader_context = nullptr);
-    void close();
+    // Returns false and retains the pointer if CUDA could not release it, so the caller can retry.
+    bool close(std::string* err = nullptr);
     uint8_t* slot_ptr(uint64_t slot) const;
     uint64_t slots() const { return offsets_.empty() ? 0 : offsets_.size() - 1; }
     uint64_t bytes() const { return offsets_.empty() ? 0 : offsets_.back(); }

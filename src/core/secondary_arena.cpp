@@ -4,6 +4,8 @@
 
 #include <cuda_runtime.h>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -34,7 +36,14 @@ bool free_snapshot(int ordinal, uint64_t& lower, std::string& err) {
 
 } // namespace
 
-SecondaryArena::~SecondaryArena() { close(); }
+SecondaryArena::~SecondaryArena() {
+    std::string err;
+    if (!close(&err)) {
+        std::fprintf(stderr, "SecondaryArena: %s; terminating to release display VRAM\n", err.c_str());
+        std::fflush(stderr);
+        std::abort();
+    }
+}
 
 bool SecondaryArena::open(int ordinal, const std::vector<uint64_t>& ranked_blob_bytes,
                           uint64_t max_bytes, std::string& err, FreeReader reader,
@@ -62,6 +71,17 @@ bool SecondaryArena::open(int ordinal, const std::vector<uint64_t>& ranked_blob_
     auto snapshot = [&](uint64_t& lower) {
         return reader ? reader(ordinal, lower, err, reader_context)
                       : free_snapshot(ordinal, lower, err);
+    };
+    auto release_candidate = [&](uint8_t* candidate) {
+        const cudaError_t released = cudaFree(candidate);
+        if (released == cudaSuccess) return true;
+        // Keep ownership but publish no usable slots. A later close() can retry the release.
+        base_ = candidate;
+        ordinal_ = ordinal;
+        offsets_.clear();
+        lower_free_after_ = 0;
+        err += std::string("; release failed: ") + cudaGetErrorString(released);
+        return false;
     };
     uint64_t limit_slots = ranked_blob_bytes.size();
     for (int attempt = 0; attempt < 8 && limit_slots > 0; ++attempt) {
@@ -92,15 +112,13 @@ bool SecondaryArena::open(int ordinal, const std::vector<uint64_t>& ranked_blob_
         const cudaError_t touched = cudaMemset(candidate, 0, (size_t) plan.bytes);
         const cudaError_t synced = touched == cudaSuccess ? cudaDeviceSynchronize() : touched;
         if (synced != cudaSuccess) {
-            const cudaError_t released = cudaFree(candidate);
             err = std::string("secondary touch: ") + cudaGetErrorString(synced);
-            if (released != cudaSuccess) err += std::string("; release: ") + cudaGetErrorString(released);
+            release_candidate(candidate);
             return false;
         }
         uint64_t after = 0;
         if (!snapshot(after)) {
-            const cudaError_t released = cudaFree(candidate);
-            if (released != cudaSuccess) err += std::string("; release: ") + cudaGetErrorString(released);
+            release_candidate(candidate);
             return false;
         }
         if (after >= kSecondaryReserveBytes) {
@@ -108,33 +126,54 @@ bool SecondaryArena::open(int ordinal, const std::vector<uint64_t>& ranked_blob_
             ordinal_ = ordinal;
             offsets_ = std::move(offsets);
             lower_free_after_ = after;
+            err.clear();
             return true;
         }
         const uint64_t shortage = kSecondaryReserveBytes - after + kAllocationCushion;
-        const cudaError_t released = cudaFree(candidate);
-        if (released != cudaSuccess) {
-            err = std::string("secondary reserve breached and allocation release failed: ") + cudaGetErrorString(released);
-            return false;
-        }
+        err = "secondary allocation breached display reserve after touch";
+        if (!release_candidate(candidate)) return false;
         limit_slots = secondary_retry_slots(ranked_blob_bytes, plan.slots, shortage);
-        err = "secondary allocation breached display reserve after touch; retrying with fewer slots";
+        err += "; retrying with fewer slots";
     }
     if (limit_slots == 0) err = "secondary allocation cannot preserve the 2560 MiB display reserve";
     return false;
 }
 
-void SecondaryArena::close() {
+bool SecondaryArena::close(std::string* err) {
     if (base_ != nullptr) {
         int previous = -1;
-        if (cudaGetDevice(&previous) == cudaSuccess && cudaSetDevice(ordinal_) == cudaSuccess) {
-            cudaFree(base_);
-            cudaSetDevice(previous);
+        const cudaError_t current = cudaGetDevice(&previous);
+        if (current != cudaSuccess) {
+            if (err) *err = std::string("cudaGetDevice before release: ") + cudaGetErrorString(current);
+            return false;
+        }
+        const cudaError_t selected = cudaSetDevice(ordinal_);
+        if (selected != cudaSuccess) {
+            if (err) *err = std::string("cudaSetDevice before release: ") + cudaGetErrorString(selected);
+            return false;
+        }
+        const cudaError_t released = cudaFree(base_);
+        const cudaError_t restored = cudaSetDevice(previous);
+        if (released != cudaSuccess) {
+            if (err) *err = std::string("cudaFree secondary arena: ") + cudaGetErrorString(released);
+            if (err && restored != cudaSuccess)
+                *err += std::string("; restore: ") + cudaGetErrorString(restored);
+            return false;
+        }
+        base_ = nullptr;
+        if (restored != cudaSuccess) {
+            ordinal_ = -1;
+            offsets_.clear();
+            lower_free_after_ = 0;
+            if (err) *err = std::string("cudaSetDevice after release: ") + cudaGetErrorString(restored);
+            return false;
         }
     }
     base_ = nullptr;
     ordinal_ = -1;
     offsets_.clear();
     lower_free_after_ = 0;
+    return true;
 }
 
 uint8_t* SecondaryArena::slot_ptr(uint64_t slot) const {

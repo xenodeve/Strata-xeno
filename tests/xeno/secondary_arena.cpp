@@ -41,7 +41,7 @@ int main() {
     uint8_t last = 255;
     CHECK(cudaMemcpy(&last, arena.slot_ptr(63) + mib - 1, 1, cudaMemcpyDeviceToHost) == cudaSuccess);
     CHECK(last == 0); // the last page was touched, not just virtually reserved
-    arena.close();
+    CHECK(arena.close());
     CHECK(arena.slots() == 0 && arena.bytes() == 0);
     InjectedFree readings{{strata::core::kSecondaryReserveBytes + 256 * mib,
                            strata::core::kSecondaryReserveBytes - 1,
@@ -51,7 +51,7 @@ int main() {
     CHECK(arena.open(1, retry_ranked, 128 * mib, err, injected_free, &readings));
     CHECK(readings.next == 4);
     CHECK(arena.slots() == 63 && arena.bytes() == 63 * mib);
-    arena.close();
+    CHECK(arena.close());
     std::puts("secondary arena: 64 MiB touched, reserve held, allocation released");
     return 0;
 }
