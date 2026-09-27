@@ -852,10 +852,10 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.exclusive_primary_experts &&
-        (!secondary_q2 || o.mmap_experts || o.cache_cpu_only || o.no_pool ||
+        (!secondary_q2 || o.spec < 2 || o.mmap_experts || o.cache_cpu_only || o.no_pool ||
          !o.no_prefill_borrow || o.adapt_swaps != 0 || o.pcie_frac != 0.0 ||
          o.expert_profile.empty())) {
-        std::fprintf(stderr, "strata generate: --exclusive-primary-experts requires native Q2_0, "
+        std::fprintf(stderr, "strata generate: --exclusive-primary-experts requires native Q2_0, spec >=2, "
                              "a profile, --no-prefill-borrow, --adapt-swaps 0, --pcie-frac 0 "
                              "and an enabled CPU pool; it excludes mmap/forced-CPU modes\n");
         return 2;
@@ -1404,8 +1404,20 @@ if (o.expert_cache_per_layer) {
         }
         const uint64_t private_before = private_commit_bytes();
         int64_t owned = 0;
+        std::vector<uint8_t> seen((size_t) (g.n_layers * g.n_expert), 0);
         for (const auto& [layer, expert] : profile) {
-            if (xcache.slot_of(layer, expert) < 0) continue;
+            const size_t index = (size_t) layer * (size_t) g.n_expert + (size_t) expert;
+            if (seen[index]) continue;
+            seen[index] = 1;
+            const int32_t slot = xcache.slot_of(layer, expert);
+            if (slot < 0) continue;
+            const uint8_t* blob = arena_src.blob(layer, expert);
+            const int64_t bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+            if (blob == nullptr || !xcache.verify_slot(slot, blob, err, bytes)) {
+                std::fprintf(stderr, "strata generate: exclusive primary verification (%d,%d) slot %d: %s\n",
+                             layer, expert, slot, err.c_str());
+                return 1;
+            }
             if (!arena_src.release_host_copy(layer, expert, err)) {
                 std::fprintf(stderr, "strata generate: exclusive primary (%d,%d): %s\n",
                              layer, expert, err.c_str());
@@ -1414,7 +1426,7 @@ if (o.expert_cache_per_layer) {
             ++owned;
         }
         const uint64_t private_after = private_commit_bytes();
-        std::fprintf(stderr, "strata generate: exclusive primary owns %lld experts; "
+        std::fprintf(stderr, "strata generate: exclusive primary verified and owns %lld experts; "
                      "decommitted %.2f GiB of host pages; private commit %.2f -> %.2f GiB "
                      "(delta %.2f GiB)\n",
                      (long long) owned,
