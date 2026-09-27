@@ -352,7 +352,7 @@ class Service:
                 for path, _ in encoded:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
-        if len(ids) + max_new > self.engine.max_context:
+        if max_new is not None and len(ids) + max_new > self.engine.max_context:
             raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                              f"({self.engine.max_context}); requests are never truncated")
         return ids, kwargs.get("enable_thinking", True) is not False
@@ -690,6 +690,16 @@ def make_handler(svc: Service):
                     self._openai(req)
                 elif self.path.rstrip("/") == "/v1/messages":
                     self._anthropic(req)
+                elif self.path.rstrip("/") == "/v1/messages/count_tokens":
+                    messages, tools, kw = anthropic_to_messages(req)
+                    ids, _ = svc.prepare(messages, tools, kw, None)
+                    try:
+                        self._json(200, {"input_tokens": len(ids)})
+                    finally:
+                        path = getattr(svc.embeddings, "path", None)
+                        if path is not None:
+                            Path(path).unlink(missing_ok=True)
+                        svc.embeddings.path = None
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
