@@ -116,12 +116,17 @@ if(STRATA_ENABLE_CUDA)
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
   target_link_libraries(strata_core PUBLIC strata_plan strata_warnings CUDA::cudart)
 
-  add_library(strata_secondary STATIC src/core/secondary_vram.cpp)
+  add_library(strata_secondary STATIC src/core/secondary_vram.cpp src/core/secondary_arena.cpp)
   target_include_directories(strata_secondary PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_secondary PUBLIC CUDA::cudart)
   if(TARGET CUDA::nvml)
     target_link_libraries(strata_secondary PUBLIC CUDA::nvml)
     target_compile_definitions(strata_secondary PRIVATE STRATA_HAS_NVML=1)
+  endif()
+  if(WIN32 AND STRATA_BUILD_XENO_TESTS)
+    add_executable(xeno_secondary_arena tests/xeno/secondary_arena.cpp)
+    target_link_libraries(xeno_secondary_arena PRIVATE strata_secondary)
+    # Hardware smoke test is run manually with CUDA_VISIBLE_DEVICES=1,0; it is not a default CTest.
   endif()
 
   add_executable(strata-device src/core/device_main.cpp)

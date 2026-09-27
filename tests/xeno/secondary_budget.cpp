@@ -11,6 +11,7 @@
 int main() {
     using strata::core::secondary_budget;
     using strata::core::secondary_effective_free;
+    using strata::core::secondary_retry_slots;
     constexpr uint64_t mib = 1ull << 20;
     constexpr uint64_t gib = 1ull << 30;
     constexpr uint64_t reserve = 2560ull * mib;
@@ -27,6 +28,10 @@ int main() {
     CHECK(aligned.slots == 1 && aligned.bytes == 512);
     const auto ranked = secondary_budget(reserve + 1024, {768, 2048, 256});
     CHECK(ranked.slots == 1 && ranked.bytes == 768); // no skipping a higher-ranked pair
+    const auto capped = secondary_budget(reserve + 512 * mib, {256 * mib, 256 * mib}, 300 * mib);
+    CHECK(capped.slots == 1 && capped.bytes == 256 * mib);
+    CHECK(secondary_retry_slots({mib, mib, mib}, 3, 2 * mib) == 1);
+    CHECK(secondary_retry_slots({mib, mib, mib}, 3, 4 * mib) == 0);
     const auto overflow = secondary_budget(std::numeric_limits<uint64_t>::max(),
                                            {std::numeric_limits<uint64_t>::max(), 256});
     CHECK(overflow.slots == 0 && overflow.bytes == 0);
