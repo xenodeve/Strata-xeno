@@ -695,7 +695,10 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path == "/health":
-                self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
+                proc = getattr(svc.engine, "proc", None)
+                alive = proc is None or proc.poll() is None
+                self._json(200 if alive else 503, {"status": "ok" if alive else "engine_exited",
+                                     "max_context": svc.engine.max_context, "model": svc.model,
                                      "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                      "loops_stopped": svc.status["loops_stopped"]})
             elif path == "/status":

@@ -25,3 +25,7 @@ The internal finish detail and OpenAI streamed/non-streamed `timings.stop_reason
 Anthropic `document` blocks now expand before message conversion. Base64 PDFs contribute each page's text layer in order. A page without text becomes a PNG image part when vision is loaded; without vision it contributes an explicit no-text-layer note. Invalid PDFs and unsupported sources also contribute visible notes. Plain-text document sources are included. Both `/v1/messages` and `/v1/messages/count_tokens` use the same conversion with the server's vision setting. An HTTP PDF count request matched the rendered prompt token count; converter tests cover the vision image path, while existing HTTP tests cover image-token expansion separately.
 
 The fixture is a two-page PDF with text on page 1 and a blank page 2. `pypdf` extracted `Revenue is 42.` from page 1; `pypdfium2` rendered its page at 300×300. Four document tests went red before integration and green after it. The full Python serving suite passed 20 tests. Installer dependencies now include `pypdf` and `pypdfium2`. A real scanned PDF and model vision quality remain for the final serving gate.
+
+## Engine liveness
+
+`/health` now returns HTTP 503 with `status: engine_exited` if the resident Strata child has exited. The previous 200 response concealed a dead engine. A mock dead-child HTTP test went red before the change and green after. This is a truthful health signal for an external launcher; automatic restart and alive-but-deaf detection are still open.

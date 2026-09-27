@@ -3,6 +3,7 @@ import base64
 import json
 from pathlib import Path
 import tempfile
+import urllib.error
 import urllib.request
 import unittest
 
@@ -36,6 +37,15 @@ class CountTokensTest(unittest.TestCase):
     def tearDown(self):
         self.http.shutdown()
         self.http.server_close()
+
+    def test_health_reports_dead_engine(self):
+        class DeadProcess:
+            def poll(self): return 1
+        self.service.engine.proc = DeadProcess()
+        with self.assertRaises(urllib.error.HTTPError) as result:
+            urllib.request.urlopen(
+                f'http://127.0.0.1:{self.http.server_address[1]}/health', timeout=5)
+        self.assertEqual(result.exception.code, 503)
 
     def test_count_exceeds_context_without_rejecting_request(self):
         body = {'model': 'qwen3.8-flash-next', 'messages': [
