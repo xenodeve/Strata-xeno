@@ -1,3 +1,4 @@
+#include <chrono>
 #include "strata/core/secondary_runner.hpp"
 #include "strata/core/secondary_budget.hpp"
 #include "strata/core/secondary_vram.hpp"
@@ -131,6 +132,7 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
         err = "secondary runner: invalid launch geometry or pending work";
         return false;
     }
+    const auto launch_t0 = std::chrono::steady_clock::now();
     ptr_.clear(); start_.clear(); dst_.clear(); tok_.clear(); selected_rows_.clear(); group_slots_.clear();
     const int entries = n_tokens * k;
     for (int i = 0; i < entries; ++i) {
@@ -205,6 +207,7 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
         !cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
         return fail_enqueued();
     pending_ = true;
+    ms_launch_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - launch_t0).count();
     err.clear();
     return true;
 }
@@ -216,10 +219,12 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
     if (!cuda_ok(cudaGetDevice(&previous), "runner current device", err) ||
         !cuda_ok(cudaSetDevice(1), "runner select device", err)) return false;
     const RestoreDevice restore{previous};
+    const auto wait_t0 = std::chrono::steady_clock::now();
     if (!cuda_ok(cudaEventSynchronize((cudaEvent_t) done_), "runner wait partials", err)) {
         failed_ = true;
         return false;
     }
+    ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_t0).count();
     for (const int32_t row : selected_rows_)
         std::memcpy(output + (size_t) row * n_embd_, host_out_ + (size_t) row * n_embd_,
                     (size_t) n_embd_ * sizeof(float));

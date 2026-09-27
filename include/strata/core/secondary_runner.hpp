@@ -36,6 +36,10 @@ public:
     void stop_monitor();
     uint64_t served_entries() const { return served_entries_; }
     uint64_t served_groups() const { return served_groups_; }
+    /// Host time spent inside launch() enqueueing, and blocked in finish() waiting for the 4070 SUPER's partials.
+    /// A non-zero wait means the secondary tier, not the CPU pool, was the slower side of that layer.
+    double ms_launch() const { return ms_launch_; }
+    double ms_wait() const { return ms_wait_; }
     uint64_t free_checks() const { return free_checks_.load(); }
     uint64_t min_free_bytes() const { return min_free_bytes_.load(); }
 
@@ -62,6 +66,7 @@ private:
     bool pending_ = false;
     bool failed_ = false; ///< async enqueue failure poisons the runner until teardown
     uint64_t served_entries_ = 0, served_groups_ = 0;
+    double ms_launch_ = 0, ms_wait_ = 0;
     std::atomic<uint64_t> free_checks_{0};
     std::atomic<uint64_t> min_free_bytes_{~uint64_t{0}};
     uint64_t free_floor_bytes_ = 2560ull << 20;

@@ -3280,6 +3280,9 @@ if (o.expert_cache_per_layer) {
                                 std::printf("%-24s %llu samples, minimum %.2f GiB free\n", "secondary reserve",
                                             (unsigned long long) secondary_runner.free_checks(),
                             (double) secondary_runner.min_free_bytes() / 1073741824.0);
+        if (rounds > 0 && o.secondary_expert_mib > 0)
+            std::printf("%-24s launch %.3f  wait %.3f ms/round (wait > 0: the 4070 SUPER finished after the CPU pool)\n",
+                        "secondary timing", secondary_runner.ms_launch() / rounds, secondary_runner.ms_wait() / rounds);
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
