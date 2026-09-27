@@ -211,6 +211,9 @@ struct ExpertDispatch {
     const SecondaryArena* secondary_weights = nullptr;
     const int32_t* secondary_res = nullptr; ///< n_layers x n_expert, -1 when not resident
     int64_t secondary_entries = 0, secondary_groups = 0;
+    /// Verify-window routed entries by where they were computed: [0] primary VRAM hit, [1] secondary (4070 SUPER)
+    /// tier, [2] GPU PCIe read, [3] CPU pool.  Their sum is every routed (token, expert) entry of those windows.
+    int64_t tier_entries[4] = {0, 0, 0, 0};
     std::string secondary_fail; ///< owns dynamic device-1 error text while `fail` points to it
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows

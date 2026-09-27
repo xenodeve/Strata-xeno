@@ -3254,6 +3254,14 @@ if (o.expert_cache_per_layer) {
                         ver.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
+        if (rounds > 0) {
+            const int64_t* te = drive.d.tier_entries;
+            const int64_t sum = te[0] + te[1] + te[2] + te[3];
+            const double all = (double) std::max<int64_t>(1, sum);
+            std::printf("%-24s primary %.1f%%  secondary %.1f%%  pcie %.1f%%  cpu %.1f%% of %lld routed entries\n",
+                        "tier hits", 100.0 * te[0] / all, 100.0 * te[1] / all, 100.0 * te[2] / all,
+                        100.0 * te[3] / all, (long long) sum);
+        }
         if (rounds > 0)
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
                         "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,

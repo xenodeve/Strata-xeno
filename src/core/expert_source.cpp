@@ -427,6 +427,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
                 if (kind[i] == 0) ++d.cache_hits;
+                ++d.tier_entries[kind[i] == 0 ? 0 : kind[i] == 2 ? 1 : 2];
                 std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
             }
@@ -453,6 +454,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             jb.out[jb.nt] = row;
             ++jb.nt;
             ++d.multi_entries;
+            ++d.tier_entries[3];
         }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
