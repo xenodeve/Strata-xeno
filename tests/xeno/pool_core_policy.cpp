@@ -52,13 +52,16 @@ int main(int argc, char** argv) {
     const int actual = automatic.workers();
     strata::kernels::cpu::ExpertPool p_cores_only(p_only, false, true);
     strata::kernels::cpu::ExpertPool with_e_cores(p_only + 1, false, true);
-    const bool forced_avx2 = argc == 2 && std::strcmp(argv[1], "--expect-avx2") == 0;
     const bool vnni = strata::kernels::cpu::cpu_avxvnni_ok();
     std::printf("physical %zu, highest class %u, preferred %d, auto workers %d/%d, P-only %d\n",
                 classes.size(), (unsigned) highest, preferred, actual, expected_auto, p_cores_only.workers());
-    std::printf("native Q2_0 dispatch: AVX-VNNI %s, forced AVX2 %s\n", vnni ? "yes" : "no",
-                forced_avx2 ? "yes" : "no");
+    std::printf("native Q2_0 dispatch: AVX-VNNI %s\n", vnni ? "yes" : "no");
+    bool dispatch = true;
+    if (argc == 2 && std::strcmp(argv[1], "--expect-vnni") == 0)
+        dispatch = vnni && !strata::kernels::cpu::cpu_avx512_ok();
+    else if (argc == 2 && std::strcmp(argv[1], "--expect-avx2") == 0)
+        dispatch = !vnni && !strata::kernels::cpu::cpu_avx512_ok();
+    else if (argc != 1) return 2;
     return ordered && actual == expected_auto && p_cores_only.workers() == p_only &&
-           with_e_cores.workers() == p_only + 1 &&
-           vnni != forced_avx2 && !strata::kernels::cpu::cpu_avx512_ok() ? 0 : 1;
+           with_e_cores.workers() == p_only + 1 && dispatch ? 0 : 1;
 }

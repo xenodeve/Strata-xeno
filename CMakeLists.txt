@@ -4,9 +4,8 @@
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
-# CUDA targets arrive in Phase 2 and this build REJECTS any architecture other than 120: the engine is
-# written against sm_120 (RTX 5000 / Blackwell) and silently building for an older arch would produce a
-# binary that runs and is wrong about its own performance, which is the worst of both outcomes.
+# CUDA targets require compute capability 8.0 or newer. The Strata-xeno build uses
+# 89;120 so one binary contains code for both desktop GPUs.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.0 LANGUAGES CXX)
 
@@ -32,6 +31,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
   set(_strata_tests_default ON)
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
+option(STRATA_BUILD_XENO_TESTS "Build machine-targeted Strata-xeno CPU checks" OFF)
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
 if(STRATA_ENABLE_CUDA)
@@ -495,9 +495,17 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
-  if(WIN32)
+  if(WIN32 AND STRATA_BUILD_XENO_TESTS)
+    enable_testing()
     add_executable(xeno_pool_core_policy tests/xeno/pool_core_policy.cpp)
     target_link_libraries(xeno_pool_core_policy PRIVATE strata_kernels_cpu)
+    add_executable(xeno_q2_isa_parity tests/xeno/q2_isa_parity.cpp)
+    target_link_libraries(xeno_q2_isa_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME xeno_pool_core_policy COMMAND xeno_pool_core_policy)
+    add_test(NAME xeno_q2_isa_parity COMMAND xeno_q2_isa_parity)
+    add_test(NAME xeno_cpu_dispatch_vnni COMMAND xeno_pool_core_policy --expect-vnni)
+    add_test(NAME xeno_cpu_dispatch_forced_avx2 COMMAND xeno_pool_core_policy --expect-avx2)
+    set_tests_properties(xeno_cpu_dispatch_forced_avx2 PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX2=1")
   endif()
   if(STRATA_ENABLE_CUDA)
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
