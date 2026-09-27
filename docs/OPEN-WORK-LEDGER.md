@@ -4,9 +4,9 @@ The authoritative scope is Flash-Next PRD #1 and the approved build handoff of 2
 
 | Phase | Engine issue | Measurement issue | State |
 |---|---|---|---|
-| 1 Cache correctness / serving fixes | xenodeve/Strata-xeno#1 | xenodeve/Qwen3.8-Flash-Next-Tuning#10 | Cache parity green on four 256-token prompts; upstream serving fixes and review pending |
-| 2 CPU affinity / architecture build | #2 | #11 | Pending |
-| 3 Static second GPU | #3 | #12 | Depends on 1–2 |
+| 1 Cache correctness / serving fixes | xenodeve/Strata-xeno#1 | xenodeve/Qwen3.8-Flash-Next-Tuning#10 | Developer accepted Q2_0 `double-exp` as the current baseline (ADR 0001); four 256-token cache-parity prompts green; review and integration pending |
+| 2 CPU affinity / architecture build | #2 | #11 | Built and reviewed on separate `xeno/afk-phase2` branch |
+| 3 Static second GPU | #3 | #12 | Phase 1 decision resolved; integrate Phase 1 and 2 first. Keep at least 2.5 GB free on display RTX 4070 SUPER at all times |
 | 4 Exclusive swaps | #4 | #13 | Depends on 3 |
 | 5 Second-GPU prefill | #5 | #14 | Depends on 3–4 |
 | 6 Claude Code compatibility | #6 | #15 | Pending |
