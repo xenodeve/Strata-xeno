@@ -725,7 +725,7 @@ def make_handler(svc: Service):
                 elif self.path.rstrip("/") == "/v1/messages":
                     self._anthropic(req)
                 elif self.path.rstrip("/") == "/v1/messages/count_tokens":
-                    messages, tools, kw = anthropic_to_messages(req)
+                    messages, tools, kw = anthropic_to_messages(req, vision=svc.vision is not None)
                     try:
                         ids, _ = svc.prepare(messages, tools, kw, None)
                     finally:
@@ -770,7 +770,7 @@ def make_handler(svc: Service):
                 chunks.close()
 
         def _anthropic(self, req):
-            messages, tools, kw = anthropic_to_messages(req)
+            messages, tools, kw = anthropic_to_messages(req, vision=svc.vision is not None)
             max_new = int(req.get("max_tokens") or 1024)
             if max_new <= 0:                             # a non-positive budget (some clients send -1) means "unset"
                 max_new = 1024

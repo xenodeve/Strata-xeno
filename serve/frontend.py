@@ -23,6 +23,7 @@ from pathlib import Path
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from serve.pdf_blocks import document_parts
 
 
 # ------------------------------------------------------------------------------------------------ template
@@ -165,7 +166,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     return messages, tools, kwargs
 
 
-def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, vision: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs)."""
     messages = []
     system = req.get("system")
@@ -178,6 +179,9 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
+        content = [part for block in content or []
+                   for part in (document_parts(block, vision) if isinstance(block, dict)
+                                and block.get("type") == "document" else [block])]
         if m.get("role") == "user" and _has_image(content) and not any(
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
             messages.append({"role": "user", "content": _parts_of(content)})

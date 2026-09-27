@@ -9,7 +9,7 @@ Strata-xeno PRD: xenodeve/Qwen3.8-Flash-Next-Tuning#1. Engine implementation and
 | 3 Static 4070 expert tier | #3 | #12 | Depends on Phase 1 decision |
 | 4 Exclusive swaps | #4 | #13 | Depends on Phase 3 |
 | 5 4070 prefill | #5 | #14 | Depends on Phase 3 |
-| 6 Claude Code serving | #6 | #15 | Upstream #7–#9, count_tokens, billing-header normalization, thinking signature and loop guard green; #10 parked for token-5 divergence; further compatibility open |
+| 6 Claude Code serving | #6 | #15 | Upstream #7–#9, count_tokens, billing-header normalization, thinking signature, loop guard, and document blocks green; #10 parked for token-5 divergence; further compatibility open |
 | 7 Long context | #7 | #16 | Depends on memory fit |
 | 8 Speculation and sampler | #8 | #17 | Depends on correctness |
 | 9 Telemetry and default decision | #9 | #18 | Final measured gate |

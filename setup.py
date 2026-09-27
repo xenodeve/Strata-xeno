@@ -55,7 +55,8 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
 MIN_ENGINE = (0, 1, 2)                 # split models (Swift 1.5), STOP, cache sized after the slots are written
-PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow"]
+PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow",
+               "pypdf", "pypdfium2"]
 
 MODELS = {
     "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0},
