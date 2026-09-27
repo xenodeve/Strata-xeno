@@ -16,6 +16,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -169,7 +170,9 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
     messages = []
     system = req.get("system")
     if system:
-        messages.append({"role": "system", "content": _text_of(system)})
+        text = _text_of(system)
+        text = re.sub(r"\A\s*x-anthropic-billing-header:(?:\s*[\w.-]+=[^;\n]*;)*\s*", "", text)
+        messages.append({"role": "system", "content": text})
     for m in req.get("messages", []):
         content = m.get("content")
         if isinstance(content, str):
