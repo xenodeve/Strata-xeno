@@ -32,6 +32,12 @@ class BillingHeaderTest(unittest.TestCase):
         messages, _, _ = anthropic_to_messages({'messages': [{'role': 'user', 'content': text}]})
         self.assertEqual(messages[0]['content'], text)
 
+    def test_assignment_shaped_system_instruction_after_header_is_preserved(self):
+        system = ('x-anthropic-billing-header: cc_version=2.1; cch=a5145;'
+                  'LANG=en;You are Claude Code.')
+        messages, _, _ = anthropic_to_messages({'system': system, 'messages': []})
+        self.assertEqual(messages[0]['content'], 'LANG=en;You are Claude Code.')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -171,7 +171,7 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
     system = req.get("system")
     if system:
         text = _text_of(system)
-        text = re.sub(r"\A\s*x-anthropic-billing-header:(?:\s*[\w.-]+=[^;\n]*;)*\s*", "", text)
+        text = re.sub(r"\A\s*x-anthropic-billing-header:(?:\s*(?:cc_[\w.-]+|cch)=[^;\n]*;)*\s*", "", text)
         messages.append({"role": "system", "content": text})
     for m in req.get("messages", []):
         content = m.get("content")
