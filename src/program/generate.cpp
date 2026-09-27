@@ -18,6 +18,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/secondary_arena.hpp"
 #include "strata/core/secondary_profile.hpp"
+#include "strata/core/secondary_runner.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -163,6 +164,7 @@ struct Options {
     /// measurement found nothing - see `expert_cache_per_layer`.
     int expert_cache = 0;
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
+    bool secondary_stage_only = false; ///< A/B arm before routing work to device 1
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -339,8 +341,9 @@ void usage() {
                  "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
                  "                       ms/token, -2.7 ms/token end to end.\n"
                  "  --cache-cpu-only     Diagnostic: prefill normally, then route verify experts to CPU.\n"
-                 "  --secondary-expert-mib N  Phase 3 staging-only probe on RTX 4070 SUPER;\n"
-                 "                            keep >=2560 MiB free. Does not compute there yet.\n"
+                 "  --secondary-expert-mib N  Phase 3 Q2_0 tier on RTX 4070 SUPER;\n"
+                     "  --secondary-stage-only  Stage/verify weights, but compute all experts as before.\n"
+                 "                            keep >=2560 MiB free, requires --pcie-frac 0.\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
@@ -644,6 +647,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--secondary-stage-only") o.secondary_stage_only = true;
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--prefill") o.prefill_chunk = std::atoll(next("--prefill"));
@@ -770,7 +774,8 @@ int main(int argc, char** argv) {
     }
     if (!std::isfinite(o.temperature) || o.temperature < 0 || !std::isfinite(o.top_p) ||
         o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 || o.pool_workers < 0 ||
-        o.secondary_expert_mib < 0 || o.secondary_expert_mib > 8192) {
+        o.secondary_expert_mib < 0 || o.secondary_expert_mib > 8192 ||
+        (o.secondary_stage_only && o.secondary_expert_mib == 0)) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
     }
@@ -815,6 +820,17 @@ int main(int argc, char** argv) {
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
     if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
+    const bool secondary_q2 = native_pack &&
+        std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
+                    strata::kernels::cpu::expert_layout().fmt.end(),
+                    [](const auto& f) { return f.gu_type == 42 && f.d_type == 42; });
+    if (o.secondary_expert_mib > 0 &&
+        (!native_pack || (!o.secondary_stage_only && !o.cache_cpu_only &&
+                          (!secondary_q2 || o.pcie_frac != 0.0 || o.no_pool || o.spec < 2)))) {
+        std::fprintf(stderr, "strata generate: secondary compute needs native Q2_0, spec >=2, "
+                             "expert pool and --pcie-frac 0 until combined routing is validated\n");
+        return 2;
+    }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
@@ -1283,9 +1299,11 @@ if (o.expert_cache_per_layer) {
                      (long long) prefilled, (long long) want);
     }
 
-    // Phase 3 tracer: stage a disjoint, static set on the display GPU, but do not
-    // route computation there until the cross-device partial path passes parity.
+    // Phase 3: profile-ranked secondary copies remain separate from the primary cache.
+    // The stage-only and forced-CPU arms keep a same-binary correctness baseline.
     strata::core::SecondaryArena secondary_arena;
+    strata::core::SecondaryRunner secondary_runner;
+    std::vector<int32_t> secondary_residency;
     if (o.secondary_expert_mib > 0) {
         if (!native_pack || profile.empty() || o.expert_cache <= 0 || srcp == nullptr) {
             std::fprintf(stderr, "strata generate: secondary experts need native Q2_0, a profile and a primary cache\n");
@@ -1313,12 +1331,23 @@ if (o.expert_cache_per_layer) {
         std::vector<uint64_t> bytes;
         bytes.reserve(candidates.size());
         for (const auto& pair : candidates) bytes.push_back(pair.bytes);
+        const bool secondary_compute = !o.secondary_stage_only && !o.cache_cpu_only;
+        if (secondary_compute &&
+            !secondary_runner.init(strata::kernels::cpu::MAXT,
+                                   (int) (strata::kernels::cpu::MAXT * K),
+                                   (int) g.n_embd, (int) g.n_ff, err)) {
+            std::fprintf(stderr, "strata generate: secondary runner: %s\n", err.c_str());
+            return 1;
+        }
         if (!secondary_arena.open(1, bytes, (uint64_t) o.secondary_expert_mib << 20, err)) {
             std::fprintf(stderr, "strata generate: secondary arena: %s\n", err.c_str());
             return 1;
         }
+        secondary_residency.assign((size_t) (g.n_layers * g.n_expert), -1);
         for (uint64_t slot = 0; slot < secondary_arena.slots(); ++slot) {
             const auto& pair = candidates[(size_t) slot];
+            secondary_residency[(size_t) pair.layer * (size_t) g.n_expert + (size_t) pair.expert] =
+                (int32_t) slot;
             const uint8_t* blob = srcp->blob(pair.layer, pair.expert);
             if (blob == nullptr ||
                 !secondary_arena.fill_slot(slot, blob, pair.bytes, err) ||
@@ -1329,10 +1358,11 @@ if (o.expert_cache_per_layer) {
             }
         }
         std::fprintf(stderr, "strata generate: staged %llu next-ranked secondary experts (%.2f GiB); "
-                     "4070 SUPER lower free %.2f GiB (floor 2.5 GiB); STAGING ONLY, no secondary compute\n",
+                     "4070 SUPER lower free %.2f GiB (floor 2.5 GiB); %s\n",
                      (unsigned long long) secondary_arena.slots(),
                      (double) secondary_arena.bytes() / 1073741824.0,
-                     (double) secondary_arena.lower_free_after() / 1073741824.0);
+                     (double) secondary_arena.lower_free_after() / 1073741824.0,
+                     secondary_compute ? "SECONDARY COMPUTE" : "STAGING ONLY, no secondary compute");
     }
 
     Drive drive;
@@ -1341,6 +1371,11 @@ if (o.expert_cache_per_layer) {
     drive.d.pool = &pool;
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
+    if (o.secondary_expert_mib > 0 && !o.secondary_stage_only && !o.cache_cpu_only) {
+        drive.d.secondary_runner = &secondary_runner;
+        drive.d.secondary_weights = &secondary_arena;
+        drive.d.secondary_res = secondary_residency.data();
+    }
     drive.d.jobs.resize((size_t) K);
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
@@ -3143,6 +3178,13 @@ if (o.expert_cache_per_layer) {
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
                         drive.d.ms_run / rounds);
+            if (o.secondary_expert_mib > 0)
+                std::printf("%-24s %lld entries in %lld groups (stage-only=%d)\n", "secondary Q2 tier",
+                            (long long) drive.d.secondary_entries, (long long) drive.d.secondary_groups,
+                            (int) (o.secondary_stage_only || o.cache_cpu_only));
+                            if (o.secondary_expert_mib > 0)
+                                std::printf("%-24s %llu samples\n", "secondary reserve",
+                                            (unsigned long long) secondary_runner.free_checks());
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
@@ -3293,7 +3335,15 @@ if (o.expert_cache_per_layer) {
                                               ? (double) xcache.resident() / (double) xcache.slots()
                                               : 0.0));
         }
-        if (tgraph.captured && tgraph.calls > 0) {
+    if (o.secondary_expert_mib > 0)
+        std::printf("%-24s %lld entries in %lld distinct layer groups (stage-only=%d)\n",
+                    " secondary Q2 tier", (long long) drive.d.secondary_entries,
+                    (long long) drive.d.secondary_groups,
+                    (int) (o.secondary_stage_only || o.cache_cpu_only));
+                    if (o.secondary_expert_mib > 0)
+                        std::printf("%-24s %llu samples\n", "secondary reserve",
+                                    (unsigned long long) secondary_runner.free_checks());
+    if (tgraph.captured && tgraph.calls > 0) {
             const double per = (double) tgraph.calls;
             std::printf("%-24s wait for rings %.3f  pool %.3f ms/token  (%lld flushes over %lld positions)\n",
                         "  token graph", tgraph.ms_wait / per, tgraph.ms_pool / per, (long long) tgraph.flushes,

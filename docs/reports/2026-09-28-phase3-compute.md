@@ -1,0 +1,25 @@
+# Phase 3 secondary Q2_0 compute checkpoint
+
+Scope: engine #3 / tracker #12, branch `xeno/afk-phase3-compute`. This is an opt-in correctness and rough-speed checkpoint, **not a production default or final peak-performance result**.
+
+`SecondaryRunner` stages activation in portable pinned host memory, sends it to device 1, uses the native Q2_0 FP32-scale quantizer and grouped multi-token kernel with verified static expert slots, returns partial rows through portable pinned host memory, and waits on a device-1 event before copying only claimed router-index rows into the verifier's host output. In `expert_pool_dispatch_multi`, primary-GPU resident and PCIe groups are decided first. Remaining entries with a secondary slot become kind 2 and are omitted from CPU jobs. Other entries remain CPU misses. The runner launches before CPU work and finishes after it, so GPU1 and CPU can overlap. `--pcie-frac 0` is required for the initial combined-routing contract. `--secondary-stage-only` and `--cache-cpu-only` remain same-binary A/B arms.
+
+Direct real-model tests with both contexts and two secondary Q2_0 blobs passed for layer 0 (half-integer Q8 boundary input) and layer 47. Each `gpu_dual_q2_runner_*` CTest compared three entries in two groups to the CPU pool: 0/7,680 differing floats. A second call selected only rows 0 and 2; row 1 stayed untouched. The separate `gpu_4070_transfer` test covers portable pinned H2D, kernel, event and D2H. These are the component proofs for the later model run.
+
+## Model token parity and rough speed
+
+All runs used `CUDA_VISIBLE_DEVICES=1,0`, Q2_0 native pack, spec 4, 4K context, six P-core workers, PCIe miss share 0, and a fixed sky prompt. The published accepted Q2_0 baseline was retained:
+
+| Primary cache | Secondary cap | Result | Secondary work | Rough decode tok/s | Lower 4070 free at staging |
+|---:|---:|---|---:|---:|---:|
+| 1,000 slots | 64 MiB | forced CPU-miss vs secondary compute 96/96 equal | 284 entries / 205 groups | 18.16 off / 22.49 on | >9 GiB |
+| 5,000 slots | 256 MiB | forced CPU-miss vs secondary compute 96/96 equal | 598 entries / 465 groups | 20.47 off / 25.16 on | 9.24–9.25 GiB |
+| 5,000 slots | 1,024 MiB | accepted single-GPU output vs secondary compute 96/96 equal | 2,422 entries / 1,891 groups | 22.43 on (unpaired) | 8.49 GiB |
+
+The 1,000-slot trial initially queried NVML every layer and ran slower (13.39 on vs 21.12 off tok/s) despite parity. It spent ~84.7 ms/round in dispatch planning. Throttling the reserve query to at most once per 250 ms reduced that term to ~9.2 ms/round; the repeated trial passed parity and showed the rough gain above. The 5,000-slot 256 MiB trial spent ~8.7 ms/round in dispatch, while the 1 GiB trial spent ~13.3 ms/round and served more groups but decoded slower. This suggests transfer/launch/wait overhead can outweigh additional CPU work saved. Startup times varied widely with host arena load rate (e.g. 31.64 GiB at 1.21 vs 0.61 GiB/s in adjacent runs); do not infer a startup penalty from those unpaired totals. Artifacts are under `%TEMP%\strata-phase3-compute-*`.
+
+## Safety and remaining gates
+
+The 4070 allocation is touched and checked against the lower CUDA/NVML reading before use, checked after each expert fill, and sampled during layers with secondary work (16–18 samples in the 96-token runs). All sampled free values were far above the 2560 MiB floor. Sampling is not yet continuous when a request has no secondary hits; a desktop application could reduce free VRAM between checks. A low-reserve runtime error currently fails the request but leaves the static allocation resident until process teardown. Fix that fail-safe behavior or shut down the owning process before enabling the tier by default.
+
+Additional work: four 256-token prompt parity gate, tests for secondary launch/error cleanup during an active verifier graph, accurate per-tier timing/bytes, paired ABBA speed runs, larger primary-cache configurations, and a live Claude Code session. The 1 GiB tier was slower than 256 MiB in one sky trial, so do not maximize the display-card fill without measurements. The large host expert arena is pageable in opt-in dual-card mode because CUDA registration of ~29 GiB repeatedly prevented initializing the second CUDA context on this 48 GB RAM machine. Phase 4 exclusive residency may relieve that pressure; this remains to be measured.

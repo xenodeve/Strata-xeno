@@ -248,10 +248,14 @@ if(STRATA_ENABLE_CUDA)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+  add_library(strata_secondary_compute STATIC src/core/secondary_runner.cpp)
+  target_include_directories(strata_secondary_compute PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(strata_secondary_compute PUBLIC strata_secondary strata_kernels CUDA::cudart)
+
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_secondary_compute CUDA::cudart)
 
   # `strata generate` (P2.S6).  The FIRST user-facing program: everything under it is a component, and this is
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
@@ -544,7 +548,7 @@ if(STRATA_NATIVE_EXPERTS)
     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact CUDA::cudart)
   add_executable(native_q2_pool_hit_parity tests/xeno/native_q2_pool_hit_parity.cpp)
   target_include_directories(native_q2_pool_hit_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(native_q2_pool_hit_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact strata_secondary CUDA::cudart)
+  target_link_libraries(native_q2_pool_hit_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact strata_secondary_compute CUDA::cudart)
   set(STRATA_XENO_Q2_GGUF "" CACHE FILEPATH "Optional local Q2_0 first shard for display-GPU parity tests")
   if(WIN32 AND STRATA_BUILD_XENO_TESTS AND STRATA_XENO_Q2_GGUF)
     add_test(NAME gpu_4070_q2_parity_layer0
@@ -555,9 +559,14 @@ if(STRATA_NATIVE_EXPERTS)
              COMMAND native_q2_pool_hit_parity "${STRATA_XENO_Q2_GGUF}" 0 7 -2 --secondary)
     add_test(NAME gpu_dual_q2_parity_layer47
              COMMAND native_q2_pool_hit_parity "${STRATA_XENO_Q2_GGUF}" 47 361 1107 --secondary)
+    add_test(NAME gpu_dual_q2_runner_layer0
+             COMMAND native_q2_pool_hit_parity "${STRATA_XENO_Q2_GGUF}" 0 7 -2 --runner)
+    add_test(NAME gpu_dual_q2_runner_layer47
+             COMMAND native_q2_pool_hit_parity "${STRATA_XENO_Q2_GGUF}" 47 361 1107 --runner)
     set_tests_properties(gpu_4070_q2_parity_layer0 gpu_4070_q2_parity_layer47
                          PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
     set_tests_properties(gpu_dual_q2_parity_layer0 gpu_dual_q2_parity_layer47
+                         gpu_dual_q2_runner_layer0 gpu_dual_q2_runner_layer47
                          PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1,0")
   endif()
   endif()

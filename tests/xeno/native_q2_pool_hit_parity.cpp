@@ -2,6 +2,7 @@
 // Uses one GGUF expert and one deterministic activation, so placement is the only variable.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/secondary_arena.hpp"
+#include "strata/core/secondary_runner.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -28,14 +29,15 @@ static void ck(cudaError_t e, const char* at) {
 
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 6) {
-        std::fprintf(stderr, "usage: native_q2_pool_hit_parity <q2_0-first-shard.gguf> [layer] [expert] [seed] [input.bin|--secondary]\n");
+        std::fprintf(stderr, "usage: native_q2_pool_hit_parity <q2_0-first-shard.gguf> [layer] [expert] [seed] [input.bin|--secondary|--runner]\n");
         return 2;
     }
     constexpr int H = cpu::H, FF = cpu::FF, ENTRIES = 3;
     const int L = argc > 2 ? std::atoi(argv[2]) : 0;
     const int E = argc > 3 ? std::atoi(argv[3]) : 7;
     const int seed = argc > 4 ? std::atoi(argv[4]) : 1107;
-    const bool secondary = argc > 5 && std::strcmp(argv[5], "--secondary") == 0;
+    const bool runner_mode = argc > 5 && std::strcmp(argv[5], "--runner") == 0;
+    const bool secondary = runner_mode || (argc > 5 && std::strcmp(argv[5], "--secondary") == 0);
     if (secondary) {
         ck(cudaSetDevice(0), "primary device");
         ck(cudaFree(nullptr), "primary context");
@@ -246,9 +248,37 @@ int main(int argc, char** argv) {
     }
     std::printf("layer %d expert %d: differing %d/%d, relative L1 %.9g, max abs %.9g\n", L, E, different, ENTRIES * H,
                 l1 / (reference + 1e-30), max_abs);
+    int runner_different = 0;
+    if (runner_mode) {
+        strata::core::SecondaryRunner runner;
+        std::string runner_err;
+        const int32_t selected_slots[ENTRIES] = {0, 0, 1};
+        std::vector<float> runner_out((size_t) ENTRIES * H, 0.f);
+        if (!runner.init(ENTRIES, ENTRIES, H, FF, runner_err) ||
+            !runner.launch(layout, secondary_arena, x.data(), selected_slots, ENTRIES, 1, runner_err) ||
+            !runner.finish(runner_out.data(), runner_err)) {
+            std::fprintf(stderr, "secondary runner: %s\n", runner_err.c_str());
+            return 2;
+        }
+        for (int i = 0; i < ENTRIES * H; ++i) runner_different += runner_out[(size_t) i] != pool_out[(size_t) i];
+        const int32_t partial_slots[ENTRIES] = {0, -1, 1};
+        std::vector<float> partial((size_t) ENTRIES * H, 123.f);
+        if (!runner.launch(layout, secondary_arena, x.data(), partial_slots, ENTRIES, 1, runner_err) ||
+            !runner.finish(partial.data(), runner_err)) {
+            std::fprintf(stderr, "secondary runner partial: %s\n", runner_err.c_str());
+            return 2;
+        }
+        for (int i = 0; i < ENTRIES * H; ++i)
+            runner_different += partial[(size_t) i] != (i / H == 1 ? 123.f : pool_out[(size_t) i]);
+        if (runner.free_checks() == 0) ++runner_different;
+        std::printf("secondary runner: differing %d/%d across full and partial routing, served %llu entries in %llu groups\n",
+                    runner_different, 2 * ENTRIES * H, (unsigned long long) runner.served_entries(),
+                    (unsigned long long) runner.served_groups());
+    }
     if (!secondary) cudaFree(dblob);
     cudaFree(dx); cudaFree(dxq); cudaFree(dx_scales); cudaFree(scratch); cudaFree(dout);
     cudaFree(dptr); cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok); cudaFree(dgate);
     cudaStreamDestroy(stream);
-    return (different_codes || different_scales || gate_different || up_different || hidden_different || different) ? 1 : 0;
+    return (different_codes || different_scales || gate_different || up_different || hidden_different ||
+            different || runner_different) ? 1 : 0;
 }

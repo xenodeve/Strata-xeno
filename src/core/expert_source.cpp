@@ -1,5 +1,7 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/secondary_runner.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "strata/core/pinned.hpp"
@@ -366,6 +368,41 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0 : -1;
         }
     }
+    bool secondary_claims = false;
+    int32_t secondary_slots[128];
+    if (d.secondary_runner != nullptr) {
+        if (!native || d.secondary_weights == nullptr || d.secondary_res == nullptr || n > 128) {
+            d.failed = true;
+            d.fail = "secondary expert dispatch is not configured for this verify window";
+            d.fail_layer = d.layers;
+            return;
+        }
+        for (int64_t i = 0; i < n; ++i) {
+            secondary_slots[i] = -1;
+            const int32_t e = ids[i];
+            if (kind[i] < 0 && e >= 0 && e < d.n_expert) {
+                const int32_t slot = d.secondary_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
+                if (slot >= 0) {
+                    secondary_slots[i] = slot;
+                    kind[i] = 2;
+                    secondary_claims = true;
+                }
+            }
+        }
+        if (secondary_claims) {
+            const auto& f = lay.fmt[(size_t) d.layers];
+            const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            std::string secondary_err;
+            if (!d.secondary_runner->launch(L, *d.secondary_weights, x_f, secondary_slots,
+                                             (int) n_tok, (int) k, secondary_err)) {
+                d.failed = true;
+                d.secondary_fail = "secondary expert launch: " + secondary_err;
+                d.fail = d.secondary_fail.c_str();
+                d.fail_layer = d.layers;
+                return;
+            }
+        }
+    }
     const auto c1 = std::chrono::steady_clock::now();
     if (native && lay.fmt[(size_t) d.layers].gu_type == 42)   // a native Q2_0 pack: the Q2_0 kernels' activations
         for (int64_t t = 0; t < n_tok; ++t) act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
@@ -421,6 +458,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("run", njobs);
     if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    if (secondary_claims) {
+        std::string secondary_err;
+        if (!d.secondary_runner->finish(out, secondary_err)) {
+            d.failed = true;
+            d.secondary_fail = "secondary expert completion: " + secondary_err;
+            d.fail = d.secondary_fail.c_str();
+            d.fail_layer = d.layers;
+            return;
+        }
+        d.secondary_entries = (int64_t) d.secondary_runner->served_entries();
+        d.secondary_groups = (int64_t) d.secondary_runner->served_groups();
+    }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
