@@ -1,5 +1,6 @@
 // src/core/pinned.cu - P2.S1: the pinned host arena and the parallel expert load.
 #include "strata/core/pinned.hpp"
+#include <limits>
 #include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -194,6 +195,48 @@ PinnedArena::~PinnedArena() {
         release(base, capacity);
         base = nullptr;
     }
+}
+
+bool PinnedArena::decommit_interior(uint64_t offset, uint64_t bytes, uint64_t& released, std::string& err) {
+    released = 0;
+    if (base == nullptr || backing != PageBacking::NormalPages || registered_bytes != 0 ||
+        locked_bytes != 0 || bytes == 0 || offset > capacity || bytes > capacity - offset) {
+        err = "host page release needs a pageable, unlocked arena and a valid byte range";
+        return false;
+    }
+#ifdef _WIN32
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const uintptr_t page = (uintptr_t) info.dwPageSize;
+    const uintptr_t origin = (uintptr_t) base;
+    if (page == 0 || (page & (page - 1)) != 0 ||
+        offset > (std::numeric_limits<uintptr_t>::max)() - origin ||
+        bytes > (std::numeric_limits<uintptr_t>::max)() - origin - offset) {
+        err = "host page release address arithmetic overflow";
+        return false;
+    }
+    const uintptr_t first = origin + (uintptr_t) offset;
+    const uintptr_t last = first + (uintptr_t) bytes;
+    if (first > (std::numeric_limits<uintptr_t>::max)() - (page - 1)) {
+        err = "host page release alignment overflow";
+        return false;
+    }
+    const uintptr_t begin = (first + page - 1) & ~(page - 1);
+    const uintptr_t end = last & ~(page - 1);
+    if (end > begin) {
+        if (!VirtualFree((void*) begin, (SIZE_T) (end - begin), MEM_DECOMMIT)) {
+            err = "VirtualFree(MEM_DECOMMIT) failed with Windows error " +
+                  std::to_string((unsigned long long) GetLastError());
+            return false;
+        }
+        released = (uint64_t) (end - begin);
+    }
+    err.clear();
+    return true;
+#else
+    err = "exclusive host page release is Windows-only in this slice";
+    return false;
+#endif
 }
 
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,

@@ -46,6 +46,12 @@
 #include "strata/program/logits_selection.hpp"
 
 #include <cuda_runtime.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 #include <chrono>
 #include <algorithm>
@@ -165,6 +171,7 @@ struct Options {
     int expert_cache = 0;
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     bool secondary_stage_only = false; ///< A/B arm before routing work to device 1
+    bool exclusive_primary_experts = false; ///< Phase 4 static GPU ownership; host pages decommitted after fill
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -343,6 +350,8 @@ void usage() {
                  "  --cache-cpu-only     Diagnostic: prefill normally, then route verify experts to CPU.\n"
                  "  --secondary-expert-mib N  Phase 3 Q2_0 tier on RTX 4070 SUPER;\n"
                      "  --secondary-stage-only  Stage/verify weights, but compute all experts as before.\n"
+                     "  --exclusive-primary-experts  Phase 4 static primary ownership; decommit host copies.\n"
+                     "                               Needs profile, --no-prefill-borrow, --adapt-swaps 0.\n"
                  "                            keep >=2560 MiB free, requires --pcie-frac 0.\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
@@ -456,6 +465,16 @@ void mem_mark(const char* where) {
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
     std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
+}
+
+uint64_t private_commit_bytes() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof counters;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*) &counters,
+                             sizeof counters)) return (uint64_t) counters.PrivateUsage;
+#endif
+    return 0;
 }
 
 int argmax(const std::vector<float>& v) {
@@ -648,6 +667,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--secondary-stage-only") o.secondary_stage_only = true;
+        else if (a == "--exclusive-primary-experts") o.exclusive_primary_experts = true;
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--prefill") o.prefill_chunk = std::atoll(next("--prefill"));
@@ -829,6 +849,15 @@ int main(int argc, char** argv) {
                           (!secondary_q2 || o.pcie_frac != 0.0 || o.no_pool || o.spec < 2)))) {
         std::fprintf(stderr, "strata generate: secondary compute needs native Q2_0, spec >=2, "
                              "expert pool and --pcie-frac 0 until combined routing is validated\n");
+        return 2;
+    }
+    if (o.exclusive_primary_experts &&
+        (!secondary_q2 || o.mmap_experts || o.cache_cpu_only || o.no_pool ||
+         !o.no_prefill_borrow || o.adapt_swaps != 0 || o.pcie_frac != 0.0 ||
+         o.expert_profile.empty())) {
+        std::fprintf(stderr, "strata generate: --exclusive-primary-experts requires native Q2_0, "
+                             "a profile, --no-prefill-borrow, --adapt-swaps 0, --pcie-frac 0 "
+                             "and an enabled CPU pool; it excludes mmap/forced-CPU modes\n");
         return 2;
     }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
@@ -1123,7 +1152,7 @@ int main(int argc, char** argv) {
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
         const char* pin_override = std::getenv("STRATA_ARENA_PIN");
-        const bool pin_for_cuda = o.secondary_expert_mib == 0 &&
+        const bool pin_for_cuda = o.secondary_expert_mib == 0 && !o.exclusive_primary_experts &&
             !(pin_override != nullptr && std::strcmp(pin_override, "0") == 0);
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_for_cuda)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -1366,6 +1395,33 @@ if (o.expert_cache_per_layer) {
                      (double) secondary_arena.bytes() / 1073741824.0,
                      (double) secondary_arena.lower_free_after() / 1073741824.0,
                      secondary_compute ? "SECONDARY COMPUTE" : "STAGING ONLY, no secondary compute");
+    }
+
+    if (o.exclusive_primary_experts) {
+        if (prefilled <= 0 || xcache.slots() <= 0) {
+            std::fprintf(stderr, "strata generate: exclusive primary tier has no verified resident experts\n");
+            return 2;
+        }
+        const uint64_t private_before = private_commit_bytes();
+        int64_t owned = 0;
+        for (const auto& [layer, expert] : profile) {
+            if (xcache.slot_of(layer, expert) < 0) continue;
+            if (!arena_src.release_host_copy(layer, expert, err)) {
+                std::fprintf(stderr, "strata generate: exclusive primary (%d,%d): %s\n",
+                             layer, expert, err.c_str());
+                return 1;
+            }
+            ++owned;
+        }
+        const uint64_t private_after = private_commit_bytes();
+        std::fprintf(stderr, "strata generate: exclusive primary owns %lld experts; "
+                     "decommitted %.2f GiB of host pages; private commit %.2f -> %.2f GiB "
+                     "(delta %.2f GiB)\n",
+                     (long long) owned,
+                     (double) arena_src.released_host_bytes() / 1073741824.0,
+                     (double) private_before / 1073741824.0,
+                     (double) private_after / 1073741824.0,
+                     ((double) private_before - (double) private_after) / 1073741824.0);
     }
 
     Drive drive;

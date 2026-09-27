@@ -721,6 +721,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     }
     arena_ = a;
     base_ = a->data();
+    exclusive_.assign((size_t) (n_layers * n_expert), 0);
+    released_host_bytes_ = 0;
     pinned_bytes_ = a->registered_bytes;
     // plan v0.3 P6: device aliases of the mapped registration, for the PCIe share of the misses
     dev_slice_.clear();
@@ -751,12 +753,37 @@ void ArenaExpertSource::close() {
         arena_ = nullptr;
     }
     base_ = nullptr;
+    exclusive_.clear();
+    released_host_bytes_ = 0;
     blobs_ = 0;
     n_expert_ = 0;
 }
 
+bool ArenaExpertSource::release_host_copy(int64_t layer, int64_t expert, std::string& err) {
+    if (base_ == nullptr || arena_ == nullptr || layer < 0 || expert < 0 ||
+        expert >= n_expert_ || layer >= blobs_ / n_expert_) {
+        err = "exclusive host release needs a loaded, in-range expert";
+        return false;
+    }
+    const size_t index = (size_t) (layer * n_expert_ + expert);
+    if (index >= exclusive_.size() || exclusive_[index]) {
+        err = "exclusive host expert is already GPU-owned";
+        return false;
+    }
+    const auto& layout = strata::kernels::cpu::expert_layout();
+    uint64_t decommitted = 0;
+    if (!((PinnedArena*) arena_)->decommit_interior(layout.blob_offset(layer, expert),
+                                                    layout.blob_bytes(layer), decommitted, err)) return false;
+    exclusive_[index] = 1; // publish ownership only after the Windows decommit succeeds
+    released_host_bytes_ += decommitted;
+    err.clear();
+    return true;
+}
+
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    if ((size_t) (layer * n_expert_ + expert) < exclusive_.size() &&
+        exclusive_[(size_t) (layer * n_expert_ + expert)]) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
     return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
 }
@@ -775,6 +802,7 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
+    if ((size_t) idx < exclusive_.size() && exclusive_[(size_t) idx]) return nullptr;
     ++reads_;
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.

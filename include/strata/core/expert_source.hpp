@@ -330,6 +330,9 @@ public:
     /// rate, because those are the two numbers that say whether the arena is the one that was asked for.
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
               std::string& err, bool pin_for_cuda = true);
+    /// Caller must first fill and verify this pair in the primary GPU cache.
+    bool release_host_copy(int64_t layer, int64_t expert, std::string& err);
+    uint64_t released_host_bytes() const { return released_host_bytes_; }
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's shard 1.
     void set_gguf(const std::string& shard1) { gguf_ = shard1; }
     void close();
@@ -348,6 +351,8 @@ public:
 
 private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned
+    std::vector<uint8_t> exclusive_;
+    uint64_t released_host_bytes_ = 0;
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)
     uint64_t slice_bytes_ = 0;
     const uint8_t* base_ = nullptr;
