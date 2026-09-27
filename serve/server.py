@@ -348,9 +348,13 @@ class Service:
                 raise ValueError("the prompt and its images do not match")
             ids = out
             combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
-            with open(combined, "wb") as f:
-                for path, _ in encoded:
-                    f.write(path.read_bytes())
+            try:
+                with open(combined, "wb") as f:
+                    for path, _ in encoded:
+                        f.write(path.read_bytes())
+            except Exception:
+                combined.unlink(missing_ok=True)
+                raise
             self.embeddings.path = combined
         if max_new is not None and len(ids) + max_new > self.engine.max_context:
             raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
@@ -692,14 +696,14 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif self.path.rstrip("/") == "/v1/messages/count_tokens":
                     messages, tools, kw = anthropic_to_messages(req)
-                    ids, _ = svc.prepare(messages, tools, kw, None)
                     try:
-                        self._json(200, {"input_tokens": len(ids)})
+                        ids, _ = svc.prepare(messages, tools, kw, None)
                     finally:
                         path = getattr(svc.embeddings, "path", None)
                         if path is not None:
                             Path(path).unlink(missing_ok=True)
                         svc.embeddings.path = None
+                    self._json(200, {"input_tokens": len(ids)})
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:

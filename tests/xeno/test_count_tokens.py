@@ -7,7 +7,20 @@ import unittest
 
 from serve.frontend import ChatTemplate, anthropic_to_messages
 from serve.server import IMAGE_PAD, ByteTokenizer, MockEngine, Service, serve
-from tools.strata_tokenizer import Tokenizer
+
+
+class ImageTokenizer(ByteTokenizer):
+    image_token = 1_000_000
+
+    def encode(self, text, parse_special=False):
+        if not parse_special or IMAGE_PAD not in text:
+            return super().encode(text, parse_special=parse_special)
+        parts = text.split(IMAGE_PAD)
+        ids = []
+        for i, part in enumerate(parts):
+            ids.extend(super().encode(part, parse_special=parse_special))
+            if i + 1 < len(parts): ids.append(self.image_token)
+        return ids
 
 
 class CountTokensTest(unittest.TestCase):
@@ -46,13 +59,8 @@ class CountTokensTest(unittest.TestCase):
             def encode(self, source):
                 return self.source, 3
 
-        token_dir = Path(r'D:\Github\Strata\packs\q2_0\tokenizer')
-        vocab = json.loads((token_dir / 'vocab.json').read_text(encoding='utf-8'))
-        tokens = [None] * len(vocab)
-        for token, index in vocab.items(): tokens[index] = token
-        tokenizer = Tokenizer(tokens, (token_dir / 'merges.txt').read_text(encoding='utf-8').split('\n'),
-                              json.loads((token_dir / 'token_type.json').read_text()))
-        template = ChatTemplate(token_dir / 'chat_template.jinja')
+        tokenizer = ImageTokenizer()
+        template = self.template
         body = {'model': 'qwen3.8-flash-next', 'messages': [{'role': 'user', 'content': [
             {'type': 'text', 'text': 'What is this?'},
             {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': 'AA=='}}
@@ -74,6 +82,23 @@ class CountTokensTest(unittest.TestCase):
                 self.assertEqual(list(Path(temp).glob('req-*.sve')), [])
             finally:
                 http.shutdown(); http.server_close()
+
+    def test_failed_image_staging_removes_partial_request_file(self):
+        class BrokenVision:
+            def __init__(self, directory): self.dir = directory
+            def encode(self, source): return self.dir / 'missing.sve', 3
+
+        body = {'messages': [{'role': 'user', 'content': [
+            {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': 'AA=='}}
+        ]}]}
+        messages, tools, kwargs = anthropic_to_messages(body)
+        with tempfile.TemporaryDirectory() as temp:
+            tokenizer = ImageTokenizer()
+            service = Service(MockEngine(tokenizer, 'Hi.', max_context=8), tokenizer, self.template,
+                              vision=BrokenVision(Path(temp)))
+            with self.assertRaises(FileNotFoundError):
+                service.prepare(messages, tools, kwargs, None)
+            self.assertEqual(list(Path(temp).glob('req-*.sve')), [])
 
 
 if __name__ == '__main__':
