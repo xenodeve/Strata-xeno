@@ -2,6 +2,7 @@
 // Uses one GGUF expert and one deterministic activation, so placement is the only variable.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/secondary_arena.hpp"
+#include "strata/core/secondary_budget.hpp"
 #include "strata/core/secondary_runner.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -11,14 +12,24 @@
 #include <cuda_fp16.h>
 
 #include <cmath>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace cpu = strata::kernels::cpu;
+static bool low_free_reading(int, uint64_t& lower, std::string&, void*) {
+    lower = strata::core::kSecondaryReserveBytes - 1;
+    return true;
+}
+static void record_low_reserve(const char*, void* context) {
+    static_cast<std::atomic<bool>*>(context)->store(true);
+}
 
 static void ck(cudaError_t e, const char* at) {
     if (e != cudaSuccess) {
@@ -29,14 +40,15 @@ static void ck(cudaError_t e, const char* at) {
 
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 6) {
-        std::fprintf(stderr, "usage: native_q2_pool_hit_parity <q2_0-first-shard.gguf> [layer] [expert] [seed] [input.bin|--secondary|--runner]\n");
+        std::fprintf(stderr, "usage: native_q2_pool_hit_parity <q2_0-first-shard.gguf> [layer] [expert] [seed] [input.bin|--secondary|--runner|--runner-monitor-abort]\n");
         return 2;
     }
     constexpr int H = cpu::H, FF = cpu::FF, ENTRIES = 3;
     const int L = argc > 2 ? std::atoi(argv[2]) : 0;
     const int E = argc > 3 ? std::atoi(argv[3]) : 7;
     const int seed = argc > 4 ? std::atoi(argv[4]) : 1107;
-    const bool runner_mode = argc > 5 && std::strcmp(argv[5], "--runner") == 0;
+    const bool monitor_abort_mode = argc > 5 && std::strcmp(argv[5], "--runner-monitor-abort") == 0;
+    const bool runner_mode = monitor_abort_mode || (argc > 5 && std::strcmp(argv[5], "--runner") == 0);
     const bool secondary = runner_mode || (argc > 5 && std::strcmp(argv[5], "--secondary") == 0);
     if (secondary) {
         ck(cudaSetDevice(0), "primary device");
@@ -271,6 +283,34 @@ int main(int argc, char** argv) {
         for (int i = 0; i < ENTRIES * H; ++i)
             runner_different += partial[(size_t) i] != (i / H == 1 ? 123.f : pool_out[(size_t) i]);
         if (runner.free_checks() == 0) ++runner_different;
+        const uint64_t checks_before_monitor = runner.free_checks();
+        if (!runner.start_monitor(10, runner_err)) {
+            std::fprintf(stderr, "secondary reserve monitor: %s\n", runner_err.c_str());
+            return 2;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(35));
+        runner.stop_monitor();
+        if (runner.free_checks() <= checks_before_monitor) ++runner_different;
+        if (runner.min_free_bytes() < strata::core::kSecondaryReserveBytes) ++runner_different;
+        if (monitor_abort_mode) {
+            if (!runner.start_monitor(10, runner_err, low_free_reading)) {
+                std::fprintf(stderr, "secondary abort monitor setup: %s\n", runner_err.c_str());
+                return 2;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::fprintf(stderr, "secondary abort monitor did not exit\n");
+            return 2;
+        }
+        std::atomic<bool> low_seen{false};
+        if (!runner.start_monitor(10, runner_err, low_free_reading, record_low_reserve, &low_seen)) {
+            std::fprintf(stderr, "secondary low-reserve monitor: %s\n", runner_err.c_str());
+            return 2;
+        }
+        for (int wait = 0; wait < 100 && !low_seen.load(); ++wait)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        runner.stop_monitor();
+        if (!low_seen.load()) ++runner_different;
+        if (runner.min_free_bytes() >= strata::core::kSecondaryReserveBytes) ++runner_different;
         std::printf("secondary runner: differing %d/%d across full and partial routing, served %llu entries in %llu groups\n",
                     runner_different, 2 * ENTRIES * H, (unsigned long long) runner.served_entries(),
                     (unsigned long long) runner.served_groups());

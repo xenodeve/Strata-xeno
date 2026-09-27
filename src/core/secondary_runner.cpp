@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 
 namespace strata::core {
 namespace {
@@ -24,12 +25,14 @@ bool cuda_ok(cudaError_t result, const char* operation, std::string& err) {
     return false;
 }
 
-bool check_display_free(std::string& err) {
+bool check_display_free(std::string& err, uint64_t* lower_out = nullptr) {
     size_t cuda_free = 0, total = 0;
     if (!cuda_ok(cudaMemGetInfo(&cuda_free, &total), "secondary runner cudaMemGetInfo", err)) return false;
     uint64_t nvml_free = 0;
     if (!secondary_nvml_free_bytes(1, nvml_free, err)) return false;
-    if (secondary_effective_free((uint64_t) cuda_free, nvml_free) < kSecondaryReserveBytes) {
+    const uint64_t lower = secondary_effective_free((uint64_t) cuda_free, nvml_free);
+    if (lower_out) *lower_out = lower;
+    if (lower < kSecondaryReserveBytes) {
         err = "secondary runner: display VRAM below 2560 MiB reserve";
         return false;
     }
@@ -39,6 +42,11 @@ bool check_display_free(std::string& err) {
 } // namespace
 
 SecondaryRunner::~SecondaryRunner() { close(); }
+
+void SecondaryRunner::record_free(uint64_t bytes) {
+    uint64_t old = min_free_bytes_.load();
+    while (bytes < old && !min_free_bytes_.compare_exchange_weak(old, bytes)) {}
+}
 
 bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff, std::string& err) {
     if (max_tokens <= 0 || max_tokens > 16 || max_entries <= 0 || max_entries > 128 ||
@@ -103,7 +111,9 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     tok_.reserve((size_t) max_entries);
     selected_rows_.reserve((size_t) max_entries);
     group_slots_.reserve((size_t) max_entries);
-    if (!check_display_free(err)) return false;
+    uint64_t lower = 0;
+    if (!check_display_free(err, &lower)) return false;
+    record_free(lower);
     ++free_checks_;
     last_free_check_ = std::chrono::steady_clock::now();
     err.clear();
@@ -114,7 +124,7 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
                              const float* x, const int32_t* selected_slots, int n_tokens, int k,
                              std::string& err) {
     if (stream_ == nullptr || pending_ || x == nullptr || selected_slots == nullptr ||
-        n_tokens <= 0 || n_tokens > max_tokens_ || k <= 0 || n_tokens * k > max_entries_ ||
+        n_tokens <= 0 || n_tokens > max_tokens_ || k <= 0 || k > max_entries_ / n_tokens ||
         layout.n_embd != n_embd_ || layout.n_ff != n_ff_ || layout.gu_type != 42 || layout.d_type != 42) {
         err = "secondary runner: invalid launch geometry or pending work";
         return false;
@@ -149,22 +159,29 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
         !cuda_ok(cudaSetDevice(1), "runner select device", err)) return false;
     const RestoreDevice restore{previous};
     const auto now = std::chrono::steady_clock::now();
-    if (now - last_free_check_ >= std::chrono::milliseconds(250)) {
-        if (!check_display_free(err)) return false;
+    if (!monitor_running_.load() && now - last_free_check_ >= std::chrono::milliseconds(250)) {
+        uint64_t lower = 0;
+        if (!check_display_free(err, &lower)) return false;
+        record_free(lower);
         ++free_checks_;
         last_free_check_ = now;
     }
     cudaStream_t stream = (cudaStream_t) stream_;
-    const int32_t groups = (int32_t) group_slots_.size();
-    if (!cuda_ok(cudaMemcpy(device_ptr_, ptr_.data(), ptr_.size() * sizeof(ptr_[0]), cudaMemcpyHostToDevice),
+    host_count_ = (int32_t) group_slots_.size();
+    if (!cuda_ok(cudaMemcpyAsync(device_ptr_, ptr_.data(), ptr_.size() * sizeof(ptr_[0]),
+                                  cudaMemcpyHostToDevice, stream),
                  "runner group pointers", err) ||
-        !cuda_ok(cudaMemcpy(device_start_, start_.data(), start_.size() * sizeof(start_[0]), cudaMemcpyHostToDevice),
+        !cuda_ok(cudaMemcpyAsync(device_start_, start_.data(), start_.size() * sizeof(start_[0]),
+                                  cudaMemcpyHostToDevice, stream),
                  "runner group starts", err) ||
-        !cuda_ok(cudaMemcpy(device_count_, &groups, sizeof groups, cudaMemcpyHostToDevice),
+        !cuda_ok(cudaMemcpyAsync(device_count_, &host_count_, sizeof host_count_,
+                                  cudaMemcpyHostToDevice, stream),
                  "runner group count", err) ||
-        !cuda_ok(cudaMemcpy(device_dst_, dst_.data(), dst_.size() * sizeof(dst_[0]), cudaMemcpyHostToDevice),
+        !cuda_ok(cudaMemcpyAsync(device_dst_, dst_.data(), dst_.size() * sizeof(dst_[0]),
+                                  cudaMemcpyHostToDevice, stream),
                  "runner destinations", err) ||
-        !cuda_ok(cudaMemcpy(device_tok_, tok_.data(), tok_.size() * sizeof(tok_[0]), cudaMemcpyHostToDevice),
+        !cuda_ok(cudaMemcpyAsync(device_tok_, tok_.data(), tok_.size() * sizeof(tok_[0]),
+                                  cudaMemcpyHostToDevice, stream),
                  "runner tokens", err) ||
         !cuda_ok(cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float),
                                  cudaMemcpyHostToDevice, stream), "runner activation H2D", err) ||
@@ -172,7 +189,7 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
                  "runner clear partials", err)) return false;
     kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
     kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
-                                   groups, (int) dst_.size(), device_xq_, device_scratch_, device_out_, stream,
+                                   host_count_, (int) dst_.size(), device_xq_, device_scratch_, device_out_, stream,
                                    device_scales_);
     if (!cuda_ok(cudaMemcpyAsync(host_out_, device_out_, (size_t) entries * n_embd_ * sizeof(float),
                                  cudaMemcpyDeviceToHost, stream), "runner partial D2H", err) ||
@@ -200,7 +217,78 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
     return true;
 }
 
+bool SecondaryRunner::start_monitor(int interval_ms, std::string& err,
+                                    SecondaryArena::FreeReader reader,
+                                    BreachHandler on_breach, void* context) {
+    if (stream_ == nullptr || monitor_.joinable() || interval_ms < 10 || interval_ms > 1000) {
+        err = "secondary monitor needs an initialized runner and 10..1000 ms interval";
+        return false;
+    }
+    int previous = -1;
+    if (!cuda_ok(cudaGetDevice(&previous), "monitor current device", err) ||
+        !cuda_ok(cudaSetDevice(1), "monitor select device", err)) return false;
+    uint64_t lower = 0;
+    const bool safe = check_display_free(err, &lower);
+    const cudaError_t restored = cudaSetDevice(previous);
+    if (!safe || !cuda_ok(restored, "monitor restore device", err)) return false;
+    record_free(lower);
+    ++free_checks_;
+    monitor_stop_.store(false);
+    monitor_running_.store(true);
+    try {
+        monitor_ = std::thread([this, interval_ms, reader, on_breach, context] {
+            const cudaError_t selected = cudaSetDevice(1);
+            if (selected != cudaSuccess) {
+                std::fprintf(stderr, "secondary monitor cannot select display GPU: %s\n",
+                             cudaGetErrorString(selected));
+                std::fflush(stderr);
+                std::_Exit(3);
+            }
+            while (!monitor_stop_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+                if (monitor_stop_.load()) break;
+                std::string problem;
+                uint64_t lower = 0;
+                bool safe = false;
+                if (reader != nullptr) {
+                    safe = reader(1, lower, problem, context) && lower >= kSecondaryReserveBytes;
+                    if (!safe && problem.empty())
+                        problem = "injected display free " + std::to_string(lower) + " B below 2560 MiB";
+                } else {
+                    safe = check_display_free(problem, &lower);
+                }
+                record_free(lower);
+                if (!safe) {
+                    if (on_breach != nullptr) {
+                        on_breach(problem.c_str(), context);
+                        monitor_stop_.store(true);
+                        break;
+                    }
+                    std::fprintf(stderr, "secondary display VRAM reserve failed: %s; terminating to release tier\n",
+                                 problem.c_str());
+                    std::fflush(stderr);
+                    std::_Exit(3);
+                }
+                ++free_checks_;
+            }
+        });
+    } catch (const std::exception& e) {
+        monitor_running_.store(false);
+        err = std::string("secondary monitor thread: ") + e.what();
+        return false;
+    }
+    err.clear();
+    return true;
+}
+
+void SecondaryRunner::stop_monitor() {
+    monitor_stop_.store(true);
+    if (monitor_.joinable()) monitor_.join();
+    monitor_running_.store(false);
+}
+
 void SecondaryRunner::close() {
+    stop_monitor();
     if (workspace_.slots() == 0 && stream_ == nullptr && done_ == nullptr &&
         host_x_ == nullptr && host_out_ == nullptr) return;
     int previous = -1;

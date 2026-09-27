@@ -1332,8 +1332,7 @@ if (o.expert_cache_per_layer) {
         bytes.reserve(candidates.size());
         for (const auto& pair : candidates) bytes.push_back(pair.bytes);
         const bool secondary_compute = !o.secondary_stage_only && !o.cache_cpu_only;
-        if (secondary_compute &&
-            !secondary_runner.init(strata::kernels::cpu::MAXT,
+        if (!secondary_runner.init(strata::kernels::cpu::MAXT,
                                    (int) (strata::kernels::cpu::MAXT * K),
                                    (int) g.n_embd, (int) g.n_ff, err)) {
             std::fprintf(stderr, "strata generate: secondary runner: %s\n", err.c_str());
@@ -1356,6 +1355,10 @@ if (o.expert_cache_per_layer) {
                              pair.layer, pair.expert, (unsigned long long) slot, err.c_str());
                 return 1;
             }
+        }
+        if (!secondary_runner.start_monitor(100, err)) {
+            std::fprintf(stderr, "strata generate: secondary reserve monitor: %s\n", err.c_str());
+            return 1;
         }
         std::fprintf(stderr, "strata generate: staged %llu next-ranked secondary experts (%.2f GiB); "
                      "4070 SUPER lower free %.2f GiB (floor 2.5 GiB); %s\n",
@@ -3183,8 +3186,9 @@ if (o.expert_cache_per_layer) {
                             (long long) drive.d.secondary_entries, (long long) drive.d.secondary_groups,
                             (int) (o.secondary_stage_only || o.cache_cpu_only));
                             if (o.secondary_expert_mib > 0)
-                                std::printf("%-24s %llu samples\n", "secondary reserve",
-                                            (unsigned long long) secondary_runner.free_checks());
+                                std::printf("%-24s %llu samples, minimum %.2f GiB free\n", "secondary reserve",
+                                            (unsigned long long) secondary_runner.free_checks(),
+                            (double) secondary_runner.min_free_bytes() / 1073741824.0);
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
@@ -3341,8 +3345,9 @@ if (o.expert_cache_per_layer) {
                     (long long) drive.d.secondary_groups,
                     (int) (o.secondary_stage_only || o.cache_cpu_only));
                     if (o.secondary_expert_mib > 0)
-                        std::printf("%-24s %llu samples\n", "secondary reserve",
-                                    (unsigned long long) secondary_runner.free_checks());
+                        std::printf("%-24s %llu samples, minimum %.2f GiB free\n", "secondary reserve",
+                                    (unsigned long long) secondary_runner.free_checks(),
+                            (double) secondary_runner.min_free_bytes() / 1073741824.0);
     if (tgraph.captured && tgraph.calls > 0) {
             const double per = (double) tgraph.calls;
             std::printf("%-24s wait for rings %.3f  pool %.3f ms/token  (%lld flushes over %lld positions)\n",

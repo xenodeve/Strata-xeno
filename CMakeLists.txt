@@ -550,6 +550,7 @@ if(STRATA_NATIVE_EXPERTS)
   target_include_directories(native_q2_pool_hit_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(native_q2_pool_hit_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact strata_secondary_compute CUDA::cudart)
   set(STRATA_XENO_Q2_GGUF "" CACHE FILEPATH "Optional local Q2_0 first shard for display-GPU parity tests")
+  set(STRATA_XENO_PYTHON "" CACHE FILEPATH "Optional local Python for monitor-exit integration test")
   if(WIN32 AND STRATA_BUILD_XENO_TESTS AND STRATA_XENO_Q2_GGUF)
     add_test(NAME gpu_4070_q2_parity_layer0
              COMMAND native_q2_pool_hit_parity "${STRATA_XENO_Q2_GGUF}" 0 7 -2)
@@ -568,6 +569,11 @@ if(STRATA_NATIVE_EXPERTS)
     set_tests_properties(gpu_dual_q2_parity_layer0 gpu_dual_q2_parity_layer47
                          gpu_dual_q2_runner_layer0 gpu_dual_q2_runner_layer47
                          PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1,0")
+    if(STRATA_XENO_PYTHON)
+      add_test(NAME gpu_dual_monitor_abort
+               COMMAND "${STRATA_XENO_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/xeno/check_monitor_abort.py"
+                       "$<TARGET_FILE:native_q2_pool_hit_parity>" "${STRATA_XENO_Q2_GGUF}")
+    endif()
   endif()
   endif()
 endif()
