@@ -8,6 +8,7 @@
 #include <immintrin.h>
 
 #include <cstdio>
+#include <utility>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -22,6 +23,7 @@ namespace strata::kernels::cpu {
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
 #if defined(_WIN32)
+    std::vector<std::pair<BYTE, int>> ranked;
     // Ask the OS rather than assuming a layout.  `hardware_concurrency()` returns LOGICAL processors, and on
     // every SMT machine half of them are siblings - pinning one worker to each of the first N would put two
     // workers on each physical core and halve the bandwidth the expert kernel is bound by.
@@ -40,12 +42,23 @@ std::vector<int> physical_cores(bool skip_first) {
                 if (e->Relationship == RelationProcessorCore) {
                     const GROUP_AFFINITY& g = e->Processor.GroupMask[0];
                     for (int bit = 0; bit < 64; ++bit)
-                        if (g.Mask & (1ull << bit)) { cores.push_back((int) (g.Group * 64 + bit)); break; }
+                    if (g.Mask & (1ull << bit)) {
+                        ranked.emplace_back(e->Processor.EfficiencyClass, (int) (g.Group * 64 + bit));
+                        break;
+                    }
                 }
                 p += e->Size;
             }
         }
     }
+    if (!ranked.empty()) {
+        // Windows assigns the greater EfficiencyClass to the faster core.
+        std::stable_sort(ranked.begin(), ranked.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (const auto& core : ranked) cores.push_back(core.second);
+    }
+    if (cores.empty())
+        for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back((int) i);
 #else
     cpu_set_t set;
     CPU_ZERO(&set);

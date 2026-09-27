@@ -706,8 +706,12 @@ int main(int argc, char** argv) {
     if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
-    else if (!strata::kernels::cpu::cpu_avx512_ok())
-        std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on AVX2\n");
+    else if (std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
+                         strata::kernels::cpu::expert_layout().fmt.end(),
+                         [](const auto& f) { return f.gu_type == 42 && f.d_type == 42; }))
+        std::fprintf(stderr, "strata generate: native Q2_0 expert rows use %s\n",
+                     strata::kernels::cpu::cpu_avx512_ok() ? "AVX-512" :
+                     strata::kernels::cpu::cpu_avxvnni_ok() ? "AVX-VNNI" : "AVX2");
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
