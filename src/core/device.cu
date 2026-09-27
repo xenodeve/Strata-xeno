@@ -26,7 +26,7 @@ __global__ void poison_kernel(float* p, uint64_t n_floats) {
 
 }  // namespace
 
-DeviceInfo device_info(int ordinal) {
+DeviceInfo device_info(int ordinal, bool allow_display_sm89) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
@@ -59,7 +59,7 @@ DeviceInfo device_info(int ordinal) {
     // The engine is written against sm_120.  Compiling for it is enforced by CMake; RUNNING on something else
     // is caught here, because a binary can be carried to a machine with an older card and would otherwise
     // silently take whatever path the driver chose.
-    if (d.cc_major != 12) {
+    if (d.cc_major != 12 && !(allow_display_sm89 && d.cc_major == 8 && d.cc_minor == 9)) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) +
                             "; Strata targets sm_120 (RTX 5000 series / Blackwell) only",
