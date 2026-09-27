@@ -63,8 +63,8 @@ def document_parts(block, vision = False):
 def _page_image(data, index):
     try:
         import pypdfium2 as pdfium
-        pdf = pdfium.PdfDocument(data)
-        img = pdf[index].render(scale = RENDER_SCALE).to_pil()
+        with pdfium.PdfDocument(data) as pdf:
+            img = pdf[index].render(scale = RENDER_SCALE).to_pil()
         buf = io.BytesIO()
         img.convert("RGB").save(buf, format = "PNG")
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()

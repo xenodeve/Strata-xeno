@@ -1,9 +1,10 @@
 """Anthropic event order and streamed tool arguments for Claude Code."""
 import threading
 import unittest
+from pathlib import Path
 
-from serve.frontend import Event, ToolCall
-from serve.server import anthropic_collect, anthropic_events
+from serve.frontend import ChatTemplate, Event, ToolCall
+from serve.server import ByteTokenizer, MockEngine, Service, anthropic_collect, anthropic_events
 
 
 class FakeService:
@@ -14,6 +15,29 @@ class FakeService:
 
 
 class StreamTest(unittest.TestCase):
+    def test_stop_sequence_spanning_token_deltas_is_excluded_and_reported(self):
+        tokenizer = ByteTokenizer()
+        template = ChatTemplate(Path(__file__).resolve().parents[2] / 'serve' / 'chat_template.jinja')
+        service = Service(MockEngine(tokenizer, 'Hello<STOP>tail'), tokenizer, template)
+        req = {'stop_sequences': ['<STOP>']}
+        result = anthropic_collect(anthropic_events(
+            service, req, [], False, None, 100, threading.Event()))
+        self.assertEqual(result['content'], [{'type': 'text', 'text': 'Hello'}])
+        self.assertEqual(result['stop_reason'], 'stop_sequence')
+        self.assertEqual(result['stop_sequence'], '<STOP>')
+        self.assertEqual(service.status['last_stop_reason'], 'stop_sequence')
+
+    def test_unmatched_stop_prefix_is_flushed(self):
+        tokenizer = ByteTokenizer()
+        template = ChatTemplate(Path(__file__).resolve().parents[2] / 'serve' / 'chat_template.jinja')
+        service = Service(MockEngine(tokenizer, 'Hello<STXtail'), tokenizer, template)
+        req = {'stop_sequences': ['<STOP>']}
+        events = list(anthropic_events(service, req, [], False, None, 100, threading.Event()))
+        streamed_text = ''.join(data['delta']['text'] for name, data in events
+                                if name == 'content_block_delta' and data['delta']['type'] == 'text_delta')
+        self.assertEqual(streamed_text, 'Hello<STXtail')
+        self.assertEqual(anthropic_collect(iter(events))['stop_reason'], 'end_turn')
+
     def test_thinking_closes_with_signature_before_text(self):
         service = FakeService([
             ('event', Event('reasoning', text='Let me think.')),

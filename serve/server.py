@@ -310,6 +310,34 @@ class Detokenizer:
         return delta
 
 
+class StopSequenceFilter:
+    """Hold only the suffix that might become a stop sequence on the next delta."""
+
+    def __init__(self, sequences):
+        if not isinstance(sequences, list) or any(not isinstance(s, str) or not s for s in sequences):
+            raise ValueError("stop_sequences must be a list of non-empty strings")
+        self.sequences = sequences
+        self.pending = ""
+
+    def feed(self, text):
+        self.pending += text
+        hits = [(self.pending.find(s), -len(s), s) for s in self.sequences if s in self.pending]
+        if hits:
+            pos, _, sequence = min(hits)
+            visible = self.pending[:pos]
+            self.pending = ""
+            return visible, sequence
+        hold = max((n for s in self.sequences for n in range(1, min(len(s), len(self.pending)) + 1)
+                    if self.pending.endswith(s[:n])), default=0)
+        visible = self.pending[:-hold] if hold else self.pending
+        self.pending = self.pending[-hold:] if hold else ""
+        return visible, None
+
+    def finish(self):
+        visible, self.pending = self.pending, ""
+        return visible
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None):
@@ -399,6 +427,8 @@ class Service:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         guard = LoopGuard()
+        stop_filter = StopSequenceFilter(sampling["stop_sequences"]) if sampling.get("stop_sequences") else None
+        matched_sequence = None
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         stop_detail = None
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
@@ -440,10 +470,23 @@ class Service:
                                     self.status["last_stop_reason"] = "loop"
                                 print(f"[strata] loop guard stopped generation: {guard.reason}", flush=True)
                                 break
+                            if ev.kind != "content" and stop_filter:
+                                tail = stop_filter.finish()
+                                if tail:
+                                    yield "event", Event("content", text=tail)
+                            if ev.kind == "content" and stop_filter:
+                                visible, matched_sequence = stop_filter.feed(ev.text)
+                                if visible:
+                                    yield "event", Event("content", text=visible)
+                                if matched_sequence:
+                                    cancel.set()
+                                    finish = "stop"
+                                    break
+                                continue
                             yield "event", ev
-                        if guard.reason:
+                        if guard.reason or matched_sequence:
                             break
-                        if cancel.is_set():
+                        if cancel.is_set() and not matched_sequence:
                             finish = "cancel"
                 finally:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
@@ -467,9 +510,31 @@ class Service:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                     self.status["busy"] = False
                     self.status["last_stop_reason"] = stop_detail or finish
-        for ev in parser.finish():
-            yield "event", ev
+        if not matched_sequence:
+            for ev in parser.finish():
+                if ev.kind == "content" and stop_filter:
+                    visible, matched_sequence = stop_filter.feed(ev.text)
+                    if visible:
+                        yield "event", Event("content", text=visible)
+                    if matched_sequence:
+                        break
+                else:
+                    if stop_filter:
+                        tail = stop_filter.finish()
+                        if tail:
+                            yield "event", Event("content", text=tail)
+                    yield "event", ev
+            if stop_filter and not matched_sequence:
+                tail = stop_filter.finish()
+                if tail:
+                    yield "event", Event("content", text=tail)
+        if matched_sequence:
+            finish = "stop"
+            with self.status_lock:
+                self.status["last_stop_reason"] = "stop_sequence"
         done = {"finish": finish, "completion_tokens": n}
+        if matched_sequence:
+            done["stop_sequence"] = matched_sequence
         if stop_detail:
             done["stop_detail"] = stop_detail
         yield "done", done
@@ -622,9 +687,11 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         else:
             if open_kind is not None:
                 yield from close()
-            stop = "tool_use" if used_tool and x["finish"] == "stop" else \
-                {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
-            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+            stop = "stop_sequence" if x.get("stop_sequence") else \
+                   "tool_use" if used_tool and x["finish"] == "stop" else \
+                   {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
+            yield "message_delta", {"type": "message_delta",
+                                    "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
                                     "usage": {"output_tokens": x["completion_tokens"]}}
             yield "message_stop", {"type": "message_stop"}
 
@@ -654,6 +721,7 @@ def anthropic_collect(events) -> dict:
             b["input"] = json.loads(b.pop("_json") or "{}")
         elif name == "message_delta":
             msg["stop_reason"] = e["delta"]["stop_reason"]
+            msg["stop_sequence"] = e["delta"]["stop_sequence"]
             msg["usage"]["output_tokens"] = e["usage"]["output_tokens"]
     msg["content"] = blocks
     return msg

@@ -29,3 +29,7 @@ The fixture is a two-page PDF with text on page 1 and a blank page 2. `pypdf` ex
 ## Engine liveness
 
 `/health` now returns HTTP 503 with `status: engine_exited` if the resident Strata child has exited. The previous 200 response concealed a dead engine. A mock dead-child HTTP test went red before the change and green after. This is a truthful health signal for an external launcher; automatic restart and alive-but-deaf detection are still open.
+
+## Anthropic stop sequences
+
+The server now detects a requested stop sequence across decoded content deltas, withholds the possible partial prefix, stops generation on a match, excludes the matched sequence and following text from the client, and reports `stop_reason: stop_sequence` plus the matched `stop_sequence` in streamed and collected Anthropic output. An unmatched prefix is flushed at completion. The red test exposed the original `Hello<STOP>tail` leak; the green test confirms `Hello` only and internal `last_stop_reason: stop_sequence`. This filter currently applies to content text; stop strings appearing only inside thinking or tool JSON need a separate protocol decision. The final full Python serving suite passed 23 tests.
