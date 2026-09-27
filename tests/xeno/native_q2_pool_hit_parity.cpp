@@ -1,6 +1,7 @@
 // The actual native-Q2_0 miss pool versus the verifier's grouped GPU hit.
 // Uses one GGUF expert and one deterministic activation, so placement is the only variable.
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/secondary_arena.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -27,13 +28,19 @@ static void ck(cudaError_t e, const char* at) {
 
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 6) {
-        std::fprintf(stderr, "usage: native_q2_pool_hit_parity <q2_0-first-shard.gguf> [layer] [expert] [seed] [input.bin]\n");
+        std::fprintf(stderr, "usage: native_q2_pool_hit_parity <q2_0-first-shard.gguf> [layer] [expert] [seed] [input.bin|--secondary]\n");
         return 2;
     }
     constexpr int H = cpu::H, FF = cpu::FF, ENTRIES = 3;
     const int L = argc > 2 ? std::atoi(argv[2]) : 0;
     const int E = argc > 3 ? std::atoi(argv[3]) : 7;
     const int seed = argc > 4 ? std::atoi(argv[4]) : 1107;
+    const bool secondary = argc > 5 && std::strcmp(argv[5], "--secondary") == 0;
+    if (secondary) {
+        ck(cudaSetDevice(0), "primary device");
+        ck(cudaFree(nullptr), "primary context");
+        ck(cudaSetDevice(1), "secondary device");
+    }
     if (L < 0 || L >= 48 || E < 0 || E >= cpu::NE) return 2;
     strata::GgufFile gguf(argv[1]);
     const strata::TensorInfo* gate = nullptr;
@@ -66,7 +73,7 @@ int main(int argc, char** argv) {
     std::mt19937 rng(seed);
     std::normal_distribution<float> normal(0.f, 1.f);
     std::vector<float> x((size_t) ENTRIES * H), pool_out((size_t) ENTRIES * H), hit_out((size_t) ENTRIES * H);
-    if (argc > 5) {
+    if (argc > 5 && !secondary) {
         std::FILE* f = std::fopen(argv[5], "rb");
         if (!f) return 2;
         int32_t header[3] = {};
@@ -108,12 +115,28 @@ int main(int argc, char** argv) {
     pool.run_split_multi_native(f, jobs, 2);
 
     const auto layout = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
+    strata::core::SecondaryArena secondary_arena;
     void *dblob = nullptr, *dx = nullptr, *dxq = nullptr, *scratch = nullptr;
     float* dx_scales = nullptr;
     float* dout = nullptr;
     unsigned long long* dptr = nullptr;
     int32_t *dstart = nullptr, *dn = nullptr, *ddst = nullptr, *dtok = nullptr;
-    ck(cudaMalloc(&dblob, 2 * blob.size()), "blob alloc");
+    if (secondary) {
+        std::string secondary_err;
+        if (!secondary_arena.open(1, {(uint64_t) blob.size(), (uint64_t) blob2.size()},
+                                  8ull << 20, secondary_err) ||
+            !secondary_arena.fill_slot(0, blob.data(), blob.size(), secondary_err) ||
+            !secondary_arena.verify_slot(0, blob.data(), blob.size(), secondary_err) ||
+            !secondary_arena.fill_slot(1, blob2.data(), blob2.size(), secondary_err) ||
+            !secondary_arena.verify_slot(1, blob2.data(), blob2.size(), secondary_err)) {
+            std::fprintf(stderr, "secondary parity: %s\n", secondary_err.c_str());
+            return 2;
+        }
+        std::printf("secondary parity: two CUDA contexts, two verified 4070 slots, lower free %.3f GiB\n",
+                    (double) secondary_arena.lower_free_after() / 1073741824.0);
+    } else {
+        ck(cudaMalloc(&dblob, 2 * blob.size()), "blob alloc");
+    }
     ck(cudaMalloc(&dx, x.size() * sizeof(float)), "x alloc");
     ck(cudaMalloc(&dxq, (size_t) ENTRIES * H / 32 * 36), "q8 alloc");
     ck(cudaMalloc((void**) &dx_scales, (size_t) ENTRIES * H / 32 * sizeof(float)), "scale alloc");
@@ -124,11 +147,14 @@ int main(int argc, char** argv) {
     ck(cudaMalloc((void**) &dn, sizeof(int32_t)), "count alloc");
     ck(cudaMalloc((void**) &ddst, ENTRIES * sizeof(int32_t)), "dst alloc");
     ck(cudaMalloc((void**) &dtok, ENTRIES * sizeof(int32_t)), "tok alloc");
-    ck(cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice), "blob copy");
-    ck(cudaMemcpy((uint8_t*) dblob + blob.size(), blob2.data(), blob2.size(), cudaMemcpyHostToDevice), "blob2 copy");
+    if (!secondary) {
+        ck(cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice), "blob copy");
+        ck(cudaMemcpy((uint8_t*) dblob + blob.size(), blob2.data(), blob2.size(), cudaMemcpyHostToDevice), "blob2 copy");
+    }
     ck(cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "x copy");
-    const unsigned long long ptr[2] = {(unsigned long long) dblob,
-                                       (unsigned long long) ((uint8_t*) dblob + blob.size())};
+    const unsigned long long ptr[2] = {
+        (unsigned long long) (secondary ? secondary_arena.slot_ptr(0) : (uint8_t*) dblob),
+        (unsigned long long) (secondary ? secondary_arena.slot_ptr(1) : (uint8_t*) dblob + blob.size())};
     const int32_t start[3] = {0, 2, ENTRIES}, groups = 2, dst[ENTRIES] = {0, 1, 2}, tok[ENTRIES] = {0, 1, 2};
     ck(cudaMemcpy(dptr, ptr, sizeof ptr, cudaMemcpyHostToDevice), "pointer copy");
     ck(cudaMemcpy(dstart, start, sizeof start, cudaMemcpyHostToDevice), "start copy");
@@ -187,7 +213,8 @@ int main(int argc, char** argv) {
                 up_different, FF, hidden_different, FF);
     float* dgate = nullptr;
     ck(cudaMalloc((void**) &dgate, FF * sizeof(float)), "gate alloc");
-    strata::kernels::iq_mmvq(42, dblob, dxq, dgate, H, FF, 1, stream);
+    strata::kernels::iq_mmvq(42, secondary ? (void*) secondary_arena.slot_ptr(0) : dblob,
+                              dxq, dgate, H, FF, 1, stream);
     ck(cudaStreamSynchronize(stream), "gate kernel");
     ck(cudaMemcpy(gpu_gate.data(), dgate, FF * sizeof(float), cudaMemcpyDeviceToHost), "gate copy");
     cpu::ActQ rounded_act = act[0];
@@ -219,7 +246,8 @@ int main(int argc, char** argv) {
     }
     std::printf("layer %d expert %d: differing %d/%d, relative L1 %.9g, max abs %.9g\n", L, E, different, ENTRIES * H,
                 l1 / (reference + 1e-30), max_abs);
-    cudaFree(dblob); cudaFree(dx); cudaFree(dxq); cudaFree(dx_scales); cudaFree(scratch); cudaFree(dout);
+    if (!secondary) cudaFree(dblob);
+    cudaFree(dx); cudaFree(dxq); cudaFree(dx_scales); cudaFree(scratch); cudaFree(dout);
     cudaFree(dptr); cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok); cudaFree(dgate);
     cudaStreamDestroy(stream);
     return (different_codes || different_scales || gate_different || up_different || hidden_different || different) ? 1 : 0;
