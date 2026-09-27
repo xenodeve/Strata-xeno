@@ -54,7 +54,7 @@ __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_
 
 // ---------------------------------------------------------------- the dot products (vecdotq.cuh)
 __device__ __forceinline__ float vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
-                                                   const int& kbx, const int& iqs) {
+                                                    const int& kbx, const int& iqs, const float* scales = nullptr) {
     const block_q2_0* bq2_0 = (const block_q2_0*) vbq + kbx;
     const float d2 = bq2_0->d;
     const int16_t* qs = (const int16_t*) bq2_0->qs + iqs * 4;
@@ -72,7 +72,7 @@ __device__ __forceinline__ float vec_dot_q2_0_q8_1(const void* __restrict__ vbq,
         sumi = ggml_cuda_dp4a(u, qx, sumi);
         sumi = ggml_cuda_dp4a(v, qy, sumi);
     }
-    const float d8 = __low2float(bq8_1_chunk->ds);
+    const float d8 = scales ? scales[iqs] : __low2float(bq8_1_chunk->ds);
     return d2 * d8 * sumi;
 }
 
@@ -294,14 +294,62 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+// Match the AVX2/AVX-VNNI CPU Q2_0 row's eight FP32 accumulators and its
+// separate zero-point correction. Only lane 0's return is used by the caller.
+__device__ __forceinline__ float row_dot_q2_cpu_order(const uint8_t* row, const block_q8_1* x,
+                                                       const float* scales, int nb, int lane) {
+    float acc = 0.f, corr = 0.f;
+    if (lane < 8) {
+        for (int b = 0; b < nb; ++b) {
+            const block_q2_0* block = (const block_q2_0*) row + b;
+            const float d = block->d;
+            int s0 = 0, s1 = 0, qsum0 = 0, qsum1 = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int k = lane * 4 + j;
+                const int c0 = (block->qs[k / 4] >> (2 * (k % 4))) & 3;
+                const int c1 = (block->qs[(k + 32) / 4] >> (2 * ((k + 32) % 4))) & 3;
+                const int q0 = x[2 * b].qs[k];
+                const int q1 = x[2 * b + 1].qs[k];
+                s0 += c0 * q0; s1 += c1 * q1;
+                qsum0 += q0; qsum1 += q1;
+            }
+            acc = __fmaf_rn(d * scales[2 * b], (float) s0, acc);
+            acc = __fmaf_rn(d * scales[2 * b + 1], (float) s1, acc);
+            qsum0 += __shfl_xor_sync(0xff, qsum0, 4, 8);
+            qsum0 += __shfl_xor_sync(0xff, qsum0, 2, 8);
+            qsum0 += __shfl_xor_sync(0xff, qsum0, 1, 8);
+            qsum1 += __shfl_xor_sync(0xff, qsum1, 4, 8);
+            qsum1 += __shfl_xor_sync(0xff, qsum1, 2, 8);
+            qsum1 += __shfl_xor_sync(0xff, qsum1, 1, 8);
+            if (lane == 0) {
+                const float hx0 = scales[2 * b] * (float) qsum0;
+                const float hx1 = scales[2 * b + 1] * (float) qsum1;
+                corr = __fadd_rn(corr, __fmul_rn(d, __fadd_rn(hx0, hx1)));
+            }
+        }
+        const float h = acc + __shfl_down_sync(0xff, acc, 4, 8);
+        const float s = h + __shfl_down_sync(0xff, h, 2, 8);
+        const float total = s + __shfl_down_sync(0xff, s, 1, 8);
+        if (lane == 0) return total - corr;
+    }
+    return 0.f;
+}
+
 // One row against one q8_1 activation, the whole warp: call k = (block, part) is lane-strided.
 template<int TY>
-__device__ __forceinline__ float row_dot(const uint8_t* row, const block_q8_1* x, int nb, int lane) {
+__device__ __forceinline__ float row_dot(const uint8_t* row, const block_q8_1* x, int nb, int lane,
+                                         const float* scales = nullptr) {
     using F = Fmt<TY>;
+    if constexpr (TY == 42)
+        if (scales) return row_dot_q2_cpu_order(row, x, scales, nb, lane);
     float s = 0.0f;
     for (int k = lane; k < nb * F::ipb; k += 32) {
         const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-        s += F::dot(row, x + kbx * (F::qk / 32), kbx, iqs);
+        if constexpr (TY == 42)
+            s += vec_dot_q2_0_q8_1(row, x + kbx * 2, kbx, iqs, scales ? scales + kbx * 2 : nullptr);
+        else
+            s += F::dot(row, x + kbx * (F::qk / 32), kbx, iqs);
     }
     return warp_sum(s);
 }
@@ -329,7 +377,7 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
                                                         const int32_t* __restrict__ grp_start,
                                                         const int32_t* __restrict__ n_groups,
                                                         const int32_t* __restrict__ ent_tok,
-                                                        const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+    const block_q8_1* __restrict__ xq, const float* __restrict__ x_scales, NativeExpertLayout L,
                                                         float* __restrict__ gate, float* __restrict__ up) {
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
@@ -343,17 +391,23 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
     const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
     for (int e = e0; e < e1; ++e) {
-        const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
+        const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane,
+                                     x_scales ? x_scales + (size_t) ent_tok[e] * xb : nullptr);
         if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
     }
 }
 
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                                      long long n) {
+                                      long long n, bool cpu_order) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    if (cpu_order) {
+        const float denominator = __fadd_rn(1.f, (float) exp((double) -g));
+        h[i] = __fmul_rn(__fdiv_rn(g, denominator), up[i]);
+    } else {
+        h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    }
 }
 
 template<int TD>
@@ -361,7 +415,7 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
                                                           const int32_t* __restrict__ grp_start,
                                                           const int32_t* __restrict__ n_groups,
                                                           const int32_t* __restrict__ ent_dst,
-                                                          const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+    const block_q8_1* __restrict__ hq, const float* __restrict__ h_scales, NativeExpertLayout L,
                                                           float* __restrict__ out) {
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
@@ -373,13 +427,15 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
     for (int e = e0; e < e1; ++e) {
-        const float s = row_dot<TD>(wr, hq + (size_t) e * hb, nb, lane);
+        const float s = row_dot<TD>(wr, hq + (size_t) e * hb, nb, lane,
+                                     h_scales ? h_scales + (size_t) e * hb : nullptr);
         if (lane == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s;
     }
 }
 
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
-__global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {
+__global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y,
+                                     float* __restrict__ scales, long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float xi = x[i];
@@ -390,10 +446,23 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
         sum += __shfl_xor_sync(0xffffffffu, sum, o);
     }
     const float d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    int8_t q = 0;
+    if (amax != 0.0f) {
+        if (scales) {
+            const float inv = __fdiv_rn(1.f, d);
+            const float v = __fmul_rn(xi, inv);
+            const int rounded = __float2int_rz(__fadd_rn(v, v >= 0.f ? 0.5f : -0.5f));
+            q = (int8_t) max(-127, min(127, rounded));
+        } else {
+            q = (int8_t) roundf(xi / d);
+        }
+    }
     const long long ib = i / 32, iqs = i % 32;
     y[ib].qs[iqs] = q;
-    if (iqs == 0) y[ib].ds = make_half2(d, sum);
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
+        if (scales) scales[ib] = d;
+    }
 }
 
 // ---------------------------------------------------------------- dequant (dequantize.cuh)
@@ -601,8 +670,18 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
 void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream) {
     const long long n = (long long) n_rows * n_cols;
     if (n <= 0) return;
-    quantize_q8_1_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
+    quantize_q8_1_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y,
+                                                                                           nullptr, n);
     check("quantize_q8_1_rows");
+}
+
+void quantize_q8_1_rows_scaled(const float* x, int64_t n_rows, int64_t n_cols, void* y,
+                               float* scales, void* stream) {
+    const long long n = (long long) n_rows * n_cols;
+    if (n <= 0) return;
+    quantize_q8_1_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+        x, (block_q8_1*) y, scales, n);
+    check("quantize_q8_1_rows_scaled");
 }
 
 void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -679,12 +758,15 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
 
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
-    return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
+    const size_t q = ((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255;
+    const size_t scales = ((size_t) cap * (size_t) (n_ff / 32) * sizeof(float) + 255) & ~(size_t) 255;
+    return 3 * ((f + 255) & ~(size_t) 255) + q + scales;
 }
 
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
-                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream) {
+                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+                           const float* x_scales) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     cudaStream_t s = (cudaStream_t) stream;
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
@@ -692,26 +774,31 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     float* up = (float*) ((uint8_t*) scratch + fa);
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
+    const size_t q = ((size_t) cap_entries * (size_t) (L.n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255;
+    float* h_scales = (float*) ((uint8_t*) hq + q);
     const auto* X = (const block_q8_1*) x_q8_1;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
     switch (L.gu_type) {
-        case 16: native_gu_kernel<16><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 17: native_gu_kernel<17><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 18: native_gu_kernel<18><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 21: native_gu_kernel<21><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 22: native_gu_kernel<22><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 29: native_gu_kernel<29><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 42: native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 16: native_gu_kernel<16><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, nullptr, L, gate, up); break;
+        case 17: native_gu_kernel<17><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, nullptr, L, gate, up); break;
+        case 18: native_gu_kernel<18><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, nullptr, L, gate, up); break;
+        case 21: native_gu_kernel<21><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, nullptr, L, gate, up); break;
+        case 22: native_gu_kernel<22><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, nullptr, L, gate, up); break;
+        case 29: native_gu_kernel<29><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, nullptr, L, gate, up); break;
+        case 42: native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, x_scales, L, gate, up); break;
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
     }
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
-    swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
-    quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+    swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh,
+                                                                          L.gu_type == 42 && x_scales != nullptr);
+    quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq,
+                                                                           L.d_type == 42 && x_scales ? h_scales : nullptr, nh);
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
-        case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, nullptr, L, out); break;
+        case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq,
+                                                            x_scales ? h_scales : nullptr, L, out); break;
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");

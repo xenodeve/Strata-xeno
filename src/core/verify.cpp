@@ -503,9 +503,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return false;
             }
         }
-        if (strata::kernels::cpu::expert_layout().native)
-            quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-        else
+        if (strata::kernels::cpu::expert_layout().native) {
+            const auto& fmt = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+            if (fmt.gu_type == 42 && fmt.d_type == 42)
+                quantize_q8_1_rows_scaled(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36,
+                                           hit_xs_ + (size_t) tb * (N / 32), cs);
+            else
+                quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+        } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
         return true;
     };
@@ -535,7 +540,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const auto& f = lay.fmt[(size_t) l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs,
+                                       f.gu_type == 42 && f.d_type == 42 ? hit_xs_ + (size_t) tb * (N / 32) : nullptr);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
