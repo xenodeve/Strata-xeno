@@ -152,6 +152,12 @@ public:
     /// this, so the token path still never sleeps; between requests the workers block on `sleep_cv_`.
     static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
 
+    /// Send the parked workers to sleep now instead of after `kSpinBeforeSleep`; the next publish wakes them.
+    /// Call it when the token path is about to leave the pool alone for a while (a verify window has ended):
+    /// the pinned spin otherwise holds every worker core at the pool's priority, and with a worker on every core
+    /// the between-window work (adapt thread, copies, MTP host work) could not run (strata-claude-workers).
+    void rest() { rest_.store(true, std::memory_order_seq_cst); }
+
 private:
     void worker(int id);
     void drain(int id, ExpertScratch& scratch);
@@ -187,6 +193,7 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
+    alignas(64) std::atomic<bool> rest_{false};   // see rest(); cleared by the next publish
     // The sleep after `kSpinBeforeSleep`.  `sleepers_` is how `publish` knows whether anyone needs waking, so the
     // token path pays one uncontended load per publish and never takes the mutex while the workers spin.
     alignas(64) std::atomic<uint32_t> sleepers_{0};

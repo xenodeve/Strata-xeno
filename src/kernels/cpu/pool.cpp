@@ -163,6 +163,7 @@ void ExpertPool::publish() {
     // order at least one of them sees the other's write - the worker sees the new epoch and does not sleep, or
     // the host sees the sleeper and notifies under the mutex the worker holds until it is inside `wait`.
     // On x86 the fetch_add is a locked xadd either way, so this costs the token path nothing.
+    rest_.store(false, std::memory_order_relaxed);   // ordered before the epoch bump below (seq_cst)
     epoch_.fetch_add(1, std::memory_order_seq_cst);
     if (sleepers_.load(std::memory_order_seq_cst) != 0) {
         std::lock_guard<std::mutex> lk(sleep_mu_);
@@ -195,7 +196,8 @@ void ExpertPool::worker(int id) {
             if (stop_.load(std::memory_order_relaxed)) return;
             _mm_pause();
             if ((++spins & 1023u) != 0) continue;
-            if (std::chrono::steady_clock::now() - parked_at < kSpinBeforeSleep) continue;
+            if (!rest_.load(std::memory_order_relaxed) &&
+                std::chrono::steady_clock::now() - parked_at < kSpinBeforeSleep) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
             sleep_cv_.wait(lk, [&] {

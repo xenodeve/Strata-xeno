@@ -190,6 +190,7 @@ struct Options {
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
     std::string route_trace;              ///< append each verify window's routed expert ids to this file
     int pool_priority = 2;                ///< THREAD_PRIORITY_* for pool workers + host; 2 = HIGHEST (default, 0 = off)
+    int pool_rest = 1;                    ///< send the pool's workers to sleep when a verify window ends (1, default)
     int process_priority = 0;             ///< process class: 0 normal (default), 1 above normal, 2 high (opt-in:
                                           ///< measured +1-3 %, but it lets the pool starve the desktop)
     bool lock_cpu_experts = false;        ///< VirtualLock the host pages of experts only the CPU serves
@@ -400,6 +401,7 @@ void usage() {
                  "  --secondary-graph N  1 (default): the 4070's per-layer work is one CUDA graph launch; 0: ~12 API calls\n"
                  "  --pool-priority P    Windows thread priority of the pool workers and the host thread.  Default 2\n"
                  "  --process-priority C 0 normal (default), 1 above normal, 2 high priority class for the process\n"
+                 "  --pool-rest N        1 (default): pool workers sleep between verify windows; 0: they spin 20 ms\n"
                  "                       (HIGHEST): pinned workers are otherwise preempted by other programs and the\n"
                  "                       layer waits; +17 %% code / +36 %% Thai decode measured.  0 keeps the OS default.\n"
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
@@ -723,6 +725,7 @@ int main(int argc, char** argv) {
         else if (a == "--lock-cpu-experts") o.lock_cpu_experts = true;
         else if (a == "--pool-priority") o.pool_priority = std::atoi(next("--pool-priority"));
         else if (a == "--process-priority") o.process_priority = std::atoi(next("--process-priority"));
+        else if (a == "--pool-rest") o.pool_rest = std::atoi(next("--pool-rest"));
         else if (a == "--secondary-graph") o.secondary_graph = std::atoi(next("--secondary-graph"));
         else if (a == "--route-trace") o.route_trace = next("--route-trace");
         else if (a == "--exclusive-primary-experts") o.exclusive_primary_experts = true;
@@ -3632,6 +3635,7 @@ if (o.expert_cache_per_layer) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
+            if (o.pool_rest) pool.rest();   // the pool idles until the next window: free its cores for adapt/MTP
             if (drive.d.failed) {
                 std::fprintf(stderr, "strata generate: the expert pool failed at layer %lld expert %lld: %s\n",
                              (long long) drive.d.fail_layer, (long long) drive.d.fail_expert,
