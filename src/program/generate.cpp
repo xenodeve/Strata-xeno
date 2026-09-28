@@ -1436,6 +1436,7 @@ if (o.expert_cache_per_layer) {
         return 1;
     }
     int64_t pf_owned = 0;
+    double pf_read_ms = 0, pf_fill_ms = 0, pf_verify_ms = 0;   // placement-first fill: where the boot time goes
     int64_t prefilled = 0;
     if (!profile.empty() && srcp != nullptr) {
         const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
@@ -1445,9 +1446,16 @@ if (o.expert_cache_per_layer) {
             const int32_t pl = profile[(size_t) i].first, pe = profile[(size_t) i].second;
             const int64_t pbytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pl);
             const uint8_t* b = srcp->blob(pl, pe);
+            const auto tr0 = Clock::now();
             if (place_first) b = arena_src.read_expert(pl, pe, pf_stage, err) ? pf_stage : nullptr;
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err, pbytes) ||
-                (place_first && !xcache.verify_slot(slot, b, err, pbytes))) {
+            const auto tr1 = Clock::now();
+            const bool filled = b != nullptr && xcache.fill_slot_blocking(slot, b, err, pbytes);
+            const auto tr2 = Clock::now();
+            const bool verified = filled && (!place_first || xcache.verify_slot(slot, b, err, pbytes));
+            pf_read_ms += std::chrono::duration<double, std::milli>(tr1 - tr0).count();
+            pf_fill_ms += std::chrono::duration<double, std::milli>(tr2 - tr1).count();
+            pf_verify_ms += std::chrono::duration<double, std::milli>(Clock::now() - tr2).count();
+            if (!verified) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
@@ -1474,6 +1482,9 @@ if (o.expert_cache_per_layer) {
         mem_mark("the profile fill");
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
                      (long long) prefilled, (long long) want);
+        if (place_first)
+            std::fprintf(stderr, "strata generate: primary fill: read %.1f s, fill %.1f s, verify %.1f s\n",
+                         pf_read_ms / 1000.0, pf_fill_ms / 1000.0, pf_verify_ms / 1000.0);
     }
 
     // Phase 3: profile-ranked secondary copies remain separate from the primary cache.
