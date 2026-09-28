@@ -261,6 +261,9 @@ struct Options {
     /// Swap only while the CPU pool is the longer side of recent verify windows (EMA of pool - wait-for-rings > 0):
     /// swaps then take CPU entries off the long pole; when the primary GPU is the long pole they only add GPU work.
     bool adapt_gate = false;
+    /// Adaptive swaps into the 4070 tier per adapt call: the most-routed CPU experts replace its least-routed
+    /// residents (their host copies stay, so no copy-home is needed).  0 = the 4070 tier stays static.
+    int adapt_secondary = 0;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -733,6 +736,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
         else if (a == "--adapt-gate") o.adapt_gate = std::atoi(next("--adapt-gate")) != 0;
+        else if (a == "--adapt-secondary") o.adapt_secondary = std::atoi(next("--adapt-secondary"));
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
@@ -2299,11 +2303,29 @@ if (o.expert_cache_per_layer) {
         const bool paired = o.exclusive_primary_experts && o.adapt_swaps > 0;
         struct PSwap { int32_t layer, in, out, slot; };
         std::vector<PSwap> ps_d2h, ps_h2d;
-        int64_t paired_swaps = 0;
+        int64_t paired_swaps = 0, sec_swaps = 0;
         bool adapt_start = true;
         cudaEvent_t d2h_ev = nullptr;
         cudaEventCreateWithFlags(&d2h_ev, cudaEventDisableTiming);
         const size_t ps_blob = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+        // 4070 adaptive swaps: the evicted resident is CPU-served at once (its host copy stays); the newcomer is
+        // staged in pinned memory, copied H2D on the 4070's own stream, and served once that copy has landed.
+        const bool sec_adapt = o.adapt_secondary > 0 && drive.d.secondary_res != nullptr;
+        std::vector<std::pair<int32_t, int32_t>> ss_pending;   // (layer * n_expert + expert, slot)
+        cudaStream_t ss_stream = nullptr;
+        cudaEvent_t ss_ev = nullptr;
+        uint8_t* ss_stage = nullptr;
+        if (sec_adapt) {
+            int prev = 0;
+            cudaGetDevice(&prev);
+            cudaSetDevice(1);
+            const bool ok = cudaStreamCreateWithFlags(&ss_stream, cudaStreamNonBlocking) == cudaSuccess &&
+                            cudaEventCreateWithFlags(&ss_ev, cudaEventDisableTiming) == cudaSuccess &&
+                            cudaHostAlloc((void**) &ss_stage, (size_t) o.adapt_secondary * ps_blob,
+                                          cudaHostAllocPortable) == cudaSuccess;
+            cudaSetDevice(prev);
+            if (!ok) { std::fprintf(stderr, "strata generate: 4070 adaptive swap setup failed\n"); return 1; }
+        }
         uint8_t* ps_stage = nullptr;
         if (paired && cudaHostAlloc((void**) &ps_stage, (size_t) o.adapt_swaps * ps_blob, cudaHostAllocDefault) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: paired swap staging (%d x %zu B) could not be allocated\n",
@@ -2321,6 +2343,47 @@ if (o.expert_cache_per_layer) {
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
+            if (sec_adapt) {   // the 4070 tier, independent of the primary swaps below
+                if (!ss_pending.empty() && cudaEventQuery(ss_ev) == cudaSuccess) {
+                    for (const auto& [i, slot] : ss_pending) secondary_residency[(size_t) i] = slot;
+                    ss_pending.clear();
+                }
+                if (ss_pending.empty() && adapt_start) {
+                    std::vector<std::pair<float, int32_t>> sc, sv;   // (usage, layer * n_expert + expert)
+                    for (int64_t i = 0; i < (int64_t) secondary_residency.size(); ++i) {
+                        const float u = drive.d.usage[(size_t) i];
+                        if (secondary_residency[(size_t) i] >= 0) sv.emplace_back(u, (int32_t) i);
+                        else if (host_res[(size_t) i] < 0 && u >= 2.0f) sc.emplace_back(u, (int32_t) i);
+                    }
+                    const size_t n = std::min<size_t>({sc.size(), sv.size(), (size_t) o.adapt_secondary});
+                    std::partial_sort(sc.begin(), sc.begin() + (ptrdiff_t) n, sc.end(),
+                                      [](auto& a, auto& b) { return a.first > b.first; });
+                    std::partial_sort(sv.begin(), sv.begin() + (ptrdiff_t) n, sv.end(),
+                                      [](auto& a, auto& b) { return a.first < b.first; });
+                    int prev = 0;
+                    cudaGetDevice(&prev);
+                    cudaSetDevice(1);
+                    for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
+                        const int32_t in = sc[k].second, out = sv[k].second;
+                        const int32_t slot = secondary_residency[(size_t) out];
+                        const int32_t layer = in / (int32_t) g.n_expert;
+                        const uint8_t* src = srcp->blob(layer, in % (int32_t) g.n_expert);
+                        const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+                        if (src == nullptr) break;
+                        secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
+                        std::memcpy(ss_stage + ss_pending.size() * ps_blob, src, bytes);
+                        if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) slot), ss_stage + ss_pending.size() * ps_blob,
+                                            bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
+                            cudaSetDevice(prev);
+                            return false;
+                        }
+                        ss_pending.emplace_back(in, slot);
+                    }
+                    if (!ss_pending.empty()) cudaEventRecord(ss_ev, ss_stream);
+                    cudaSetDevice(prev);
+                    sec_swaps += (int64_t) ss_pending.size();
+                }
+            }
             if (paired) {
                 const auto& lay = strata::kernels::cpu::expert_layout();
                 if (!ps_h2d.empty() && cudaEventQuery(adapt_ev) == cudaSuccess) {   // stage 3
@@ -2374,6 +2437,8 @@ if (o.expert_cache_per_layer) {
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
+                // the 4070 tier already serves its experts off the CPU: promoting one only moves GPU work
+                const int32_t* sr = drive.d.secondary_res ? drive.d.secondary_res + l * g.n_expert : nullptr;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && (sr == nullptr || sr[e] < 0)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
@@ -2437,8 +2502,6 @@ if (o.expert_cache_per_layer) {
                 in_cv.notify_one();
             }
             std::lock_guard<std::mutex> lk(in_mu);
-                // the 4070 tier already serves its experts off the CPU: promoting one only moves GPU work
-                const int32_t* sr = drive.d.secondary_res ? drive.d.secondary_res + l * g.n_expert : nullptr;
             in_eof = true;
             in_cv.notify_one();
         }).detach();
@@ -2752,7 +2815,7 @@ if (o.expert_cache_per_layer) {
                     gate_ema = 0.8 * gate_ema + 0.2 * (dp - dw);
                 }
                 adapt_start = ((rounds + 1) % o.adapt_every) == 0 && (!o.adapt_gate || gate_ema > 0.0);
-                if (!drive.d.usage.empty() && (adapt_start || !ps_d2h.empty() || !ps_h2d.empty()))
+                if (!drive.d.usage.empty() && (adapt_start || !ps_d2h.empty() || !ps_h2d.empty() || !ss_pending.empty()))
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -3248,11 +3311,29 @@ if (o.expert_cache_per_layer) {
         const bool paired = o.exclusive_primary_experts && o.adapt_swaps > 0;
         struct PSwap { int32_t layer, in, out, slot; };
         std::vector<PSwap> ps_d2h, ps_h2d;
-        int64_t paired_swaps = 0;
+        int64_t paired_swaps = 0, sec_swaps = 0;
         bool adapt_start = true;
         cudaEvent_t d2h_ev = nullptr;
         cudaEventCreateWithFlags(&d2h_ev, cudaEventDisableTiming);
         const size_t ps_blob = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+        // 4070 adaptive swaps: the evicted resident is CPU-served at once (its host copy stays); the newcomer is
+        // staged in pinned memory, copied H2D on the 4070's own stream, and served once that copy has landed.
+        const bool sec_adapt = o.adapt_secondary > 0 && drive.d.secondary_res != nullptr;
+        std::vector<std::pair<int32_t, int32_t>> ss_pending;   // (layer * n_expert + expert, slot)
+        cudaStream_t ss_stream = nullptr;
+        cudaEvent_t ss_ev = nullptr;
+        uint8_t* ss_stage = nullptr;
+        if (sec_adapt) {
+            int prev = 0;
+            cudaGetDevice(&prev);
+            cudaSetDevice(1);
+            const bool ok = cudaStreamCreateWithFlags(&ss_stream, cudaStreamNonBlocking) == cudaSuccess &&
+                            cudaEventCreateWithFlags(&ss_ev, cudaEventDisableTiming) == cudaSuccess &&
+                            cudaHostAlloc((void**) &ss_stage, (size_t) o.adapt_secondary * ps_blob,
+                                          cudaHostAllocPortable) == cudaSuccess;
+            cudaSetDevice(prev);
+            if (!ok) { std::fprintf(stderr, "strata generate: 4070 adaptive swap setup failed\n"); return 1; }
+        }
         uint8_t* ps_stage = nullptr;
         if (paired && cudaHostAlloc((void**) &ps_stage, (size_t) o.adapt_swaps * ps_blob, cudaHostAllocDefault) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: paired swap staging (%d x %zu B) could not be allocated\n",
@@ -3273,6 +3354,47 @@ if (o.expert_cache_per_layer) {
         // routed clearly more often.  Copies run between rounds, when the GPU is idle.
         auto adapt = [&]() -> bool {
             const Clock::time_point ta = Clock::now();
+            if (sec_adapt) {   // the 4070 tier, independent of the primary swaps below
+                if (!ss_pending.empty() && cudaEventQuery(ss_ev) == cudaSuccess) {
+                    for (const auto& [i, slot] : ss_pending) secondary_residency[(size_t) i] = slot;
+                    ss_pending.clear();
+                }
+                if (ss_pending.empty() && adapt_start) {
+                    std::vector<std::pair<float, int32_t>> sc, sv;   // (usage, layer * n_expert + expert)
+                    for (int64_t i = 0; i < (int64_t) secondary_residency.size(); ++i) {
+                        const float u = drive.d.usage[(size_t) i];
+                        if (secondary_residency[(size_t) i] >= 0) sv.emplace_back(u, (int32_t) i);
+                        else if (host_res[(size_t) i] < 0 && u >= 2.0f) sc.emplace_back(u, (int32_t) i);
+                    }
+                    const size_t n = std::min<size_t>({sc.size(), sv.size(), (size_t) o.adapt_secondary});
+                    std::partial_sort(sc.begin(), sc.begin() + (ptrdiff_t) n, sc.end(),
+                                      [](auto& a, auto& b) { return a.first > b.first; });
+                    std::partial_sort(sv.begin(), sv.begin() + (ptrdiff_t) n, sv.end(),
+                                      [](auto& a, auto& b) { return a.first < b.first; });
+                    int prev = 0;
+                    cudaGetDevice(&prev);
+                    cudaSetDevice(1);
+                    for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
+                        const int32_t in = sc[k].second, out = sv[k].second;
+                        const int32_t slot = secondary_residency[(size_t) out];
+                        const int32_t layer = in / (int32_t) g.n_expert;
+                        const uint8_t* src = srcp->blob(layer, in % (int32_t) g.n_expert);
+                        const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+                        if (src == nullptr) break;
+                        secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
+                        std::memcpy(ss_stage + ss_pending.size() * ps_blob, src, bytes);
+                        if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) slot), ss_stage + ss_pending.size() * ps_blob,
+                                            bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
+                            cudaSetDevice(prev);
+                            return false;
+                        }
+                        ss_pending.emplace_back(in, slot);
+                    }
+                    if (!ss_pending.empty()) cudaEventRecord(ss_ev, ss_stream);
+                    cudaSetDevice(prev);
+                    sec_swaps += (int64_t) ss_pending.size();
+                }
+            }
             if (paired) {
                 const auto& lay = strata::kernels::cpu::expert_layout();
                 if (!ps_h2d.empty() && cudaEventQuery(adapt_ev) == cudaSuccess) {   // stage 3
@@ -3326,6 +3448,8 @@ if (o.expert_cache_per_layer) {
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
+                // the 4070 tier already serves its experts off the CPU: promoting one only moves GPU work
+                const int32_t* sr = drive.d.secondary_res ? drive.d.secondary_res + l * g.n_expert : nullptr;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && (sr == nullptr || sr[e] < 0)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
@@ -3448,14 +3572,12 @@ if (o.expert_cache_per_layer) {
             std::thread adapt_thr;
             bool adapt_ok = true;
             {   // --adapt-gate: EMA of this window's CPU pool minus its wait for the primary GPU
-                // the 4070 tier already serves its experts off the CPU: promoting one only moves GPU work
-                const int32_t* sr = drive.d.secondary_res ? drive.d.secondary_res + l * g.n_expert : nullptr;
                 const double dp = ver.ms_pool - gate_pool, dw = ver.ms_wait - gate_wait;
                 gate_pool = ver.ms_pool; gate_wait = ver.ms_wait;
                 gate_ema = 0.8 * gate_ema + 0.2 * (dp - dw);
             }
             adapt_start = ((rounds + 1) % o.adapt_every) == 0 && (!o.adapt_gate || gate_ema > 0.0);
-            if (!drive.d.usage.empty() && (adapt_start || !ps_d2h.empty() || !ps_h2d.empty()))
+            if (!drive.d.usage.empty() && (adapt_start || !ps_d2h.empty() || !ps_h2d.empty() || !ss_pending.empty()))
                 adapt_thr = std::thread([&] { adapt_ok = adapt(); });
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
@@ -3566,6 +3688,8 @@ if (o.expert_cache_per_layer) {
     if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) (swaps_total + paired_swaps), o.adapt_every, ms_adapt / rounds);
+        if (rounds > 0 && sec_adapt)
+            std::printf("%-24s %lld experts swapped into the 4070 tier\n", "adaptive 4070", (long long) sec_swaps);
         if (rounds > 0 && drive.d.pcie_num > 0)
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
