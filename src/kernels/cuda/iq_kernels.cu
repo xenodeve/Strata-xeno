@@ -294,6 +294,11 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+// Four 2-bit codes of one byte, one per byte of the result: code j (bits 2j..2j+1) -> byte j.
+__device__ __forceinline__ int q2_spread(uint32_t w) {
+    return (int) ((w | (w << 6) | (w << 12) | (w << 18)) & 0x03030303u);
+}
+
 // Match the AVX2/AVX-VNNI CPU Q2_0 row's eight FP32 accumulators and its
 // separate zero-point correction. `hx[c]` is scales[c] * (float) (sum of chunk c's q8
 // codes), precomputed once per activation. `lane` counts within one aligned 8-lane
@@ -306,16 +311,10 @@ __device__ __forceinline__ float row_dot_q2_cpu_order(const uint8_t* row, const 
         for (int b = 0; b < nb; ++b) {
             const block_q2_0* block = (const block_q2_0*) row + b;
             const float d = block->d;
-            int s0 = 0, s1 = 0;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int k = lane * 4 + j;
-                const int c0 = (block->qs[k / 4] >> (2 * (k % 4))) & 3;
-                const int c1 = (block->qs[(k + 32) / 4] >> (2 * ((k + 32) % 4))) & 3;
-                const int q0 = x[2 * b].qs[k];
-                const int q1 = x[2 * b + 1].qs[k];
-                s0 += c0 * q0; s1 += c1 * q1;
-            }
+            // This lane's four codes of each half sit in one byte (qs[lane], qs[lane + 8]); spread them to
+            // one per byte and take the exact integer dot with the four matching q8 codes in one dp4a.
+            const int s0 = __dp4a(q2_spread(block->qs[lane]), *(const int*) (x[2 * b].qs + 4 * lane), 0);
+            const int s1 = __dp4a(q2_spread(block->qs[lane + 8]), *(const int*) (x[2 * b + 1].qs + 4 * lane), 0);
             acc = __fmaf_rn(d * scales[2 * b], (float) s0, acc);
             acc = __fmaf_rn(d * scales[2 * b + 1], (float) s1, acc);
             if (lane == 0) corr = __fadd_rn(corr, __fmul_rn(d, __fadd_rn(hx[2 * b], hx[2 * b + 1])));
