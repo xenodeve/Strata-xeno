@@ -2437,6 +2437,8 @@ if (o.expert_cache_per_layer) {
                 in_cv.notify_one();
             }
             std::lock_guard<std::mutex> lk(in_mu);
+                // the 4070 tier already serves its experts off the CPU: promoting one only moves GPU work
+                const int32_t* sr = drive.d.secondary_res ? drive.d.secondary_res + l * g.n_expert : nullptr;
             in_eof = true;
             in_cv.notify_one();
         }).detach();
@@ -3446,6 +3448,8 @@ if (o.expert_cache_per_layer) {
             std::thread adapt_thr;
             bool adapt_ok = true;
             {   // --adapt-gate: EMA of this window's CPU pool minus its wait for the primary GPU
+                // the 4070 tier already serves its experts off the CPU: promoting one only moves GPU work
+                const int32_t* sr = drive.d.secondary_res ? drive.d.secondary_res + l * g.n_expert : nullptr;
                 const double dp = ver.ms_pool - gate_pool, dw = ver.ms_wait - gate_wait;
                 gate_pool = ver.ms_pool; gate_wait = ver.ms_wait;
                 gate_ema = 0.8 * gate_ema + 0.2 * (dp - dw);
