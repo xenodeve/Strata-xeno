@@ -559,8 +559,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr2, p_start2, p_counts + 2);
         }
         wait_flag_ge(m_flag_, ring, cs);                       // the CPU's share is in the mapped rows
-        copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
-        moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        // H2: read only the rows that are not GPU hits over the link (bitwise copy + moe_hit_add)
+        moe_hit_merge_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst,
+                             p_counts + 1, (int64_t) n * K, N, cs);
         for (int t = tb; t < te; ++t) {
             MoEBuffers mb = ss.moe;
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;

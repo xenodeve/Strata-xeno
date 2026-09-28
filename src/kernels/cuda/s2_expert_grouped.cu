@@ -423,6 +423,29 @@ __global__ void add_hits_kernel(float* __restrict__ parts, const float* __restri
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
         parts[row + i] += hit_out[row + i];
 }
+
+// H2: the verify window's CPU/4070 rows arrive through mapped host memory over the x4 link.  A GPU hit's row is +0
+// there (the pool writes it), so read the mapped row only when the row is NOT a hit, and write a hit row as
+// 0 + hit_out - the same bytes as `copy_from_mapped` followed by `add_hits_kernel`.
+__global__ void merge_mapped_kernel(float4* __restrict__ parts, const volatile float4* ymiss,
+                                    const float4* __restrict__ hit_out, const int32_t* __restrict__ dst,
+                                    const int32_t* __restrict__ count, int n4) {
+    const int row = blockIdx.y;
+    const int c = *count;
+    bool hit = false;
+    for (int h = 0; h < c; ++h) hit |= dst[h] == row;
+    const size_t base = (size_t) row * (size_t) n4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) {
+        float4 v;
+        if (hit) {
+            const float4 h = hit_out[base + i];
+            v = make_float4(__fadd_rn(0.0f, h.x), __fadd_rn(0.0f, h.y), __fadd_rn(0.0f, h.z), __fadd_rn(0.0f, h.w));
+        } else {
+            v = const_cast<const float4*>(ymiss)[base + i];
+        }
+        parts[base + i] = v;
+    }
+}
 }  // namespace
 
 void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_expert, int32_t* slot, int32_t* dst,
@@ -736,6 +759,21 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
     const dim3 grid((unsigned) ((n_embd + 255) / 256 < 8 ? (n_embd + 255) / 256 : 8), (unsigned) cap);
     add_hits_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(parts, hit_out, dst, count, (int) n_embd);
     check("moe_hit_add", stream);
+}
+
+void moe_hit_merge_mapped(float* parts, const float* ymiss_mapped, const float* hit_out, const int32_t* dst,
+                          const int32_t* count, int64_t rows, int64_t n_embd, void* stream) {
+    if (rows <= 0) return;
+    if ((n_embd & 3) != 0 || ((uintptr_t) parts & 15) != 0 || ((uintptr_t) ymiss_mapped & 15) != 0 ||
+        ((uintptr_t) hit_out & 15) != 0) {
+        std::fprintf(stderr, "moe_hit_merge_mapped: n_embd must be a multiple of 4 and pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    const int n4 = (int) (n_embd / 4);
+    const dim3 grid((unsigned) ((n4 + 255) / 256), (unsigned) rows);
+    merge_mapped_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>((float4*) parts, (const volatile float4*) ymiss_mapped,
+                                                               (const float4*) hit_out, dst, count, n4);
+    check("moe_hit_merge_mapped", stream);
 }
 
 void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_index,
