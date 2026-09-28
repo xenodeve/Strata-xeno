@@ -19,6 +19,7 @@ namespace strata::core {
 // include gaps while the host enqueues work; they are not pure kernel timings.
 struct SecondaryTiming {
     uint64_t launches = 0;
+    uint64_t d2h_full_bytes = 0, d2h_requested_bytes = 0;
     double host_plan_ms = 0, host_switch_ms = 0, host_enqueue_ms = 0;
     double host_query_ms = 0, host_copyout_ms = 0;
     double h2d_ms = 0, clear_ms = 0, quantize_ms = 0, expert_ms = 0, d2h_ms = 0;

@@ -21,6 +21,7 @@ class LatencyBreakdownTest(unittest.TestCase):
         timed = STDOUT + (
             "secondary host           plan 0.420 switch 0.250 enqueue 3.700 query 0.080 copyout 0.160 ms/round\n"
             "secondary device         H2D 0.730 clear 0.100 quantize 0.190 expert 2.100 D2H 0.330 ms/round; 2784 launches\n"
+            "secondary D2H bytes      full 100.00 MiB requested 25.00 MiB\n"
         )
         p = parse(timed)
         self.assertAlmostEqual(p['secondary_host_plan'], 0.420)
@@ -34,6 +35,8 @@ class LatencyBreakdownTest(unittest.TestCase):
         self.assertAlmostEqual(p['secondary_expert'], 2.100)
         self.assertAlmostEqual(p['secondary_d2h'], 0.330)
         self.assertEqual(p['secondary_launches'], 2784)
+        self.assertAlmostEqual(p['secondary_d2h_full_mib'], 100.0)
+        self.assertAlmostEqual(p['secondary_d2h_requested_mib'], 25.0)
 
     def test_parses_every_counter(self):
         p = parse(STDOUT, STDERR)

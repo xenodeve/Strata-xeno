@@ -46,5 +46,6 @@ The CUDA event intervals may include host enqueue gaps, and six event markers pe
 - [x] Implement packed pinned metadata H2D as one isolated change; expand the public runner parity test to cover shrinking group count, and get the direct test green.
 - [x] Recheck four fixed prompts for 256/256 raw-token parity and the required CTest/Python gates.
 - [x] Run alternating baseline/packed process benchmarks with profiling off. The large CPU-time variance prevents a throughput-gain claim; see `docs/reports/2026-09-28-packed-secondary-metadata.md`.
-- [ ] Run a separate compact-D2H ablation if the direct and full-model parity gates can still be kept. Measure actual D2H bytes and post-CPU wait, not just tok/s.
+- [x] Run a separate compact-D2H ablation with direct and four-prompt parity; requested D2H bytes fell 74.1%, but an end-to-end speed gain remains unproved. See `docs/reports/2026-09-28-compact-secondary-d2h.md`.
+- [ ] Split `dispatch.ms_run` into CPU pool self-time and complete secondary finish time, then use `--gpu-stages` to inspect the primary path before choosing the next performance change.
 - [ ] Update engine/tracker issues bilingually after the next measured checkpoint.

@@ -306,6 +306,9 @@ int main(int argc, char** argv) {
                 timing.host_enqueue_ms <= 0 ||
                 timing.h2d_ms <= 0 || timing.expert_ms <= 0 || timing.d2h_ms <= 0)
                 ++runner_different;
+            if (timing.d2h_full_bytes != 9ull * H * sizeof(float) ||
+                timing.d2h_requested_bytes != 6ull * H * sizeof(float))
+                ++runner_different;
         } else if (timing.launches != 0) {
             ++runner_different;
         }

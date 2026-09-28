@@ -175,7 +175,7 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
         ptr_.push_back((unsigned long long) weights.slot_ptr((uint64_t) slot));
         start_.push_back((int32_t) dst_.size());
         for (int i = 0; i < entries; ++i) if (selected_slots[i] == slot) {
-            dst_.push_back(i);
+            dst_.push_back((int32_t) selected_rows_.size());
             tok_.push_back(i / k);
             selected_rows_.push_back(i);
         }
@@ -233,12 +233,18 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
                                    host_count_, (int) dst_.size(), device_xq_, device_scratch_, device_out_, stream,
                                    device_scales_);
     if (!mark(4)) return fail_enqueued();
-    if (!cuda_ok(cudaMemcpyAsync(host_out_, device_out_, (size_t) entries * n_embd_ * sizeof(float),
+    const size_t full_d2h_bytes = (size_t) entries * n_embd_ * sizeof(float);
+    const size_t requested_d2h_bytes = selected_rows_.size() * (size_t) n_embd_ * sizeof(float);
+    if (!cuda_ok(cudaMemcpyAsync(host_out_, device_out_, requested_d2h_bytes,
                                  cudaMemcpyDeviceToHost, stream), "runner partial D2H", err) ||
         !mark(5) ||
         !cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
         return fail_enqueued();
     pending_ = true;
+    if (profile_timing_) {
+        timing_.d2h_full_bytes += full_d2h_bytes;
+        timing_.d2h_requested_bytes += requested_d2h_bytes;
+    }
     if (profile_timing_)
         timing_.host_enqueue_ms += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - enqueue_t0).count();
@@ -283,8 +289,9 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
         ++timing_.launches;
     }
     const auto copy_t0 = std::chrono::steady_clock::now();
-    for (const int32_t row : selected_rows_)
-        std::memcpy(output + (size_t) row * n_embd_, host_out_ + (size_t) row * n_embd_,
+    for (size_t dense = 0; dense < selected_rows_.size(); ++dense)
+        std::memcpy(output + (size_t) selected_rows_[dense] * n_embd_,
+                    host_out_ + dense * n_embd_,
                     (size_t) n_embd_ * sizeof(float));
     if (profile_timing_)
         timing_.host_copyout_ms += std::chrono::duration<double, std::milli>(

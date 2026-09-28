@@ -56,6 +56,11 @@ def parse(stdout: str, stderr: str = '') -> dict:
         out.update(secondary_h2d=float(m.group(1)), secondary_clear=float(m.group(2)),
                    secondary_quantize=float(m.group(3)), secondary_expert=float(m.group(4)),
                    secondary_d2h=float(m.group(5)), secondary_launches=int(m.group(6)))
+    m = re.search(r'^secondary D2H bytes\s+full ' + FLOAT + r' MiB requested ' + FLOAT +
+                  r' MiB$', stdout, re.M)
+    if m:
+        out.update(secondary_d2h_full_mib=float(m.group(1)),
+                   secondary_d2h_requested_mib=float(m.group(2)))
     m = re.search(r'prefill (\d+) tokens in (\d+) chunks, ' + FLOAT + r' ms .*?host ' + FLOAT + r' ms\), resident (\d+); PLE '
                   + FLOAT, stderr)
     if m:
@@ -110,6 +115,9 @@ def main(argv: list) -> int:
                   f'clear {p["secondary_clear"]:.3f}, quantize {p["secondary_quantize"]:.3f}, '
                   f'expert {p["secondary_expert"]:.3f}, D2H {p["secondary_d2h"]:.3f} ms/round '
                   f'({p["secondary_launches"]} launches)')
+            if 'secondary_d2h_full_mib' in p:
+                print(f'  D2H requested {p["secondary_d2h_requested_mib"]:.2f} MiB of '
+                      f'{p["secondary_d2h_full_mib"]:.2f} MiB full routed rows')
         if 'prefill_ms' in p:
             print(f'  prefill {p["prefill_tokens"]} tok {p["prefill_ms"]:.0f} ms: expert upload host '
                   f'{p["prefill_host_ms"]:.0f} ms ({p["prefill_host_ms"] / p["prefill_ms"] * 100:.0f} %), '

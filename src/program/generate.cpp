@@ -3299,6 +3299,9 @@ if (o.expert_cache_per_layer) {
                     "secondary device", t.h2d_ms / rounds, t.clear_ms / rounds,
                     t.quantize_ms / rounds, t.expert_ms / rounds, t.d2h_ms / rounds,
                     (unsigned long long) t.launches);
+        std::printf("%-24s full %.2f MiB requested %.2f MiB\n", "secondary D2H bytes",
+                    (double) t.d2h_full_bytes / 1048576.0,
+                    (double) t.d2h_requested_bytes / 1048576.0);
     }
     if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
