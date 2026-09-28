@@ -34,9 +34,23 @@ runs or tools.
 
 ## Other standing rules
 
-- **The correctness gate is greedy raw-token parity.** A performance change must
-  reproduce the accepted baseline's token IDs, and `native_q2_pool_hit_parity`
+- **The correctness gate is greedy raw-token parity against a same-session
+  baseline.** Run the unchanged build alongside the candidate in the same ABBA
+  session. Token IDs recorded in an earlier session are not a gate: on
+  2026-09-28 the same exe with a byte-identical command produced different
+  tokens hours later, diverging already in prefill
+  (`docs/reports/2026-09-28-ggml-cpu-build-mode.md`). `native_q2_pool_hit_parity`
   must stay bit-exact (ADR `docs/adr/0001-q2-exp-baseline.md`).
+- **Record the exe sha256 with every run** and check it before reusing a build
+  dir: build dirs get rebuilt in place.
+- **ggml-cpu SIMD mode does not matter here.** Generic, AVX2 and AVX2+VNNI gave
+  identical tokens and speed within 4 %. The native Q2_0 CPU kernel is Strata's
+  own AVX-VNNI code. A configure shell with an empty `CMAKE_SYSTEM_PROCESSOR`
+  silently yields `GGML_CPU_GENERIC`, which is harmless but should not be
+  mistaken for a real difference between builds.
+- **Launching `strata.exe` from a script** needs both CUDA `bin` and `bind`
+  on `PATH`. Without them the exe exits with `0xC0000135` before loading
+  anything.
 - **Effects under the 13.6 % noise gate are unproved** unless paired ABBA runs
   show them consistently.
 - **GPU roles.** Primary is the RTX 5060 Ti (`CUDA_VISIBLE_DEVICES=1,0`, logical
