@@ -67,6 +67,18 @@ The developer's standing rule (2026-09-28, restated 2026-09-29) decides every kn
 - The launcher and serving profile (`strata-xeno.json`) are still the developer's. Engine defaults change on the
   branch; the profile does not.
 
+## Never put a window on the developer's display
+
+The developer works on the display card while runs happen. Every process an agent starts runs in the background,
+with no console window:
+
+- Use the Bash tool's `run_in_background`, or a detached launcher. `tests/xeno/perf/launch_ab.py` uses
+  `DETACHED_PROCESS | CREATE_NO_WINDOW`.
+- Any script that starts `strata.exe` or another console program passes `CREATE_NO_WINDOW` (0x08000000).
+  `ab.py` and `mem_trace.py` do. A detached parent has no console, so without the flag Windows opens a new
+  window for every child.
+- Do not use `start`, `cmd /c start`, a visible PowerShell `Start-Process` or anything else that opens a window.
+
 ## Other standing rules
 
 - **The correctness gate is greedy raw-token parity against a same-session

@@ -91,7 +91,7 @@ def main(argv):
             t0 = time.time()
             # every arm runs in HIGH_PRIORITY_CLASS (0x80): strata-claude-hiclass showed it cuts desktop interference
             # (code +2.6 %, thai +1.3 %, tighter spread); '@normal' in an arm's args opts that arm out
-            flags = 0 if "@normal" in arm_args[arm] else 0x80
+            flags = (0 if "@normal" in arm_args[arm] else 0x80) | 0x08000000   # + CREATE_NO_WINDOW: no console pops up on the display
             pr = subprocess.Popen([exe[arm]] + [c for c in cmd if '~' + c not in arm_args[arm]] + [x for x in arm_args[arm] if not x.startswith(('~', '@'))], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", creationflags=flags)
             peak = [0.0, 0.0, 0.0, 0.0]   # system in use, system committed, process private, process working set
             def sample():

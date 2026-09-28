@@ -18,7 +18,7 @@ cuda = os.path.join("C:" + os.sep, "Program Files", "NVIDIA GPU Computing Toolki
 env["PATH"] = os.pathsep.join([cuda, os.path.join(cuda, "x64"), env["PATH"]])
 t0 = time.time()
 pr = subprocess.Popen([exe] + cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                      encoding="utf-8", errors="replace", creationflags=0x80)
+                      encoding="utf-8", errors="replace", creationflags=0x80 | 0x08000000)   # HIGH class, CREATE_NO_WINDOW
 samples, events = [], []
 
 
