@@ -192,6 +192,7 @@ struct Options {
     int pool_priority = 2;                ///< THREAD_PRIORITY_* for pool workers + host; 2 = HIGHEST (default, 0 = off)
     bool lock_cpu_experts = false;        ///< VirtualLock the host pages of experts only the CPU serves
     bool secondary_async_launch = false;  ///< enqueue the 4070's work on a helper thread (off the host path)
+    int secondary_graph = 1;              ///< enqueue the 4070's work as one CUDA graph per token count (#25)
     bool secondary_profile_timing = false; ///< opt-in CUDA events; normal decode adds no markers
     bool secondary_stage_only = false; ///< A/B arm before routing work to device 1
     bool exclusive_primary_experts = false; ///< Phase 4 static GPU ownership; host pages decommitted after fill
@@ -394,6 +395,7 @@ void usage() {
                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
+                 "  --secondary-graph N  1 (default): the 4070's per-layer work is one CUDA graph launch; 0: ~12 API calls\n"
                  "  --pool-priority P    Windows thread priority of the pool workers and the host thread.  Default 2\n"
                  "                       (HIGHEST): pinned workers are otherwise preempted by other programs and the\n"
                  "                       layer waits; +17 %% code / +36 %% Thai decode measured.  0 keeps the OS default.\n"
@@ -717,6 +719,7 @@ int main(int argc, char** argv) {
         else if (a == "--secondary-async-launch") o.secondary_async_launch = true;
         else if (a == "--lock-cpu-experts") o.lock_cpu_experts = true;
         else if (a == "--pool-priority") o.pool_priority = std::atoi(next("--pool-priority"));
+        else if (a == "--secondary-graph") o.secondary_graph = std::atoi(next("--secondary-graph"));
         else if (a == "--route-trace") o.route_trace = next("--route-trace");
         else if (a == "--exclusive-primary-experts") o.exclusive_primary_experts = true;
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
@@ -1448,6 +1451,10 @@ if (o.expert_cache_per_layer) {
                              pair.layer, pair.expert, (unsigned long long) slot, err.c_str());
                 return 1;
             }
+        }
+        if (!secondary_runner.set_graph(o.secondary_graph != 0, err)) {
+            std::fprintf(stderr, "strata generate: secondary graph: %s\n", err.c_str());
+            return 1;
         }
         if (o.secondary_async_launch) {
             // the first core after the pool's workers (an E-core on hybrid parts), else unpinned
@@ -3703,6 +3710,9 @@ if (o.expert_cache_per_layer) {
                         ver.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
+        if (rounds > 0)
+            std::printf("%-24s launch %.3f  tail %.3f ms/round (graph launch; last pool until the stream is done)\n",
+                        "verify edges", ver.ms_launch / rounds, ver.ms_tail / rounds);
         if (rounds > 0) {
             const int64_t* te = drive.d.tier_entries;
             const int64_t sum = te[0] + te[1] + te[2] + te[3];

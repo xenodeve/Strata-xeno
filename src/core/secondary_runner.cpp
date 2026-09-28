@@ -173,6 +173,15 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
     return true;
 }
 
+bool SecondaryRunner::set_graph(bool on, std::string& err) {
+    if (stream_ == nullptr) { err = "secondary runner: set_graph needs an initialised runner"; return false; }
+    graph_ = on;
+    graph_exec_.assign((size_t) (max_tokens_ + 1) * (size_t) (max_entries_ + 1), nullptr);
+    graph_k_.assign(graph_exec_.size(), 0);
+    err.clear();
+    return true;
+}
+
 bool SecondaryRunner::start_async_launch(int core, std::string& err) {
     if (stream_ == nullptr || launcher_.joinable()) {
         err = "secondary runner: async launch needs an initialised runner, once";
@@ -285,6 +294,49 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
         return !profile_timing_ || cuda_ok(cudaEventRecord((cudaEvent_t) timing_events_[index], stream),
                                            "runner timing marker", err);
     };
+    if (graph_ && !profile_timing_) {
+        const size_t rows = selected_rows_.size();
+        const size_t gi = (size_t) n_tokens * (size_t) (max_entries_ + 1) + rows;
+        void*& ge = graph_exec_[gi];
+        if (ge != nullptr && graph_k_[gi] != k) {
+            cudaGraphExecDestroy((cudaGraphExec_t) ge);
+            ge = nullptr;
+        }
+        if (ge == nullptr) {
+            const size_t out_bytes = (size_t) entries * n_embd_ * sizeof(float);
+            if (!cuda_ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "runner graph capture", err))
+                return false;
+            cudaMemcpyAsync(device_ptr_, host_meta_, meta_bytes_, cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float), cudaMemcpyHostToDevice,
+                            stream);
+            cudaMemsetAsync(device_out_, 0, out_bytes, stream);
+            kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
+            kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
+                                           entries, entries, device_xq_, device_scratch_, device_out_, stream,
+                                           device_scales_);
+            cudaMemcpyAsync(host_out_, device_out_, rows * (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost,
+                            stream);
+            cudaGraph_t graph = nullptr;
+            const cudaError_t ce = cudaStreamEndCapture(stream, &graph);
+            const cudaError_t ie = ce == cudaSuccess
+                ? cudaGraphInstantiate((cudaGraphExec_t*) &ge, graph, 0) : ce;
+            if (graph != nullptr) cudaGraphDestroy(graph);
+            if (ie != cudaSuccess) {
+                ge = nullptr;
+                err = std::string("secondary runner: graph capture: ") + cudaGetErrorString(ie);
+                return false;
+            }
+            graph_k_[gi] = k;
+        }
+        if (!cuda_ok(cudaGraphLaunch((cudaGraphExec_t) ge, stream), "runner graph launch", err) ||
+            !cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
+            return fail_enqueued();
+        pending_ = true;
+        if (!async_)
+            ms_launch_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - launch_t0).count();
+        err.clear();
+        return true;
+    }
     const auto enqueue_t0 = std::chrono::steady_clock::now();
     if (!mark(0) ||
         !cuda_ok(cudaMemcpyAsync(device_ptr_, host_meta_, meta_bytes_, cudaMemcpyHostToDevice, stream),
@@ -471,6 +523,8 @@ void SecondaryRunner::close() {
         raw = nullptr;
     }
     if (done_ != nullptr && cudaEventDestroy((cudaEvent_t) done_) != cudaSuccess) std::abort();
+    for (void*& ge : graph_exec_)
+        if (ge != nullptr) { cudaGraphExecDestroy((cudaGraphExec_t) ge); ge = nullptr; }
     if (stream_ != nullptr && cudaStreamDestroy((cudaStream_t) stream_) != cudaSuccess) std::abort();
     if (host_out_ != nullptr && cudaFreeHost(host_out_) != cudaSuccess) std::abort();
     if (host_meta_ != nullptr && cudaFreeHost(host_meta_) != cudaSuccess) std::abort();

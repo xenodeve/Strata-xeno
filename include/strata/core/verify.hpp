@@ -82,6 +82,7 @@ public:
     void set_pcie_share(bool on) { pcie_share_ = on; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_launch = 0, ms_tail = 0;   // cudaGraphLaunch; after the last pool until the window's stream is done
     int64_t windows = 0;
 
 private:

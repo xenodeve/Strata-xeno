@@ -47,6 +47,10 @@ public:
     /// `core` when >= 0), so the host thread goes straight on to the CPU pool; finish() first waits for the
     /// helper. Arithmetic and outputs are unchanged. Call once, after init().
     bool start_async_launch(int core, std::string& err);
+    /// Issue #25: enqueue each launch as one CUDA graph per token count (captured on first use, sized for every
+    /// entry; the kernels read the real group count from the metadata) instead of ~12 API calls. Outputs are
+    /// unchanged. Ignored while profile timing is on (its event markers are per call).
+    bool set_graph(bool on, std::string& err);
     /// Helper-thread time spent enqueueing (async mode), and host time finish() waited for that enqueue.
     double ms_async_enqueue() const { return ms_async_enqueue_; }
     double ms_async_wait() const { return ms_async_wait_; }
@@ -111,6 +115,9 @@ private:
     bool launch_req_ = false, launch_stop_ = false;
     std::atomic<bool> launch_done_{true};
     bool async_ = false, async_ok_ = true;
+    bool graph_ = false;
+    std::vector<void*> graph_exec_;   // per (token count, claimed rows): the D2H copies only the claimed rows
+    std::vector<int> graph_k_;
     std::string async_err_;
     kernels::NativeExpertLayout job_layout_{};
     const SecondaryArena* job_weights_ = nullptr;

@@ -40,7 +40,7 @@ static void ck(cudaError_t e, const char* at) {
 
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 6) {
-        std::fprintf(stderr, "usage: native_q2_pool_hit_parity <q2_0-first-shard.gguf> [layer] [expert] [seed] [input.bin|--secondary|--runner|--runner-timing|--runner-monitor-abort]\n");
+        std::fprintf(stderr, "usage: native_q2_pool_hit_parity <q2_0-first-shard.gguf> [layer] [expert] [seed] [input.bin|--secondary|--runner|--runner-graph|--runner-timing|--runner-monitor-abort]\n");
         return 2;
     }
     constexpr int H = cpu::H, FF = cpu::FF, ENTRIES = 3;
@@ -49,7 +49,9 @@ int main(int argc, char** argv) {
     const int seed = argc > 4 ? std::atoi(argv[4]) : 1107;
     const bool monitor_abort_mode = argc > 5 && std::strcmp(argv[5], "--runner-monitor-abort") == 0;
     const bool runner_timing_mode = argc > 5 && std::strcmp(argv[5], "--runner-timing") == 0;
-    const bool runner_mode = monitor_abort_mode || runner_timing_mode ||
+    // --runner-graph: the same three launches replayed through one captured CUDA graph (issue #25)
+    const bool runner_graph_mode = argc > 5 && std::strcmp(argv[5], "--runner-graph") == 0;
+    const bool runner_mode = monitor_abort_mode || runner_timing_mode || runner_graph_mode ||
                              (argc > 5 && std::strcmp(argv[5], "--runner") == 0);
     const bool secondary = runner_mode || (argc > 5 && std::strcmp(argv[5], "--secondary") == 0);
     if (secondary) {
@@ -270,6 +272,7 @@ int main(int argc, char** argv) {
         std::vector<float> runner_out((size_t) ENTRIES * H, 0.f);
         if (!runner.init(ENTRIES, ENTRIES, H, FF, runner_err,
                          strata::core::kSecondaryReserveBytes, runner_timing_mode) ||
+            !runner.set_graph(runner_graph_mode, runner_err) ||
             !runner.launch(layout, secondary_arena, x.data(), selected_slots, ENTRIES, 1, runner_err) ||
             !runner.finish(runner_out.data(), runner_err)) {
             std::fprintf(stderr, "secondary runner: %s\n", runner_err.c_str());

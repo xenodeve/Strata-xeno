@@ -575,12 +575,14 @@ if(STRATA_NATIVE_EXPERTS)
              COMMAND native_q2_pool_hit_parity "${STRATA_XENO_Q2_GGUF}" 0 7 -2 --runner)
     add_test(NAME gpu_dual_q2_runner_layer47
              COMMAND native_q2_pool_hit_parity "${STRATA_XENO_Q2_GGUF}" 47 361 1107 --runner)
+    add_test(NAME gpu_dual_q2_runner_graph_layer47
+             COMMAND native_q2_pool_hit_parity "${STRATA_XENO_Q2_GGUF}" 47 361 1107 --runner-graph)
     add_test(NAME gpu_dual_q2_runner_timing_layer0
              COMMAND native_q2_pool_hit_parity "${STRATA_XENO_Q2_GGUF}" 0 7 -2 --runner-timing)
     set_tests_properties(gpu_4070_q2_parity_layer0 gpu_4070_q2_parity_layer47
                          PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
     set_tests_properties(gpu_dual_q2_parity_layer0 gpu_dual_q2_parity_layer47
-                         gpu_dual_q2_runner_layer0 gpu_dual_q2_runner_layer47 gpu_dual_q2_runner_timing_layer0
+                         gpu_dual_q2_runner_layer0 gpu_dual_q2_runner_layer47 gpu_dual_q2_runner_graph_layer47 gpu_dual_q2_runner_timing_layer0
                          PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1,0")
     if(STRATA_XENO_PYTHON)
       add_test(NAME gpu_dual_monitor_abort
