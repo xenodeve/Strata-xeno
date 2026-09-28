@@ -17,9 +17,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -59,6 +64,46 @@ struct Alloc {
         used += bytes;
         return (T*) p;
     }
+};
+
+// Pageable experts (the arena is not page-locked, e.g. under exclusive GPU ownership) must be copied into a pinned
+// staging slot before the DMA. One thread doing that copy spent 17.9 s of an 8K prompt's 32 s
+// (strata-claude-exclborrow): a few workers copy the slots of the ring in parallel instead.
+class Stager {
+public:
+    void start(int n, int device) {
+        for (int i = 0; i < n; ++i)
+            th_.emplace_back([this, device] {
+                cudaSetDevice(device);
+                for (;;) {
+                    std::function<void()> job;
+                    {
+                        std::unique_lock<std::mutex> lk(mu_);
+                        cv_.wait(lk, [this] { return stop_ || !q_.empty(); });
+                        if (stop_ && q_.empty()) return;
+                        job = std::move(q_.front());
+                        q_.pop_front();
+                    }
+                    job();
+                }
+            });
+    }
+    void submit(std::function<void()> job) {
+        { std::lock_guard<std::mutex> lk(mu_); q_.push_back(std::move(job)); }
+        cv_.notify_one();
+    }
+    bool running() const { return !th_.empty(); }
+    ~Stager() {
+        { std::lock_guard<std::mutex> lk(mu_); stop_ = true; }
+        cv_.notify_all();
+        for (auto& t : th_) t.join();
+    }
+private:
+    std::vector<std::thread> th_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> q_;
+    bool stop_ = false;
 };
 
 }  // namespace
@@ -105,6 +150,8 @@ struct Prefill::Impl {
     uint8_t* stage_host[STAGE] = {};
     cudaEvent_t copied[STAGE] = {}, used[STAGE] = {};
     bool stage_live[STAGE] = {};
+    std::atomic<int> stage_ready[STAGE] = {};   // a pageable slot's copy is enqueued and `copied` recorded
+    Stager stager;                              // declared after the slots: joined before they are freed
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_emb_host;
@@ -466,13 +513,29 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             // DMA straight from the page-locked arena: the copy stream only waits for the slot
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
                             cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                            cudaEventRecord(m.copied[sl], m.copy);
+                            m.stage_ready[sl].store(1, std::memory_order_release);
                             ++stats_.experts_dma;
                         } else {
-                            if (m.stage_live[sl]) cudaEventSynchronize(m.used[sl]);   // its previous blob was dequantized
-                            std::memcpy(m.stage_host[sl], b, (size_t) lay.blob_bytes(l));
-                            cudaMemcpyAsync(m.stage_dev[sl], m.stage_host[sl], (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                            // a worker waits for the slot's previous blob to be dequantized, copies this blob into
+                            // the pinned slot and enqueues its DMA; the compute loop waits for `stage_ready` first
+                            if (!m.stager.running()) {
+                                int dev = 0;
+                                cudaGetDevice(&dev);
+                                m.stager.start(4, dev);
+                            }
+                            m.stage_ready[sl].store(0, std::memory_order_relaxed);
+                            const bool live = m.stage_live[sl];
+                            const size_t bytes = (size_t) lay.blob_bytes(l);
+                            Impl* mp = &m;
+                            m.stager.submit([mp, sl, b, bytes, live] {
+                                if (live) cudaEventSynchronize(mp->used[sl]);
+                                std::memcpy(mp->stage_host[sl], b, bytes);
+                                cudaMemcpyAsync(mp->stage_dev[sl], mp->stage_host[sl], bytes, cudaMemcpyHostToDevice, mp->copy);
+                                cudaEventRecord(mp->copied[sl], mp->copy);
+                                mp->stage_ready[sl].store(1, std::memory_order_release);
+                            });
                         }
-                        cudaEventRecord(m.copied[sl], m.copy);
                         m.stage_live[sl] = true;
                         stage_of[j] = sl;
                         stats_.ms_experts_host += ms_since(th);
@@ -492,6 +555,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             blob_dev = m.cache->device_slot(m.host_res[(size_t) l * NE + e]);
                             ++stats_.experts_resident;
                         } else {
+                            while (m.stage_ready[stage_of[j]].load(std::memory_order_acquire) == 0) std::this_thread::yield();
                             cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
                             blob_dev = m.stage_dev[stage_of[j]];
                         }

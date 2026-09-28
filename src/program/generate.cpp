@@ -201,6 +201,10 @@ struct Options {
     bool secondary_profile_timing = false; ///< opt-in CUDA events; normal decode adds no markers
     bool secondary_stage_only = false; ///< A/B arm before routing work to device 1
     bool exclusive_primary_experts = false; ///< Phase 4 static GPU ownership; host pages decommitted after fill
+    /// -1 (default): exclusive ownership whenever the configuration supports it (a measured win with no trade-off:
+    /// strata-claude-stager, 8K prompt: -7.86 GiB host RAM, decode +7.5 %, TTFT unchanged, outputs identical);
+    /// 1: --exclusive-primary-experts (an error when unsupported); 0: --no-exclusive-primary-experts.
+    int exclusive_mode = -1;
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -736,7 +740,8 @@ int main(int argc, char** argv) {
         else if (a == "--mmvq-exact") o.mmvq_exact = std::atoi(next("--mmvq-exact"));
         else if (a == "--secondary-graph") o.secondary_graph = std::atoi(next("--secondary-graph"));
         else if (a == "--route-trace") o.route_trace = next("--route-trace");
-        else if (a == "--exclusive-primary-experts") o.exclusive_primary_experts = true;
+        else if (a == "--exclusive-primary-experts") o.exclusive_mode = 1;
+        else if (a == "--no-exclusive-primary-experts") o.exclusive_mode = 0;
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--prefill") o.prefill_chunk = std::atoll(next("--prefill"));
@@ -806,10 +811,6 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // adaptive tiers: measured wins with no trade-off inside the mode that enables them (AGENTS.md default rule)
-    if (o.adapt_swaps < 0) o.adapt_swaps = o.exclusive_primary_experts ? 8 : 96;
-    if (o.adapt_every < 0) o.adapt_every = o.exclusive_primary_experts ? 1 : 4;
-    if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 ? 8 : 0;
     if ((o.ple_io != "direct" && o.ple_io != "mmap") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
         o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
         std::fprintf(stderr, "strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
@@ -935,15 +936,21 @@ int main(int argc, char** argv) {
                              "expert pool and --pcie-frac 0 until combined routing is validated\n");
         return 2;
     }
-    if (o.exclusive_primary_experts &&
-        (!secondary_q2 || o.spec < 2 || o.mmap_experts || o.cache_cpu_only || o.no_pool ||
-         !o.no_prefill_borrow || o.pcie_frac != 0.0 ||
-         o.expert_profile.empty())) {
-        std::fprintf(stderr, "strata generate: --exclusive-primary-experts requires native Q2_0, spec >=2, "
-                             "a profile, --no-prefill-borrow, --pcie-frac 0 "
-                             "and an enabled CPU pool; it excludes mmap/forced-CPU modes\n");
-        return 2;
+    {
+        const bool eligible = secondary_q2 && o.spec >= 2 && !o.mmap_experts && !o.cache_cpu_only && !o.no_pool &&
+                              o.pcie_frac == 0.0 && !o.expert_profile.empty() && o.expert_cache != 0;
+        if (o.exclusive_mode == 1 && !eligible) {
+            std::fprintf(stderr, "strata generate: --exclusive-primary-experts requires native Q2_0, spec >=2, "
+                                 "a profile, an expert cache, --pcie-frac 0 "
+                                 "and an enabled CPU pool; it excludes mmap/forced-CPU modes\n");
+            return 2;
+        }
+        o.exclusive_primary_experts = o.exclusive_mode == 1 || (o.exclusive_mode < 0 && eligible);
     }
+    // adaptive tiers: measured wins with no trade-off inside the mode that enables them (AGENTS.md default rule)
+    if (o.adapt_swaps < 0) o.adapt_swaps = o.exclusive_primary_experts ? 8 : 96;
+    if (o.adapt_every < 0) o.adapt_every = o.exclusive_primary_experts ? 1 : 4;
+    if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 ? 8 : 0;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
@@ -1508,6 +1515,25 @@ if (o.expert_cache_per_layer) {
                      secondary_compute ? "SECONDARY COMPUTE" : "STAGING ONLY, no secondary compute");
     }
 
+    // Exclusive ownership and prompt-path borrowing together: the prompt path lends the cache's LAST slots and
+    // refills them from the host afterwards, so the experts in those slots keep their host copies. The tail is
+    // found exactly as the serve loop finds it (the chunk halves until the buffers fit in the lendable slots).
+    int32_t excl_keep_from = INT32_MAX;
+    if (o.exclusive_primary_experts && !o.no_prefill_borrow && o.prefill_chunk > 0 && xcache.slots() > 0) {
+        for (int64_t chunk = o.prefill_chunk; chunk >= 256; chunk /= 2) {
+            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, chunk);
+            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
+            if (xcache.slot_offsets() != nullptr) {
+                k = 0;
+                while (k < xcache.slots() &&
+                       (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+            }
+            if (k + 128 <= xcache.slots()) { excl_keep_from = (int32_t) (xcache.slots() - k); break; }
+        }
+    }
+    if (o.exclusive_primary_experts && o.exclusive_mode < 0 && (prefilled <= 0 || xcache.slots() <= 0))
+        o.exclusive_primary_experts = false;   // the default only applies where there is a primary tier to own
     if (o.exclusive_primary_experts) {
         if (prefilled <= 0 || xcache.slots() <= 0) {
             std::fprintf(stderr, "strata generate: exclusive primary tier has no verified resident experts\n");
@@ -1521,7 +1547,7 @@ if (o.expert_cache_per_layer) {
             if (seen[index]) continue;
             seen[index] = 1;
             const int32_t slot = xcache.slot_of(layer, expert);
-            if (slot < 0) continue;
+            if (slot < 0 || slot >= excl_keep_from) continue;   // the lendable tail keeps its host copy
             const uint8_t* blob = arena_src.blob(layer, expert);
             const int64_t bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
             if (blob == nullptr || !xcache.verify_slot(slot, blob, err, bytes)) {
@@ -2442,7 +2468,7 @@ if (o.expert_cache_per_layer) {
                     for (const PSwap& s : ps_h2d) {
                         host_res[(size_t) s.layer * g.n_expert + s.in] = s.slot;
                         std::string e;
-                        if (!arena_src.release_host_copy(s.layer, s.in, e)) {
+                        if (s.slot < excl_keep_from && !arena_src.release_host_copy(s.layer, s.in, e)) {
                             std::fprintf(stderr, "strata generate: paired swap release: %s\n", e.c_str());
                             return false;
                         }
@@ -2454,25 +2480,33 @@ if (o.expert_cache_per_layer) {
                 if (!ps_d2h.empty() && ps_h2d.empty() && cudaEventQuery(d2h_ev) == cudaSuccess) {   // stage 2
                     // the evicted expert goes home first; its staging slot then takes the newcomer
                     std::vector<CopyJob> home_jobs, in_jobs;
+                    std::vector<char> went_home(ps_d2h.size(), 0);
                     for (size_t i = 0; i < ps_d2h.size(); ++i) {
                         const PSwap& s = ps_d2h[i];
                         const size_t bytes = (size_t) lay.blob_bytes(s.layer);
                         uint8_t* st = ps_stage + i * ps_blob;
                         std::string e;
-                        uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
                         const uint8_t* src = srcp->blob(s.layer, s.in);
-                        if (home == nullptr || src == nullptr) {
-                            std::fprintf(stderr, "strata generate: paired swap copy-home: %s\n", e.c_str());
+                        if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
+                            uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
+                            if (home == nullptr) {
+                                std::fprintf(stderr, "strata generate: paired swap copy-home: %s\n", e.c_str());
+                                return false;
+                            }
+                            home_jobs.push_back({home, st, bytes});
+                            went_home[i] = 1;
+                        }
+                        if (src == nullptr) {
+                            std::fprintf(stderr, "strata generate: paired swap newcomer has no host copy\n");
                             return false;
                         }
-                        home_jobs.push_back({home, st, bytes});
                         in_jobs.push_back({st, src, bytes});
                     }
                     parallel_copy(home_jobs);
                     parallel_copy(in_jobs);
                     for (size_t i = 0; i < ps_d2h.size(); ++i) {
                         const PSwap& s = ps_d2h[i];
-                        arena_src.publish_host_copy(s.layer, s.out);
+                        if (went_home[i]) arena_src.publish_host_copy(s.layer, s.out);
                         host_res[(size_t) s.layer * g.n_expert + s.out] = strata::core::kNotResident;
                         if (cudaMemcpyAsync(xcache.device_slot(s.slot), in_jobs[i].dst, in_jobs[i].bytes,
                                             cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
@@ -2500,7 +2534,7 @@ if (o.expert_cache_per_layer) {
                 const int32_t* sr = drive.d.secondary_res ? drive.d.secondary_res + l * g.n_expert : nullptr;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && (sr == nullptr || sr[e] < 0)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    else if (!paired || r[e] < excl_keep_from) vict.emplace_back(u[e], e);   // not the lent tail
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -3473,7 +3507,7 @@ if (o.expert_cache_per_layer) {
                     for (const PSwap& s : ps_h2d) {
                         host_res[(size_t) s.layer * g.n_expert + s.in] = s.slot;
                         std::string e;
-                        if (!arena_src.release_host_copy(s.layer, s.in, e)) {
+                        if (s.slot < excl_keep_from && !arena_src.release_host_copy(s.layer, s.in, e)) {
                             std::fprintf(stderr, "strata generate: paired swap release: %s\n", e.c_str());
                             return false;
                         }
@@ -3487,25 +3521,33 @@ if (o.expert_cache_per_layer) {
                 if (!ps_d2h.empty() && ps_h2d.empty() && cudaEventQuery(d2h_ev) == cudaSuccess) {   // stage 2
                     // the evicted expert goes home first; its staging slot then takes the newcomer
                     std::vector<CopyJob> home_jobs, in_jobs;
+                    std::vector<char> went_home(ps_d2h.size(), 0);
                     for (size_t i = 0; i < ps_d2h.size(); ++i) {
                         const PSwap& s = ps_d2h[i];
                         const size_t bytes = (size_t) lay.blob_bytes(s.layer);
                         uint8_t* st = ps_stage + i * ps_blob;
                         std::string e;
-                        uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
                         const uint8_t* src = srcp->blob(s.layer, s.in);
-                        if (home == nullptr || src == nullptr) {
-                            std::fprintf(stderr, "strata generate: paired swap copy-home: %s\n", e.c_str());
+                        if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
+                            uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
+                            if (home == nullptr) {
+                                std::fprintf(stderr, "strata generate: paired swap copy-home: %s\n", e.c_str());
+                                return false;
+                            }
+                            home_jobs.push_back({home, st, bytes});
+                            went_home[i] = 1;
+                        }
+                        if (src == nullptr) {
+                            std::fprintf(stderr, "strata generate: paired swap newcomer has no host copy\n");
                             return false;
                         }
-                        home_jobs.push_back({home, st, bytes});
                         in_jobs.push_back({st, src, bytes});
                     }
                     parallel_copy(home_jobs);
                     parallel_copy(in_jobs);
                     for (size_t i = 0; i < ps_d2h.size(); ++i) {
                         const PSwap& s = ps_d2h[i];
-                        arena_src.publish_host_copy(s.layer, s.out);
+                        if (went_home[i]) arena_src.publish_host_copy(s.layer, s.out);
                         host_res[(size_t) s.layer * g.n_expert + s.out] = strata::core::kNotResident;
                         if (cudaMemcpyAsync(xcache.device_slot(s.slot), in_jobs[i].dst, in_jobs[i].bytes,
                                             cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
@@ -3535,7 +3577,7 @@ if (o.expert_cache_per_layer) {
                 const int32_t* sr = drive.d.secondary_res ? drive.d.secondary_res + l * g.n_expert : nullptr;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && (sr == nullptr || sr[e] < 0)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    else if (!paired || r[e] < excl_keep_from) vict.emplace_back(u[e], e);   // not the lent tail
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
