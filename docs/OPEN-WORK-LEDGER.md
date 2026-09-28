@@ -29,12 +29,18 @@ State on 2026-09-29. Every number comes from a same-session ABBA with identical 
 | `gr_down_multi` one-wave geometry | Tried and not kept: `wait for rings` unchanged. The parity test `xeno_gr_multi_parity` was kept (`21a2ed0`). |
 | HIGH process class | `0a2d70d`: `--process-priority` is opt-in; code +2.6 %, thai +1.3 %. Every measurement arm now runs at HIGH class. |
 | Measurement tools in the repo | #24 closed (`99c5cdf`). |
-| #16 pool workers 6/9/13 | Running (`strata-claude-workers`). |
+| #16 pool workers | `ExpertPool::rest()` (`ba0cade`, default on) lets 13 workers win: code 89.2, thai 53.8 tok/s, CPU rows 42.8 GB/s. The engine default is already all cores; the serving worker count is the developer's call. |
+| #27 serving decode | Root cause: the PCIe read path stalls the verify window on the x4 primary. `--pcie-frac` now defaults to 0 (`704ac58`): serving 8K decode 3.24 -> 61.92 tok/s. |
+| Exclusive 5060 Ti, default | `fdaddbe`: it works together with prompt borrowing, and pageable staging runs on 4 workers. Serving 8K: -7.86 GiB host RAM, decode +5.3 %, TTFT unchanged. |
+| Placement-first cold start | `1d35b34`..`77bbd38`: the arena is reserve-only, GPU tiers fill straight from the pack with unbuffered pipelined reads, and only host-owned experts are committed. No boot spike: dual peak 31.0 GB (was 46.3), serving 38.9 GB (was 46.6). Boot ~161 s -> ~18 s. |
+| Exclusive 4070 (#4 A+B) | `5213b90`, `ea04a91`: opt-in `--exclusive-secondary-experts`, with paired 4070 swaps. -8.5 GB RAM for -2.5-3 % decode, so it is waiting for the developer. |
+| #28 P1 host-memory modes | Opened. Supersedes #17 (closed): normal / locked / hybrid, layer-contiguous layout. |
 
 **Waiting for the developer:**
+- Whether the dual-GPU default uses an exclusive 4070 (-8.5 GB RAM for -2.5-3 % decode).
+- Deploying the new engine to `engine-xeno/strata.exe`, which picks up the #27 fix, the exclusive default and placement-first.
 - Whether the serving default uses `--process-priority 2`, given the risk of desktop starvation.
 - The dual-GPU serving profile (#12/#21).
-- Large pages (#17).
 - Quantizing the BF16 hyper-connection weights, which breaks ADR 0001.
 - The trunk split across GPUs (H4 on dense projections).
 
