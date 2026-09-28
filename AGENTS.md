@@ -32,6 +32,20 @@ runs or tools.
   single-digit %", built from an Nsight trace plus a different run's dispatch
   counters, is the example not to repeat.
 
+## Run every speed measurement at high CPU priority
+
+Other programs on this machine (browser, Discord, Wallpaper Engine, Defender scans) take CPU time from the pool's
+pinned workers. A pinned worker cannot migrate, so one preempted worker stalls the whole layer. That is the
+most likely source of the random slow runs (CPU rows 13–14 GB/s against 19–24 GB/s on identical work,
+2026-09-28 sweeps).
+
+- **Every A/B, ABBA or sweep passes `--pool-priority 2`** (THREAD_PRIORITY_HIGHEST for the pool workers and the
+  host thread) **in every arm**, so both sides get the same condition. Record it in the report.
+- Report whether a run was disturbed (for example, another CPU-heavy job was running) rather than silently
+  keeping it. Do not run builds or other CPU-heavy work while a measurement is in flight.
+- Measured numbers at high priority describe the engine, not a normal-priority server. Whether the serving
+  launcher also raises priority is a separate decision for the developer, backed by the same measurements.
+
 ## Other standing rules
 
 - **The correctness gate is greedy raw-token parity against a same-session
