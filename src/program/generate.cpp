@@ -175,7 +175,7 @@ struct Options {
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
     std::string route_trace;              ///< append each verify window's routed expert ids to this file
-    int pool_priority = 0;                ///< THREAD_PRIORITY_* for the pool workers and the host thread
+    int pool_priority = 2;                ///< THREAD_PRIORITY_* for pool workers + host; 2 = HIGHEST (default, 0 = off)
     bool lock_cpu_experts = false;        ///< VirtualLock the host pages of experts only the CPU serves
     bool secondary_async_launch = false;  ///< enqueue the 4070's work on a helper thread (off the host path)
     bool secondary_profile_timing = false; ///< opt-in CUDA events; normal decode adds no markers
@@ -374,6 +374,9 @@ void usage() {
                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
+                 "  --pool-priority P    Windows thread priority of the pool workers and the host thread.  Default 2\n"
+                 "                       (HIGHEST): pinned workers are otherwise preempted by other programs and the\n"
+                 "                       layer waits; +17 %% code / +36 %% Thai decode measured.  0 keeps the OS default.\n"
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on.  A sweep is how the pool's\n"
                  "                       deviation from `cpu_s2` is attributed.\n"
