@@ -1,0 +1,26 @@
+# Native Q2 decode GPU trace — Nsight Systems
+
+The existing `--gpu-stages` diagnostic cannot run on the native Q2 pack: `generate.cpp` deliberately skips `session_capture` for native experts, while the diagnostic requires `SessionGraphs::split_captured`. A probe exited with `session_replay_stages: not captured with split` after loading; it produced **no usable stage numbers**. Forcing a different single-token graph would profile a different execution path.
+
+An opt-in `--profile-decode-range` now calls `cudaProfilerStart/Stop` around the actual speculative verifier decode loop. Nsight Systems 2026.1.3 collected CUDA graph **node** activity for a 256-token code run of the compact-D2H branch, with CPU sampling disabled because administrator privileges were unavailable. The profiler reported a successful process exit and wrote `%TEMP%\strata-codex-primary-nsys-code256\decode.nsys-rep` (plus SQLite export and exact command JSON). The same binary and placement passed 256/256 code parity in the earlier unprofiled run; Nsight's child stdout was not captured as a raw-token artifact, so this trace is **timing evidence, not an additional parity check**.
+
+The run used the EXL3-only ranked profile, 6,653 primary cache slots, 8.5 GiB secondary tier, six CPU workers, MTP `--spec 4`, `--prefill 2048`, `--max-context 8192`, and `CUDA_VISIBLE_DEVICES=1,0` (logical CUDA 0 = 5060 Ti, logical 1 = 4070 SUPER). The captured primary `native_gu_kernel` count was 7,200 = 75 verifier rounds × 48 layers × two groups, consistent with decode-only capture.
+
+## Per-device activity in the trace
+
+| Logical device | Kernel + copy activity union | First-to-last activity span | Idle gaps in that span | Share active |
+|---|---:|---:|---:|---:|
+| CUDA 0 / 5060 Ti | 4,839.47 ms | 5,366.69 ms | 527.22 ms | 90.2% |
+| CUDA 1 / 4070 SUPER | 1,121.98 ms | 5,361.33 ms | 4,239.36 ms | 20.9% |
+
+These are unions of recorded CUDA kernel/copy intervals, **not GPU utilization samples, end-to-end decode wall time or causal critical-path savings**. Concurrent streams can overlap; an individual kernel-duration sum must not be added to another device's wall time. Trace instrumentation may change scheduling.
+
+On the 5060 Ti, `native_gu_kernel<Q2_0>` took 1,594.1 ms over 7,200 calls and `native_down_kernel<Q2_0>` 883.4 ms over 7,200 calls. Together they account for **2,477.5 ms, about 51.2% of the primary's 4,836.8 ms summed kernel durations**. Other notable primary intervals were `wait_flag_ge_kernel` 370.7 ms (includes GPU-side waits), Q3K projection kernel 250.1 ms, `copy_from_mapped_kernel` 232.3 ms, GR down 220.0 ms and GR up 152.3 ms. The primary Q2 expert kernels are the largest measured GPU work class in this trace.
+
+On the 4070 SUPER, Q2 gate/up took 706.5 ms and down 362.3 ms, totaling 1,068.8 ms of its roughly 1,084.6 ms kernel duration sum. Nsight's memcpy records for that card showed H2D **142.3 MiB / 16.75 ms** and D2H **345.6 MiB / 20.66 ms** for this capture. The D2H byte count agrees with the compact runner's 345.87 MiB API-requested counter in a separate 256-token code run. It is much smaller than the earlier CUDA-event “H2D/D2H intervals,” validating the caveat that event bracketing across host enqueue calls includes idle gaps. [NVIDIA's event API](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__EVENT.html) documents asynchronous event-record timing limits.
+
+## Next falsifying experiment
+
+The 5060 is near continuously busy while the 4070 has large idle gaps. A fixed-placement experiment should move some profile-ranked experts from primary to secondary **without changing Q2 arithmetic, MTP or the 4070 reserve**, e.g. compare the proven 6,653 primary slots against a 5,000-slot primary with the same 8.5 GiB secondary cap. Measure primary/secondary/CPU tier hits, post-CPU secondary wait, per-device busy time and complete decode wall time; preserve 256/256 greedy IDs. If the 4070 tail grows at least as much as primary work falls, load balancing is not the next win. One-run throughput alone cannot select a policy given the measured CPU load variance.
+
+The current graph trace does not split primary expert gate/up versus down **by layer** or isolate pure GPU arithmetic from waits inside every graph node. It does show that optimizing only metadata H2D and D2H transfer volume has a modest ceiling relative to primary expert compute on this workload.

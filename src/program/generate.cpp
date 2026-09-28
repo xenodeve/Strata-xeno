@@ -46,6 +46,7 @@
 #include "strata/program/logits_selection.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -197,6 +198,7 @@ struct Options {
     /// R0.9: capture each layer as THREE graphs and time them from outside the capture, which is the only
     /// valid way to get a per-stage table on the real graph.  Prints and exits; it is a measurement, not a run.
     bool gpu_stages = false;
+    bool profile_decode_range = false; ///< mark real verifier decode for Nsight Systems
     bool stats = false;
     bool shared_late = false;          ///< plan v0.3 P3 A/B: shared expert inside post[l] (old order)
     bool keep_canonical = false;       ///< plan v0.3 P1 A/B: load canonical copies of natively served tensors
@@ -338,6 +340,7 @@ void usage() {
                  "  --gpu-stages         R0.9: capture the layer as three graphs (mixer / ffn+router / post)\n"
                  "                       and time them from OUTSIDE the capture.  The per-stage table on the\n"
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
+                 "  --profile-decode-range  Mark real decode with cudaProfilerStart/Stop for Nsight.\n"
                  "  --expert-profile P   R4.2e: pre-load the VRAM tier from a `profile.bin` (see\n"
                  "                       tools/make_profile.py) instead of admitting on first use.\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
@@ -718,6 +721,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--gpu-stages") o.gpu_stages = true;
+        else if (a == "--profile-decode-range") o.profile_decode_range = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
@@ -854,6 +858,10 @@ int main(int argc, char** argv) {
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
+    if (o.gpu_stages && native_pack) {
+        std::fprintf(stderr, "strata generate: --gpu-stages needs SessionGraphs, unavailable on native-pack verifier decode; use --profile-decode-range\n");
+        return 2;
+    }
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
     if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
     const bool secondary_q2 = native_pack &&
@@ -3159,9 +3167,17 @@ if (o.expert_cache_per_layer) {
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
-        const double pool_ms0 = drive.cpu_ms;
-        const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
-        while ((int64_t) produced.size() < o.max_new) {
+    const double pool_ms0 = drive.cpu_ms;
+    const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
+    if (o.profile_decode_range && cudaProfilerStart() != cudaSuccess) {
+        std::fprintf(stderr, "strata generate: cudaProfilerStart failed\n");
+        return 1;
+    }
+    if (o.profile_decode_range && (o.gpu_stages || o.graph_only || o.gpu_only_full)) {
+        std::fprintf(stderr, "strata generate: --profile-decode-range requires the real decode loop\n");
+        return 2;
+    }
+    while ((int64_t) produced.size() < o.max_new) {
             const Clock::time_point t0 = Clock::now();
             int T = o.spec;
             if (use_mtp && o.spec_min_p > 0.0) {
@@ -3241,7 +3257,11 @@ if (o.expert_cache_per_layer) {
                 std::fprintf(stderr, "strata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);
         }
-        std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
+    if (o.profile_decode_range && cudaProfilerStop() != cudaSuccess) {
+        std::fprintf(stderr, "strata generate: cudaProfilerStop failed\n");
+        return 1;
+    }
+    std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
                     rounds > 0 ? (double) (drafts_ok + rounds) / (double) rounds : 0.0);
