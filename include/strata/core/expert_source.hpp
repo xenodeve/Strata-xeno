@@ -342,6 +342,10 @@ public:
     /// Caller must first fill and verify this pair in the primary GPU cache.
     bool release_host_copy(int64_t layer, int64_t expert, std::string& err);
     uint64_t released_host_bytes() const { return released_host_bytes_; }
+    /// Phase 4 paired swap, for an expert the GPU owns exclusively: re-commit its host pages and return where its
+    /// bytes go (the caller copies them home from the GPU), then publish_host_copy once that copy has landed.
+    uint8_t* recommit_host_copy(int64_t layer, int64_t expert, std::string& err);
+    void publish_host_copy(int64_t layer, int64_t expert);
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's shard 1.
     void set_gguf(const std::string& shard1) { gguf_ = shard1; }
     void close();

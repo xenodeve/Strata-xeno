@@ -777,6 +777,31 @@ void ArenaExpertSource::close() {
     n_expert_ = 0;
 }
 
+uint8_t* ArenaExpertSource::recommit_host_copy(int64_t layer, int64_t expert, std::string& err) {
+    if (base_ == nullptr || arena_ == nullptr || layer < 0 || expert < 0 ||
+        expert >= n_expert_ || layer >= blobs_ / n_expert_) {
+        err = "exclusive host re-commit needs a loaded, in-range expert";
+        return nullptr;
+    }
+    const size_t index = (size_t) (layer * n_expert_ + expert);
+    if (index >= exclusive_.size() || !exclusive_[index]) {
+        err = "exclusive host re-commit needs a GPU-owned expert";
+        return nullptr;
+    }
+    const auto& layout = strata::kernels::cpu::expert_layout();
+    uint64_t committed = 0;
+    if (!((PinnedArena*) arena_)->commit_interior(layout.blob_offset(layer, expert), layout.blob_bytes(layer),
+                                                  committed, err)) return nullptr;
+    released_host_bytes_ -= committed < released_host_bytes_ ? committed : released_host_bytes_;
+    err.clear();
+    return const_cast<uint8_t*>(base_) + layout.blob_offset(layer, expert);   // GPU-owned until publish_host_copy
+}
+
+void ArenaExpertSource::publish_host_copy(int64_t layer, int64_t expert) {
+    const size_t index = (size_t) (layer * n_expert_ + expert);
+    if (index < exclusive_.size()) exclusive_[index] = 0;
+}
+
 bool ArenaExpertSource::release_host_copy(int64_t layer, int64_t expert, std::string& err) {
     if (base_ == nullptr || arena_ == nullptr || layer < 0 || expert < 0 ||
         expert >= n_expert_ || layer >= blobs_ / n_expert_) {

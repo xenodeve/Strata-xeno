@@ -48,6 +48,8 @@ struct PinnedArena {
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }
     bool decommit_interior(uint64_t offset, uint64_t bytes, uint64_t& released, std::string& err);
+    /// Re-commit exactly the pages decommit_interior released for the same range (their contents are zero).
+    bool commit_interior(uint64_t offset, uint64_t bytes, uint64_t& committed, std::string& err);
 };
 
 struct LoadStats {

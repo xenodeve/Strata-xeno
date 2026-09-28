@@ -239,6 +239,36 @@ bool PinnedArena::decommit_interior(uint64_t offset, uint64_t bytes, uint64_t& r
 #endif
 }
 
+bool PinnedArena::commit_interior(uint64_t offset, uint64_t bytes, uint64_t& committed, std::string& err) {
+    committed = 0;
+    if (base == nullptr || backing != PageBacking::NormalPages || registered_bytes != 0 ||
+        locked_bytes != 0 || bytes == 0 || offset > capacity || bytes > capacity - offset) {
+        err = "host page re-commit needs a pageable, unlocked arena and a valid byte range";
+        return false;
+    }
+#ifdef _WIN32
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const uintptr_t page = (uintptr_t) info.dwPageSize;
+    const uintptr_t first = (uintptr_t) base + (uintptr_t) offset;
+    const uintptr_t begin = (first + page - 1) & ~(page - 1);
+    const uintptr_t end = (first + (uintptr_t) bytes) & ~(page - 1);
+    if (end > begin) {
+        if (VirtualAlloc((void*) begin, (SIZE_T) (end - begin), MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+            err = "VirtualAlloc(MEM_COMMIT) failed with Windows error " +
+                  std::to_string((unsigned long long) GetLastError());
+            return false;
+        }
+        committed = (uint64_t) (end - begin);
+    }
+    err.clear();
+    return true;
+#else
+    err = "exclusive host page re-commit is Windows-only in this slice";
+    return false;
+#endif
+}
+
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,
                        uint64_t layers, int threads, uint64_t chunk) {
     std::vector<uint64_t> off((size_t) layers), n((size_t) layers, blobs_per_layer * blob_bytes);
