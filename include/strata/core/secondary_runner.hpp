@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -66,6 +67,9 @@ private:
     SecondaryTiming timing_{};
     float* host_x_ = nullptr;
     float* host_out_ = nullptr;
+    uint8_t* host_meta_ = nullptr;
+    size_t meta_start_off_ = 0, meta_count_off_ = 0, meta_dst_off_ = 0, meta_tok_off_ = 0;
+    size_t meta_bytes_ = 0;
     float* device_x_ = nullptr;
     uint8_t* device_xq_ = nullptr;
     float* device_scales_ = nullptr;
@@ -76,7 +80,7 @@ private:
     int32_t *device_dst_ = nullptr, *device_tok_ = nullptr;
     std::vector<unsigned long long> ptr_;
     std::vector<int32_t> start_, dst_, tok_, selected_rows_, group_slots_;
-    int32_t host_count_ = 0; ///< async H2D source must outlive launch() until finish()
+    int32_t host_count_ = 0; ///< copied into portable pinned metadata before enqueue
     bool pending_ = false;
     bool failed_ = false; ///< async enqueue failure poisons the runner until teardown
     uint64_t served_entries_ = 0, served_groups_ = 0;

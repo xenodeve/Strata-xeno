@@ -86,6 +86,11 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     const uint64_t count_at = carve(sizeof(int32_t));
     const uint64_t dst_at = carve((uint64_t) max_entries * sizeof(int32_t));
     const uint64_t tok_at = carve((uint64_t) max_entries * sizeof(int32_t));
+    meta_start_off_ = (size_t) (start_at - ptr_at);
+    meta_count_off_ = (size_t) (count_at - ptr_at);
+    meta_dst_off_ = (size_t) (dst_at - ptr_at);
+    meta_tok_off_ = (size_t) (tok_at - ptr_at);
+    meta_bytes_ = (size_t) (cursor - ptr_at);
     if (!workspace_.open(1, {cursor}, cursor, err)) return false;
     uint8_t* base = workspace_.slot_ptr(0);
     device_x_ = (float*) (base + x_at);
@@ -110,13 +115,16 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
         !cuda_ok(cudaHostAlloc((void**) &host_x_, (size_t) max_tokens * n_embd * sizeof(float),
                                cudaHostAllocPortable), "runner pinned input", err) ||
         !cuda_ok(cudaHostAlloc((void**) &host_out_, (size_t) max_entries * n_embd * sizeof(float),
-                               cudaHostAllocPortable), "runner pinned output", err)) {
+                               cudaHostAllocPortable), "runner pinned output", err) ||
+        !cuda_ok(cudaHostAlloc((void**) &host_meta_, meta_bytes_, cudaHostAllocPortable),
+                 "runner pinned metadata", err)) {
         stream_ = stream;
         done_ = done;
         return false;
     }
     stream_ = stream;
     done_ = done;
+    std::memset(host_meta_, 0, meta_bytes_);
     if (profile_timing_) {
         for (void*& raw : timing_events_) {
             cudaEvent_t event = nullptr;
@@ -174,6 +182,12 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
     }
     start_.push_back((int32_t) dst_.size());
     std::memcpy(host_x_, x, (size_t) n_tokens * n_embd_ * sizeof(float));
+    host_count_ = (int32_t) group_slots_.size();
+    std::memcpy(host_meta_, ptr_.data(), ptr_.size() * sizeof(ptr_[0]));
+    std::memcpy(host_meta_ + meta_start_off_, start_.data(), start_.size() * sizeof(start_[0]));
+    std::memcpy(host_meta_ + meta_count_off_, &host_count_, sizeof host_count_);
+    std::memcpy(host_meta_ + meta_dst_off_, dst_.data(), dst_.size() * sizeof(dst_[0]));
+    std::memcpy(host_meta_ + meta_tok_off_, tok_.data(), tok_.size() * sizeof(tok_[0]));
     const auto switch_t0 = std::chrono::steady_clock::now();
     if (profile_timing_)
         timing_.host_plan_ms += std::chrono::duration<double, std::milli>(switch_t0 - launch_t0).count();
@@ -205,23 +219,9 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
                                            "runner timing marker", err);
     };
     const auto enqueue_t0 = std::chrono::steady_clock::now();
-    host_count_ = (int32_t) group_slots_.size();
     if (!mark(0) ||
-        !cuda_ok(cudaMemcpyAsync(device_ptr_, ptr_.data(), ptr_.size() * sizeof(ptr_[0]),
-                                  cudaMemcpyHostToDevice, stream),
-                 "runner group pointers", err) ||
-        !cuda_ok(cudaMemcpyAsync(device_start_, start_.data(), start_.size() * sizeof(start_[0]),
-                                  cudaMemcpyHostToDevice, stream),
-                 "runner group starts", err) ||
-        !cuda_ok(cudaMemcpyAsync(device_count_, &host_count_, sizeof host_count_,
-                                  cudaMemcpyHostToDevice, stream),
-                 "runner group count", err) ||
-        !cuda_ok(cudaMemcpyAsync(device_dst_, dst_.data(), dst_.size() * sizeof(dst_[0]),
-                                  cudaMemcpyHostToDevice, stream),
-                 "runner destinations", err) ||
-        !cuda_ok(cudaMemcpyAsync(device_tok_, tok_.data(), tok_.size() * sizeof(tok_[0]),
-                                  cudaMemcpyHostToDevice, stream),
-                 "runner tokens", err) ||
+        !cuda_ok(cudaMemcpyAsync(device_ptr_, host_meta_, meta_bytes_, cudaMemcpyHostToDevice, stream),
+                 "runner packed metadata H2D", err) ||
         !cuda_ok(cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float),
                                  cudaMemcpyHostToDevice, stream), "runner activation H2D", err) ||
         !mark(1) ||
@@ -371,7 +371,7 @@ void SecondaryRunner::stop_monitor() {
 void SecondaryRunner::close() {
     stop_monitor();
     if (workspace_.slots() == 0 && stream_ == nullptr && done_ == nullptr &&
-        host_x_ == nullptr && host_out_ == nullptr) return;
+        host_x_ == nullptr && host_out_ == nullptr && host_meta_ == nullptr) return;
     int previous = -1;
     const cudaError_t current = cudaGetDevice(&previous);
     const cudaError_t selected = current == cudaSuccess ? cudaSetDevice(1) : current;
@@ -391,6 +391,7 @@ void SecondaryRunner::close() {
     if (done_ != nullptr && cudaEventDestroy((cudaEvent_t) done_) != cudaSuccess) std::abort();
     if (stream_ != nullptr && cudaStreamDestroy((cudaStream_t) stream_) != cudaSuccess) std::abort();
     if (host_out_ != nullptr && cudaFreeHost(host_out_) != cudaSuccess) std::abort();
+    if (host_meta_ != nullptr && cudaFreeHost(host_meta_) != cudaSuccess) std::abort();
     if (host_x_ != nullptr && cudaFreeHost(host_x_) != cudaSuccess) std::abort();
     std::string err;
     if (!workspace_.close(&err)) {

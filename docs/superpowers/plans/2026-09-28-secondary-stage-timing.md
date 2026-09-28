@@ -43,6 +43,8 @@ The CUDA event intervals may include host enqueue gaps, and six event markers pe
 
 ## Task 3: One optimization at a time
 
-- [ ] Write the smallest useful red test at the public runner/dispatch seam, implement one change (candidate: packed pinned metadata H2D or compact device output), and get the direct parity test green.
-- [ ] Recheck four fixed prompts for raw-token parity and the required CTest/Python gates.
-- [ ] Use alternating same-boot benchmarks against the unoptimized child-branch commit before claiming a speed gain; update engine/tracker issues bilingually with evidence.
+- [x] Implement packed pinned metadata H2D as one isolated change; expand the public runner parity test to cover shrinking group count, and get the direct test green.
+- [x] Recheck four fixed prompts for 256/256 raw-token parity and the required CTest/Python gates.
+- [x] Run alternating baseline/packed process benchmarks with profiling off. The large CPU-time variance prevents a throughput-gain claim; see `docs/reports/2026-09-28-packed-secondary-metadata.md`.
+- [ ] Run a separate compact-D2H ablation if the direct and full-model parity gates can still be kept. Measure actual D2H bytes and post-CPU wait, not just tok/s.
+- [ ] Update engine/tracker issues bilingually after the next measured checkpoint.

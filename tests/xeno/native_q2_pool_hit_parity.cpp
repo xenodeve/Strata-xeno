@@ -285,10 +285,19 @@ int main(int argc, char** argv) {
         }
         for (int i = 0; i < ENTRIES * H; ++i)
             runner_different += partial[(size_t) i] != (i / H == 1 ? 123.f : pool_out[(size_t) i]);
+        const int32_t single_slot[ENTRIES] = {0, -1, -1};
+        std::vector<float> single((size_t) ENTRIES * H, 321.f);
+        if (!runner.launch(layout, secondary_arena, x.data(), single_slot, ENTRIES, 1, runner_err) ||
+            !runner.finish(single.data(), runner_err)) {
+            std::fprintf(stderr, "secondary runner single group: %s\n", runner_err.c_str());
+            return 2;
+        }
+        for (int i = 0; i < ENTRIES * H; ++i)
+            runner_different += single[(size_t) i] != (i / H == 0 ? pool_out[(size_t) i] : 321.f);
         const auto& timing = runner.timing();
         if (runner_timing_mode) {
             auto nonnegative = [](double ms) { return std::isfinite(ms) && ms >= 0; };
-            if (timing.launches != 2 || !nonnegative(timing.host_plan_ms) ||
+            if (timing.launches != 3 || !nonnegative(timing.host_plan_ms) ||
                 !nonnegative(timing.host_switch_ms) || !nonnegative(timing.host_enqueue_ms) ||
                 !nonnegative(timing.host_query_ms) || !nonnegative(timing.host_copyout_ms) ||
                 !nonnegative(timing.h2d_ms) ||
@@ -330,7 +339,7 @@ int main(int argc, char** argv) {
         if (!low_seen.load()) ++runner_different;
         if (runner.min_free_bytes() >= strata::core::kSecondaryReserveBytes) ++runner_different;
         std::printf("secondary runner: differing %d/%d across full and partial routing, served %llu entries in %llu groups\n",
-                    runner_different, 2 * ENTRIES * H, (unsigned long long) runner.served_entries(),
+                    runner_different, 3 * ENTRIES * H, (unsigned long long) runner.served_entries(),
                     (unsigned long long) runner.served_groups());
     }
     if (!secondary) cudaFree(dblob);
