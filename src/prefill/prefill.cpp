@@ -151,6 +151,9 @@ struct Prefill::Impl {
     cudaEvent_t copied[STAGE] = {}, used[STAGE] = {};
     bool stage_live[STAGE] = {};
     std::atomic<int> stage_ready[STAGE] = {};   // a pageable slot's copy is enqueued and `copied` recorded
+    const int32_t* peer_res = nullptr;          // set_peer_tier: experts owned by another device
+    std::function<const void*(int32_t)> peer_ptr;
+    int peer_dev = -1;
     Stager stager;                              // declared after the slots: joined before they are freed
     // PLE
     float* ple_emb = nullptr;
@@ -240,6 +243,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.ple_emb_host.resize(T * N); m.ple_rows.resize(T * strata::kernels::PLE_N_HEADS);
     if (!ok) { err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit"; return false; }
     return true;
+}
+
+void Prefill::set_peer_tier(const int32_t* res, std::function<const void*(int32_t)> slot_ptr, int device) {
+    impl_->peer_res = res;
+    impl_->peer_ptr = std::move(slot_ptr);
+    impl_->peer_dev = device;
 }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
@@ -507,9 +516,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int sl = stage_next;
                         stage_next = (stage_next + 1) % STAGE;
                         const auto th = Clock::now();
-                        const uint8_t* b = m.src->blob(l, e);
-                        if (!b) { err = "prefill: expert source has no blob"; return false; }
-                        if (m.src->pinned(l, e)) {
+                        const int32_t peer_slot = m.peer_res ? m.peer_res[(size_t) l * NE + e] : -1;
+                        const uint8_t* b = peer_slot >= 0 ? nullptr : m.src->blob(l, e);
+                        if (peer_slot < 0 && !b) { err = "prefill: expert source has no blob"; return false; }
+                        if (peer_slot >= 0) {
+                            // its only copy is on the 4070: a peer copy (staged through the host by the driver
+                            // when the cards have no P2P path) into this slot
+                            int self_dev = 0;
+                            cudaGetDevice(&self_dev);
+                            if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                            cudaMemcpyPeerAsync(m.stage_dev[sl], self_dev, m.peer_ptr(peer_slot), m.peer_dev,
+                                                (size_t) lay.blob_bytes(l), m.copy);
+                            cudaEventRecord(m.copied[sl], m.copy);
+                            m.stage_ready[sl].store(1, std::memory_order_release);
+                            ++stats_.experts_dma;
+                        } else if (m.src->pinned(l, e)) {
                             // DMA straight from the page-locked arena: the copy stream only waits for the slot
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
                             cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);

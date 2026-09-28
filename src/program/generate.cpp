@@ -205,6 +205,9 @@ struct Options {
     /// strata-claude-stager, 8K prompt: -7.86 GiB host RAM, decode +7.5 %, TTFT unchanged, outputs identical);
     /// 1: --exclusive-primary-experts (an error when unsupported); 0: --no-exclusive-primary-experts.
     int exclusive_mode = -1;
+    /// #4 step A: the 4070 tier's experts give up their host pages once filled and verified (opt-in until measured).
+    /// The prompt path stages them with a peer copy; 4070 swaps stay off in this step.
+    bool exclusive_secondary = false;
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -742,6 +745,7 @@ int main(int argc, char** argv) {
         else if (a == "--route-trace") o.route_trace = next("--route-trace");
         else if (a == "--exclusive-primary-experts") o.exclusive_mode = 1;
         else if (a == "--no-exclusive-primary-experts") o.exclusive_mode = 0;
+        else if (a == "--exclusive-secondary-experts") o.exclusive_secondary = true;
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--prefill") o.prefill_chunk = std::atoll(next("--prefill"));
@@ -950,7 +954,12 @@ int main(int argc, char** argv) {
     // adaptive tiers: measured wins with no trade-off inside the mode that enables them (AGENTS.md default rule)
     if (o.adapt_swaps < 0) o.adapt_swaps = o.exclusive_primary_experts ? 8 : 96;
     if (o.adapt_every < 0) o.adapt_every = o.exclusive_primary_experts ? 1 : 4;
-    if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 ? 8 : 0;
+    if (o.exclusive_secondary && (o.secondary_expert_mib <= 0 || o.mmap_experts || o.adapt_secondary > 0)) {
+        std::fprintf(stderr, "strata generate: --exclusive-secondary-experts needs --secondary-expert-mib, the "
+                             "arena expert source, and no --adapt-secondary (4070 swaps come in the next step)\n");
+        return 2;
+    }
+    if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 && !o.exclusive_secondary ? 8 : 0;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
@@ -1486,6 +1495,23 @@ if (o.expert_cache_per_layer) {
                              pair.layer, pair.expert, (unsigned long long) slot, err.c_str());
                 return 1;
             }
+        }
+        if (o.exclusive_secondary) {   // #4 step A: the 4070 holds the only copy of its experts
+            const uint64_t private_before = private_commit_bytes();
+            const uint64_t released_before = arena_src.released_host_bytes();
+            for (uint64_t slot = 0; slot < secondary_arena.slots(); ++slot) {
+                const auto& pair = candidates[(size_t) slot];
+                if (!arena_src.release_host_copy(pair.layer, pair.expert, err)) {
+                    std::fprintf(stderr, "strata generate: exclusive secondary (%d,%d): %s\n", pair.layer, pair.expert,
+                                 err.c_str());
+                    return 1;
+                }
+            }
+            std::fprintf(stderr, "strata generate: exclusive secondary owns %llu experts; decommitted %.2f GiB of host "
+                                 "pages; private commit %.2f -> %.2f GiB\n",
+                         (unsigned long long) secondary_arena.slots(),
+                         (double) (arena_src.released_host_bytes() - released_before) / 1073741824.0,
+                         (double) private_before / 1073741824.0, (double) private_commit_bytes() / 1073741824.0);
         }
         if (!secondary_runner.set_graph(o.secondary_graph != 0, err)) {
             std::fprintf(stderr, "strata generate: secondary graph: %s\n", err.c_str());
@@ -2296,6 +2322,9 @@ if (o.expert_cache_per_layer) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
+        if (o.exclusive_secondary)
+            sp.set_peer_tier(secondary_residency.data(),
+                             [&](int32_t s) { return (const void*) secondary_arena.slot_ptr((uint64_t) s); }, 1);
         mem_mark("the head and the prompt path");
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
@@ -3067,6 +3096,9 @@ if (o.expert_cache_per_layer) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (o.exclusive_secondary)
+            prefill.set_peer_tier(secondary_residency.data(),
+                                  [&](int32_t s) { return (const void*) secondary_arena.slot_ptr((uint64_t) s); }, 1);
         if (!o.mtp.empty()) {
             if (!mtp.bind(wt, &native_head, nullptr, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());

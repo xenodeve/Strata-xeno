@@ -7,7 +7,47 @@ at the normal priority class (every arm runs at HIGH class by default, AGENTS.md
 %TEMP%/OUT_NAME/<arm>.exe first so a rebuild in place cannot change them mid-run. The prompts' reference
 commands are %TEMP%/<REF dir>/on.command.json (see README.md).
 """
-import hashlib, json, os, re, shutil, statistics as st, subprocess, sys, time
+import ctypes, hashlib, json, os, re, shutil, statistics as st, subprocess, sys, threading, time
+from ctypes import wintypes
+
+
+class _MemStatus(ctypes.Structure):
+    _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+class _ProcMem(ctypes.Structure):
+    _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t)]
+
+
+def system_memory():
+    """(in-use GiB, available GiB, committed GiB) of the whole machine - what Task Manager shows."""
+    m = _MemStatus(); m.dwLength = ctypes.sizeof(m)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    g = 2 ** 30
+    return (m.ullTotalPhys - m.ullAvailPhys) / g, m.ullAvailPhys / g, (m.ullTotalPageFile - m.ullAvailPageFile) / g
+
+
+def process_memory(pid):
+    """(private GiB, working set GiB) of one process, or None."""
+    h = ctypes.windll.kernel32.OpenProcess(0x1000 | 0x0010, False, pid)   # QUERY_LIMITED_INFORMATION | VM_READ
+    if not h:
+        return None
+    try:
+        c = _ProcMem(); c.cb = ctypes.sizeof(c)
+        if not ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(c), c.cb):
+            return None
+        return c.PrivateUsage / 2 ** 30, c.WorkingSetSize / 2 ** 30
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
 
 T = os.environ.get("TEMP", os.environ.get("TMP", "."))
 REF = {"code": "strata-codex-dispatch-detail-code256", "thai": "strata-codex-dispatch-detail-thai256",
@@ -18,7 +58,9 @@ STAGES = {"tok/s": r"->\s+" + F + " tok/s", "rings": r"wait for rings " + F, "po
           "cpu_pool": r"dispatch detail\s+CPU pool " + F, "sec_fin": r"secondary finish " + F,
           "sec_launch": r"secondary timing\s+launch " + F, "cpu_GBs": r"ms/round; " + F + " GB/s",
           "mtp": r"^mtp\s+" + F, "host": r" host " + F, "commit": r"commit " + F,
-          "ttft_ms": r"time to first token " + F}
+          "ttft_ms": r"time to first token " + F,
+          "sys_used_gib": r"^memory peak\s+system in use " + F, "sys_commit_gib": r"^memory peak.*committed " + F,
+          "proc_private_gib": r"^memory peak.*process private " + F, "proc_ws_gib": r"^memory peak.*working set " + F}
 
 
 def main(argv):
@@ -50,7 +92,19 @@ def main(argv):
             # every arm runs in HIGH_PRIORITY_CLASS (0x80): strata-claude-hiclass showed it cuts desktop interference
             # (code +2.6 %, thai +1.3 %, tighter spread); '@normal' in an arm's args opts that arm out
             flags = 0 if "@normal" in arm_args[arm] else 0x80
-            p = subprocess.run([exe[arm]] + [c for c in cmd if '~' + c not in arm_args[arm]] + [x for x in arm_args[arm] if not x.startswith(('~', '@'))], env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=flags)
+            pr = subprocess.Popen([exe[arm]] + [c for c in cmd if '~' + c not in arm_args[arm]] + [x for x in arm_args[arm] if not x.startswith(('~', '@'))], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", creationflags=flags)
+            peak = [0.0, 0.0, 0.0, 0.0]   # system in use, system committed, process private, process working set
+            def sample():
+                while pr.poll() is None:
+                    u, _, c = system_memory()
+                    pm = process_memory(pr.pid) or (0.0, 0.0)
+                    for i, v in enumerate((u, c, pm[0], pm[1])): peak[i] = max(peak[i], v)
+                    time.sleep(0.5)
+            th = threading.Thread(target=sample, daemon=True); th.start()
+            stdout, stderr = pr.communicate(); th.join()
+            stdout += (f"memory peak              system in use {peak[0]:.2f} GiB  committed {peak[1]:.2f} GiB  "
+                       f"process private {peak[2]:.2f} GiB  working set {peak[3]:.2f} GiB\n")
+            p = subprocess.CompletedProcess(pr.args, pr.returncode, stdout, stderr)
             open(os.path.join(out, tag + ".stdout"), "w", encoding="utf-8").write(p.stdout)
             open(os.path.join(out, tag + ".stderr"), "w", encoding="utf-8").write(p.stderr)
             tps = re.search(STAGES["tok/s"], p.stdout)

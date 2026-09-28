@@ -48,6 +48,11 @@ public:
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
               void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0);
 
+    /// Exclusive 4070 tier (#4): experts whose only copy lives on another device. `res` is (n_layers x n_expert)
+    /// slot or -1 and `slot_ptr(slot)` that slot's pointer on `device`; the prompt path stages such an expert with a
+    /// peer copy instead of reading its (released) host pages.
+    void set_peer_tier(const int32_t* res, std::function<const void*(int32_t)> slot_ptr, int device);
+
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
 
