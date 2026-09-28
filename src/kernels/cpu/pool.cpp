@@ -88,6 +88,18 @@ void pin_this_thread(int core) {
 
 }  // namespace
 
+namespace { int g_worker_priority = 0; }
+
+void set_worker_priority(int priority) { g_worker_priority = priority; }
+
+void set_current_thread_priority(int priority) {
+#if defined(_WIN32)
+    if (priority != 0) SetThreadPriority(GetCurrentThread(), priority);
+#else
+    (void) priority;
+#endif
+}
+
 long long pin_current_thread(int core) {
     if (core < 0) return -1;
 #if defined(_WIN32)
@@ -132,6 +144,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
         const int core = pin ? (i < (int) cores.size() ? cores[(size_t) i] : -1) : -1;
         threads_.emplace_back([this, i, core] {
             pin_this_thread(core);
+            set_current_thread_priority(g_worker_priority);
             worker(i);
         });
     }

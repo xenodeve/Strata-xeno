@@ -73,6 +73,12 @@ std::vector<int> physical_cores(bool skip_first);
 ///
 /// Returns the PREVIOUS affinity mask, or -1 if the platform refused; pass it to `restore_thread_affinity`.
 long long pin_current_thread(int core);
+
+/// Windows thread priority (THREAD_PRIORITY_*, e.g. 1 = above normal, 2 = highest) that ExpertPool workers
+/// set on themselves at start, and that set_current_thread_priority applies to the caller. 0 leaves the default.
+/// Set before constructing the pool.
+void set_worker_priority(int priority);
+void set_current_thread_priority(int priority);
 void restore_thread_affinity(long long previous);
 
 class ExpertPool {

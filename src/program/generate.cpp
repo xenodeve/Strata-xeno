@@ -175,6 +175,7 @@ struct Options {
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
     std::string route_trace;              ///< append each verify window's routed expert ids to this file
+    int pool_priority = 0;                ///< THREAD_PRIORITY_* for the pool workers and the host thread
     bool lock_cpu_experts = false;        ///< VirtualLock the host pages of experts only the CPU serves
     bool secondary_async_launch = false;  ///< enqueue the 4070's work on a helper thread (off the host path)
     bool secondary_profile_timing = false; ///< opt-in CUDA events; normal decode adds no markers
@@ -692,6 +693,7 @@ int main(int argc, char** argv) {
         else if (a == "--secondary-profile-timing") o.secondary_profile_timing = true;
         else if (a == "--secondary-async-launch") o.secondary_async_launch = true;
         else if (a == "--lock-cpu-experts") o.lock_cpu_experts = true;
+        else if (a == "--pool-priority") o.pool_priority = std::atoi(next("--pool-priority"));
         else if (a == "--route-trace") o.route_trace = next("--route-trace");
         else if (a == "--exclusive-primary-experts") o.exclusive_primary_experts = true;
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
@@ -1206,6 +1208,8 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
         if (!o.mtp.empty() && !mtp.load(o.mtp, g, ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     }
+    strata::kernels::cpu::set_worker_priority(o.pool_priority);
+    strata::kernels::cpu::set_current_thread_priority(o.pool_priority);   // the host works in the pool too
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
