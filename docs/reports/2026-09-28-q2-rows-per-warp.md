@@ -67,3 +67,21 @@ Tier hits did not change between arms: primary / secondary / CPU of routed entri
 - **The next GPU-side steps are unchanged.** K1 moves the `hx` precompute into activation quantize. K2 is the packed `dp4a` integer dot. K3 reuses one weight load for several routed tokens. The empty PCIe-share launches remain. Each will be judged with the same per-stage table.
 - **Thai and sky need less CPU work per round.** Per the counters above, that means more primary hits (ranked profile, adaptive swaps) or misses served by the 4070 over x16 DMA. It also means finding the cause of the CPU-rows swing (13–24 GB/s on identical work).
 - **An earlier estimate here was wrong.** A prediction that a faster Q2 kernel would gain "single-digit %" was built by stitching an Nsight trace to another run's counters. The measured code gain is +36 %. That estimate is withdrawn, and `AGENTS.md` now requires per-stage counters from the same paired runs.
+
+## K1 and K2 (same-session ABBA, profiler off)
+
+Runner `ab.py` (scratchpad), exes snapshotted with sha256 so rebuilding in place cannot change an arm mid-run.
+
+| Step | Commit | Prompt | tok/s A → B (runs) | wait for rings | Outputs A = B |
+|---|---|---|---|---|---|
+| K1 `hx` precompute | `40d482b` | code | 68.2 → 67.9 (67.2, 69.3 / 66.8, 69.0) | 21.15 → 20.77 | yes |
+| K1 | | thai | 38.2 → 35.4 (35.1, 41.4 / 38.8, 31.9) | 14.53 → 14.64 | yes |
+| K2 `dp4a` | `cad5a92` | code | 61.3 → 67.9 (62.4, 60.2 / 71.1, 64.7) | 20.89 → 20.53 | yes |
+| K2 | | long | 56.9 → 54.9 (61.5, 52.4 / 48.6, 61.2) | 18.87 → 18.50 | yes |
+
+**Reading:**
+- Each of K1 and K2 lowers `wait for rings` by about 0.35–0.4 ms/round.
+- That is far below the tok/s spread, which follows the CPU pool: CPU rows ran at 14–23 GB/s across these runs.
+- After K0 the six-shuffle `qsum` and the byte-wise integer dot were no longer where the primary spent its time.
+- Both steps are kept because they are bit-exact (0/7680 at six layers on both GPUs, secondary runner 0/23040) and never slower on the GPU stage. Neither is claimed as a throughput gain.
+- **The next GPU question needs a new Nsight capture:** what fills the ~20 ms of `wait for rings` now that the Q2 kernels shrank. The trace must be taken on the current exe.
