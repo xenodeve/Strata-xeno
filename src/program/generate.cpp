@@ -3377,53 +3377,60 @@ if (o.expert_cache_per_layer) {
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
         // routed clearly more often.  Copies run between rounds, when the GPU is idle.
-        auto adapt = [&]() -> bool {
+        // the 4070 swaps run beside the paired stages 3 and 2: they touch only the 4070 tables, read the primary
+        // residency from a snapshot, and skip experts whose host pages stage 3 is about to release
+        std::thread sec_thr;
+        bool sec_fail = false;
+        std::vector<int32_t> hr_snap;
+        std::vector<char> sec_busy;
+        auto sec_work = [&]() {
             const Clock::time_point t_sec = Clock::now();
-            if (sec_adapt) {   // the 4070 tier, independent of the primary swaps below
-                if (!ss_pending.empty() && cudaEventQuery(ss_ev) == cudaSuccess) {
-                    for (const auto& [i, slot] : ss_pending) secondary_residency[(size_t) i] = slot;
-                    ss_pending.clear();
+            if (!ss_pending.empty() && cudaEventQuery(ss_ev) == cudaSuccess) {
+                for (const auto& [i, slot] : ss_pending) secondary_residency[(size_t) i] = slot;
+                ss_pending.clear();
+            }
+            if (ss_pending.empty() && adapt_start) {
+                std::vector<std::pair<float, int32_t>> sc, sv;   // (usage, layer * n_expert + expert)
+                for (int64_t i = 0; i < (int64_t) secondary_residency.size(); ++i) {
+                    const float u = drive.d.usage[(size_t) i];
+                    if (secondary_residency[(size_t) i] >= 0) sv.emplace_back(u, (int32_t) i);
+                    else if (hr_snap[(size_t) i] < 0 && u >= 2.0f && !sec_busy[(size_t) i]) sc.emplace_back(u, (int32_t) i);
                 }
-                if (ss_pending.empty() && adapt_start) {
-                    std::vector<std::pair<float, int32_t>> sc, sv;   // (usage, layer * n_expert + expert)
-                    for (int64_t i = 0; i < (int64_t) secondary_residency.size(); ++i) {
-                        const float u = drive.d.usage[(size_t) i];
-                        if (secondary_residency[(size_t) i] >= 0) sv.emplace_back(u, (int32_t) i);
-                        else if (host_res[(size_t) i] < 0 && u >= 2.0f) sc.emplace_back(u, (int32_t) i);
-                    }
-                    const size_t n = std::min<size_t>({sc.size(), sv.size(), (size_t) o.adapt_secondary});
-                    std::partial_sort(sc.begin(), sc.begin() + (ptrdiff_t) n, sc.end(),
-                                      [](auto& a, auto& b) { return a.first > b.first; });
-                    std::partial_sort(sv.begin(), sv.begin() + (ptrdiff_t) n, sv.end(),
-                                      [](auto& a, auto& b) { return a.first < b.first; });
-                    int prev = 0;
-                    cudaGetDevice(&prev);
-                    cudaSetDevice(1);
-                    std::vector<CopyJob> jobs;
-                    for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
-                        const int32_t in = sc[k].second, out = sv[k].second;
-                        const int32_t slot = secondary_residency[(size_t) out];
-                        const int32_t layer = in / (int32_t) g.n_expert;
-                        const uint8_t* src = srcp->blob(layer, in % (int32_t) g.n_expert);
-                        const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
-                        if (src == nullptr) break;
-                        secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
-                        jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
-                        ss_pending.emplace_back(in, slot);
-                    }
-                    parallel_copy(jobs);
-                    for (size_t k = 0; k < jobs.size(); ++k)
-                        if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) ss_pending[k].second), jobs[k].dst,
-                                            jobs[k].bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
-                            cudaSetDevice(prev);
-                            return false;
-                        }
-                    if (!ss_pending.empty()) cudaEventRecord(ss_ev, ss_stream);
-                    cudaSetDevice(prev);
-                    sec_swaps += (int64_t) ss_pending.size();
+                const size_t n = std::min<size_t>({sc.size(), sv.size(), (size_t) o.adapt_secondary});
+                std::partial_sort(sc.begin(), sc.begin() + (ptrdiff_t) n, sc.end(),
+                                  [](auto& a, auto& b) { return a.first > b.first; });
+                std::partial_sort(sv.begin(), sv.begin() + (ptrdiff_t) n, sv.end(),
+                                  [](auto& a, auto& b) { return a.first < b.first; });
+                int prev = 0;
+                cudaGetDevice(&prev);
+                cudaSetDevice(1);
+                std::vector<CopyJob> jobs;
+                for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
+                    const int32_t in = sc[k].second, out = sv[k].second;
+                    const int32_t slot = secondary_residency[(size_t) out];
+                    const int32_t layer = in / (int32_t) g.n_expert;
+                    const uint8_t* src = srcp->blob(layer, in % (int32_t) g.n_expert);
+                    const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+                    if (src == nullptr) break;
+                    secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
+                    jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
+                    ss_pending.emplace_back(in, slot);
                 }
+                parallel_copy(jobs);
+                for (size_t k = 0; k < jobs.size(); ++k)
+                    if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) ss_pending[k].second), jobs[k].dst,
+                                        jobs[k].bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
+                        cudaSetDevice(prev);
+                        sec_fail = true;
+                        return;
+                    }
+                if (!ss_pending.empty()) cudaEventRecord(ss_ev, ss_stream);
+                cudaSetDevice(prev);
+                sec_swaps += (int64_t) ss_pending.size();
             }
             ms_sec += std::chrono::duration<double, std::milli>(Clock::now() - t_sec).count();
+        };
+        auto adapt_primary = [&]() -> bool {
             if (paired) {
                 const auto& lay = strata::kernels::cpu::expert_layout();
                 const Clock::time_point t_p3 = Clock::now();
@@ -3480,6 +3487,7 @@ if (o.expert_cache_per_layer) {
             } else if (!pending.empty()) {
                 return true;   // the previous swaps are still in flight
             }
+            if (sec_thr.joinable()) sec_thr.join();
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -3539,6 +3547,18 @@ if (o.expert_cache_per_layer) {
             for (float& v : drive.d.usage) v *= 0.7f;
             swaps_total += (int64_t) swaps.size();
             return true;
+        };
+        auto adapt = [&]() -> bool {
+            sec_fail = false;
+            if (sec_adapt) {
+                hr_snap = host_res;
+                sec_busy.assign(host_res.size(), 0);
+                for (const PSwap& b : ps_h2d) sec_busy[(size_t) b.layer * g.n_expert + b.in] = 1;
+                sec_thr = std::thread(sec_work);
+            }
+            const bool ok = adapt_primary();
+            if (sec_thr.joinable()) sec_thr.join();
+            return ok && !sec_fail;
         };
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
