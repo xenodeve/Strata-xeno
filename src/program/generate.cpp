@@ -1459,11 +1459,13 @@ if (o.expert_cache_per_layer) {
             const auto& lay = strata::kernels::cpu::expert_layout();
             std::string rd_err;
             auto read_batch = [&](int64_t k, uint8_t* dst) -> bool {
-                for (int64_t j = 0; j < B && k * B + j < want; ++j) {
-                    const auto& pr = profile[(size_t) (k * B + j)];
-                    if (!arena_src.read_expert(pr.first, pr.second, dst + (size_t) j * MB, rd_err)) return false;
+                int32_t ls[B], es[B];
+                int n = 0;
+                for (int64_t j = 0; j < B && k * B + j < want; ++j, ++n) {
+                    ls[n] = profile[(size_t) (k * B + j)].first;
+                    es[n] = profile[(size_t) (k * B + j)].second;
                 }
-                return true;
+                return arena_src.read_experts(ls, es, n, dst, MB, rd_err);
             };
             std::vector<uint8_t> owned_mark((size_t) (g.n_layers * g.n_expert), 0);
             const auto tp0 = Clock::now();
@@ -1639,11 +1641,13 @@ if (o.expert_cache_per_layer) {
             }
             std::string rd_err;
             auto read_batch = [&](uint64_t k, uint8_t* dst) -> bool {
-                for (uint64_t j = 0; j < B && k * B + j < ns; ++j) {
-                    const auto& pair = candidates[(size_t) (k * B + j)];
-                    if (!arena_src.read_expert(pair.layer, pair.expert, dst + j * MB, rd_err)) return false;
+                int32_t ls[B], es[B];
+                int n = 0;
+                for (uint64_t j = 0; j < B && k * B + j < ns; ++j, ++n) {
+                    ls[n] = candidates[(size_t) (k * B + j)].layer;
+                    es[n] = candidates[(size_t) (k * B + j)].expert;
                 }
-                return true;
+                return arena_src.read_experts(ls, es, n, dst, MB, rd_err);
             };
             const auto ts0 = Clock::now();
             bool rd_ok = read_batch(0, rbuf[0]);

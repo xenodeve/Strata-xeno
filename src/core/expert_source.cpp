@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/platform/direct_file.hpp"
 #include "strata/core/secondary_runner.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -817,6 +818,160 @@ bool ArenaExpertSource::read_expert(int64_t layer, int64_t expert, uint8_t* dst,
     return true;
 }
 
+namespace {
+std::string expert_file(const std::string& gguf, const std::string& path, bool from_gguf,
+                        const strata::kernels::cpu::ExpertLayout& lay, int64_t layer) {
+    if (!from_gguf) return path;
+    if (lay.gguf_file.empty() || lay.gguf_file[(size_t) layer].empty()) return gguf;
+    const size_t cut = gguf.find_last_of("/\\");
+    return (cut == std::string::npos ? std::string() : gguf.substr(0, cut + 1)) + lay.gguf_file[(size_t) layer];
+}
+// The file ranges one expert occupies: three role slices from a GGUF (gate | up | down), or one blob.
+int expert_ranges(const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf, int64_t layer, int64_t expert,
+                  uint64_t off[3], uint64_t len[3], uint64_t at[3]) {
+    if (!from_gguf) {
+        off[0] = lay.blob_offset(layer, expert); len[0] = lay.blob_bytes(layer); at[0] = 0;
+        return 1;
+    }
+    const auto& fm = lay.fmt[(size_t) layer];
+    const uint64_t blob = lay.bytes[(size_t) layer];
+    const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+    const uint64_t a[3] = {0, fm.up_off, fm.down_off};
+    for (int r = 0; r < 3; ++r) {
+        off[r] = lay.gguf_off[(size_t) (3 * layer + r)] + (uint64_t) expert * per[r];
+        len[r] = per[r];
+        at[r] = a[r];
+    }
+    return 3;
+}
+}  // namespace
+
+bool ArenaExpertSource::read_experts(const int32_t* layers, const int32_t* experts, int n, uint8_t* dst, size_t stride,
+                                     std::string& err) {
+    using strata::platform::DirectFile;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    constexpr uint64_t A = DirectFile::alignment();
+    const size_t slot_bytes = ((size_t) lay.max_blob + 2 * A + A - 1) / A * A;   // one aligned range, with its edges
+    const size_t need = (size_t) n * 3 * slot_bytes;
+    if (need > dscratch_bytes_) {
+        if (dscratch_ != nullptr) DirectFile::free_aligned(dscratch_);
+        dscratch_ = DirectFile::alloc_aligned(need);
+        dscratch_bytes_ = dscratch_ ? need : 0;
+        if (dscratch_ == nullptr) { err = "read_experts: bounce buffer"; return false; }
+    }
+    auto file_for = [&](const std::string& name) -> DirectFile* {
+        for (auto& [nm, f] : dfiles_) if (nm == name) return (DirectFile*) f;
+        auto* f = new DirectFile();
+        if (!f->open(name, err)) { delete f; return nullptr; }
+        dfiles_.emplace_back(name, f);
+        return f;
+    };
+    struct Req { DirectFile* f; uint64_t skip, len; uint8_t* to; };
+    std::vector<Req> reqs;
+    reqs.reserve((size_t) n * 3);
+    for (int i = 0; i < n; ++i) {
+        uint64_t off[3], len[3], at[3];
+        const int nr = expert_ranges(lay, from_gguf_, layers[i], experts[i], off, len, at);
+        DirectFile* f = file_for(expert_file(gguf_, path_, from_gguf_, lay, layers[i]));
+        if (f == nullptr) return false;
+        for (int r = 0; r < nr; ++r) {
+            const uint64_t a0 = off[r] & ~(A - 1), a1 = (off[r] + len[r] + A - 1) & ~(A - 1);
+            uint8_t* bounce = (uint8_t*) dscratch_ + reqs.size() * slot_bytes;
+            if (!f->submit(a0, bounce, (uint32_t) (a1 - a0), (uint64_t) reqs.size(), err)) return false;
+            reqs.push_back({f, off[r] - a0, len[r], dst + (size_t) i * stride + at[r]});
+        }
+    }
+    // collect every completion (each file's port reports its own requests)
+    std::vector<char> done(reqs.size(), 0);
+    size_t got = 0;
+    for (auto& [nm, fp] : dfiles_) {
+        DirectFile* f = (DirectFile*) fp;
+        size_t mine = 0;
+        for (const Req& q : reqs) mine += q.f == f;
+        strata::platform::Completion c[64];
+        while (mine > 0) {
+            const int k = f->wait(c, 64, -1);
+            for (int j = 0; j < k; ++j) {
+                if (c[j].tag == DirectFile::WAKE_TAG) continue;
+                const Req& q = reqs[(size_t) c[j].tag];
+                if (!c[j].ok || c[j].bytes < q.skip + q.len) { err = "read_experts: short read"; return false; }
+                std::memcpy(q.to, (uint8_t*) dscratch_ + (size_t) c[j].tag * slot_bytes + q.skip, (size_t) q.len);
+                done[(size_t) c[j].tag] = 1;
+                ++got;
+                --mine;
+            }
+        }
+    }
+    if (got != reqs.size()) { err = "read_experts: missing completions"; return false; }
+    return true;
+}
+
+// load_rest's reader: each worker takes a layer and reads each role's 512 slices in aligned chunks of 32 experts
+// with its own unbuffered file, copying only the host-owned experts into the arena.
+static LoadStats load_experts_gguf_direct(const std::string& gguf, uint8_t* dst,
+                                          const strata::kernels::cpu::ExpertLayout& lay, int threads,
+                                          const uint8_t* skip) {
+    using strata::platform::DirectFile;
+    LoadStats st;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::atomic<int64_t> next{0};
+    std::atomic<bool> bad{false};
+    constexpr uint64_t A = DirectFile::alignment();
+    auto worker = [&]() {
+        std::string open_name, e;
+        DirectFile f;
+        void* buf = nullptr;
+        size_t buf_bytes = 0;
+        for (;;) {
+            const int64_t l = next.fetch_add(1);
+            if (l >= lay.n_layers || bad) break;
+            const std::string name = expert_file(gguf, std::string(), true, lay, l);
+            if (name != open_name) {
+                f.close();
+                if (!f.open(name, e)) { bad = true; break; }
+                open_name = name;
+            }
+            const auto& fm = lay.fmt[(size_t) l];
+            const uint64_t blob = lay.bytes[(size_t) l];
+            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t at[3] = {0, fm.up_off, fm.down_off};
+            for (int r = 0; r < 3 && !bad; ++r) {
+                const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
+                for (int64_t e0 = 0; e0 < lay.n_expert && !bad; e0 += 32) {
+                    const int64_t ne = std::min<int64_t>(32, lay.n_expert - e0);
+                    bool any = false;
+                    for (int64_t x = e0; x < e0 + ne; ++x) any |= !skip[(size_t) (l * lay.n_expert + x)];
+                    if (!any) continue;   // a GPU-owned run: not even read
+                    const uint64_t off = src + (uint64_t) e0 * per[r], n = (uint64_t) ne * per[r];
+                    const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
+                    if (a1 - a0 > buf_bytes) {
+                        if (buf) DirectFile::free_aligned(buf);
+                        buf = DirectFile::alloc_aligned((size_t) (a1 - a0));
+                        buf_bytes = buf ? (size_t) (a1 - a0) : 0;
+                        if (!buf) { bad = true; break; }
+                    }
+                    strata::platform::Completion c;
+                    if (!f.submit(a0, buf, (uint32_t) (a1 - a0), 0, e) || f.wait(&c, 1, -1) != 1 || !c.ok ||
+                        c.bytes < (off - a0) + n) { bad = true; break; }
+                    for (int64_t x = e0; x < e0 + ne; ++x) {
+                        if (skip[(size_t) (l * lay.n_expert + x)]) continue;
+                        std::memcpy(dst + lay.blob_offset(l, x) + at[r],
+                                    (uint8_t*) buf + (off - a0) + (uint64_t) (x - e0) * per[r], (size_t) per[r]);
+                    }
+                }
+            }
+        }
+        if (buf) DirectFile::free_aligned(buf);
+    };
+    std::vector<std::thread> pool;
+    for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
+    worker();
+    for (auto& t : pool) t.join();
+    st.seconds = bad ? -1.0 : std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    st.bytes = lay.total;
+    return st;
+}
+
 bool ArenaExpertSource::load_rest(int threads, std::string& err) {
     if (!deferred_) return true;
     const auto& lay = strata::kernels::cpu::expert_layout();
@@ -830,7 +985,8 @@ bool ArenaExpertSource::load_rest(int threads, std::string& err) {
         kept += lay.blob_bytes(l);
     }
     if (from_gguf_) {
-        const LoadStats st = load_experts_gguf(gguf_, const_cast<uint8_t*>(base_), lay, threads, exclusive_.data());
+        const LoadStats st = load_experts_gguf_direct(gguf_, const_cast<uint8_t*>(base_), lay, threads,
+                                                      exclusive_.data());
         if (st.seconds < 0) { err = "load_rest: the GGUF read failed"; return false; }
     } else {
         std::string e;
@@ -846,6 +1002,11 @@ bool ArenaExpertSource::load_rest(int threads, std::string& err) {
 }
 
 void ArenaExpertSource::close() {
+    for (auto& [nm, f] : dfiles_) delete (strata::platform::DirectFile*) f;
+    dfiles_.clear();
+    if (dscratch_ != nullptr) strata::platform::DirectFile::free_aligned(dscratch_);
+    dscratch_ = nullptr;
+    dscratch_bytes_ = 0;
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
         arena_ = nullptr;

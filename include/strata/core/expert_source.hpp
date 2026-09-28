@@ -345,6 +345,10 @@ public:
     /// pack, not through the arena) and marks each GPU-owned expert with `release_host_copy` (its pages were never
     /// touched, so no physical RAM is used); `load_rest` then reads only the experts the host still owns.
     bool read_expert(int64_t layer, int64_t expert, uint8_t* dst, std::string& err);
+    /// `n` experts into dst + i * stride, with unbuffered overlapped reads (FILE_FLAG_NO_BUFFERING: the pack never
+    /// lands in the OS file cache) queued together. One caller thread at a time.
+    bool read_experts(const int32_t* layers, const int32_t* experts, int n, uint8_t* dst, size_t stride,
+                      std::string& err);
     bool load_rest(int threads, std::string& err);
     bool deferred() const { return deferred_; }
     /// Caller must first fill and verify this pair in the primary GPU cache.
@@ -389,6 +393,9 @@ private:
     bool deferred_ = false;     ///< open(defer_load): experts not read yet (load_rest pending)
     std::ifstream rf_;          ///< read_expert's file, kept open across calls
     std::string rf_name_;
+    void* dscratch_ = nullptr;  ///< read_experts' aligned bounce buffer
+    size_t dscratch_bytes_ = 0;
+    std::vector<std::pair<std::string, void*>> dfiles_;   ///< read_experts' open DirectFiles, by name
 };
 
 }  // namespace strata::core
