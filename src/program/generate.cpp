@@ -1440,7 +1440,90 @@ if (o.expert_cache_per_layer) {
     int64_t prefilled = 0;
     if (!profile.empty() && srcp != nullptr) {
         const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
-        for (int64_t i = 0; i < want; ++i) {
+        if (place_first) {
+            // Placement-first primary fill, pipelined: a reader thread reads the next batch of experts from the pack
+            // into one pinned buffer while this thread copies the current batch in, reads it back into another, and
+            // compares (read 10.3 + fill 8.0 + verify 10.3 s had run in series on one thread).
+            constexpr int64_t B = 32;
+            const size_t MB = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+            uint8_t* rbuf[2] = {nullptr, nullptr};
+            uint8_t* vbuf = nullptr;
+            cudaStream_t fs = nullptr;
+            if (cudaHostAlloc((void**) &rbuf[0], B * MB, cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostAlloc((void**) &rbuf[1], B * MB, cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostAlloc((void**) &vbuf, B * MB, cudaHostAllocPortable) != cudaSuccess ||
+                cudaStreamCreateWithFlags(&fs, cudaStreamNonBlocking) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: placement-first fill buffers could not be allocated\n");
+                return 1;
+            }
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            std::string rd_err;
+            auto read_batch = [&](int64_t k, uint8_t* dst) -> bool {
+                for (int64_t j = 0; j < B && k * B + j < want; ++j) {
+                    const auto& pr = profile[(size_t) (k * B + j)];
+                    if (!arena_src.read_expert(pr.first, pr.second, dst + (size_t) j * MB, rd_err)) return false;
+                }
+                return true;
+            };
+            std::vector<uint8_t> owned_mark((size_t) (g.n_layers * g.n_expert), 0);
+            const auto tp0 = Clock::now();
+            bool rd_ok = read_batch(0, rbuf[0]);
+            bool full = false;
+            for (int64_t k = 0; k * B < want && !full; ++k) {
+                if (!rd_ok) {
+                    std::fprintf(stderr, "strata generate: the profile fill read failed: %s\n", rd_err.c_str());
+                    return 1;
+                }
+                bool next_ok = true;
+                std::thread rd;
+                if ((k + 1) * B < want) rd = std::thread([&, k] { next_ok = read_batch(k + 1, rbuf[(k + 1) % 2]); });
+                uint8_t* cur = rbuf[k % 2];
+                std::vector<std::pair<int64_t, int32_t>> batch;   // (profile index, slot)
+                for (int64_t j = 0; j < B && k * B + j < want; ++j) {
+                    const auto& pr = profile[(size_t) (k * B + j)];
+                    const int32_t slot = xcache.admit(pr.first, pr.second);
+                    if (slot == strata::core::kNotResident) { full = true; break; }
+                    cudaMemcpyAsync(xcache.device_slot(slot), cur + (size_t) j * MB, (size_t) lay.blob_bytes(pr.first),
+                                    cudaMemcpyHostToDevice, fs);
+                    batch.emplace_back(k * B + j, slot);
+                }
+                for (size_t j = 0; j < batch.size(); ++j)
+                    cudaMemcpyAsync(vbuf + j * MB, xcache.device_slot(batch[j].second),
+                                    (size_t) lay.blob_bytes(profile[(size_t) batch[j].first].first),
+                                    cudaMemcpyDeviceToHost, fs);
+                const cudaError_t se = cudaStreamSynchronize(fs);
+                for (size_t j = 0; j < batch.size(); ++j) {
+                    const auto& pr = profile[(size_t) batch[j].first];
+                    const size_t bytes = (size_t) lay.blob_bytes(pr.first);
+                    if (se != cudaSuccess || std::memcmp(vbuf + j * MB, cur + j * MB, bytes) != 0) {
+                        if (rd.joinable()) rd.join();
+                        std::fprintf(stderr, "strata generate: the profile fill failed verification at pair %lld (%s)\n",
+                                     (long long) batch[j].first, se != cudaSuccess ? cudaGetErrorString(se) : "bytes differ");
+                        return 1;
+                    }
+                    const size_t idx = (size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second;
+                    if (o.exclusive_primary_experts && batch[j].second < excl_keep_from && !owned_mark[idx]) {
+                        if (!arena_src.release_host_copy(pr.first, pr.second, err)) {
+                            if (rd.joinable()) rd.join();
+                            std::fprintf(stderr, "strata generate: placement-first primary (%d,%d): %s\n", pr.first,
+                                         pr.second, err.c_str());
+                            return 1;
+                        }
+                        owned_mark[idx] = 1;
+                        ++pf_owned;
+                    }
+                    ++prefilled;
+                }
+                if (rd.joinable()) rd.join();
+                rd_ok = next_ok;
+            }
+            cudaStreamDestroy(fs);
+            cudaFreeHost(rbuf[0]);
+            cudaFreeHost(rbuf[1]);
+            cudaFreeHost(vbuf);
+            pf_fill_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
+        }
+        for (int64_t i = 0; i < want && !place_first; ++i) {
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
             if (slot == strata::core::kNotResident) break;
             const int32_t pl = profile[(size_t) i].first, pe = profile[(size_t) i].second;
@@ -1483,8 +1566,8 @@ if (o.expert_cache_per_layer) {
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
                      (long long) prefilled, (long long) want);
         if (place_first)
-            std::fprintf(stderr, "strata generate: primary fill: read %.1f s, fill %.1f s, verify %.1f s\n",
-                         pf_read_ms / 1000.0, pf_fill_ms / 1000.0, pf_verify_ms / 1000.0);
+            std::fprintf(stderr, "strata generate: primary fill (pipelined read / copy / verify): %.1f s\n",
+                         pf_fill_ms / 1000.0);
     }
 
     // Phase 3: profile-ranked secondary copies remain separate from the primary cache.
