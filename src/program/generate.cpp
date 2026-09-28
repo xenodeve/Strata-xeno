@@ -261,7 +261,7 @@ struct Options {
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
-    double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
+    double pcie_frac = -1.0;   ///< < 0: the default, 0 (the read path stalls decode on this machine's x4 link, #27)
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
@@ -919,8 +919,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --gpu-stages needs SessionGraphs, unavailable on native-pack verifier decode; use --profile-decode-range\n");
         return 2;
     }
-    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
-    if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
+    // plan v0.3 P6 chose 0.55 (native) / 0.2 from the upstream paper's machine. Here the primary GPU sits on a
+    // PCIe x4 link and the read path stalls the verify window: the serving args on an 8,024-token prompt decode
+    // at 3.24 tok/s with it and 61.92 tok/s with --pcie-frac 0, prefill unchanged (292.9 vs 294.7 tok/s;
+    // strata-claude-servepcie, #27). So the default is 0; --pcie-frac still turns the path on.
+    if (o.pcie_frac < 0.0) o.pcie_frac = 0.0;
     const bool secondary_q2 = native_pack &&
         std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
                     strata::kernels::cpu::expert_layout().fmt.end(),

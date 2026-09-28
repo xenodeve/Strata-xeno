@@ -53,6 +53,20 @@ most likely source of the random slow runs (CPU rows 13–14 GB/s against 19–2
 - Measured numbers at high priority describe the engine, not a normal-priority server. Whether the serving
   launcher also raises priority is a separate decision for the developer, backed by the same measurements.
 
+## Defaults: no trade-off becomes the default, a trade-off stays an option
+
+The developer's standing rule (2026-09-28, restated 2026-09-29) decides every knob:
+
+- **A measured win with no trade-off becomes the default at once.** It needs a same-session ABBA with identical
+  outputs, and the per-stage counters must explain the change. Leave a flag to turn it off for A/B.
+- **Anything with a trade-off stays an option, off by default.** Examples: it costs prefill, takes cores or VRAM
+  the desktop needs, needs a privilege, or changes numerics or outputs. Record the trade-off beside the flag and in
+  the issue, with the numbers on both sides, so the developer can choose.
+- **Removing the trade-off is the preferred fix.** If a feature wins but carries a cost, try to remove the cost,
+  and then it becomes a default under the first rule.
+- The launcher and serving profile (`strata-xeno.json`) are still the developer's. Engine defaults change on the
+  branch; the profile does not.
+
 ## Other standing rules
 
 - **The correctness gate is greedy raw-token parity against a same-session
