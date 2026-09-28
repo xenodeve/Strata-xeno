@@ -40,7 +40,7 @@ static void ck(cudaError_t e, const char* at) {
 
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 6) {
-        std::fprintf(stderr, "usage: native_q2_pool_hit_parity <q2_0-first-shard.gguf> [layer] [expert] [seed] [input.bin|--secondary|--runner|--runner-monitor-abort]\n");
+        std::fprintf(stderr, "usage: native_q2_pool_hit_parity <q2_0-first-shard.gguf> [layer] [expert] [seed] [input.bin|--secondary|--runner|--runner-timing|--runner-monitor-abort]\n");
         return 2;
     }
     constexpr int H = cpu::H, FF = cpu::FF, ENTRIES = 3;
@@ -48,7 +48,9 @@ int main(int argc, char** argv) {
     const int E = argc > 3 ? std::atoi(argv[3]) : 7;
     const int seed = argc > 4 ? std::atoi(argv[4]) : 1107;
     const bool monitor_abort_mode = argc > 5 && std::strcmp(argv[5], "--runner-monitor-abort") == 0;
-    const bool runner_mode = monitor_abort_mode || (argc > 5 && std::strcmp(argv[5], "--runner") == 0);
+    const bool runner_timing_mode = argc > 5 && std::strcmp(argv[5], "--runner-timing") == 0;
+    const bool runner_mode = monitor_abort_mode || runner_timing_mode ||
+                             (argc > 5 && std::strcmp(argv[5], "--runner") == 0);
     const bool secondary = runner_mode || (argc > 5 && std::strcmp(argv[5], "--secondary") == 0);
     if (secondary) {
         ck(cudaSetDevice(0), "primary device");
@@ -266,7 +268,8 @@ int main(int argc, char** argv) {
         std::string runner_err;
         const int32_t selected_slots[ENTRIES] = {0, 0, 1};
         std::vector<float> runner_out((size_t) ENTRIES * H, 0.f);
-        if (!runner.init(ENTRIES, ENTRIES, H, FF, runner_err) ||
+        if (!runner.init(ENTRIES, ENTRIES, H, FF, runner_err,
+                         strata::core::kSecondaryReserveBytes, runner_timing_mode) ||
             !runner.launch(layout, secondary_arena, x.data(), selected_slots, ENTRIES, 1, runner_err) ||
             !runner.finish(runner_out.data(), runner_err)) {
             std::fprintf(stderr, "secondary runner: %s\n", runner_err.c_str());
@@ -282,6 +285,21 @@ int main(int argc, char** argv) {
         }
         for (int i = 0; i < ENTRIES * H; ++i)
             runner_different += partial[(size_t) i] != (i / H == 1 ? 123.f : pool_out[(size_t) i]);
+        const auto& timing = runner.timing();
+        if (runner_timing_mode) {
+            auto nonnegative = [](double ms) { return std::isfinite(ms) && ms >= 0; };
+            if (timing.launches != 2 || !nonnegative(timing.host_plan_ms) ||
+                !nonnegative(timing.host_switch_ms) || !nonnegative(timing.host_enqueue_ms) ||
+                !nonnegative(timing.host_query_ms) || !nonnegative(timing.host_copyout_ms) ||
+                !nonnegative(timing.h2d_ms) ||
+                !nonnegative(timing.clear_ms) || !nonnegative(timing.quantize_ms) ||
+                !nonnegative(timing.expert_ms) || !nonnegative(timing.d2h_ms) ||
+                timing.host_enqueue_ms <= 0 ||
+                timing.h2d_ms <= 0 || timing.expert_ms <= 0 || timing.d2h_ms <= 0)
+                ++runner_different;
+        } else if (timing.launches != 0) {
+            ++runner_different;
+        }
         if (runner.free_checks() == 0) ++runner_different;
         const uint64_t checks_before_monitor = runner.free_checks();
         if (!runner.start_monitor(10, runner_err)) {

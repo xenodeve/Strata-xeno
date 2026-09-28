@@ -171,6 +171,7 @@ struct Options {
     int expert_cache = 0;
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
+    bool secondary_profile_timing = false; ///< opt-in CUDA events; normal decode adds no markers
     bool secondary_stage_only = false; ///< A/B arm before routing work to device 1
     bool exclusive_primary_experts = false; ///< Phase 4 static GPU ownership; host pages decommitted after fill
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
@@ -351,6 +352,7 @@ void usage() {
                  "  --cache-cpu-only     Diagnostic: prefill normally, then route verify experts to CPU.\n"
                  "  --secondary-expert-mib N  Phase 3 Q2_0 tier on RTX 4070 SUPER;\n"
                  "  --secondary-free-floor-mib N  Experimental free floor on 4070; default 2560.\n"
+                 "  --secondary-profile-timing  Opt-in CUDA event timing for secondary transfer/compute.\n"
                      "  --secondary-stage-only  Stage/verify weights, but compute all experts as before.\n"
                      "  --exclusive-primary-experts  Phase 4 static primary ownership; decommit host copies.\n"
                      "                               Needs profile, --no-prefill-borrow, --adapt-swaps 0.\n"
@@ -408,7 +410,8 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
     return true;
 }
 
-/// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
+/// Historical name: cpu_ms times the whole expert dispatch callback, including
+/// secondary enqueue/finish when enabled. It is not CPU-pool self-time.
 struct Drive {
     strata::core::ExpertDispatch d;
     double cpu_ms = 0;
@@ -678,6 +681,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--secondary-stage-only") o.secondary_stage_only = true;
+        else if (a == "--secondary-profile-timing") o.secondary_profile_timing = true;
         else if (a == "--exclusive-primary-experts") o.exclusive_primary_experts = true;
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
@@ -806,7 +810,8 @@ int main(int argc, char** argv) {
     if (!std::isfinite(o.temperature) || o.temperature < 0 || !std::isfinite(o.top_p) ||
         o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 || o.pool_workers < 0 ||
         o.secondary_expert_mib < 0 || o.secondary_expert_mib > 12288 ||
-        (o.secondary_stage_only && o.secondary_expert_mib == 0)) {
+        (o.secondary_stage_only && o.secondary_expert_mib == 0) ||
+        (o.secondary_profile_timing && o.secondary_expert_mib == 0)) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
     }
@@ -1375,7 +1380,8 @@ if (o.expert_cache_per_layer) {
         if (!secondary_runner.init(strata::kernels::cpu::MAXT,
                                    (int) (strata::kernels::cpu::MAXT * K),
                                    (int) g.n_embd, (int) g.n_ff, err,
-                                   (uint64_t) o.secondary_free_floor_mib << 20)) {
+                                   (uint64_t) o.secondary_free_floor_mib << 20,
+                                   o.secondary_profile_timing)) {
             std::fprintf(stderr, "strata generate: secondary runner: %s\n", err.c_str());
             return 1;
         }
@@ -3264,7 +3270,7 @@ if (o.expert_cache_per_layer) {
         }
         if (rounds > 0)
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
-                        "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,
+                    "expert callback %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,
                         pool.ms_multi_q / rounds, pool.ms_multi_down / rounds,
                         (double) pool.multi_bytes / 1e6 / std::max(1e-9, pool.ms_multi_gu + pool.ms_multi_down),
                         (drive.cpu_ms - pool_ms0) / rounds);
@@ -3283,7 +3289,18 @@ if (o.expert_cache_per_layer) {
         if (rounds > 0 && o.secondary_expert_mib > 0)
             std::printf("%-24s launch %.3f  wait %.3f ms/round (wait > 0: the 4070 SUPER finished after the CPU pool)\n",
                         "secondary timing", secondary_runner.ms_launch() / rounds, secondary_runner.ms_wait() / rounds);
-        if (rounds > 0 && !drive.d.usage.empty())
+    if (rounds > 0 && o.secondary_profile_timing) {
+        const auto& t = secondary_runner.timing();
+        std::printf("%-24s plan %.3f switch %.3f enqueue %.3f query %.3f copyout %.3f ms/round\n",
+                    "secondary host", t.host_plan_ms / rounds, t.host_switch_ms / rounds,
+                    t.host_enqueue_ms / rounds, t.host_query_ms / rounds,
+                    t.host_copyout_ms / rounds);
+        std::printf("%-24s H2D %.3f clear %.3f quantize %.3f expert %.3f D2H %.3f ms/round; %llu launches\n",
+                    "secondary device", t.h2d_ms / rounds, t.clear_ms / rounds,
+                    t.quantize_ms / rounds, t.expert_ms / rounds, t.d2h_ms / rounds,
+                    (unsigned long long) t.launches);
+    }
+    if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
         if (rounds > 0 && drive.d.pcie_num > 0)
@@ -3395,14 +3412,14 @@ if (o.expert_cache_per_layer) {
                         (ms_ple + ms_embed + ms_layers + ms_head + ms_readback + ms_sample) / pt, decode_ms);
         }
         if (const std::string io = ple_table.io_report(); !io.empty()) std::printf("  %s\n", io.c_str());
-        // **THE DENOMINATOR IS THE POSITIONS THE POOL ACTUALLY RAN ON, NOT THE DECODED TOKENS (A6).**
+    // **THE DENOMINATOR IS DISPATCH POSITIONS, NOT THE DECODED TOKENS (A6).**
         // `drive_pool` is called once per layer per position and PREFILL runs the loop too, so accumulating
         // `cpu_ms` over prefill and then dividing by `decoded` inflates this figure.  `drive.calls / n_layers`
         // is the number of positions - the same correction the ring counters below already received, which is
         // why they print "of 192" rather than "240 of 192".
         const double pool_positions = g.n_layers > 0 ? (double) drive.calls / (double) g.n_layers : 0.0;
         std::printf("%-24s %.3f ms/token over %lld layers (%.0f positions, %lld dispatches)\n",
-                    "  the CPU expert pool", pool_positions > 0.0 ? drive.cpu_ms / pool_positions : 0.0,
+                    "  expert callback", pool_positions > 0.0 ? drive.cpu_ms / pool_positions : 0.0,
                     (long long) g.n_layers, pool_positions, (long long) drive.calls);
         // **AND WHERE INSIDE `run()` IT WENT.**  Three phases per layer and they were one number, which cannot
         // tell a pool that is slow at the WORK from one that is slow at the SYNCHRONISATION - opposite fixes.

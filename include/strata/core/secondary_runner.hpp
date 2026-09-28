@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/core/secondary_arena.hpp"
+#include <array>
 
 #include <chrono>
 #include <atomic>
@@ -13,6 +14,15 @@ namespace strata::kernels { struct NativeExpertLayout; }
 
 namespace strata::core {
 
+// Opt-in timing totals. CUDA event intervals are stream elapsed time and can
+// include gaps while the host enqueues work; they are not pure kernel timings.
+struct SecondaryTiming {
+    uint64_t launches = 0;
+    double host_plan_ms = 0, host_switch_ms = 0, host_enqueue_ms = 0;
+    double host_query_ms = 0, host_copyout_ms = 0;
+    double h2d_ms = 0, clear_ms = 0, quantize_ms = 0, expert_ms = 0, d2h_ms = 0;
+};
+
 // Device-1 grouped native Q2_0 partials. launch() queues pinned H2D, compute,
 // pinned D2H; finish() waits and copies only claimed router rows into host output.
 class SecondaryRunner {
@@ -24,7 +34,7 @@ public:
     SecondaryRunner& operator=(const SecondaryRunner&) = delete;
 
     bool init(int max_tokens, int max_entries, int n_embd, int n_ff, std::string& err,
-              uint64_t free_floor_bytes = 2560ull << 20);
+              uint64_t free_floor_bytes = 2560ull << 20, bool profile_timing = false);
     bool launch(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
                 const float* x, const int32_t* selected_slots, int n_tokens, int k,
                 std::string& err);
@@ -40,6 +50,7 @@ public:
     /// A non-zero wait means the secondary tier, not the CPU pool, was the slower side of that layer.
     double ms_launch() const { return ms_launch_; }
     double ms_wait() const { return ms_wait_; }
+    const SecondaryTiming& timing() const { return timing_; }
     uint64_t free_checks() const { return free_checks_.load(); }
     uint64_t min_free_bytes() const { return min_free_bytes_.load(); }
 
@@ -50,6 +61,9 @@ private:
     int max_tokens_ = 0, max_entries_ = 0, n_embd_ = 0, n_ff_ = 0;
     void* stream_ = nullptr;
     void* done_ = nullptr;
+    std::array<void*, 6> timing_events_{};
+    bool profile_timing_ = false;
+    SecondaryTiming timing_{};
     float* host_x_ = nullptr;
     float* host_out_ = nullptr;
     float* device_x_ = nullptr;

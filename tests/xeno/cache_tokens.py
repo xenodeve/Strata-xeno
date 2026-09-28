@@ -34,6 +34,7 @@ def main():
     p.add_argument('--devices', default='1', help='CUDA_VISIBLE_DEVICES order (Phase 3: 1,0)')
     p.add_argument('--secondary-expert-mib', type=int, default=0)
     p.add_argument('--secondary-free-floor-mib', type=int)
+    p.add_argument('--secondary-profile-timing', action='store_true')
     p.add_argument('--primary-reserve-mib', type=int)
     p.add_argument('--prefill-chunk', type=int)
     p.add_argument('--max-context', type=int, default=4096)
@@ -96,6 +97,8 @@ def main():
             command += ['--secondary-free-floor-mib', str(args.secondary_free_floor_mib)]
         if args.secondary_expert_mib:
             command += ['--secondary-expert-mib', str(args.secondary_expert_mib)]
+        if args.secondary_profile_timing:
+            command.append('--secondary-profile-timing')
         if args.secondary_stage_only:
             command.append('--secondary-stage-only')
         if args.exclusive_primary:

@@ -15,7 +15,14 @@ namespace {
 
 struct RestoreDevice {
     int previous;
-    ~RestoreDevice() { cudaSetDevice(previous); }
+    double* restore_ms = nullptr;
+    ~RestoreDevice() {
+        if (restore_ms == nullptr) { cudaSetDevice(previous); return; }
+        const auto start = std::chrono::steady_clock::now();
+        cudaSetDevice(previous);
+        *restore_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+    }
 };
 
 uint64_t aligned(uint64_t bytes) { return (bytes + 255) & ~uint64_t{255}; }
@@ -50,7 +57,7 @@ void SecondaryRunner::record_free(uint64_t bytes) {
 }
 
 bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff,
-                           std::string& err, uint64_t free_floor_bytes) {
+                           std::string& err, uint64_t free_floor_bytes, bool profile_timing) {
     if (max_tokens <= 0 || max_tokens > 16 || max_entries <= 0 || max_entries > 128 ||
         n_embd <= 0 || n_embd % 32 != 0 || n_ff <= 0 || n_ff % 32 != 0) {
         err = "secondary runner: invalid verify-window geometry";
@@ -61,6 +68,8 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
         return false;
     }
     free_floor_bytes_ = free_floor_bytes;
+    profile_timing_ = profile_timing;
+    timing_ = {};
     max_tokens_ = max_tokens;
     max_entries_ = max_entries;
     n_embd_ = n_embd;
@@ -108,6 +117,13 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     }
     stream_ = stream;
     done_ = done;
+    if (profile_timing_) {
+        for (void*& raw : timing_events_) {
+            cudaEvent_t event = nullptr;
+            if (!cuda_ok(cudaEventCreate(&event), "runner timing event", err)) return false;
+            raw = event;
+        }
+    }
     ptr_.reserve((size_t) max_entries);
     start_.reserve((size_t) max_entries + 1);
     dst_.reserve((size_t) max_entries);
@@ -158,10 +174,16 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
     }
     start_.push_back((int32_t) dst_.size());
     std::memcpy(host_x_, x, (size_t) n_tokens * n_embd_ * sizeof(float));
+    const auto switch_t0 = std::chrono::steady_clock::now();
+    if (profile_timing_)
+        timing_.host_plan_ms += std::chrono::duration<double, std::milli>(switch_t0 - launch_t0).count();
     int previous = -1;
     if (!cuda_ok(cudaGetDevice(&previous), "runner current device", err) ||
         !cuda_ok(cudaSetDevice(1), "runner select device", err)) return false;
-    const RestoreDevice restore{previous};
+    const RestoreDevice restore{previous, profile_timing_ ? &timing_.host_switch_ms : nullptr};
+    if (profile_timing_)
+        timing_.host_switch_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - switch_t0).count();
     const auto now = std::chrono::steady_clock::now();
     if (!monitor_running_.load() && now - last_free_check_ >= std::chrono::milliseconds(250)) {
         uint64_t lower = 0;
@@ -178,8 +200,14 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
             err += std::string("; stream drain: ") + cudaGetErrorString(drained);
         return false;
     };
+    auto mark = [&](size_t index) {
+        return !profile_timing_ || cuda_ok(cudaEventRecord((cudaEvent_t) timing_events_[index], stream),
+                                           "runner timing marker", err);
+    };
+    const auto enqueue_t0 = std::chrono::steady_clock::now();
     host_count_ = (int32_t) group_slots_.size();
-    if (!cuda_ok(cudaMemcpyAsync(device_ptr_, ptr_.data(), ptr_.size() * sizeof(ptr_[0]),
+    if (!mark(0) ||
+        !cuda_ok(cudaMemcpyAsync(device_ptr_, ptr_.data(), ptr_.size() * sizeof(ptr_[0]),
                                   cudaMemcpyHostToDevice, stream),
                  "runner group pointers", err) ||
         !cuda_ok(cudaMemcpyAsync(device_start_, start_.data(), start_.size() * sizeof(start_[0]),
@@ -196,17 +224,24 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
                  "runner tokens", err) ||
         !cuda_ok(cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float),
                                  cudaMemcpyHostToDevice, stream), "runner activation H2D", err) ||
+        !mark(1) ||
         !cuda_ok(cudaMemsetAsync(device_out_, 0, (size_t) entries * n_embd_ * sizeof(float), stream),
-                 "runner clear partials", err)) return fail_enqueued();
+                 "runner clear partials", err) || !mark(2)) return fail_enqueued();
     kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
+    if (!mark(3)) return fail_enqueued();
     kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
                                    host_count_, (int) dst_.size(), device_xq_, device_scratch_, device_out_, stream,
                                    device_scales_);
+    if (!mark(4)) return fail_enqueued();
     if (!cuda_ok(cudaMemcpyAsync(host_out_, device_out_, (size_t) entries * n_embd_ * sizeof(float),
                                  cudaMemcpyDeviceToHost, stream), "runner partial D2H", err) ||
+        !mark(5) ||
         !cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
         return fail_enqueued();
     pending_ = true;
+    if (profile_timing_)
+        timing_.host_enqueue_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - enqueue_t0).count();
     ms_launch_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - launch_t0).count();
     err.clear();
     return true;
@@ -215,19 +250,45 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
 bool SecondaryRunner::finish(float* output, std::string& err) {
     if (!pending_) { err.clear(); return true; }
     if (output == nullptr) { err = "secondary runner: output is null"; return false; }
+    const auto switch_t0 = std::chrono::steady_clock::now();
     int previous = -1;
     if (!cuda_ok(cudaGetDevice(&previous), "runner current device", err) ||
         !cuda_ok(cudaSetDevice(1), "runner select device", err)) return false;
-    const RestoreDevice restore{previous};
+    const RestoreDevice restore{previous, profile_timing_ ? &timing_.host_switch_ms : nullptr};
+    if (profile_timing_)
+        timing_.host_switch_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - switch_t0).count();
     const auto wait_t0 = std::chrono::steady_clock::now();
     if (!cuda_ok(cudaEventSynchronize((cudaEvent_t) done_), "runner wait partials", err)) {
         failed_ = true;
         return false;
     }
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_t0).count();
+    if (profile_timing_) {
+        const auto query_t0 = std::chrono::steady_clock::now();
+        double* stages[] = {&timing_.h2d_ms, &timing_.clear_ms, &timing_.quantize_ms,
+                            &timing_.expert_ms, &timing_.d2h_ms};
+        for (size_t i = 0; i < 5; ++i) {
+            float elapsed = 0.f;
+            if (!cuda_ok(cudaEventElapsedTime(&elapsed, (cudaEvent_t) timing_events_[i],
+                                              (cudaEvent_t) timing_events_[i + 1]),
+                         "runner stage elapsed", err)) {
+                failed_ = true;
+                return false;
+            }
+            *stages[i] += elapsed;
+        }
+        timing_.host_query_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - query_t0).count();
+        ++timing_.launches;
+    }
+    const auto copy_t0 = std::chrono::steady_clock::now();
     for (const int32_t row : selected_rows_)
         std::memcpy(output + (size_t) row * n_embd_, host_out_ + (size_t) row * n_embd_,
                     (size_t) n_embd_ * sizeof(float));
+    if (profile_timing_)
+        timing_.host_copyout_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - copy_t0).count();
     served_entries_ += selected_rows_.size();
     served_groups_ += group_slots_.size();
     pending_ = false;
@@ -322,6 +383,10 @@ void SecondaryRunner::close() {
     if (stream_ != nullptr && cudaStreamSynchronize((cudaStream_t) stream_) != cudaSuccess) {
         std::fprintf(stderr, "secondary runner cleanup found a failed GPU stream\n");
         std::abort();
+    }
+    for (void*& raw : timing_events_) {
+        if (raw != nullptr && cudaEventDestroy((cudaEvent_t) raw) != cudaSuccess) std::abort();
+        raw = nullptr;
     }
     if (done_ != nullptr && cudaEventDestroy((cudaEvent_t) done_) != cudaSuccess) std::abort();
     if (stream_ != nullptr && cudaStreamDestroy((cudaStream_t) stream_) != cudaSuccess) std::abort();

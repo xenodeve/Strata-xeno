@@ -17,6 +17,24 @@ STDERR = ("strata generate: prefill 3964 tokens in 2 chunks, 13677.6 ms (289.8 t
 
 
 class LatencyBreakdownTest(unittest.TestCase):
+    def test_parses_opt_in_secondary_stage_timings(self):
+        timed = STDOUT + (
+            "secondary host           plan 0.420 switch 0.250 enqueue 3.700 query 0.080 copyout 0.160 ms/round\n"
+            "secondary device         H2D 0.730 clear 0.100 quantize 0.190 expert 2.100 D2H 0.330 ms/round; 2784 launches\n"
+        )
+        p = parse(timed)
+        self.assertAlmostEqual(p['secondary_host_plan'], 0.420)
+        self.assertAlmostEqual(p['secondary_host_switch'], 0.250)
+        self.assertAlmostEqual(p['secondary_host_enqueue'], 3.700)
+        self.assertAlmostEqual(p['secondary_host_query'], 0.080)
+        self.assertAlmostEqual(p['secondary_host_copyout'], 0.160)
+        self.assertAlmostEqual(p['secondary_h2d'], 0.730)
+        self.assertAlmostEqual(p['secondary_clear'], 0.100)
+        self.assertAlmostEqual(p['secondary_quantize'], 0.190)
+        self.assertAlmostEqual(p['secondary_expert'], 2.100)
+        self.assertAlmostEqual(p['secondary_d2h'], 0.330)
+        self.assertEqual(p['secondary_launches'], 2784)
+
     def test_parses_every_counter(self):
         p = parse(STDOUT, STDERR)
         self.assertEqual(p['rounds'], 173)
@@ -35,6 +53,14 @@ class LatencyBreakdownTest(unittest.TestCase):
         total = rows.pop('round total')
         parts = sum(ms for name, ms in rows.items() if not name.startswith(' '))
         self.assertAlmostEqual(parts, total, places=6)
+
+    def test_budget_names_actual_host_intervals(self):
+        rows = dict((name, ms) for name, ms, _ in budget(parse(STDOUT)))
+        self.assertAlmostEqual(rows['Host waits for primary GPU doorbell'], 21.518)
+        self.assertAlmostEqual(rows['Host services expert callback'], 21.226)
+        self.assertIn('Other/unaccounted wall time', rows)
+        self.assertNotIn('GPU waits for CPU experts (wait for rings)', rows)
+        self.assertNotIn('GPU compute + unaccounted', rows)
 
     def test_missing_decode_gives_no_budget(self):
         self.assertEqual(budget(parse('speculation 10 rounds of 3\n')), [])
