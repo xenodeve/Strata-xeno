@@ -1019,6 +1019,7 @@ void ArenaExpertSource::close() {
 }
 
 uint8_t* ArenaExpertSource::recommit_host_copy(int64_t layer, int64_t expert, std::string& err) {
+    std::lock_guard<std::mutex> lk(host_mu_);
     if (base_ == nullptr || arena_ == nullptr || layer < 0 || expert < 0 ||
         expert >= n_expert_ || layer >= blobs_ / n_expert_) {
         err = "exclusive host re-commit needs a loaded, in-range expert";
@@ -1039,11 +1040,13 @@ uint8_t* ArenaExpertSource::recommit_host_copy(int64_t layer, int64_t expert, st
 }
 
 void ArenaExpertSource::publish_host_copy(int64_t layer, int64_t expert) {
+    std::lock_guard<std::mutex> lk(host_mu_);
     const size_t index = (size_t) (layer * n_expert_ + expert);
     if (index < exclusive_.size()) exclusive_[index] = 0;
 }
 
 bool ArenaExpertSource::release_host_copy(int64_t layer, int64_t expert, std::string& err) {
+    std::lock_guard<std::mutex> lk(host_mu_);
     if (base_ == nullptr || arena_ == nullptr || layer < 0 || expert < 0 ||
         expert >= n_expert_ || layer >= blobs_ / n_expert_) {
         err = "exclusive host release needs a loaded, in-range expert";

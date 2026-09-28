@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -378,6 +379,7 @@ private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned
     std::vector<uint8_t> exclusive_;
     uint64_t released_host_bytes_ = 0;
+    std::mutex host_mu_;   ///< release / recommit / publish run on the primary and the 4070 adapt threads
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)
     uint64_t slice_bytes_ = 0;
     const uint8_t* base_ = nullptr;

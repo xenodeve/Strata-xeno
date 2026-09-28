@@ -958,12 +958,12 @@ int main(int argc, char** argv) {
     // adaptive tiers: measured wins with no trade-off inside the mode that enables them (AGENTS.md default rule)
     if (o.adapt_swaps < 0) o.adapt_swaps = o.exclusive_primary_experts ? 8 : 96;
     if (o.adapt_every < 0) o.adapt_every = o.exclusive_primary_experts ? 1 : 4;
-    if (o.exclusive_secondary && (o.secondary_expert_mib <= 0 || o.mmap_experts || o.adapt_secondary > 0)) {
-        std::fprintf(stderr, "strata generate: --exclusive-secondary-experts needs --secondary-expert-mib, the "
-                             "arena expert source, and no --adapt-secondary (4070 swaps come in the next step)\n");
+    if (o.exclusive_secondary && (o.secondary_expert_mib <= 0 || o.mmap_experts || (o.serve && o.adapt_secondary > 0))) {
+        std::fprintf(stderr, "strata generate: --exclusive-secondary-experts needs --secondary-expert-mib and the "
+                             "arena expert source; under --serve its 4070 swaps are not paired yet (--adapt-secondary 0)\n");
         return 2;
     }
-    if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 && !o.exclusive_secondary ? 8 : 0;
+    if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 && !(o.exclusive_secondary && o.serve) ? 8 : 0;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
@@ -2636,6 +2636,9 @@ if (o.expert_cache_per_layer) {
         std::vector<std::pair<int32_t, int32_t>> ss_pending;   // (layer * n_expert + expert, slot)
         cudaStream_t ss_stream = nullptr;
         cudaEvent_t ss_ev = nullptr;
+        cudaEvent_t sx_d2h_ev = nullptr;   // --exclusive-secondary-experts: the evicted experts' D2H has landed
+        struct SSwap { int32_t in, out, slot; };
+        std::vector<SSwap> sx_d2h, sx_h2d;   // paired 4070 swaps: D2H of the victims issued / newcomers' H2D issued
         uint8_t* ss_stage = nullptr;
         if (sec_adapt) {
             int prev = 0;
@@ -2643,6 +2646,7 @@ if (o.expert_cache_per_layer) {
             cudaSetDevice(1);
             const bool ok = cudaStreamCreateWithFlags(&ss_stream, cudaStreamNonBlocking) == cudaSuccess &&
                             cudaEventCreateWithFlags(&ss_ev, cudaEventDisableTiming) == cudaSuccess &&
+                            cudaEventCreateWithFlags(&sx_d2h_ev, cudaEventDisableTiming) == cudaSuccess &&
                             cudaHostAlloc((void**) &ss_stage, (size_t) o.adapt_secondary * ps_blob,
                                           cudaHostAllocPortable) == cudaSuccess;
             cudaSetDevice(prev);
@@ -3666,6 +3670,9 @@ if (o.expert_cache_per_layer) {
         std::vector<std::pair<int32_t, int32_t>> ss_pending;   // (layer * n_expert + expert, slot)
         cudaStream_t ss_stream = nullptr;
         cudaEvent_t ss_ev = nullptr;
+        cudaEvent_t sx_d2h_ev = nullptr;   // --exclusive-secondary-experts: the evicted experts' D2H has landed
+        struct SSwap { int32_t in, out, slot; };
+        std::vector<SSwap> sx_d2h, sx_h2d;   // paired 4070 swaps: D2H of the victims issued / newcomers' H2D issued
         uint8_t* ss_stage = nullptr;
         if (sec_adapt) {
             int prev = 0;
@@ -3673,6 +3680,7 @@ if (o.expert_cache_per_layer) {
             cudaSetDevice(1);
             const bool ok = cudaStreamCreateWithFlags(&ss_stream, cudaStreamNonBlocking) == cudaSuccess &&
                             cudaEventCreateWithFlags(&ss_ev, cudaEventDisableTiming) == cudaSuccess &&
+                            cudaEventCreateWithFlags(&sx_d2h_ev, cudaEventDisableTiming) == cudaSuccess &&
                             cudaHostAlloc((void**) &ss_stage, (size_t) o.adapt_secondary * ps_blob,
                                           cudaHostAllocPortable) == cudaSuccess;
             cudaSetDevice(prev);
@@ -3702,8 +3710,91 @@ if (o.expert_cache_per_layer) {
         bool sec_fail = false;
         std::vector<int32_t> hr_snap;
         std::vector<char> sec_busy;
+        // --exclusive-secondary-experts: the 4070 holds the only copy of its experts, so a swap is paired like the
+        // primary's: 1 the victim's bytes D2H into staging (it stays 4070-served meanwhile); 2 once landed, copy it
+        // home, publish it CPU-owned, stage the newcomer and H2D it into the slot; 3 once landed, the newcomer is
+        // 4070-served and its host pages are released.
+        auto sec_paired = [&]() -> bool {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            int prev = 0;
+            cudaGetDevice(&prev);
+            cudaSetDevice(1);
+            struct Restore { int d; ~Restore() { cudaSetDevice(d); } } restore{prev};
+            if (!sx_h2d.empty() && cudaEventQuery(ss_ev) == cudaSuccess) {   // stage 3
+                for (const SSwap& x : sx_h2d) {
+                    secondary_residency[(size_t) x.in] = x.slot;
+                    std::string e;
+                    if (!arena_src.release_host_copy(x.in / (int32_t) g.n_expert, x.in % (int32_t) g.n_expert, e)) {
+                        std::fprintf(stderr, "strata generate: paired 4070 swap release: %s\n", e.c_str());
+                        return false;
+                    }
+                }
+                sec_swaps += (int64_t) sx_h2d.size();
+                sx_h2d.clear();
+            }
+            if (!sx_d2h.empty() && sx_h2d.empty() && cudaEventQuery(sx_d2h_ev) == cudaSuccess) {   // stage 2
+                std::vector<CopyJob> home_jobs, in_jobs;
+                for (size_t i = 0; i < sx_d2h.size(); ++i) {
+                    const SSwap& x = sx_d2h[i];
+                    // the 4070 pairs are ranked across the whole model: victim and newcomer may be in different layers
+                    const int32_t out_layer = x.out / (int32_t) g.n_expert, in_layer = x.in / (int32_t) g.n_expert;
+                    uint8_t* st = ss_stage + i * ps_blob;
+                    std::string e;
+                    uint8_t* home = arena_src.recommit_host_copy(out_layer, x.out % (int32_t) g.n_expert, e);
+                    const uint8_t* src = srcp->blob(in_layer, x.in % (int32_t) g.n_expert);
+                    if (home == nullptr || src == nullptr) {
+                        std::fprintf(stderr, "strata generate: paired 4070 swap copy-home: %s\n", e.c_str());
+                        return false;
+                    }
+                    home_jobs.push_back({home, st, (size_t) lay.blob_bytes(out_layer)});
+                    in_jobs.push_back({st, src, (size_t) lay.blob_bytes(in_layer)});
+                }
+                parallel_copy(home_jobs);
+                parallel_copy(in_jobs);
+                for (size_t i = 0; i < sx_d2h.size(); ++i) {
+                    const SSwap& x = sx_d2h[i];
+                    arena_src.publish_host_copy(x.out / (int32_t) g.n_expert, x.out % (int32_t) g.n_expert);
+                    secondary_residency[(size_t) x.out] = -1;   // CPU-served from now on, from the copy just made
+                    if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) x.slot), in_jobs[i].dst, in_jobs[i].bytes,
+                                        cudaMemcpyHostToDevice, ss_stream) != cudaSuccess)
+                        return false;
+                }
+                cudaEventRecord(ss_ev, ss_stream);
+                sx_h2d.swap(sx_d2h);
+                sx_d2h.clear();
+            }
+            if (!sx_d2h.empty() || !sx_h2d.empty() || !adapt_start) return true;
+            std::vector<std::pair<float, int32_t>> sc, sv;   // stage 1: choose the pairs, D2H the victims
+            for (int64_t i = 0; i < (int64_t) secondary_residency.size(); ++i) {
+                const float u = drive.d.usage[(size_t) i];
+                if (secondary_residency[(size_t) i] >= 0) sv.emplace_back(u, (int32_t) i);
+                else if (hr_snap[(size_t) i] < 0 && u >= 2.0f && !sec_busy[(size_t) i]) sc.emplace_back(u, (int32_t) i);
+            }
+            const size_t n = std::min<size_t>({sc.size(), sv.size(), (size_t) o.adapt_secondary});
+            std::partial_sort(sc.begin(), sc.begin() + (ptrdiff_t) n, sc.end(),
+                              [](auto& a, auto& b) { return a.first > b.first; });
+            std::partial_sort(sv.begin(), sv.begin() + (ptrdiff_t) n, sv.end(),
+                              [](auto& a, auto& b) { return a.first < b.first; });
+            for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
+                const int32_t in = sc[k].second, out = sv[k].second;
+                const int32_t slot = secondary_residency[(size_t) out];
+                const int32_t layer = out / (int32_t) g.n_expert;
+                if (srcp->blob(in / (int32_t) g.n_expert, in % (int32_t) g.n_expert) == nullptr) break;
+                if (cudaMemcpyAsync(ss_stage + sx_d2h.size() * ps_blob, secondary_arena.slot_ptr((uint64_t) slot),
+                                    (size_t) lay.blob_bytes(layer), cudaMemcpyDeviceToHost, ss_stream) != cudaSuccess)
+                    return false;
+                sx_d2h.push_back({in, out, slot});
+            }
+            if (!sx_d2h.empty()) cudaEventRecord(sx_d2h_ev, ss_stream);
+            return true;
+        };
         auto sec_work = [&]() {
             const Clock::time_point t_sec = Clock::now();
+            if (o.exclusive_secondary) {
+                if (!sec_paired()) sec_fail = true;
+                ms_sec += std::chrono::duration<double, std::milli>(Clock::now() - t_sec).count();
+                return;
+            }
             if (!ss_pending.empty() && cudaEventQuery(ss_ev) == cudaSuccess) {
                 for (const auto& [i, slot] : ss_pending) secondary_residency[(size_t) i] = slot;
                 ss_pending.clear();
@@ -3815,6 +3906,11 @@ if (o.expert_cache_per_layer) {
                 return true;   // the previous swaps are still in flight
             }
             if (sec_thr.joinable()) sec_thr.join();
+            auto sec_inflight = [&](int32_t idx) {
+                for (const SSwap& x : sx_d2h) if (x.in == idx) return true;
+                for (const SSwap& x : sx_h2d) if (x.in == idx) return true;
+                return false;
+            };
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -3826,7 +3922,10 @@ if (o.expert_cache_per_layer) {
                 // the 4070 tier already serves its experts off the CPU: promoting one only moves GPU work
                 const int32_t* sr = drive.d.secondary_res ? drive.d.secondary_res + l * g.n_expert : nullptr;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && (sr == nullptr || sr[e] < 0)) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) {
+                        if (u[e] >= 2.0f && (sr == nullptr || sr[e] < 0) && !sec_inflight((int32_t) (l * g.n_expert + e)))
+                            cand.emplace_back(u[e], e);
+                    }
                     else if (!paired || r[e] < excl_keep_from) vict.emplace_back(u[e], e);   // not the lent tail
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -3881,6 +3980,7 @@ if (o.expert_cache_per_layer) {
                 hr_snap = host_res;
                 sec_busy.assign(host_res.size(), 0);
                 for (const PSwap& b : ps_h2d) sec_busy[(size_t) b.layer * g.n_expert + b.in] = 1;
+                for (const PSwap& b : ps_d2h) sec_busy[(size_t) b.layer * g.n_expert + b.in] = 1;
                 sec_thr = std::thread(sec_work);
             }
             const bool ok = adapt_primary();
