@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -338,7 +339,14 @@ public:
     /// Allocates and loads `<pack_dir>/experts.bin`.  Prints nothing; the caller reports `note()` and the load
     /// rate, because those are the two numbers that say whether the arena is the one that was asked for.
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
-              std::string& err, bool pin_for_cuda = true);
+              std::string& err, bool pin_for_cuda = true, bool defer_load = false);
+    /// Placement-first cold start (#4, PRD "RAM-lean loading"): with `defer_load` the arena is reserved and
+    /// committed but nothing is read into it. The caller fills its GPU tiers with `read_expert` (straight from the
+    /// pack, not through the arena) and marks each GPU-owned expert with `release_host_copy` (its pages were never
+    /// touched, so no physical RAM is used); `load_rest` then reads only the experts the host still owns.
+    bool read_expert(int64_t layer, int64_t expert, uint8_t* dst, std::string& err);
+    bool load_rest(int threads, std::string& err);
+    bool deferred() const { return deferred_; }
     /// Caller must first fill and verify this pair in the primary GPU cache.
     bool release_host_copy(int64_t layer, int64_t expert, std::string& err);
     uint64_t released_host_bytes() const { return released_host_bytes_; }
@@ -376,6 +384,11 @@ private:
     double gib_per_s_ = 0.0;
     uint64_t pinned_bytes_ = 0;
     std::string gguf_;
+    std::string path_;          ///< experts.bin, when the pack has one
+    bool from_gguf_ = false;
+    bool deferred_ = false;     ///< open(defer_load): experts not read yet (load_rest pending)
+    std::ifstream rf_;          ///< read_expert's file, kept open across calls
+    std::string rf_name_;
 };
 
 }  // namespace strata::core

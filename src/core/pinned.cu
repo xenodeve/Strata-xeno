@@ -182,6 +182,21 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, bo
     }
 }
 
+PinnedArena* PinnedArena::reserve_only(uint64_t bytes) {
+    PinnedArena* a = new PinnedArena(0, std::vector<uint64_t>{}, false);
+    a->capacity = bytes;
+#ifdef _WIN32
+    a->base = VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE, PAGE_READWRITE);
+#else
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    a->base = p == MAP_FAILED ? nullptr : p;
+#endif
+    a->backing = PageBacking::NormalPages;
+    a->reserved_only = true;
+    a->note = "reserved address space only; host-owned experts are committed as they load (placement-first)";
+    return a;
+}
+
 PinnedArena::~PinnedArena() {
     if (base) {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
@@ -253,14 +268,14 @@ bool PinnedArena::commit_interior(uint64_t offset, uint64_t bytes, uint64_t& com
     const uintptr_t first = (uintptr_t) base + (uintptr_t) offset;
     const uintptr_t begin = (first + page - 1) & ~(page - 1);
     const uintptr_t end = (first + (uintptr_t) bytes) & ~(page - 1);
-    if (end > begin) {
-        if (VirtualAlloc((void*) begin, (SIZE_T) (end - begin), MEM_COMMIT, PAGE_READWRITE) == nullptr) {
-            err = "VirtualAlloc(MEM_COMMIT) failed with Windows error " +
-                  std::to_string((unsigned long long) GetLastError());
-            return false;
-        }
-        committed = (uint64_t) (end - begin);
+    const uintptr_t outer_begin = first & ~(page - 1);
+    const uintptr_t outer_end = (first + (uintptr_t) bytes + page - 1) & ~(page - 1);
+    if (VirtualAlloc((void*) outer_begin, (SIZE_T) (outer_end - outer_begin), MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+        err = "VirtualAlloc(MEM_COMMIT) failed with Windows error " +
+              std::to_string((unsigned long long) GetLastError());
+        return false;
     }
+    if (end > begin) committed = (uint64_t) (end - begin);
     err.clear();
     return true;
 #else

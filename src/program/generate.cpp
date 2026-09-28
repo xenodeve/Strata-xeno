@@ -951,6 +951,10 @@ int main(int argc, char** argv) {
         }
         o.exclusive_primary_experts = o.exclusive_mode == 1 || (o.exclusive_mode < 0 && eligible);
     }
+    // Placement-first cold start (#4): when a GPU tier owns experts exclusively, the arena is reserved but not
+    // committed or read; GPU tiers fill straight from the pack, and only the host-owned experts are committed and
+    // loaded afterwards - so neither RAM nor the commit charge ever holds an expert a GPU owns, not even at boot.
+    const bool place_first = !o.mmap_experts && (o.exclusive_primary_experts || o.exclusive_secondary);
     // adaptive tiers: measured wins with no trade-off inside the mode that enables them (AGENTS.md default rule)
     if (o.adapt_swaps < 0) o.adapt_swaps = o.exclusive_primary_experts ? 8 : 96;
     if (o.adapt_every < 0) o.adapt_every = o.exclusive_primary_experts ? 1 : 4;
@@ -1254,7 +1258,7 @@ int main(int argc, char** argv) {
         const char* pin_override = std::getenv("STRATA_ARENA_PIN");
         const bool pin_for_cuda = o.secondary_expert_mib == 0 && !o.exclusive_primary_experts &&
             !(pin_override != nullptr && std::strcmp(pin_override, "0") == 0);
-        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_for_cuda)) {
+        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_for_cuda, place_first)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -1407,25 +1411,61 @@ if (o.expert_cache_per_layer) {
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
+    // Exclusive ownership and prompt-path borrowing together: the prompt path lends the cache's LAST slots and
+    // refills them from the host afterwards, so the experts in those slots keep their host copies. The tail is
+    // found exactly as the serve loop finds it (the chunk halves until the buffers fit in the lendable slots).
+    int32_t excl_keep_from = INT32_MAX;
+    if (o.exclusive_primary_experts && !o.no_prefill_borrow && o.prefill_chunk > 0 && xcache.slots() > 0) {
+        for (int64_t chunk = o.prefill_chunk; chunk >= 256; chunk /= 2) {
+            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, chunk);
+            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
+            if (xcache.slot_offsets() != nullptr) {
+                k = 0;
+                while (k < xcache.slots() &&
+                       (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+            }
+            if (k + 128 <= xcache.slots()) { excl_keep_from = (int32_t) (xcache.slots() - k); break; }
+        }
+    }
+    // placement-first: one pinned buffer the pack is read into, for the fills below
+    uint8_t* pf_stage = nullptr;
+    if (place_first && cudaHostAlloc((void**) &pf_stage, (size_t) strata::kernels::cpu::expert_layout().max_blob,
+                                     cudaHostAllocPortable) != cudaSuccess) {
+        std::fprintf(stderr, "strata generate: placement-first staging buffer could not be allocated\n");
+        return 1;
+    }
+    int64_t pf_owned = 0;
     int64_t prefilled = 0;
     if (!profile.empty() && srcp != nullptr) {
         const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
         for (int64_t i = 0; i < want; ++i) {
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
             if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+            const int32_t pl = profile[(size_t) i].first, pe = profile[(size_t) i].second;
+            const int64_t pbytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pl);
+            const uint8_t* b = srcp->blob(pl, pe);
+            if (place_first) b = arena_src.read_expert(pl, pe, pf_stage, err) ? pf_stage : nullptr;
+            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err, pbytes) ||
+                (place_first && !xcache.verify_slot(slot, b, err, pbytes))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
+            }
+            // placement-first ownership: never committed, so releasing it only records the owner
+            if (place_first && o.exclusive_primary_experts && slot < excl_keep_from) {
+                if (!arena_src.release_host_copy(pl, pe, err)) {
+                    std::fprintf(stderr, "strata generate: placement-first primary (%d,%d): %s\n", pl, pe, err.c_str());
+                    return 1;
+                }
+                ++pf_owned;
             }
             ++prefilled;
         }
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
+        if (prefilled > 0 && !place_first && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                 srcp->blob(profile[0].first, profile[0].second), err,
                                 (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -1487,16 +1527,19 @@ if (o.expert_cache_per_layer) {
             const auto& pair = candidates[(size_t) slot];
             secondary_residency[(size_t) pair.layer * (size_t) g.n_expert + (size_t) pair.expert] =
                 (int32_t) slot;
-            const uint8_t* blob = srcp->blob(pair.layer, pair.expert);
+            const uint8_t* blob = place_first ? (arena_src.read_expert(pair.layer, pair.expert, pf_stage, err)
+                                                 ? pf_stage : nullptr)
+                                              : srcp->blob(pair.layer, pair.expert);
             if (blob == nullptr ||
                 !secondary_arena.fill_slot(slot, blob, pair.bytes, err) ||
-                !secondary_arena.verify_slot(slot, blob, pair.bytes, err)) {
+                !secondary_arena.verify_slot(slot, blob, pair.bytes, err) ||
+                (place_first && o.exclusive_secondary && !arena_src.release_host_copy(pair.layer, pair.expert, err))) {
                 std::fprintf(stderr, "strata generate: secondary expert (%d,%d) slot %llu: %s\n",
                              pair.layer, pair.expert, (unsigned long long) slot, err.c_str());
                 return 1;
             }
         }
-        if (o.exclusive_secondary) {   // #4 step A: the 4070 holds the only copy of its experts
+        if (o.exclusive_secondary && !place_first) {   // #4 step A: the 4070 holds the only copy of its experts
             const uint64_t private_before = private_commit_bytes();
             const uint64_t released_before = arena_src.released_host_bytes();
             for (uint64_t slot = 0; slot < secondary_arena.slots(); ++slot) {
@@ -1541,26 +1584,24 @@ if (o.expert_cache_per_layer) {
                      secondary_compute ? "SECONDARY COMPUTE" : "STAGING ONLY, no secondary compute");
     }
 
-    // Exclusive ownership and prompt-path borrowing together: the prompt path lends the cache's LAST slots and
-    // refills them from the host afterwards, so the experts in those slots keep their host copies. The tail is
-    // found exactly as the serve loop finds it (the chunk halves until the buffers fit in the lendable slots).
-    int32_t excl_keep_from = INT32_MAX;
-    if (o.exclusive_primary_experts && !o.no_prefill_borrow && o.prefill_chunk > 0 && xcache.slots() > 0) {
-        for (int64_t chunk = o.prefill_chunk; chunk >= 256; chunk /= 2) {
-            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, chunk);
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-            int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
-            if (xcache.slot_offsets() != nullptr) {
-                k = 0;
-                while (k < xcache.slots() &&
-                       (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
-            }
-            if (k + 128 <= xcache.slots()) { excl_keep_from = (int32_t) (xcache.slots() - k); break; }
+    if (place_first) {
+        const uint64_t commit_before = private_commit_bytes();
+        const auto tl = Clock::now();
+        if (!arena_src.load_rest(6, err)) {
+            std::fprintf(stderr, "strata generate: placement-first load: %s\n", err.c_str());
+            return 1;
         }
+        cudaFreeHost(pf_stage);
+        pf_stage = nullptr;
+        std::fprintf(stderr, "strata generate: placement-first: GPU tiers own %lld + %llu experts (never in RAM); "
+                             "host-owned experts loaded in %.1f s; private commit %.2f -> %.2f GiB\n",
+                     (long long) pf_owned, (unsigned long long) (o.exclusive_secondary ? secondary_arena.slots() : 0),
+                     std::chrono::duration<double>(Clock::now() - tl).count(),
+                     (double) commit_before / 1073741824.0, (double) private_commit_bytes() / 1073741824.0);
     }
     if (o.exclusive_primary_experts && o.exclusive_mode < 0 && (prefilled <= 0 || xcache.slots() <= 0))
         o.exclusive_primary_experts = false;   // the default only applies where there is a primary tier to own
-    if (o.exclusive_primary_experts) {
+    if (o.exclusive_primary_experts && !place_first) {
         if (prefilled <= 0 || xcache.slots() <= 0) {
             std::fprintf(stderr, "strata generate: exclusive primary tier has no verified resident experts\n");
             return 2;

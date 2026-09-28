@@ -40,6 +40,11 @@ struct PinnedArena {
     /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, bool pin_for_cuda = true);
+    /// Placement-first cold start: address space only (MEM_RESERVE), nothing committed. The owner commits each
+    /// host-owned range with `commit_interior` before writing it, so neither RAM nor the commit charge ever holds
+    /// an expert the GPUs own. Pageable only (no CUDA registration, no lock).
+    static PinnedArena* reserve_only(uint64_t bytes);
+    bool reserved_only = false;
     std::vector<uint64_t> slice_starts;
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;
