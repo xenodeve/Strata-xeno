@@ -295,9 +295,11 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 // Match the AVX2/AVX-VNNI CPU Q2_0 row's eight FP32 accumulators and its
-// separate zero-point correction. Only lane 0's return is used by the caller.
+// separate zero-point correction. `lane` counts within one aligned 8-lane group whose
+// lanes are `mask`; only that group's lane 0 return is used by the caller.
 __device__ __forceinline__ float row_dot_q2_cpu_order(const uint8_t* row, const block_q8_1* x,
-                                                       const float* scales, int nb, int lane) {
+                                                       const float* scales, int nb, int lane,
+                                                       unsigned mask = 0xffu) {
     float acc = 0.f, corr = 0.f;
     if (lane < 8) {
         for (int b = 0; b < nb; ++b) {
@@ -316,21 +318,21 @@ __device__ __forceinline__ float row_dot_q2_cpu_order(const uint8_t* row, const 
             }
             acc = __fmaf_rn(d * scales[2 * b], (float) s0, acc);
             acc = __fmaf_rn(d * scales[2 * b + 1], (float) s1, acc);
-            qsum0 += __shfl_xor_sync(0xff, qsum0, 4, 8);
-            qsum0 += __shfl_xor_sync(0xff, qsum0, 2, 8);
-            qsum0 += __shfl_xor_sync(0xff, qsum0, 1, 8);
-            qsum1 += __shfl_xor_sync(0xff, qsum1, 4, 8);
-            qsum1 += __shfl_xor_sync(0xff, qsum1, 2, 8);
-            qsum1 += __shfl_xor_sync(0xff, qsum1, 1, 8);
+            qsum0 += __shfl_xor_sync(mask, qsum0, 4, 8);
+            qsum0 += __shfl_xor_sync(mask, qsum0, 2, 8);
+            qsum0 += __shfl_xor_sync(mask, qsum0, 1, 8);
+            qsum1 += __shfl_xor_sync(mask, qsum1, 4, 8);
+            qsum1 += __shfl_xor_sync(mask, qsum1, 2, 8);
+            qsum1 += __shfl_xor_sync(mask, qsum1, 1, 8);
             if (lane == 0) {
                 const float hx0 = scales[2 * b] * (float) qsum0;
                 const float hx1 = scales[2 * b + 1] * (float) qsum1;
                 corr = __fadd_rn(corr, __fmul_rn(d, __fadd_rn(hx0, hx1)));
             }
         }
-        const float h = acc + __shfl_down_sync(0xff, acc, 4, 8);
-        const float s = h + __shfl_down_sync(0xff, h, 2, 8);
-        const float total = s + __shfl_down_sync(0xff, s, 1, 8);
+        const float h = acc + __shfl_down_sync(mask, acc, 4, 8);
+        const float s = h + __shfl_down_sync(mask, h, 2, 8);
+        const float total = s + __shfl_down_sync(mask, s, 1, 8);
         if (lane == 0) return total - corr;
     }
     return 0.f;
@@ -394,6 +396,57 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
         const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane,
                                      x_scales ? x_scales + (size_t) ent_tok[e] * xb : nullptr);
         if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
+    }
+}
+
+// Q2_0 with CPU-order arithmetic uses eight lanes per row, so one warp carries four
+// independent rows instead of leaving 24 lanes idle. Per-row arithmetic is unchanged.
+constexpr int Q2_ROWS = 32;    // rows per block: 8 warps x 4 eight-lane groups
+
+__global__ void __launch_bounds__(256) native_gu_q2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                           const int32_t* __restrict__ grp_start,
+                                                           const int32_t* __restrict__ n_groups,
+                                                           const int32_t* __restrict__ ent_tok,
+    const block_q8_1* __restrict__ xq, const float* __restrict__ x_scales, NativeExpertLayout L,
+                                                           float* __restrict__ gate, float* __restrict__ up) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int lane = threadIdx.x & 31, lane8 = lane & 7;
+    const unsigned mask = 0xffu << (lane & 24);
+    const int row = blockIdx.x * Q2_ROWS + (threadIdx.x >> 3);   // 0 .. 2*n_ff
+    if (row >= 2 * L.n_ff) return;                                 // the whole 8-lane group leaves together
+    const bool is_up = row >= L.n_ff;
+    const int r = is_up ? row - (int) L.n_ff : row;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* wr = blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
+    const int nb = (int) (L.n_embd / 64), xb = (int) (L.n_embd / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int e = e0; e < e1; ++e) {
+        const size_t xo = (size_t) ent_tok[e] * xb;
+        const float s = row_dot_q2_cpu_order(wr, xq + xo, x_scales + xo, nb, lane8, mask);
+        if (lane8 == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
+    }
+}
+
+__global__ void __launch_bounds__(256) native_down_q2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                             const int32_t* __restrict__ grp_start,
+                                                             const int32_t* __restrict__ n_groups,
+                                                             const int32_t* __restrict__ ent_dst,
+    const block_q8_1* __restrict__ hq, const float* __restrict__ h_scales, NativeExpertLayout L,
+                                                             float* __restrict__ out) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int lane = threadIdx.x & 31, lane8 = lane & 7;
+    const unsigned mask = 0xffu << (lane & 24);
+    const int r = blockIdx.x * Q2_ROWS + (threadIdx.x >> 3);
+    if (r >= L.n_embd) return;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* wr = blob + L.down_off + (size_t) r * L.d_row;
+    const int nb = (int) (L.n_ff / 64), hb = (int) (L.n_ff / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int e = e0; e < e1; ++e) {
+        const float s = row_dot_q2_cpu_order(wr, hq + (size_t) e * hb, h_scales + (size_t) e * hb, nb, lane8, mask);
+        if (lane8 == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s;
     }
 }
 
@@ -785,7 +838,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 21: native_gu_kernel<21><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, nullptr, L, gate, up); break;
         case 22: native_gu_kernel<22><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, nullptr, L, gate, up); break;
         case 29: native_gu_kernel<29><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, nullptr, L, gate, up); break;
-        case 42: native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, x_scales, L, gate, up); break;
+        case 42:
+            if (x_scales)
+                native_gu_q2_kernel<<<dim3((unsigned) ((2 * L.n_ff + Q2_ROWS - 1) / Q2_ROWS), (unsigned) cap_groups), 256, 0,
+                                      s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, x_scales, L, gate, up);
+            else
+                native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, nullptr, L, gate, up);
+            break;
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
     }
     check("native_expert_grouped/gu");
@@ -797,8 +856,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
         case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, nullptr, L, out); break;
-        case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq,
-                                                            x_scales ? h_scales : nullptr, L, out); break;
+        case 42:
+            if (x_scales)
+                native_down_q2_kernel<<<dim3((unsigned) ((L.n_embd + Q2_ROWS - 1) / Q2_ROWS), (unsigned) cap_groups), 256, 0,
+                                        s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, h_scales, L, out);
+            else
+                native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, nullptr, L, out);
+            break;
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
