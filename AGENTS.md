@@ -48,7 +48,7 @@ runs or tools.
   own AVX-VNNI code. A configure shell with an empty `CMAKE_SYSTEM_PROCESSOR`
   silently yields `GGML_CPU_GENERIC`, which is harmless but should not be
   mistaken for a real difference between builds.
-- **Launching `strata.exe` from a script** needs both CUDA `bin` and `bind`
+- **Launching `strata.exe` from a script** needs both CUDA `bin` and `bin/x64`
   on `PATH`. Without them the exe exits with `0xC0000135` before loading
   anything.
 - **Effects under the 13.6 % noise gate are unproved** unless paired ABBA runs
