@@ -299,32 +299,38 @@ __device__ __forceinline__ int q2_spread(uint32_t w) {
     return (int) ((w | (w << 6) | (w << 12) | (w << 18)) & 0x03030303u);
 }
 
-// Match the AVX2/AVX-VNNI CPU Q2_0 row's eight FP32 accumulators and its
-// separate zero-point correction. `hx[c]` is scales[c] * (float) (sum of chunk c's q8
-// codes), precomputed once per activation. `lane` counts within one aligned 8-lane
-// group whose lanes are `mask`; only that group's lane 0 return is used by the caller.
-__device__ __forceinline__ float row_dot_q2_cpu_order(const uint8_t* row, const block_q8_1* x,
-                                                       const float* scales, const float* hx, int nb,
-                                                       int lane, unsigned mask) {
-    float acc = 0.f, corr = 0.f;
-    if (lane < 8) {
-        for (int b = 0; b < nb; ++b) {
-            const block_q2_0* block = (const block_q2_0*) row + b;
-            const float d = block->d;
-            // This lane's four codes of each half sit in one byte (qs[lane], qs[lane + 8]); spread them to
-            // one per byte and take the exact integer dot with the four matching q8 codes in one dp4a.
-            const int s0 = __dp4a(q2_spread(block->qs[lane]), *(const int*) (x[2 * b].qs + 4 * lane), 0);
-            const int s1 = __dp4a(q2_spread(block->qs[lane + 8]), *(const int*) (x[2 * b + 1].qs + 4 * lane), 0);
-            acc = __fmaf_rn(d * scales[2 * b], (float) s0, acc);
-            acc = __fmaf_rn(d * scales[2 * b + 1], (float) s1, acc);
-            if (lane == 0) corr = __fadd_rn(corr, __fmul_rn(d, __fadd_rn(hx[2 * b], hx[2 * b + 1])));
+// Match the AVX2/AVX-VNNI CPU Q2_0 row's eight FP32 accumulators and its separate zero-point correction,
+// for Q2_MULTI routed entries of one row at once. The weight block is loaded and spread once and reused for
+// every entry; each entry keeps its own exact integer dot, FP32 accumulation order, corr chain and
+// reduction. `hx[i][c]` is scales * (float) (sum of chunk c's q8 codes), precomputed per activation. `lane`
+// counts within one aligned 8-lane group whose lanes are `mask`; lane 0 writes out[i].  xs/sc/hx[i] are entry i's activation, scales and hx; entries >= ne are skipped.
+constexpr int Q2_MULTI = 4;
+__device__ __forceinline__ void row_dot_q2_cpu_order_multi(const uint8_t* row, const block_q8_1* const* xs,
+                                                           const float* const* sc, const float* const* hx, int ne,
+                                                           int nb, int lane, unsigned mask, float* out) {
+    float acc[Q2_MULTI] = {}, corr[Q2_MULTI] = {};
+    for (int b = 0; b < nb; ++b) {
+        const block_q2_0* block = (const block_q2_0*) row + b;
+        const float d = block->d;
+        const int w0 = q2_spread(block->qs[lane]), w1 = q2_spread(block->qs[lane + 8]);
+#pragma unroll
+        for (int i = 0; i < Q2_MULTI; ++i) {
+            if (i >= ne) break;
+            const int s0 = __dp4a(w0, *(const int*) (xs[i][2 * b].qs + 4 * lane), 0);
+            const int s1 = __dp4a(w1, *(const int*) (xs[i][2 * b + 1].qs + 4 * lane), 0);
+            acc[i] = __fmaf_rn(d * sc[i][2 * b], (float) s0, acc[i]);
+            acc[i] = __fmaf_rn(d * sc[i][2 * b + 1], (float) s1, acc[i]);
+            if (lane == 0) corr[i] = __fadd_rn(corr[i], __fmul_rn(d, __fadd_rn(hx[i][2 * b], hx[i][2 * b + 1])));
         }
-        const float h = acc + __shfl_down_sync(mask, acc, 4, 8);
+    }
+#pragma unroll
+    for (int i = 0; i < Q2_MULTI; ++i) {
+        if (i >= ne) break;
+        const float h = acc[i] + __shfl_down_sync(mask, acc[i], 4, 8);
         const float s = h + __shfl_down_sync(mask, h, 2, 8);
         const float total = s + __shfl_down_sync(mask, s, 1, 8);
-        if (lane == 0) return total - corr;
+        if (lane == 0) out[i] = total - corr[i];
     }
-    return 0.f;
 }
 
 // One row against one q8_1 activation, the whole warp: call k = (block, part) is lane-strided.
@@ -423,10 +429,20 @@ __global__ void __launch_bounds__(256) native_gu_q2_kernel(const unsigned long l
     const uint8_t* wr = blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
     const int nb = (int) (L.n_embd / 64), xb = (int) (L.n_embd / 32);
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
-    for (int e = e0; e < e1; ++e) {
-        const size_t xo = (size_t) ent_tok[e] * xb;
-        const float s = row_dot_q2_cpu_order(wr, xq + xo, x_scales + xo, x_hx + (size_t) e * xb, nb, lane8, mask);
-        if (lane8 == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
+    float* dst = is_up ? up : gate;
+    for (int e = e0; e < e1; e += Q2_MULTI) {
+        const int ne = min(Q2_MULTI, e1 - e);
+        const block_q8_1* xs[Q2_MULTI];
+        const float *sc[Q2_MULTI], *hx[Q2_MULTI];
+        float s[Q2_MULTI];
+#pragma unroll
+        for (int i = 0; i < Q2_MULTI; ++i) {
+            const size_t xo = (size_t) ent_tok[e + min(i, ne - 1)] * xb;
+            xs[i] = xq + xo; sc[i] = x_scales + xo; hx[i] = x_hx + (size_t) (e + min(i, ne - 1)) * xb;
+        }
+        row_dot_q2_cpu_order_multi(wr, xs, sc, hx, ne, nb, lane8, mask, s);
+        if (lane8 == 0)
+            for (int i = 0; i < ne; ++i) dst[(size_t) (e + i) * L.n_ff + r] = s[i];
     }
 }
 
@@ -447,10 +463,19 @@ __global__ void __launch_bounds__(256) native_down_q2_kernel(const unsigned long
     const uint8_t* wr = blob + L.down_off + (size_t) r * L.d_row;
     const int nb = (int) (L.n_ff / 64), hb = (int) (L.n_ff / 32);
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
-    for (int e = e0; e < e1; ++e) {
-        const size_t ho = (size_t) e * hb;
-        const float s = row_dot_q2_cpu_order(wr, hq + ho, h_scales + ho, h_hx + ho, nb, lane8, mask);
-        if (lane8 == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s;
+    for (int e = e0; e < e1; e += Q2_MULTI) {
+        const int ne = min(Q2_MULTI, e1 - e);
+        const block_q8_1* xs[Q2_MULTI];
+        const float *sc[Q2_MULTI], *hx[Q2_MULTI];
+        float s[Q2_MULTI];
+#pragma unroll
+        for (int i = 0; i < Q2_MULTI; ++i) {
+            const size_t ho = (size_t) (e + min(i, ne - 1)) * hb;
+            xs[i] = hq + ho; sc[i] = h_scales + ho; hx[i] = h_hx + ho;
+        }
+        row_dot_q2_cpu_order_multi(wr, xs, sc, hx, ne, nb, lane8, mask, s);
+        if (lane8 == 0)
+            for (int i = 0; i < ne; ++i) out[(size_t) ent_dst[e + i] * L.n_embd + r] = s[i];
     }
 }
 
