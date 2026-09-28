@@ -11,12 +11,14 @@ import hashlib, json, os, re, shutil, statistics as st, subprocess, sys, time
 
 T = os.environ.get("TEMP", os.environ.get("TMP", "."))
 REF = {"code": "strata-codex-dispatch-detail-code256", "thai": "strata-codex-dispatch-detail-thai256",
-       "sky": "strata-codex-compact-parity-sky256", "long": "strata-codex-compact-parity-long256"}
+       "sky": "strata-codex-compact-parity-sky256", "long": "strata-codex-compact-parity-long256",
+       "serve": "strata-claude-serve-long"}   # strata-xeno.json's serving args, an 8,024-token prompt, 128 new
 F = r"([0-9.]+)"
 STAGES = {"tok/s": r"->\s+" + F + " tok/s", "rings": r"wait for rings " + F, "pool": r"verify window.*pool " + F,
           "cpu_pool": r"dispatch detail\s+CPU pool " + F, "sec_fin": r"secondary finish " + F,
           "sec_launch": r"secondary timing\s+launch " + F, "cpu_GBs": r"ms/round; " + F + " GB/s",
-          "mtp": r"^mtp\s+" + F, "host": r" host " + F, "commit": r"commit " + F}
+          "mtp": r"^mtp\s+" + F, "host": r" host " + F, "commit": r"commit " + F,
+          "ttft_ms": r"time to first token " + F}
 
 
 def main(argv):

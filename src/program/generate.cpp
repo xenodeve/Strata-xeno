@@ -29,6 +29,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -190,6 +191,7 @@ struct Options {
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
     std::string route_trace;              ///< append each verify window's routed expert ids to this file
     int pool_priority = 2;                ///< THREAD_PRIORITY_* for pool workers + host; 2 = HIGHEST (default, 0 = off)
+    int mmvq_exact = 1;                   ///< 0: llama.cpp's multi-column MMVQ layout (not bitwise equal to ncols = 1)
     int pool_rest = 1;                    ///< send the pool's workers to sleep when a verify window ends (1, default)
     int process_priority = 0;             ///< process class: 0 normal (default), 1 above normal, 2 high (opt-in:
                                           ///< measured +1-3 %, but it lets the pool starve the desktop)
@@ -263,7 +265,9 @@ struct Options {
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
-    int adapt_every = 4;
+    /// -1 (unset) resolves by mode after parsing: 96 every 4 rounds on one GPU; paired 8 every round with
+    /// --exclusive-primary-experts (a batch above 8 measured worse, #21).
+    int adapt_every = -1;
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
@@ -275,13 +279,15 @@ struct Options {
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
-    int adapt_swaps = 96;
+    int adapt_swaps = -1;
     /// Swap only while the CPU pool is the longer side of recent verify windows (EMA of pool - wait-for-rings > 0):
     /// swaps then take CPU entries off the long pole; when the primary GPU is the long pole they only add GPU work.
     bool adapt_gate = false;
     /// Adaptive swaps into the 4070 tier per adapt call: the most-routed CPU experts replace its least-routed
     /// residents (their host copies stay, so no copy-home is needed).  0 = the 4070 tier stays static.
-    int adapt_secondary = 0;
+    /// -1 (unset): 8 when the 4070 tier is on (--secondary-expert-mib), else 0.  Same-session A/B at 13 workers
+    /// (strata-claude-w13swap): paired 8 + 4070 8 was the best arm on thai and code, no arm slower, outputs identical.
+    int adapt_secondary = -1;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -402,6 +408,7 @@ void usage() {
                  "  --pool-priority P    Windows thread priority of the pool workers and the host thread.  Default 2\n"
                  "  --process-priority C 0 normal (default), 1 above normal, 2 high priority class for the process\n"
                  "  --pool-rest N        1 (default): pool workers sleep between verify windows; 0: they spin 20 ms\n"
+                 "  --mmvq-exact N       1 (default): multi-column MMVQ bitwise equal to ncols = 1; 0: llama.cpp layout\n"
                  "                       (HIGHEST): pinned workers are otherwise preempted by other programs and the\n"
                  "                       layer waits; +17 %% code / +36 %% Thai decode measured.  0 keeps the OS default.\n"
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
@@ -726,6 +733,7 @@ int main(int argc, char** argv) {
         else if (a == "--pool-priority") o.pool_priority = std::atoi(next("--pool-priority"));
         else if (a == "--process-priority") o.process_priority = std::atoi(next("--process-priority"));
         else if (a == "--pool-rest") o.pool_rest = std::atoi(next("--pool-rest"));
+        else if (a == "--mmvq-exact") o.mmvq_exact = std::atoi(next("--mmvq-exact"));
         else if (a == "--secondary-graph") o.secondary_graph = std::atoi(next("--secondary-graph"));
         else if (a == "--route-trace") o.route_trace = next("--route-trace");
         else if (a == "--exclusive-primary-experts") o.exclusive_primary_experts = true;
@@ -798,6 +806,10 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // adaptive tiers: measured wins with no trade-off inside the mode that enables them (AGENTS.md default rule)
+    if (o.adapt_swaps < 0) o.adapt_swaps = o.exclusive_primary_experts ? 8 : 96;
+    if (o.adapt_every < 0) o.adapt_every = o.exclusive_primary_experts ? 1 : 4;
+    if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 ? 8 : 0;
     if ((o.ple_io != "direct" && o.ple_io != "mmap") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
         o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
         std::fprintf(stderr, "strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
@@ -1243,6 +1255,7 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
         if (!o.mtp.empty() && !mtp.load(o.mtp, g, ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     }
+    strata::kernels::native_mmvq_set_multi_exact(o.mmvq_exact != 0);   // before any graph capture
 #ifdef _WIN32
     if (o.process_priority > 0 &&
         !SetPriorityClass(GetCurrentProcess(), o.process_priority >= 2 ? HIGH_PRIORITY_CLASS : ABOVE_NORMAL_PRIORITY_CLASS))

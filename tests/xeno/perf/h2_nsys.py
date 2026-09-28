@@ -7,15 +7,15 @@ import json, os, sqlite3, subprocess, sys, time
 
 T = os.environ["TEMP"]
 NSYS = r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.1.3\target-windows-x64\nsys.exe"
-EXE = os.path.join(T, "strata-claude-exe", "x7-sec.exe")
-OUT = os.path.join(T, "strata-claude-h2-nsys")
+EXE = os.environ.get("H2_EXE", os.path.join(T, "strata-claude-exe", "x7-sec.exe"))
+OUT = os.path.join(T, os.environ.get("H2_OUT", "strata-claude-h2-nsys"))
 if len(sys.argv) > 1:
     while "DONE" not in open(sys.argv[1], encoding="utf-8").read():
         time.sleep(20)
 os.makedirs(OUT, exist_ok=True)
 base = json.load(open(os.path.join(T, "strata-codex-dispatch-detail-code256", "on.command.json")))[1:]
-extra = ["--pool-priority", "2", "--adapt-swaps", "8", "--adapt-every", "1", "--adapt-secondary", "8",
-         "--profile-decode-range"]
+extra = os.environ.get("H2_ARGS", "--pool-priority 2 --adapt-swaps 8 --adapt-every 1 --adapt-secondary 8").split() + [
+    "--profile-decode-range"]
 env = dict(os.environ, CUDA_VISIBLE_DEVICES="1,0")
 cuda = os.path.join("C:" + os.sep, "Program Files", "NVIDIA GPU Computing Toolkit", "CUDA", "v13.3", "bin")
 env["PATH"] = os.pathsep.join([cuda, os.path.join(cuda, "x64"), env["PATH"]])
