@@ -458,11 +458,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
+    const auto pool_start = std::chrono::steady_clock::now();
     if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    const auto pool_end = std::chrono::steady_clock::now();
+    double secondary_finish_ms = 0;
     if (secondary_claims) {
         std::string secondary_err;
-        if (!d.secondary_runner->finish(out, secondary_err)) {
+        const auto finish_start = std::chrono::steady_clock::now();
+        const bool finished = d.secondary_runner->finish(out, secondary_err);
+        secondary_finish_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - finish_start).count();
+        if (!finished) {
             d.failed = true;
             d.secondary_fail = "secondary expert completion: " + secondary_err;
             d.fail = d.secondary_fail.c_str();
@@ -479,6 +486,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
+    d.ms_cpu_pool += ms(pool_start, pool_end);
+    d.ms_secondary_finish += secondary_finish_ms;
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;

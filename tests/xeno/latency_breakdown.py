@@ -39,6 +39,10 @@ def parse(stdout: str, stderr: str = '') -> dict:
     if m:
         out.update(disp_plan=float(m.group(1)), disp_actq=float(m.group(2)), disp_jobs=float(m.group(3)),
                    disp_run=float(m.group(4)))
+    m = re.search(r'^dispatch detail\s+CPU pool ' + FLOAT + r' secondary finish ' + FLOAT +
+                  r' ms/round$', stdout, re.M)
+    if m:
+        out.update(cpu_pool_self=float(m.group(1)), secondary_finish_total=float(m.group(2)))
     m = re.search(r'^mtp\s+' + FLOAT + r' ms/round drafting', stdout, re.M)
     if m:
         out['mtp'] = float(m.group(1))
@@ -89,6 +93,8 @@ def budget(p: dict) -> list:
     rows.append(('Other/unaccounted wall time', rest, rest / per_round))
     for key, name in (('disp_plan', '  dispatch plan (inside callback)'),
                       ('disp_run', '  dispatch run (CPU pool + secondary finish)'),
+                      ('cpu_pool_self', '    CPU pool self-time'),
+                      ('secondary_finish_total', '    secondary finish total'),
                       ('pool_gateup', '  CPU gate/up phase'), ('pool_down', '  CPU down phase')):
         if key in p:
             rows.append((name, p[key], p[key] / per_round))

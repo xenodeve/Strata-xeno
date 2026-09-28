@@ -38,6 +38,12 @@ class LatencyBreakdownTest(unittest.TestCase):
         self.assertAlmostEqual(p['secondary_d2h_full_mib'], 100.0)
         self.assertAlmostEqual(p['secondary_d2h_requested_mib'], 25.0)
 
+    def test_dispatch_run_separates_cpu_pool_and_secondary_finish(self):
+        timed = STDOUT + "dispatch detail          CPU pool 18.250 secondary finish 5.125 ms/round\n"
+        p = parse(timed)
+        self.assertAlmostEqual(p['cpu_pool_self'], 18.250)
+        self.assertAlmostEqual(p['secondary_finish_total'], 5.125)
+
     def test_parses_every_counter(self):
         p = parse(STDOUT, STDERR)
         self.assertEqual(p['rounds'], 173)

@@ -218,6 +218,7 @@ struct ExpertDispatch {
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
+    double ms_cpu_pool = 0, ms_secondary_finish = 0; ///< non-overlapping parts of ms_run
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;

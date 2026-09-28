@@ -3277,7 +3277,10 @@ if (o.expert_cache_per_layer) {
         if (rounds > 0)
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
-                        drive.d.ms_run / rounds);
+                    drive.d.ms_run / rounds);
+    if (rounds > 0 && o.secondary_expert_mib > 0)
+        std::printf("%-24s CPU pool %.3f secondary finish %.3f ms/round\n", "dispatch detail",
+                    drive.d.ms_cpu_pool / rounds, drive.d.ms_secondary_finish / rounds);
             if (o.secondary_expert_mib > 0)
                 std::printf("%-24s %lld entries in %lld groups (stage-only=%d)\n", "secondary Q2 tier",
                             (long long) drive.d.secondary_entries, (long long) drive.d.secondary_groups,

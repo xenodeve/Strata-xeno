@@ -47,5 +47,6 @@ The CUDA event intervals may include host enqueue gaps, and six event markers pe
 - [x] Recheck four fixed prompts for 256/256 raw-token parity and the required CTest/Python gates.
 - [x] Run alternating baseline/packed process benchmarks with profiling off. The large CPU-time variance prevents a throughput-gain claim; see `docs/reports/2026-09-28-packed-secondary-metadata.md`.
 - [x] Run a separate compact-D2H ablation with direct and four-prompt parity; requested D2H bytes fell 74.1%, but an end-to-end speed gain remains unproved. See `docs/reports/2026-09-28-compact-secondary-d2h.md`.
-- [ ] Split `dispatch.ms_run` into CPU pool self-time and complete secondary finish time, then use `--gpu-stages` to inspect the primary path before choosing the next performance change.
+- [x] Split `dispatch.ms_run` into CPU pool self-time and complete secondary finish time. Code/Thai runs account for the old apparent gap; see `docs/reports/2026-09-28-dispatch-run-breakdown.md`.
+- [ ] Use `--gpu-stages` to inspect the primary path before choosing another performance change.
 - [ ] Update engine/tracker issues bilingually after the next measured checkpoint.
