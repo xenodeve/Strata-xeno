@@ -41,6 +41,13 @@ most likely source of the random slow runs (CPU rows 13–14 GB/s against 19–2
 
 - **Every A/B, ABBA or sweep passes `--pool-priority 2`** (THREAD_PRIORITY_HIGHEST for the pool workers and the
   host thread) **in every arm**, so both sides get the same condition. Record it in the report.
+- **Every arm also runs in the HIGH process priority class** (`--process-priority 2`, or start the process with
+  HIGH_PRIORITY_CLASS). Same-session A/B `strata-claude-hiclass` (2026-09-29): code 76.76 -> 78.73 tok/s, thai
+  48.72 -> 49.33, CPU pool 12.41 -> 11.37 ms/round, and a tighter spread; desktop programs had been taking CPU
+  time from the pool. It is a measurement condition, not the serving default: at HIGH class the pool can starve
+  the desktop, so the serving default stays normal until the developer decides.
+- Wait for the measurement's `DONE` line before a build, a test run or another measurement; a wait loop that
+  times out is not completion.
 - Report whether a run was disturbed (for example, another CPU-heavy job was running) rather than silently
   keeping it. Do not run builds or other CPU-heavy work while a measurement is in flight.
 - Measured numbers at high priority describe the engine, not a normal-priority server. Whether the serving

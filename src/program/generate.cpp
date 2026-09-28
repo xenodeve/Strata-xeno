@@ -190,6 +190,8 @@ struct Options {
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
     std::string route_trace;              ///< append each verify window's routed expert ids to this file
     int pool_priority = 2;                ///< THREAD_PRIORITY_* for pool workers + host; 2 = HIGHEST (default, 0 = off)
+    int process_priority = 0;             ///< process class: 0 normal (default), 1 above normal, 2 high (opt-in:
+                                          ///< measured +1-3 %, but it lets the pool starve the desktop)
     bool lock_cpu_experts = false;        ///< VirtualLock the host pages of experts only the CPU serves
     bool secondary_async_launch = false;  ///< enqueue the 4070's work on a helper thread (off the host path)
     int secondary_graph = 1;              ///< enqueue the 4070's work as one CUDA graph per token count (#25)
@@ -397,6 +399,7 @@ void usage() {
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
                  "  --secondary-graph N  1 (default): the 4070's per-layer work is one CUDA graph launch; 0: ~12 API calls\n"
                  "  --pool-priority P    Windows thread priority of the pool workers and the host thread.  Default 2\n"
+                 "  --process-priority C 0 normal (default), 1 above normal, 2 high priority class for the process\n"
                  "                       (HIGHEST): pinned workers are otherwise preempted by other programs and the\n"
                  "                       layer waits; +17 %% code / +36 %% Thai decode measured.  0 keeps the OS default.\n"
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
@@ -719,6 +722,7 @@ int main(int argc, char** argv) {
         else if (a == "--secondary-async-launch") o.secondary_async_launch = true;
         else if (a == "--lock-cpu-experts") o.lock_cpu_experts = true;
         else if (a == "--pool-priority") o.pool_priority = std::atoi(next("--pool-priority"));
+        else if (a == "--process-priority") o.process_priority = std::atoi(next("--process-priority"));
         else if (a == "--secondary-graph") o.secondary_graph = std::atoi(next("--secondary-graph"));
         else if (a == "--route-trace") o.route_trace = next("--route-trace");
         else if (a == "--exclusive-primary-experts") o.exclusive_primary_experts = true;
@@ -1236,6 +1240,11 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
         if (!o.mtp.empty() && !mtp.load(o.mtp, g, ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     }
+#ifdef _WIN32
+    if (o.process_priority > 0 &&
+        !SetPriorityClass(GetCurrentProcess(), o.process_priority >= 2 ? HIGH_PRIORITY_CLASS : ABOVE_NORMAL_PRIORITY_CLASS))
+        std::fprintf(stderr, "strata generate: --process-priority %d could not be applied\n", o.process_priority);
+#endif
     strata::kernels::cpu::set_worker_priority(o.pool_priority);
     strata::kernels::cpu::set_current_thread_priority(o.pool_priority);   // the host works in the pool too
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
