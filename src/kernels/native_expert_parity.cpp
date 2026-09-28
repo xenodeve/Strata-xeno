@@ -169,7 +169,7 @@ int main(int argc, char** argv) {
             cudaMalloc(&dblob, blob.size());
             cudaMalloc(&dx, x.size() * 4);
             cudaMalloc(&dxq, (size_t) NT * H / 32 * 36);
-            cudaMalloc(&dscr, strata::kernels::native_expert_scratch_bytes(NT, FF));
+            cudaMalloc(&dscr, strata::kernels::native_expert_scratch_bytes(NT, FF, H));
             cudaMalloc((void**) &dout, (size_t) NT * H * 4);
             cudaMalloc((void**) &dptr, 8);
             cudaMalloc((void**) &dstart, 8);

@@ -80,7 +80,7 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     const uint64_t xq_at = carve((uint64_t) max_tokens * (n_embd / 32) * 36);
     const uint64_t scales_at = carve((uint64_t) max_tokens * (n_embd / 32) * sizeof(float));
     const uint64_t out_at = carve((uint64_t) max_entries * n_embd * sizeof(float));
-    const uint64_t scratch_at = carve(kernels::native_expert_scratch_bytes(max_entries, n_ff));
+    const uint64_t scratch_at = carve(kernels::native_expert_scratch_bytes(max_entries, n_ff, n_embd));
     const uint64_t ptr_at = carve((uint64_t) max_entries * sizeof(unsigned long long));
     const uint64_t start_at = carve((uint64_t) (max_entries + 1) * sizeof(int32_t));
     const uint64_t count_at = carve(sizeof(int32_t));

@@ -49,7 +49,7 @@ struct NativeExpertLayout {
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
-size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
+size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff, int64_t n_embd);
 
 /// Grouped experts in the native format: group g's blob at device address grp_ptr[g]; its entries
 /// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s q8_1 activation (n_embd/32 blocks per token in x_q8_1)

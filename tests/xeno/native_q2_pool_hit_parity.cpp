@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
     ck(cudaMalloc(&dx, x.size() * sizeof(float)), "x alloc");
     ck(cudaMalloc(&dxq, (size_t) ENTRIES * H / 32 * 36), "q8 alloc");
     ck(cudaMalloc((void**) &dx_scales, (size_t) ENTRIES * H / 32 * sizeof(float)), "scale alloc");
-    ck(cudaMalloc(&scratch, strata::kernels::native_expert_scratch_bytes(ENTRIES, FF)), "scratch alloc");
+    ck(cudaMalloc(&scratch, strata::kernels::native_expert_scratch_bytes(ENTRIES, FF, H)), "scratch alloc");
     ck(cudaMalloc((void**) &dout, (size_t) ENTRIES * H * sizeof(float)), "out alloc");
     ck(cudaMalloc((void**) &dptr, 2 * sizeof(unsigned long long)), "pointer alloc");
     ck(cudaMalloc((void**) &dstart, 3 * sizeof(int32_t)), "start alloc");
