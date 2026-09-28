@@ -79,6 +79,20 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// Adaptive swaps stage whole experts (1.38 MB each) between rounds, when the CPU pool is idle; one thread copying
+// 16 of them took 2.7 ms/round and outlasted the commit + MTP draft it overlaps (`adapt detail`).
+struct CopyJob { void* dst; const void* src; size_t bytes; };
+void parallel_copy(const std::vector<CopyJob>& jobs) {
+    const size_t nt = std::min<size_t>(4, jobs.size());
+    auto part = [&](size_t t) {
+        for (size_t i = t; i < jobs.size(); i += nt) std::memcpy(jobs[i].dst, jobs[i].src, jobs[i].bytes);
+    };
+    std::vector<std::thread> th;
+    for (size_t t = 1; t < nt; ++t) th.emplace_back(part, t);
+    if (nt > 0) part(0);
+    for (auto& x : th) x.join();
+}
+
 struct Options {
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
@@ -2363,6 +2377,7 @@ if (o.expert_cache_per_layer) {
                     int prev = 0;
                     cudaGetDevice(&prev);
                     cudaSetDevice(1);
+                    std::vector<CopyJob> jobs;
                     for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                         const int32_t in = sc[k].second, out = sv[k].second;
                         const int32_t slot = secondary_residency[(size_t) out];
@@ -2371,14 +2386,16 @@ if (o.expert_cache_per_layer) {
                         const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
                         if (src == nullptr) break;
                         secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
-                        std::memcpy(ss_stage + ss_pending.size() * ps_blob, src, bytes);
-                        if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) slot), ss_stage + ss_pending.size() * ps_blob,
-                                            bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
+                        jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
+                        ss_pending.emplace_back(in, slot);
+                    }
+                    parallel_copy(jobs);
+                    for (size_t k = 0; k < jobs.size(); ++k)
+                        if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) ss_pending[k].second), jobs[k].dst,
+                                            jobs[k].bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
                             cudaSetDevice(prev);
                             return false;
                         }
-                        ss_pending.emplace_back(in, slot);
-                    }
                     if (!ss_pending.empty()) cudaEventRecord(ss_ev, ss_stream);
                     cudaSetDevice(prev);
                     sec_swaps += (int64_t) ss_pending.size();
@@ -2400,6 +2417,8 @@ if (o.expert_cache_per_layer) {
                         cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 }
                 if (!ps_d2h.empty() && ps_h2d.empty() && cudaEventQuery(d2h_ev) == cudaSuccess) {   // stage 2
+                    // the evicted expert goes home first; its staging slot then takes the newcomer
+                    std::vector<CopyJob> home_jobs, in_jobs;
                     for (size_t i = 0; i < ps_d2h.size(); ++i) {
                         const PSwap& s = ps_d2h[i];
                         const size_t bytes = (size_t) lay.blob_bytes(s.layer);
@@ -2411,12 +2430,17 @@ if (o.expert_cache_per_layer) {
                             std::fprintf(stderr, "strata generate: paired swap copy-home: %s\n", e.c_str());
                             return false;
                         }
-                        std::memcpy(home, st, bytes);
+                        home_jobs.push_back({home, st, bytes});
+                        in_jobs.push_back({st, src, bytes});
+                    }
+                    parallel_copy(home_jobs);
+                    parallel_copy(in_jobs);
+                    for (size_t i = 0; i < ps_d2h.size(); ++i) {
+                        const PSwap& s = ps_d2h[i];
                         arena_src.publish_host_copy(s.layer, s.out);
                         host_res[(size_t) s.layer * g.n_expert + s.out] = strata::core::kNotResident;
-                        std::memcpy(st, src, bytes);
-                        if (cudaMemcpyAsync(xcache.device_slot(s.slot), st, bytes, cudaMemcpyHostToDevice,
-                                            adapt_stream) != cudaSuccess)
+                        if (cudaMemcpyAsync(xcache.device_slot(s.slot), in_jobs[i].dst, in_jobs[i].bytes,
+                                            cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
                             return false;
                     }
                     cudaEventRecord(adapt_ev, adapt_stream);
@@ -3290,7 +3314,8 @@ if (o.expert_cache_per_layer) {
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
-        double ms_adapt = 0;
+        double ms_adapt = 0, ms_apply = 0, ms_join = 0;   // adapt(): its thread; apply/join: the decode thread
+        double ms_sec = 0, ms_p2 = 0, ms_p3 = 0;          // inside adapt(): 4070 swaps, paired stage 2 and 3
         cudaStream_t adapt_stream = nullptr;
         if (!drive.d.usage.empty() && cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
@@ -3353,7 +3378,7 @@ if (o.expert_cache_per_layer) {
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
         // routed clearly more often.  Copies run between rounds, when the GPU is idle.
         auto adapt = [&]() -> bool {
-            const Clock::time_point ta = Clock::now();
+            const Clock::time_point t_sec = Clock::now();
             if (sec_adapt) {   // the 4070 tier, independent of the primary swaps below
                 if (!ss_pending.empty() && cudaEventQuery(ss_ev) == cudaSuccess) {
                     for (const auto& [i, slot] : ss_pending) secondary_residency[(size_t) i] = slot;
@@ -3374,6 +3399,7 @@ if (o.expert_cache_per_layer) {
                     int prev = 0;
                     cudaGetDevice(&prev);
                     cudaSetDevice(1);
+                    std::vector<CopyJob> jobs;
                     for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                         const int32_t in = sc[k].second, out = sv[k].second;
                         const int32_t slot = secondary_residency[(size_t) out];
@@ -3382,21 +3408,25 @@ if (o.expert_cache_per_layer) {
                         const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
                         if (src == nullptr) break;
                         secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
-                        std::memcpy(ss_stage + ss_pending.size() * ps_blob, src, bytes);
-                        if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) slot), ss_stage + ss_pending.size() * ps_blob,
-                                            bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
+                        jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
+                        ss_pending.emplace_back(in, slot);
+                    }
+                    parallel_copy(jobs);
+                    for (size_t k = 0; k < jobs.size(); ++k)
+                        if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) ss_pending[k].second), jobs[k].dst,
+                                            jobs[k].bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
                             cudaSetDevice(prev);
                             return false;
                         }
-                        ss_pending.emplace_back(in, slot);
-                    }
                     if (!ss_pending.empty()) cudaEventRecord(ss_ev, ss_stream);
                     cudaSetDevice(prev);
                     sec_swaps += (int64_t) ss_pending.size();
                 }
             }
+            ms_sec += std::chrono::duration<double, std::milli>(Clock::now() - t_sec).count();
             if (paired) {
                 const auto& lay = strata::kernels::cpu::expert_layout();
+                const Clock::time_point t_p3 = Clock::now();
                 if (!ps_h2d.empty() && cudaEventQuery(adapt_ev) == cudaSuccess) {   // stage 3
                     for (const PSwap& s : ps_h2d) {
                         host_res[(size_t) s.layer * g.n_expert + s.in] = s.slot;
@@ -3410,7 +3440,11 @@ if (o.expert_cache_per_layer) {
                     if (d_res != nullptr)
                         cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 }
+                const Clock::time_point t_p2 = Clock::now();
+                ms_p3 += std::chrono::duration<double, std::milli>(t_p2 - t_p3).count();
                 if (!ps_d2h.empty() && ps_h2d.empty() && cudaEventQuery(d2h_ev) == cudaSuccess) {   // stage 2
+                    // the evicted expert goes home first; its staging slot then takes the newcomer
+                    std::vector<CopyJob> home_jobs, in_jobs;
                     for (size_t i = 0; i < ps_d2h.size(); ++i) {
                         const PSwap& s = ps_d2h[i];
                         const size_t bytes = (size_t) lay.blob_bytes(s.layer);
@@ -3422,12 +3456,17 @@ if (o.expert_cache_per_layer) {
                             std::fprintf(stderr, "strata generate: paired swap copy-home: %s\n", e.c_str());
                             return false;
                         }
-                        std::memcpy(home, st, bytes);
+                        home_jobs.push_back({home, st, bytes});
+                        in_jobs.push_back({st, src, bytes});
+                    }
+                    parallel_copy(home_jobs);
+                    parallel_copy(in_jobs);
+                    for (size_t i = 0; i < ps_d2h.size(); ++i) {
+                        const PSwap& s = ps_d2h[i];
                         arena_src.publish_host_copy(s.layer, s.out);
                         host_res[(size_t) s.layer * g.n_expert + s.out] = strata::core::kNotResident;
-                        std::memcpy(st, src, bytes);
-                        if (cudaMemcpyAsync(xcache.device_slot(s.slot), st, bytes, cudaMemcpyHostToDevice,
-                                            adapt_stream) != cudaSuccess)
+                        if (cudaMemcpyAsync(xcache.device_slot(s.slot), in_jobs[i].dst, in_jobs[i].bytes,
+                                            cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
                             return false;
                     }
                     cudaEventRecord(adapt_ev, adapt_stream);
@@ -3436,6 +3475,7 @@ if (o.expert_cache_per_layer) {
                     if (d_res != nullptr)
                         cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 }
+                ms_p2 += std::chrono::duration<double, std::milli>(Clock::now() - t_p2).count();
                 if (!ps_d2h.empty() || !ps_h2d.empty() || !adapt_start) return true;
             } else if (!pending.empty()) {
                 return true;   // the previous swaps are still in flight
@@ -3498,7 +3538,6 @@ if (o.expert_cache_per_layer) {
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             for (float& v : drive.d.usage) v *= 0.7f;
             swaps_total += (int64_t) swaps.size();
-            ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             return true;
         };
         int64_t p = spec_pos;
@@ -3550,7 +3589,9 @@ if (o.expert_cache_per_layer) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
+            const Clock::time_point tap = Clock::now();
             apply_pending(false);
+            ms_apply += std::chrono::duration<double, std::milli>(Clock::now() - tap).count();
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -3578,7 +3619,11 @@ if (o.expert_cache_per_layer) {
             }
             adapt_start = ((rounds + 1) % o.adapt_every) == 0 && (!o.adapt_gate || gate_ema > 0.0);
             if (!drive.d.usage.empty() && (adapt_start || !ps_d2h.empty() || !ps_h2d.empty() || !ss_pending.empty()))
-                adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                adapt_thr = std::thread([&] {
+                    const Clock::time_point ta = Clock::now();
+                    adapt_ok = adapt();
+                    ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                });
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -3600,7 +3645,9 @@ if (o.expert_cache_per_layer) {
             }
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+            const Clock::time_point tj = Clock::now();
             if (adapt_thr.joinable()) adapt_thr.join();
+            ms_join += std::chrono::duration<double, std::milli>(Clock::now() - tj).count();
             if (!adapt_ok) return 1;
             if (!drafted) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -3686,8 +3733,13 @@ if (o.expert_cache_per_layer) {
                     (double) t.d2h_requested_bytes / 1048576.0);
     }
     if (rounds > 0 && !drive.d.usage.empty())
-            std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
-                        (long long) (swaps_total + paired_swaps), o.adapt_every, ms_adapt / rounds);
+            std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds); adapt thread %.3f, "
+                        "apply %.3f, join wait %.3f ms/round\n", "adaptive tier",
+                        (long long) (swaps_total + paired_swaps), o.adapt_every, ms_adapt / rounds, ms_apply / rounds,
+                        ms_join / rounds);
+        if (rounds > 0 && !drive.d.usage.empty())
+            std::printf("%-24s 4070 swaps %.3f  paired stage 2 %.3f  stage 3 %.3f ms/round\n", "adapt detail",
+                        ms_sec / rounds, ms_p2 / rounds, ms_p3 / rounds);
         if (rounds > 0 && sec_adapt)
             std::printf("%-24s %lld experts swapped into the 4070 tier\n", "adaptive 4070", (long long) sec_swaps);
         if (rounds > 0 && drive.d.pcie_num > 0)
