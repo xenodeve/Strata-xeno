@@ -14,4 +14,28 @@ Strata-xeno PRD: xenodeve/Qwen3.8-Flash-Next-Tuning#1. Engine implementation and
 | 8 Speculation and sampler | #8 | #17 | Depends on correctness |
 | 9 Telemetry and default decision | #9 | #18 | Final measured gate |
 
+## Hybrid runtime and decode speed (xenodeve/Strata-xeno#12, branch `xeno/claude-q2-kernel`)
+
+State on 2026-09-29. Every number comes from a same-session ABBA with identical greedy outputs (tool: `tests/xeno/perf/ab.py`).
+
+| Item | State |
+|---|---|
+| H1: 4070 swaps `--adapt-secondary` | `87e9922`. Opt-in: the CPU pool drops, tok/s is unchanged because the round is bound by the primary GPU. |
+| H2: primary-GPU Nsight | Done: `docs/reports/2026-09-28-h2-primary-timeline.md`. The trunk is 41 % of the primary's timeline, its own experts 15 %. |
+| Mapped-copy merge | #26 closed (`94d347d`): thai +3.4 %. |
+| Swap host cost | `86b6419` (parallel staging copy) and `5748dc5` (4070 swaps on their own thread): code +2 %, thai +2.2 %. New counters: `adaptive tier` thread/apply/join, `adapt detail`, `verify edges`. |
+| 4070 launch as a CUDA graph | #25 closed (`3ec52cb`), on by default: thai +5.4 %, code +1.2 %. |
+| 4070 partials clear dropped | `aec0da7`: bit-exact, no measurable change. |
+| `gr_down_multi` one-wave geometry | Tried and not kept: `wait for rings` unchanged. The parity test `xeno_gr_multi_parity` was kept (`21a2ed0`). |
+| HIGH process class | `0a2d70d`: `--process-priority` is opt-in; code +2.6 %, thai +1.3 %. Every measurement arm now runs at HIGH class. |
+| Measurement tools in the repo | #24 closed (`99c5cdf`). |
+| #16 pool workers 6/9/13 | Running (`strata-claude-workers`). |
+
+**Waiting for the developer:**
+- Whether the serving default uses `--process-priority 2`, given the risk of desktop starvation.
+- The dual-GPU serving profile (#12/#21).
+- Large pages (#17).
+- Quantizing the BF16 hyper-connection weights, which breaks ADR 0001.
+- The trunk split across GPUs (H4 on dense projections).
+
 The source audit at Flash-Next commit `8bf2c853417c5d381c1a4d4d1c20c3f55b5ad1c0` supersedes the earlier report at `ced0445`.
