@@ -207,6 +207,10 @@ bool SecondaryArena::fill_slot(uint64_t slot, const uint8_t* blob, uint64_t byte
         err = std::string("secondary fill copy: ") + cudaGetErrorString(copied);
         return false;
     }
+    // Filling a slot allocates nothing (the arena was allocated whole at open), so the display card's free memory
+    // can only move with other processes. Sampling it after every slot cost ~15 ms per expert (104 s for 6,602
+    // experts, strata-claude-memtrace-E); every 256th slot and the last one keep the floor check.
+    if (slot % 256 != 0 && slot + 1 != slots()) { err.clear(); return true; }
     uint64_t lower = 0;
     if (!free_snapshot(ordinal_, lower, err)) return false;
     if (lower < free_floor_bytes_) {
@@ -230,17 +234,18 @@ bool SecondaryArena::verify_slot(uint64_t slot, const uint8_t* blob, uint64_t by
         return false;
     }
     const RestoreDevice restore{previous};
-    std::vector<uint8_t> actual((size_t) bytes);
+    static thread_local std::vector<uint8_t> actual;   // reused: one allocation, not one per slot
+    actual.resize((size_t) bytes);
     const cudaError_t copied = cudaMemcpy(actual.data(), slot_ptr(slot), (size_t) bytes, cudaMemcpyDeviceToHost);
     if (copied != cudaSuccess) {
         err = std::string("secondary verify copy: ") + cudaGetErrorString(copied);
         return false;
     }
-    for (uint64_t i = 0; i < bytes; ++i) {
-        if (actual[(size_t) i] != blob[i]) {
-            err = "secondary slot " + std::to_string(slot) + " differs at byte " + std::to_string(i);
-            return false;
-        }
+    if (std::memcmp(actual.data(), blob, (size_t) bytes) != 0) {
+        uint64_t i = 0;
+        while (i < bytes && actual[(size_t) i] == blob[i]) ++i;
+        err = "secondary slot " + std::to_string(slot) + " differs at byte " + std::to_string(i);
+        return false;
     }
     err.clear();
     return true;
