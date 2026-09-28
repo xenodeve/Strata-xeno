@@ -24,6 +24,8 @@ public:
     uint8_t* slot_ptr(uint64_t slot) const;
     bool fill_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err);
     bool verify_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err);
+    /// The display card's free-memory floor, checked once (a pipelined fill that bypasses fill_slot calls it last).
+    bool check_free_floor(std::string& err);
     uint64_t slots() const { return offsets_.empty() ? 0 : offsets_.size() - 1; }
     uint64_t bytes() const { return offsets_.empty() ? 0 : offsets_.back(); }
     uint64_t lower_free_after() const { return lower_free_after_; }

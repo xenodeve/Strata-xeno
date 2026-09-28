@@ -1617,7 +1617,86 @@ if (o.expert_cache_per_layer) {
             return 1;
         }
         secondary_residency.assign((size_t) (g.n_layers * g.n_expert), -1);
-        for (uint64_t slot = 0; slot < secondary_arena.slots(); ++slot) {
+        if (place_first) {
+            // the same pipeline as the primary fill: a reader thread reads the next batch from the pack while this
+            // thread copies the current one into the 4070 (x16), reads it back and compares
+            constexpr uint64_t B = 32;
+            const size_t MB = (size_t) layout.max_blob;
+            const uint64_t ns = secondary_arena.slots();
+            uint8_t* rbuf[2] = {nullptr, nullptr};
+            uint8_t* vbuf = nullptr;
+            cudaStream_t fs = nullptr;
+            int prev_dev = 0;
+            cudaGetDevice(&prev_dev);
+            cudaSetDevice(1);
+            if (cudaHostAlloc((void**) &rbuf[0], B * MB, cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostAlloc((void**) &rbuf[1], B * MB, cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostAlloc((void**) &vbuf, B * MB, cudaHostAllocPortable) != cudaSuccess ||
+                cudaStreamCreateWithFlags(&fs, cudaStreamNonBlocking) != cudaSuccess) {
+                cudaSetDevice(prev_dev);
+                std::fprintf(stderr, "strata generate: placement-first 4070 fill buffers could not be allocated\n");
+                return 1;
+            }
+            std::string rd_err;
+            auto read_batch = [&](uint64_t k, uint8_t* dst) -> bool {
+                for (uint64_t j = 0; j < B && k * B + j < ns; ++j) {
+                    const auto& pair = candidates[(size_t) (k * B + j)];
+                    if (!arena_src.read_expert(pair.layer, pair.expert, dst + j * MB, rd_err)) return false;
+                }
+                return true;
+            };
+            const auto ts0 = Clock::now();
+            bool rd_ok = read_batch(0, rbuf[0]);
+            for (uint64_t k = 0; k * B < ns; ++k) {
+                if (!rd_ok) {
+                    cudaSetDevice(prev_dev);
+                    std::fprintf(stderr, "strata generate: the 4070 fill read failed: %s\n", rd_err.c_str());
+                    return 1;
+                }
+                bool next_ok = true;
+                std::thread rd;
+                if ((k + 1) * B < ns) rd = std::thread([&, k] { next_ok = read_batch(k + 1, rbuf[(k + 1) % 2]); });
+                uint8_t* cur = rbuf[k % 2];
+                const uint64_t n = std::min<uint64_t>(B, ns - k * B);
+                for (uint64_t j = 0; j < n; ++j) {
+                    const auto& pair = candidates[(size_t) (k * B + j)];
+                    cudaMemcpyAsync(secondary_arena.slot_ptr(k * B + j), cur + j * MB, (size_t) pair.bytes,
+                                    cudaMemcpyHostToDevice, fs);
+                }
+                for (uint64_t j = 0; j < n; ++j)
+                    cudaMemcpyAsync(vbuf + j * MB, secondary_arena.slot_ptr(k * B + j),
+                                    (size_t) candidates[(size_t) (k * B + j)].bytes, cudaMemcpyDeviceToHost, fs);
+                const cudaError_t se = cudaStreamSynchronize(fs);
+                for (uint64_t j = 0; j < n; ++j) {
+                    const auto& pair = candidates[(size_t) (k * B + j)];
+                    secondary_residency[(size_t) pair.layer * (size_t) g.n_expert + (size_t) pair.expert] =
+                        (int32_t) (k * B + j);
+                    if (se != cudaSuccess || std::memcmp(vbuf + j * MB, cur + j * MB, (size_t) pair.bytes) != 0 ||
+                        (o.exclusive_secondary && !arena_src.release_host_copy(pair.layer, pair.expert, err))) {
+                        if (rd.joinable()) rd.join();
+                        cudaSetDevice(prev_dev);
+                        std::fprintf(stderr, "strata generate: secondary expert (%d,%d) slot %llu failed its fill: %s\n",
+                                     pair.layer, pair.expert, (unsigned long long) (k * B + j),
+                                     se != cudaSuccess ? cudaGetErrorString(se) : err.empty() ? "bytes differ" : err.c_str());
+                        return 1;
+                    }
+                }
+                if (rd.joinable()) rd.join();
+                rd_ok = next_ok;
+            }
+            cudaStreamDestroy(fs);
+            cudaFreeHost(rbuf[0]);
+            cudaFreeHost(rbuf[1]);
+            cudaFreeHost(vbuf);
+            cudaSetDevice(prev_dev);
+            if (!secondary_arena.check_free_floor(err)) {
+                std::fprintf(stderr, "strata generate: secondary fill: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: 4070 fill (pipelined read / copy / verify): %.1f s\n",
+                         std::chrono::duration<double>(Clock::now() - ts0).count());
+        }
+        for (uint64_t slot = 0; slot < secondary_arena.slots() && !place_first; ++slot) {
             const auto& pair = candidates[(size_t) slot];
             secondary_residency[(size_t) pair.layer * (size_t) g.n_expert + (size_t) pair.expert] =
                 (int32_t) slot;

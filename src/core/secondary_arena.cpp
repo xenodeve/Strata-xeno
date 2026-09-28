@@ -222,6 +222,18 @@ bool SecondaryArena::fill_slot(uint64_t slot, const uint8_t* blob, uint64_t byte
     return true;
 }
 
+bool SecondaryArena::check_free_floor(std::string& err) {
+    uint64_t lower = 0;
+    if (!free_snapshot(ordinal_, lower, err)) return false;
+    if (lower < free_floor_bytes_) {
+        err = "secondary fill crossed the display free floor";
+        return false;
+    }
+    lower_free_after_ = lower;
+    err.clear();
+    return true;
+}
+
 bool SecondaryArena::verify_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err) {
     if (blob == nullptr || bytes == 0 || slot >= slots() ||
         bytes > offsets_[(size_t) slot + 1] - offsets_[(size_t) slot]) {
