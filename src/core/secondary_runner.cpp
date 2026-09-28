@@ -303,13 +303,11 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
             ge = nullptr;
         }
         if (ge == nullptr) {
-            const size_t out_bytes = (size_t) entries * n_embd_ * sizeof(float);
             if (!cuda_ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "runner graph capture", err))
                 return false;
             cudaMemcpyAsync(device_ptr_, host_meta_, meta_bytes_, cudaMemcpyHostToDevice, stream);
             cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float), cudaMemcpyHostToDevice,
                             stream);
-            cudaMemsetAsync(device_out_, 0, out_bytes, stream);
             kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
             kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
                                            entries, entries, device_xq_, device_scratch_, device_out_, stream,
@@ -343,9 +341,7 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
                  "runner packed metadata H2D", err) ||
         !cuda_ok(cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float),
                                  cudaMemcpyHostToDevice, stream), "runner activation H2D", err) ||
-        !mark(1) ||
-        !cuda_ok(cudaMemsetAsync(device_out_, 0, (size_t) entries * n_embd_ * sizeof(float), stream),
-                 "runner clear partials", err) || !mark(2)) return fail_enqueued();
+        !mark(1) || !mark(2)) return fail_enqueued();   // no clear: the down kernel writes every claimed row
     kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
     if (!mark(3)) return fail_enqueued();
     kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
