@@ -26,6 +26,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -96,6 +97,10 @@ struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     int64_t n_expert = strata::kernels::cpu::NE;
+
+    /// Optional routing trace (--route-trace): per verify-window layer, int16 layer, n_tok, k, then n_tok*k
+    /// int16 expert ids (-1 = none), little-endian, appended in dispatch order.
+    std::FILE* route_trace = nullptr;
 
     /// Counters, for the driver to report rather than for control flow.
     int64_t layers = 0;

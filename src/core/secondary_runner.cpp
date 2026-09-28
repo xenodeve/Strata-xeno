@@ -3,6 +3,7 @@
 #include "strata/core/secondary_budget.hpp"
 #include "strata/core/secondary_vram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -150,6 +151,72 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
 bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
                              const float* x, const int32_t* selected_slots, int n_tokens, int k,
                              std::string& err) {
+    if (!async_) return launch_now(layout, weights, x, selected_slots, n_tokens, k, err);
+    const auto t0 = std::chrono::steady_clock::now();
+    const int entries = n_tokens * k;
+    if (!launch_done_.load(std::memory_order_acquire) || x == nullptr || selected_slots == nullptr ||
+        n_tokens <= 0 || k <= 0 || entries > (int) job_slots_.size()) {
+        err = "secondary runner: invalid async launch or a launch still in flight";
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(launch_mu_);
+        job_layout_ = layout; job_weights_ = &weights; job_x_ = x;
+        std::memcpy(job_slots_.data(), selected_slots, (size_t) entries * sizeof(int32_t));
+        job_tokens_ = n_tokens; job_k_ = k;
+        launch_done_.store(false, std::memory_order_relaxed);
+        launch_req_ = true;
+    }
+    launch_cv_.notify_one();
+    ms_launch_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    err.clear();
+    return true;
+}
+
+bool SecondaryRunner::start_async_launch(int core, std::string& err) {
+    if (stream_ == nullptr || launcher_.joinable()) {
+        err = "secondary runner: async launch needs an initialised runner, once";
+        return false;
+    }
+    launch_stop_ = false;
+    launcher_ = std::thread([this, core] { launcher_loop(core); });
+    async_ = true;
+    err.clear();
+    return true;
+}
+
+void SecondaryRunner::launcher_loop(int core) {
+    kernels::cpu::pin_current_thread(core);
+    cudaSetDevice(1);   // stays on the display device, so launch_now's select/restore is a no-op here
+    for (;;) {
+        std::unique_lock<std::mutex> lk(launch_mu_);
+        launch_cv_.wait(lk, [this] { return launch_req_ || launch_stop_; });
+        if (launch_stop_) return;
+        launch_req_ = false;
+        lk.unlock();
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string e;
+        async_ok_ = launch_now(job_layout_, *job_weights_, job_x_, job_slots_.data(), job_tokens_, job_k_, e);
+        async_err_ = e;
+        ms_async_enqueue_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        launch_done_.store(true, std::memory_order_release);
+    }
+}
+
+void SecondaryRunner::stop_launcher() {
+    if (!launcher_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(launch_mu_);
+        launch_stop_ = true;
+    }
+    launch_cv_.notify_one();
+    launcher_.join();
+    async_ = false;
+}
+
+bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
+                                 const float* x, const int32_t* selected_slots, int n_tokens, int k,
+                                 std::string& err) {
     if (stream_ == nullptr || pending_ || failed_ || x == nullptr || selected_slots == nullptr ||
         n_tokens <= 0 || n_tokens > max_tokens_ || k <= 0 || k > max_entries_ / n_tokens ||
         layout.n_embd != n_embd_ || layout.n_ff != n_ff_ || layout.gu_type != 42 || layout.d_type != 42) {
@@ -248,12 +315,19 @@ bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const Se
     if (profile_timing_)
         timing_.host_enqueue_ms += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - enqueue_t0).count();
-    ms_launch_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - launch_t0).count();
+    if (!async_)   // async: launch() counts the host's own time, the helper's goes to ms_async_enqueue_
+        ms_launch_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - launch_t0).count();
     err.clear();
     return true;
 }
 
 bool SecondaryRunner::finish(float* output, std::string& err) {
+    if (async_) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!launch_done_.load(std::memory_order_acquire)) std::this_thread::yield();
+        ms_async_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!async_ok_) { err = async_err_; return false; }
+    }
     if (!pending_) { err.clear(); return true; }
     if (output == nullptr) { err = "secondary runner: output is null"; return false; }
     const auto switch_t0 = std::chrono::steady_clock::now();
@@ -376,6 +450,7 @@ void SecondaryRunner::stop_monitor() {
 }
 
 void SecondaryRunner::close() {
+    stop_launcher();
     stop_monitor();
     if (workspace_.slots() == 0 && stream_ == nullptr && done_ == nullptr &&
         host_x_ == nullptr && host_out_ == nullptr && host_meta_ == nullptr) return;

@@ -5,13 +5,15 @@
 
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <thread>
 #include <vector>
 
-namespace strata::kernels { struct NativeExpertLayout; }
+#include "strata/kernels/iq_kernels.hpp"
 
 namespace strata::core {
 
@@ -41,6 +43,13 @@ public:
                 const float* x, const int32_t* selected_slots, int n_tokens, int k,
                 std::string& err);
     bool finish(float* output, std::string& err);
+    /// Opt-in: from now on launch() hands its enqueue to a helper thread that stays on device 1 (pinned to
+    /// `core` when >= 0), so the host thread goes straight on to the CPU pool; finish() first waits for the
+    /// helper. Arithmetic and outputs are unchanged. Call once, after init().
+    bool start_async_launch(int core, std::string& err);
+    /// Helper-thread time spent enqueueing (async mode), and host time finish() waited for that enqueue.
+    double ms_async_enqueue() const { return ms_async_enqueue_; }
+    double ms_async_wait() const { return ms_async_wait_; }
     bool start_monitor(int interval_ms, std::string& err,
                        SecondaryArena::FreeReader reader = nullptr,
                        BreachHandler on_breach = nullptr, void* context = nullptr,
@@ -57,6 +66,10 @@ public:
     uint64_t min_free_bytes() const { return min_free_bytes_.load(); }
 
 private:
+    bool launch_now(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
+                    const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err);
+    void launcher_loop(int core);
+    void stop_launcher();
     void close();
     void record_free(uint64_t bytes);
     SecondaryArena workspace_;
@@ -91,6 +104,20 @@ private:
     uint64_t free_floor_bytes_ = 2560ull << 20;
     std::atomic<bool> monitor_stop_{false}, monitor_running_{false};
     std::thread monitor_;
+    // async launch: one request in flight at a time (launch -> finish per layer)
+    std::thread launcher_;
+    std::mutex launch_mu_;
+    std::condition_variable launch_cv_;
+    bool launch_req_ = false, launch_stop_ = false;
+    std::atomic<bool> launch_done_{true};
+    bool async_ = false, async_ok_ = true;
+    std::string async_err_;
+    kernels::NativeExpertLayout job_layout_{};
+    const SecondaryArena* job_weights_ = nullptr;
+    const float* job_x_ = nullptr;
+    std::array<int32_t, 128> job_slots_{};
+    int job_tokens_ = 0, job_k_ = 0;
+    double ms_async_enqueue_ = 0, ms_async_wait_ = 0;
     std::chrono::steady_clock::time_point last_free_check_{};
 };
 

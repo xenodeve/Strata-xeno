@@ -19,6 +19,7 @@
 #include "strata/core/secondary_arena.hpp"
 #include "strata/core/secondary_profile.hpp"
 #include "strata/core/secondary_runner.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -46,6 +47,7 @@
 #include "strata/program/logits_selection.hpp"
 
 #include <cuda_runtime.h>
+#include <memory>
 #include <cuda_profiler_api.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -172,6 +174,9 @@ struct Options {
     int expert_cache = 0;
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
+    std::string route_trace;              ///< append each verify window's routed expert ids to this file
+    bool lock_cpu_experts = false;        ///< VirtualLock the host pages of experts only the CPU serves
+    bool secondary_async_launch = false;  ///< enqueue the 4070's work on a helper thread (off the host path)
     bool secondary_profile_timing = false; ///< opt-in CUDA events; normal decode adds no markers
     bool secondary_stage_only = false; ///< A/B arm before routing work to device 1
     bool exclusive_primary_experts = false; ///< Phase 4 static GPU ownership; host pages decommitted after fill
@@ -685,6 +690,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--secondary-stage-only") o.secondary_stage_only = true;
         else if (a == "--secondary-profile-timing") o.secondary_profile_timing = true;
+        else if (a == "--secondary-async-launch") o.secondary_async_launch = true;
+        else if (a == "--lock-cpu-experts") o.lock_cpu_experts = true;
+        else if (a == "--route-trace") o.route_trace = next("--route-trace");
         else if (a == "--exclusive-primary-experts") o.exclusive_primary_experts = true;
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
@@ -1412,6 +1420,16 @@ if (o.expert_cache_per_layer) {
                 return 1;
             }
         }
+        if (o.secondary_async_launch) {
+            // the first core after the pool's workers (an E-core on hybrid parts), else unpinned
+            const std::vector<int> cores = strata::kernels::cpu::physical_cores(true);
+            const int core = o.pool_workers > 0 && o.pool_workers < (int) cores.size()
+                             ? cores[(size_t) o.pool_workers] : -1;
+            if (!secondary_runner.start_async_launch(core, err)) {
+                std::fprintf(stderr, "strata generate: secondary async launch: %s\n", err.c_str());
+                return 1;
+            }
+        }
         if (!secondary_runner.start_monitor(100, err, nullptr, nullptr, nullptr,
                                             (uint64_t) o.secondary_free_floor_mib << 20)) {
             std::fprintf(stderr, "strata generate: secondary reserve monitor: %s\n", err.c_str());
@@ -1464,8 +1482,33 @@ if (o.expert_cache_per_layer) {
                      (double) private_after / 1073741824.0,
                      ((double) private_before - (double) private_after) / 1073741824.0);
     }
+    if (o.lock_cpu_experts) {
+        // Keep Windows from trimming the experts the CPU pool reads: every expert that neither GPU tier holds.
+        std::vector<std::pair<void*, uint64_t>> ranges;
+        uint64_t cpu_owned = 0;
+        for (int64_t layer = 0; layer < g.n_layers; ++layer)
+            for (int64_t expert = 0; expert < g.n_expert; ++expert) {
+                const size_t index = (size_t) layer * (size_t) g.n_expert + (size_t) expert;
+                if (xcache.slots() > 0 && xcache.slot_of((int) layer, (int) expert) >= 0) continue;
+                if (!secondary_residency.empty() && secondary_residency[index] >= 0) continue;
+                const uint8_t* blob = arena_src.blob((int) layer, (int) expert);
+                if (blob == nullptr) continue;
+                ranges.emplace_back((void*) blob, (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes((int) layer));
+                ++cpu_owned;
+            }
+        const strata::platform::LockResult lr = strata::platform::lock_resident_ranges(ranges);
+        std::fprintf(stderr, "strata generate: lock CPU experts (%llu): %s\n", (unsigned long long) cpu_owned,
+                     lr.note.c_str());
+    }
 
     Drive drive;
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> route_trace_file(
+        o.route_trace.empty() ? nullptr : std::fopen(o.route_trace.c_str(), "wb"), &std::fclose);
+    if (!o.route_trace.empty() && !route_trace_file) {
+        std::fprintf(stderr, "strata generate: cannot open --route-trace %s\n", o.route_trace.c_str());
+        return 1;
+    }
+    drive.d.route_trace = route_trace_file.get();
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
@@ -2223,6 +2266,7 @@ if (o.expert_cache_per_layer) {
         };
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        ver.set_pcie_share(drive.d.pcie_num > 0);
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         cudaStream_t adapt_stream = nullptr;
         if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
@@ -2266,7 +2310,6 @@ if (o.expert_cache_per_layer) {
                     if (cand[i].first < vict[i].first + 1.5f) break;
                     swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
                 }
-        ver.set_pcie_share(drive.d.pcie_num > 0);
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
@@ -3080,6 +3123,7 @@ if (o.expert_cache_per_layer) {
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
+        ver.set_pcie_share(drive.d.pcie_num > 0);
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
@@ -3123,7 +3167,6 @@ if (o.expert_cache_per_layer) {
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
                 const size_t nc = std::min(cand.size(), vict.size());
-        ver.set_pcie_share(drive.d.pcie_num > 0);
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
                 for (size_t i = 0; i < nc; ++i) {
@@ -3314,6 +3357,9 @@ if (o.expert_cache_per_layer) {
         if (rounds > 0 && o.secondary_expert_mib > 0)
             std::printf("%-24s launch %.3f  wait %.3f ms/round (wait > 0: the 4070 SUPER finished after the CPU pool)\n",
                         "secondary timing", secondary_runner.ms_launch() / rounds, secondary_runner.ms_wait() / rounds);
+        if (rounds > 0 && o.secondary_async_launch)
+            std::printf("%-24s helper enqueue %.3f  finish waited for it %.3f ms/round\n", "secondary async",
+                        secondary_runner.ms_async_enqueue() / rounds, secondary_runner.ms_async_wait() / rounds);
     if (rounds > 0 && o.secondary_profile_timing) {
         const auto& t = secondary_runner.timing();
         std::printf("%-24s plan %.3f switch %.3f enqueue %.3f query %.3f copyout %.3f ms/round\n",
