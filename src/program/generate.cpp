@@ -609,6 +609,114 @@ struct TailFile {
     uint64_t offset(int32_t slot) const { return 4096 + (uint64_t) (slot - first) * stride; }
 };
 TailFile g_tail;
+/// #22 STRATA_LINK_PROBE=<blobs>: each decode round, <blobs> expert-sized (1,382,400 B) pinned H2D copies and as many
+/// D2H on a side stream of every card, timed on the device while the round runs - the links' effective bandwidth under
+/// a real decode (what the swap split of #12 H1 budgets), against the same copies with the cards idle before decode.
+/// A measurement, never a default: the copies compete with the decode's own traffic.
+struct LinkProbe {
+    static constexpr size_t kBlob = 1382400;
+    struct Card {
+        int dev = 0;
+        char name[64] = {};
+        cudaStream_t s = nullptr;
+        void* d = nullptr;
+        void* h = nullptr;
+        cudaEvent_t e[3] = {};
+        bool live = false;
+        double ms_h2d = 0, ms_d2h = 0;
+        int64_t rounds = 0;
+    };
+    int blobs = 0;
+    std::vector<Card> cards;
+    bool init() {
+        const char* v = std::getenv("STRATA_LINK_PROBE");
+        blobs = v ? std::max(0, std::atoi(v)) : 0;
+        if (blobs == 0) return false;
+        int n = 0, prev = 0;
+        cudaGetDeviceCount(&n);
+        cudaGetDevice(&prev);
+        for (int dv = 0; dv < n; ++dv) {
+            Card c;
+            c.dev = dv;
+            cudaDeviceProp pr{};
+            cudaGetDeviceProperties(&pr, dv);
+            std::snprintf(c.name, sizeof c.name, "%s", pr.name);
+            cudaSetDevice(dv);
+            bool ok = cudaStreamCreateWithFlags(&c.s, cudaStreamNonBlocking) == cudaSuccess &&
+                      cudaMalloc(&c.d, (size_t) blobs * kBlob) == cudaSuccess &&
+                      cudaHostAlloc(&c.h, (size_t) blobs * kBlob, cudaHostAllocPortable) == cudaSuccess;
+            for (cudaEvent_t& e : c.e) ok = ok && cudaEventCreate(&e) == cudaSuccess;
+            if (!ok) {
+                std::fprintf(stderr, "strata generate: link probe: device %d could not allocate\n", dv);
+                cudaGetLastError();
+                continue;
+            }
+            std::memset(c.h, 1, (size_t) blobs * kBlob);
+            cards.push_back(c);
+        }
+        cudaSetDevice(prev);
+        // the idle reference, on the same buffers: 8 rounds, one card at a time
+        for (Card& c : cards) {
+            for (int r = 0; r < 8; ++r) { issue(c); collect(c); }
+            report_card(c, "idle");
+            c.ms_h2d = c.ms_d2h = 0;
+            c.rounds = 0;
+        }
+        return true;
+    }
+    void issue(Card& c) {
+        int prev = 0;
+        cudaGetDevice(&prev);
+        cudaSetDevice(c.dev);
+        cudaEventRecord(c.e[0], c.s);
+        for (int i = 0; i < blobs; ++i)
+            cudaMemcpyAsync((uint8_t*) c.d + (size_t) i * kBlob, (uint8_t*) c.h + (size_t) i * kBlob, kBlob,
+                            cudaMemcpyHostToDevice, c.s);
+        cudaEventRecord(c.e[1], c.s);
+        for (int i = 0; i < blobs; ++i)
+            cudaMemcpyAsync((uint8_t*) c.h + (size_t) i * kBlob, (uint8_t*) c.d + (size_t) i * kBlob, kBlob,
+                            cudaMemcpyDeviceToHost, c.s);
+        cudaEventRecord(c.e[2], c.s);
+        (void) cudaStreamQuery(c.s);   // WDDM: hand the batch to the device now
+        c.live = true;
+        cudaSetDevice(prev);
+    }
+    void collect(Card& c) {
+        if (!c.live) return;
+        cudaEventSynchronize(c.e[2]);
+        float a = 0, b = 0;
+        cudaEventElapsedTime(&a, c.e[0], c.e[1]);
+        cudaEventElapsedTime(&b, c.e[1], c.e[2]);
+        c.ms_h2d += a;
+        c.ms_d2h += b;
+        ++c.rounds;
+        c.live = false;
+    }
+    void report_card(const Card& c, const char* when) const {
+        if (c.rounds == 0 || c.ms_h2d <= 0 || c.ms_d2h <= 0) return;
+        const double bytes = (double) blobs * kBlob * (double) c.rounds;
+        std::fprintf(stderr, "strata generate: link probe %-6s device %d (%s): H2D %.2f GB/s, D2H %.2f GB/s "
+                             "(%d blobs x %lld rounds, %.2f + %.2f ms per round)\n",
+                     when, c.dev, c.name, bytes / (c.ms_h2d * 1e6), bytes / (c.ms_d2h * 1e6), blobs,
+                     (long long) c.rounds, c.ms_h2d / c.rounds, c.ms_d2h / c.rounds);
+    }
+    void round() {   // the previous round's copies, then this round's (they run while it decodes)
+        for (Card& c : cards) { collect(c); issue(c); }
+    }
+    void report() {
+        for (Card& c : cards) { collect(c); report_card(c, "decode"); }
+    }
+    ~LinkProbe() {
+        for (Card& c : cards) {
+            cudaSetDevice(c.dev);
+            cudaStreamSynchronize(c.s);
+            for (cudaEvent_t e : c.e) cudaEventDestroy(e);
+            cudaStreamDestroy(c.s);
+            cudaFree(c.d);
+            cudaFreeHost(c.h);
+        }
+    }
+};
 // #35 D7 (STRATA_PREFILL_WAVE=1 with the split layout): two prompt-path lanes of half the chunk each
 bool g_prefill_wave = false;
 bool wave_on(int64_t prefill_chunk) { return g_prefill_wave && prefill_chunk >= 4096; }   // lanes of 2,048+ tokens
@@ -5397,8 +5505,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --profile-decode-range requires the real decode loop\n");
             return 2;
         }
+        LinkProbe link_probe;   // #22 STRATA_LINK_PROBE
+        link_probe.init();
         while ((int64_t) produced.size() < o.max_new) {
             const Clock::time_point t0 = Clock::now();
+            if (!link_probe.cards.empty()) link_probe.round();
             strata::timeline::Span round_span("decode round", p, (int64_t) produced.size());
             int T = S_mtp;
             if (use_mtp && o.spec_min_p > 0.0) {
@@ -5521,6 +5632,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);
         }
+        link_probe.report();
     if (o.profile_decode_range && cudaProfilerStop() != cudaSuccess) {
         std::fprintf(stderr, "strata generate: cudaProfilerStop failed\n");
         return 1;
