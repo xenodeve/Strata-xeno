@@ -609,6 +609,12 @@ struct TailFile {
     uint64_t offset(int32_t slot) const { return 4096 + (uint64_t) (slot - first) * stride; }
 };
 TailFile g_tail;
+// #35 D7 (STRATA_PREFILL_WAVE=1 with the split layout): two prompt-path lanes of half the chunk each
+bool g_prefill_wave = false;
+uint64_t prompt_bytes_needed(const strata::core::ModelGeometry& g, const strata::core::SessionState& ss, int64_t chunk) {
+    if (!g_prefill_wave) return strata::prefill::Prefill::bytes_needed(g, ss, chunk);
+    return 2 * ((strata::prefill::Prefill::bytes_needed(g, ss, chunk / 2) + 4095) / 4096 * 4096);
+}
 /// the tail file's slot stride, also the refill's bounce stride: the largest blob, rounded up to 4 KiB
 uint64_t tail_stride() { return ((uint64_t) strata::kernels::cpu::expert_layout().max_blob + 4095) / 4096 * 4096; }
 
@@ -1580,6 +1586,11 @@ int main(int argc, char** argv) {
     if (o.exclusive_secondary)
         if (const char* v = std::getenv("STRATA_PREFILL_EXPERT_SPLIT"); v != nullptr && std::atoi(v) != 0)
             strata::prefill::Prefill::set_split_layout(true);
+    if (o.exclusive_secondary && !o.serve)
+        if (const char* v = std::getenv("STRATA_PREFILL_WAVE"); v != nullptr && std::atoi(v) != 0) {
+            const char* sp = std::getenv("STRATA_PREFILL_EXPERT_SPLIT");
+            g_prefill_wave = sp != nullptr && std::atoi(sp) != 0;   // the wave overlaps the split's two cards
+        }
     // #34 tail file (default; --no-tail-file): the lendable tail's host copies are released too; the prompt path and the refill after a prompt
     // read those experts from a contiguous tail file (setup_tail_file, refill_lent)
     const bool tail_from_pack = o.tail_file && o.exclusive_primary_experts && !o.mmap_experts;
@@ -2151,7 +2162,7 @@ int main(int argc, char** argv) {
     int32_t excl_keep_from = INT32_MAX;
     if (o.exclusive_primary_experts && !o.no_prefill_borrow && o.prefill_chunk > 0 && xcache.slots() > 0) {
         for (int64_t chunk = o.prefill_chunk; chunk >= 256; chunk /= 2) {
-            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, chunk);
+            const uint64_t need = prompt_bytes_needed(g, ss, chunk);
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
             if (xcache.slot_offsets() != nullptr) {
@@ -3288,7 +3299,7 @@ int main(int argc, char** argv) {
         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
     auto lend_slots = [&](int64_t c) -> int64_t {
-        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
+        const uint64_t need = prompt_bytes_needed(g, ss, c);
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
@@ -4520,6 +4531,9 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
+    strata::prefill::Prefill prefill2;   // #35 D7: the wave's second lane
+    std::shared_ptr<strata::prefill::Prefill::WaveLink> wave_link;
+    cudaStream_t wave_cs = nullptr;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
@@ -4559,15 +4573,49 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
+        // #35 D7: with the wave, two lanes of half the chunk, each with half the borrowed region and its own stream
+        const bool wave = g_prefill_wave && o.prefill_chunk >= 4096;
+        cudaStream_t lane0_cs = (cudaStream_t) main_cs;
+        if (wave) {   // #35 D7: the chunk ahead (lane 0) goes first on this card
+            int least = 0, greatest = 0;
+            cudaDeviceGetStreamPriorityRange(&least, &greatest);
+            cudaStreamCreateWithPriority(&lane0_cs, cudaStreamNonBlocking, greatest);
+            cudaStreamCreateWithPriority(&wave_cs, cudaStreamNonBlocking, least);
+        }
+        const int64_t lane_chunk = wave ? o.prefill_chunk / 2 : o.prefill_chunk;
+        uint64_t lane_bytes = borrow_bytes;
+        if (wave && borrow != nullptr) {
+            lane_bytes = (strata::prefill::Prefill::bytes_needed(g, ss, lane_chunk) + 4095) / 4096 * 4096;
+            if (2 * lane_bytes > borrow_bytes) {
+                std::fprintf(stderr, "strata generate: the wave's two lanes need %.2f GiB, %.2f GiB is lent\n",
+                             2.0 * lane_bytes / 1073741824.0, borrow_bytes / 1073741824.0);
+                return 1;
+            }
+        }
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
-                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
-                          borrow_bytes)) {
+                          host_res.empty() ? nullptr : host_res.data(), lane_chunk, lane0_cs, err, borrow,
+                          lane_bytes)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         if (o.exclusive_secondary)
             prefill.set_peer_tier(secondary_residency.data(),
                                   [&](int32_t s) { return (const void*) secondary_arena.slot_ptr((uint64_t) s); }, 1);
+        if (wave) {
+            if (!prefill2.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
+                               host_res.empty() ? nullptr : host_res.data(), lane_chunk, wave_cs, err,
+                               borrow ? (uint8_t*) borrow + lane_bytes : nullptr, borrow ? lane_bytes : 0)) {
+                std::fprintf(stderr, "strata generate: wave lane 2: %s\n", err.c_str());
+                return 1;
+            }
+            if (o.exclusive_secondary)
+                prefill2.set_peer_tier(secondary_residency.data(),
+                                       [&](int32_t s) { return (const void*) secondary_arena.slot_ptr((uint64_t) s); }, 1);
+            wave_link = strata::prefill::Prefill::make_wave_link();
+            prefill.set_wave(wave_link, 0);
+            prefill2.set_wave(wave_link, 1);
+            std::fprintf(stderr, "strata generate: prompt wave: two lanes of %lld tokens\n", (long long) lane_chunk);
+        }
         if (!o.mtp.empty()) {
             if (!mtp.bind(wt, &native_head, nullptr, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -4579,13 +4627,30 @@ int main(int argc, char** argv) {
                 for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p0 + t + 1)];
                 return mtp.prefill(R_rows, nxt.data(), T, p0, e);
             };
+            prefill2.on_chunk = prefill.on_chunk;   // #35 D7: the wave calls it in chunk order
         }
         const Clock::time_point tp0 = Clock::now();
         const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
         if (o.profile_prefill_range) cudaProfilerStart();
         const bool prefill_ok = [&] {
             strata::timeline::Span sp("prompt read (batched)", 0, n_batched);
-            return prefill.run(o.tokens.data(), n_batched, 0, err);
+            if (!wave_link) return prefill.run(o.tokens.data(), n_batched, 0, err);
+            // #35 D7: both lanes over the whole prompt, the second on its own thread
+            strata::prefill::Prefill::wave_reset(*wave_link, (n_batched + prefill.chunk() - 1) / prefill.chunk(), g.n_layers);
+            int dev = 0;
+            cudaGetDevice(&dev);
+            std::string err2;
+            auto lane2 = std::async(std::launch::async, [&, dev] {
+                cudaSetDevice(dev);
+                strata::timeline::name_thread("prompt wave lane 2");
+                return prefill2.run(o.tokens.data(), n_batched, 0, err2);
+            });
+            const bool ok1 = prefill.run(o.tokens.data(), n_batched, 0, err);
+            const bool ok2 = lane2.get();
+            if (!ok1 && (err.empty() || err.find("other wave lane") != std::string::npos) && !ok2) err = err2;
+            else if (ok1 && !ok2) err = err2;
+            cudaStreamSynchronize(wave_cs);
+            return ok1 && ok2;
         }();
         if (o.profile_prefill_range) { cudaDeviceSynchronize(); cudaProfilerStop(); }
         if (!prefill_ok) {

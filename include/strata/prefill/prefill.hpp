@@ -73,6 +73,16 @@ public:
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
 
+    /// #35 D7: the two-lane wavefront.  Two Prefill objects on one session read a prompt's chunks alternately
+    /// (chunk c on lane c % 2, each lane on its own stream of the same GPU), and chunk c's layer l starts only once
+    /// chunk c-1 has queued that layer's attention half (its KV, GDN and PLE state) - the order one lane keeps, so
+    /// the output is the same bytes.  With expert_split, one lane's chunk runs its routed experts on the 4070 while
+    /// the other lane's runs its trunk on this card.  Both lanes' run() get the whole prompt; reset() first.
+    struct WaveLink;
+    static std::shared_ptr<WaveLink> make_wave_link();
+    static void wave_reset(WaveLink& link, int64_t n_chunks, int64_t n_layers);
+    void set_wave(std::shared_ptr<WaveLink> link, int lane);
+
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
