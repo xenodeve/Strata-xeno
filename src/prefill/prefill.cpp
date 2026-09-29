@@ -20,6 +20,7 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/frontier.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/timeline.hpp"
 #include "strata/timeline_gpu.hpp"
@@ -92,16 +93,66 @@ bool g_split_layout = false;   // #35 D6 (Prefill::set_split_layout)
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
 // the host copies are the limit and the bigger ring only takes cache slots).  STRATA_PREFILL_RING overrides.
-// #41 gate 2: STRATA_EXPERT_ORDER=reverse runs every layer's experts in reverse id order - the row layout, the MMQ
-// groups and both stream plans follow it.  A row's bytes do not depend on its group (xeno_moe_layer_cross_arch), so the
-// output must not change; a static rank order (a Dm frontier's schedule) uses the same four places.
-inline bool expert_order_reverse() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_EXPERT_ORDER"); return e && std::strcmp(e, "reverse") == 0; }();
-    return v;
+// #41: the order a layer's experts run in - the row layout, the MMQ groups and both stream plans follow it.  A row's
+// bytes do not depend on its group (xeno_moe_layer_cross_arch), so the output does not change (gate 2).
+//   STRATA_EXPERT_ORDER=reverse   reverse id order (the gate-2 check)
+//   STRATA_EXPERT_ORDER=<file>    a static per-layer order (tests/xeno/perf/make_expert_order.py: mean router rank
+//                                 first), which keeps a Dm frontier small (#41: 29.7 % of T*K against 48.9 % in id order)
+//   unset                         id order
+struct ExpertOrder {
+    bool reverse = false;
+    int64_t layers = 0, experts = 0;
+    std::vector<int32_t> at, pos;   // per layer: position -> expert, expert -> position
+};
+inline const ExpertOrder& expert_order() {
+    static const ExpertOrder o = [] {
+        ExpertOrder r;
+        const char* e = std::getenv("STRATA_EXPERT_ORDER");
+        if (e == nullptr || *e == 0) return r;
+        if (std::strcmp(e, "reverse") == 0) { r.reverse = true; return r; }
+        std::FILE* f = std::fopen(e, "rb");
+        int32_t hdr[3] = {0, 0, 0};
+        if (f == nullptr || std::fread(hdr, 4, 3, f) != 3 || hdr[0] != 0x4F585053 || hdr[1] <= 0 || hdr[2] <= 0) {
+            std::fprintf(stderr, "strata prefill: STRATA_EXPERT_ORDER=%s is not an expert-order file; id order\n", e);
+            if (f) std::fclose(f);
+            return r;
+        }
+        r.layers = hdr[1];
+        r.experts = hdr[2];
+        r.at.resize((size_t) (r.layers * r.experts));
+        r.pos.assign(r.at.size(), -1);
+        const bool ok = std::fread(r.at.data(), 4, r.at.size(), f) == r.at.size();
+        std::fclose(f);
+        for (int64_t l = 0; ok && l < r.layers; ++l)
+            for (int64_t i = 0; i < r.experts; ++i) {
+                const int32_t x = r.at[(size_t) (l * r.experts + i)];
+                if (x >= 0 && x < r.experts) r.pos[(size_t) (l * r.experts + x)] = (int32_t) i;
+            }
+        for (int32_t v : r.pos)
+            if (!ok || v < 0) {   // not a permutation of every layer: never run a partial order
+                std::fprintf(stderr, "strata prefill: STRATA_EXPERT_ORDER=%s is not a permutation; id order\n", e);
+                return ExpertOrder{};
+            }
+        std::fprintf(stderr, "strata prefill: expert order from %s (%lld layers x %lld experts)\n", e,
+                     (long long) r.layers, (long long) r.experts);
+        return r;
+    }();
+    return o;
 }
-inline int32_t expert_at(int32_t i, int64_t n_expert) { return expert_order_reverse() ? (int32_t) (n_expert - 1 - i) : i; }
+inline int32_t expert_at(int64_t l, int32_t i, int64_t n_expert) {
+    const ExpertOrder& o = expert_order();
+    if (o.reverse) return (int32_t) (n_expert - 1 - i);
+    if (!o.at.empty() && l < o.layers && n_expert == o.experts) return o.at[(size_t) (l * o.experts + i)];
+    return i;
+}
 // an expert's position in that order (n_expert itself: past every expert)
-inline int64_t expert_pos(int64_t e, int64_t n_expert) { return expert_order_reverse() && e < n_expert ? n_expert - 1 - e : e; }
+inline int64_t expert_pos(int64_t l, int64_t e, int64_t n_expert) {
+    if (e >= n_expert) return e;
+    const ExpertOrder& o = expert_order();
+    if (o.reverse) return n_expert - 1 - e;
+    if (!o.pos.empty() && l < o.layers && n_expert == o.experts) return o.pos[(size_t) (l * o.experts + e)];
+    return e;
+}
 inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
     const int r = v ? std::atoi(v) : (g_pinned_share >= 0.9 ? 384 : 96);
@@ -330,6 +381,15 @@ struct SplitTier {
     std::unique_ptr<Stager> stager;          // on the 4070: host experts into pinned buffers
     void *xtok = nullptr, *xq = nullptr, *hq = nullptr;
     float *gu = nullptr, *h = nullptr, *dm = nullptr, *w = nullptr, *bo = nullptr;   // bo: the routed sum
+    // #41 STRATA_DM_FRONTIER=1: no Dm; a sub-product's rows land in fg, the ones that must wait in fpool (pool_cap rows,
+    // STRATA_DM_FRONTIER_FRAC of T*K, default 0.6), and a host plan (hplan -> dplan) drives the k-order commits into bo
+    bool frontier = false;
+    float *fg = nullptr, *fpool = nullptr;
+    int32_t *dplan = nullptr, *hplan = nullptr;
+    size_t plan_cap = 0;
+    int32_t pool_cap = 0;
+    cudaEvent_t ev_plan = nullptr;
+    FrontierPlan fplan;
     int32_t *rows = nullptr, *slot = nullptr, *ids = nullptr, *bounds = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr, *ring = nullptr;
     size_t grp_gu_bytes = 0, grp_d_bytes = 0;
@@ -426,7 +486,7 @@ struct SplitTier {
         stager.reset();
         { Dev g(dev); if (s) cudaStreamSynchronize(s); if (c) cudaStreamSynchronize(c); if (cr) cudaStreamSynchronize(cr);
           for (void* b : dev_bufs) cudaFree(b);
-          for (cudaEvent_t e : {ev_xread, ev_gatesread, ev_meta, ev_bo}) if (e) cudaEventDestroy(e);
+          for (cudaEvent_t e : {ev_xread, ev_gatesread, ev_meta, ev_bo, ev_plan}) if (e) cudaEventDestroy(e);
           for (cudaEvent_t e : ev_resread) if (e) cudaEventDestroy(e);
           for (size_t i = 0; i < used.size(); ++i) { if (used[i]) cudaEventDestroy(used[i]); if (copied[i]) cudaEventDestroy(copied[i]); }
           for (cudaEvent_t e : used1) if (e) cudaEventDestroy(e);
@@ -436,7 +496,7 @@ struct SplitTier {
         for (cudaEvent_t e : {ev_x, ev_gates, ev_done, ev_q}) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_res) if (e) cudaEventDestroy(e);
         for (void* b : {(void*) hx, (void*) hres, (void*) hw, (void*) hbo, (void*) hrows,
-                        (void*) hslot, (void*) hbounds}) if (b) cudaFreeHost(b);
+                        (void*) hslot, (void*) hbounds, (void*) hplan}) if (b) cudaFreeHost(b);
     }
     /// allocate for chunks of up to T tokens; false (and err) when the 4070 cannot hold it
     bool high = false;   // #35 D7: this lane's streams run at the cards' highest priority
@@ -472,12 +532,20 @@ struct SplitTier {
         hslot = (int32_t*) h_alloc((size_t) TK * 4);
         hbounds = (int32_t*) h_alloc((size_t) hbounds_cap * 4);
         hres = (uint8_t*) h_alloc((size_t) RES * blob);
+        if (const char* fv = std::getenv("STRATA_DM_FRONTIER"); fv != nullptr && fv[0] == '1') {
+            frontier = true;
+            const char* fr = std::getenv("STRATA_DM_FRONTIER_FRAC");
+            const double frac = fr ? std::atof(fr) : 0.6;
+            pool_cap = (int32_t) std::max<int64_t>(1, (int64_t) ((double) TK * std::min(1.0, std::max(0.05, frac))));
+            plan_cap = (size_t) (7 * TK + 64);   // worst case: T*K sources, 4 ints per (sub, token) group, 2 per copy
+            hplan = (int32_t*) h_alloc(plan_cap * 4);
+        }
         Dev g(dev);
         size_t f0 = 0, tot = 0;
         cudaMemGetInfo(&f0, &tot);
         const int prio = wave_priority(high);
         for (cudaStream_t* st : {&s, &c, &u, &cr}) ok = ok && make_stream(st, prio);
-        for (cudaEvent_t* e : {&ev_xread, &ev_gatesread, &ev_meta, &ev_bo})
+        for (cudaEvent_t* e : {&ev_xread, &ev_gatesread, &ev_meta, &ev_bo, &ev_plan})
             ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
         for (cudaEvent_t& e : ev_resread)
             ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
@@ -501,7 +569,13 @@ struct SplitTier {
         hq = d_alloc(mmq::q8_bytes(R, 640));
         gu = (float*) d_alloc((size_t) (R * 1280) * 4);
         h = (float*) d_alloc((size_t) (R * 640) * 4);
-        dm = (float*) d_alloc((size_t) (TK * N) * 4);
+        if (frontier) {   // #41: a sub-product's rows and the pool instead of Dm
+            fg = (float*) d_alloc((size_t) (R * N) * 4);
+            fpool = (float*) d_alloc((size_t) pool_cap * N * 4);
+            dplan = (int32_t*) d_alloc(plan_cap * 4);
+        } else {
+            dm = (float*) d_alloc((size_t) (TK * N) * 4);
+        }
         bo = (float*) d_alloc((size_t) (T * N) * 4);
         w = (float*) d_alloc((size_t) TK * 4);
         rows = (int32_t*) d_alloc((size_t) TK * 4);
@@ -910,7 +984,20 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
         timeline::Span ws("split wait issuer", (int64_t) k, l);
         return SplitTier::wait_above(xs.issued, k, xs.aborted);
     };
+    if (sp.frontier) {   // #41: the layer's commit plan, then the gates (every commit reads w)
+        std::vector<std::pair<int64_t, int64_t>> ranges;
+        ranges.reserve(subs.size());
+        for (const Sub& sb : subs) ranges.push_back({sb.r0, sb.nr});
+        if (!plan_frontier(sp.hslot, T, K, ranges, sp.pool_cap, sp.fplan, err)) { err = "prefill: " + err; return false; }
+        if (sp.fplan.data.size() > sp.plan_cap) { err = "prefill: the frontier plan outgrew its buffer"; return false; }
+        cudaEventSynchronize(sp.ev_plan);   // the previous layer's plan upload has read hplan
+        std::memcpy(sp.hplan, sp.fplan.data.data(), sp.fplan.data.size() * 4);
+        cudaMemcpyAsync(sp.dplan, sp.hplan, sp.fplan.data.size() * 4, cudaMemcpyHostToDevice, sp.s);
+        cudaEventRecord(sp.ev_plan, sp.s);
+        cudaStreamWaitEvent(sp.s, sp.ev_gatesread, 0);
+    }
     int cur_grp = -1;
+    size_t sub_i = 0;
     for (const Sub& sb : subs) {
         if (sb.grp != cur_grp) {   // gather the group's experts into the group buffers
             cur_grp = sb.grp;
@@ -967,9 +1054,14 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
         a.n = sb.n; a.gu = sp.grp_gu + (size_t) sb.q0 * gub; a.gu_type = mmq_gt; a.gu_bytes = gub;
         a.down = sp.grp_d + (size_t) sb.q0 * db; a.down_type = mmq_dt; a.down_bytes = db;
         a.bounds = sp.bounds + sb.boff; a.ids = sp.ids; a.n_embd = N; a.n_ff = 640; a.interleaved = false;
-        a.xq = sp.xq; a.gu_out = sp.gu; a.h = sp.h; a.hq = sp.hq; a.dst = sp.dm + sb.r0 * N;
+        a.xq = sp.xq; a.gu_out = sp.gu; a.h = sp.h; a.hq = sp.hq; a.dst = sp.frontier ? sp.fg : sp.dm + sb.r0 * N;
         sp.clk_s.mark(sp.tl_s, "products", sp.s, l, sb.grp);
         mmq::expert_rows(*sp.ctx, a, sp.s);
+        if (sp.frontier) {
+            sp.clk_s.mark(sp.tl_s, "frontier", sp.s, l, sb.grp);
+            frontier_run(sp.fplan, sub_i, sp.dplan, sp.fg, sp.fpool, sp.w, sp.bo, sp.s);
+        }
+        ++sub_i;
     }
     sp.clk_s.mark(sp.tl_s, "wait gates", sp.s, l);
     cudaStreamWaitEvent(sp.s, sp.ev_gatesread, 0);
@@ -978,8 +1070,8 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
         const size_t end = xs.seq_start[us + (size_t) l + 1];
         if (my_consumed.load(std::memory_order_acquire) < end) SplitTier::publish(my_consumed, end);
     }
-    // 5. combine here; the output down to host and up into the 5060's bo
-    moe_routed_sum(sp.dm, sp.slot, sp.w, sp.bo, T, sp.s);
+    // 5. combine here (the frontier has already summed into bo); the output down to host and up into the 5060's bo
+    if (!sp.frontier) moe_routed_sum(sp.dm, sp.slot, sp.w, sp.bo, T, sp.s);
     cudaEventSynchronize(sp.ev_done);   // the 5060 has uploaded the previous layer's output from hbo
     sp.clk_s.mark(sp.tl_s, "output down", sp.s, l);
     cudaMemcpyAsync(sp.hbo, sp.bo, (size_t) (T * N) * 4, cudaMemcpyDeviceToHost, sp.s);
@@ -1680,7 +1772,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 seq_start[(size_t) l] = seq.size();
                 for (int32_t ei = 0; ei < m.g->n_expert; ++ei) {
-                    const int32_t e = expert_at(ei, m.g->n_expert);   // #41 gate 2
+                    const int32_t e = expert_at(l, ei, m.g->n_expert);   // #41 gate 2
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     if (split_on) break;   // #32 S4: every routed expert of the layer runs on the 4070
                     const int32_t ps = m.peer_res ? m.peer_res[(size_t) l * m.g->n_expert + e] : -1;
@@ -1738,7 +1830,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 for (int64_t l = 0; l < g.n_layers; ++l) {
                     sp.seq_start[(size_t) (u * (g.n_layers + 1) + l)] = sp.seq.size();
                     for (int32_t ei = 0; ei < m.g->n_expert; ++ei) {
-                        const int32_t e = expert_at(ei, m.g->n_expert);   // #41 gate 2
+                        const int32_t e = expert_at(l, ei, m.g->n_expert);   // #41 gate 2
                         if (m.peer_res[(size_t) l * m.g->n_expert + e] >= 0) continue;   // the 4070's own
                         if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) {
                             sp.seq.push_back({(int32_t) l, e, -1, 1});
@@ -2241,7 +2333,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     {   // each expert's first row, experts laid out in expert_at order (#41 gate 2; id order by default)
                         int64_t at_row = 0;
                         for (int32_t ei = 0; ei < m.g->n_expert; ++ei) {
-                            const int32_t e = expert_at(ei, m.g->n_expert);
+                            const int32_t e = expert_at(l, ei, m.g->n_expert);
                             m.off[(size_t) e] = (int32_t) at_row;
                             at_row += m.cnt[(size_t) e];
                         }
@@ -2290,7 +2382,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     std::vector<int32_t> order;
                     std::vector<int32_t> order_4070;   // #32 S4
                     for (int32_t ei = 0; ei < m.g->n_expert; ++ei) {
-                        const int32_t e = expert_at(ei, m.g->n_expert);   // #41 gate 2
+                        const int32_t e = expert_at(l, ei, m.g->n_expert);   // #41 gate 2
                         if (m.cnt[(size_t) e] > 0) (split_l ? order_4070 : order).push_back(e);
                     }
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
@@ -2557,7 +2649,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             publish(k);
                         };
                         auto release_to = [&](int32_t e_stop) {   // entries the routing did not pick: slot back at once
-                            while (k < kend && expert_pos(seq[k].e, m.g->n_expert) < expert_pos(e_stop, m.g->n_expert)) {
+                            while (k < kend && expert_pos(l, seq[k].e, m.g->n_expert) < expert_pos(l, e_stop, m.g->n_expert)) {
                                 cudaEventRecord(m.used[k % (size_t) m.ring], m.cs);
                                 ++k;
                                 if (k_hold == SIZE_MAX) publish(k);
@@ -2597,7 +2689,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         size_t k = seq_start[(size_t) l];
                         const size_t kend = seq_start[(size_t) l + 1];
                         auto release_to = [&](int32_t e_stop) {
-                            while (k < kend && expert_pos(seq[k].e, m.g->n_expert) < expert_pos(e_stop, m.g->n_expert)) {
+                            while (k < kend && expert_pos(l, seq[k].e, m.g->n_expert) < expert_pos(l, e_stop, m.g->n_expert)) {
                                 cudaEventRecord(m.used[k % (size_t) m.ring], m.cs);
                                 consumed = ++k;
                                 if (use_issuer) a_consumed.store(consumed, std::memory_order_release);

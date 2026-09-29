@@ -277,7 +277,7 @@ if(STRATA_ENABLE_CUDA)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/frontier.cu src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata_prefill PUBLIC strata_engine CUDA::cublas CUDA::cudart)
 
@@ -620,6 +620,10 @@ if(STRATA_NATIVE_EXPERTS)
       add_executable(xeno_combine_split_parity tests/xeno/combine_split_parity.cu)
       target_link_libraries(xeno_combine_split_parity PRIVATE strata_prefill CUDA::cudart)
       add_test(NAME xeno_combine_split_parity COMMAND xeno_combine_split_parity)
+      # #41 gate 3: a Dm frontier writes moe_routed_sum's bytes
+      add_executable(xeno_frontier_combine_parity tests/xeno/frontier_combine_parity.cu)
+      target_link_libraries(xeno_frontier_combine_parity PRIVATE strata_prefill CUDA::cudart)
+      add_test(NAME xeno_frontier_combine_parity COMMAND xeno_frontier_combine_parity)
       # #42: upstream F-1 / F-2's fused hyper-connection kernels write the unfused kernels' bytes
       add_executable(xeno_gr_fused_parity tests/xeno/gr_fused_parity.cu)
       target_link_libraries(xeno_gr_fused_parity PRIVATE strata_prefill CUDA::cudart)
