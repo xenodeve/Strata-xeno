@@ -153,6 +153,11 @@ struct Stager {
             if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming) != cudaSuccess) return false;
         }
         cudaGetDevice(&device);
+        int n_pinned = 0;
+        for (int i = 0; i < kRing; ++i) n_pinned += pinned[i] ? 1 : 0;
+        // a pageable staging buffer makes every DMA from it synchronous on the launching thread: say so
+        std::fprintf(stderr, "strata prefill: stager %d threads, %d of %d staging buffers pinned\n", nthreads, n_pinned,
+                     kRing);
         for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
         return true;
     }
@@ -361,7 +366,6 @@ Prefill::~Prefill() {
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
-    if (impl_->ple_emb_host) cudaFreeHost(impl_->ple_emb_host);
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     for (void* p : impl_->owned) cudaFree(p);
 }
@@ -857,11 +861,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             Stager* st;
             ~StagerDone() { if (st) st->finish(); }
         } chunk_stager_done{stream_all ? m.stager.get() : nullptr};
-        auto issue_until = [&](size_t limit) {
-            limit = std::min(limit, seq.size());
-            while (issued < limit) {
-                const StreamEntry& en = seq[issued];
-                const int sl = (int) (issued % (size_t) m.ring);
+        auto issue_one = [&](size_t i) {
+                const StreamEntry& en = seq[i];
+                const int sl = (int) (i % (size_t) m.ring);
                 const auto th = Clock::now();
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
@@ -884,10 +886,47 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 m.stage_live[sl] = true;
                 stats_.ms_experts_host += ms_since(th);
                 ++stats_.experts_streamed;
-                ++issued;
-            }
         };
-        if (stream_all) issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
+        auto issue_until = [&](size_t limit) {
+            limit = std::min(limit, seq.size());
+            while (issued < limit) issue_one(issued++);
+        };
+        // #30, a x4 link: the copy queue fills and cudaMemcpyAsync blocks (243 us per expert, 5.0 s of an 8K prompt
+        // on the launching thread), which then cannot launch the compute - the GPU idles while the link is busy.
+        // STRATA_PREFILL_COPY_THREAD=1: a thread issues the stream's copies instead; entry i is issued once entry
+        // i - ring is consumed (its `used` event recorded, published through a_consumed), and the compute thread
+        // waits on entry k's `copied` event only once the issuer has recorded it (a_issued > k).
+        static const bool copy_thread_on = [] {
+            const char* v = std::getenv("STRATA_PREFILL_COPY_THREAD");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        const bool use_issuer = stream_all && copy_thread_on;
+        std::atomic<size_t> a_consumed{0}, a_issued{0};
+        std::atomic<bool> issuer_stop{false};
+        std::thread issuer;
+        struct IssuerJoin {
+            std::atomic<bool>& stop;
+            std::thread& t;
+            ~IssuerJoin() { stop.store(true); if (t.joinable()) t.join(); }
+        } issuer_join{issuer_stop, issuer};
+        if (use_issuer) {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            issuer = std::thread([&, dev] {
+                cudaSetDevice(dev);
+                for (size_t i = 0; i < seq.size(); ++i) {
+                    while (i >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
+                        if (issuer_stop.load(std::memory_order_relaxed)) return;
+                        std::this_thread::yield();
+                    }
+                    if (issuer_stop.load(std::memory_order_relaxed)) return;
+                    issue_one(i);
+                    a_issued.store(i + 1, std::memory_order_release);
+                }
+            });
+        } else if (stream_all) {
+            issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
+        }
         for (int64_t l = 0; l < g.n_layers; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             const core::LayerView v(*m.wt, l);
@@ -1340,7 +1379,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             while (k < kend && seq[k].e < e_stop) {
                                 cudaEventRecord(m.used[k % (size_t) m.ring], m.cs);
                                 consumed = ++k;
-                                issue_until(consumed + (size_t) m.ring);
+                                if (use_issuer) a_consumed.store(consumed, std::memory_order_release);
+                                else issue_until(consumed + (size_t) m.ring);
                             }
                         };
                         for (size_t j = 0; j < order.size(); ++j) {
@@ -1349,10 +1389,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (k < kend && seq[k].e == e) {
                                 const int sl = (int) (k % (size_t) m.ring);
                                 pt.mark(kPfWaitCopy, cs);
+                                if (use_issuer)
+                                    while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
                                 cudaStreamWaitEvent(m.cs, m.copied[sl], 0);
                                 if (!compute(j, m.stage_dev[sl], sl)) return false;
                                 consumed = ++k;
-                                issue_until(consumed + (size_t) m.ring);
+                                if (use_issuer) a_consumed.store(consumed, std::memory_order_release);
+                                else issue_until(consumed + (size_t) m.ring);
                             } else {
                                 ++stats_.experts_resident;
                                 if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;

@@ -118,7 +118,7 @@ int main() {
         return 1;
     }
     // expert shapes: gate/up [T, n_embd] x [1280, n_embd]^T, down [T, 640] x [n_embd, 640]^T
-    const int64_t embds[] = {2048, 2560, 4096};
+    const int64_t embds[] = {16, 32, 2048, 2560, 4096};   // 16: one mma.sync k-step, no order to differ
     const int64_t toks[] = {1, 2, 3, 8, 17, 32, 64, 100, 128, 257, 512, 1024};
     const int64_t maxT = 1024, maxK = 4096, maxN = 4096;
     Device a, b;
