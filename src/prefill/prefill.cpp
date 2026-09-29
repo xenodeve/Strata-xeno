@@ -1315,6 +1315,26 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     m.off[0] = 0;
                     for (int64_t e = 0; e < m.g->n_expert; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
+                    // #32 STRATA_PREFILL_ROUTE_TRACE=<file>: this layer's routing for the 2-GPU simulator
+                    // (tests/xeno/perf/prefill_route_sim.py).  One record per MoE layer of a chunk, int32 little-endian:
+                    // magic 0x52505453 ('STPR'), pos0 of the chunk, layer, T, K, n_expert, then n_expert rows each
+                    // {rows, resident on this card (0/1), owned by the peer card (0/1)}, then the T*K routed ids.
+                    if (static const char* rt = std::getenv("STRATA_PREFILL_ROUTE_TRACE"); rt != nullptr) {
+                        if (std::FILE* f = std::fopen(rt, "ab")) {
+                            const int32_t NE32 = (int32_t) m.g->n_expert;
+                            const int32_t hdr[6] = {0x52505453, (int32_t) p0, (int32_t) l, (int32_t) T, (int32_t) K, NE32};
+                            std::fwrite(hdr, 4, 6, f);
+                            std::vector<int32_t> ex((size_t) NE32 * 3);
+                            for (int32_t e = 0; e < NE32; ++e) {
+                                ex[(size_t) e * 3] = m.cnt[(size_t) e];
+                                ex[(size_t) e * 3 + 1] = m.host_res && m.cache && m.host_res[(size_t) l * NE32 + e] >= 0;
+                                ex[(size_t) e * 3 + 2] = m.peer_res && m.peer_res[(size_t) l * NE32 + e] >= 0;
+                            }
+                            std::fwrite(ex.data(), 4, ex.size(), f);
+                            std::fwrite(m.ids_host.data(), 4, (size_t) T * K, f);
+                            std::fclose(f);
+                        }
+                    }
                     std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = m.ids_host[(size_t) i];

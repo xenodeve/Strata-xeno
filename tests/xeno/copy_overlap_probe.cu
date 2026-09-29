@@ -55,7 +55,8 @@ int main() {
     CK(cudaHostAlloc((void**) &host, blob * ncopy, cudaHostAllocDefault));
     CK(cudaMalloc((void**) &dev, blob * ncopy));
     for (size_t i = 0; i < blob * ncopy; ++i) host[i] = (uint8_t) i;
-    const size_t nf = (size_t) 256 << 20;   // 256 Mi floats (1 GiB) each way
+    // 256 Mi floats (1 GiB) each way; STRATA_PROBE_SMALL=1: 16 Mi (64 MiB), for the display card's 2.5 GB headroom
+    const size_t nf = std::getenv("STRATA_PROBE_SMALL") ? (size_t) 16 << 20 : (size_t) 256 << 20;
     float4 *a = nullptr, *b = nullptr;
     CK(cudaMalloc((void**) &a, nf / 4 * sizeof(float4)));
     CK(cudaMalloc((void**) &b, nf / 4 * sizeof(float4)));
