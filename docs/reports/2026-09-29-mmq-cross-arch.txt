@@ -29,3 +29,6 @@ mmq   [2560 x 640] 8 experts x ~3 rows: exact 0 of 79360 differ, max |d| 0
 mmq   [2560 x 640] 8 experts x ~40 rows: exact 0 of 837120 differ, max |d| 0
 mmq   [2560 x 640] 8 experts x ~160 rows: exact 0 of 3294720 differ, max |d| 0
 mmq: 8 of 8 cases bit-identical across the cards
+tail  rows     1: swiglu 0 of 640 differ, q8_1 H 0 of 19584 bytes differ
+tail  rows    40: swiglu 0 of 25600 differ, q8_1 H 0 of 64512 bytes differ
+tail  rows  1000: swiglu 0 of 640000 differ, q8_1 H 0 of 1170432 bytes differ

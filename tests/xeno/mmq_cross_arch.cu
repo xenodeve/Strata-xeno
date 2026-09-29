@@ -114,6 +114,29 @@ bool mmq_on(int dev, const std::vector<uint8_t>& W, int64_t w_rows, int64_t w_co
     cudaStreamDestroy(s);
     return good;
 }
+// (c) the per-expert ops around the products: swiglu (built with fast math) and the q8_1 quantizer of H
+bool tail_on(int dev, const std::vector<float>& GU, int64_t rows, std::vector<float>& H, std::vector<uint8_t>& Hq) {
+    namespace mmq = strata::prefill::mmq;
+    cudaSetDevice(dev);
+    cudaStream_t s;
+    if (!ok(cudaStreamCreate(&s), "stream")) return false;
+    float *dgu = nullptr, *dh = nullptr;
+    void* dq = nullptr;
+    const size_t qb = mmq::q8_bytes(rows, 640);
+    if (!ok(cudaMalloc((void**) &dgu, GU.size() * 4), "gu") || !ok(cudaMalloc((void**) &dh, (size_t) rows * 640 * 4), "h") ||
+        !ok(cudaMalloc(&dq, qb), "hq")) return false;
+    cudaMemcpy(dgu, GU.data(), GU.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemset(dq, 0, qb);
+    mmq::swiglu(dgu, dh, rows, 640, false, s);
+    mmq::quantize(dh, nullptr, dq, 42, 640, 640, rows, s);
+    if (!ok(cudaStreamSynchronize(s), "tail")) return false;
+    H.assign((size_t) rows * 640, 0.0f);
+    Hq.assign(qb, 0);
+    cudaMemcpy(H.data(), dh, H.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(Hq.data(), dq, qb, cudaMemcpyDeviceToHost);
+    cudaFree(dgu); cudaFree(dh); cudaFree(dq); cudaStreamDestroy(s);
+    return true;
+}
 }  // namespace
 
 int main() {
@@ -184,5 +207,20 @@ int main() {
                         (long long) sh.rows, (long long) sh.cols, n, per, diff ? "DIFF " : "exact", diff, ya.size(), worst);
         }
     std::printf("mmq: %d of %d cases bit-identical across the cards\n", mq_same, mq_cases);
+
+    // (c) swiglu + q8_1 quantize of H, as the down product's input
+    for (const int64_t rows : {1, 40, 1000}) {
+        std::vector<float> GU((size_t) rows * 1280);
+        for (auto& v : GU) v = next_f() * 16.0f;
+        std::vector<float> ha, hb;
+        std::vector<uint8_t> qa, qb;
+        if (!tail_on(0, GU, rows, ha, qa) || !tail_on(1, GU, rows, hb, qb)) return 1;
+        size_t dh = 0;
+        for (size_t i = 0; i < ha.size(); ++i) dh += std::memcmp(&ha[i], &hb[i], 4) != 0;
+        size_t dq = 0;
+        for (size_t i = 0; i < qa.size(); ++i) dq += qa[i] != qb[i];
+        std::printf("tail  rows %5lld: swiglu %zu of %zu differ, q8_1 H %zu of %zu bytes differ\n", (long long) rows, dh,
+                    ha.size(), dq, qa.size());
+    }
     return 0;
 }
