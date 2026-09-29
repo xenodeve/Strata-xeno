@@ -81,6 +81,7 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 constexpr int RING_MAX = 512;           // the arrays; the ring itself is ring_slots()
 constexpr int64_t STREAM_ALL_MIN = 2048;
 double g_pinned_share = 1.0;
+bool g_split_layout = false;   // #35 D6 (Prefill::set_split_layout)
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
@@ -92,6 +93,9 @@ inline int ring_slots(size_t T) {
     return (int64_t) T >= STREAM_ALL_MIN ? big : STAGE;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
+// #35 D6: the tokens the one-card MoE buffers hold: every chunk, or in the split layout only the chunks below
+// STREAM_ALL_MIN (a bigger one runs its routed experts on the peer card and never touches them)
+inline size_t moe_cap(size_t T) { return g_split_layout ? std::min(T, (size_t) STREAM_ALL_MIN - 1) : T; }
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -521,6 +525,7 @@ struct Prefill::Impl {
     void* Xtok = nullptr;                    // #34: the chunk's activations, q8_1, one row per token
     float* H = nullptr;
     int64_t mmq_rows = 0;                    // #34: the rows GU / H / Xq / Hq hold (a sub-product's, mmq_rows_cap)
+    int64_t moe_tokens = 0;                  // #35 D6: the tokens the one-card MoE buffers hold (moe_cap)
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     std::vector<int32_t> bounds_host;
@@ -881,13 +886,14 @@ const MmqPlan& mmq_plan() {
 uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     const MmqPlan& mp = mmq_plan();
     Alloc a; a.count_only = true; bool ok = true;
+    const size_t Tm = moe_cap(T);
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
-    if (mp.fallback) a.take<uint16_t>(T * K * N, ok);
-    const size_t R = (size_t) mmq_rows_cap((int64_t) T);
-    a.take<float>((mp.fallback ? T * K : R) * 1280, ok);   // the FP16 path (a fallback layer) uses the layer's rows
-    if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
-    a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
+    if (mp.fallback) a.take<uint16_t>(Tm * K * N, ok);
+    const size_t R = (size_t) mmq_rows_cap((int64_t) Tm);
+    a.take<float>((mp.fallback ? Tm * K : R) * 1280, ok);   // the FP16 path (a fallback layer) uses the layer's rows
+    if (mp.fallback) a.take<uint16_t>(Tm * K * 640, ok);
+    a.take<float>(Tm * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
     if (mp.any) {
         a.take<uint8_t>(mmq::q8_bytes((int64_t) T, N), ok);
@@ -1025,11 +1031,13 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
-        m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
-        m.mmq_rows = mmq_rows_cap((int64_t) T);
-        m.GU = c.take<float>((mp.fallback ? T * K : (size_t) m.mmq_rows) * 1280, ok);
-        m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
-        m.Dm = c.take<float>(T * K * N, ok);
+        const size_t Tm = moe_cap(T);
+        m.moe_tokens = (int64_t) Tm;
+        m.Xs = mp.fallback ? c.take<uint16_t>(Tm * K * N, ok) : nullptr;
+        m.mmq_rows = mmq_rows_cap((int64_t) Tm);
+        m.GU = c.take<float>((mp.fallback ? Tm * K : (size_t) m.mmq_rows) * 1280, ok);
+        m.Hh = mp.fallback ? c.take<uint16_t>(Tm * K * 640, ok) : nullptr;
+        m.Dm = c.take<float>(Tm * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
         if (mp.any) {
@@ -1051,7 +1059,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
     }
-    m.ring = ring_slots(T);
+    m.ring = ring_slots(moe_cap(T));
     for (int i = 0; i < m.ring; ++i) {
         m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
         m.stage_live[i] = false;                        // a new buffer: nothing of an earlier layout to wait for
@@ -1096,6 +1104,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 
 int64_t Prefill::chunk() const { return impl_->T; }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
+void Prefill::set_split_layout(bool on) { g_split_layout = on; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
@@ -1125,7 +1134,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
     }
-    for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
+    for (int i = 0; i < ring_slots(moe_cap(T)); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;
@@ -1388,6 +1397,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             else std::fprintf(stderr, "strata prefill: expert_split off: %s\n", se.empty() ? "no relay stream" : se.c_str());
         }
         split_on = split_on && m.split != nullptr && T >= STREAM_ALL_MIN;   // every candidate expert streams: big chunks only
+        if (!split_on && (int64_t) T > m.moe_tokens) {
+            err = "prefill: the split layout holds one-card MoE buffers for " + std::to_string(m.moe_tokens) +
+                  " tokens, and this " + std::to_string(T) + "-token chunk cannot run split (see the expert_split "
+                  "lines above); restart without STRATA_PREFILL_EXPERT_SPLIT";
+            return false;
+        }
         auto split_layer = [&](int64_t l) { return split_on && mmq_plan().layer[(size_t) l]; };
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; int32_t peer; };   // peer: a 4070 slot or -1
         std::vector<StreamEntry> seq;

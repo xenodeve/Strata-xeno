@@ -1575,6 +1575,11 @@ int main(int argc, char** argv) {
                             (o.exclusive_secondary_mode < 0 && o.secondary_expert_mib > 0 && !o.mmap_experts &&
                              !(o.serve && o.adapt_secondary > 0));
     const bool place_first = !o.mmap_experts && (o.exclusive_primary_experts || o.exclusive_secondary);
+    // #35 D6: with the peer tier and STRATA_PREFILL_EXPERT_SPLIT, big chunks run their routed experts on the 4070:
+    // the prompt path's one-card MoE buffers are sized for the short chunks only, so it borrows fewer cache slots
+    if (o.exclusive_secondary)
+        if (const char* v = std::getenv("STRATA_PREFILL_EXPERT_SPLIT"); v != nullptr && std::atoi(v) != 0)
+            strata::prefill::Prefill::set_split_layout(true);
     // #34 tail file (default; --no-tail-file): the lendable tail's host copies are released too; the prompt path and the refill after a prompt
     // read those experts from a contiguous tail file (setup_tail_file, refill_lent)
     const bool tail_from_pack = o.tail_file && o.exclusive_primary_experts && !o.mmap_experts;
