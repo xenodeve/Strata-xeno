@@ -894,16 +894,12 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
-    // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
-    // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
-    if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
-#if defined(_WIN32)
-        _putenv_s("CUDA_MODULE_LOADING", "EAGER");
-#else
-        setenv("CUDA_MODULE_LOADING", "EAGER", 0);
-#endif
-    }
+    // xeno (#30): CUDA's default LAZY module loading, not upstream 0.1.15's forced EAGER. EAGER loads every kernel of
+    // the binary into every context: here +3.1 GiB of process private memory (42.20 vs 39.11 GiB, two contexts),
+    // ~0.2 GB of VRAM on each card (the 4070 is the display card) and 2.7 s for the first cuBLAS handle. Upstream
+    // forced it because a kernel first used mid-prompt found no VRAM for its code on a 12 GB card left with ~30 MB
+    // free; the expert cache here is sized with --vram-reserve-mib (700 MiB) left over, which lazy loads fit in.
+    // CUDA_MODULE_LOADING=EAGER in the environment still selects it.
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
@@ -1737,6 +1733,7 @@ int main(int argc, char** argv) {
         uint64_t used = 0;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
+        std::fprintf(stderr, "strata generate: expert cache sizing: %.2f GiB free, %d MiB reserve, budget %.2f GiB -> cap %.2f GiB%c", (double) free_b / 1073741824.0, o.vram_reserve_mib, (double) budget / 1073741824.0, (double) cap / 1073741824.0, 10);
         for (const auto& pr : profile) {
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > cap) break;
