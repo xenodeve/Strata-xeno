@@ -4402,8 +4402,12 @@ int main(int argc, char** argv) {
                 if (strata::timeline::enabled())
                     strata::timeline::complete(win ? "prompt read (windows)" : "prompt read (batched)", tsp, Clock::now(),
                                                at, to);
-                if (trace) {
-                    std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
+                {   // #37: every prompt part, always - the read sizes decide what the dual-GPU prompt path is worth
+                    // (tests/xeno/perf/read_sizes.py parses this line)
+                    const char* part = to == reread_to ? "reread" : to == root_at ? "root" : to == turn_at ? "history"
+                                                                                                           : "new turn";
+                    std::fprintf(stderr, "strata serve: prompt part %s: %lld tokens [%lld, %lld) of %lld (%s) in %.1f ms\n",
+                                 part, (long long) (to - at), (long long) at, (long long) to, (long long) n,
                                  win ? "windows" : "batched",
                                  std::chrono::duration<double, std::milli>(Clock::now() - tsp).count());
                     std::fflush(stderr);
