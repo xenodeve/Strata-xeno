@@ -4,6 +4,8 @@
 #include "strata/core/secondary_vram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/timeline.hpp"
+#include "strata/timeline_gpu.hpp"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -13,6 +15,14 @@
 
 namespace strata::core {
 namespace {
+
+// #33 STRATA_TIMELINE: the 4070's share of a layer on its own GPU lane (one runner per process; launch_now and
+// finish never overlap - finish waits for the launch first)
+timeline::GpuClock& tl_clock() {
+    static timeline::GpuClock c;
+    return c;
+}
+bool tl_anchored = false;
 
 struct RestoreDevice {
     int previous;
@@ -197,6 +207,7 @@ bool SecondaryRunner::start_async_launch(int core, std::string& err) {
 void SecondaryRunner::launcher_loop(int core) {
     kernels::cpu::pin_current_thread(core);
     cudaSetDevice(1);   // stays on the display device, so launch_now's select/restore is a no-op here
+    timeline::name_thread("4070 launcher");
     for (;;) {
         std::unique_lock<std::mutex> lk(launch_mu_);
         launch_cv_.wait(lk, [this] { return launch_req_ || launch_stop_; });
@@ -205,6 +216,7 @@ void SecondaryRunner::launcher_loop(int core) {
         lk.unlock();
         const auto t0 = std::chrono::steady_clock::now();
         std::string e;
+        timeline::Span enqueue_span("4070 enqueue", job_tokens_, job_k_);
         async_ok_ = launch_now(job_layout_, *job_weights_, job_x_, job_slots_.data(), job_tokens_, job_k_, e);
         async_err_ = e;
         ms_async_enqueue_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -283,6 +295,12 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
         last_free_check_ = now;
     }
     cudaStream_t stream = (cudaStream_t) stream_;
+    if (timeline::enabled() && !tl_anchored) { tl_clock().anchor(stream); tl_anchored = true; }
+    cudaEvent_t tl_e0 = tl_clock().record(stream);
+    auto tl_close = [&]() {
+        tl_clock().span(timeline::lane("gpu1 4070 experts"), "4070 experts", tl_e0, tl_clock().record(stream), n_tokens,
+                        (int64_t) group_slots_.size());
+    };
     auto fail_enqueued = [&]() {
         failed_ = true;
         const cudaError_t drained = cudaStreamSynchronize(stream);
@@ -326,8 +344,9 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
             }
             graph_k_[gi] = k;
         }
-        if (!cuda_ok(cudaGraphLaunch((cudaGraphExec_t) ge, stream), "runner graph launch", err) ||
-            !cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
+        if (!cuda_ok(cudaGraphLaunch((cudaGraphExec_t) ge, stream), "runner graph launch", err)) return fail_enqueued();
+        tl_close();
+        if (!cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
             return fail_enqueued();
         pending_ = true;
         if (!async_)
@@ -352,8 +371,10 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
     const size_t requested_d2h_bytes = selected_rows_.size() * (size_t) n_embd_ * sizeof(float);
     if (!cuda_ok(cudaMemcpyAsync(host_out_, device_out_, requested_d2h_bytes,
                                  cudaMemcpyDeviceToHost, stream), "runner partial D2H", err) ||
-        !mark(5) ||
-        !cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
+        !mark(5))
+        return fail_enqueued();
+    tl_close();
+    if (!cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
         return fail_enqueued();
     pending_ = true;
     if (profile_timing_) {
@@ -374,6 +395,7 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
         const auto t0 = std::chrono::steady_clock::now();
         while (!launch_done_.load(std::memory_order_acquire)) std::this_thread::yield();
         ms_async_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        timeline::complete("4070 wait launcher", t0, std::chrono::steady_clock::now());
         if (!async_ok_) { err = async_err_; return false; }
     }
     if (!pending_) { err.clear(); return true; }
@@ -392,6 +414,10 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
         return false;
     }
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_t0).count();
+    if (timeline::enabled()) {
+        timeline::complete("4070 wait", wait_t0, std::chrono::steady_clock::now());
+        tl_clock().resolve(false);
+    }
     if (profile_timing_) {
         const auto query_t0 = std::chrono::steady_clock::now();
         double* stages[] = {&timing_.h2d_ms, &timing_.clear_ms, &timing_.quantize_ms,

@@ -36,6 +36,7 @@ State on 2026-09-29. Every number comes from a same-session ABBA with identical 
 | Exclusive 4070 (#4 A+B) | `5213b90`, `ea04a91`, default in `0a0791d`: paired 4070 swaps. The longer A/B showed no trade-off (code 84.75 vs 85.76, thai 51.64 vs 51.36); peak RAM 39.8 -> 31.3 GB. |
 | #11 NVMe cold tier | N0 simulator (`c2aabee`); N1 opt-in `--ram-cache-gib` (`bf0baf2`). The output is identical, but for this model it is a poor trade: 12 GiB gives 34.3 GiB commit at -21 % decode, 8 GiB gives 30.3 GiB at -41 %. It is for models that do not fit. |
 | #28 P1 host-memory modes | Opened. Supersedes #17 (closed): normal / locked / hybrid, layer-contiguous layout. |
+| #33 pipeline timeline | `STRATA_TIMELINE=<file>` + `tests/xeno/perf/timeline.py`: every thread and GPU lane on one clock (prompt phases per layer, each expert copy and why the copy engine idled, decode round stages, pool workers, 4070, server). First runs answer #31 for the default path (router sync blocks the only issuing thread: 4.5 s of copy idle on 8K) and show in-flight copies stalling during `gdn` / `qsa attn` in issuer mode: `docs/reports/2026-09-29-pipeline-timeline.md`. Off-mode cost not yet A/B-measured against the pre-timeline exe. |
 
 **Waiting for the developer:**
 - Deploying the new engine to `engine-xeno/strata.exe`, which picks up the #27 fix, the exclusive default and placement-first.

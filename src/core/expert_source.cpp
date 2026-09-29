@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/timeline.hpp"
 #include "strata/platform/direct_file.hpp"
 #include "strata/core/secondary_runner.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -518,6 +519,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_run += ms(c3, c4);
     d.ms_cpu_pool += ms(pool_start, pool_end);
     d.ms_secondary_finish += secondary_finish_ms;
+    if (timeline::enabled()) {   // #33: the layer's dispatch stages (inside the verify window's "cpu experts")
+        timeline::complete("dispatch plan", c0, c1, d.layers, n_tok * k);
+        timeline::complete("act quantize", c1, c2, d.layers, n_tok);
+        timeline::complete("dispatch jobs", c2, c3, d.layers, njobs);
+        timeline::complete("cpu pool", pool_start, pool_end, d.layers, njobs);
+        if (secondary_claims)
+            timeline::complete("4070 finish", pool_end, c4, d.layers, (int64_t) d.secondary_runner->served_entries());
+    }
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;

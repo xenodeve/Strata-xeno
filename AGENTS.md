@@ -23,6 +23,11 @@ runs or tools.
   host waiting for the **primary GPU** doorbell. It is not "the GPU waiting for
   CPU experts". That mislabel was published once and had to be retracted
   (Strata-xeno #3).
+- **The pipeline timeline** (`STRATA_TIMELINE=<file>`, then `tests/xeno/perf/timeline.py`; #33) is the first
+  tool for **where** a stage's time goes. It records every thread and GPU lane on one clock: the prompt
+  path's phases per layer, each expert copy and why the copy engine idled, each decode round's stages, the
+  pool workers, the 4070, and the server's requests. It costs about 6 % of an 8K prefill, so it splits a
+  stage and does not replace the paired counters for A/B numbers.
 - **Nsight Systems** is for splitting a stage further, for example the kernels
   inside `wait for rings`. It is not a replacement for the paired counters: the
   profiler changes scheduling, and a trace from one run cannot be subtracted

@@ -20,6 +20,8 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/timeline.hpp"
+#include "strata/timeline_gpu.hpp"
 
 #include <cuda_runtime.h>
 
@@ -159,7 +161,7 @@ struct Stager {
         // a pageable staging buffer makes every DMA from it synchronous on the launching thread: say so
         std::fprintf(stderr, "strata prefill: stager %d threads, %d of %d staging buffers pinned\n", nthreads, n_pinned,
                      kRing);
-        for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
+        for (int t = 0; t < nthreads; ++t) threads.emplace_back([this, t] { work(t); });
         return true;
     }
     ~Stager() {
@@ -172,8 +174,13 @@ struct Stager {
             if (buf[i] && pinned[i]) cudaFreeHost(buf[i]);
         }
     }
-    void work() {
+    void work(int id) {
         cudaSetDevice(device);
+        if (timeline::enabled()) {
+            char nm[40];
+            std::snprintf(nm, sizeof nm, "prefill stager %d", id);
+            timeline::name_thread(nm);
+        }
         uint32_t seen = 0;
         for (;;) {
             {
@@ -188,10 +195,13 @@ struct Stager {
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
                 const int b = j % kRing;
                 if (j >= kRing) {
+                    const double tw = timeline::enabled() ? timeline::now_us() : 0;
                     while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
                     cudaEventSynchronize(dma_done[b]);
+                    if (tw > 0) timeline::complete("stager wait buffer", tw, timeline::now_us(), j, j - kRing);
                 }
                 const Job& jb = jobs[(size_t) j];
+                timeline::Span stage_span(jb.src ? "stager memcpy" : "stager nvme read", j, jb.l);
                 if (jb.src) {
                     std::memcpy(buf[b], jb.src, jb.bytes);
                 } else {
@@ -719,7 +729,11 @@ struct PfTimer {
     std::vector<int> ph;
     size_t used = 0;
     double ms[kPfCount] = {};
+    timeline::GpuClock* clk = nullptr;   // #33: STRATA_TIMELINE - the same marks on the compute lane
+    int lane = 0;
+    int64_t layer = -1;
     void mark(int phase, cudaStream_t s) {
+        if (clk) clk->mark(lane, kPfNames[phase], s, layer);
         if (!on) return;
         if (used == ev.size()) {
             cudaEvent_t e = nullptr;
@@ -733,6 +747,7 @@ struct PfTimer {
     }
     // every recorded mark has completed (the stream was synchronized): charge the gaps, keep the last mark
     void fold() {
+        if (clk) clk->resolve(false);
         if (!on || used < 2) return;
         for (size_t i = 0; i + 1 < used; ++i) {
             float t = 0.0f;
@@ -761,6 +776,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
     PfTimer pt;
     const cudaStream_t cs = (cudaStream_t) m.cs;
+    // #33: STRATA_TIMELINE - the compute stream's phases (the marks above) and every expert copy on the copy stream,
+    // each on its own clock (the copies are recorded by whichever thread issues them)
+    timeline::GpuClock clk_compute, clk_copy;
+    const int tl_compute = timeline::lane("gpu0 compute (prefill)"), tl_copy = timeline::lane("gpu0 copy engine (prefill)");
+    if (timeline::enabled()) {
+        clk_compute.anchor(cs);
+        clk_copy.anchor((cudaStream_t) m.copy);
+        pt.clk = &clk_compute;
+        pt.lane = tl_compute;
+    }
+    timeline::Span run_span("prefill run", n, pos0);
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
     if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
@@ -800,6 +826,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         ++stats_.chunks;
+        clk_copy.resolve(false);   // the previous chunk's issuer has joined
+        timeline::Span chunk_span("prompt chunk", c0, T);
+        pt.layer = -1;
         pt.mark(kPfStart, cs);
         // ---- embeddings, broadcast to the four streams
         for (int64_t t = 0; t < T; ++t) {
@@ -817,6 +846,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // ---- the PLE rows of the whole chunk, one batched SSD request (read ahead on a thread, see ple_gather)
         if (ple_on) {
             const auto tp = Clock::now();
+            timeline::Span ple_span("ple rows (host)", c0);
             if (!ple_next.valid()) {
                 if (!ple_gather(c0, ple_buf, err)) return false;
             } else if (!ple_next.get()) {
@@ -828,6 +858,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (c0 + m.T < n) {
                 cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                    timeline::name_thread("ple read-ahead");
+                    timeline::Span sp("ple read-ahead", c1);
                     return ple_gather(c1, b, ple_next_err);
                 });
             }
@@ -872,6 +904,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 }
             }
             seq_start[(size_t) g.n_layers] = seq.size();
+            timeline::instant("stream plan", (int64_t) seq.size(), (int64_t) js.size());
             m.stager->start(std::move(js));
         }
         struct StagerDone {
@@ -882,8 +915,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 const StreamEntry& en = seq[i];
                 const int sl = (int) (i % (size_t) m.ring);
                 const auto th = Clock::now();
+                timeline::Span issue_span("copy issue", (int64_t) i, en.l);
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                cudaEvent_t tl0 = clk_copy.record(m.copy);
+                const char* tl_name = en.peer >= 0 ? "copy peer" : en.job < 0 ? "copy pinned" : "copy staged";
                 if (en.peer >= 0) {
                     // #4: its only copy is on the 4070 - a peer copy (staged through the host by the driver when
                     // the cards have no P2P path)
@@ -895,10 +931,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                     ++stats_.experts_dma;
                 } else {
+                    const double tw = timeline::enabled() ? timeline::now_us() : 0;
                     const uint8_t* hb = m.stager->wait(en.job);
+                    if (tw > 0) timeline::complete("stager wait", tw, timeline::now_us(), en.job, (int64_t) i);
                     cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                     m.stager->issued_one(en.job, m.copy);
                 }
+                clk_copy.span(tl_copy, tl_name, tl0, clk_copy.record(m.copy), (int64_t) i, en.l);
                 cudaEventRecord(m.copied[sl], m.copy);
                 m.stage_live[sl] = true;
                 stats_.ms_experts_host += ms_since(th);
@@ -931,11 +970,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             cudaGetDevice(&dev);
             issuer = std::thread([&, dev] {
                 cudaSetDevice(dev);
+                timeline::name_thread("prefill copy issuer");
                 for (size_t i = 0; i < seq.size(); ++i) {
+                    const double tw = timeline::enabled() ? timeline::now_us() : 0;
+                    bool waited = false;
                     while (i >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
                         if (issuer_stop.load(std::memory_order_relaxed)) return;
+                        waited = true;
                         std::this_thread::yield();
                     }
+                    if (waited && tw > 0) timeline::complete("issuer wait ring slot", tw, timeline::now_us(), (int64_t) i);
                     if (issuer_stop.load(std::memory_order_relaxed)) return;
                     issue_one(i);
                     a_issued.store(i + 1, std::memory_order_release);
@@ -946,6 +990,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         }
         for (int64_t l = 0; l < g.n_layers; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
+            timeline::Span layer_span("layer (host)", l, c0);
+            pt.layer = l;
             const core::LayerView v(*m.wt, l);
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
@@ -1195,9 +1241,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                     // group the (token, k) pairs by expert on the host
                     pt.mark(kPfHostGroup, cs);
+                    const double tl_sync = timeline::enabled() ? timeline::now_us() : 0;
                     cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
                     cudaStreamSynchronize(m.cs);
+                    if (tl_sync > 0) timeline::complete("router sync", tl_sync, timeline::now_us(), l, (int64_t) consumed);
                     pt.fold();
+                    const double tl_group = timeline::enabled() ? timeline::now_us() : 0;
                     std::fill(m.cnt.begin(), m.cnt.end(), 0);
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = m.ids_host[(size_t) i];
@@ -1261,6 +1310,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                         m.stager->start(std::move(js));
                     }
+                    if (tl_group > 0) timeline::complete("host grouping", tl_group, timeline::now_us(), l);
+                    timeline::Span launch_span("expert launches", l, (int64_t) order.size());
                     StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
                     auto stage_one = [&](size_t j) -> bool {
                         const int32_t e = order[j];
@@ -1269,6 +1320,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int sl = stage_next;
                         stage_next = (stage_next + 1) % STAGE;
                         const auto th = Clock::now();
+                        timeline::Span issue_span("copy issue", (int64_t) j, l);
+                        cudaEvent_t tl0 = nullptr;
+                        const char* tl_name = "copy pinned";
                         const int32_t peer_slot = m.peer_res ? m.peer_res[(size_t) l * NE + e] : -1;
                         const uint8_t* b = peer_slot >= 0 ? nullptr : m.src->blob(l, e);
                         const bool from_pack = peer_slot < 0 && b == nullptr;   // #11: on NVMe - read, do not admit
@@ -1282,21 +1336,29 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             int self_dev = 0;
                             cudaGetDevice(&self_dev);
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                            tl0 = clk_copy.record(m.copy);
+                            tl_name = "copy peer";
                             cudaMemcpyPeerAsync(m.stage_dev[sl], self_dev, m.peer_ptr(peer_slot), m.peer_dev,
                                                 (size_t) lay.blob_bytes(l), m.copy);
                             ++stats_.experts_dma;
                         } else if (m.src->pinned(l, e)) {
                             // DMA straight from the page-locked arena: the copy stream only waits for the slot
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                            tl0 = clk_copy.record(m.copy);
                             cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                             ++stats_.experts_dma;
                         } else {
                             // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
+                            const double tw = timeline::enabled() ? timeline::now_us() : 0;
                             const uint8_t* hb = m.stager->wait(job_of[j]);
+                            if (tw > 0) timeline::complete("stager wait", tw, timeline::now_us(), job_of[j], (int64_t) j);
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                            tl0 = clk_copy.record(m.copy);
+                            tl_name = "copy staged";
                             cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                             m.stager->issued_one(job_of[j], m.copy);
                         }
+                        clk_copy.span(tl_copy, tl_name, tl0, clk_copy.record(m.copy), (int64_t) j, l);
                         cudaEventRecord(m.copied[sl], m.copy);   // every branch: the compute stream waits on it
                         m.stage_live[sl] = true;
                         stage_of[j] = sl;
@@ -1406,8 +1468,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (k < kend && seq[k].e == e) {
                                 const int sl = (int) (k % (size_t) m.ring);
                                 pt.mark(kPfWaitCopy, cs);
-                                if (use_issuer)
+                                if (use_issuer && a_issued.load(std::memory_order_acquire) <= k) {
+                                    const double tw = timeline::enabled() ? timeline::now_us() : 0;
                                     while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
+                                    if (tw > 0) timeline::complete("wait issuer", tw, timeline::now_us(), (int64_t) k, l);
+                                }
                                 cudaStreamWaitEvent(m.cs, m.copied[sl], 0);
                                 if (!compute(j, m.stage_dev[sl], sl)) return false;
                                 consumed = ++k;
@@ -1451,6 +1516,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
         }
         stats_.tokens += T;
+        pt.layer = -1;
         pt.mark(kPfStart, cs);
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
             cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
@@ -1498,6 +1564,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return false;
     }
     stats_.ms_total += ms_since(t_start);
+    if (timeline::enabled()) {
+        clk_compute.mark(tl_compute, nullptr, cs);
+        cudaStreamSynchronize((cudaStream_t) m.copy);
+        clk_compute.resolve(true);
+        clk_copy.resolve(true);
+    }
     if (pt.on) {
         pt.fold();
         double total = 0.0;

@@ -225,6 +225,7 @@ private:
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
     alignas(64) std::atomic<bool> rest_{false};   // see rest(); cleared by the next publish
+    alignas(64) std::atomic<double> publish_us_{0};   // #33 STRATA_TIMELINE: the last publish, for the wake spans
     // The sleep after `kSpinBeforeSleep`.  `sleepers_` is how `publish` knows whether anyone needs waking, so the
     // token path pays one uncontended load per publish and never takes the mutex while the workers spin.
     alignas(64) std::atomic<uint32_t> sleepers_{0};

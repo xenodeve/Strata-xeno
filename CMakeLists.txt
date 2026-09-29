@@ -101,6 +101,12 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 
+# ---- strata_timeline (#33) ------------------------------------------------------
+# STRATA_TIMELINE=<file>: one timeline of every host thread and GPU lane of the pipeline (Chrome trace JSON).
+# Host-only, no CUDA: the CPU pool at the bottom of the dependency graph records into it too.
+add_library(strata_timeline STATIC src/platform/timeline.cpp)
+target_include_directories(strata_timeline PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the
 # whole point of P1.S9 is that the decision is arithmetic you can check by hand.
@@ -121,7 +127,7 @@ if(STRATA_ENABLE_CUDA)
   # CUDA::cudart is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
-  target_link_libraries(strata_core PUBLIC strata_plan strata_warnings CUDA::cudart)
+  target_link_libraries(strata_core PUBLIC strata_plan strata_warnings strata_timeline CUDA::cudart)
 
   add_library(strata_secondary STATIC src/core/secondary_vram.cpp src/core/secondary_arena.cpp)
   target_include_directories(strata_secondary PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -496,7 +502,7 @@ else()
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 endif()
 find_package(Threads REQUIRED)
-target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
+target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads strata_timeline)
 
 # ---- plan v0.3 P6: the i-quant models' CPU experts (IQ2_XS / IQ3_XXS files) ----
 #
@@ -555,6 +561,8 @@ if(STRATA_NATIVE_EXPERTS)
     enable_testing()
     add_executable(xeno_pool_core_policy tests/xeno/pool_core_policy.cpp)
     target_link_libraries(xeno_pool_core_policy PRIVATE strata_kernels_cpu)
+    add_executable(xeno_timeline_core tests/xeno/timeline_core.cpp)
+    target_link_libraries(xeno_timeline_core PRIVATE strata_timeline Threads::Threads)
     add_executable(xeno_q2_isa_parity tests/xeno/q2_isa_parity.cpp)
     target_link_libraries(xeno_q2_isa_parity PRIVATE strata_kernels_cpu)
     add_executable(xeno_pool_idle_sleep tests/xeno/pool_idle_sleep.cpp)
@@ -585,6 +593,10 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(xeno_dequant_expert_fused PRIVATE strata_kernels CUDA::cudart)
       add_test(NAME xeno_dequant_expert_fused COMMAND xeno_dequant_expert_fused)
       set_tests_properties(xeno_dequant_expert_fused PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1")
+      add_executable(xeno_timeline_gpu tests/xeno/timeline_gpu.cpp)
+      target_link_libraries(xeno_timeline_gpu PRIVATE strata_timeline CUDA::cudart)
+      add_test(NAME xeno_timeline_gpu COMMAND xeno_timeline_gpu)
+      set_tests_properties(xeno_timeline_gpu PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1")
       add_executable(xeno_qsa_append_batch tests/xeno/qsa_append_batch.cpp)
       target_link_libraries(xeno_qsa_append_batch PRIVATE strata_kernels CUDA::cudart)
       add_test(NAME xeno_qsa_append_batch COMMAND xeno_qsa_append_batch)
@@ -606,6 +618,7 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     add_test(NAME xeno_pool_core_policy COMMAND xeno_pool_core_policy)
     add_test(NAME xeno_q2_isa_parity COMMAND xeno_q2_isa_parity)
+    add_test(NAME xeno_timeline_core COMMAND xeno_timeline_core)
     add_test(NAME xeno_pool_idle_sleep COMMAND xeno_pool_idle_sleep)
     add_test(NAME xeno_pool_rest COMMAND xeno_pool_rest)
     add_test(NAME xeno_secondary_budget COMMAND xeno_secondary_budget)

@@ -44,6 +44,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.loop_guard import LoopGuard
+from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 
 IM_END = "<|im_end|>"
@@ -645,8 +646,10 @@ class Service:
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
+        t_tl = timeline.now_us()
         prompt = self.template.render(messages, tools=tools, **kwargs)
         ids = self.tok.encode(prompt, parse_special=True)
+        timeline.complete("template+tokenize", t_tl, timeline.now_us(), len(ids))
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -745,8 +748,10 @@ class Service:
         emb = getattr(self.embeddings, "path", None)
         with self.status_lock:
             self.status["queued"] += 1
+        t_queue = timeline.now_us()
         try:
             with self.fifo:
+                timeline.complete("queue wait", t_queue, timeline.now_us())
                 with self.status_lock:
                     self.status["queued"] -= 1
                 if hasattr(self.engine, "alive") and not self.engine.alive():
@@ -760,6 +765,7 @@ class Service:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
                 last_print = time.time()
+                t_engine = timeline.now_us()
                 gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
                     self.engine.generate(ids, max_new, sampling, cancel)
                 try:
@@ -769,6 +775,8 @@ class Service:
                             yield "ping", None
                             continue
                         n += 1
+                        if n == 1:
+                            timeline.instant("first token", len(ids))
                         if t in self.stop_ids:
                             finish = "stop"
                             raw_ids.append(t)
@@ -820,6 +828,7 @@ class Service:
                     raise
                 finally:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
+                    timeline.complete("engine request", t_engine, timeline.now_us(), len(ids), n)
                     #                                     fifo, so a stop-token break can't leave the shared engine
                     #                                     queue mid-drain for the next request to read as its own DONE
         except GeneratorExit:                           # the client disconnected mid-stream
@@ -1284,6 +1293,10 @@ def make_handler(svc: Service):
                 self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
+            with timeline.span("http request"):
+                self._do_post()
+
+        def _do_post(self):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
@@ -1570,6 +1583,8 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
 
 
 def main() -> int:
+    if os.environ.get("STRATA_TIMELINE"):   # #33: the engine writes the file, the server the one beside it
+        timeline.configure(os.environ["STRATA_TIMELINE"] + ".server.json")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "

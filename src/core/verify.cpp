@@ -29,6 +29,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/timeline.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -757,6 +758,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
+    // #33 STRATA_TIMELINE: the window, and inside it staging, launch, per layer the host's wait for the primary GPU's
+    // doorbell ("wait gpu") and the CPU experts it then serves ("cpu experts"), the tail and the head sampling
+    timeline::Span window_span("verify window", T, pos0);
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
@@ -787,10 +791,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
     const Clock::time_point tl = Clock::now();
+    timeline::complete("verify stage", t0, tl, T);
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     ms_launch += ms_since(tl);
+    timeline::complete("verify launch", tl, Clock::now(), T);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -845,6 +851,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+        if (timeline::enabled()) {
+            timeline::complete("wait gpu", a, b, l, grp);
+            timeline::complete("cpu experts", b, Clock::now(), l, grp);
+        }
     }
     const Clock::time_point tt = Clock::now();
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
@@ -853,12 +863,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
     ms_tail += ms_since(tt);
+    timeline::complete("verify tail", tt, Clock::now(), T);
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+        timeline::Span sampling_span("head sampling", T);
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
@@ -962,6 +974,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
         ss_->ple_prev[1] = last_tokens_[t];
     }
     ms_commit += ms_since(t0);
+    timeline::complete("verify commit", t0, Clock::now(), n_keep);
     return true;
 }
 
