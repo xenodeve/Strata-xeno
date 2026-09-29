@@ -591,6 +591,7 @@ struct Prefill::Impl {
     std::unique_ptr<SplitTier> split;        // #32 S4: the 4070's share of the routed experts
     std::shared_ptr<Prefill::WaveLink> wave; // #35 D7: set_wave (null: one lane reads every chunk)
     int wave_lane = 0;
+    bool in_wave = false;                    // run_wave is running this lane (run() alone reads every chunk)
     cudaStream_t relay = nullptr;            // #32 S4: the 5060's side of the split's copies
     std::function<const void*(int32_t)> peer_ptr;
     int peer_dev = -1;
@@ -717,6 +718,11 @@ bool Prefill::run_wave(Prefill& a, Prefill& b, WaveLink& link, const int64_t* to
     int dev = 0;
     cudaGetDevice(&dev);
     std::string err2;
+    struct InWave {   // run() uses the link only inside run_wave
+        Impl* a; Impl* b;
+        ~InWave() { a->in_wave = b->in_wave = false; }
+    } in_wave{a.impl_.get(), b.impl_.get()};
+    a.impl_->in_wave = b.impl_->in_wave = true;
     auto lane2 = std::async(std::launch::async, [&, dev] {
         cudaSetDevice(dev);
         timeline::name_thread("prompt wave lane 2");
@@ -1379,6 +1385,15 @@ struct PfTimer {
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     Impl& m = *impl_;
+    // #35: a lane run on its own (serve: a part the lent wave layout holds but whose lane chunk does not run split)
+    // reads every chunk itself.  With the link attached it read every other chunk and planned the 4070's stream for
+    // a lane 2 that never ran: the issuer waited for it forever (serve_wave_mixed: 6,000 then 3,500 tokens)
+    struct WaveDetach {
+        Impl& m;
+        std::shared_ptr<WaveLink> held;
+        explicit WaveDetach(Impl& i) : m(i) { if (m.wave && !m.in_wave) held = std::move(m.wave); }
+        ~WaveDetach() { if (held) m.wave = std::move(held); }
+    } wave_detach{m};
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
