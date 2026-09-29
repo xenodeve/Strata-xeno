@@ -92,6 +92,16 @@ bool g_split_layout = false;   // #35 D6 (Prefill::set_split_layout)
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
 // the host copies are the limit and the bigger ring only takes cache slots).  STRATA_PREFILL_RING overrides.
+// #41 gate 2: STRATA_EXPERT_ORDER=reverse runs every layer's experts in reverse id order - the row layout, the MMQ
+// groups and both stream plans follow it.  A row's bytes do not depend on its group (xeno_moe_layer_cross_arch), so the
+// output must not change; a static rank order (a Dm frontier's schedule) uses the same four places.
+inline bool expert_order_reverse() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_EXPERT_ORDER"); return e && std::strcmp(e, "reverse") == 0; }();
+    return v;
+}
+inline int32_t expert_at(int32_t i, int64_t n_expert) { return expert_order_reverse() ? (int32_t) (n_expert - 1 - i) : i; }
+// an expert's position in that order (n_expert itself: past every expert)
+inline int64_t expert_pos(int64_t e, int64_t n_expert) { return expert_order_reverse() && e < n_expert ? n_expert - 1 - e : e; }
 inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
     const int r = v ? std::atoi(v) : (g_pinned_share >= 0.9 ? 384 : 96);
@@ -1669,7 +1679,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             std::vector<Stager::Job> js;
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 seq_start[(size_t) l] = seq.size();
-                for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                for (int32_t ei = 0; ei < m.g->n_expert; ++ei) {
+                    const int32_t e = expert_at(ei, m.g->n_expert);   // #41 gate 2
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     if (split_on) break;   // #32 S4: every routed expert of the layer runs on the 4070
                     const int32_t ps = m.peer_res ? m.peer_res[(size_t) l * m.g->n_expert + e] : -1;
@@ -1726,7 +1737,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 std::vector<Stager::Job>& js4 = sp.unit_jobs[(size_t) u];
                 for (int64_t l = 0; l < g.n_layers; ++l) {
                     sp.seq_start[(size_t) (u * (g.n_layers + 1) + l)] = sp.seq.size();
-                    for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                    for (int32_t ei = 0; ei < m.g->n_expert; ++ei) {
+                        const int32_t e = expert_at(ei, m.g->n_expert);   // #41 gate 2
                         if (m.peer_res[(size_t) l * m.g->n_expert + e] >= 0) continue;   // the 4070's own
                         if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) {
                             sp.seq.push_back({(int32_t) l, e, -1, 1});
@@ -2226,8 +2238,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     // #32 S4: with expert_split, the 5060's experts' rows first and the 4070's (the peer tier's) after
                     const bool split_l = split_on;   // a split chunk runs every layer's routed experts there
-                    m.off[0] = 0;
-                    for (int64_t e = 0; e < m.g->n_expert; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
+                    {   // each expert's first row, experts laid out in expert_at order (#41 gate 2; id order by default)
+                        int64_t at_row = 0;
+                        for (int32_t ei = 0; ei < m.g->n_expert; ++ei) {
+                            const int32_t e = expert_at(ei, m.g->n_expert);
+                            m.off[(size_t) e] = (int32_t) at_row;
+                            at_row += m.cnt[(size_t) e];
+                        }
+                        m.off[(size_t) m.g->n_expert] = (int32_t) at_row;
+                    }
                     // #32 STRATA_PREFILL_ROUTE_TRACE=<file>: this layer's routing for the 2-GPU simulator
                     // (tests/xeno/perf/prefill_route_sim.py).  One record per MoE layer of a chunk, int32 little-endian:
                     // magic 0x52505453 ('STPR'), pos0 of the chunk, layer, T, K, n_expert, then n_expert rows each
@@ -2270,8 +2289,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // the experts, in id order: resident ones from VRAM, the others through the staging ring
                     std::vector<int32_t> order;
                     std::vector<int32_t> order_4070;   // #32 S4
-                    for (int32_t e = 0; e < m.g->n_expert; ++e)
+                    for (int32_t ei = 0; ei < m.g->n_expert; ++ei) {
+                        const int32_t e = expert_at(ei, m.g->n_expert);   // #41 gate 2
                         if (m.cnt[(size_t) e] > 0) (split_l ? order_4070 : order).push_back(e);
+                    }
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
@@ -2536,7 +2557,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             publish(k);
                         };
                         auto release_to = [&](int32_t e_stop) {   // entries the routing did not pick: slot back at once
-                            while (k < kend && seq[k].e < e_stop) {
+                            while (k < kend && expert_pos(seq[k].e, m.g->n_expert) < expert_pos(e_stop, m.g->n_expert)) {
                                 cudaEventRecord(m.used[k % (size_t) m.ring], m.cs);
                                 ++k;
                                 if (k_hold == SIZE_MAX) publish(k);
@@ -2576,7 +2597,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         size_t k = seq_start[(size_t) l];
                         const size_t kend = seq_start[(size_t) l + 1];
                         auto release_to = [&](int32_t e_stop) {
-                            while (k < kend && seq[k].e < e_stop) {
+                            while (k < kend && expert_pos(seq[k].e, m.g->n_expert) < expert_pos(e_stop, m.g->n_expert)) {
                                 cudaEventRecord(m.used[k % (size_t) m.ring], m.cs);
                                 consumed = ++k;
                                 if (use_issuer) a_consumed.store(consumed, std::memory_order_release);
