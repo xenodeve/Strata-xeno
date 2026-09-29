@@ -118,6 +118,14 @@ Context::Context() {
     int dev = 0;
     cudaGetDevice(&dev);
     ctx_ = new ggml_backend_cuda_context(dev);
+    // #5: stream-k sizes its grid from the SM count (36 on the 5060 Ti, 56 on the 4070 SUPER) and splits a tile's K
+    // range across blocks, summed in float by the fixup - so the result depends on the card. With nsm = 1 every tile
+    // gets its own block over the whole K range in one fixed order, and the products are bit-identical on sm_89 and
+    // sm_120 (xeno_mmq_cross_arch: 0 of 6.4M values differ; with stream-k 7 of 8 cases differed). Same speed and the
+    // same 8K output on the 5060 Ti (strata-claude-stage K*), so it is the default. STRATA_MMQ_STREAM_K=1: stream-k.
+    // ggml-cuda serves only these MMQ products in this process, so the device table is ours to set.
+    if (std::getenv("STRATA_MMQ_STREAM_K") == nullptr)
+        const_cast<ggml_cuda_device_info&>(ggml_cuda_info()).devices[dev].nsm = 1;
 }
 Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
 

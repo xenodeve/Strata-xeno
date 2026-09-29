@@ -598,6 +598,9 @@ if(STRATA_NATIVE_EXPERTS)
       add_test(NAME gpu_4070_transfer COMMAND xeno_secondary_transfer)
       set_tests_properties(gpu_4070_transfer PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1,0")
       # #5 probe (not a test): which expert GEMMs are bit-identical on sm_89 and sm_120; CUDA_VISIBLE_DEVICES=1,0
+      # #5 probe (not a test): integer mma.sync and the prompt path's MMQ across sm_89 / sm_120
+      add_executable(xeno_mmq_cross_arch tests/xeno/mmq_cross_arch.cu)
+      target_link_libraries(xeno_mmq_cross_arch PRIVATE strata_prefill CUDA::cudart)
       add_executable(xeno_gemm_cross_arch tests/xeno/gemm_cross_arch.cu)
       target_link_libraries(xeno_gemm_cross_arch PRIVATE strata_prefill CUDA::cudart)
     endif()

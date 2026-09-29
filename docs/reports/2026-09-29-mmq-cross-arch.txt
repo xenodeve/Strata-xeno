@@ -1,0 +1,31 @@
+NVIDIA GeForce RTX 5060 Ti (36 SMs) vs NVIDIA GeForce RTX 4070 SUPER (56 SMs)
+imma  K    32 T    1  cross identical  vs exact reference exact
+imma  K    32 T    7  cross identical  vs exact reference exact
+imma  K    32 T   16  cross identical  vs exact reference exact
+imma  K    32 T  100  cross identical  vs exact reference exact
+imma  K    32 T  257  cross identical  vs exact reference exact
+imma  K    64 T    1  cross identical  vs exact reference exact
+imma  K    64 T    7  cross identical  vs exact reference exact
+imma  K    64 T   16  cross identical  vs exact reference exact
+imma  K    64 T  100  cross identical  vs exact reference exact
+imma  K    64 T  257  cross identical  vs exact reference exact
+imma  K   640 T    1  cross identical  vs exact reference exact
+imma  K   640 T    7  cross identical  vs exact reference exact
+imma  K   640 T   16  cross identical  vs exact reference exact
+imma  K   640 T  100  cross identical  vs exact reference exact
+imma  K   640 T  257  cross identical  vs exact reference exact
+imma  K  2560 T    1  cross identical  vs exact reference exact
+imma  K  2560 T    7  cross identical  vs exact reference exact
+imma  K  2560 T   16  cross identical  vs exact reference exact
+imma  K  2560 T  100  cross identical  vs exact reference exact
+imma  K  2560 T  257  cross identical  vs exact reference exact
+imma: 20 of 20 cases identical across the cards, 20 of 20 equal to the exact reference
+mmq   [1280 x 2560] 8 experts x ~1 rows: exact 0 of 19200 differ, max |d| 0
+mmq   [1280 x 2560] 8 experts x ~3 rows: exact 0 of 39680 differ, max |d| 0
+mmq   [1280 x 2560] 8 experts x ~40 rows: exact 0 of 418560 differ, max |d| 0
+mmq   [1280 x 2560] 8 experts x ~160 rows: exact 0 of 1647360 differ, max |d| 0
+mmq   [2560 x 640] 8 experts x ~1 rows: exact 0 of 38400 differ, max |d| 0
+mmq   [2560 x 640] 8 experts x ~3 rows: exact 0 of 79360 differ, max |d| 0
+mmq   [2560 x 640] 8 experts x ~40 rows: exact 0 of 837120 differ, max |d| 0
+mmq   [2560 x 640] 8 experts x ~160 rows: exact 0 of 3294720 differ, max |d| 0
+mmq: 8 of 8 cases bit-identical across the cards
