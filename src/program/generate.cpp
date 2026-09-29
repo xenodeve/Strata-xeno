@@ -208,6 +208,10 @@ struct Options {
     /// #4 step A: the 4070 tier's experts give up their host pages once filled and verified (opt-in until measured).
     /// The prompt path stages them with a peer copy; 4070 swaps stay off in this step.
     bool exclusive_secondary = false;
+    /// -1 (default): exclusive whenever the 4070 tier is on - no trade-off measured (strata-claude-secpair2, 4 runs
+    /// each: code 84.75 copy-kept vs 85.76, thai 51.64 vs 51.36, outputs identical; peak RAM 39.8 -> 31.3 GB);
+    /// 1: --exclusive-secondary-experts; 0: --no-exclusive-secondary-experts.
+    int exclusive_secondary_mode = -1;
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -745,7 +749,8 @@ int main(int argc, char** argv) {
         else if (a == "--route-trace") o.route_trace = next("--route-trace");
         else if (a == "--exclusive-primary-experts") o.exclusive_mode = 1;
         else if (a == "--no-exclusive-primary-experts") o.exclusive_mode = 0;
-        else if (a == "--exclusive-secondary-experts") o.exclusive_secondary = true;
+        else if (a == "--exclusive-secondary-experts") o.exclusive_secondary_mode = 1;
+        else if (a == "--no-exclusive-secondary-experts") o.exclusive_secondary_mode = 0;
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--prefill") o.prefill_chunk = std::atoll(next("--prefill"));
@@ -954,6 +959,9 @@ int main(int argc, char** argv) {
     // Placement-first cold start (#4): when a GPU tier owns experts exclusively, the arena is reserved but not
     // committed or read; GPU tiers fill straight from the pack, and only the host-owned experts are committed and
     // loaded afterwards - so neither RAM nor the commit charge ever holds an expert a GPU owns, not even at boot.
+    o.exclusive_secondary = o.exclusive_secondary_mode == 1 ||
+                            (o.exclusive_secondary_mode < 0 && o.secondary_expert_mib > 0 && !o.mmap_experts &&
+                             !(o.serve && o.adapt_secondary > 0));
     const bool place_first = !o.mmap_experts && (o.exclusive_primary_experts || o.exclusive_secondary);
     // adaptive tiers: measured wins with no trade-off inside the mode that enables them (AGENTS.md default rule)
     if (o.adapt_swaps < 0) o.adapt_swaps = o.exclusive_primary_experts ? 8 : 96;
