@@ -2156,8 +2156,8 @@ int main(int argc, char** argv) {
             }
             if (k + 128 <= xcache.slots()) { excl_keep_from = (int32_t) (xcache.slots() - k); break; }
         }
-        std::fprintf(stderr, "strata generate: exclusive: cache slots %d.. keep their host copies (the lendable tail)\n",
-                     excl_keep_from);
+        std::fprintf(stderr, "strata generate: exclusive: cache slots %d.. are the lendable tail (%s)\n", excl_keep_from,
+                     tail_from_pack ? "no host copies; the tail file refills them" : "they keep their host copies");
     }
     // placement-first: one pinned buffer the pack is read into, for the fills below
     uint8_t* pf_stage = nullptr;
