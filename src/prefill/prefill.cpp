@@ -297,10 +297,17 @@ struct Prefill::Impl {
     // step 2b (MMQ): the activations quantized per layer, H in FP32 and its group's quantized rows, the identity
     // row map, the group bounds, the group buffers of gathered experts
     void *Xq = nullptr, *Hq = nullptr;
+    void* Xtok = nullptr;                    // #34: the chunk's activations, q8_1, one row per token
     float* H = nullptr;
+    int64_t mmq_rows = 0;                    // #34: the rows GU / H / Xq / Hq hold (a sub-product's, mmq_rows_cap)
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     std::vector<int32_t> bounds_host;
+    // #34: an MMQ group's products run as sub-products of at most mmq_rows rows: group positions [q0, q1), their
+    // first row r0 in the layer's expert order, nr rows, the largest expert's rows, and a 0-based bounds block
+    struct MmqSub { size_t q0, q1; int64_t r0, nr, maxr; int32_t off; };
+    std::vector<MmqSub> mmq_subs;
+    std::vector<size_t> mmq_sub_first;       // per group: its first sub-product (and one past the last group)
     std::unique_ptr<mmq::Context> mmq_ctx;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     uint16_t* dq_gu[DQ] = {};
@@ -415,6 +422,11 @@ static_assert(MMQ_GROUP <= mmq::kGatherGroupMax, "one gather_native_group launch
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// #34: the MMQ products run one group at a time, so their scratch (the group's q8 activations, gate/up, SwiGLU and its
+// q8) needs only a group's rows, not the layer's T*K (0.9 GB at 8K).  A token routes to an expert at most once, so an
+// expert has at most T rows; a group with more rows than the cap runs as sub-products that each fit (a row's MMQ result
+// does not depend on the rows beside it, xeno_mmq_cross_arch (d)).  The 8K prompt's largest group has 10,426 rows.
+inline int64_t mmq_rows_cap(int64_t T) { return std::min<int64_t>(T * K, 2 * T); }
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
@@ -447,14 +459,16 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
     if (mp.fallback) a.take<uint16_t>(T * K * N, ok);
-    a.take<float>(T * K * 1280, ok);
+    const size_t R = (size_t) mmq_rows_cap((int64_t) T);
+    a.take<float>((mp.fallback ? T * K : R) * 1280, ok);   // the FP16 path (a fallback layer) uses the layer's rows
     if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
     if (mp.any) {
-        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
-        a.take<float>(T * K * 640, ok);
-        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
+        a.take<uint8_t>(mmq::q8_bytes((int64_t) T, N), ok);
+        a.take<uint8_t>(mmq::q8_bytes((int64_t) R, N), ok);
+        a.take<float>(R * 640, ok);
+        a.take<uint8_t>(mmq::q8_bytes((int64_t) R, 640), ok);
     }
     return a.used;
 }
@@ -587,15 +601,17 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
         m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
-        m.GU = c.take<float>(T * K * 1280, ok);
+        m.mmq_rows = mmq_rows_cap((int64_t) T);
+        m.GU = c.take<float>((mp.fallback ? T * K : (size_t) m.mmq_rows) * 1280, ok);
         m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
         if (mp.any) {
-            m.Xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
-            m.H = c.take<float>(T * K * 640, ok);
-            m.Hq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
+            m.Xtok = c.take<uint8_t>(mmq::q8_bytes((int64_t) T, N), ok);
+            m.Xq = c.take<uint8_t>(mmq::q8_bytes(m.mmq_rows, N), ok);
+            m.H = c.take<float>((size_t) m.mmq_rows * 640, ok);
+            m.Hq = c.take<uint8_t>(mmq::q8_bytes(m.mmq_rows, 640), ok);
         }
         if (base == nullptr) ok = false;
     }
@@ -603,7 +619,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
-        m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
+        m.bounds_dev = o.take<int32_t>((size_t) (4 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
@@ -680,7 +696,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
-        o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
+        o.take<int32_t>((size_t) (4 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
     }
@@ -1355,18 +1371,35 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                     pt.mark(kPfGather, cs);
                     if (use_mmq) {
-                        // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
-                        mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
-                        // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
-                        // reads the group's own quantized H)
+                        // step 2b / #34: the chunk's activations as q8_1, once per token (a sub-product gathers its
+                        // rows from them: byte-identical to quantizing the gathered rows, xeno_q8_row_gather)
+                        mmq::quantize(m.mixed, nullptr, m.Xtok, mmq_gt, N, N, T, m.cs);
+                        // the layer's rows per expert (absolute), then each group's sub-products: at most mmq_rows
+                        // rows each, with a 0-based bounds block that gate/up and down both read
                         const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
-                        m.bounds_host.resize(n + 1 + ng * (MMQ_GROUP + 1));
+                        m.bounds_host.resize(n + 1);
                         for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) order[j]];
                         m.bounds_host[n] = (int32_t) (T * K);
-                        for (size_t g = 0; g < ng; ++g)
-                            for (size_t i = 0; i <= MMQ_GROUP; ++i)
-                                m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
-                                    m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
+                        m.mmq_subs.clear();
+                        m.mmq_sub_first.assign(ng + 1, 0);
+                        for (size_t g = 0; g < ng; ++g) {
+                            m.mmq_sub_first[g] = m.mmq_subs.size();
+                            const size_t a = g * MMQ_GROUP, e = std::min(n, a + MMQ_GROUP);
+                            for (size_t q0 = a; q0 < e;) {
+                                size_t q1 = q0 + 1;   // one expert always fits: at most T rows, and mmq_rows >= T
+                                while (q1 < e && m.bounds_host[q1 + 1] - m.bounds_host[q0] <= m.mmq_rows) ++q1;
+                                int64_t maxr = 0;
+                                for (size_t i = q0; i < q1; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                                const Impl::MmqSub sub{q0 - a, q1 - a, m.bounds_host[q0],
+                                                       m.bounds_host[q1] - m.bounds_host[q0], maxr,
+                                                       (int32_t) m.bounds_host.size()};
+                                for (size_t i = q0; i <= q1; ++i)
+                                    m.bounds_host.push_back(m.bounds_host[i] - m.bounds_host[q0]);
+                                m.mmq_subs.push_back(sub);
+                                q0 = q1;
+                            }
+                        }
+                        m.mmq_sub_first[ng] = m.mmq_subs.size();
                         cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
                                         cudaMemcpyHostToDevice, m.cs);
                     } else {
@@ -1451,30 +1484,35 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // an MMQ group's products once its experts are gathered into the group slots; j = its last expert
                     auto mmq_products = [&](size_t j) {
                         const size_t q = j % MMQ_GROUP;
-                        // the group's products: gate/up, swiglu, the group's H to q8_1, down
-                        const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                        // the group's products, per sub-product (#34): its rows' q8 activations, gate/up, swiglu,
+                        // H to q8_1, down into the layer's Dm rows
+                        const size_t g = (j - q) / MMQ_GROUP;
                         const int ngx = (int) (q + 1);
-                        const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
-                        int64_t maxr = 0;
-                        for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                         pt.mark(kPfGemmGU, cs);
-                        // the zeroed tail after the group's last expert (see MMQ_TAIL)
+                        // the zeroed tail after the group's last expert (see MMQ_TAIL; a sub-product that ends earlier
+                        // reads into the next expert's finite blocks)
                         cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
                         cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
-                        mmq::Product gu;
-                        gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
-                        gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
-                        gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
-                        m.mmq_ctx->run(gu, m.cs);
-                        mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
-                        pt.mark(kPfGemmD, cs);
-                        mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
-                        mmq::Product dn;
-                        dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
-                        dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
-                        dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
-                        dn.ld_dst = N;
-                        m.mmq_ctx->run(dn, m.cs);
+                        for (size_t si = m.mmq_sub_first[g]; si < m.mmq_sub_first[g + 1]; ++si) {
+                            const Impl::MmqSub& sb = m.mmq_subs[si];
+                            const int nx = (int) (sb.q1 - sb.q0);
+                            mmq::gather_q8_rows(m.Xtok, T, m.src_dev + sb.r0, sb.nr, N, m.Xq, m.cs);
+                            mmq::Product gu;
+                            gu.w = m.grp_gu + sb.q0 * mmq_gub; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N;
+                            gu.expert_bytes = mmq_gub; gu.n = nx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + sb.off;
+                            gu.ids = m.ids_identity; gu.total_rows = sb.nr; gu.max_rows = sb.maxr; gu.dst = m.GU;
+                            gu.ld_dst = 1280;
+                            m.mmq_ctx->run(gu, m.cs);
+                            mmq::swiglu(m.GU, m.H, sb.nr, 640, !lay.native, m.cs);
+                            pt.mark(kPfGemmD, cs);
+                            mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, sb.nr, m.cs);
+                            mmq::Product dn;
+                            dn.w = m.grp_d + sb.q0 * mmq_db; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640;
+                            dn.expert_bytes = mmq_db; dn.n = nx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + sb.off;
+                            dn.ids = m.ids_identity; dn.total_rows = sb.nr; dn.max_rows = sb.maxr;
+                            dn.dst = m.Dm + sb.r0 * N; dn.ld_dst = N;
+                            m.mmq_ctx->run(dn, m.cs);
+                        }
                         pt.mark(kPfWaitHost, cs);
                     };
                     // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
@@ -1664,8 +1702,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             for (float v : h) c += !std::isfinite(v);
                             return c;
                         };
-                        const int64_t bgu = bad(m.GU, T * K * 1280), bdm = bad(m.Dm, T * K * N), bbo = bad(m.bo, T * N);
-                        const int64_t bh = m.H ? bad(m.H, T * K * 640) : -1;
+                        const int64_t gu_rows = use_mmq ? m.mmq_rows : T * K;
+                        const int64_t bgu = bad(m.GU, gu_rows * 1280), bdm = bad(m.Dm, T * K * N), bbo = bad(m.bo, T * N);
+                        const int64_t bh = m.H ? bad(m.H, m.mmq_rows * 640) : -1;
                         static int64_t reported = -1;
                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
                             reported = stats_.chunks;
