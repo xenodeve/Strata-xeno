@@ -34,6 +34,10 @@ struct PrefillStats {
     /// #5 P5a: the streamed experts by source (count, bytes): pinned arena, pageable arena, the 4070 tier, NVMe
     int64_t src_n[4] = {0, 0, 0, 0};
     uint64_t src_bytes[4] = {0, 0, 0, 0};
+    int64_t src_rows[4] = {0, 0, 0, 0};
+    /// #5 overlap: pageable staging, summed over the workers (slot wait, memcpy, DMA enqueue) and the compute
+    /// thread's wait for a slot to be staged
+    double ms_stage_slot = 0, ms_stage_memcpy = 0, ms_stage_enqueue = 0, ms_wait_ready = 0;   ///< routed token rows those experts served (sizes an activation round trip)
     double ms_ple = 0;
 };
 

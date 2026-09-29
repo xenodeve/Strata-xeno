@@ -67,6 +67,23 @@ The developer's standing rule (2026-09-28, restated 2026-09-29) decides every kn
 - The launcher and serving profile (`strata-xeno.json`) are still the developer's. Engine defaults change on the
   branch; the profile does not.
 
+## Write it to the tracker as you go, not at the end
+
+Context gets compacted and sessions end. Anything that exists only in the conversation is lost, so the tracker has to
+hold the knowledge and the history (the developer, 2026-09-29):
+
+- **When one piece of work is finished, update its issue straight away.** Post a comment with what was done, the
+  commit, the measured numbers and the log path, and what comes next. Do this per item, not in a batch at session
+  end.
+- **When you find a problem, open an issue for it at once.** This covers a perf bottleneck, a bug, an instrument
+  fault, or a claim that turned out wrong. Give the evidence (counter lines, trace files, commands) even if you will
+  not fix it now. A finding that lives only in the chat is a finding that will be lost.
+- A negative result is worth writing down too. Record a lever that was measured and did nothing, with its numbers,
+  so the next session does not test it again.
+- Issue bodies and comments are bilingual (English plus a full Thai mirror). `gh` is at
+  `"C:\Program Files\GitHub CLI\gh.exe"`, and every command passes `--repo xenodeve/Strata-xeno` explicitly.
+  Without it, `gh` resolves the upstream fork parent.
+
 ## Never put a window on the developer's display
 
 The developer works on the display card while runs happen. Every process an agent starts runs in the background,

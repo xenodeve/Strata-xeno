@@ -47,8 +47,11 @@ class LatencyBreakdownTest(unittest.TestCase):
     def test_parses_prefill_sources_per_tier(self):
         # #5 P5a: where the prompt's streamed experts came from, so 4070-assisted prefill is sized from a counter
         err = STDERR + ("strata generate: prefill sources pinned 100 (0.13 GB) pageable 20000 (27.65 GB) "
-                        "peer 4375 (6.05 GB) nvme 0 (0.00 GB)\n")
+                        "peer 4375 (6.05 GB) nvme 0 (0.00 GB); rows 900 180000 42000 0\n")
         p = parse(STDOUT, err)
+        self.assertEqual(p['prefill_rows_pinned'], 900)
+        self.assertEqual(p['prefill_rows_peer'], 42000)
+        self.assertEqual(p['prefill_rows_nvme'], 0)
         self.assertEqual(p['prefill_src_pinned'], 100)
         self.assertEqual(p['prefill_src_pageable'], 20000)
         self.assertEqual(p['prefill_src_peer'], 4375)

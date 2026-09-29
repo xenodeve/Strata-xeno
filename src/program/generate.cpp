@@ -3404,7 +3404,11 @@ if (o.expert_cache_per_layer) {
         const char* tier_name[4] = {"pinned", "pageable", "peer", "nvme"};
         for (int t = 0; t < 4; ++t)
             std::fprintf(stderr, " %s %lld (%.2f GB)", tier_name[t], (long long) ps.src_n[t], (double) ps.src_bytes[t] / 1e9);
-        std::fprintf(stderr, "\n");
+        std::fprintf(stderr, "; rows %lld %lld %lld %lld\n", (long long) ps.src_rows[0], (long long) ps.src_rows[1],
+                     (long long) ps.src_rows[2], (long long) ps.src_rows[3]);
+        std::fprintf(stderr, "strata generate: prefill staging slot wait %.1f memcpy %.1f enqueue %.1f ms (workers, summed);"
+                             " compute thread waited %.1f ms for staged slots\n",
+                     ps.ms_stage_slot, ps.ms_stage_memcpy, ps.ms_stage_enqueue, ps.ms_wait_ready);
     }
     if (o.cache_cpu_only && !host_res.empty() && d_res != nullptr) {
         std::fill(host_res.begin(), host_res.end(), strata::core::kNotResident);

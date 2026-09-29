@@ -37,7 +37,10 @@ constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
-constexpr int STAGE = 8;           // host->device expert staging ring
+// host->device expert staging ring. #29: 24 slots, 8 workers and a WDDM flush per enqueue were measured and made
+// no difference (the prompt path is bound by launches, not staging)
+constexpr int STAGE = 8;
+constexpr int STAGE_WORKERS = 4;
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
@@ -161,6 +164,7 @@ struct Prefill::Impl {
     std::vector<uint32_t> ple_rows;
     float* ple_norm = nullptr;
     PrefillStats* stats = nullptr;
+    std::atomic<int64_t> ns_slot{0}, ns_memcpy{0}, ns_enqueue{0};   // the staging workers' timers
 };
 
 Prefill::Prefill() : impl_(new Impl) {}
@@ -432,17 +436,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     rope(m.q, T, 24, 256, 6144, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
                     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
                     rope(m.q_idx, T, 4, 128, 512, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
-                    // the indexer appends, token by token; then scores + selection for many queries at once:
-                    // a query reads completed blocks (final once completed) and `dead` for its own tail block
+                    // the indexer appends, token by token in one launch; then scores + selection for many queries at
+                    // once: a query reads completed blocks (final once completed) and `dead` for its own tail block
                     const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                    for (int64_t t = 0; t < T; ++t) {
-                        const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                        try {
-                            strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
-                                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                       (float) strata::kernels::qsa_freq_base(), m.cs);
-                        } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
-                    }
+                    try {
+                        strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, m.steps_dev + strata::kernels::kStepPos,
+                                                                         strata::kernels::kStepCount, 0,
+                                                                         (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                                         (float) strata::kernels::qsa_freq_base(), m.cs);
+                    } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
@@ -522,6 +524,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int tier = peer_slot >= 0 ? 2 : from_pack ? 3 : m.src->pinned(l, e) ? 0 : 1;
                         ++stats_.src_n[tier];
                         stats_.src_bytes[tier] += lay.blob_bytes(l);
+                        stats_.src_rows[tier] += m.cnt[(size_t) e];
                         if (peer_slot >= 0) {
                             // its only copy is on the 4070: a peer copy (staged through the host by the driver
                             // when the cards have no P2P path) into this slot
@@ -546,7 +549,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (!m.stager.running()) {
                                 int dev = 0;
                                 cudaGetDevice(&dev);
-                                m.stager.start(4, dev);
+                                m.stager.start(STAGE_WORKERS, dev);
                             }
                             m.stage_ready[sl].store(0, std::memory_order_relaxed);
                             const bool live = m.stage_live[sl];
@@ -554,7 +557,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             Impl* mp = &m;
                             const int64_t pl = l, pe = e;
                             m.stager.submit([mp, sl, b, bytes, live, from_pack, pl, pe] {
+                                const auto w0 = Clock::now();
                                 if (live) cudaEventSynchronize(mp->used[sl]);
+                                const auto w1 = Clock::now();
                                 std::string re;
                                 if (from_pack) {
                                     if (!mp->src->read_into(pl, pe, mp->stage_host[sl], re)) {
@@ -565,8 +570,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 } else {
                                     std::memcpy(mp->stage_host[sl], b, bytes);
                                 }
+                                const auto w2 = Clock::now();
                                 cudaMemcpyAsync(mp->stage_dev[sl], mp->stage_host[sl], bytes, cudaMemcpyHostToDevice, mp->copy);
                                 cudaEventRecord(mp->copied[sl], mp->copy);
+                                const auto w3 = Clock::now();
+                                auto ns = [](auto a, auto z) {
+                                    return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(z - a).count();
+                                };
+                                mp->ns_slot += ns(w0, w1);
+                                mp->ns_memcpy += ns(w1, w2);
+                                mp->ns_enqueue += ns(w2, w3);
                                 mp->stage_ready[sl].store(1, std::memory_order_release);
                             });
                         }
@@ -589,7 +602,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             blob_dev = m.cache->device_slot(m.host_res[(size_t) l * NE + e]);
                             ++stats_.experts_resident;
                         } else {
+                            const auto tw = Clock::now();
                             while (m.stage_ready[stage_of[j]].load(std::memory_order_acquire) == 0) std::this_thread::yield();
+                            stats_.ms_wait_ready += ms_since(tw);
                             cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
                             blob_dev = m.stage_dev[stage_of[j]];
                         }
@@ -631,6 +646,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return false;
     }
     stats_.ms_total += ms_since(t_start);
+    stats_.ms_stage_slot = (double) m.ns_slot.load() / 1e6;
+    stats_.ms_stage_memcpy = (double) m.ns_memcpy.load() / 1e6;
+    stats_.ms_stage_enqueue = (double) m.ns_enqueue.load() / 1e6;
     return true;
 }
 

@@ -76,6 +76,10 @@ def parse(stdout: str, stderr: str = '') -> dict:
         for i, k in enumerate(tiers):
             out[f'prefill_src_{k}'] = int(m.group(2 * i + 1))
             out[f'prefill_src_{k}_gb'] = float(m.group(2 * i + 2))
+    m = re.search(r'prefill sources.*; rows (\d+) (\d+) (\d+) (\d+)', stderr)
+    if m:
+        for i, k in enumerate(tiers):
+            out[f'prefill_rows_{k}'] = int(m.group(i + 1))
     return out
 
 
