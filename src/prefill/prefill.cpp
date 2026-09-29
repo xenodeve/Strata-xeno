@@ -1905,7 +1905,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
                         cudaStreamSynchronize(m.cs);
                     }
+                    const double tl_fold = timeline::enabled() ? timeline::now_us() : 0;
                     pt.fold();
+                    if (tl_fold > 0) timeline::complete("group: timer fold", tl_fold, timeline::now_us(), l);
                     const double tl_group = timeline::enabled() ? timeline::now_us() : 0;
                     std::fill(m.cnt.begin(), m.cnt.end(), 0);
                     for (int64_t i = 0; i < T * K; ++i) {
@@ -1938,6 +1940,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             std::fclose(f);
                         }
                     }
+                    if (tl_group > 0) timeline::complete("group: counts", tl_group, timeline::now_us(), l);
+                    const double tl_fill = timeline::enabled() ? timeline::now_us() : 0;
                     std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = m.ids_host[(size_t) i];
@@ -1945,8 +1949,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         m.slot_host[(size_t) i] = p;
                         m.src_host[(size_t) p] = (int32_t) (i / K);
                     }
-                    cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
-                    cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
+                    if (tl_fill > 0) timeline::complete("group: fill", tl_fill, timeline::now_us(), l);
+                    // the 5060's own expert walk and combine read them; a split layer's go to the 4070 instead (#35 D5:
+                    // two pageable uploads here held the 5060's queue ahead of the quantize the 4070 waits for)
+                    if (!split_l) {
+                        cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
+                        cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
+                    }
                     // the experts, in id order: resident ones from VRAM, the others through the staging ring
                     std::vector<int32_t> order;
                     std::vector<int32_t> order_4070;   // #32 S4
@@ -1958,7 +1967,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
                     const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                     const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
+                    const double tl_pre = timeline::enabled() ? timeline::now_us() : 0;
                     pt.mark(kPfGather, cs);
+                    if (tl_pre > 0) timeline::complete("group: mark", tl_pre, timeline::now_us(), l);
                     if (use_mmq) {
                         // step 2b / #34: the chunk's activations as q8_1, once per token (a sub-product gathers its
                         // rows from them: byte-identical to quantizing the gathered rows, xeno_q8_row_gather)
