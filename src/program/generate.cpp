@@ -2302,6 +2302,22 @@ int main(int argc, char** argv) {
     double pf_read_ms = 0, pf_fill_ms = 0, pf_verify_ms = 0;   // placement-first fill: where the boot time goes
     int64_t prefilled = 0;
     if (!profile.empty() && srcp != nullptr) {
+        // #12 H3 STRATA_HOT_TO_SECONDARY=N: every Nth pair of the primary's share goes to the 4070 instead - moved just
+        // past that share, so the 4070 tier (profile order, minus the primary's) takes it first; the primary fills on
+        // with the next pairs.  Placement never changes the output (#36); this moves expert work off the primary GPU.
+        if (const char* hv = std::getenv("STRATA_HOT_TO_SECONDARY"); hv != nullptr && std::atoi(hv) > 1 &&
+                                                                    o.secondary_expert_mib > 0) {
+            const int64_t every = std::atoi(hv), cap = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+            std::vector<std::pair<int32_t, int32_t>> keep, moved;
+            size_t i = 0;
+            for (; i < profile.size() && (int64_t) keep.size() < cap; ++i)
+                ((int64_t) (i % (size_t) every) == every - 1 ? moved : keep).push_back(profile[i]);
+            keep.insert(keep.end(), moved.begin(), moved.end());
+            keep.insert(keep.end(), profile.begin() + (std::ptrdiff_t) i, profile.end());
+            profile.swap(keep);
+            std::fprintf(stderr, "strata generate: H3: %zu of the primary's hottest pairs (every %lld) go to the 4070\n",
+                         moved.size(), (long long) every);
+        }
         const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
         if (place_first) {
             // Placement-first primary fill, pipelined: a reader thread reads the next batch of experts from the pack
