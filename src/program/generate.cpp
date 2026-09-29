@@ -46,6 +46,8 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/gemm.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
@@ -1240,6 +1242,12 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // #30: the prompt path's first cuBLAS handle loads all of cuBLAS under CUDA_MODULE_LOADING=EAGER (~2.7 s and
+    // ~220 MB of VRAM; TTFT 1.2 -> 3.9 s on the code prompt). A thread does it once the expert cache is sized (so it
+    // takes no cache slots), during the host load, together with llama.cpp's one-time CUDA init for MMQ.
+    std::thread cublas_warm_thr;
+    struct JoinWarm { std::thread& t; ~JoinWarm() { if (t.joinable()) t.join(); } } cublas_warm_join{cublas_warm_thr};
+
     // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI) and its translation unit is
     // compiled `/arch:AVX512`, so on a CPU without those features it does not fail - it executes an illegal
     // instruction at some unpredictable token.  Refusing at second zero is the whole point of P2.S3's check.
@@ -1826,6 +1834,11 @@ int main(int argc, char** argv) {
                          o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
     }
     if (o.expert_cache > 0) {
+        if (!cublas_warm_thr.joinable())
+            cublas_warm_thr = std::thread([] {
+                strata::prefill::warm_cublas(0);   // the primary device
+                strata::prefill::mmq::warm();
+            });
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");

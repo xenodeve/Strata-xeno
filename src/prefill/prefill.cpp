@@ -48,6 +48,7 @@ bool supported(int) { return false; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }
 void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*) {}
+void warm() {}
 Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product&, void*) {}
@@ -501,6 +502,20 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
     o.owned = &m.owned;
+    const auto t_alloc = Clock::now();
+    if (borrow == nullptr) {
+        // its own buffers: one allocation carved like a borrowed region.  One cudaMalloc per buffer (hundreds of
+        // stream-all ring slots) took ~2.5 s of TTFT under WDDM (#30, strata-claude-merge-decode ts_B)
+        const uint64_t need = bytes_needed(g, ss, chunk);
+        void* block = nullptr;
+        if (cudaMalloc(&block, (size_t) need) != cudaSuccess) {
+            err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
+            return false;
+        }
+        m.owned.push_back(block);
+        o.base = (uint8_t*) block;
+        o.cap = need;
+    }
     {
         uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
         void* ws = o.take<uint8_t>(GEMM_WS, ok);
@@ -511,6 +526,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
     }
+    std::fprintf(stderr, "strata prefill: chunk %lld, %.0f MiB of device buffers (%s), %d ring slots, laid out in %.0f ms\n",
+                 (long long) chunk, (double) o.used / 1048576.0, borrow ? "borrowed" : "own", m.ring, ms_since(t_alloc));
     return true;
 }
 

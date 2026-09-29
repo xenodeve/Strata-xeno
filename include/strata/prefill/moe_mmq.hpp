@@ -12,6 +12,9 @@ namespace strata::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
+/// llama.cpp's one-time CUDA init (device enumeration), ~2.4 s here: call it on a thread during load so the first
+/// prompt does not pay it (#30).  Safe to call more than once.
+void warm();
 /// MMQ covers this ggml type (the i-quants and Q2_0 the packs use; IQ1_M is not covered).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.

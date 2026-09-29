@@ -88,6 +88,7 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 }  // namespace
 
 bool built() { return true; }
+void warm() { (void) ggml_cuda_info(); }
 
 bool supported(int t) {
     switch ((ggml_type) t) {
