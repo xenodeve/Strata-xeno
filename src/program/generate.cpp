@@ -613,7 +613,7 @@ TailFile g_tail;
 bool g_prefill_wave = false;
 uint64_t prompt_bytes_needed(const strata::core::ModelGeometry& g, const strata::core::SessionState& ss, int64_t chunk) {
     if (!g_prefill_wave) return strata::prefill::Prefill::bytes_needed(g, ss, chunk);
-    return 2 * ((strata::prefill::Prefill::bytes_needed(g, ss, chunk / 2) + 4095) / 4096 * 4096);
+    return strata::prefill::Prefill::wave_bytes_needed(g, ss, chunk);
 }
 /// the tail file's slot stride, also the refill's bounce stride: the largest blob, rounded up to 4 KiB
 uint64_t tail_stride() { return ((uint64_t) strata::kernels::cpu::expert_layout().max_blob + 4095) / 4096 * 4096; }
@@ -3353,6 +3353,8 @@ int main(int argc, char** argv) {
         strata::prefill::Prefill sp;
         strata::prefill::Prefill sp2;   // #35 D7: the wave's second lane
         std::shared_ptr<strata::prefill::Prefill::WaveLink> sp_wave;
+        bool sp_layout_wave = false;   // #35 D7: the lanes are laid out as a wave (else lane 1 alone over the region)
+        bool sp_part_wave = false;     // this part of the prompt runs through both lanes
         cudaStream_t sp_lane0_cs = (cudaStream_t) main_cs, sp_lane1_cs = nullptr;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
@@ -3387,7 +3389,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         // #35 D7: with the wave, two lanes of half the chunk: half the borrowed region and a stream each
         const bool sp_waving = g_prefill_wave && o.prefill_chunk >= 4096;
-        const int64_t sp_lane_chunk = sp_waving ? o.prefill_chunk / 2 : o.prefill_chunk;
+        const int64_t sp_lane_chunk = sp_waving ? strata::prefill::Prefill::wave_lane_chunk(o.prefill_chunk) : o.prefill_chunk;
         auto lane_bytes_for = [&](int64_t lane_chunk) -> uint64_t {
             return (strata::prefill::Prefill::bytes_needed(g, ss, lane_chunk) + 4095) / 4096 * 4096;
         };
@@ -3417,6 +3419,7 @@ int main(int argc, char** argv) {
             sp_wave = strata::prefill::Prefill::make_wave_link();
             sp.set_wave(sp_wave, 0);
             sp2.set_wave(sp_wave, 1);
+            sp_layout_wave = true;
             std::fprintf(stderr, "strata serve: prompt wave: two lanes of %lld tokens\n", (long long) sp_lane_chunk);
         }
         mem_mark("the head and the prompt path");
@@ -4185,25 +4188,37 @@ int main(int argc, char** argv) {
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
             // rounded up to 256), laid out in the last of the slots it may borrow
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
-                if (lend_first < 0) return true;                       // its own buffers: nothing to lend
+                if (lend_first < 0) {                                  // its own buffers: nothing to lend
+                    sp_part_wave = sp_layout_wave;   // #35 D7: fixed lanes (a short part leaves lane 2 without a chunk)
+                    return true;
+                }
                 const int64_t want = std::min<int64_t>(o.prefill_chunk, (tokens + 255) / 256 * 256);
                 if (!lent_now.empty()) {
-                    if (want <= lent_chunk) return true;
+                    if (want <= lent_chunk) {   // the lent layout holds it: a wave only if that layout is one
+                        sp_part_wave = sp_layout_wave && strata::prefill::Prefill::wave_lane_chunk(want) >= 2048;
+                        return true;
+                    }
                     if (!refill(e)) return false;
                 }
                 const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want)));
-                if (sp_wave) {   // #35 D7: each lane half the chunk, in its half of the lent region
-                    const int64_t lane_want = std::max<int64_t>(256, (want / 2 + 255) / 256 * 256);
-                    if (lane_want != sp.chunk() || first != lend_first_now) {
+                // #35 D7: the wave only where each lane's chunk still runs split (the review's 3,000-token request
+                // read 1,536-token chunks on one card each: 8.6 s against 3.8 s without the wave)
+                sp_part_wave = sp_wave && strata::prefill::Prefill::wave_lane_chunk(want) >= 2048;
+                if (sp_part_wave) {   // each lane half the chunk, in its half of the lent region
+                    const int64_t lane_want = strata::prefill::Prefill::wave_lane_chunk(want);
+                    if (lane_want != sp.chunk() || first != lend_first_now || !sp_layout_wave) {
                         const uint64_t lb = lane_bytes_for(lane_want);
                         uint8_t* base = (uint8_t*) xcache.device_slot(first);
                         if (2 * lb > lend_bytes(first)) { e = "the wave's lanes do not fit in the lent slots"; return false; }
                         if (!sp.relayout(lane_want, base, lb, e) || !sp2.relayout(lane_want, base + lb, lb, e)) return false;
                         lend_first_now = first;
+                        sp_layout_wave = true;
                     }
-                } else if (want != sp.chunk() || first != lend_first_now) {
+                } else if (want != sp.chunk() || first != lend_first_now || sp_layout_wave) {
+                    // one lane over the whole lent region (a wave's lane 2 is idle until the next wave layout)
                     if (!sp.relayout(want, xcache.device_slot(first), lend_bytes(first), e)) return false;
                     lend_first_now = first;
+                    sp_layout_wave = false;
                 }
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
@@ -4269,22 +4284,9 @@ int main(int argc, char** argv) {
                 }
                 const auto tsp = Clock::now();
                 auto run_prompt = [&](int64_t a, int64_t b, std::string& e) -> bool {
-                    if (!sp_wave) return sp.run(ids.data() + a, b - a, a, e);
+                    if (!sp_wave || !sp_part_wave) return sp.run(ids.data() + a, b - a, a, e);
                     // #35 D7: both lanes over this part, the second on its own thread
-                    strata::prefill::Prefill::wave_reset(*sp_wave, (b - a + sp.chunk() - 1) / sp.chunk(), g.n_layers);
-                    int dev = 0;
-                    cudaGetDevice(&dev);
-                    std::string e2;
-                    auto lane2 = std::async(std::launch::async, [&, dev] {
-                        cudaSetDevice(dev);
-                        strata::timeline::name_thread("prompt wave lane 2");
-                        return sp2.run(ids.data() + a, b - a, a, e2);
-                    });
-                    const bool ok1 = sp.run(ids.data() + a, b - a, a, e);
-                    const bool ok2 = lane2.get();
-                    if (!ok2 && (ok1 || e.find("other wave lane") != std::string::npos)) e = e2;
-                    cudaStreamSynchronize(sp_lane1_cs);
-                    return ok1 && ok2;
+                    return strata::prefill::Prefill::run_wave(sp, sp2, *sp_wave, ids.data() + a, b - a, a, g.n_layers, e);
                 };
                 const bool sp_ok = win ? read_windows(at, to, err) : run_prompt(at, to, err);
                 if (strata::timeline::enabled())
@@ -4642,7 +4644,7 @@ int main(int argc, char** argv) {
             cudaStreamCreateWithPriority(&lane0_cs, cudaStreamNonBlocking, greatest);
             cudaStreamCreateWithPriority(&wave_cs, cudaStreamNonBlocking, least);
         }
-        const int64_t lane_chunk = wave ? o.prefill_chunk / 2 : o.prefill_chunk;
+        const int64_t lane_chunk = wave ? strata::prefill::Prefill::wave_lane_chunk(o.prefill_chunk) : o.prefill_chunk;
         uint64_t lane_bytes = borrow_bytes;
         if (wave && borrow != nullptr) {
             lane_bytes = (strata::prefill::Prefill::bytes_needed(g, ss, lane_chunk) + 4095) / 4096 * 4096;
@@ -4696,21 +4698,8 @@ int main(int argc, char** argv) {
             strata::timeline::Span sp("prompt read (batched)", 0, n_batched);
             if (!wave_link) return prefill.run(o.tokens.data(), n_batched, 0, err);
             // #35 D7: both lanes over the whole prompt, the second on its own thread
-            strata::prefill::Prefill::wave_reset(*wave_link, (n_batched + prefill.chunk() - 1) / prefill.chunk(), g.n_layers);
-            int dev = 0;
-            cudaGetDevice(&dev);
-            std::string err2;
-            auto lane2 = std::async(std::launch::async, [&, dev] {
-                cudaSetDevice(dev);
-                strata::timeline::name_thread("prompt wave lane 2");
-                return prefill2.run(o.tokens.data(), n_batched, 0, err2);
-            });
-            const bool ok1 = prefill.run(o.tokens.data(), n_batched, 0, err);
-            const bool ok2 = lane2.get();
-            if (!ok1 && (err.empty() || err.find("other wave lane") != std::string::npos) && !ok2) err = err2;
-            else if (ok1 && !ok2) err = err2;
-            cudaStreamSynchronize(wave_cs);
-            return ok1 && ok2;
+            return strata::prefill::Prefill::run_wave(prefill, prefill2, *wave_link, o.tokens.data(), n_batched, 0,
+                                                      g.n_layers, err);
         }();
         if (o.profile_prefill_range) { cudaDeviceSynchronize(); cudaProfilerStop(); }
         if (!prefill_ok) {
@@ -4735,7 +4724,8 @@ int main(int argc, char** argv) {
         // the PLE window of the token path: the two tokens before `pos_start`
         ss.ple_prev[0] = pos_start >= 2 ? (int32_t) o.tokens[(size_t) (pos_start - 2)] : -1;
         ss.ple_prev[1] = pos_start >= 1 ? (int32_t) o.tokens[(size_t) (pos_start - 1)] : -1;
-        const strata::prefill::PrefillStats& ps = prefill.stats();
+        strata::prefill::PrefillStats ps = prefill.stats();
+        if (wave_link) ps.merge_lane(prefill2.stats());   // #35 D7: both lanes' tokens (was lane 1's only)
         std::fprintf(stderr, "strata generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
                              "streamed %lld (%lld by DMA, host %.1f ms), resident %lld; PLE %.1f ms\n",
                      (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,

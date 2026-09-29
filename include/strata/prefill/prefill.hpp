@@ -36,6 +36,13 @@ struct PrefillStats {
     uint64_t src_bytes[4] = {0, 0, 0, 0};
     int64_t src_rows[4] = {0, 0, 0, 0};   ///< routed token rows those experts served (small chunks; 0 on stream-all)
     double ms_ple = 0;
+    /// #35 D7: another lane's stats of the same prompt: counts add up, the wall time is the longer lane's
+    void merge_lane(const PrefillStats& o) {
+        tokens += o.tokens; chunks += o.chunks; ms_total = ms_total > o.ms_total ? ms_total : o.ms_total;
+        ms_experts_host += o.ms_experts_host; experts_streamed += o.experts_streamed; experts_dma += o.experts_dma;
+        experts_resident += o.experts_resident; ms_ple += o.ms_ple;
+        for (int i = 0; i < 4; ++i) { src_n[i] += o.src_n[i]; src_bytes[i] += o.src_bytes[i]; src_rows[i] += o.src_rows[i]; }
+    }
 };
 
 class Prefill {
@@ -72,6 +79,12 @@ public:
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
+    /// #35 D7: a wave lane's chunk for a prompt-path chunk of `chunk` tokens (half, rounded up to 256), and the device
+    /// bytes both lanes need - the one sizing rule for the lend, the layouts and the relayouts
+    static int64_t wave_lane_chunk(int64_t chunk) { return chunk / 2 < 256 ? 256 : (chunk / 2 + 255) / 256 * 256; }
+    static uint64_t wave_bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+        return 2 * ((bytes_needed(g, ss, wave_lane_chunk(chunk)) + 4095) / 4096 * 4096);
+    }
 
     /// #35 D7: the two-lane wavefront.  Two Prefill objects on one session read a prompt's chunks alternately
     /// (chunk c on lane c % 2, each lane on its own stream of the same GPU), and chunk c's layer l starts only once
@@ -82,6 +95,10 @@ public:
     static std::shared_ptr<WaveLink> make_wave_link();
     static void wave_reset(WaveLink& link, int64_t n_chunks, int64_t n_layers);
     void set_wave(std::shared_ptr<WaveLink> link, int lane);
+    /// Read [pos0, pos0 + n) through both lanes (`b` on its own thread; b's stream is synchronized before return).
+    /// The first lane's error wins unless it only reports the other lane's failure.
+    static bool run_wave(Prefill& a, Prefill& b, WaveLink& link, const int64_t* tokens, int64_t n, int64_t pos0,
+                         int64_t n_layers, std::string& err);
 
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.

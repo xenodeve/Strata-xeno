@@ -1,4 +1,4 @@
-// #32 D1: the 4070 need not receive the shared expert's output.  moe_combine is
+// #35 D1: the 4070 need not receive the shared expert's output.  moe_combine is
 //   bo = (fmaf chain over k = 0..9 of w * Dm rows) + shared * sigmoid(sg)
 // so the 4070 can compute only the routed sum (moe_routed_sum) and the 5060 finish it with its own shared output
 // (moe_shared_finish), saving 84 MB over x4 per layer at 8K.  The split must write the same bytes as moe_combine on

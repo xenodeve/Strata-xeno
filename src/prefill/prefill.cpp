@@ -95,7 +95,10 @@ inline int ring_slots(size_t T) {
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // #35 D6: the tokens the one-card MoE buffers hold: every chunk, or in the split layout only the chunks below
 // STREAM_ALL_MIN (a bigger one runs its routed experts on the peer card and never touches them)
-inline size_t moe_cap(size_t T) { return g_split_layout ? std::min(T, (size_t) STREAM_ALL_MIN - 1) : T; }
+bool split_layout_usable();   // below: the split's static conditions (a native pack, every layer on MMQ)
+inline size_t moe_cap(size_t T) {
+    return g_split_layout && split_layout_usable() ? std::min(T, (size_t) STREAM_ALL_MIN - 1) : T;
+}
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -336,6 +339,9 @@ struct SplitTier {
     std::vector<cudaEvent_t> used1;        // lane 2's gathers, per ring slot
     std::atomic<size_t> consumed1{((size_t) 1 << 60)};
     std::atomic<int> lanes_done{0};
+    int lanes_expected = 1;                // the lanes that consume this plan (2: a wave whose lane 2 has a chunk)
+    std::atomic<bool> aborted{false};      // a wave lane failed: every waiter below gives up
+    static constexpr size_t kNever = (size_t) 1 << 60;   // a counter past any entry (a lane that no longer holds)
     bool plan_live = false;
     int64_t layers = 0;
     std::vector<std::vector<Stager::Job>> unit_jobs;
@@ -358,7 +364,7 @@ struct SplitTier {
     }
     void join_issuer() {
         stop.store(true);
-        for (auto* a : {&consumed, &consumed1, &issued, &res_ready, &res_uploaded}) publish(*a, (size_t) 1 << 60);
+        for (auto* a : {&consumed, &consumed1, &issued, &res_ready, &res_uploaded}) publish(*a, kNever);
         if (issuer.joinable()) issuer.join();
         if (res_thread.joinable()) res_thread.join();
         if (tl_res >= 0) clk_res.resolve(true);
@@ -651,8 +657,17 @@ struct Prefill::WaveLink {
         cv.wait(lk, [&] { return failed || split_owner != nullptr; });
         return failed ? nullptr : split_owner;
     }
+    SplitTier* owner_now() { std::lock_guard<std::mutex> lk(mu); return split_owner; }
+    static void release(SplitTier* o) {   // a failed wave: the stream's waiters give up (the output is discarded)
+        o->aborted.store(true, std::memory_order_release);
+        for (auto* a : {&o->consumed, &o->consumed1, &o->issued}) SplitTier::publish(*a, SplitTier::kNever);
+    }
     void set_split_owner(SplitTier* o) {
-        { std::lock_guard<std::mutex> lk(mu); split_owner = o; }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            split_owner = o;
+            if (failed) release(o);
+        }
         cv.notify_all();
     }
     ~WaveLink() { for (cudaEvent_t e : ev) if (e) cudaEventDestroy(e); }
@@ -680,11 +695,32 @@ struct Prefill::WaveLink {
         cv.notify_all();
     }
     void fail() {
-        { std::lock_guard<std::mutex> lk(mu); failed = true; }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            failed = true;
+            if (split_owner) release(split_owner);
+        }
         cv.notify_all();
     }
 };
 std::shared_ptr<Prefill::WaveLink> Prefill::make_wave_link() { return std::make_shared<WaveLink>(); }
+bool Prefill::run_wave(Prefill& a, Prefill& b, WaveLink& link, const int64_t* tokens, int64_t n, int64_t pos0,
+                       int64_t n_layers, std::string& err) {
+    wave_reset(link, (n + a.chunk() - 1) / a.chunk(), n_layers);
+    int dev = 0;
+    cudaGetDevice(&dev);
+    std::string err2;
+    auto lane2 = std::async(std::launch::async, [&, dev] {
+        cudaSetDevice(dev);
+        timeline::name_thread("prompt wave lane 2");
+        return b.run(tokens, n, pos0, err2);
+    });
+    const bool ok1 = a.run(tokens, n, pos0, err);
+    const bool ok2 = lane2.get();
+    if (!ok2 && (ok1 || err.find("other wave lane") != std::string::npos)) err = err2;
+    cudaStreamSynchronize(b.impl_->cs);
+    return ok1 && ok2;
+}
 void Prefill::wave_reset(WaveLink& w, int64_t n_chunks, int64_t n_layers) {
     std::lock_guard<std::mutex> lk(w.mu);
     w.layers = n_layers;
@@ -835,10 +871,12 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
     // 4. the experts: each group gathers from the 4070's slots and the ring; a ring entry is released (consumed)
     //    once its group's gather is recorded, and a group whose entries span more than the ring holds gathers what it
     //    has first
-    auto wait_issued = [&](size_t k) {
-        if (xs.issued.load(std::memory_order_acquire) > k) return;
-        timeline::Span ws("split wait issuer", (int64_t) k, l);
-        for (size_t v; (v = xs.issued.load(std::memory_order_acquire)) <= k;) xs.issued.wait(v);
+    auto wait_issued = [&](size_t k) -> bool {
+        if (xs.issued.load(std::memory_order_acquire) <= k) {
+            timeline::Span ws("split wait issuer", (int64_t) k, l);
+            for (size_t v; (v = xs.issued.load(std::memory_order_acquire)) <= k;) xs.issued.wait(v);
+        }
+        return !xs.aborted.load(std::memory_order_acquire);   // a failed wave publishes `issued` past everything
     };
     int cur_grp = -1;
     for (const Sub& sb : subs) {
@@ -875,7 +913,7 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
                         const size_t c = my_consumed.load(std::memory_order_acquire);
                         if ((size_t) k > c) SplitTier::publish(my_consumed, (size_t) k);
                     }
-                    wait_issued((size_t) k);
+                    if (!wait_issued((size_t) k)) { err = "prefill: the other wave lane failed"; return false; }
                     cudaStreamWaitEvent(sp.s, xs.copied[k % xs.RING], 0);   // same card (the stream's copy streams)
                     blobs[pn] = xs.ring + (size_t) (k % xs.RING) * xs.blob;
                 }
@@ -998,6 +1036,14 @@ const MmqPlan& mmq_plan() {
         return p;
     }();
     return plan;
+}
+// #35 D6 (review): the split layout applies only where every big chunk can run split, or such a chunk has no
+// one-card buffers to fall back to
+bool split_layout_usable() {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || !mmq_plan().any) return false;
+    for (char c : mmq_plan().layer) if (!c) return false;
+    return true;
 }
 uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     const MmqPlan& mp = mmq_plan();
@@ -1401,12 +1447,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     struct WaveStreamDone {
         Impl& m;
         ~WaveStreamDone() {
-            if (!m.wave || !m.split || !m.split->xs || !m.split->xs->plan_live) return;
-            SplitTier& x = *m.split->xs;
-            SplitTier::publish(m.wave_lane == 1 ? x.consumed1 : x.consumed, (size_t) 1 << 60);
-            if (x.lanes_done.fetch_add(1) + 1 == 2) x.join_issuer();
+            if (!m.wave) return;
+            // lane 1 owns its plan; lane 2 asks the link for this run's owner (never a pointer from an earlier run)
+            SplitTier* x = m.wave_lane == 0 ? m.split.get() : m.wave->owner_now();
+            if (m.split) m.split->xs = m.split.get();
+            if (!x || !x->plan_live || (m.wave_lane == 1 && x->lanes_expected < 2)) return;
+            SplitTier::publish(m.wave_lane == 1 ? x->consumed1 : x->consumed, SplitTier::kNever);
+            if (x->lanes_done.fetch_add(1) + 1 == x->lanes_expected) x->join_issuer();
         }
     } wave_stream_done{m};
+    if (m.split) m.split->xs = m.split.get();   // #35 D7: a run starts on its own tier (lane 2 attaches below)
     for (int64_t c0 = wave ? m.wave_lane * m.T : 0; c0 < n; c0 += stride) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         const int64_t chunk_i = c0 / m.T;   // the chunk's index in the prompt (the wave hand-off's key)
@@ -1596,8 +1646,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         }
         if (split_on && (!wave || (m.wave_lane == 0 && c0 == 0))) {
             SplitTier& sp = *m.split;
+            if (sp.issuer.joinable() || sp.res_thread.joinable()) sp.join_issuer();   // a failed run's stream
             sp.xs = &sp;
             sp.layers = g.n_layers;
+            // lane 2 consumes the plan when it has a chunk (it then attaches: same condition as this plan's)
+            sp.lanes_expected = wave && n > m.T ? 2 : 1;
+            sp.aborted.store(false);
             const int64_t n_units = wave ? ((n + m.T - 1) / m.T + 1) / 2 : 1;
             sp.seq.clear();
             sp.seq_start.assign((size_t) (n_units * (g.n_layers + 1)), 0);
@@ -1625,7 +1679,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             sp.unit_first[(size_t) n_units] = sp.seq.size();
             sp.consumed.store(0);
-            SplitTier::publish(sp.consumed1, wave ? 0 : ((size_t) 1 << 60));
+            SplitTier::publish(sp.consumed1, sp.lanes_expected == 2 ? 0 : SplitTier::kNever);
             sp.lanes_done.store(0);
             sp.plan_live = true;
             sp.issued.store(0);
@@ -1687,7 +1741,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (k >= (size_t) t.RING && (!SplitTier::wait_above(t.consumed, k - (size_t) t.RING, t.stop) ||
                                                  !SplitTier::wait_above(t.consumed1, k - (size_t) t.RING, t.stop)))
                         return;
-                    if (t.stop.load(std::memory_order_relaxed)) return;
+                    if (t.stop.load(std::memory_order_relaxed) || t.aborted.load(std::memory_order_acquire)) return;
                     const SplitTier::Entry& en = t.seq[k];
                     timeline::Span issue_span(en.kind == 1 ? "split issue resident" : "split issue host", (int64_t) k, en.l);
                     const int rs = (int) (k % t.RING);
