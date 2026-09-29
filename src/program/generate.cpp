@@ -1393,6 +1393,12 @@ struct PleAhead {
 
 }  // namespace
 
+// #45 exit-hang probe: STRATA_EXIT_TRACE=1 prints as each marked object of main is destroyed (reverse order)
+struct ExitTrace {
+    const char* what;
+    ~ExitTrace() { if (std::getenv("STRATA_EXIT_TRACE")) { std::fprintf(stderr, "exit trace: everything after it is gone; destroying %s\n", what); std::fflush(stderr); } }
+};
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -2167,6 +2173,7 @@ int main(int argc, char** argv) {
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
     strata::kernels::PleTable ple_table;
+    ExitTrace exit_trace_ple_table{"ple_table next"};
     std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
     float* ple_scratch = nullptr;
@@ -2323,6 +2330,7 @@ int main(int argc, char** argv) {
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
+    ExitTrace exit_trace_mtp{"mtp next"};
     PleAhead ple_ahead;   // #44 D4: lives as long as the drafter that calls into it
     mtp.on_draft = [&ple_ahead](int32_t t) { ple_ahead.push(t); };
     if (!o.mtp.empty()) {
@@ -2372,6 +2380,7 @@ int main(int argc, char** argv) {
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
     strata::core::ArenaExpertSource arena_src;
+    ExitTrace exit_trace_arena_src{"arena_src next"};
     strata::core::ExpertSource* srcp = nullptr;
     if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
@@ -2434,12 +2443,14 @@ int main(int argc, char** argv) {
     strata::kernels::cpu::set_worker_priority(o.pool_priority);
     strata::kernels::cpu::set_current_thread_priority(o.pool_priority);   // the host works in the pool too
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
+    ExitTrace exit_trace_pool{"pool next"};
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
     mem_mark("the weights, the session and the drafter");
     strata::core::ExpertCache xcache;
+    ExitTrace exit_trace_xcache{"xcache next"};
     std::vector<std::pair<int32_t, int32_t>> profile;
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
@@ -2962,6 +2973,7 @@ int main(int argc, char** argv) {
     // The stage-only and forced-CPU arms keep a same-binary correctness baseline.
     strata::core::SecondaryArena secondary_arena;
     strata::core::SecondaryRunner secondary_runner;
+    ExitTrace exit_trace_secondary_runner{"secondary_runner next"};
     std::vector<int32_t> secondary_residency;
     if (o.secondary_expert_mib > 0) {
         if (!native_pack || profile.empty() || o.expert_cache <= 0 || srcp == nullptr) {
@@ -3325,6 +3337,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
 
     std::array<strata::core::RemoteExperts, 3> remote_experts;
+    ExitTrace exit_trace_remote_experts{"remote_experts next"};
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
     if (o.expert_cache_remote[0] > 0) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
@@ -5692,6 +5705,7 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
+    ExitTrace exit_trace_prefill{"prefill next"};
     strata::prefill::Prefill prefill2;   // #35 D7: the wave's second lane
     std::shared_ptr<strata::prefill::Prefill::WaveLink> wave_link;
     cudaStream_t wave_cs = nullptr;
@@ -6937,5 +6951,9 @@ int main(int argc, char** argv) {
     cudaFree(d_parts);
     cudaFree(sbuf);
     cudaFree(arena);
+    // #45 (experiment only): the merged engine's prompt-path stager threads hang in thread exit after returning
+    // (traced: all four return, the first join never does); STRATA_EXP_QUICK_EXIT=1 ends the process here, after
+    // every result is printed and flushed.  A bypass for measuring, not a fix.
+    if (std::getenv("STRATA_EXP_QUICK_EXIT")) { std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 0); }
     return 0;
 }

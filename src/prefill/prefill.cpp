@@ -279,10 +279,18 @@ struct Stager {
         return true;
     }
     ~Stager() {
+        const bool tr = std::getenv("STRATA_EXIT_TRACE") != nullptr;   // #45 exit-hang probe
+        if (tr) { std::fprintf(stderr, "exit trace: ~Stager start, active %d\n", active.load()); std::fflush(stderr); }
         finish();
+        if (tr) { std::fprintf(stderr, "exit trace: ~Stager finished\n"); std::fflush(stderr); }
         { std::lock_guard<std::mutex> lk(mu); quit = true; }
         cv.notify_all();
-        for (auto& t : threads) t.join();
+        if (tr) { std::fprintf(stderr, "exit trace: ~Stager joining %zu threads, quit %d gen %u\n", threads.size(), (int) quit, gen); std::fflush(stderr); }
+        for (size_t ti = 0; ti < threads.size(); ++ti) {
+            threads[ti].join();
+            if (tr) { std::fprintf(stderr, "exit trace: ~Stager joined %zu\n", ti); std::fflush(stderr); }
+        }
+        if (tr) { std::fprintf(stderr, "exit trace: ~Stager joined\n"); std::fflush(stderr); }
         for (int i = 0; i < kRing; ++i) {
             if (dma_done[i]) cudaEventDestroy(dma_done[i]);
             if (buf[i] && pinned[i]) cudaFreeHost(buf[i]);
@@ -300,7 +308,10 @@ struct Stager {
             {
                 std::unique_lock<std::mutex> lk(mu);
                 cv.wait(lk, [&] { return quit || gen != seen; });
-                if (quit) return;
+                if (quit) {
+                    if (std::getenv("STRATA_EXIT_TRACE")) { std::fprintf(stderr, "exit trace: stager %d returns\n", id); std::fflush(stderr); }
+                    return;
+                }
                 seen = gen;
             }
             for (;;) {
@@ -889,9 +900,13 @@ void Prefill::set_wave(std::shared_ptr<WaveLink> link, int lane) {
 
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() {
+    const bool tr = std::getenv("STRATA_EXIT_TRACE") != nullptr;   // #45 exit-hang probe
+    auto T_ = [&](const char* w) { if (tr) { std::fprintf(stderr, "exit trace: ~Prefill %s\n", w); std::fflush(stderr); } };
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
+    T_("cs synced");
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
+    T_("copy synced");
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -904,8 +919,11 @@ Prefill::~Prefill() {
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     impl_->split.reset();
+    T_("split reset");
     if (impl_->relay) { cudaStreamSynchronize(impl_->relay); cudaStreamDestroy(impl_->relay); }
+    T_("relay done");
     for (void* p : impl_->owned) cudaFree(p);
+    T_("owned freed; members next");
 }
 
 namespace {
