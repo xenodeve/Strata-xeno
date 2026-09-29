@@ -62,6 +62,12 @@ private:
 /// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream);
+/// #29: up to kGatherGroupMax GGUF-native expert blobs (gate at blob, up at blob + up_off, down at blob + down_off) into
+/// consecutive group slots in ONE launch: expert i's gate then up rows at gu_dst + i * gu_stride, its down at
+/// d_dst + i * d_stride.  Byte-identical to gather_native per expert (xeno_gather_group_parity).
+constexpr int kGatherGroupMax = 16;
+void gather_native_group(const uint8_t* const* blobs, int n, size_t up_off, size_t down_off, size_t gu_half_bytes,
+                         size_t d_bytes, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream);
 /// A Strata-pack Q2_0 expert blob (codes and fp16 scales in separate planes, gate/up rows interleaved) into GGUF
 /// Q2_0 blocks: gate/up [1280, 2560] at `gu_dst` (rows stay interleaved), down [2560, 640] at `d_dst`.  Same values.
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);

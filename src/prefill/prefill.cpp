@@ -998,6 +998,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             return v != nullptr && std::atoi(v) != 0;
         }();
         const bool use_issuer = stream_all && copy_thread_on;
+        // #29: STRATA_PREFILL_GROUP_GATHER=0 keeps one gather launch per expert (the A/B)
+        static const bool group_gather_on = [] {
+            const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
         std::atomic<size_t> a_consumed{0}, a_issued{0};
         std::atomic<bool> issuer_stop{false};
         std::thread issuer;
@@ -1411,6 +1416,35 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         ++stats_.experts_streamed;
                         return true;
                     };
+                    // an MMQ group's products once its experts are gathered into the group slots; j = its last expert
+                    auto mmq_products = [&](size_t j) {
+                        const size_t q = j % MMQ_GROUP;
+                        // the group's products: gate/up, swiglu, the group's H to q8_1, down
+                        const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                        const int ngx = (int) (q + 1);
+                        const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
+                        int64_t maxr = 0;
+                        for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                        pt.mark(kPfGemmGU, cs);
+                        // the zeroed tail after the group's last expert (see MMQ_TAIL)
+                        cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
+                        cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                        mmq::Product gu;
+                        gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+                        gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
+                        gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                        m.mmq_ctx->run(gu, m.cs);
+                        mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                        pt.mark(kPfGemmD, cs);
+                        mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                        mmq::Product dn;
+                        dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
+                        dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
+                        dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
+                        dn.ld_dst = N;
+                        m.mmq_ctx->run(dn, m.cs);
+                        pt.mark(kPfWaitHost, cs);
+                    };
                     // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                     // expert) is released once the blob is read
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
@@ -1431,31 +1465,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 pt.mark(kPfWaitHost, cs);
                                 return true;
                             }
-                            // the group's products: gate/up, swiglu, the group's H to q8_1, down
-                            const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
-                            const int ngx = (int) (q + 1);
-                            const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
-                            int64_t maxr = 0;
-                            for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
-                            pt.mark(kPfGemmGU, cs);
-                            // the zeroed tail after the group's last expert (see MMQ_TAIL)
-                            cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
-                            cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
-                            mmq::Product gu;
-                            gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
-                            gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
-                            gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
-                            m.mmq_ctx->run(gu, m.cs);
-                            mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
-                            pt.mark(kPfGemmD, cs);
-                            mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
-                            mmq::Product dn;
-                            dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
-                            dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
-                            dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
-                            dn.ld_dst = N;
-                            m.mmq_ctx->run(dn, m.cs);
-                            pt.mark(kPfWaitHost, cs);
+                            mmq_products(j);
                             return true;
                         }
                         const int q = (int) (j % DQ);
@@ -1499,6 +1509,82 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
                             }
                         }
+                    } else if (use_mmq && lay.native && group_gather_on) {
+                        // #29, the streamed walk with one gather launch per MMQ group (was: a wait, a gather and a used
+                        // record per expert, ~0.17 ms of host per expert).  A routed entry's gather is deferred until the
+                        // group ends; its ring slot is released (used recorded, `consumed` published) only then, so the
+                        // copy issuer can never overwrite a slot whose blob is not read yet.  The copy stream runs in
+                        // entry order: waiting on the group's last streamed copy covers the ones before it.  A group that
+                        // would span more entries than the ring holds gathers what it has first (the products still run
+                        // per group: the gathers only fill slots).
+                        size_t k = seq_start[(size_t) l];
+                        const size_t kend = seq_start[(size_t) l + 1];
+                        const auto& f = lay.fmt[(size_t) l];
+                        const uint8_t* gsrc[MMQ_GROUP];
+                        int gslot[MMQ_GROUP];
+                        size_t g0 = 0, gn = 0;          // pending gathers: group positions [g0, g0 + gn)
+                        size_t k_hold = SIZE_MAX;       // the first entry whose slot a pending gather still reads
+                        size_t k_wait = SIZE_MAX;       // the last streamed entry of the pending gathers
+                        auto publish = [&](size_t upto) {
+                            consumed = upto;
+                            if (use_issuer) a_consumed.store(consumed, std::memory_order_release);
+                            else issue_until(consumed + (size_t) m.ring);
+                        };
+                        auto flush_gathers = [&]() {
+                            if (gn == 0) return;
+                            if (k_wait != SIZE_MAX) {
+                                pt.mark(kPfWaitCopy, cs);
+                                if (use_issuer && a_issued.load(std::memory_order_acquire) <= k_wait) {
+                                    timeline::Span wait_span("wait issuer", (int64_t) k_wait, l);
+                                    while (a_issued.load(std::memory_order_acquire) <= k_wait) std::this_thread::yield();
+                                }
+                                cudaStreamWaitEvent(m.cs, m.copied[k_wait % (size_t) m.ring], 0);
+                            }
+                            pt.mark(kPfDequant, cs);
+                            mmq::gather_native_group(gsrc, (int) gn, f.up_off, f.down_off, mmq_gub / 2, mmq_db,
+                                                     m.grp_gu + g0 * mmq_gub, mmq_gub, m.grp_d + g0 * mmq_db, mmq_db, m.cs);
+                            for (size_t i = 0; i < gn; ++i)
+                                if (gslot[i] >= 0) cudaEventRecord(m.used[gslot[i]], m.cs);
+                            g0 += gn;
+                            gn = 0;
+                            k_hold = k_wait = SIZE_MAX;
+                            publish(k);
+                        };
+                        auto release_to = [&](int32_t e_stop) {   // entries the routing did not pick: slot back at once
+                            while (k < kend && seq[k].e < e_stop) {
+                                cudaEventRecord(m.used[k % (size_t) m.ring], m.cs);
+                                ++k;
+                                if (k_hold == SIZE_MAX) publish(k);
+                            }
+                        };
+                        for (size_t j = 0; j < order.size(); ++j) {
+                            const int32_t e = order[j];
+                            const size_t q = j % MMQ_GROUP;
+                            if (q == 0) g0 = 0;
+                            release_to(e);
+                            if (k < kend && seq[k].e == e) {
+                                // the pending gathers hold slots from k_hold on: the issuer can run ring entries past
+                                // it, so this entry's copy exists only while it is within that reach
+                                if (k_hold != SIZE_MAX && k + 2 > k_hold + (size_t) m.ring) flush_gathers();
+                                if (k_hold == SIZE_MAX) k_hold = k;
+                                gsrc[gn] = m.stage_dev[k % (size_t) m.ring];
+                                gslot[gn] = (int) (k % (size_t) m.ring);
+                                k_wait = k;
+                                ++gn;
+                                ++k;
+                            } else {
+                                ++stats_.experts_resident;
+                                gsrc[gn] = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
+                                gslot[gn] = -1;
+                                ++gn;
+                            }
+                            if (q + 1 == MMQ_GROUP || j + 1 == order.size()) {
+                                flush_gathers();
+                                mmq_products(j);
+                            }
+                        }
+                        release_to(m.g->n_expert);
+                        if (k_hold == SIZE_MAX) publish(k);
                     } else {
                         // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did not
                         // pick only gives its slot back

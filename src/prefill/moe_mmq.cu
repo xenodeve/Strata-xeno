@@ -174,6 +174,43 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
     ck(cudaGetLastError(), "gather_native");
 }
 
+namespace {
+struct GatherGroup {
+    const uint4* blob[kGatherGroupMax];
+};
+// blockIdx.y = the expert: the same element walk as copy16_kernel, from that expert's blob into its slot
+__global__ void copy16_group_kernel(GatherGroup g, int64_t up16, int64_t down16, int64_t na, int64_t nc,
+                                    uint4* __restrict__ gu, int64_t gu_stride16, uint4* __restrict__ dn, int64_t d_stride16) {
+    const int e = blockIdx.y;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const uint4* b = g.blob[e];
+    if (i < na) gu[e * gu_stride16 + i] = b[i];
+    else if (i < 2 * na) gu[e * gu_stride16 + i] = b[up16 + i - na];
+    else if (i < 2 * na + nc) dn[e * d_stride16 + i - 2 * na] = b[down16 + i - 2 * na];
+}
+}  // namespace
+
+void gather_native_group(const uint8_t* const* blobs, int n, size_t up_off, size_t down_off, size_t gu_half_bytes,
+                         size_t d_bytes, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream) {
+    if (n <= 0) return;
+    uintptr_t align = (uintptr_t) gu_dst | (uintptr_t) d_dst | up_off | down_off | gu_half_bytes | d_bytes | gu_stride |
+                      d_stride;
+    for (int i = 0; i < n; ++i) align |= (uintptr_t) blobs[i];
+    if (n > kGatherGroupMax || align % 16 != 0) {   // the per-expert path (its own unaligned fallback included)
+        for (int i = 0; i < n; ++i)
+            gather_native(blobs[i], blobs[i] + up_off, gu_half_bytes, blobs[i] + down_off, d_bytes,
+                          (uint8_t*) gu_dst + (size_t) i * gu_stride, (uint8_t*) d_dst + (size_t) i * d_stride, stream);
+        return;
+    }
+    GatherGroup g{};
+    for (int i = 0; i < n; ++i) g.blob[i] = (const uint4*) blobs[i];
+    const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16;
+    copy16_group_kernel<<<dim3(blocks(2 * na + nc), (unsigned) n), 256, 0, (cudaStream_t) stream>>>(
+        g, (int64_t) up_off / 16, (int64_t) down_off / 16, na, nc, (uint4*) gu_dst, (int64_t) gu_stride / 16,
+        (uint4*) d_dst, (int64_t) d_stride / 16);
+    ck(cudaGetLastError(), "gather_native_group");
+}
+
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
     strata_q2_kernel<<<blocks(1280LL * 40 + 2560LL * 10), 256, 0, (cudaStream_t) stream>>>(blob, (uint16_t*) gu_dst,
                                                                                          (uint16_t*) d_dst);
