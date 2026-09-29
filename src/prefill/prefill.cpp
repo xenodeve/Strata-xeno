@@ -119,6 +119,15 @@ inline const ExpertOrder& expert_order() {
         }
         r.layers = hdr[1];
         r.experts = hdr[2];
+        // the header must match the file's size before anything is sized from it (a corrupt one would throw here)
+        std::fseek(f, 0, SEEK_END);
+        const long long bytes = (long long) std::ftell(f);
+        std::fseek(f, 12, SEEK_SET);
+        if (r.layers > 4096 || r.experts > 65536 || bytes != 12 + 4LL * r.layers * r.experts) {
+            std::fprintf(stderr, "strata prefill: STRATA_EXPERT_ORDER=%s: header and size disagree; id order\n", e);
+            std::fclose(f);
+            return ExpertOrder{};
+        }
         r.at.resize((size_t) (r.layers * r.experts));
         r.pos.assign(r.at.size(), -1);
         const bool ok = std::fread(r.at.data(), 4, r.at.size(), f) == r.at.size();
@@ -142,6 +151,13 @@ inline const ExpertOrder& expert_order() {
 inline int32_t expert_at(int64_t l, int32_t i, int64_t n_expert) {
     const ExpertOrder& o = expert_order();
     if (o.reverse) return (int32_t) (n_expert - 1 - i);
+    if (!o.at.empty() && (l >= o.layers || n_expert != o.experts)) {   // say once that this layer runs in id order
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr, "strata prefill: the expert order covers %lld layers x %lld experts; layer %lld "
+                                 "(%lld experts) and any like it run in id order\n", (long long) o.layers,
+                         (long long) o.experts, (long long) l, (long long) n_expert);
+    }
     if (!o.at.empty() && l < o.layers && n_expert == o.experts) return o.at[(size_t) (l * o.experts + i)];
     return i;
 }
