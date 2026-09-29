@@ -239,6 +239,7 @@ struct Options {
     /// valid way to get a per-stage table on the real graph.  Prints and exits; it is a measurement, not a run.
     bool gpu_stages = false;
     bool profile_decode_range = false; ///< mark real verifier decode for Nsight Systems
+    bool profile_prefill_range = false; ///< mark the batched prompt read for Nsight Systems (cudaProfilerStart/Stop)
     bool stats = false;
     bool shared_late = false;          ///< plan v0.3 P3 A/B: shared expert inside post[l] (old order)
     bool keep_canonical = false;       ///< plan v0.3 P1 A/B: load canonical copies of natively served tensors
@@ -793,6 +794,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--profile-decode-range") o.profile_decode_range = true;
+        else if (a == "--profile-prefill-range") o.profile_prefill_range = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
@@ -3362,7 +3364,10 @@ if (o.expert_cache_per_layer) {
         }
         const Clock::time_point tp0 = Clock::now();
         const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
-        if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
+        if (o.profile_prefill_range) cudaProfilerStart();
+        const bool prefill_ok = prefill.run(o.tokens.data(), n_batched, 0, err);
+        if (o.profile_prefill_range) { cudaDeviceSynchronize(); cudaProfilerStop(); }
+        if (!prefill_ok) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
