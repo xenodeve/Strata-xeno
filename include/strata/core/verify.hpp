@@ -21,9 +21,12 @@
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
 
+#include <cstdio>
+
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
 
@@ -51,6 +54,9 @@ public:
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
 
+    /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
+    void diag(std::FILE* f) const;
+
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
@@ -58,6 +64,27 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
+    /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
+    /// parameters would otherwise be baked forever - so this can change between requests freely.
+    void set_sampling(const strata::kernels::SamplerParams& sp) {
+        sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
+    }
+
+    /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
+    /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
+    /// front slots -1 (the kernel reads only the tail window).  Row t follows the window's drafts 1..t - staging
+    /// row 0 alone (before 0.1.19) left the drafted rows with unwritten histories.  Null disables the penalties
+    /// entirely - the neutral run's sampling call is byte-for-byte what it was.  The engine re-uploads the rows
+    /// before every window; the buffer must hold kVerifyMaxT rows and stay alive across the request.
+    void set_history(const int32_t* history, int history_len) {
+        hist_d_ = history;
+        hist_len_ = history_len;
+    }
+    /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose
+    /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
+    /// or sync and never read a history staged for another position.
+    void set_head_sampling(bool on) { head_sampling_ = on; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
@@ -87,6 +114,15 @@ public:
 
 private:
     bool capture(int T, std::string& err);
+    strata::kernels::SamplerParams sampling_ = [] {
+        strata::kernels::SamplerParams s;
+        s.greedy = true;
+        s.temperature = 0.0f;
+        return s;
+    }();   ///< greedy by default; per-request via set_sampling
+    const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
+    int hist_len_ = 0;
+    bool head_sampling_ = true;          ///< set_head_sampling
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
 

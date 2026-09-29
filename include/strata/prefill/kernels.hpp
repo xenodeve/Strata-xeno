@@ -5,6 +5,8 @@
 // the kernel walks the chunk's tokens in order inside one launch.
 #pragma once
 
+#include "strata/kernels/kv_stream.hpp"
+
 #include <cstdint>
 
 namespace strata::prefill {
@@ -35,7 +37,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
-void route(const float* logits, int32_t* ids, float* weights, int64_t T, void* stream);
+void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
 /// Expert blob (Strata pack layout, Q2_0) -> BF16 matrices: gate/up interleaved [1280, 2560], down [2560, 640].
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)
@@ -63,11 +65,14 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
 /// K, V: [T, 2, 256].
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-               void* stream);
+               void* stream, const strata::kernels::KvHostPools* host = nullptr,
+               const strata::kernels::KvHostPools* stage = nullptr);
 
 /// fp32 -> fp16 bits and fp32 -> bf16, n elements (the two activation images of the prompt GEMMs).
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream);
+/// y = fp32(fp16(x)): what an FP16 store of x would read back (the FP16 indexer-key experiment)
+void round_f16(const float* x, float* y, int64_t n, void* stream);
 /// Expert blob -> FP16 (Q2_0 values are exact in FP16).
 void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 

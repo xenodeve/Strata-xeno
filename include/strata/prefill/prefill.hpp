@@ -34,10 +34,7 @@ struct PrefillStats {
     /// #5 P5a: the streamed experts by source (count, bytes): pinned arena, pageable arena, the 4070 tier, NVMe
     int64_t src_n[4] = {0, 0, 0, 0};
     uint64_t src_bytes[4] = {0, 0, 0, 0};
-    int64_t src_rows[4] = {0, 0, 0, 0};
-    /// #5 overlap: pageable staging, summed over the workers (slot wait, memcpy, DMA enqueue) and the compute
-    /// thread's wait for a slot to be staged
-    double ms_stage_slot = 0, ms_stage_memcpy = 0, ms_stage_enqueue = 0, ms_wait_ready = 0;   ///< routed token rows those experts served (sizes an activation round trip)
+    int64_t src_rows[4] = {0, 0, 0, 0};   ///< routed token rows those experts served (small chunks; 0 on stream-all)
     double ms_ple = 0;
 };
 
@@ -59,6 +56,15 @@ public:
     /// slot or -1 and `slot_ptr(slot)` that slot's pointer on `device`; the prompt path stages such an expert with a
     /// peer copy instead of reading its (released) host pages.
     void set_peer_tier(const int32_t* res, std::function<const void*(int32_t)> slot_ptr, int device);
+    /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
+    /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
+    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+    int64_t chunk() const;
+
+    /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
+    /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
+    static void set_pinned_share(double share);
+    static double pinned_share();
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
@@ -82,6 +88,7 @@ public:
     const float* const* embd_rows = nullptr;
 
 private:
+    bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     struct Impl;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;

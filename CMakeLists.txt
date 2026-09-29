@@ -7,7 +7,14 @@
 # CUDA targets require compute capability 8.0 or newer. The Strata-xeno build uses
 # 89;120 so one binary contains code for both desktop GPUs.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.0 LANGUAGES CXX)
+project(strata VERSION 0.1.20 LANGUAGES CXX)
+add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+# issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
+# be read back to the exact source line
+if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zi>)
+  add_link_options(/DEBUG /OPT:REF /OPT:ICF)
+endif()
 
 # The prebuilt release (setup.py downloads it, so users need no compiler): ggml's CPU backend for any AVX2 CPU
 # instead of this machine's (Strata's own AVX-512 kernels are per-file and chosen at run time either way), and
@@ -190,7 +197,10 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/native_qsa_score.cu
                           src/kernels/cuda/ple.cu
                           src/kernels/cuda/kv_q8.cu
+                          src/kernels/cuda/kv_stream.cu
+                          src/kernels/cuda/kv_q4.cu
                           src/kernels/cuda/fused_gr.cu
+                          src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
                           src/kernels/cuda/fused_gdn.cu
                           src/kernels/cuda/dequant_bf16.cu
@@ -267,7 +277,7 @@ if(STRATA_ENABLE_CUDA)
 
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_secondary CUDA::cudart)
+  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_secondary strata_spec CUDA::cudart)
   if(WIN32)
     target_link_libraries(strata PRIVATE psapi)
   endif()
@@ -376,6 +386,22 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(kv_q8_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME kv_q8_parity COMMAND kv_q8_parity)
 
+  # KV streaming (docs/kv-streaming-design.md): streamed vs resident attention, bitwise (GPU, synthetic, no model).
+  add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
+  target_include_directories(kv_stream_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(kv_stream_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME kv_stream_parity COMMAND kv_stream_parity)
+
+  # PR #21: Q4_0 KV with Walsh-Hadamard rotation vs a host reference (GPU, synthetic, no model).
+  add_executable(kv_q4_parity src/kernels/kv_q4_parity.cpp)
+  target_include_directories(kv_q4_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(kv_q4_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+  add_executable(cvec_parity src/kernels/cvec_parity.cpp)
+  target_include_directories(cvec_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(cvec_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME cvec_parity COMMAND cvec_parity)
+
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
   if(STRATA_BUILD_TESTS)
   add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
@@ -437,7 +463,7 @@ endif()
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
 # Plan v0.3 P6: speculation components that need no GPU.
-add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp)
+add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
@@ -446,6 +472,13 @@ if(STRATA_BUILD_TESTS)
   add_executable(controller_test src/spec/controller_test.cpp)
   target_link_libraries(controller_test PRIVATE strata_spec)
   add_test(NAME controller_test COMMAND controller_test)
+  add_executable(draft_policy_test src/spec/draft_policy_test.cpp)
+  target_link_libraries(draft_policy_test PRIVATE strata_spec)
+  add_test(NAME draft_policy_test COMMAND draft_policy_test)
+  # the serve loop's conversation-cache retention policy (header-only, no library to link)
+  add_executable(conv_cache_test src/program/conv_cache_test.cpp)
+  target_include_directories(conv_cache_test PRIVATE include)
+  add_test(NAME conv_cache_test COMMAND conv_cache_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
@@ -505,13 +538,16 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
+                                           src/kernels/cpu/iq_avx2.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
   else()
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+    set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
@@ -574,6 +610,30 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME xeno_cpu_dispatch_vnni COMMAND xeno_pool_core_policy --expect-vnni)
     add_test(NAME xeno_cpu_dispatch_forced_avx2 COMMAND xeno_pool_core_policy --expect-avx2)
     set_tests_properties(xeno_cpu_dispatch_forced_avx2 PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX2=1")
+  endif()
+  if(STRATA_ENABLE_CUDA)
+    # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
+    # from the same checkout as ggml above - only mmq.cuh's instances for the packs' types and the quantizer, with
+    # the few host symbols of ggml-cuda.cu they use in src/prefill/ggml_cuda_host.cu
+    if(STRATA_GGML_DIR)
+      set(_strata_gg ${STRATA_GGML_DIR}/ggml)
+    else()
+      set(_strata_gg ${strata_llamacpp_SOURCE_DIR}/ggml)
+    endif()
+    set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs)
+      target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
+    endforeach()
+    target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
+                               PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
+    if(MSVC)
+      target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+    endif()
+    target_link_libraries(strata_mmq PUBLIC ggml-base CUDA::cudart)
+    target_link_libraries(strata_prefill PUBLIC strata_mmq)
+    target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
   endif()
   if(STRATA_ENABLE_CUDA)
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
@@ -641,6 +701,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_test src/kernels/cpu/pool_test.cpp)
   target_link_libraries(pool_test PRIVATE strata_kernels_cpu)
   add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  # issue #29: tiny batches with sleeping workers, as on a big-VRAM card; a hang fails it
+  add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
+  target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
+  add_test(NAME pool_stress COMMAND pool_stress 20)
 endif()
 
 if(STRATA_BUILD_TESTS)

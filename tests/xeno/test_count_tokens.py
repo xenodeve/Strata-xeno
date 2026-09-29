@@ -76,7 +76,7 @@ class CountTokensTest(unittest.TestCase):
             self.assertEqual(response.status, 200)
             count = json.load(response)['input_tokens']
         messages, tools, kwargs = anthropic_to_messages(body)
-        expected, _ = self.service.prepare(messages, tools, kwargs, None)
+        expected, _, _ = self.service.prepare(messages, tools, kwargs, None)
         self.assertEqual(count, len(expected))
         self.assertIn('Revenue is 42.', messages[0]['content'])
 
