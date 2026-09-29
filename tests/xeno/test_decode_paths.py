@@ -26,6 +26,16 @@ def test_a_layer_whose_4070_ends_after_the_pool_is_counted():
     assert dp.breakdown(ev)["4070 after pool"] == 1.0
 
 
+def test_the_4070_sync_is_split_by_whether_its_gpu_had_already_finished():
+    # layer 1: the GPU ended at 20, the host waited from 30 for 1 us; layer 2: the GPU ends at 140, the wait starts at
+    # 100 and lasts 50, so 40 of it is the GPU and 10 the wake-up after it
+    ev = [_x("decode round", 0, 200), _x("4070 experts", 5, 15), _x("4070 wait", 30, 1),
+          _x("4070 experts", 90, 50), _x("4070 wait", 100, 50)]
+    s = dp.sync_split(ev)
+    assert s["done"] == {"n": 1, "ms_per_round": 0.001}
+    assert s["running"] == {"n": 1, "ms_per_round": 0.05, "gpu_left_us": 40.0, "overshoot_us": 10.0}
+
+
 def test_layers_without_a_4070_share_are_skipped():
     ev = [_x("decode round", 0, 100), _x("cpu experts", 10, 50), _x("dispatch plan", 10, 5), _x("cpu pool", 20, 10),
           _x("4070 experts", 70, 5)]
