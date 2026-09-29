@@ -25,6 +25,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <future>
 #include <thread>
 #include <vector>
 
@@ -160,7 +161,7 @@ struct Prefill::Impl {
     Stager stager;                              // declared after the slots: joined before they are freed
     // PLE
     float* ple_emb = nullptr;
-    std::vector<float> ple_emb_host;
+    float* ple_emb_host = nullptr;   // pinned: the chunk's PLE rows, read from SSD while layer 0 runs (#29)
     std::vector<uint32_t> ple_rows;
     float* ple_norm = nullptr;
     PrefillStats* stats = nullptr;
@@ -176,6 +177,7 @@ Prefill::~Prefill() {
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
         if (impl_->stage_host[i]) cudaFreeHost(impl_->stage_host[i]);
     }
+    if (impl_->ple_emb_host) cudaFreeHost(impl_->ple_emb_host);
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     for (void* p : impl_->owned) cudaFree(p);
 }
@@ -244,7 +246,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(NE); m.off.resize(NE + 1);
-    m.ple_emb_host.resize(T * N); m.ple_rows.resize(T * strata::kernels::PLE_N_HEADS);
+    if (!m.ple_emb_host &&
+        cudaHostAlloc((void**) &m.ple_emb_host, (size_t) T * N * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+        err = "prefill: pinned PLE rows";
+        return false;
+    }
+    m.ple_rows.resize(T * strata::kernels::PLE_N_HEADS);
     if (!ok) { err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit"; return false; }
     return true;
 }
@@ -338,8 +345,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
         }
         gr_broadcast(m.emb, m.R, T, m.cs);
-        // ---- the PLE rows of the whole chunk, one batched SSD request
+        // ---- the PLE rows of the whole chunk, one batched SSD request. Only layer 1 reads them, so the read runs on
+        // a thread while layer 0 is launched (#29: it held the GPU idle ~250 ms at the start of every chunk)
         const bool ple_on = ss.ple.ready();
+        std::string ple_err;
+        std::future<bool> ple_read;   // declared after ple_err: destroyed (joined) first
         if (ple_on) {
             const auto tp = Clock::now();
             for (int64_t t = 0; t < T; ++t) {
@@ -348,8 +358,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 prev[0] = prev[1];
                 prev[1] = tok;
             }
-            if (!ss.ple.table->gather_batch(m.ple_rows.data(), (size_t) T, m.ple_emb_host.data(), err)) return false;
-            cudaMemcpyAsync(m.ple_emb, m.ple_emb_host.data(), (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs);
+            ple_read = std::async(std::launch::async, [&ss, &m, &ple_err, T] {
+                return ss.ple.table->gather_batch(m.ple_rows.data(), (size_t) T, m.ple_emb_host, ple_err);
+            });
             stats_.ms_ple += ms_since(tp);
         } else {
             for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
@@ -365,6 +376,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on) {
                 const auto tp = Clock::now();
+                if (!ple_read.get()) { err = ple_err; return false; }
+                cudaMemcpyAsync(m.ple_emb, m.ple_emb_host, (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs);
                 for (int64_t t = 0; t < T; ++t) {
                     strata::kernels::PleOut po;
                     po.normalized = m.ple_norm;
