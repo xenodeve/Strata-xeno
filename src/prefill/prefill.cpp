@@ -124,13 +124,19 @@ struct Alloc {
 // j-th unpinned expert, in launch order - lands in host buffer j % kRing, which is free again once the DMA of job
 // j - kRing (recorded by the launching thread, `issued`) is done.
 struct Stager {
-    static constexpr int kRing = 16;
+    // pinned staging buffers: the prefetch depth of every unpinned expert (#31: with 16 the copy issuer ran 16 entries
+    // ahead of the copy engine whatever the ring's depth). STRATA_PREFILL_STAGE_BUFS sets it (default 16).
+    const int kRing = [] {
+        const char* v = std::getenv("STRATA_PREFILL_STAGE_BUFS");
+        const int n = v ? std::atoi(v) : 16;
+        return n >= 2 ? n : 16;
+    }();
     struct Job { const uint8_t* src; size_t bytes; int32_t l = -1, e = -1; };   // src null: read (l, e) from the pack
     core::ExpertSource* xsrc = nullptr;   // #11: the NVMe tier's experts are read, never admitted
-    uint8_t* buf[kRing] = {};
-    bool pinned[kRing] = {};
+    std::vector<uint8_t*> buf = std::vector<uint8_t*>((size_t) kRing, nullptr);
+    std::vector<char> pinned = std::vector<char>((size_t) kRing, 0);
     std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
-    cudaEvent_t dma_done[kRing] = {};
+    std::vector<cudaEvent_t> dma_done = std::vector<cudaEvent_t>((size_t) kRing, nullptr);
     std::vector<Job> jobs;
     std::unique_ptr<std::atomic<int>[]> ready;
     size_t ready_cap = 0;
@@ -719,10 +725,13 @@ namespace {
 // host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
-               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfCount };
+               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfWaitHost, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
-                                        "gemm gate/up", "gemm down", "combine", "ple"};
+                                        "gemm gate/up", "gemm down", "combine", "ple", "wait host"};
+// "wait host" (#31): marked after the last kernel an expert enqueues, so the time until the next expert's work reaches
+// the stream is the GPU idle while the launching thread is elsewhere (a stager or issuer wait, a copy issue); it used
+// to land on "dequant", the phase before it.
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
@@ -1418,7 +1427,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                             }
                             if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
-                            if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                            if (q + 1 < MMQ_GROUP && j + 1 < order.size()) {
+                                pt.mark(kPfWaitHost, cs);
+                                return true;
+                            }
                             // the group's products: gate/up, swiglu, the group's H to q8_1, down
                             const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
                             const int ngx = (int) (q + 1);
@@ -1443,6 +1455,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                             dn.ld_dst = N;
                             m.mmq_ctx->run(dn, m.cs);
+                            pt.mark(kPfWaitHost, cs);
                             return true;
                         }
                         const int q = (int) (j % DQ);
@@ -1465,6 +1478,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                         pt.mark(kPfGemmD, cs);
                         m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                        pt.mark(kPfWaitHost, cs);
                         return true;
                     };
                     if (!stream_all) {

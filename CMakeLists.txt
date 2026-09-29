@@ -620,6 +620,9 @@ if(STRATA_NATIVE_EXPERTS)
       # #31 probe (not a test): does a pinned H2D copy progress while a long kernel runs? CUDA_VISIBLE_DEVICES=1
       add_executable(xeno_copy_overlap_probe tests/xeno/copy_overlap_probe.cu)
       target_link_libraries(xeno_copy_overlap_probe PRIVATE CUDA::cudart)
+      # #31 probe (not a test): the per-expert MMQ gather's device time
+      add_executable(xeno_gather_probe tests/xeno/gather_probe.cu)
+      target_link_libraries(xeno_gather_probe PRIVATE strata_prefill CUDA::cudart)
       add_executable(xeno_gemm_cross_arch tests/xeno/gemm_cross_arch.cu)
       target_link_libraries(xeno_gemm_cross_arch PRIVATE strata_prefill CUDA::cudart)
     endif()
