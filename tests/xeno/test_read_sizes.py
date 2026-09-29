@@ -34,3 +34,16 @@ def test_split_eligible_share_is_the_prefill_time_of_parts_of_2048_tokens_or_mor
     # the split runs only chunks of 2,048+ tokens: 3000 and 9800 here, 15700.5 of 17290.5 ms
     share = rs.split_eligible_share(rs.parse(LOG))
     assert abs(share - 15700.5 / 17290.5) < 1e-9
+
+
+REQ = """strata serve: request metrics: decode entries 39840 = primary 15482 + secondary 10174 + pcie 0 + cpu 14184; cpu experts 543.3 ms; nvme loads 0; private commit 38.41 GiB
+strata serve: decode expert cache hit rate: 52.2% (15482 hits / 29666 lookups)
+"""
+
+
+def test_request_metrics_are_parsed_and_the_tiers_add_up():
+    # #9 (PRD story 47): the per-request decode counters; the four tiers must add up to the routed entries
+    (r,) = rs.parse_requests(REQ)
+    assert r == {"entries": 39840, "primary": 15482, "secondary": 10174, "pcie": 0, "cpu": 14184, "cpu_ms": 543.3,
+                 "nvme_loads": 0, "commit_gib": 38.41}
+    assert r["primary"] + r["secondary"] + r["pcie"] + r["cpu"] == r["entries"]

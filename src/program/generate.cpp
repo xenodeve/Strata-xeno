@@ -4456,6 +4456,11 @@ int main(int argc, char** argv) {
             const Clock::time_point d0 = Clock::now();
             const int64_t decode_hits0 = drive.d.cache_hits;
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
+            // #9 (PRD story 47): this request's decode counters, as deltas of the process totals (no sync, no copies)
+            int64_t tier0[4];
+            for (int i = 0; i < 4; ++i) tier0[i] = drive.d.tier_entries[i];
+            const double cpu_ms0 = drive.cpu_ms;
+            const int64_t nvme0 = arena_src.nvme_loads();
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
@@ -4675,6 +4680,15 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * fresh / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            {   // #9: where this request's routed decode entries ran, the CPU pool's time, NVMe reads and the commit
+                int64_t te[4], sum = 0;
+                for (int i = 0; i < 4; ++i) { te[i] = drive.d.tier_entries[i] - tier0[i]; sum += te[i]; }
+                std::fprintf(stderr, "strata serve: request metrics: decode entries %lld = primary %lld + secondary %lld "
+                                     "+ pcie %lld + cpu %lld; cpu experts %.1f ms; nvme loads %lld; private commit "
+                                     "%.2f GiB\n", (long long) sum, (long long) te[0], (long long) te[1],
+                             (long long) te[2], (long long) te[3], drive.cpu_ms - cpu_ms0,
+                             (long long) (arena_src.nvme_loads() - nvme0), private_commit_bytes() / 1073741824.0);
+            }
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count
             if (req_look > 0) {

@@ -28,6 +28,21 @@ def parse(text: str) -> list[dict]:
     return out
 
 
+REQ = re.compile(r"request metrics: decode entries (\d+) = primary (\d+) \+ secondary (\d+) \+ pcie (\d+) \+ cpu (\d+); "
+                 r"cpu experts ([\d.]+) ms; nvme loads (\d+); private commit ([\d.]+) GiB")
+
+
+def parse_requests(text: str) -> list[dict]:
+    """#9 (PRD story 47): each request's decode counters - where its routed entries ran, the CPU pool's time, NVMe
+    reads and the process's private commit at its end."""
+    out = []
+    for m in REQ.finditer(text):
+        e, p, s, pc, c, ms, nv, gib = m.groups()
+        out.append({"entries": int(e), "primary": int(p), "secondary": int(s), "pcie": int(pc), "cpu": int(c),
+                    "cpu_ms": float(ms), "nvme_loads": int(nv), "commit_gib": float(gib)})
+    return out
+
+
 def histogram(parts: list[dict]) -> dict:
     h = {name: {"parts": 0, "tokens": 0, "ms": 0.0} for name, _, _ in BINS}
     for p in parts:
@@ -62,6 +77,15 @@ def main(argv: list[str]) -> int:
         print(f"{name:6}{v['parts']:7d}{v['tokens']:10d}{v['ms'] / 1000:9.1f}{100 * v['ms'] / total_ms:8.1f}")
     print(f"prefill time in parts of {SPLIT_MIN}+ tokens (what split + wave can act on): "
           f"{100 * split_eligible_share(parts):.1f} %")
+    reqs = []
+    for path in argv:
+        reqs += parse_requests(open(path, encoding="utf-8", errors="replace").read())
+    if reqs:   # #9: the decode tiers of every request in the logs, summed
+        tot = {k: sum(r[k] for r in reqs) for k in ("entries", "primary", "secondary", "pcie", "cpu", "cpu_ms")}
+        e = max(1, tot["entries"])
+        print(f"{len(reqs)} requests: decode entries primary {100 * tot['primary'] / e:.1f} %, secondary "
+              f"{100 * tot['secondary'] / e:.1f} %, pcie {100 * tot['pcie'] / e:.1f} %, cpu {100 * tot['cpu'] / e:.1f} %; "
+              f"cpu experts {tot['cpu_ms'] / 1000:.1f} s; peak private commit {max(r['commit_gib'] for r in reqs):.2f} GiB")
     kinds = {}
     for p in parts:
         kinds.setdefault(p["kind"], []).append(p["tokens"])
