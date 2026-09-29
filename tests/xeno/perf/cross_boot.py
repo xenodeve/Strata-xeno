@@ -47,6 +47,11 @@ def facts_from(stderr: str, stdout: str) -> dict:
 
 
 def compare(a: dict, b: dict) -> dict:
+    # a run that did not finish is not a determinism result (2026-09-30: a missing DLL gave "divergent at 0")
+    for tag, r in (("A", a), ("B", b)):
+        if r.get("rc", 0) != 0 or not r["tokens"]:
+            return {"failed": f"{tag}: rc {r.get('rc', 0)}, {len(r['tokens'])} tokens", "first_divergent_token": None,
+                    "facts": {}}
     ta, tb = a["tokens"], b["tokens"]
     first = -1
     for i in range(max(len(ta), len(tb))):
@@ -77,13 +82,21 @@ def command(prompt_ids: str) -> list[str]:
             "--exclusive-primary-experts", "--pool-priority", "2", "--process-priority", "2"]
 
 
+CUDA_BIN = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64"
+
+
+def engine_env(base: dict) -> dict:
+    """The engine's environment: the CUDA runtime DLLs first on PATH (a fresh boot's shell may not have them)."""
+    return dict(base, CUDA_VISIBLE_DEVICES="1,0", PATH=CUDA_BIN + ";" + base.get("PATH", ""))
+
+
 def capture(name: str) -> None:
     os.makedirs(KIT, exist_ok=True)
     smi = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total", "--format=csv,noheader"],
                          capture_output=True, text=True).stdout.strip()
     sha = hashlib.sha256(open(EXE, "rb").read()).hexdigest()[:16]
     result = {"exe_sha256": sha, "nvidia_smi_before": smi, "runs": {}}
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="1,0")
+    env = engine_env(dict(os.environ))
     for prompt, d in PROMPTS.items():
         ids = os.path.join(os.environ["TEMP"], d, "prompt.ids")
         for rep in (1, 2):
@@ -116,6 +129,9 @@ def main(argv: list[str]) -> int:
         print(f"VRAM before: {a['nvidia_smi_before']!r}\n         vs: {b['nvidia_smi_before']!r}")
         for k in sorted(set(a["runs"]) & set(b["runs"])):
             d = compare(a["runs"][k], b["runs"][k])
+            if d.get("failed"):
+                print(f"{k}: NOT COMPARED, a run failed ({d['failed']})")
+                continue
             print(f"{k}: first divergent token {d['first_divergent_token']} (-1: identical)")
             for f, (x, y) in d["facts"].items():
                 print(f"    {f}: {x!r}\n    {' ' * len(f)}  {y!r}")
