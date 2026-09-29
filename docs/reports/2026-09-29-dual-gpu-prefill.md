@@ -205,6 +205,16 @@ the 4070 starts), inputs up (15.6), experts gated by copies (41), combine and ou
 
 ### 7.5 The 5060 still lends 2.9 GB for buffers split mode does not use
 
+> **CORRECTED 2026-09-30 (#38): this section is wrong.** `STRATA_PREFILL_BUFFERS=1` itemises the borrowed bytes
+> (`bb*.stderr`, exe built from the commit that added it). At 8,192 tokens they are: trunk 1,551 MiB, shared set
+> 1,126-1,153 MiB, rest 131-247 MiB. The shared set is the largest of the GDN, QSA and MoE scratch.
+> - Without split, the MoE set is the largest, but only just: 1,153 against GDN's 1,126 MiB.
+> - With the split layout (D6) it falls to 415 MiB and hides under GDN.
+> - A wave lane (4,096 tokens): trunk 824, GDN 563 (MoE 331, hidden), rest 91 MiB.
+>
+> So the 2.9 GB is the trunk and the GDN scratch, which the split path needs too. MoE-only buffers left to reclaim:
+> under about 60 MiB (ring, MMQ group buffers, DQ). The text below is kept as written.
+
 - In split mode the 5060 runs no routed expert, yet `--prefill auto` still borrows 2,245 cache slots for its MoE
   buffers: `Dm` (840 MB), GU, the 96-slot ring and so on.
 - **Cost of that:** those experts are read from the #34 tail file during the prompt (2,245 NVMe reads, ~2.2 s of

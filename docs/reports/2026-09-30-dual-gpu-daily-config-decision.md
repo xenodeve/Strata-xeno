@@ -182,8 +182,10 @@ to the CPU pool. What that does to decode is **not settled**:
    - `Dm` is T·K·N f32 (839 MB at 8K). Tiling the chunk by tokens is exact but re-streams host experts over x16 (+0.9 s
      per extra tile, report §7.6).
    - Half-size chunks (the wave already halves each lane) might allow a smaller `Dm` per lane. UNMEASURED.
-5. **The 5060 still lends 2.9 GB in split mode** for MoE buffers it no longer uses (report §7.5). A split-aware layout
-   would keep those experts resident and remove the 0.6 s post-prompt refill. TTFT −0.6 s (UNMEASURED).
+5. ~~**The 5060 still lends 2.9 GB in split mode** for MoE buffers it no longer uses.~~ **CORRECTED 2026-09-30
+   (#38):** the 2.9 GB is the trunk (824 MiB per wave lane) and the GDN scratch (563 MiB); the MoE set (331 MiB) hides
+   under GDN. Under about 60 MiB is MoE-only. The 0.6 s refill can only shrink with the trunk or GDN scratch, e.g. GDN
+   tiled over tokens (UNMEASURED).
 6. **Remaining per-layer critical path with the wave** (report §5, #35 D4 comment): trunk 56 ms, host route grouping
    8 ms, activations over x4 5 ms, 4070 MoE 31 ms, routed sum back over x4 15 ms. The wave overlaps trunk and MoE; route
    grouping on the device (about 0.4 s per prompt) is the next listed lever.

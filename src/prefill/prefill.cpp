@@ -1290,8 +1290,21 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     s.idx_dim = g.idx_key_dim;
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[0].max_cells / s.idx_block + 2;
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
-                                       moe_set_bytes(T, g.n_expert)}), ok);
+    const uint64_t trunk = o.used, gdn = gdn_set_bytes(T), qsa = qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
+                   moe = moe_set_bytes(T, g.n_expert);
+    o.take<uint8_t>((size_t) std::max({gdn, qsa, moe}), ok);
+    // #38 STRATA_PREFILL_BUFFERS=1: where the prompt path's borrowed bytes go (the shared set is the largest of three)
+    static const bool breakdown = [] { const char* v = std::getenv("STRATA_PREFILL_BUFFERS"); return v && std::atoi(v); }();
+    struct Report {
+        bool on; size_t T; uint64_t trunk, gdn, qsa, moe; const Alloc& o;
+        ~Report() {
+            if (!on) return;
+            auto mib = [](uint64_t b) { return b / 1048576.0; };
+            std::fprintf(stderr, "strata prefill: buffers for %zu tokens: trunk %.0f MiB, shared set %.0f MiB (gdn %.0f, "
+                                 "qsa %.0f, moe %.0f), the rest %.0f MiB\n", T, mib(trunk), mib(std::max({gdn, qsa, moe})),
+                         mib(gdn), mib(qsa), mib(moe), mib(o.used - trunk - std::max({gdn, qsa, moe})));
+        }
+    } report{breakdown, T, trunk, gdn, qsa, moe, o};
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
