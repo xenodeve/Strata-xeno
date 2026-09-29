@@ -45,3 +45,32 @@ State on 2026-09-29. Every number comes from a same-session ABBA with identical 
 - The trunk split across GPUs (H4 on dense projections).
 
 The source audit at Flash-Next commit `8bf2c853417c5d381c1a4d4d1c20c3f55b5ad1c0` supersedes the earlier report at `ced0445`.
+
+## Session state before compaction (2026-09-29)
+
+**Speed against a bandwidth ceiling.** This is an estimate, not a measurement. Per verify round, code window 4 with 3.36 accepted tokens:
+- trunk ~3.2 GB at 448 GB/s = 7.1 ms;
+- 5060 Ti experts ~1.1 GB = 2.4 ms;
+- CPU experts ~0.27 GB at 60-108 GB/s = 2.5-4.5 ms, overlappable;
+- 4070 experts ~0.55 GB = 1.1 ms, overlappable;
+- output head + MTP ~2.4 ms.
+
+The floor is therefore about 12 ms/round. Measured is ~39.5 ms/round on code (85 tok/s), about 30 % of the ceiling; thai is about 45 % (53 of ~115-120 tok/s). The largest gaps:
+1. The trunk `mmvq` reads at ~36 % of bandwidth (H3 Nsight). Two fixes were tried and neither was kept: the rows-per-block variant was slower, and the upstream layout was not faster.
+2. The layer-by-layer GPU<->CPU ping-pong, with ~7 ms/round of GPU idle.
+3. The mapped-copy and 4070 waits, ~2-3 ms/round.
+
+**In flight at compaction:**
+- An Nsight capture of a 2K-token prefill (`--profile-prefill-range`; prompt `%TEMP%/strata-claude-serve-2k`; output `%TEMP%/strata-claude-prefill-nsys`). It is meant to show where the 8K TTFT (~27 s) goes before any Phase 5 (#5, 4070-assisted prefill) work.
+
+**Open questions:**
+- Short prompts show TTFT +0.12-0.19 s with placement-first (4/4 runs), while the 8K prompt is unchanged. The cause is unknown.
+- `tests/xeno/short_read_probe.py` appeared untracked in this worktree. It was not written by this session and was left alone.
+- `--serve` has no paired 4070 swap path yet, so under `--serve` the exclusive 4070 runs without 4070 swaps.
+
+**Waiting for the developer:**
+- Deploying the new engine to `engine-xeno/strata.exe`, which picks up #27, the exclusive defaults and placement-first.
+- `--process-priority 2` and 13 workers for serving, which are desktop trade-offs.
+- Quantizing the BF16 hyper-connection weights (breaks ADR 0001).
+- The trunk split across GPUs (H4).
+- #28 host-memory modes.
