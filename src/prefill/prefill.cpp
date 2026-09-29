@@ -59,6 +59,9 @@ void gather_native(const void*, const void*, size_t, const void*, size_t, void*,
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
+void expert_rows(Context&, const ExpertRows&, void*) {}
+void expert_rows_gate_up(Context&, const ExpertRows&, void*) {}
+void expert_rows_down(Context&, const ExpertRows&, void*) {}
 }  // namespace strata::prefill::mmq
 #endif
 
@@ -1495,23 +1498,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
                         for (size_t si = m.mmq_sub_first[g]; si < m.mmq_sub_first[g + 1]; ++si) {
                             const Impl::MmqSub& sb = m.mmq_subs[si];
-                            const int nx = (int) (sb.q1 - sb.q0);
-                            mmq::gather_q8_rows(m.Xtok, T, m.src_dev + sb.r0, sb.nr, N, m.Xq, m.cs);
-                            mmq::Product gu;
-                            gu.w = m.grp_gu + sb.q0 * mmq_gub; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N;
-                            gu.expert_bytes = mmq_gub; gu.n = nx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + sb.off;
-                            gu.ids = m.ids_identity; gu.total_rows = sb.nr; gu.max_rows = sb.maxr; gu.dst = m.GU;
-                            gu.ld_dst = 1280;
-                            m.mmq_ctx->run(gu, m.cs);
-                            mmq::swiglu(m.GU, m.H, sb.nr, 640, !lay.native, m.cs);
+                            mmq::ExpertRows a;
+                            a.xtok = m.Xtok; a.xtok_rows = T; a.rows = m.src_dev + sb.r0; a.nr = sb.nr;
+                            a.max_rows = sb.maxr; a.n = (int) (sb.q1 - sb.q0);
+                            a.gu = m.grp_gu + sb.q0 * mmq_gub; a.gu_type = mmq_gt; a.gu_bytes = mmq_gub;
+                            a.down = m.grp_d + sb.q0 * mmq_db; a.down_type = mmq_dt; a.down_bytes = mmq_db;
+                            a.bounds = m.bounds_dev + sb.off; a.ids = m.ids_identity; a.n_embd = N; a.n_ff = 640;
+                            a.interleaved = !lay.native;
+                            a.xq = m.Xq; a.gu_out = m.GU; a.h = m.H; a.hq = m.Hq; a.dst = m.Dm + sb.r0 * N;
+                            mmq::expert_rows_gate_up(*m.mmq_ctx, a, m.cs);
                             pt.mark(kPfGemmD, cs);
-                            mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, sb.nr, m.cs);
-                            mmq::Product dn;
-                            dn.w = m.grp_d + sb.q0 * mmq_db; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640;
-                            dn.expert_bytes = mmq_db; dn.n = nx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + sb.off;
-                            dn.ids = m.ids_identity; dn.total_rows = sb.nr; dn.max_rows = sb.maxr;
-                            dn.dst = m.Dm + sb.r0 * N; dn.ld_dst = N;
-                            m.mmq_ctx->run(dn, m.cs);
+                            mmq::expert_rows_down(*m.mmq_ctx, a, m.cs);
                         }
                         pt.mark(kPfWaitHost, cs);
                     };

@@ -82,6 +82,38 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
 
+/// #32: one sub-product of an MMQ group, the prompt path's routed-expert rows on whichever card runs it: the rows'
+/// q8 activations gathered from the per-token ones, gate/up, swiglu, H to q8_1, down.  n experts' gate/up and down
+/// lie gu_bytes / down_bytes apart (zeroed bytes after the last, see prefill's MMQ_TAIL); bounds: n + 1 row offsets
+/// from the first row (device); dst: nr rows of n_embd floats.  xq, gu_out, h and hq hold nr rows (scratch).
+struct ExpertRows {
+    const void* xtok = nullptr;   // quantize() of the chunk's xtok_rows token rows (n_embd values each, no ids)
+    int64_t xtok_rows = 0;
+    const int32_t* rows = nullptr;   // device: the token of each of the nr rows
+    int64_t nr = 0, max_rows = 0;
+    int n = 0;
+    const void* gu = nullptr;
+    int gu_type = -1;
+    size_t gu_bytes = 0;
+    const void* down = nullptr;
+    int down_type = -1;
+    size_t down_bytes = 0;
+    const int32_t* bounds = nullptr;
+    const int32_t* ids = nullptr;   // an identity table of at least nr entries
+    int64_t n_embd = 0, n_ff = 0;
+    bool interleaved = false;       // gate/up rows interleaved (the Strata pack) or split (GGUF)
+    void* xq = nullptr;
+    float* gu_out = nullptr;
+    float* h = nullptr;
+    void* hq = nullptr;
+    float* dst = nullptr;
+};
+void expert_rows(Context& ctx, const ExpertRows& a, void* stream);
+/// expert_rows in its two halves, for a caller that times them apart: the gather, gate/up and swiglu (into h), then
+/// H to q8_1 and down (into dst).
+void expert_rows_gate_up(Context& ctx, const ExpertRows& a, void* stream);
+void expert_rows_down(Context& ctx, const ExpertRows& a, void* stream);
+
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
 

@@ -181,6 +181,30 @@ void Context::run(const Product& p, void* stream) {
     ck(cudaGetLastError(), "mul_mat_q");
 }
 
+void expert_rows_gate_up(Context& ctx, const ExpertRows& a, void* stream) {
+    gather_q8_rows(a.xtok, a.xtok_rows, a.rows, a.nr, a.n_embd, a.xq, stream);
+    Product gu;
+    gu.w = a.gu; gu.type = a.gu_type; gu.w_rows = 2 * a.n_ff; gu.w_cols = a.n_embd; gu.expert_bytes = a.gu_bytes;
+    gu.n = a.n; gu.xq = a.xq; gu.bounds = a.bounds; gu.ids = a.ids; gu.total_rows = a.nr; gu.max_rows = a.max_rows;
+    gu.dst = a.gu_out; gu.ld_dst = 2 * a.n_ff;
+    ctx.run(gu, stream);
+    swiglu(a.gu_out, a.h, a.nr, a.n_ff, a.interleaved, stream);
+}
+
+void expert_rows_down(Context& ctx, const ExpertRows& a, void* stream) {
+    quantize(a.h, nullptr, a.hq, a.down_type, a.n_ff, a.n_ff, a.nr, stream);
+    Product dn;
+    dn.w = a.down; dn.type = a.down_type; dn.w_rows = a.n_embd; dn.w_cols = a.n_ff; dn.expert_bytes = a.down_bytes;
+    dn.n = a.n; dn.xq = a.hq; dn.bounds = a.bounds; dn.ids = a.ids; dn.total_rows = a.nr; dn.max_rows = a.max_rows;
+    dn.dst = a.dst; dn.ld_dst = a.n_embd;
+    ctx.run(dn, stream);
+}
+
+void expert_rows(Context& ctx, const ExpertRows& a, void* stream) {
+    expert_rows_gate_up(ctx, a, stream);
+    expert_rows_down(ctx, a, stream);
+}
+
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream) {
     const cudaStream_t s = (cudaStream_t) stream;
