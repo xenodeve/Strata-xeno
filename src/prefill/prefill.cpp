@@ -917,16 +917,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 timeline::Span issue_span("copy issue", (int64_t) i, en.l);
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
-                cudaEvent_t tl0 = clk_copy.record(m.copy);
-                const char* tl_name = en.peer >= 0 ? "copy peer" : en.job < 0 ? "copy pinned" : "copy staged";
+                cudaEvent_t tl0 = nullptr;   // recorded right before the copy: never across a host wait
+                const char* tl_name = en.peer >= 0 ? "copy peer" : en.job < 0 ? "copy pinned"
+                                                           : en.blob == nullptr ? "copy nvme" : "copy staged";
                 if (en.peer >= 0) {
                     // #4: its only copy is on the 4070 - a peer copy (staged through the host by the driver when
                     // the cards have no P2P path)
                     int self_dev = 0;
                     cudaGetDevice(&self_dev);
+                    tl0 = clk_copy.record(m.copy);
                     cudaMemcpyPeerAsync(m.stage_dev[sl], self_dev, m.peer_ptr(en.peer), m.peer_dev, bytes, m.copy);
                     ++stats_.experts_dma;
                 } else if (en.job < 0) {
+                    tl0 = clk_copy.record(m.copy);
                     cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                     ++stats_.experts_dma;
                 } else {
@@ -935,6 +938,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         timeline::Span wait_span("stager wait", en.job, (int64_t) i);
                         hb = m.stager->wait(en.job);
                     }
+                    tl0 = clk_copy.record(m.copy);
                     cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                     m.stager->issued_one(en.job, m.copy);
                 }
@@ -1358,7 +1362,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
                             tl0 = clk_copy.record(m.copy);
-                            tl_name = "copy staged";
+                            tl_name = b == nullptr ? "copy nvme" : "copy staged";
                             cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                             m.stager->issued_one(job_of[j], m.copy);
                         }

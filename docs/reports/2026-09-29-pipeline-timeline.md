@@ -11,7 +11,7 @@ thread, ring 384) and `tl4.json` (dual-GPU decode). Reports: `tl*.report.txt`. A
 file into a budget. Usage, lanes and cost are in `tests/xeno/perf/README.md`.
 
 - **Tests.** `xeno_timeline_core` (threads, append flushes, lane reuse), `xeno_timeline_gpu` (device spans in order,
-  on the host clock) and `tests/xeno/test_timeline.py` (13 hand-worked traces). The server side is covered by
+  on the host clock) and `tests/xeno/test_timeline.py` (15 hand-worked traces). The server side is covered by
   `serve/test_timeline.py`.
 - **Clock.** The C++ `steady_clock` and Python's `perf_counter` share the QPC timebase. Checked with
   `scratchpad/clockcheck.cpp`: the C++ reading fell between two Python readings 3 of 3 times.
@@ -66,32 +66,58 @@ While a copy was not issued yet, the issuing thread (main) was in `router sync` 
   Sixteen copies at 0.206 ms is about 3.3 ms, close to that p50. Hypothesis: the stager's 16 pinned buffers cap how
   many copies can be in flight, so the main thread waits in `stager wait`.
 
-### Copy issuer thread, ring 384 (`tl3`)
+### Copy issuer thread, ring 384 (`tl6`; supersedes `tl3`)
 
-The prompt path took 11,418 ms, the same as `tl2` within noise. The copy engine's time moved:
+> **Correction (same day).** The first version of this section, measured on `tl3`, said that "a copy that is
+> already in flight does not progress while a `gdn` or `qsa attn` kernel runs". It gave 40 copies averaging 35.7 ms
+> during `gdn`, 161 averaging 10.8 ms during `qsa attn`, and the copy engine busy 8,642 ms. That was an instrument
+> fault.
+>
+> - **The fault:** in `issue_one` the copy's start event was recorded **before** the host blocked in
+>   `stager->wait()`, so a span covered the host's wait as copy-engine time. The code review of #33 found it.
+> - **The fix:** the start is now recorded right before the copy.
+> - **The check:** `xeno_copy_overlap_probe` shows that a pinned H2D copy progresses at full speed (6.3-6.9 GB/s)
+>   during a 100 ms single-block kernel, a VRAM-streaming kernel, and a kernel that fills every SM for 1.5 s.
+>
+> The default-path numbers above are unaffected: copy busy was 4,197 ms before the fix and 4,194 ms after it (`tl7`).
 
-- **Busy 8,642 ms (75.7 %).** The median copy still takes 0.205 ms. The longer busy time comes from copies that
-  stretch while particular kernels run:
+The prompt path took 11,533 ms, the same as `tl2` within noise. The copy engine was busy 5,326 ms (46.2 %), and a
+copy takes 0.204 ms (median, during every phase). Its idle time between copies splits three ways:
 
-  | compute phase at the copy's midpoint | copies | mean ms | p50 ms |
-  |---|---|---|---|
-  | `gdn` | 40 | 35.7 | 51.8 |
-  | `qsa attn` | 161 | 10.76 | 0.20 |
-  | `dequant` | 11,708 | 0.209 | 0.204 |
+| idle between copies | ms | share of run |
+|---|---|---|
+| issued, not started (device) | 4,494 | 39.0 % |
+| not issued yet (host) | 378 | 3.3 % |
+| in the issue call | 12 | 0.1 % |
 
-  A copy that is already in flight does not progress while a `gdn` or `qsa attn` kernel runs. The cause is
-  unknown; a hypothesis is WDDM scheduling of the copy engine against a long compute kernel. It would explain
-  #31's "the issuer is 350 entries ahead but the engine idles".
-- **The issuer thread spent 83.6 % of its time in `stager wait`.** With the issuer, the stager's buffer ring is what
-  holds it back. Host main: `router sync` 4,657 ms, `wait issuer` 3,583 ms.
-- **Idle between copies:** issued, not started (device) 1,103 ms; not issued yet (host) 366 ms, all of it
-  `issuer wait ring slot`.
+The 378 ms not issued yet is all `issuer wait ring slot`.
+
+- **The gaps are about 144 ms each, at the QSA layers.** Moving the issuer off the main thread moved the idle time
+  from the host to the device: the copies are issued, but they wait for their ring slot. The ring holds 384 entries,
+  which is about 79 ms of copies at 0.206 ms each; a QSA layer's attention runs about 126 ms.
+  - Hypothesis: to hide a layer's attention, the prefetch depth has to be about 700 or more entries. The ring slots
+    are VRAM (1.38 MB each) and the stager buffers are pinned host memory.
+- **The issuer thread spent 83.6 % of its time in `stager wait`,** and the main thread spent 3,617 ms in
+  `wait issuer`.
+
+## Off-mode cost
+
+Timeline exe `tl.exe` (sha256 `e5b2b9854f84b…`) against the pre-timeline exe built from `4a5c9ce` (`pretl.exe`,
+`70f6f9d7bf31a…`). Both had the timeline off. The runs were in the same session and alternated; every run used HIGH
+class and `--pool-priority 2`. The outputs were identical (`8c6c97e1` for 8K, `d2edde68` for code256).
+
+| workload | runs per arm | pretl | tl (timeline off) |
+|---|---|---|---|
+| 8K prefill, mean | 4 | 12.07 s (11.89-12.48) | 12.27 s (11.87-12.69) |
+| code256 decode on two GPUs, mean | 4 | 84.42 tok/s | 84.26 tok/s |
+
+The difference is inside the run-to-run spread. The logs are `offP*`, `offT*`, `code*` in
+`%TEMP%/strata-claude-stage`.
 
 ## Next steps (for #31 / #32)
 
 1. **Stop the router synchronize from blocking the only issuing thread.** Issue ahead of it, or plan routes on the
    device. Target: about 4.5 s of copy idle on the 8K prompt.
-2. **Find why an in-flight copy stalls during `gdn` and `qsa attn`.** Try a copy from a pinned arena without the
-   stager; try the copy on the other engine or without the event record. The timeline measures each variant in one
-   run.
+2. **Deepen the prefetch within the memory budget.** The ring and stager depth set how much of a layer's attention
+   the copies can hide (`tl6`). That is a VRAM and pinned-RAM trade, so the developer decides it.
 3. **Measure a batched embedding lookup and a first-chunk PLE read-ahead** against the 1.27 s `embed+steps` cost.

@@ -225,7 +225,7 @@ def prefill_report(tl: Timeline, top: int = 15) -> list[dict]:
         def issue_of(c: Span):
             i = bisect.bisect_right(issue_t0, c.t0 + EPS) - 1
             while i >= 0 and issues[i].t0 >= run.t0 - EPS:
-                if issues[i].a == c.a:
+                if issues[i].a == c.a and issues[i].b == c.b:   # entry and layer (entries restart per layer)
                     return issues[i]
                 i -= 1
             return None
@@ -282,6 +282,10 @@ def prefill_report(tl: Timeline, top: int = 15) -> list[dict]:
             i = bisect.bisect_right(cstart, mid) - 1
             by[comp[i].name if i >= 0 and comp[i].t1 >= mid else "(none)"].append(c.dur)
         r["copy_by_phase"] = {k: {"n": len(v), "ms": sum(v), "p50": pct(v, 0.5)} for k, v in by.items()}
+        per_layer: dict[int, list] = defaultdict(list)
+        for c in copies:
+            per_layer[c.b].append(c)
+        r["layer_copy_ms"] = {l: union_ms(v, run.t0, run.t1) for l, v in sorted(per_layer.items())}
         r["host_ms"] = dict(tl.innermost(run.lane, run.t0, run.t1))
         out.append(r)
     return out
@@ -460,9 +464,10 @@ def render(tl: Timeline, top: int) -> str:
             names = [k for k, _ in sorted(r["phase_ms"].items(), key=lambda kv: -kv[1])[:6]]
             rows = []
             for l, d in r["layer_phase_ms"].items():
-                rows.append((l, f"{sum(d.values()):.1f}", *[f"{d.get(n, 0.0):.1f}" for n in names]))
-            out.append("GPU compute lane per layer (ms):")
-            out.append(table(rows, ("layer", "total", *names)))
+                rows.append((l, f"{sum(d.values()):.1f}", f"{r['layer_copy_ms'].get(l, 0.0):.1f}",
+                             *[f"{d.get(n, 0.0):.1f}" for n in names]))
+            out.append("GPU compute lane per layer, and the copy engine's busy time for the layer's experts (ms):")
+            out.append(table(rows, ("layer", "compute", "copy busy", *names)))
     d = decode_report(tl)
     if d["rounds"]:
         out.append(f"\n== decode: {d['rounds']} rounds, {d['round_ms']:.2f} ms per round ==")

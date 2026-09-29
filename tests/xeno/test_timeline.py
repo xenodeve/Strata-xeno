@@ -195,3 +195,23 @@ def test_server_file_merges_and_the_request_is_split_from_http_to_first_token(tm
     assert r["ttft_ms"] == pytest.approx(120.0)            # first token - http start
     assert r["engine_side_ms"] == pytest.approx(300.0)     # the engine's own "request" inside it
     assert r["pipe_ms"] == pytest.approx(7.0)              # engine request - engine side: pipes and parsing
+
+
+def test_a_copy_is_matched_to_the_issue_of_its_own_layer(tmp_path):
+    # the per-layer path numbers entries from 0 in every layer: a backlogged engine can start layer 5's entry 3
+    # after layer 6's entry 3 was issued; matching on the entry alone took layer 6's issue (code-review of #33)
+    ev = [X(1, "prefill run", 0, 100),
+          X(1, "copy issue", 0, 0.1, 2, 5), X(2, "copy pinned", 0.1, 10, 2, 5),
+          X(1, "copy issue", 1, 1.1, 3, 5),
+          X(1, "copy issue", 30, 30.1, 3, 6),
+          X(2, "copy pinned", 40, 50, 3, 5)]
+    r = timeline.prefill_report(timeline.load(write(tmp_path, ev)))[0]
+    # layer 5's entry 3 was issued at 1.1, so its whole 10..40 gap waited on the device
+    assert r["copy_gaps"]["issued, not started (device)"] == pytest.approx(30.0)
+    assert r["copy_gaps"]["not issued yet (host)"] == pytest.approx(0.0)
+
+
+def test_copy_engine_busy_is_reported_per_layer(tmp_path):
+    # spec: "per layer ... copy-engine busy"; layer 0 has the copies 1..11 and 20..30, layer 1 has 40.2..50
+    r = timeline.prefill_report(timeline.load(write(tmp_path, PREFILL)))[0]
+    assert r["layer_copy_ms"] == {0: pytest.approx(20.0), 1: pytest.approx(9.8)}

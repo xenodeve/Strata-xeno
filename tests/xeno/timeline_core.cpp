@@ -38,10 +38,14 @@ int main() {
     char path[512];
     std::snprintf(path, sizeof path, "%s/strata-timeline-test-%d.json",
                   std::getenv("TEMP") ? std::getenv("TEMP") : ".", (int) std::rand());
+    // the cap bounds events not yet flushed: 4,004 before the first flush and 101 after it both fit under 4,100 (a
+    // cap counted since start refused the last five - code-review of #33)
 #if defined(_WIN32)
     _putenv_s("STRATA_TIMELINE", path);
+    _putenv_s("STRATA_TIMELINE_MAX_EVENTS", "4100");
 #else
     setenv("STRATA_TIMELINE", path, 1);
+    setenv("STRATA_TIMELINE_MAX_EVENTS", "4100", 1);
 #endif
     namespace tl = strata::timeline;
     CHECK(tl::enabled(), "STRATA_TIMELINE is set");
@@ -51,6 +55,15 @@ int main() {
     tl::complete("setup", t0, t0 + 5, 7, 8);
     const int gpu = tl::lane("gpu0 compute");
     CHECK(gpu == tl::lane("gpu0 compute"), "a lane name maps to one lane");
+    {   // threads asking for the same new lane at once get one lane (look-up and creation are one critical section)
+        std::vector<int> ids(8, -1);
+        std::vector<std::thread> ask;
+        for (int i = 0; i < 8; ++i) ask.emplace_back([&ids, i] { ids[(size_t) i] = tl::lane("gpu1 shared"); });
+        for (auto& t : ask) t.join();
+        bool same = true;
+        for (int id : ids) same &= id == ids[0];
+        CHECK(same, "one lane for one name under concurrent look-ups");
+    }
     tl::complete_on(gpu, "gemm", t0 + 1, t0 + 3, 3, -1);
     tl::instant("marker", 1);
     {
@@ -75,7 +88,7 @@ int main() {
     CHECK(count(first, "\"ph\":\"X\"") == 4003, "complete events after the first flush: %zu",
           count(first, "\"ph\":\"X\""));
     CHECK(count(first, "\"ph\":\"i\"") == 1, "instant events: %zu", count(first, "\"ph\":\"i\""));
-    CHECK(count(first, "\"name\":\"thread_name\"") == 6, "lane names (main, gpu0 compute, 4 workers): %zu",
+    CHECK(count(first, "\"name\":\"thread_name\"") == 7, "lane names (main, gpu0 compute, gpu1 shared, 4 workers): %zu",
           count(first, "\"name\":\"thread_name\""));
     CHECK(count(first, "\"worker 3\"") == 1, "a worker's name is written once");
     CHECK(count(first, "\"a\":42") >= 1, "a span's argument reaches the file");
@@ -92,7 +105,7 @@ int main() {
     std::string second = slurp(path);
     CHECK(second.compare(0, first.size(), first) == 0, "a second flush appends");
     CHECK(count(second, "\"ph\":\"X\"") == 4104, "only the new events are appended: %zu", count(second, "\"ph\":\"X\""));
-    CHECK(count(second, "\"name\":\"thread_name\"") == 7, "names are not repeated, a reused lane is one: %zu",
+    CHECK(count(second, "\"name\":\"thread_name\"") == 8, "names are not repeated, a reused lane is one: %zu",
           count(second, "\"name\":\"thread_name\""));
     // every record ends with ",\n": closing the array makes it valid JSON (the analyzer does exactly this)
     CHECK(second.size() >= 2 && second.compare(second.size() - 2, 2, ",\n") == 0, "records end with a comma");

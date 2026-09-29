@@ -5,20 +5,30 @@
 // times of events, placed on the host clock by strata/timeline_gpu.hpp) into one Chrome trace JSON file.  Open it
 // in ui.perfetto.dev, or read the budget with tests/xeno/perf/timeline.py.
 //
-// Unset, every call is one predictable branch on a static bool.  Names must be string literals (they are stored as
+// Unset, every call is one relaxed load and a branch; a call site whose ARGUMENTS read the clock guards itself with
+// `if (enabled())`, since C++ evaluates them first.  Names must be string literals (they are stored as
 // pointers); what varies goes in the two integer arguments (a layer, an entry index, a count).
 //
 // The clock is std::chrono::steady_clock in microseconds since its epoch: QueryPerformanceCounter on Windows, the
 // same timebase as Python's time.perf_counter(), so serve/server.py's spans line up with the engine's.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 
 namespace strata::timeline {
 
-/// STRATA_TIMELINE names a file (read once).
-bool enabled();
+namespace detail {
+extern std::atomic<int> g_state;   // 0 = not read yet, 1 = off, 2 = on (constant-initialized: no init-order issue)
+bool init_enabled();
+}  // namespace detail
+
+/// STRATA_TIMELINE names a file (read once, on first use).  Inline: one relaxed load and a branch.
+inline bool enabled() {
+    const int s = detail::g_state.load(std::memory_order_relaxed);
+    return s != 0 ? s == 2 : detail::init_enabled();
+}
 /// The timeline clock, in microseconds.
 double now_us();
 inline double us(std::chrono::steady_clock::time_point t) {

@@ -677,9 +677,9 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 #endif
 }
 
-/// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 double g_tl_step = 0;   // #33: the end of the previous startup step on the timeline
 
+/// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 void mem_mark(const char* where) {
     if (strata::timeline::enabled()) {   // #33 STRATA_TIMELINE: the startup step that ends here
         const double now = strata::timeline::now_us();
@@ -3917,7 +3917,9 @@ int main(int argc, char** argv) {
                 }
                 const auto tsp = Clock::now();
                 const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
-                strata::timeline::complete(win ? "prompt read (windows)" : "prompt read (batched)", tsp, Clock::now(), at, to);
+                if (strata::timeline::enabled())
+                    strata::timeline::complete(win ? "prompt read (windows)" : "prompt read (batched)", tsp, Clock::now(),
+                                               at, to);
                 if (trace) {
                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
                                  win ? "windows" : "batched",
@@ -4044,7 +4046,7 @@ int main(int argc, char** argv) {
                 draft_accepted += a;
                 first_window = false;
                 bool eos = false;
-                const Clock::time_point tl_emit = Clock::now();
+                const Clock::time_point tl_emit = strata::timeline::enabled() ? Clock::now() : Clock::time_point{};
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     strata::core::progress_beat();
@@ -4053,15 +4055,15 @@ int main(int argc, char** argv) {
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
                 std::fflush(stdout);
-                const Clock::time_point tl_draft = Clock::now();
+                const Clock::time_point tl_draft = strata::timeline::enabled() ? Clock::now() : Clock::time_point{};
                 strata::timeline::complete("emit tokens", tl_emit, tl_draft, a + 1);
                 ++rounds;
                 const bool drafted = eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
-                const Clock::time_point tl_join = Clock::now();
+                const Clock::time_point tl_join = strata::timeline::enabled() ? Clock::now() : Clock::time_point{};
                 strata::timeline::complete("mtp draft", tl_draft, tl_join, T, a);
                 if (adapt_thr.joinable()) adapt_thr.join();
-                strata::timeline::complete("adapt join", tl_join, Clock::now());
+                if (strata::timeline::enabled()) strata::timeline::complete("adapt join", tl_join, Clock::now());
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
@@ -5023,7 +5025,7 @@ int main(int argc, char** argv) {
             const Clock::time_point tap = Clock::now();
             apply_pending(false);
             ms_apply += std::chrono::duration<double, std::milli>(Clock::now() - tap).count();
-            strata::timeline::complete("adapt apply", tap, Clock::now());
+            if (strata::timeline::enabled()) strata::timeline::complete("adapt apply", tap, Clock::now());
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -5081,14 +5083,14 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
-            const Clock::time_point td = Clock::now();
+            const Clock::time_point td = strata::timeline::enabled() ? Clock::now() : Clock::time_point{};
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
             const Clock::time_point tj = Clock::now();
             strata::timeline::complete("mtp draft", td, tj, T, a);
             if (adapt_thr.joinable()) adapt_thr.join();
             ms_join += std::chrono::duration<double, std::milli>(Clock::now() - tj).count();
-            strata::timeline::complete("adapt join", tj, Clock::now());
+            if (strata::timeline::enabled()) strata::timeline::complete("adapt join", tj, Clock::now());
             if (!adapt_ok) return 1;
             if (!drafted) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());

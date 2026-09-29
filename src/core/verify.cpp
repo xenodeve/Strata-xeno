@@ -796,7 +796,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     ms_launch += ms_since(tl);
-    timeline::complete("verify launch", tl, Clock::now(), T);
+    if (timeline::enabled()) timeline::complete("verify launch", tl, Clock::now(), T);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -863,7 +863,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
     ms_tail += ms_since(tt);
-    timeline::complete("verify tail", tt, Clock::now(), T);
+    if (timeline::enabled()) timeline::complete("verify tail", tt, Clock::now(), T);
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
@@ -974,7 +974,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
         ss_->ple_prev[1] = last_tokens_[t];
     }
     ms_commit += ms_since(t0);
-    timeline::complete("verify commit", t0, Clock::now(), n_keep);
+    if (timeline::enabled()) timeline::complete("verify commit", t0, Clock::now(), n_keep);
     return true;
 }
 

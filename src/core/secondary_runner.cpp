@@ -395,7 +395,7 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
         const auto t0 = std::chrono::steady_clock::now();
         while (!launch_done_.load(std::memory_order_acquire)) std::this_thread::yield();
         ms_async_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        timeline::complete("4070 wait launcher", t0, std::chrono::steady_clock::now());
+        if (timeline::enabled()) timeline::complete("4070 wait launcher", t0, std::chrono::steady_clock::now());
         if (!async_ok_) { err = async_err_; return false; }
     }
     if (!pending_) { err.clear(); return true; }

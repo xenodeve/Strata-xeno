@@ -12,6 +12,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <utility>
@@ -24,12 +25,19 @@ public:
     GpuClock() = default;
     GpuClock(const GpuClock&) = delete;
     GpuClock& operator=(const GpuClock&) = delete;
-    ~GpuClock() {
-        for (cudaEvent_t e : free_) cudaEventDestroy(e);
+    ~GpuClock() {   // also the events of spans never resolved and of open chains (an early return of a run)
+        std::vector<cudaEvent_t> all = free_;
+        for (const Pending& p : pending_) {
+            all.push_back(p.e0);
+            all.push_back(p.e1);
+        }
+        for (const auto& kv : chains_) all.push_back(kv.second.ev);
+        std::sort(all.begin(), all.end());
+        all.erase(std::unique(all.begin(), all.end()), all.end());
+        for (cudaEvent_t e : all)
+            if (e != nullptr) cudaEventDestroy(e);
         if (anchor_ev_) cudaEventDestroy(anchor_ev_);
     }
-
-    bool on() const { return enabled(); }
 
     /// Ties the device clock to the host clock.  Synchronizes `s` (call it where that is free: a run's start).
     void anchor(cudaStream_t s) {
@@ -84,10 +92,8 @@ public:
         if (!enabled() || !anchored_) return;
         Chain& c = chains_[lane_id];
         cudaEvent_t e = name != nullptr || c.ev != nullptr ? record(s) : nullptr;
-        if (c.ev != nullptr && e != nullptr)
-            pending_.push_back({lane_id, c.name, c.ev, e, c.a, c.b, true, name == nullptr});
-        else if (c.ev != nullptr)
-            free_.push_back(c.ev);   // could not record: drop the open mark
+        if (e == nullptr) return;   // could not record: the open mark stays open (a pending span may end on it)
+        if (c.ev != nullptr) pending_.push_back({lane_id, c.name, c.ev, e, c.a, c.b, true, name == nullptr});
         if (name == nullptr) {
             if (c.ev == nullptr && e != nullptr) free_.push_back(e);
             c = Chain{};

@@ -73,7 +73,13 @@ The report covers:
 **Cost.** The timeline changes the thing it measures, so it is for splitting a stage, like Nsight Systems, and not for
 A/B speed numbers. Those still come from paired, profiler-off counters (AGENTS.md). On the 8,023-token prompt, a
 same-session ABBA gave prefill at 12.78/12.16 s with the timeline on against 11.95/11.55 s off (about +6 %), with
-identical output. Decode was within noise (`%TEMP%/strata-claude-stage/TL*.stdout`).
+identical output. Decode was within noise (`%TEMP%/strata-claude-stage/TL*.stdout`). With the timeline off, the exe
+matches the pre-timeline build within the run-to-run spread (8K prefill 12.27 vs 12.07 s, code256 decode 84.26 vs
+84.42 tok/s, 4+4 alternating runs). Details are in `docs/reports/2026-09-29-pipeline-timeline.md`.
+
+**A copy's start is recorded right before the copy, never before a host wait.** Recorded before the stager wait,
+it charged the host's wait to the copy engine, and it produced a plausible false finding: "copies stall during
+`gdn`" (see the report's correction). Keep every new device span's start event after any host-side block.
 
 The GPU lanes are placed on the host clock by an anchor event. WDDM batches submissions, so the anchor forces the
 submission and keeps the narrowest of eight tries. Without that, spans landed 4 ms early (`xeno_timeline_gpu`).

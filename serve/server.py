@@ -828,9 +828,9 @@ class Service:
                     raise
                 finally:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
-                    timeline.complete("engine request", t_engine, timeline.now_us(), len(ids), n)
                     #                                     fifo, so a stop-token break can't leave the shared engine
                     #                                     queue mid-drain for the next request to read as its own DONE
+                    timeline.complete("engine request", t_engine, timeline.now_us(), len(ids), n)
         except GeneratorExit:                           # the client disconnected mid-stream
             finish = "disconnect"
             raise

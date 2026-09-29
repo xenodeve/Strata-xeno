@@ -613,6 +613,9 @@ if(STRATA_NATIVE_EXPERTS)
       # #5 probe (not a test): integer mma.sync and the prompt path's MMQ across sm_89 / sm_120
       add_executable(xeno_mmq_cross_arch tests/xeno/mmq_cross_arch.cu)
       target_link_libraries(xeno_mmq_cross_arch PRIVATE strata_prefill CUDA::cudart)
+      # #31 probe (not a test): does a pinned H2D copy progress while a long kernel runs? CUDA_VISIBLE_DEVICES=1
+      add_executable(xeno_copy_overlap_probe tests/xeno/copy_overlap_probe.cu)
+      target_link_libraries(xeno_copy_overlap_probe PRIVATE CUDA::cudart)
       add_executable(xeno_gemm_cross_arch tests/xeno/gemm_cross_arch.cu)
       target_link_libraries(xeno_gemm_cross_arch PRIVATE strata_prefill CUDA::cudart)
     endif()

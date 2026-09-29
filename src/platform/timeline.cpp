@@ -27,7 +27,8 @@ struct Ev {
     char ph;   // 'X' span, 'i' instant
 };
 
-// One per thread and one per virtual lane.  The owner appends under `mu` (uncontended except during a flush).
+// One per thread and one per virtual lane.  The owner appends under `mu` (uncontended except during a flush);
+// name, named_out and retired belong to the registry and are read and written under Registry::mu only.
 struct Lane {
     int tid = 0;
     std::string name;
@@ -42,7 +43,7 @@ struct Registry {
     std::vector<std::unique_ptr<Lane>> lanes;   // never freed: a finished thread's events are still flushed
     std::mutex file_mu;
     bool file_open = false;
-    std::atomic<int64_t> recorded{0}, dropped{0};
+    std::atomic<int64_t> pending{0}, dropped{0};   // events recorded and not flushed yet; events refused
     int64_t max_events = 0;
     const char* path = nullptr;
     int pid = 0;
@@ -54,16 +55,14 @@ Registry& reg() {
         x->path = std::getenv("STRATA_TIMELINE");
         if (x->path != nullptr && *x->path == 0) x->path = nullptr;
         const char* m = std::getenv("STRATA_TIMELINE_MAX_EVENTS");
-        x->max_events = m ? std::atoll(m) : 8'000'000;   // ~0.4 GB of events; the rest are counted, not kept
+        x->max_events = m ? std::atoll(m) : 8'000'000;   // unflushed events (~0.4 GB); beyond, counted, not kept
         x->pid = (int) STRATA_GETPID();
         return x;
     }();
     return *r;
 }
 
-Lane* new_lane(std::string name) {
-    Registry& r = reg();
-    std::lock_guard<std::mutex> lk(r.mu);
+Lane* new_lane_locked(Registry& r, std::string name) {   // r.mu held
     r.lanes.push_back(std::make_unique<Lane>());
     Lane* l = r.lanes.back().get();
     l->tid = (int) r.lanes.size();
@@ -84,13 +83,18 @@ struct Holder {
 thread_local Holder t_holder;
 
 Lane* my_lane() {
-    if (t_holder.l == nullptr) t_holder.l = new_lane("");
+    if (t_holder.l == nullptr) {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        t_holder.l = new_lane_locked(r, "");
+    }
     return t_holder.l;
 }
 
 void push(Lane* l, const Ev& e) {
     Registry& r = reg();
-    if (r.recorded.fetch_add(1, std::memory_order_relaxed) >= r.max_events) {
+    if (r.pending.fetch_add(1, std::memory_order_relaxed) >= r.max_events) {
+        r.pending.fetch_sub(1, std::memory_order_relaxed);
         r.dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -109,29 +113,31 @@ void escape(std::string& out, const char* s) {
 
 }  // namespace
 
-bool enabled() {
-    static const bool on = reg().path != nullptr;
+namespace detail {
+std::atomic<int> g_state{0};
+bool init_enabled() {
+    const bool on = reg().path != nullptr;
+    g_state.store(on ? 2 : 1, std::memory_order_relaxed);
     return on;
 }
+}  // namespace detail
 
 double now_us() { return us(std::chrono::steady_clock::now()); }
 
 void name_thread(const char* name) {
     if (!enabled()) return;
     const std::string nm = name ? name : "";
-    if (t_holder.l == nullptr && !nm.empty()) {
-        Registry& r = reg();
-        std::lock_guard<std::mutex> lk(r.mu);
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    if (t_holder.l == nullptr && !nm.empty())
         for (auto& l : r.lanes)
             if (l->retired && l->name == nm) {
                 l->retired = false;
                 t_holder.l = l.get();
                 return;
             }
-    }
-    Lane* l = my_lane();
-    std::lock_guard<std::mutex> lk(l->mu);
-    l->name = nm;
+    if (t_holder.l == nullptr) t_holder.l = new_lane_locked(r, nm);
+    else t_holder.l->name = nm;
 }
 
 void complete(const char* name, double t0_us, double t1_us, int64_t a, int64_t b) {
@@ -142,12 +148,10 @@ void complete(const char* name, double t0_us, double t1_us, int64_t a, int64_t b
 int lane(const char* name) {
     if (!enabled()) return 0;
     Registry& r = reg();
-    {
-        std::lock_guard<std::mutex> lk(r.mu);
-        for (auto& l : r.lanes)
-            if (l->name == name) return l->tid;
-    }
-    return new_lane(name)->tid;
+    std::lock_guard<std::mutex> lk(r.mu);
+    for (auto& l : r.lanes)
+        if (l->name == name) return l->tid;
+    return new_lane_locked(r, name)->tid;
 }
 
 void complete_on(int lane_id, const char* name, double t0_us, double t1_us, int64_t a, int64_t b) {
@@ -172,9 +176,15 @@ void flush() {
     Registry& r = reg();
     std::lock_guard<std::mutex> fk(r.file_mu);
     std::vector<Lane*> lanes;
+    std::vector<std::string> names_now;   // a lane's name, when its thread_name record is due in this flush
     {
         std::lock_guard<std::mutex> lk(r.mu);
-        for (auto& l : r.lanes) lanes.push_back(l.get());
+        for (auto& l : r.lanes) {
+            lanes.push_back(l.get());
+            const bool due = !l->named_out && !l->name.empty();
+            names_now.push_back(due ? l->name : std::string());
+            if (due) l->named_out = true;
+        }
     }
     std::FILE* f = std::fopen(r.path, r.file_open ? "ab" : "wb");
     if (f == nullptr) return;
@@ -188,17 +198,17 @@ void flush() {
         out += b;
         r.file_open = true;
     }
-    for (Lane* l : lanes) {
+    for (size_t li = 0; li < lanes.size(); ++li) {
+        Lane* l = lanes[li];
         std::vector<Ev> ev;
-        std::string name;
-        bool name_now = false;
         {
             std::lock_guard<std::mutex> lk(l->mu);
             ev.swap(l->ev);
-            if (!l->named_out && !l->name.empty()) { name = l->name; name_now = true; l->named_out = true; }
         }
+        r.pending.fetch_sub((int64_t) ev.size(), std::memory_order_relaxed);
+        const std::string& name = names_now[li];
         char b[320];
-        if (name_now) {
+        if (!name.empty()) {
             out += "{\"ph\":\"M\",\"pid\":";
             out += std::to_string(r.pid);
             out += ",\"tid\":";
