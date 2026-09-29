@@ -124,19 +124,13 @@ struct Alloc {
 // j-th unpinned expert, in launch order - lands in host buffer j % kRing, which is free again once the DMA of job
 // j - kRing (recorded by the launching thread, `issued`) is done.
 struct Stager {
-    // pinned staging buffers: the prefetch depth of every unpinned expert (#31: with 16 the copy issuer ran 16 entries
-    // ahead of the copy engine whatever the ring's depth). STRATA_PREFILL_STAGE_BUFS sets it (default 16).
-    const int kRing = [] {
-        const char* v = std::getenv("STRATA_PREFILL_STAGE_BUFS");
-        const int n = v ? std::atoi(v) : 16;
-        return n >= 2 ? n : 16;
-    }();
+    static constexpr int kRing = 16;   // #31: 128 and 384 measured no faster (11.23-11.38 s at 8K) and cost pinned RAM
     struct Job { const uint8_t* src; size_t bytes; int32_t l = -1, e = -1; };   // src null: read (l, e) from the pack
     core::ExpertSource* xsrc = nullptr;   // #11: the NVMe tier's experts are read, never admitted
-    std::vector<uint8_t*> buf = std::vector<uint8_t*>((size_t) kRing, nullptr);
-    std::vector<char> pinned = std::vector<char>((size_t) kRing, 0);
+    uint8_t* buf[kRing] = {};
+    bool pinned[kRing] = {};
     std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
-    std::vector<cudaEvent_t> dma_done = std::vector<cudaEvent_t>((size_t) kRing, nullptr);
+    cudaEvent_t dma_done[kRing] = {};
     std::vector<Job> jobs;
     std::unique_ptr<std::atomic<int>[]> ready;
     size_t ready_cap = 0;
@@ -415,7 +409,8 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 // Step 2b: which layers' experts go through MMQ (both weight types covered; the Strata Q2_0 pack always - its blob
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
 // gate/up and down matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
-constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
+constexpr int MMQ_GROUP = 16;
+static_assert(MMQ_GROUP <= mmq::kGatherGroupMax, "one gather_native_group launch must hold an MMQ group");                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
@@ -845,13 +840,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // drafter's; byte-identical to the per-token dequant, xeno_embed_batch_parity).  Token by token it was 8,023
         // launches and ~0.6 s of host time while the GPU waited, on the 8K prompt.  The ids ride in slot_dev, which
         // the chunk's first MoE layer overwrites later on the same stream.
+        // STRATA_PREFILL_EMBED_BATCH=0 keeps the per-token embedding (the A/B)
+        static const bool embed_batch_on = [] {
+            const char* v = std::getenv("STRATA_PREFILL_EMBED_BATCH");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
         bool any_image = false;
         for (int64_t t = 0; t < T && embd_rows; ++t) any_image |= embd_rows[p0 + t] != nullptr;
         const core::NativeEmbed* ne = core::native_embed();
-        const bool batched_embed = ne != nullptr && !any_image;
+        const bool batched_embed = embed_batch_on && ne != nullptr && !any_image;
         if (batched_embed) {
-            for (int64_t t = 0; t < T; ++t) m.slot_host[(size_t) t] = (int32_t) tokens[c0 + t];
-            cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * 4, cudaMemcpyHostToDevice, m.cs);
+            for (int64_t t = 0; t < T; ++t) {
+                if (tokens[c0 + t] < 0 || tokens[c0 + t] > INT32_MAX) { err = "prefill: invalid token id"; return false; }
+                m.slot_host[(size_t) t] = (int32_t) tokens[c0 + t];
+            }
+            if (cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * 4, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+                err = "prefill: the token ids upload failed";
+                return false;
+            }
             ne->gather_dev(m.slot_dev, T, m.emb, m.cs);
         }
         for (int64_t t = 0; t < T && !batched_embed; ++t) {
@@ -879,6 +885,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             });
         };
         if (ple_on && !ple_next.valid()) ple_next = ple_read(c0, ple_buf);
+        // STRATA_PREFILL_PLE_AHEAD=0 takes the rows here, before the layers (the A/B: the old in-line read)
+        static const bool ple_ahead_on = [] {
+            const char* v = std::getenv("STRATA_PREFILL_PLE_AHEAD");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
         auto ple_take = [&]() -> bool {
             const auto tp = Clock::now();
             timeline::Span ple_span("ple rows (host)", c0);
@@ -893,9 +904,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 ple_next = ple_read(c0 + m.T, ple_buf ^ 1);
             }
             ple_buf ^= 1;
-            stats_.ms_ple += ms_since(tp);
+            stats_.ms_ple += ms_since(tp);   // since 4935d9b: the wait for the rows, not the whole read
             return true;
         };
+        if (ple_on && !ple_ahead_on && !ple_take()) return false;   // A/B: the rows before the layers
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
         // ---- the QSA step records of every position in the chunk
         {
@@ -1039,7 +1051,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             timeline::Span layer_span("layer (host)", l, c0);
             pt.layer = l;
             const core::LayerView v(*m.wt, l);
-            if (l == 1 && ple_on && !ple_take()) return false;   // this chunk's PLE rows, uploaded
+            if (l == 1 && ple_on && ple_ahead_on && !ple_take()) return false;   // this chunk's PLE rows, uploaded
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
