@@ -5233,7 +5233,9 @@ int main(int argc, char** argv) {
             cudaGetDevice(&prev);
             cudaSetDevice(1);
             struct Restore { int d; ~Restore() { cudaSetDevice(d); } } restore{prev};
+            strata::timeline::name_thread("adapt 4070");
             if (!sx_h2d.empty() && cudaEventQuery(ss_ev) == cudaSuccess) {   // stage 3
+                strata::timeline::Span st3("4070 stage 3");   // #44
                 for (const SSwap& x : sx_h2d) {
                     secondary_residency[(size_t) x.in] = x.slot;
                     std::string e;
@@ -5246,6 +5248,7 @@ int main(int argc, char** argv) {
                 sx_h2d.clear();
             }
             if (!sx_d2h.empty() && sx_h2d.empty() && cudaEventQuery(sx_d2h_ev) == cudaSuccess) {   // stage 2
+                strata::timeline::Span st2("4070 stage 2");   // #44
                 std::vector<CopyJob> home_jobs, in_jobs;
                 for (size_t i = 0; i < sx_d2h.size(); ++i) {
                     const SSwap& x = sx_d2h[i];
@@ -5279,6 +5282,7 @@ int main(int argc, char** argv) {
                 sx_d2h.clear();
             }
             if (!sx_d2h.empty() || !sx_h2d.empty() || !adapt_start) return true;
+            strata::timeline::Span pick_span("4070 pick");   // #44: the ranking scan and stage 1
             std::vector<std::pair<float, int32_t>> sc, sv;   // stage 1: choose the pairs, D2H the victims
             for (int64_t i = 0; i < (int64_t) secondary_residency.size(); ++i) {
                 const float u = drive.d.usage[(size_t) i];
@@ -5374,6 +5378,7 @@ int main(int argc, char** argv) {
                 }
                 const Clock::time_point t_p2 = Clock::now();
                 ms_p3 += std::chrono::duration<double, std::milli>(t_p2 - t_p3).count();
+                strata::timeline::complete("adapt stage 3", t_p3, t_p2);
                 if (!ps_d2h.empty() && ps_h2d.empty() && cudaEventQuery(d2h_ev) == cudaSuccess) {   // stage 2
                     // the evicted expert goes home first; its staging slot then takes the newcomer
                     std::vector<CopyJob> home_jobs, in_jobs;
@@ -5417,11 +5422,13 @@ int main(int argc, char** argv) {
                         cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 }
                 ms_p2 += std::chrono::duration<double, std::milli>(Clock::now() - t_p2).count();
+                strata::timeline::complete("adapt stage 2", t_p2, Clock::now());
                 if (!ps_d2h.empty() || !ps_h2d.empty() || !adapt_start) return true;
             } else if (!pending.empty()) {
                 return true;   // the previous swaps are still in flight
             }
             if (sec_thr.joinable()) sec_thr.join();
+            strata::timeline::Span pick_span("adapt pick");   // #44: the ranking scan and stage 1
             auto sec_inflight = [&](int32_t idx) {
                 for (const SSwap& x : sx_d2h) if (x.in == idx) return true;
                 for (const SSwap& x : sx_h2d) if (x.in == idx) return true;
@@ -5553,6 +5560,7 @@ int main(int argc, char** argv) {
             if (first_window) T = 1;
             bool from_sfx = false;
             int sfx_match = 0;
+            const Clock::time_point t_sfx = Clock::now();   // #44: the suffix drafter's search
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
@@ -5561,6 +5569,7 @@ int main(int argc, char** argv) {
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
+            if (strata::timeline::enabled()) strata::timeline::complete("suffix propose", t_sfx, Clock::now(), T);
             const bool timed_round = !first_window;
             ++window_hist[(size_t) T];
             if (p + T > o.max_context) {
@@ -5759,6 +5768,8 @@ int main(int argc, char** argv) {
                         ms_sec / rounds, ms_p2 / rounds, ms_p3 / rounds);
         if (rounds > 0 && sec_adapt)
             std::printf("%-24s %lld experts swapped into the 4070 tier\n", "adaptive 4070", (long long) sec_swaps);
+        if (const std::string io = ple_table.io_report(); rounds > 0 && !io.empty())   // #44: the windows' PLE reads
+            std::printf("%-24s %s\n", "ple reads", io.c_str());
         if (rounds > 0 && drive.d.pcie_num > 0)
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),

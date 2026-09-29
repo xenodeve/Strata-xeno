@@ -33,7 +33,15 @@
 #include <cstdint>
 #include <string>
 
+namespace strata::timeline { class GpuClock; }
+
 namespace strata::core {
+
+/// #44 STRATA_TIMELINE: the primary GPU's decode lane ("gpu0 decode": the verify window's graph, the commit graph and
+/// the MTP draft graphs), so the round's edge shows when the GPU works and when it waits for the host.  Used from the
+/// decode thread only; decode_gpu_begin() anchors it on the first call (it synchronizes that stream once).
+timeline::GpuClock* decode_gpu_begin(cudaStream_t s);
+void decode_gpu_span(const char* name, cudaEvent_t e0, cudaEvent_t e1, int64_t a = -1, int64_t b = -1);
 
 class NativeHead;
 

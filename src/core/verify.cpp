@@ -30,6 +30,7 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/timeline.hpp"
+#include "strata/timeline_gpu.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -761,7 +762,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // #33 STRATA_TIMELINE: the window, and inside it staging, launch, per layer the host's wait for the primary GPU's
     // doorbell ("wait gpu") and the CPU experts it then serves ("cpu experts"), the tail and the head sampling
     timeline::Span window_span("verify window", T, pos0);
-    if (!capture(T, err) || !capture_commit(err)) return false;
+    {
+        timeline::Span capture_span("verify capture", T);   // #44: the graph lookup (a capture when T is new)
+        if (!capture(T, err) || !capture_commit(err)) return false;
+    }
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
@@ -771,6 +775,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) (pos0 + t);
     }
     if (ss.ple.ready()) {
+        timeline::Span ple_span("ple gather", T);   // #44: the PLE rows of the window's tokens
         uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
         for (int t = 0; t < T; ++t) {
@@ -792,8 +797,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     VDBG("staged; launching\n");
     const Clock::time_point tl = Clock::now();
     timeline::complete("verify stage", t0, tl, T);
+    timeline::GpuClock* gc = decode_gpu_begin(cs_);
+    cudaEvent_t ge0 = gc ? gc->record(cs_) : nullptr;
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    if (gc) decode_gpu_span("verify graph", ge0, gc->record(cs_), T, pos0);
     (void) cudaStreamQuery(cs_);
     ms_launch += ms_since(tl);
     if (timeline::enabled()) timeline::complete("verify launch", tl, Clock::now(), T);
@@ -958,6 +966,22 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
+timeline::GpuClock* decode_gpu_begin(cudaStream_t s) {
+    if (!timeline::enabled()) return nullptr;
+    static timeline::GpuClock clock;
+    static bool anchored = false;
+    if (!anchored) { clock.anchor(s); anchored = true; }
+    clock.resolve(false);
+    return &clock;
+}
+
+void decode_gpu_span(const char* name, cudaEvent_t e0, cudaEvent_t e1, int64_t a, int64_t b) {
+    timeline::GpuClock* c = decode_gpu_begin(nullptr);
+    if (c == nullptr) return;
+    static const int lane = timeline::lane("gpu0 decode");
+    c->span(lane, name, e0, e1, a, b);
+}
+
 bool Verifier::commit(int n_keep, std::string& err) {
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
@@ -965,8 +989,11 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    timeline::GpuClock* gc = decode_gpu_begin(cs_);
+    cudaEvent_t ge0 = gc ? gc->record(cs_) : nullptr;
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+    if (gc) decode_gpu_span("commit graph", ge0, gc->record(cs_), n_keep);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     for (int t = 0; t < n_keep; ++t) {

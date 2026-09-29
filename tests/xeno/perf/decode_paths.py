@@ -2,7 +2,8 @@
 
 timeline.py sums the decode stages per round; this pairs, per layer, the main thread's "cpu experts" stage with its
 "dispatch plan", its "cpu pool" and the 4070's GPU span ("4070 experts", which includes its H2D and D2H), and reports
-where the stage's time goes and how often the 4070 finished after the CPU pool.
+where the stage's time goes and how often the 4070 finished after the CPU pool; the 4070 sync split by cause; and,
+from the "gpu0 decode" lane, the primary GPU's idle time between its graphs charged to the host work it waited for.
 
 Usage:
     python tests/xeno/perf/decode_paths.py run.json [run.json ...]
@@ -72,6 +73,37 @@ def sync_split(events: list[dict]) -> dict:
     return out
 
 
+GPU_DECODE = ("verify graph", "commit graph", "mtp round", "mtp step")   # the "gpu0 decode" lane (#44)
+EDGE_HOST = ("verify stage", "verify launch", "verify tail", "head sampling", "verify commit", "mtp draft", "emit tokens",
+             "adapt join", "adapt apply", "verify capture", "ple gather", "suffix propose")
+
+
+def edge(events: list[dict]) -> dict:
+    """The primary GPU at the rounds' edge: its busy time per graph, and each idle gap between two of its graphs
+    charged to the main thread's edge spans that overlap it (the host work the GPU waited for), innermost span first."""
+    xs = [e for e in events if e.get("ph") == "X"]
+    rounds = max(1, sum(1 for e in xs if e["name"] == "decode round"))
+    gpu = sorted((e["ts"], e["ts"] + e["dur"], e["name"]) for e in xs if e["name"] in GPU_DECODE)
+    host = sorted((e["ts"], e["ts"] + e["dur"], e["name"]) for e in xs if e["name"] in EDGE_HOST)
+    busy: dict[str, float] = defaultdict(float)
+    for s, e, n in gpu:
+        busy[n] += e - s
+    idle = 0.0
+    during: dict[str, float] = defaultdict(float)
+    for (_, a, _), (b, _, _) in zip(gpu, gpu[1:]):
+        if b <= a:
+            continue
+        idle += b - a
+        inside = [(max(s, a), min(e, b), s, n) for s, e, n in host if e > a and s < b]
+        cuts = sorted({a, b} | {x for lo, hi, _, _ in inside for x in (lo, hi)})
+        for lo, hi in zip(cuts, cuts[1:]):   # each piece goes to the innermost span covering it (the latest start)
+            cover = [(s0, n) for l0, h0, s0, n in inside if l0 <= lo and h0 >= hi]
+            during[max(cover)[1] if cover else "(no host span)"] += hi - lo
+    ms = lambda v: round(v / 1000 / rounds, 6)   # noqa: E731
+    return {"gpu busy": {k: ms(v) for k, v in busy.items()}, "gpu idle": ms(idle),
+            "idle during": {k: ms(v) for k, v in during.items()}}
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print(__doc__)
@@ -90,6 +122,12 @@ def main(argv: list[str]) -> int:
             print(f"  4070 sync, GPU still running: {s['running']['n'] / n:.0%} of waits, "
                   f"{s['running']['ms_per_round']:.2f} ms/round (median GPU left {s['running'].get('gpu_left_us', 0):.1f} us, "
                   f"median wake-up after it {s['running'].get('overshoot_us', 0):.1f} us)")
+        g = edge(ev)
+        if g["gpu busy"]:
+            print(f"  primary GPU at the round edge: busy " +
+                  ", ".join(f"{k} {v:.2f}" for k, v in g["gpu busy"].items()) + f"; idle {g['gpu idle']:.2f} ms/round, during:")
+            for k, v in sorted(g["idle during"].items(), key=lambda x: -x[1]):
+                print(f"    {k:28}{v:8.2f}")
     return 0
 
 

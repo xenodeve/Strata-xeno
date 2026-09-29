@@ -40,3 +40,21 @@ def test_layers_without_a_4070_share_are_skipped():
     ev = [_x("decode round", 0, 100), _x("cpu experts", 10, 50), _x("dispatch plan", 10, 5), _x("cpu pool", 20, 10),
           _x("4070 experts", 70, 5)]
     assert dp.breakdown(ev)["layers"] == 0
+
+
+def test_the_round_edge_charges_each_gpu_idle_gap_to_the_host_spans_it_overlaps():
+    ev = [_x("decode round", 0, 300),
+          _x("verify graph", 0, 100), _x("commit graph", 110, 10), _x("mtp round", 130, 20), _x("verify graph", 170, 130),
+          _x("verify commit", 100, 25), _x("mtp draft", 125, 35), _x("adapt join", 160, 5), _x("verify stage", 165, 4)]
+    e = dp.edge(ev)
+    assert e["gpu busy"] == {"verify graph": 0.23, "commit graph": 0.01, "mtp round": 0.02}
+    assert e["gpu idle"] == 0.04
+    assert e["idle during"] == {"verify commit": 0.015, "mtp draft": 0.015, "adapt join": 0.005, "verify stage": 0.004,
+                                "(no host span)": 0.001}
+
+
+def test_a_gap_goes_to_the_innermost_host_span():
+    # the GPU idles 10..30; "verify stage" covers it, and "ple gather" inside it covers 15..25
+    ev = [_x("decode round", 0, 100), _x("verify graph", 0, 10), _x("verify graph", 30, 10),
+          _x("verify stage", 10, 20), _x("ple gather", 15, 10)]
+    assert dp.edge(ev)["idle during"] == {"verify stage": 0.01, "ple gather": 0.01}
