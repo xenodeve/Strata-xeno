@@ -60,8 +60,7 @@ The floor is therefore about 12 ms/round. Measured is ~39.5 ms/round on code (85
 2. The layer-by-layer GPU<->CPU ping-pong, with ~7 ms/round of GPU idle.
 3. The mapped-copy and 4070 waits, ~2-3 ms/round.
 
-**In flight at compaction:**
-- An Nsight capture of a 2K-token prefill (`--profile-prefill-range`; prompt `%TEMP%/strata-claude-serve-2k`; output `%TEMP%/strata-claude-prefill-nsys`). It is meant to show where the 8K TTFT (~27 s) goes before any Phase 5 (#5, 4070-assisted prefill) work.
+**Prefill profile, done:** 2K prefill: span 7.79 s, GPU busy 2.84 s (37 %), memcpy 2.90 s for 20.05 GB. Expert streaming over x4 bounds prefill, so #5 (4070 x16 prefill) is the TTFT lever. Posted on #5.
 
 **Open questions:**
 - Short prompts show TTFT +0.12-0.19 s with placement-first (4/4 runs), while the 8K prompt is unchanged. The cause is unknown.
