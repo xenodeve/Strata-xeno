@@ -208,6 +208,50 @@ int main() {
         }
     std::printf("mmq: %d of %d cases bit-identical across the cards\n", mq_same, mq_cases);
 
+    // (d) batch-composition invariance (#32): one token's row through one expert must not depend on which other
+    // rows share the launch (token split, rank-streamed combine and microbatches all change that)
+    {
+        const int64_t R = 1280, C = 2560;
+        const size_t eb = strata::prefill::mmq::matrix_bytes(42, R, C);
+        std::vector<uint8_t> W(eb * 8);
+        for (size_t b = 0; b + 18 <= W.size(); b += 18) {
+            const __half d = __float2half(0.01f + 0.02f * (next_f() + 0.5f));
+            std::memcpy(&W[b], &d, 2);
+            for (int i = 2; i < 18; ++i) W[b + i] = (uint8_t) next_u32();
+        }
+        std::vector<float> xt((size_t) C);
+        for (auto& v : xt) v = next_f() * 4.0f;
+        // layouts: {rows before the probe token in its expert, rows after it, rows of the other 7 experts each}
+        const int layouts[][3] = {{0, 0, 0}, {0, 39, 0}, {20, 19, 5}, {999, 0, 3}, {500, 499, 40}, {0, 999, 160}};
+        for (int dev = 0; dev < 2; ++dev) {
+            std::vector<float> ref;
+            for (const auto& L : layouts) {
+                // expert 3 holds the probe token at row L[0] of its L[0]+1+L[1] rows; experts 0-2 and 4-7 get L[2] rows
+                std::vector<int32_t> bounds(9, 0);
+                for (int e = 0; e < 8; ++e) bounds[(size_t) e + 1] = bounds[(size_t) e] + (e == 3 ? L[0] + 1 + L[1] : L[2]);
+                std::vector<float> X((size_t) bounds.back() * C);
+                for (auto& v : X) v = next_f() * 4.0f;
+                const int64_t at = bounds[3] + L[0];
+                std::memcpy(&X[(size_t) at * C], xt.data(), (size_t) C * 4);
+                std::vector<float> Y;
+                if (!mmq_on(dev, W, R, C, X, bounds, Y)) return 1;
+                std::vector<float> row(Y.begin() + at * R, Y.begin() + (at + 1) * R);
+                if (ref.empty()) ref = row;
+                size_t diff = 0;
+                for (size_t i = 0; i < row.size(); ++i) diff += std::memcmp(&row[i], &ref[i], 4) != 0;
+                std::printf("batch dev %d  before %4d after %4d others %3d: probe row %zu of %zu differ from alone\n", dev,
+                            L[0], L[1], L[2], diff, row.size());
+            }
+            static std::vector<float> ref0;
+            if (dev == 0) ref0 = ref;
+            else {
+                size_t diff = 0;
+                for (size_t i = 0; i < ref.size(); ++i) diff += std::memcmp(&ref[i], &ref0[i], 4) != 0;
+                std::printf("batch alone-row across the cards: %zu of %zu differ\n", diff, ref.size());
+            }
+        }
+    }
+
     // (c) swiglu + q8_1 quantize of H, as the down product's input
     for (const int64_t rows : {1, 40, 1000}) {
         std::vector<float> GU((size_t) rows * 1280);
