@@ -348,6 +348,9 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
         tl_close();
         if (!cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
             return fail_enqueued();
+        // #10 item 1 STRATA_SECONDARY_POKE=1: hand the batch to the 4070 now (WDDM may hold it until finish() asks)
+        static const bool poke = [] { const char* v = std::getenv("STRATA_SECONDARY_POKE"); return v && v[0] == '1'; }();
+        if (poke) (void) cudaStreamQuery(stream);
         pending_ = true;
         if (!async_)
             ms_launch_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - launch_t0).count();
@@ -376,6 +379,8 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
     tl_close();
     if (!cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
         return fail_enqueued();
+    static const bool poke = [] { const char* v = std::getenv("STRATA_SECONDARY_POKE"); return v && v[0] == '1'; }();
+    if (poke) (void) cudaStreamQuery(stream);   // #10 item 1 (see the graph path above)
     pending_ = true;
     if (profile_timing_) {
         timing_.d2h_full_bytes += full_d2h_bytes;
