@@ -1,5 +1,41 @@
 # AGENTS.md — rules for coding agents working on Strata-xeno
 
+## Where did the time go? Record a timeline, do not hunt stage by stage
+
+The developer's rule (2026-09-29): **do not hunt for the slow part one point at a time.** The engine records the
+whole pipeline in one run. Start every "why is this slow / where does the time go" question here, **before** adding
+ad-hoc timers, hand-built host traces or an Nsight capture:
+
+```sh
+STRATA_TIMELINE=run.json strata.exe <the same args>      # generate or --serve; no other flag needed
+python tests/xeno/perf/timeline.py run.json               # the budget; --perfetto closed.json for ui.perfetto.dev
+```
+
+What the report already answers:
+
+- **Prompt path:**
+  - GPU time by phase and by layer, and the host thread's budget.
+  - Why the copy engine idled: *not issued yet (host)* (and what the issuing thread was doing), *in the issue call*,
+    or *issued, not started (device)*.
+  - Copy durations by the compute kernel running at the same time, and the largest gaps by layer.
+- **Decode:** ms per round of every stage, with the unaccounted rest; the slowest layers; the 4070's busy time; the
+  pool workers' wake-up and stragglers.
+- **Helper threads** (stagers, issuer, adapt), **lane utilisation**, and **server requests** from HTTP to first token.
+
+The tool's lanes, usage and cost are in `tests/xeno/perf/README.md`, and its first findings in
+`docs/reports/2026-09-29-pipeline-timeline.md`. #31 needed about 12 hand-built experiments before this tool existed;
+the first timeline run answered it.
+
+- **A stage the timeline does not show yet gets a span in the timeline**, not a one-off timer or a printf.
+  - Host code: `strata::timeline::Span` / `complete()` (`include/strata/timeline.hpp`).
+  - A GPU stream: `timeline::GpuClock` (`include/strata/timeline_gpu.hpp`).
+  - The server: `serve/timeline.py`.
+  - Names are string literals; numbers go in the two integer arguments.
+  - Add the analyzer's test first (`tests/xeno/test_timeline.py`).
+- **The timeline splits a stage; it does not replace the paired counters.** It costs about 6 % of an 8K prefill.
+  - A/B speed claims still come from profiler-off ABBA runs and their counters (next section).
+  - Use the timeline to explain which stage moved.
+
 ## Measure latency, do not guess where the time went
 
 Every claim about **why** decode or prefill got faster, slower or stayed flat must
