@@ -195,10 +195,9 @@ struct Stager {
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
                 const int b = j % kRing;
                 if (j >= kRing) {
-                    const double tw = timeline::enabled() ? timeline::now_us() : 0;
+                    timeline::Span wait_span("stager wait buffer", j, j - kRing);
                     while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
                     cudaEventSynchronize(dma_done[b]);
-                    if (tw > 0) timeline::complete("stager wait buffer", tw, timeline::now_us(), j, j - kRing);
                 }
                 const Job& jb = jobs[(size_t) j];
                 timeline::Span stage_span(jb.src ? "stager memcpy" : "stager nvme read", j, jb.l);
@@ -931,9 +930,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                     ++stats_.experts_dma;
                 } else {
-                    const double tw = timeline::enabled() ? timeline::now_us() : 0;
-                    const uint8_t* hb = m.stager->wait(en.job);
-                    if (tw > 0) timeline::complete("stager wait", tw, timeline::now_us(), en.job, (int64_t) i);
+                    const uint8_t* hb = nullptr;
+                    {
+                        timeline::Span wait_span("stager wait", en.job, (int64_t) i);
+                        hb = m.stager->wait(en.job);
+                    }
                     cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                     m.stager->issued_one(en.job, m.copy);
                 }
@@ -1241,10 +1242,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                     // group the (token, k) pairs by expert on the host
                     pt.mark(kPfHostGroup, cs);
-                    const double tl_sync = timeline::enabled() ? timeline::now_us() : 0;
-                    cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
-                    cudaStreamSynchronize(m.cs);
-                    if (tl_sync > 0) timeline::complete("router sync", tl_sync, timeline::now_us(), l, (int64_t) consumed);
+                    {
+                        timeline::Span sync_span("router sync", l, (int64_t) consumed);
+                        cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                        cudaStreamSynchronize(m.cs);
+                    }
                     pt.fold();
                     const double tl_group = timeline::enabled() ? timeline::now_us() : 0;
                     std::fill(m.cnt.begin(), m.cnt.end(), 0);
@@ -1349,9 +1351,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             ++stats_.experts_dma;
                         } else {
                             // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
-                            const double tw = timeline::enabled() ? timeline::now_us() : 0;
-                            const uint8_t* hb = m.stager->wait(job_of[j]);
-                            if (tw > 0) timeline::complete("stager wait", tw, timeline::now_us(), job_of[j], (int64_t) j);
+                            const uint8_t* hb = nullptr;
+                            {
+                                timeline::Span wait_span("stager wait", job_of[j], (int64_t) j);
+                                hb = m.stager->wait(job_of[j]);
+                            }
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
                             tl0 = clk_copy.record(m.copy);
                             tl_name = "copy staged";
@@ -1469,9 +1473,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 const int sl = (int) (k % (size_t) m.ring);
                                 pt.mark(kPfWaitCopy, cs);
                                 if (use_issuer && a_issued.load(std::memory_order_acquire) <= k) {
-                                    const double tw = timeline::enabled() ? timeline::now_us() : 0;
+                                    timeline::Span wait_span("wait issuer", (int64_t) k, l);
                                     while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
-                                    if (tw > 0) timeline::complete("wait issuer", tw, timeline::now_us(), (int64_t) k, l);
                                 }
                                 cudaStreamWaitEvent(m.cs, m.copied[sl], 0);
                                 if (!compute(j, m.stage_dev[sl], sl)) return false;

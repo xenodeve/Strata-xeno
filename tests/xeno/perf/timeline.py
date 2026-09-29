@@ -85,6 +85,8 @@ class Timeline:
             (self.lanes[lane] if ph == "X" else self.instants).append(s)
         for v in self.lanes.values():
             v.sort(key=lambda s: (s.t0, -s.dur))
+        self._t0 = {ln: [s.t0 for s in v] for ln, v in self.lanes.items()}
+        self._maxdur = {ln: max((s.dur for s in v), default=0.0) for ln, v in self.lanes.items()}
         self._inner: dict[str, tuple[list, list]] = {}
 
     def lane(self, name: str) -> list[Span]:
@@ -97,6 +99,27 @@ class Timeline:
 
     def lanes_like(self, part: str) -> list[str]:
         return [n for n in self.lanes if part in n]
+
+    # windowed lookups (the lanes are sorted by start): a serve trace holds a million spans and thousands of rounds
+    def inside(self, lane: str, t0: float, t1: float) -> list[Span]:
+        """The spans of `lane` that lie within [t0, t1]."""
+        spans, starts = self.lane(lane), self._t0.get(lane, [])
+        out, i = [], bisect.bisect_left(starts, t0 - EPS)
+        while i < len(spans) and starts[i] <= t1 + EPS:
+            if spans[i].t1 <= t1 + EPS:
+                out.append(spans[i])
+            i += 1
+        return out
+
+    def overlapping(self, lane: str, t0: float, t1: float) -> list[Span]:
+        """The spans of `lane` that overlap (t0, t1)."""
+        spans, starts = self.lane(lane), self._t0.get(lane, [])
+        out, i = [], bisect.bisect_left(starts, t0 - self._maxdur.get(lane, 0.0) - EPS)
+        while i < len(spans) and starts[i] < t1 - EPS:
+            if spans[i].t1 > t0 + EPS:
+                out.append(spans[i])
+            i += 1
+        return out
 
     # ---- innermost attribution: at every instant of a lane, the shortest span covering it
     def _segments(self, lane: str) -> tuple[list, list]:
@@ -166,14 +189,6 @@ def union_ms(spans: list[Span], lo: float = float("-inf"), hi: float = float("in
     return total
 
 
-def overlapping(spans: list[Span], t0: float, t1: float) -> list[Span]:
-    return [s for s in spans if s.t0 < t1 - EPS and s.t1 > t0 + EPS]
-
-
-def inside(spans: list[Span], t0: float, t1: float) -> list[Span]:
-    return [s for s in spans if s.t0 >= t0 - EPS and s.t1 <= t1 + EPS]
-
-
 def pct(xs: list[float], q: float) -> float:
     if not xs:
         return 0.0
@@ -197,7 +212,7 @@ def prefill_report(tl: Timeline, top: int = 15) -> list[dict]:
     issue_t0 = [s.t0 for s in issues]
     out = []
     for run in tl.find("prefill run"):
-        copies = sorted((s for ln in copy_lanes for s in overlapping(tl.lane(ln), run.t0, run.t1)
+        copies = sorted((s for ln in copy_lanes for s in tl.overlapping(ln, run.t0, run.t1)
                          if s.name.startswith("copy ")), key=lambda s: s.t0)
         r: dict = {"t0_ms": run.t0, "wall_ms": run.dur, "tokens": run.a, "copies": len(copies),
                    "copy_busy_ms": union_ms(copies, run.t0, run.t1),
@@ -252,14 +267,14 @@ def prefill_report(tl: Timeline, top: int = 15) -> list[dict]:
         phase: dict[str, float] = defaultdict(float)
         layer_phase: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
         for ln in compute_lanes:
-            for s in overlapping(tl.lane(ln), run.t0, run.t1):
+            for s in tl.overlapping(ln, run.t0, run.t1):
                 phase[s.name] += s.dur
                 layer_phase[s.a][s.name] += s.dur
         r["phase_ms"] = dict(phase)
         r["layer_phase_ms"] = {k: dict(v) for k, v in sorted(layer_phase.items())}
         # each copy against the compute phase running at its midpoint: a copy that stretches while a long kernel
         # runs shows up against that kernel's phase
-        comp = sorted((s for ln in compute_lanes for s in overlapping(tl.lane(ln), run.t0, run.t1)), key=lambda s: s.t0)
+        comp = sorted((s for ln in compute_lanes for s in tl.overlapping(ln, run.t0, run.t1)), key=lambda s: s.t0)
         cstart = [s.t0 for s in comp]
         by: dict[str, list] = defaultdict(list)
         for c in copies:
@@ -282,7 +297,7 @@ def decode_report(tl: Timeline) -> dict:
     unacc = 0.0
     layer: dict[int, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     for rd in rounds:
-        kids = [s for s in inside(tl.lane(rd.lane), rd.t0, rd.t1) if s is not rd and s.name != "decode round"]
+        kids = [s for s in tl.inside(rd.lane, rd.t0, rd.t1) if s is not rd and s.name != "decode round"]
         for s in kids:
             per[s.name] += s.dur
             if s.name in ("wait gpu", "cpu experts"):
@@ -297,8 +312,7 @@ def decode_report(tl: Timeline) -> dict:
     gpu = {}
     for ln in tl.lanes:
         if ln.startswith("gpu") and "prefill" not in ln:
-            spans = tl.lane(ln)
-            gpu[ln] = sum(union_ms(overlapping(spans, rd.t0, rd.t1), rd.t0, rd.t1) for rd in rounds) / n
+            gpu[ln] = sum(union_ms(tl.overlapping(ln, rd.t0, rd.t1), rd.t0, rd.t1) for rd in rounds) / n
     r["gpu_busy_per_round_ms"] = gpu
     r["workers"] = workers_report(tl)
     return r
@@ -365,7 +379,7 @@ def server_report(tl: Timeline) -> list[dict]:
     engine_reqs = [s for s in tl.find("request")]
     for h in tl.find("http request"):
         r = {"t0_ms": h.t0, "http_ms": h.dur}
-        for s in inside(tl.lane(h.lane), h.t0, h.t1):
+        for s in tl.inside(h.lane, h.t0, h.t1):
             if s.name in ("template+tokenize", "queue wait", "engine request"):
                 r[s.name + "_ms"] = r.get(s.name + "_ms", 0.0) + s.dur
                 if s.name == "engine request":

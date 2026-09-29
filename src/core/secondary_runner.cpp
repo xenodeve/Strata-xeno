@@ -298,8 +298,8 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
     if (timeline::enabled() && !tl_anchored) { tl_clock().anchor(stream); tl_anchored = true; }
     cudaEvent_t tl_e0 = tl_clock().record(stream);
     auto tl_close = [&]() {
-        tl_clock().span(timeline::lane("gpu1 4070 experts"), "4070 experts", tl_e0, tl_clock().record(stream), n_tokens,
-                        (int64_t) group_slots_.size());
+        static const int tl_lane = timeline::lane("gpu1 4070 experts");
+        tl_clock().span(tl_lane, "4070 experts", tl_e0, tl_clock().record(stream), n_tokens, (int64_t) group_slots_.size());
     };
     auto fail_enqueued = [&]() {
         failed_ = true;
