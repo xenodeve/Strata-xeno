@@ -62,6 +62,12 @@ private:
 /// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream);
+/// #32: one row's bytes in quantize()'s layout (q8_1 blocks of 128 values, 144 B, column-block major).
+size_t q8_row_bytes(int64_t cols);
+/// #32: rows `rows[0..n)` of `src` (src_rows rows quantized by quantize() without ids) into `dst`, in quantize()'s
+/// layout: byte-identical to quantize() of the gathered float rows (xeno_q8_row_gather).
+void gather_q8_rows(const void* src, int64_t src_rows, const int32_t* rows, int64_t n, int64_t cols, void* dst,
+                    void* stream);
 /// #29: up to kGatherGroupMax GGUF-native expert blobs (gate at blob, up at blob + up_off, down at blob + down_off) into
 /// consecutive group slots in ONE launch: expert i's gate then up rows at gu_dst + i * gu_stride, its down at
 /// d_dst + i * d_stride.  Byte-identical to gather_native per expert (xeno_gather_group_parity).

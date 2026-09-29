@@ -108,6 +108,30 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) pad512(cols) * sizeof(block_q8_1_mmq) / (4 * QK8_1) + 128 * sizeof(block_q8_1_mmq);
 }
 
+size_t q8_row_bytes(int64_t cols) { return (size_t) pad512(cols) / (4 * QK8_1) * sizeof(block_q8_1_mmq); }
+
+namespace {
+static_assert(sizeof(block_q8_1_mmq) % 16 == 0, "a q8_1 MMQ block is copied as 16-byte words");
+constexpr int kQ8Words = (int) (sizeof(block_q8_1_mmq) / 16);
+// block (c, r) of the destination = block (c, rows[r]) of the source; one thread per 16-byte word
+__global__ void gather_q8_rows_kernel(const uint4* __restrict__ src, int64_t src_rows, const int32_t* __restrict__ rows,
+                                      int64_t n, int64_t nblk, uint4* __restrict__ dst) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nblk * n * kQ8Words) return;
+    const int64_t w = i % kQ8Words, rc = i / kQ8Words, r = rc % n, c = rc / n;
+    dst[(c * n + r) * kQ8Words + w] = src[(c * src_rows + rows[r]) * kQ8Words + w];
+}
+}  // namespace
+
+void gather_q8_rows(const void* src, int64_t src_rows, const int32_t* rows, int64_t n, int64_t cols, void* dst,
+                    void* stream) {
+    if (n <= 0) return;
+    const int64_t nblk = pad512(cols) / (4 * QK8_1);
+    gather_q8_rows_kernel<<<blocks(nblk * n * kQ8Words), 256, 0, (cudaStream_t) stream>>>(
+        (const uint4*) src, src_rows, rows, n, nblk, (uint4*) dst);
+    ck(cudaGetLastError(), "gather_q8_rows");
+}
+
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
