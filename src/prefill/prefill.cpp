@@ -99,6 +99,12 @@ inline int ring_slots(size_t T) {
     return (int64_t) T >= STREAM_ALL_MIN ? big : STAGE;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
+// F-1 (upstream 882bb6d, #42): STRATA_GR_UNFUSED=1 keeps the FP32 copy of the normalized rows (gr_norm + gr_mix, and
+// no F-2 fusion), the A/B arm
+inline bool gr_unfused() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_GR_UNFUSED"); return e && e[0] == '1'; }();
+    return v;
+}
 // #35 D6: the tokens the one-card MoE buffers hold: every chunk, or in the split layout only the chunks below
 // STREAM_ALL_MIN (a bigger one runs its routed experts on the peer card and never touches them)
 bool split_layout_usable();   // below: the split's static conditions (a native pack, every layer on MMQ)
@@ -541,6 +547,7 @@ struct Prefill::Impl {
     std::vector<void*> owned;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
+    float* grs = nullptr;                    // F-1: the hyper-connection read's row scales (T x 4)
     uint16_t *xn16 = nullptr, *lo16 = nullptr;
     float* mixed = nullptr;
     uint16_t *mixed_bf = nullptr, *mixed_h = nullptr;
@@ -580,6 +587,15 @@ struct Prefill::Impl {
     std::vector<size_t> mmq_sub_first;       // per group: its first sub-product (and one past the last group)
     std::unique_ptr<mmq::Context> mmq_ctx;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
+    // #42 (upstream fe609ce): the grouping tables in mapped pinned memory, [ids | slot | src] of T_max * K each, then
+    // the MMQ bounds.  Kernels (copy_i32) read and write them in place: a cudaMemcpyAsync of them queued behind the
+    // expert blobs the copy stream already held, and the GPU idled meanwhile.  STRATA_GROUP_COPY=1: the copies (A/B).
+    int32_t* grp_host = nullptr;
+    int32_t* grp_dev = nullptr;          // its device alias
+    size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
+    int32_t* ids_h() { return grp_host ? grp_host : ids_host.data(); }
+    int32_t* slot_h() { return grp_host ? grp_host + grp_tk : slot_host.data(); }
+    int32_t* src_h() { return grp_host ? grp_host + 2 * grp_tk : src_host.data(); }
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
     uint8_t* stage_dev[RING_MAX] = {};
@@ -766,6 +782,7 @@ Prefill::~Prefill() {
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
+    if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     impl_->split.reset();
     if (impl_->relay) { cudaStreamSynchronize(impl_->relay); cudaStreamDestroy(impl_->relay); }
     for (void* p : impl_->owned) cudaFree(p);
@@ -819,8 +836,8 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
         timeline::Span ws("split: sync prev meta", l);
         cudaEventSynchronize(sp.ev_meta);   // the previous layer's uploads have read hrows / hslot / hbounds
     }
-    std::memcpy(sp.hrows, m.src_host.data(), (size_t) TK * 4);
-    std::memcpy(sp.hslot, m.slot_host.data(), (size_t) TK * 4);
+    std::memcpy(sp.hrows, m.src_h(), (size_t) TK * 4);
+    std::memcpy(sp.hslot, m.slot_h(), (size_t) TK * 4);
     int64_t nb = 0;
     const int ng = (int) ((order.size() + MMQ_GROUP - 1) / MMQ_GROUP);
     for (int gi = 0; gi < ng; ++gi) {
@@ -1098,6 +1115,26 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
+    {   // #42: the mapped grouping tables (bounds: bounds_dev's size)
+        const size_t need = 3 * T * K + (size_t) (4 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
+        const char* gc = std::getenv("STRATA_GROUP_COPY");
+        if (m.grp_n < need && !(gc && gc[0] == '1')) {
+            if (m.grp_host) cudaFreeHost(m.grp_host);
+            m.grp_host = m.grp_dev = nullptr;
+            m.grp_n = m.grp_tk = 0;
+            void *h = nullptr, *d = nullptr;
+            if (cudaHostAlloc(&h, need * 4, cudaHostAllocMapped) == cudaSuccess &&
+                cudaHostGetDevicePointer(&d, h, 0) == cudaSuccess) {
+                m.grp_host = (int32_t*) h;
+                m.grp_dev = (int32_t*) d;
+                m.grp_n = need;
+                m.grp_tk = T * K;
+            } else {                              // the copies, as before
+                if (h) cudaFreeHost(h);
+                cudaGetLastError();
+            }
+        }
+    }
     for (int b = 0; b < 2; ++b) {
         if (!m.ple_emb_host[b] &&
             cudaHostAlloc((void**) &m.ple_emb_host[b], (size_t) T * N * 4, cudaHostAllocDefault) != cudaSuccess) {
@@ -1161,7 +1198,9 @@ bool Prefill::carve(size_t T, void* alloc) {
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     bool ok = true;
-    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok); m.xn = o.take<float>(T * D, ok);
+    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok);
+    m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
+    m.grs = o.take<float>(T * HC, ok);
     m.xn16 = o.take<uint16_t>(T * D, ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
@@ -1282,7 +1321,10 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
-    f(T * N); f(T * D); f(T * D); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
+    f(T * N); f(T * D);
+    if (gr_unfused()) f(T * D);   // F-1: xn only in the unfused arm (carve's order)
+    f(T * HC);
+    o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -1893,6 +1935,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         } else if (stream_all) {
             issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
         }
+        bool normed = false;   // F-2: the previous half's write already normed R for this half (grs, xn16)
         for (int64_t l = 0; l < g.n_layers; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             timeline::Span layer_span("layer (host)", l, c0);
@@ -1956,7 +1999,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 stats_.ms_ple += ms_since(tp);
             }
             for (int half = 0; half < 2; ++half) {
-                // ---- the hyper-connection read of this half
+                // ---- the hyper-connection read of this half (F-2: already normed by the previous half's write)
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
                 const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
                                   su = std::string(pre) + "up.weight", si = std::string(pre) + "inject.weight";
@@ -1964,12 +2007,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
                 pt.mark(kPfHc, cs);
-                gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs);
+                if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs);
+                else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs);
+                normed = false;
                 if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs);
                 if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
-                gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
+                if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
+                else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
 
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
@@ -2159,16 +2205,22 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfHostGroup, cs);
                     {
                         timeline::Span sync_span("router sync", l, (int64_t) consumed);
-                        cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                        // (the sync also orders this layer's host writes of slot/src/bounds after the previous
+                        // layer's kernels that read them)
+                        if (m.grp_host) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
+                        else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
                         cudaStreamSynchronize(m.cs);
                     }
                     const double tl_fold = timeline::enabled() ? timeline::now_us() : 0;
                     pt.fold();
                     if (tl_fold > 0) timeline::complete("group: timer fold", tl_fold, timeline::now_us(), l);
                     const double tl_group = timeline::enabled() ? timeline::now_us() : 0;
+                    const int32_t* ids_h = m.ids_h();
+                    int32_t* slot_h = m.slot_h();
+                    int32_t* src_h = m.src_h();
                     std::fill(m.cnt.begin(), m.cnt.end(), 0);
                     for (int64_t i = 0; i < T * K; ++i) {
-                        const int32_t e = m.ids_host[(size_t) i];
+                        const int32_t e = ids_h[(size_t) i];
                         if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                         ++m.cnt[(size_t) e];
                     }
@@ -2192,7 +2244,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 ex[(size_t) e * 3 + 2] = m.peer_res && m.peer_res[(size_t) l * NE32 + e] >= 0;
                             }
                             std::fwrite(ex.data(), 4, ex.size(), f);
-                            std::fwrite(m.ids_host.data(), 4, (size_t) T * K, f);
+                            std::fwrite(ids_h, 4, (size_t) T * K, f);
                             std::fclose(f);
                         }
                     }
@@ -2200,15 +2252,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const double tl_fill = timeline::enabled() ? timeline::now_us() : 0;
                     std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                     for (int64_t i = 0; i < T * K; ++i) {
-                        const int32_t e = m.ids_host[(size_t) i];
+                        const int32_t e = ids_h[(size_t) i];
                         const int32_t p = fill[(size_t) e]++;
-                        m.slot_host[(size_t) i] = p;
-                        m.src_host[(size_t) p] = (int32_t) (i / K);
+                        slot_h[(size_t) i] = p;
+                        src_h[(size_t) p] = (int32_t) (i / K);
                     }
                     if (tl_fill > 0) timeline::complete("group: fill", tl_fill, timeline::now_us(), l);
                     // the 5060's own expert walk and combine read them; a split layer's go to the 4070 instead (#35 D5:
                     // two pageable uploads here held the 5060's queue ahead of the quantize the 4070 waits for)
-                    if (!split_l) {
+                    if (!split_l && m.grp_host) {   // #42: kernels on the compute stream, not the copy engine
+                        copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
+                        copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
+                    } else if (!split_l) {
                         cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                         cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                     }
@@ -2261,8 +2316,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                         }
                         m.mmq_sub_first[ng] = m.mmq_subs.size();
-                        cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
-                                        cudaMemcpyHostToDevice, m.cs);
+                        if (m.grp_host && m.bounds_host.size() <= m.grp_n - 3 * m.grp_tk) {
+                            std::memcpy(m.grp_host + 3 * m.grp_tk, m.bounds_host.data(), m.bounds_host.size() * 4);
+                            copy_i32(m.bounds_dev, m.grp_dev + 3 * m.grp_tk, (int64_t) m.bounds_host.size(), m.cs);
+                        } else {
+                            cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
+                                            cudaMemcpyHostToDevice, m.cs);
+                        }
                     } else {
                         gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                     }
@@ -2577,8 +2637,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                     }
                 }
-                // ---- the hyper-connection write of this half
-                gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
+                // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
+                // touches R in between (not after the last layer, not before the PLE block of layer 1, not under a
+                // control vector)
+                const int64_t nl = half == 0 ? l : l + 1;
+                const bool fuse = !gr_unfused() && nl < g.n_layers && !(half == 1 && nl == 1 && ple_on) &&
+                                  !(half == 1 && strata::kernels::cvec().covers(l));
+                const core::WeightRef* wnn = nullptr;
+                if (fuse) {
+                    const core::LayerView vn(*m.wt, nl);
+                    wnn = need(vn, half == 0 ? "hc_ffn_norm.weight" : "hc_attn_norm.weight", err);
+                    if (!wnn) return false;
+                }
+                if (wnn) {
+                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs);
+                    normed = true;
+                } else {
+                    gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
+                }
                 // #35 D7: chunk c+1 may start layer l - in a split layer only once this chunk's MoE is handed to the
                 // 4070 (split_experts), or its trunk occupies this card and delays that hand-off (tlS: 37 ms a layer)
                 if (wave && half == 0 && !split_on) wave->publish_attn(chunk_i, l, m.cs);
