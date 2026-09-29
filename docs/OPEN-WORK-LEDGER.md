@@ -62,6 +62,17 @@ The floor is therefore about 12 ms/round. Measured is ~39.5 ms/round on code (85
 
 **Prefill profile, corrected 2026-09-29:** 2K prefill: span 7.79 s, GPU busy 2.84 s (37 %), memcpy 2.90 s for 20.05 GB. ~~Expert streaming over x4 bounds prefill~~ - wrong: copy and compute overlap only 0.65 s and the compute thread spends 4.88 s in CUDA API calls, so prefill is launch-bound (#29). Tensor-core GEMMs are not bit-identical across sm_89/sm_120 (`docs/reports/2026-09-29-gemm-cross-arch.txt`), so #5 is an opt-in for later. #29 item 1 (batched QSA indexer append, 767fcfc): 7.17 -> 6.75 s, identical output.
 
+**Upstream 0.1.20 merge (#30), branch `xeno/claude-merge-0.1.20`, 2026-09-29.** Merge commit `2a9b26c`, then `c7a469e`, `ff2bdae`.
+- The merge introduced one bug of its own, fixed before commit: the stager branch lost its `copied` event, so MMQ read ring slots early (NaN under exclusive ownership).
+- Measured: 2K prefill −19 % single GPU and −12 % dual, with identical output. 8K with `--prefill auto`: 339 → ~700 tok/s, but the output differs from pre-merge (MMQ numerics).
+- Prefill breakdown at 8K, single GPU (`STRATA_PREFILL_TIMING`): GPU0 timeline 10.8 s. MoE 5.4 s, of which the x4 copies take 4.1 s. QSA 2.1 s, GDN 1.6 s, hc/embed 1.6 s. The 4070 does no prefill compute. The CPU staging threads take 3.7 s (overlapped, pageable arena).
+- **Unexplained:** at 8K the x4 link idles ~200 ms per layer. The gap ends at the next router synchronize while the copy thread sits inside `cudaMemcpyAsync`. Ruled out: stager threads, ring size, mapped router ids, stream flushes.
+- **Cross-arch numerics** (#5):
+  - A single floating `mma.sync` differs between sm_89 and sm_120; integer `mma.sync` is exact.
+  - MMQ is identical once stream-k is off (default since `ff2bdae`, no speed cost). swiglu and q8_1 quantize are identical too.
+  - A bit-exact MoE-layer offload to the 4070 is designed, **parked on the 4070 VRAM decision** (#5).
+- Still to validate on the merged build: decode ABBA, `--serve`, `--pcie-frac` on x4 after upstream's 0.1.14 copy kernel.
+
 **Open questions:**
 - Short prompts show TTFT +0.12-0.19 s with placement-first (4/4 runs), while the 8K prompt is unchanged. The cause is unknown.
 - `tests/xeno/short_read_probe.py` appeared untracked in this worktree. It was not written by this session and was left alone.
