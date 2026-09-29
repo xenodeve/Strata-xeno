@@ -488,6 +488,31 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
     check("gather_rows16");
 }
+__global__ void moe_routed_sum_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                      const float* __restrict__ w, float* __restrict__ out, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    out[i] = s;
+}
+__global__ void moe_shared_finish_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
+                                         float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const float s = bo[i];
+    bo[i] = s + shared[i] * sigm(sg[i / N]);
+}
+void moe_routed_sum(const float* Dm, const int32_t* slot, const float* w, float* s, int64_t T, void* stream) {
+    moe_routed_sum_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, s, T);
+    check("moe_routed_sum");
+}
+void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
+    moe_shared_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(shared, sg, bo, T);
+    check("moe_shared_finish");
+}
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);

@@ -47,6 +47,11 @@ void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void*
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
+/// #35 D1: moe_combine in two halves on two cards: the routed sum (the same fmaf chain over k = 0..9) where the
+/// expert rows are, then bo += shared * sigmoid(sg) where the shared expert ran.  Together byte-identical to
+/// moe_combine (xeno_combine_split_parity).  moe_shared_finish runs in place: bo holds the routed sum on entry.
+void moe_routed_sum(const float* D, const int32_t* slot, const float* w, float* s, int64_t T, void* stream);
+void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream);
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
 

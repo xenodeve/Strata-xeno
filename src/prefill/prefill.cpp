@@ -262,12 +262,13 @@ struct Stager {
 };
 
 // #32 S4 expert_split (STRATA_PREFILL_EXPERT_SPLIT=1), the simulator's whole_4070 policy (it wins every layer of
-// the real 8K dual-GPU trace, 2.2 vs 4.0 s lower bound): the 4070 runs every routed expert of an MoE layer and its
-// combine.  The 5060 keeps the trunk, the router and the shared expert.  Per layer, over the 5060's x4 link: the
-// per-token q8 activations, the shared expert's output and the gates go down (5060 -> pinned host -> 4070), the
-// weights of the experts only the 5060 holds go down too, and the combined output comes back.  Every other expert
-// reaches the 4070 over its own x16: the ones it owns in place, the host ones through a pinned stager and a ring.
-// The products are mmq::expert_rows and moe_combine, byte-identical across the cards (xeno_moe_layer_cross_arch).
+// the real 8K dual-GPU trace, 2.2 vs 4.0 s lower bound): the 4070 runs every routed expert of an MoE layer and their
+// routed sum.  The 5060 keeps the trunk, the router and the shared expert, and finishes bo with the shared term (#35
+// D1: moe_routed_sum + moe_shared_finish == moe_combine, xeno_combine_split_parity).  Per layer, over the 5060's x4
+// link: the per-token q8 activations and the gates go down (5060 -> pinned host -> 4070), the weights of the experts
+// only the 5060 holds go down too, and the routed sum comes back.  Every other expert reaches the 4070 over its own
+// x16: the ones it owns in place, the host ones through a pinned stager and a ring.  The products are
+// mmq::expert_rows, byte-identical across the cards (xeno_moe_layer_cross_arch).
 struct SplitTier {
     static constexpr int64_t R = 4096;   // rows per sub-product (an expert with more rows spans several)
     // 4070 expert staging slots.  96, 192, 320, 480 and 512 measured the same (8.85-9.1 s at 8K) once the 5060's
@@ -284,16 +285,16 @@ struct SplitTier {
     std::unique_ptr<mmq::Context> ctx;       // on the 4070
     std::unique_ptr<Stager> stager;          // on the 4070: host experts into pinned buffers
     void *xtok = nullptr, *xq = nullptr, *hq = nullptr;
-    float *gu = nullptr, *h = nullptr, *dm = nullptr, *shared = nullptr, *w = nullptr, *sg = nullptr, *bo = nullptr;
+    float *gu = nullptr, *h = nullptr, *dm = nullptr, *w = nullptr, *bo = nullptr;   // bo: the routed sum
     int32_t *rows = nullptr, *slot = nullptr, *ids = nullptr, *bounds = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr, *ring = nullptr;
     size_t grp_gu_bytes = 0, grp_d_bytes = 0;
     // pinned relay buffers (portable) and the host side of the uploads
     uint8_t *hx = nullptr, *hres = nullptr;
-    float *hsh = nullptr, *hw = nullptr, *hsg = nullptr, *hbo = nullptr;
+    float *hw = nullptr, *hbo = nullptr;
     int32_t *hrows = nullptr, *hslot = nullptr, *hbounds = nullptr;
     int64_t hbounds_cap = 0;
-    // on the 5060: the activations in host, the shared output and gates in host, the output uploaded, a resident
+    // on the 5060: the activations in host, the gates in host, the output uploaded, a resident
     // expert's blob in host
     cudaEvent_t ev_x = nullptr, ev_sh = nullptr, ev_done = nullptr, ev_res[RES] = {};
     // on the 4070: the inputs read, the uploads read, the output in host, a pinned slot / ring slot free, copied
@@ -359,7 +360,7 @@ struct SplitTier {
         if (res_stream) { cudaStreamSynchronize(res_stream); cudaStreamDestroy(res_stream); }
         for (cudaEvent_t e : {ev_x, ev_sh, ev_done}) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_res) if (e) cudaEventDestroy(e);
-        for (void* b : {(void*) hx, (void*) hres, (void*) hsh, (void*) hw, (void*) hsg, (void*) hbo, (void*) hrows,
+        for (void* b : {(void*) hx, (void*) hres, (void*) hw, (void*) hbo, (void*) hrows,
                         (void*) hslot, (void*) hbounds}) if (b) cudaFreeHost(b);
     }
     /// allocate for chunks of up to T tokens; false (and err) when the 4070 cannot hold it
@@ -383,10 +384,8 @@ struct SplitTier {
         const int64_t TK = T * 10;
         hbounds_cap = 2 * n_expert + 2 * (TK / R + 2) + 8;
         hx = (uint8_t*) h_alloc(mmq::q8_bytes(T, N));
-        hsh = (float*) h_alloc((size_t) (T * N) * 4);
         hbo = (float*) h_alloc((size_t) (T * N) * 4);
         hw = (float*) h_alloc((size_t) TK * 4);
-        hsg = (float*) h_alloc((size_t) T * 4);
         hrows = (int32_t*) h_alloc((size_t) TK * 4);
         hslot = (int32_t*) h_alloc((size_t) TK * 4);
         hbounds = (int32_t*) h_alloc((size_t) hbounds_cap * 4);
@@ -420,10 +419,8 @@ struct SplitTier {
         gu = (float*) d_alloc((size_t) (R * 1280) * 4);
         h = (float*) d_alloc((size_t) (R * 640) * 4);
         dm = (float*) d_alloc((size_t) (TK * N) * 4);
-        shared = (float*) d_alloc((size_t) (T * N) * 4);
         bo = (float*) d_alloc((size_t) (T * N) * 4);
         w = (float*) d_alloc((size_t) TK * 4);
-        sg = (float*) d_alloc((size_t) T * 4);
         rows = (int32_t*) d_alloc((size_t) TK * 4);
         slot = (int32_t*) d_alloc((size_t) TK * 4);
         ids = (int32_t*) d_alloc((size_t) R * 4);
@@ -627,12 +624,11 @@ bool split_experts(Impl& m, int64_t l, int64_t T, const std::vector<int32_t>& or
     cudaEventRecord(sp.ev_x, m.relay);
     cudaEvent_t tr1 = sp.clk_relay.record(m.relay);
     sp.clk_relay.span(sp.tl_relay, "activations down", tr0, tr1, l);
-    // the combine's inputs: needed only at the end, so they cross while the experts run
-    cudaMemcpyAsync(sp.hsh, m.shared, (size_t) (T * N) * 4, cudaMemcpyDeviceToHost, m.relay);
+    // the routed sum's gates: needed only at the end, so they cross while the experts run (#35 D1: the shared
+    // output and its gate stay on the 5060, which finishes bo itself)
     cudaMemcpyAsync(sp.hw, m.w, (size_t) TK * 4, cudaMemcpyDeviceToHost, m.relay);
-    cudaMemcpyAsync(sp.hsg, m.sg, (size_t) T * 4, cudaMemcpyDeviceToHost, m.relay);
     cudaEventRecord(sp.ev_sh, m.relay);
-    sp.clk_relay.span(sp.tl_relay, "shared down", tr1, sp.clk_relay.record(m.relay), l);
+    sp.clk_relay.span(sp.tl_relay, "gates down", tr1, sp.clk_relay.record(m.relay), l);
     // 2. the host tables (rows by expert, (t, k) -> row) and the sub-products: row ranges cut at R within a group
     struct Sub { int grp; int64_t r0, nr, maxr; int q0, n; int64_t boff; };
     std::vector<Sub> subs;
@@ -676,12 +672,10 @@ bool split_experts(Impl& m, int64_t l, int64_t T, const std::vector<int32_t>& or
     sp.clk_s.mark(sp.tl_s, "inputs up", sp.s, l);
     cudaMemcpyAsync(sp.xtok, sp.hx, xbytes, cudaMemcpyHostToDevice, sp.s);
     cudaEventRecord(sp.ev_xread, sp.s);
-    // the late inputs on their own stream (the previous layer's combine has read them: u waits for s's last record)
+    // the gates on their own stream (the previous layer's routed sum has read them: u waits for s's last record)
     cudaStreamWaitEvent(sp.u, sp.ev_bo, 0);
     cudaStreamWaitEvent(sp.u, sp.ev_sh, 0);
-    cudaMemcpyAsync(sp.shared, sp.hsh, (size_t) (T * N) * 4, cudaMemcpyHostToDevice, sp.u);
     cudaMemcpyAsync(sp.w, sp.hw, (size_t) TK * 4, cudaMemcpyHostToDevice, sp.u);
-    cudaMemcpyAsync(sp.sg, sp.hsg, (size_t) T * 4, cudaMemcpyHostToDevice, sp.u);
     cudaEventRecord(sp.ev_shread, sp.u);
     cudaMemcpyAsync(sp.rows, sp.hrows, (size_t) TK * 4, cudaMemcpyHostToDevice, sp.s);
     cudaMemcpyAsync(sp.slot, sp.hslot, (size_t) TK * 4, cudaMemcpyHostToDevice, sp.s);
@@ -751,15 +745,15 @@ bool split_experts(Impl& m, int64_t l, int64_t T, const std::vector<int32_t>& or
         sp.clk_s.mark(sp.tl_s, "products", sp.s, l, sb.grp);
         mmq::expert_rows(*sp.ctx, a, sp.s);
     }
-    sp.clk_s.mark(sp.tl_s, "wait shared", sp.s, l);
+    sp.clk_s.mark(sp.tl_s, "wait gates", sp.s, l);
     cudaStreamWaitEvent(sp.s, sp.ev_shread, 0);
-    sp.clk_s.mark(sp.tl_s, "combine", sp.s, l);
+    sp.clk_s.mark(sp.tl_s, "routed sum", sp.s, l);
     {
         const size_t end = sp.seq_start[(size_t) l + 1];
         if (sp.consumed.load(std::memory_order_acquire) < end) sp.consumed.store(end, std::memory_order_release);
     }
     // 5. combine here; the output down to host and up into the 5060's bo
-    moe_combine(sp.dm, sp.slot, sp.w, sp.shared, sp.sg, sp.bo, T, sp.s);
+    moe_routed_sum(sp.dm, sp.slot, sp.w, sp.bo, T, sp.s);
     cudaStreamWaitEvent(sp.s, sp.ev_done, 0);   // the 5060 has uploaded the previous layer's output from hbo
     sp.clk_s.mark(sp.tl_s, "output down", sp.s, l);
     cudaMemcpyAsync(sp.hbo, sp.bo, (size_t) (T * N) * 4, cudaMemcpyDeviceToHost, sp.s);
@@ -1826,13 +1820,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
-                    // the shared expert and its scalar gate
-                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
-                    swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
-                    if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
-                    m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                    // the shared expert and its scalar gate (#35 D1: in a split layer it runs after the routed experts
+                    // are handed to the 4070, overlapping them; the 4070 never needs it)
+                    auto shared_expert = [&]() -> bool {
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
+                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                        if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
+                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                        return true;
+                    };
+                    const bool split_here = split_layer(l);
+                    if (!split_here && !shared_expert()) return false;
                     // group the (token, k) pairs by expert on the host
                     pt.mark(kPfHostGroup, cs);
                     {
@@ -2211,8 +2211,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         release_to(m.g->n_expert);
                     }
                     pt.mark(kPfCombine, cs);
-                    if (split_l) cudaStreamWaitEvent(m.cs, m.split->ev_done, 0);   // the 4070's combined output
-                    else moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    if (split_l) {
+                        if (!shared_expert()) return false;   // while the 4070 runs the routed experts
+                        cudaStreamWaitEvent(m.cs, m.split->ev_done, 0);   // the 4070's routed sum is in bo
+                        moe_shared_finish(m.shared, m.sg, m.bo, T, m.cs);
+                    } else {
+                        moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    }
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
