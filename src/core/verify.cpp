@@ -32,6 +32,8 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/timeline.hpp"
+#include "strata/timeline_gpu.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -252,7 +254,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff, g.n_embd)));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
@@ -646,9 +648,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return false;
             }
         }
-        if (strata::kernels::cpu::expert_layout().native)
-            quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-        else
+        if (strata::kernels::cpu::expert_layout().native) {
+            const auto& fmt = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+            if (fmt.gu_type == 42 && fmt.d_type == 42)
+                quantize_q8_1_rows_scaled(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36,
+                                           hit_xs_ + (size_t) tb * (N / 32), cs);
+            else
+                quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+        } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
         stamp(l, 18, grp);
         return true;
@@ -685,7 +692,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const auto& f = lay.fmt[(size_t) l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs,
+                                       f.gu_type == 42 && f.d_type == 42 ? hit_xs_ + (size_t) tb * (N / 32) : nullptr);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
@@ -693,31 +701,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         grouped(p_ptr, p_start, p_counts);
         stamp(l, 20, grp);
-        if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-        else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-        if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-            uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+        if (pcie_share_) {   // (xeno) no PCIe share planned (--pcie-frac 0): skip its wait and empty grouped launches
+            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+            else wait_flag_ge(m_flagB_, ring, cs);             // the PCIe share is in staging (DMA) or mapped
+            if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            }
+            stamp(l, 21, grp);
+            grouped(p_ptr2, p_start2, p_counts + 2);
         }
-        stamp(l, 21, grp);
-        grouped(p_ptr2, p_start2, p_counts + 2);
         stamp(l, 22, grp);
         if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
             wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
+            moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         } else {
             wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
             stamp(l, 23, grp);
-            if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
-                copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
-                                      p_dst, p_counts + 1, cs);
-            else
-                copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+            // (xeno) H2: read only the rows that are not GPU hits over the link (bitwise copy + moe_hit_add)
+            moe_hit_merge_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst,
+                                 p_counts + 1, (int64_t) n * K, N, cs);
         }
-        moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
                 native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
@@ -952,7 +960,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
-    if (!capture(T, err) || !capture_commit(err)) return false;
+    // #33 STRATA_TIMELINE: the window, and inside it staging, launch, per layer the host's wait for the primary GPU's
+    // doorbell ("wait gpu") and the CPU experts it then serves ("cpu experts"), the tail and the head sampling
+    timeline::Span window_span("verify window", T, pos0);
+    {
+        timeline::Span capture_span("verify capture", T);   // #44: the graph lookup (a capture when T is new)
+        if (!capture(T, err) || !capture_commit(err)) return false;
+    }
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
@@ -966,6 +980,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) (pos0 + t);
     }
     if (ss.ple.ready() && ple_stage()) {
+        timeline::Span ple_span("ple gather", T);   // #44: the PLE rows of the window's tokens
         uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
         for (int t = 0; t < T; ++t) {
@@ -985,9 +1000,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
+    const Clock::time_point tl = Clock::now();
+    timeline::complete("verify stage", t0, tl, T);
+    timeline::GpuClock* gc = decode_gpu_begin(cs_);
+    cudaEvent_t ge0 = gc ? gc->record(cs_) : nullptr;
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    if (gc) decode_gpu_span("verify graph", ge0, gc->record(cs_), T, pos0);
     (void) cudaStreamQuery(cs_);
+    ms_launch += ms_since(tl);
+    if (timeline::enabled()) timeline::complete("verify launch", tl, Clock::now(), T);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -1042,12 +1064,19 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+        if (timeline::enabled()) {
+            timeline::complete("wait gpu", a, b, l, grp);
+            timeline::complete("cpu experts", b, Clock::now(), l, grp);
+        }
     }
+    const Clock::time_point tt = Clock::now();
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    ms_tail += ms_since(tt);
+    if (timeline::enabled()) timeline::complete("verify tail", tt, Clock::now(), T);
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
         const int64_t L = g.n_layers;
@@ -1080,6 +1109,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+        timeline::Span sampling_span("head sampling", T);
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
@@ -1167,6 +1197,22 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
+timeline::GpuClock* decode_gpu_begin(cudaStream_t s) {
+    if (!timeline::enabled()) return nullptr;
+    static timeline::GpuClock clock;
+    static bool anchored = false;
+    if (!anchored) { clock.anchor(s); anchored = true; }
+    clock.resolve(false);
+    return &clock;
+}
+
+void decode_gpu_span(const char* name, cudaEvent_t e0, cudaEvent_t e1, int64_t a, int64_t b) {
+    timeline::GpuClock* c = decode_gpu_begin(nullptr);
+    if (c == nullptr) return;
+    static const int lane = timeline::lane("gpu0 decode");
+    c->span(lane, name, e0, e1, a, b);
+}
+
 bool Verifier::commit(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
@@ -1175,8 +1221,11 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    timeline::GpuClock* gc = decode_gpu_begin(cs_);
+    cudaEvent_t ge0 = gc ? gc->record(cs_) : nullptr;
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+    if (gc) decode_gpu_span("commit graph", ge0, gc->record(cs_), n_keep);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     if (ple_stage())   // stages that share one session must advance it once
@@ -1185,6 +1234,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
+    if (timeline::enabled()) timeline::complete("verify commit", t0, Clock::now(), n_keep);
     return next_ == nullptr || next_->commit(n_keep, err);
 }
 

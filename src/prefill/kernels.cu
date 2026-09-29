@@ -444,15 +444,22 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     const int64_t r = i / per, j = i % per;
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
+// the routed sum of token t's column d: one fmaf chain in k order.  moe_combine and the split's moe_routed_sum share it,
+// so the two cards' halves (#35 D1) add in the same order by construction
+__device__ __forceinline__ float routed_sum(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                            const float* __restrict__ w, int64_t t, int64_t d) {
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    return s;
+}
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
                                    const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
-    float s = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    const float s = routed_sum(Dm, slot, w, t, d);
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
@@ -663,10 +670,6 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
     swiglu_il_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(gu, h16, n);
     check("swiglu_interleaved");
 }
-void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
-    swiglu_pair_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(g, u, h16, n);
-    check("swiglu_pair");
-}
 namespace {
 __global__ void copy_i32_kernel(int32_t* __restrict__ dst, const int32_t* __restrict__ src, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
@@ -679,10 +682,35 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     copy_i32_kernel<<<(unsigned) (b < 256 ? b : 256), 256, 0, (cudaStream_t) stream>>>(dst, src, n);
     check("copy_i32");
 }
+void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
+    swiglu_pair_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(g, u, h16, n);
+    check("swiglu_pair");
+}
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream) {
     if (n <= 0) return;
     gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
     check("gather_rows16");
+}
+__global__ void moe_routed_sum_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                      const float* __restrict__ w, float* __restrict__ out, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    out[i] = routed_sum(Dm, slot, w, i / N, i % N);
+}
+__global__ void moe_shared_finish_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
+                                         float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const float s = bo[i];
+    bo[i] = s + shared[i] * sigm(sg[i / N]);
+}
+void moe_routed_sum(const float* Dm, const int32_t* slot, const float* w, float* s, int64_t T, void* stream) {
+    moe_routed_sum_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, s, T);
+    check("moe_routed_sum");
+}
+void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
+    moe_shared_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(shared, sg, bo, T);
+    check("moe_shared_finish");
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {

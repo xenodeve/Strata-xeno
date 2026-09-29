@@ -83,6 +83,12 @@ std::vector<int> physical_cores(bool skip_first);
 ///
 /// Returns the PREVIOUS affinity mask, or -1 if the platform refused; pass it to `restore_thread_affinity`.
 long long pin_current_thread(int core);
+
+/// Windows thread priority (THREAD_PRIORITY_*, e.g. 1 = above normal, 2 = highest) that ExpertPool workers
+/// set on themselves at start, and that set_current_thread_priority applies to the caller. 0 leaves the default.
+/// Set before constructing the pool.
+void set_worker_priority(int priority);
+void set_current_thread_priority(int priority);
 void restore_thread_affinity(long long previous);
 
 class ExpertPool {
@@ -163,6 +169,12 @@ public:
     /// spinning forever, and the server starts it again (issue #29).
     static constexpr std::chrono::seconds kStall{60};
 
+    /// Send the parked workers to sleep now instead of after the spin; the next publish wakes them.
+    /// Call it when the token path is about to leave the pool alone for a while (a verify window has ended):
+    /// the pinned spin otherwise holds every worker core at the pool's priority, and with a worker on every core
+    /// the between-window work (adapt thread, copies, MTP host work) could not run (strata-claude-workers).
+    void rest() { rest_.store(true, std::memory_order_seq_cst); }
+
 private:
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
@@ -212,6 +224,8 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
+    alignas(64) std::atomic<bool> rest_{false};   // see rest(); cleared by the next publish
+    alignas(64) std::atomic<double> publish_us_{0};   // #33 STRATA_TIMELINE: the last publish, for the wake spans
     // The sleep after `kSpinBeforeSleep`.  `sleepers_` is how `publish` knows whether anyone needs waking, so the
     // token path pays one uncontended load per publish and never takes the mutex while the workers spin.
     alignas(64) std::atomic<uint32_t> sleepers_{0};

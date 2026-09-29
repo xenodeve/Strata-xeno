@@ -12,6 +12,11 @@
 
 namespace strata::prefill {
 
+/// Creates and drops a cuBLAS handle on `device`: with CUDA_MODULE_LOADING=EAGER (set by strata generate) the first
+/// handle loads every cuBLAS kernel into the context, ~2.7 s here.  Called on a thread during load, so the prompt
+/// path's own handle is fast (#30: TTFT 3.9 -> 1.3 s on the code prompt).
+void warm_cublas(int device);
+
 class Gemm {
 public:
     Gemm() = default;

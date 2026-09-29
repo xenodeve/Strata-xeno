@@ -88,6 +88,7 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 }  // namespace
 
 bool built() { return true; }
+void warm() { (void) ggml_cuda_info(); }
 
 bool supported(int t) {
     switch ((ggml_type) t) {
@@ -108,6 +109,30 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) pad512(cols) * sizeof(block_q8_1_mmq) / (4 * QK8_1) + 128 * sizeof(block_q8_1_mmq);
 }
 
+size_t q8_row_bytes(int64_t cols) { return (size_t) pad512(cols) / (4 * QK8_1) * sizeof(block_q8_1_mmq); }
+
+namespace {
+static_assert(sizeof(block_q8_1_mmq) % 16 == 0, "a q8_1 MMQ block is copied as 16-byte words");
+constexpr int kQ8Words = (int) (sizeof(block_q8_1_mmq) / 16);
+// block (c, r) of the destination = block (c, rows[r]) of the source; one thread per 16-byte word
+__global__ void gather_q8_rows_kernel(const uint4* __restrict__ src, int64_t src_rows, const int32_t* __restrict__ rows,
+                                      int64_t n, int64_t nblk, uint4* __restrict__ dst) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nblk * n * kQ8Words) return;
+    const int64_t w = i % kQ8Words, rc = i / kQ8Words, r = rc % n, c = rc / n;
+    dst[(c * n + r) * kQ8Words + w] = src[(c * src_rows + rows[r]) * kQ8Words + w];
+}
+}  // namespace
+
+void gather_q8_rows(const void* src, int64_t src_rows, const int32_t* rows, int64_t n, int64_t cols, void* dst,
+                    void* stream) {
+    if (n <= 0) return;
+    const int64_t nblk = pad512(cols) / (4 * QK8_1);
+    gather_q8_rows_kernel<<<blocks(nblk * n * kQ8Words), 256, 0, (cudaStream_t) stream>>>(
+        (const uint4*) src, src_rows, rows, n, nblk, (uint4*) dst);
+    ck(cudaGetLastError(), "gather_q8_rows");
+}
+
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
@@ -119,6 +144,14 @@ Context::Context() {
     int dev = 0;
     cudaGetDevice(&dev);
     ctx_ = new ggml_backend_cuda_context(dev);
+    // #5: stream-k sizes its grid from the SM count (36 on the 5060 Ti, 56 on the 4070 SUPER) and splits a tile's K
+    // range across blocks, summed in float by the fixup - so the result depends on the card. With nsm = 1 every tile
+    // gets its own block over the whole K range in one fixed order, and the products are bit-identical on sm_89 and
+    // sm_120 (xeno_mmq_cross_arch: 0 of 6.4M values differ; with stream-k 7 of 8 cases differed). Same speed and the
+    // same 8K output on the 5060 Ti (strata-claude-stage K*), so it is the default. STRATA_MMQ_STREAM_K=1: stream-k.
+    // ggml-cuda serves only these MMQ products in this process, so the device table is ours to set.
+    if (std::getenv("STRATA_MMQ_STREAM_K") == nullptr)
+        const_cast<ggml_cuda_device_info&>(ggml_cuda_info()).devices[dev].nsm = 1;
 }
 Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
 
@@ -150,6 +183,30 @@ void Context::run(const Product& p, void* stream) {
     ck(cudaGetLastError(), "mul_mat_q");
 }
 
+void expert_rows_gate_up(Context& ctx, const ExpertRows& a, void* stream) {
+    gather_q8_rows(a.xtok, a.xtok_rows, a.rows, a.nr, a.n_embd, a.xq, stream);
+    Product gu;
+    gu.w = a.gu; gu.type = a.gu_type; gu.w_rows = 2 * a.n_ff; gu.w_cols = a.n_embd; gu.expert_bytes = a.gu_bytes;
+    gu.n = a.n; gu.xq = a.xq; gu.bounds = a.bounds; gu.ids = a.ids; gu.total_rows = a.nr; gu.max_rows = a.max_rows;
+    gu.dst = a.gu_out; gu.ld_dst = 2 * a.n_ff;
+    ctx.run(gu, stream);
+    swiglu(a.gu_out, a.h, a.nr, a.n_ff, a.interleaved, stream);
+}
+
+void expert_rows_down(Context& ctx, const ExpertRows& a, void* stream) {
+    quantize(a.h, nullptr, a.hq, a.down_type, a.n_ff, a.n_ff, a.nr, stream);
+    Product dn;
+    dn.w = a.down; dn.type = a.down_type; dn.w_rows = a.n_embd; dn.w_cols = a.n_ff; dn.expert_bytes = a.down_bytes;
+    dn.n = a.n; dn.xq = a.hq; dn.bounds = a.bounds; dn.ids = a.ids; dn.total_rows = a.nr; dn.max_rows = a.max_rows;
+    dn.dst = a.dst; dn.ld_dst = a.n_embd;
+    ctx.run(dn, stream);
+}
+
+void expert_rows(Context& ctx, const ExpertRows& a, void* stream) {
+    expert_rows_gate_up(ctx, a, stream);
+    expert_rows_down(ctx, a, stream);
+}
+
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream) {
     const cudaStream_t s = (cudaStream_t) stream;
@@ -165,6 +222,43 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
                                                          (uint8_t*) gu_dst, (const uint8_t*) down, nc, (uint8_t*) d_dst);
     }
     ck(cudaGetLastError(), "gather_native");
+}
+
+namespace {
+struct GatherGroup {
+    const uint4* blob[kGatherGroupMax];
+};
+// blockIdx.y = the expert: the same element walk as copy16_kernel, from that expert's blob into its slot
+__global__ void copy16_group_kernel(GatherGroup g, int64_t up16, int64_t down16, int64_t na, int64_t nc,
+                                    uint4* __restrict__ gu, int64_t gu_stride16, uint4* __restrict__ dn, int64_t d_stride16) {
+    const int e = blockIdx.y;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const uint4* b = g.blob[e];
+    if (i < na) gu[e * gu_stride16 + i] = b[i];
+    else if (i < 2 * na) gu[e * gu_stride16 + i] = b[up16 + i - na];
+    else if (i < 2 * na + nc) dn[e * d_stride16 + i - 2 * na] = b[down16 + i - 2 * na];
+}
+}  // namespace
+
+void gather_native_group(const uint8_t* const* blobs, int n, size_t up_off, size_t down_off, size_t gu_half_bytes,
+                         size_t d_bytes, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream) {
+    if (n <= 0) return;
+    uintptr_t align = (uintptr_t) gu_dst | (uintptr_t) d_dst | up_off | down_off | gu_half_bytes | d_bytes | gu_stride |
+                      d_stride;
+    for (int i = 0; i < n; ++i) align |= (uintptr_t) blobs[i];
+    if (n > kGatherGroupMax || align % 16 != 0) {   // the per-expert path (its own unaligned fallback included)
+        for (int i = 0; i < n; ++i)
+            gather_native(blobs[i], blobs[i] + up_off, gu_half_bytes, blobs[i] + down_off, d_bytes,
+                          (uint8_t*) gu_dst + (size_t) i * gu_stride, (uint8_t*) d_dst + (size_t) i * d_stride, stream);
+        return;
+    }
+    GatherGroup g{};
+    for (int i = 0; i < n; ++i) g.blob[i] = (const uint4*) blobs[i];
+    const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16;
+    copy16_group_kernel<<<dim3(blocks(2 * na + nc), (unsigned) n), 256, 0, (cudaStream_t) stream>>>(
+        g, (int64_t) up_off / 16, (int64_t) down_off / 16, na, nc, (uint4*) gu_dst, (int64_t) gu_stride / 16,
+        (uint4*) d_dst, (int64_t) d_stride / 16);
+    ck(cudaGetLastError(), "gather_native_group");
 }
 
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {

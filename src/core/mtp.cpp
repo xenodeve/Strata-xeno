@@ -3,6 +3,8 @@
 #include "strata/core/on_device.hpp"
 
 #include "strata/core/native_head.hpp"
+#include "strata/core/verify.hpp"
+#include "strata/timeline_gpu.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -689,12 +691,17 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (cudaGraphLaunch(round_exec_[T], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+    timeline::GpuClock* gc = decode_gpu_begin(cs_);
+    cudaEvent_t ge0 = gc ? gc->record(cs_) : nullptr;
+    const bool launched = cudaGraphLaunch(round_exec_[T], cs_) == cudaSuccess;
+    if (launched && gc) decode_gpu_span("mtp round", ge0, gc->record(cs_), T, a);
+    if (!launched || cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     float pj = ((volatile float*) h_prob_)[0];
+    if (on_draft && pj >= min_p) on_draft(drafts[0]);   // #44 D4: only a draft the next window will verify
     if (probs) probs[0] = pj;
     int n = 1;
     // the chain continues while the last draft is likely enough to be verified
@@ -702,12 +709,16 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (!capture_step(j, err)) return false;
         put(max_t_ + j - 1, p + a + j);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (cudaGraphLaunch(step_exec_[j], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+        cudaEvent_t se0 = gc ? gc->record(cs_) : nullptr;
+        const bool stepped = cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess;
+        if (stepped && gc) decode_gpu_span("mtp step", se0, gc->record(cs_), j);
+        if (!stepped || cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
         drafts[j] = ((volatile int32_t*) h_out_)[j];
         pj = ((volatile float*) h_prob_)[j];
+        if (on_draft && pj >= min_p) on_draft(drafts[j]);
         if (probs) probs[j] = pj;
         ++n;
     }

@@ -18,6 +18,10 @@ size_t iq_row_bytes(int ggml_type, int64_t n) noexcept;
 
 /// q8_1 blocks for `n_rows` rows of `n_cols` floats (n_cols a multiple of 32): y is n_rows * n_cols/32 blocks.
 void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream);
+// The Q2_0 CPU pool keeps activation scales in fp32. Preserve those scales
+// alongside the legacy q8_1 blocks when parity with CPU misses is required.
+void quantize_q8_1_rows_scaled(const float* x, int64_t n_rows, int64_t n_cols, void* y,
+                                float* scales, void* stream);
 
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
@@ -44,14 +48,19 @@ struct NativeExpertLayout {
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 
+/// One native expert blob (device) dequantized in a single launch: gate/up into `gu` in the iq_dequant_gu_f16
+/// layout and down into `down` as iq_dequant_f16 writes it. Byte-identical to those two launches.
+void iq_dequant_expert_f16(const NativeExpertLayout& L, const void* blob, uint16_t* gu, uint16_t* down, void* stream);
+
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
-size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
+size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff, int64_t n_embd);
 
 /// Grouped experts in the native format: group g's blob at device address grp_ptr[g]; its entries
 /// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s q8_1 activation (n_embd/32 blocks per token in x_q8_1)
 /// and write row ent_dst[e] of `out` (n_embd floats).  Counts are read on the device.
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
-                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
+                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+                           const float* x_scales = nullptr);
 
 }  // namespace strata::kernels

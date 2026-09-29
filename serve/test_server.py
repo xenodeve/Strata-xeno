@@ -20,7 +20,9 @@ from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Servi
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
-ANSWER = "x" * 2000                              # longer than the old 1024 fallback: one token per byte
+# longer than the old 1024 fallback, one token per byte, and not a loop: "x" * 2000 is one, and the serving loop
+# guard (serve/loop_guard.py, xeno) rightly stops it at 512 characters
+ANSWER = "".join("abcdefghijklmnopqrstuvwxyz"[(i * 7919 + i * i * 104729) % 26] for i in range(2000))
 
 
 class RecordingEngine(MockEngine):

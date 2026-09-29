@@ -184,7 +184,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
 
     const size_t scratch = std::max<size_t>(
         (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
-        strata::kernels::native_expert_scratch_bytes(CAP, FF));
+        strata::kernels::native_expert_scratch_bytes(CAP, FF, H));   // (xeno) our kernels size by n_embd too
     const bool allocated =
         check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err, device) &&
         check(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err, device) &&

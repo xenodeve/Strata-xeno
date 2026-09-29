@@ -39,4 +39,11 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                int64_t max_cells, float freq_base, void* stream);
 
+// The appends of `n_tokens` consecutive cells in one launch, in order: raw row t at raw + 128 * t, its cell index at
+// relative_pos_device[t * pos_stride]. Leaves the state byte-identical to n_tokens single appends (the prompt path).
+void native_qsa_indexer_append_batch(const float* raw, int64_t n_tokens, const int32_t* relative_pos_device,
+                                     int64_t pos_stride, int32_t pos_base, const float* gamma, float epsilon,
+                                     const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
+                                     int64_t max_cells, float freq_base, void* stream);
+
 } // namespace strata::kernels

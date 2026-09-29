@@ -14,13 +14,14 @@ namespace strata::prefill {
 // ---- hyper-connection (n_embd 2560, hc 4, hc_lr 320)
 /// xn[t, c*2560 + d] = R[t,c,d] * rsqrt(mean_d R[t,c,:]^2 + eps) * w_norm[c*2560 + d]; also its BF16 image.
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream);
-/// F-1: gr_norm without its FP32 output: the row scales rs[t*4 + c] and the BF16 image; gr_mix_r then reads R.
+/// F-1 (upstream 882bb6d, #42): gr_norm without its FP32 output: the row scales rs[t*4 + c] and the BF16 image;
+/// gr_mix_r then reads R.
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream);
 /// gr_mix with xn recomputed from R, rs and w_norm exactly as gr_norm computes it (the same bits).
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
               int64_t T, void* stream, uint16_t* mixed_h = nullptr);
-/// F-2: gr_write, then gr_norm_rs of the next half (its norm weights) over the rows just written - the same bits as
-/// the two calls, without reading R back.
+/// F-2 (upstream b046845, #42): gr_write, then gr_norm_rs of the next half (its norm weights) over the rows just
+/// written - the same bits as the two calls, without reading R back.
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream);
 /// lo16[t, k] = bf16(silu(lo[t, k] / hc))
@@ -54,11 +55,17 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
 /// h16[n, r] = fp16(silu(g[n, r]) * u[n, r])   (the shared expert, gate and up separate, width 640)
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream);
 /// dst[i] = src[i] for n int32s, as a kernel: either side may be mapped host memory, and the copy never waits
-/// behind the copy engine's queue (the prompt path's grouping tables, while the expert stream fills it).
+/// behind the copy engine's queue (the prompt path's grouping tables, while the expert stream fills it; upstream
+/// fe609ce, #42).
 void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
+/// #35 D1: moe_combine in two halves on two cards: the routed sum (the same fmaf chain over k = 0..9) where the
+/// expert rows are, then bo += shared * sigmoid(sg) where the shared expert ran.  Together byte-identical to
+/// moe_combine (xeno_combine_split_parity).  moe_shared_finish runs in place: bo holds the routed sum on entry.
+void moe_routed_sum(const float* D, const int32_t* slot, const float* w, float* s, int64_t T, void* stream);
+void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream);
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
 

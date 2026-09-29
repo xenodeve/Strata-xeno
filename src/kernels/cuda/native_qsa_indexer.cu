@@ -39,13 +39,14 @@ __device__ float warp_sum(float x) {
         x += __shfl_xor_sync(0xffffffffu, x, offset);
     return x;
 }
-__global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+// One cell's append; the whole block calls it (`values`/`partials` are the block's shared scratch).
+__device__ __forceinline__ void append_one(const float* __restrict__ raw, int pos,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
                         float* __restrict__ tail, float* __restrict__ dead,
                         float* __restrict__ pooled, int32_t* __restrict__ block_pos,
-                        int max_cells, float theta_scale, const int32_t* __restrict__ mtab) {
-    const int pos = *pos_dev, d = threadIdx.x;
-    if (pos < 0 || pos >= max_cells) return;
+                        float theta_scale, const int32_t* __restrict__ mtab,
+                        float* values, float* partials) {
+    const int d = threadIdx.x;
     const int slot = pos % R;
     float incoming = 0.0f;
     if (d < D) {
@@ -54,8 +55,6 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
         if (slot < R - 1) tail[slot * D + d] = incoming;
     }
     if (pos != 0 && slot != R - 1) return;
-    __shared__ float values[D];
-    __shared__ float partials[32];
     float mean = 0.0f;
     if (d < D) {
         // The spare's four gather indices all name cell zero. Completed blocks
@@ -184,6 +183,34 @@ __global__ void append_tail(const float* __restrict__ raw, int64_t n, int64_t p0
     if (cell < p0) return;
     tail[s * D + d] = __half2float(__float2half_rn(raw[(cell - p0) * D + d]));
 }
+__global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+                        int pos_base, const float* __restrict__ gamma, float epsilon,
+                        float* __restrict__ tail, float* __restrict__ dead,
+                        float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                        int max_cells, float theta_scale, const int32_t* __restrict__ mtab) {
+    __shared__ float values[D];
+    __shared__ float partials[32];
+    const int pos = *pos_dev;
+    if (pos < 0 || pos >= max_cells) return;
+    append_one(raw, pos, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, theta_scale, mtab, values, partials);
+}
+// A chunk of consecutive cells in one launch: the same appends in the same order, one block, a barrier between cells
+// so each reads the tail the previous one wrote.
+__global__ void append_batch(const float* __restrict__ raw, int n, const int32_t* __restrict__ pos_dev, int pos_stride,
+                             int pos_base, const float* __restrict__ gamma, float epsilon,
+                             float* __restrict__ tail, float* __restrict__ dead,
+                             float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                             int max_cells, float theta_scale, const int32_t* __restrict__ mtab) {
+    __shared__ float values[D];
+    __shared__ float partials[32];
+    for (int t = 0; t < n; ++t) {
+        const int pos = pos_dev[(std::size_t) t * pos_stride];
+        if (pos >= 0 && pos < max_cells)
+            append_one(raw + (std::size_t) t * D, pos, pos_base, gamma, epsilon, tail, dead, pooled, block_pos,
+                       theta_scale, mtab, values, partials);
+        __syncthreads();
+    }
+}
 struct Span { const void* p; std::size_t n; };
 void validate(Span s) {
     const auto p = reinterpret_cast<std::uintptr_t>(s.p);
@@ -237,6 +264,30 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
                                                                        b.dead, b.pooled, b.block_pos, first, hi,
                                                                        theta_scale, mtab);
     append_tail<<<R - 1, D, 0, st>>>(raw, n, p0, b.tail);
+}
+
+// (xeno #29) one launch per chunk over device positions, kept beside upstream's C-2 batch
+void native_qsa_indexer_append_batch(const float* raw, int64_t n_tokens, const int32_t* relative_pos_device,
+                                     int64_t pos_stride, int32_t pos_base, const float* gamma, float epsilon,
+                                     const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
+                                     float freq_base, void* stream) {
+    if (n_tokens <= 0) return;
+    if (n_tokens > INT32_MAX || pos_stride < 1 || pos_stride > INT32_MAX)
+        throw std::invalid_argument("native QSA indexer batch requires a positive token count and position stride");
+    // the single-cell checks, once for the chunk (the spans cover every cell's raw row and position)
+    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
+        int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        !std::isfinite(freq_base) || freq_base <= 1.0f)
+        throw std::invalid_argument("native QSA indexer requires fixed geometry, aligned position base, positive capacity/epsilon, valid frequency and explicit stream");
+    const Span spans[] = {{raw,std::size_t(n_tokens)*D*4},{relative_pos_device,std::size_t((n_tokens-1)*pos_stride+1)*4},
+        {gamma,D*4},{b.tail,(R-1)*D*4},{b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
+    for (const auto& span : spans) validate(span);
+    for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
+        if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    const float theta_scale = powf(freq_base, -2.0f / ROT);
+    append_batch<<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,int(n_tokens),relative_pos_device,int(pos_stride),
+        pos_base,gamma,epsilon,b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,mrope_table());
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

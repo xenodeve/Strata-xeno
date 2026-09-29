@@ -26,7 +26,7 @@ __global__ void poison_kernel(float* p, uint64_t n_floats) {
 
 }  // namespace
 
-DeviceInfo device_info(int ordinal) {
+DeviceInfo device_info(int ordinal, bool allow_display_sm89) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
@@ -69,6 +69,7 @@ DeviceInfo device_info(int ordinal) {
         throw CudaError("HIP backend requires validated gfx1100 wave32 hardware", -1);
     }
 #else
+    (void) allow_display_sm89;   // (xeno) upstream's sm_80 floor admits the sm_89 display card already
     if (d.cc_major < 8) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) +

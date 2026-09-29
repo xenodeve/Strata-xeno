@@ -282,6 +282,12 @@ Gemm::~Gemm() {
     }
 }
 
+void warm_cublas(int device) {
+    if (cudaSetDevice(device) != cudaSuccess) return;
+    cublasHandle_t h = nullptr;
+    if (cublasCreate(&h) == CUBLAS_STATUS_SUCCESS) cublasDestroy(h);
+}
+
 bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
                          std::string& err) {
     cublasHandle_t h = nullptr;

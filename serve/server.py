@@ -45,6 +45,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
+from serve.loop_guard import LoopGuard
+from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 
 IM_END = "<|im_end|>"
@@ -549,6 +551,34 @@ class Detokenizer:
         return delta
 
 
+class StopSequenceFilter:
+    """Hold only the suffix that might become a stop sequence on the next delta."""
+
+    def __init__(self, sequences):
+        if not isinstance(sequences, list) or any(not isinstance(s, str) or not s for s in sequences):
+            raise ValueError("stop_sequences must be a list of non-empty strings")
+        self.sequences = sequences
+        self.pending = ""
+
+    def feed(self, text):
+        self.pending += text
+        hits = [(self.pending.find(s), -len(s), s) for s in self.sequences if s in self.pending]
+        if hits:
+            pos, _, sequence = min(hits)
+            visible = self.pending[:pos]
+            self.pending = ""
+            return visible, sequence
+        hold = max((n for s in self.sequences for n in range(1, min(len(s), len(self.pending)) + 1)
+                    if self.pending.endswith(s[:n])), default=0)
+        visible = self.pending[:-hold] if hold else self.pending
+        self.pending = self.pending[-hold:] if hold else ""
+        return visible, None
+
+    def finish(self):
+        visible, self.pending = self.pending, ""
+        return visible
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -561,7 +591,7 @@ class Service:
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
-        self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.status = {"busy": False, "queued": 0, "loops_stopped": 0}  # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
@@ -711,8 +741,10 @@ class Service:
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
+        t_tl = timeline.now_us()
         prompt = self.template.render(messages, tools=tools, **kwargs)
         ids = self.tok.encode(prompt, parse_special=True)
+        timeline.complete("template+tokenize", t_tl, timeline.now_us(), len(ids))
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -737,12 +769,18 @@ class Service:
                 raise ValueError("the prompt and its images do not match")
             ids = out
             combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
-            with open(combined, "wb") as f:
-                for path, _ in encoded:
-                    f.write(path.read_bytes())
+            try:
+                with open(combined, "wb") as f:
+                    for path, _ in encoded:
+                        f.write(path.read_bytes())
+            except Exception:
+                combined.unlink(missing_ok=True)
+                raise
             self.embeddings.path = combined
+        if max_new is None:                  # count only (POST /v1/messages/count_tokens): no room check
+            return ids, kwargs.get("enable_thinking", True) is not False, None
         room = self.engine.max_context - CTX_SLACK - len(ids)
-        if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
+        if max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
                                  f"({self.engine.max_context}); requests are never truncated")
@@ -797,8 +835,12 @@ class Service:
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        guard = LoopGuard()
+        stop_filter = StopSequenceFilter(sampling["stop_sequences"]) if sampling.get("stop_sequences") else None
+        matched_sequence = None
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         timings, before = None, None                    # this request's timings; the engine's `last` before it
+        stop_detail = None
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
@@ -806,8 +848,10 @@ class Service:
         engine_last0 = getattr(self.engine, "last", None)
         with self.status_lock:
             self.status["queued"] += 1
+        t_queue = timeline.now_us()
         try:
             with self.fifo:
+                timeline.complete("queue wait", t_queue, timeline.now_us())
                 with self.status_lock:
                     self.status["queued"] -= 1
                 if hasattr(self.engine, "alive") and not self.engine.alive():
@@ -824,6 +868,7 @@ class Service:
                     self.rate.clear()               # the previous request's samples must not leak into this one
                 before = getattr(self.engine, "last", None)
                 last_print = time.time()
+                t_engine = timeline.now_us()
                 gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
                     self.engine.generate(ids, max_new, sampling, cancel)
                 try:
@@ -833,6 +878,8 @@ class Service:
                             yield "ping", None
                             continue
                         n += 1
+                        if n == 1:
+                            timeline.instant("first token", len(ids))
                         if t in self.stop_ids:
                             finish = "stop"
                             raw_ids.append(t)
@@ -842,8 +889,34 @@ class Service:
                         self._note(n, evs)
                         last_print = self._progress(last_print)
                         for ev in evs:
+                            if ev.kind in ("reasoning", "content") and guard.feed(
+                                    ev.text, in_think=ev.kind == "reasoning"):
+                                cancel.set()
+                                finish = "length"
+                                stop_detail = "loop"
+                                with self.status_lock:
+                                    self.status["loops_stopped"] += 1
+                                    self.status["last_stop_reason"] = "loop"
+                                print(f"[strata] loop guard stopped generation: {guard.reason}", flush=True)
+                                break
+                            if ev.kind != "content" and stop_filter:
+                                tail = stop_filter.finish()
+                                if tail:
+                                    yield "event", Event("content", text=tail)
+                            if ev.kind == "content" and stop_filter:
+                                visible, matched_sequence = stop_filter.feed(ev.text)
+                                if visible:
+                                    yield "event", Event("content", text=visible)
+                                if matched_sequence:
+                                    cancel.set()
+                                    finish = "stop"
+                                    break
+                                continue
                             yield "event", ev
-                    if cancel.is_set():
+                        if guard.reason or matched_sequence:
+                            break
+                    # the loop guard and a stop sequence cancel the engine themselves; only a client cancel is one
+                    if cancel.is_set() and not matched_sequence and not guard.reason:
                         finish = "cancel"
                 except EngineDied as e:
                     finish = "error"
@@ -860,6 +933,7 @@ class Service:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
                     #                                     fifo, so a stop-token break can't leave the shared engine
                     #                                     queue mid-drain for the next request to read as its own DONE
+                    timeline.complete("engine request", t_engine, timeline.now_us(), len(ids), n)
         except GeneratorExit:                           # the client disconnected mid-stream
             finish = "disconnect"
             raise
@@ -906,10 +980,35 @@ class Service:
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
-        for ev in parser.finish():
-            yield "event", ev
-        yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                       "timings": timings}
+                self.status["last_stop_reason"] = stop_detail or finish
+        if not matched_sequence:
+            for ev in parser.finish():
+                if ev.kind == "content" and stop_filter:
+                    visible, matched_sequence = stop_filter.feed(ev.text)
+                    if visible:
+                        yield "event", Event("content", text=visible)
+                    if matched_sequence:
+                        break
+                else:
+                    if stop_filter:
+                        tail = stop_filter.finish()
+                        if tail:
+                            yield "event", Event("content", text=tail)
+                    yield "event", ev
+            if stop_filter and not matched_sequence:
+                tail = stop_filter.finish()
+                if tail:
+                    yield "event", Event("content", text=tail)
+        if matched_sequence:
+            finish = "stop"
+            with self.status_lock:
+                self.status["last_stop_reason"] = "stop_sequence"
+        done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0), "timings": timings}
+        if matched_sequence:
+            done["stop_sequence"] = matched_sequence
+        if stop_detail:
+            done["stop_detail"] = stop_detail
+        yield "done", done
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
@@ -1085,6 +1184,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                              "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
+            if x.get("stop_detail"):
+                last["timings"] = {**(last.get("timings") or {}), "stop_reason": x["stop_detail"]}
             yield last
 
 
@@ -1131,7 +1232,10 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
     index, open_kind, used_tool = -1, None, False
 
     def close():
-        return ("content_block_stop", {"type": "content_block_stop", "index": index})
+        if open_kind == "thinking":
+            yield "content_block_delta", {"type": "content_block_delta", "index": index,
+                                          "delta": {"type": "signature_delta", "signature": ""}}
+        yield "content_block_stop", {"type": "content_block_stop", "index": index}
 
     streamed = set()
     for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
@@ -1154,7 +1258,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 used_tool = True
             if open_kind != want or want == "tool_use":
                 if open_kind is not None:
-                    yield close()
+                    yield from close()
                 index += 1
                 open_kind = want
                 block = {"thinking": {"type": "thinking", "thinking": "", "signature": ""},
@@ -1176,13 +1280,13 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                     "type": "input_json_delta", "partial_json": json.dumps(ev.call.arguments, ensure_ascii=False)}}
         else:
             if open_kind is not None:
-                yield close()
-            stop = "tool_use" if used_tool and x["finish"] == "stop" else \
-                {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
+                yield from close()
+            stop = "stop_sequence" if x.get("stop_sequence") else                    "tool_use" if used_tool and x["finish"] == "stop" else                    {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             # the final counts, Anthropic's way: input_tokens leaves out what the conversation cache already held,
             # which is cache_read_input_tokens (message_start could only say the whole prompt)
             reused = min(x.get("reused") or 0, len(ids))
-            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+            yield "message_delta", {"type": "message_delta",
+                                    "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
                                     "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
                                               "output_tokens": x["completion_tokens"]}}
             yield "message_stop", {"type": "message_stop"}
@@ -1204,6 +1308,8 @@ def anthropic_collect(events) -> dict:
                 b["text"] += d["text"]
             elif d["type"] == "thinking_delta":
                 b["thinking"] += d["thinking"]
+            elif d["type"] == "signature_delta":
+                b["signature"] = d["signature"]
             else:                                  # input_json_delta pieces: parsed when complete
                 b["_json"] = b.get("_json", "") + d["partial_json"]
         elif name == "content_block_stop" and blocks and "_json" in blocks[-1]:
@@ -1211,6 +1317,7 @@ def anthropic_collect(events) -> dict:
             b["input"] = json.loads(b.pop("_json") or "{}")
         elif name == "message_delta":
             msg["stop_reason"] = e["delta"]["stop_reason"]
+            msg["stop_sequence"] = e["delta"]["stop_sequence"]
             msg["usage"].update(e["usage"])
     msg["content"] = blocks
     return msg
@@ -1299,8 +1406,12 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path == "/health":
-                self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key)})
+                proc = getattr(svc.engine, "proc", None)
+                alive = proc is None or proc.poll() is None
+                self._json(200 if alive else 503, {"status": "ok" if alive else "engine_exited",
+                                     "max_context": svc.engine.max_context, "model": svc.model,
+                                     "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                     "loops_stopped": svc.status["loops_stopped"]})
             elif path == "/status":
                 with svc.status_lock:
                     s = dict(svc.status)
@@ -1338,6 +1449,10 @@ def make_handler(svc: Service):
                 self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
+            with timeline.span("http request"):
+                self._do_post()
+
+        def _do_post(self):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
@@ -1350,6 +1465,16 @@ def make_handler(svc: Service):
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
+                elif self.path.rstrip("/") == "/v1/messages/count_tokens":
+                    messages, tools, kw = anthropic_to_messages(req, vision=svc.vision is not None)
+                    try:
+                        ids, _, _ = svc.prepare(messages, tools, kw, None)
+                    finally:
+                        path = getattr(svc.embeddings, "path", None)
+                        if path is not None:
+                            Path(path).unlink(missing_ok=True)
+                        svc.embeddings.path = None
+                    self._json(200, {"input_tokens": len(ids)})
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
@@ -1457,7 +1582,7 @@ def make_handler(svc: Service):
 
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req)
+            messages, tools, kw = anthropic_to_messages(req, vision=svc.vision is not None)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
@@ -1639,6 +1764,8 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
 
 
 def main() -> int:
+    if os.environ.get("STRATA_TIMELINE"):   # #33: the engine writes the file, the server the one beside it
+        timeline.configure(os.environ["STRATA_TIMELINE"] + ".server.json")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "

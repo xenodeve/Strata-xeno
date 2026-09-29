@@ -1,5 +1,6 @@
 // src/core/pinned.cu - P2.S1: the pinned host arena and the parallel expert load.
 #include "strata/core/pinned.hpp"
+#include <limits>
 #include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -35,7 +36,7 @@ namespace strata::core {
 namespace {
 
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
-void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
+void* reserve(uint64_t bytes, PageBacking& got, std::string& note, bool allow_large_pages) {
 #ifdef _WIN32
     // MEM_LARGE_PAGES needs SeLockMemoryPrivilege.  Having it assigned to the account is not enough: the
     // PROCESS must enable it in its own token (AdjustTokenPrivileges) before VirtualAlloc, or the call fails.
@@ -56,9 +57,11 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
     }
     // MEM_LARGE_PAGES needs SeLockMemoryPrivilege; a normal account does not have it and VirtualAlloc then
     // fails with ERROR_PRIVILEGE_NOT_HELD.  That is the EXPECTED outcome on a desktop, not an error.
-    SIZE_T large = GetLargePageMinimum();
+    SIZE_T large = allow_large_pages ? GetLargePageMinimum() : 0;
     // A/B switch: STRATA_NO_LARGEPAGES=1 skips the large-page attempt, same run, same boot.
-    if (large > 0 && std::getenv("STRATA_NO_LARGEPAGES") == nullptr) {
+    if (!allow_large_pages) {
+        note = "large pages skipped for pageable host arena";
+    } else if (large > 0 && std::getenv("STRATA_NO_LARGEPAGES") == nullptr) {
         // MEM_LARGE_PAGES requires the allocation size to be an exact multiple of the large page size -
         // anything else is ERROR_INVALID_PARAMETER (87), which reads like a privilege problem but is not.
         // Round up: the slack is under 2 MB and the tail stays unused.
@@ -84,14 +87,18 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
     got = PageBacking::NormalPages;
     return p;
 #else
-    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-    if (p != MAP_FAILED) {
-        got = PageBacking::LargePages;
-        note = "hugetlb 2 MB pages";
-        return p;
+    void* p = MAP_FAILED;
+    if (allow_large_pages) {
+        p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+        if (p != MAP_FAILED) {
+            got = PageBacking::LargePages;
+            note = "hugetlb 2 MB pages";
+            return p;
+        }
     }
-    note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
+    note = allow_large_pages ? "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages"
+                             : "large pages skipped for pageable host arena";
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     got = PageBacking::NormalPages;
     return p == MAP_FAILED ? nullptr : p;
@@ -133,14 +140,19 @@ std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
 }
 }  // namespace
 
-PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
+PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, bool pin_for_cuda)
+    : PinnedArena(bytes, uniform_bounds(bytes, slice), pin_for_cuda) {
     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
 }
 
-PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, bool pin_for_cuda,
                          uint64_t max_pinned_bytes) : capacity(bytes) {
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note);
+    base = reserve(bytes, backing, note, pin_for_cuda);
+    if (base != nullptr && !pin_for_cuda) {
+        note = "pageable host arena (no CUDA registration or OS lock); " + note;
+        return;
+    }
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
@@ -210,17 +222,106 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
     }
 }
 
+PinnedArena* PinnedArena::reserve_only(uint64_t bytes) {
+    PinnedArena* a = new PinnedArena(0, std::vector<uint64_t>{}, false);
+    a->capacity = bytes;
+#ifdef _WIN32
+    a->base = VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE, PAGE_READWRITE);
+#else
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    a->base = p == MAP_FAILED ? nullptr : p;
+#endif
+    a->backing = PageBacking::NormalPages;
+    a->reserved_only = true;
+    a->note = "reserved address space only; host-owned experts are committed as they load (placement-first)";
+    return a;
+}
+
 PinnedArena::~PinnedArena() {
     if (base) {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
-        if (slice_bytes) {
-            for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
-        } else {
-            cudaHostUnregister(base);
+        if (registered_bytes != 0) {
+            if (slice_bytes) {
+                for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
+            } else {
+                cudaHostUnregister(base);
+            }
         }
         release(base, capacity);
         base = nullptr;
     }
+}
+
+bool PinnedArena::decommit_interior(uint64_t offset, uint64_t bytes, uint64_t& released, std::string& err) {
+    released = 0;
+    if (base == nullptr || backing != PageBacking::NormalPages || registered_bytes != 0 ||
+        locked_bytes != 0 || bytes == 0 || offset > capacity || bytes > capacity - offset) {
+        err = "host page release needs a pageable, unlocked arena and a valid byte range";
+        return false;
+    }
+#ifdef _WIN32
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const uintptr_t page = (uintptr_t) info.dwPageSize;
+    const uintptr_t origin = (uintptr_t) base;
+    if (page == 0 || (page & (page - 1)) != 0 ||
+        offset > (std::numeric_limits<uintptr_t>::max)() - origin ||
+        bytes > (std::numeric_limits<uintptr_t>::max)() - origin - offset) {
+        err = "host page release address arithmetic overflow";
+        return false;
+    }
+    const uintptr_t first = origin + (uintptr_t) offset;
+    const uintptr_t last = first + (uintptr_t) bytes;
+    if (first > (std::numeric_limits<uintptr_t>::max)() - (page - 1)) {
+        err = "host page release alignment overflow";
+        return false;
+    }
+    const uintptr_t begin = (first + page - 1) & ~(page - 1);
+    const uintptr_t end = last & ~(page - 1);
+    if (end > begin) {
+        if (!VirtualFree((void*) begin, (SIZE_T) (end - begin), MEM_DECOMMIT)) {
+            err = "VirtualFree(MEM_DECOMMIT) failed with Windows error " +
+                  std::to_string((unsigned long long) GetLastError());
+            return false;
+        }
+        released = (uint64_t) (end - begin);
+    }
+    err.clear();
+    return true;
+#else
+    err = "exclusive host page release is Windows-only in this slice";
+    return false;
+#endif
+}
+
+bool PinnedArena::commit_interior(uint64_t offset, uint64_t bytes, uint64_t& committed, std::string& err) {
+    committed = 0;
+    if (base == nullptr || backing != PageBacking::NormalPages || registered_bytes != 0 ||
+        locked_bytes != 0 || bytes == 0 || offset > capacity || bytes > capacity - offset) {
+        err = "host page re-commit needs a pageable, unlocked arena and a valid byte range";
+        return false;
+    }
+#ifdef _WIN32
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const uintptr_t page = (uintptr_t) info.dwPageSize;
+    const uintptr_t first = (uintptr_t) base + (uintptr_t) offset;
+    const uintptr_t begin = (first + page - 1) & ~(page - 1);
+    const uintptr_t end = (first + (uintptr_t) bytes) & ~(page - 1);
+    const uintptr_t outer_begin = first & ~(page - 1);
+    const uintptr_t outer_end = (first + (uintptr_t) bytes + page - 1) & ~(page - 1);
+    if (VirtualAlloc((void*) outer_begin, (SIZE_T) (outer_end - outer_begin), MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+        err = "VirtualAlloc(MEM_COMMIT) failed with Windows error " +
+              std::to_string((unsigned long long) GetLastError());
+        return false;
+    }
+    if (end > begin) committed = (uint64_t) (end - begin);
+    err.clear();
+    return true;
+#else
+    err = "exclusive host page re-commit is Windows-only in this slice";
+    return false;
+#endif
 }
 
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,

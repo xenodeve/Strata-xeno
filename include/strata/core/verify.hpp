@@ -34,7 +34,15 @@
 #include <string>
 #include <vector>
 
+namespace strata::timeline { class GpuClock; }
+
 namespace strata::core {
+
+/// #44 STRATA_TIMELINE: the primary GPU's decode lane ("gpu0 decode": the verify window's graph, the commit graph and
+/// the MTP draft graphs), so the round's edge shows when the GPU works and when it waits for the host.  Used from the
+/// decode thread only; decode_gpu_begin() anchors it on the first call (it synchronizes that stream once).
+timeline::GpuClock* decode_gpu_begin(cudaStream_t s);
+void decode_gpu_span(const char* name, cudaEvent_t e0, cudaEvent_t e1, int64_t a = -1, int64_t b = -1);
 
 class NativeHead;
 
@@ -125,9 +133,13 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
-    /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    /// (upstream) the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    /// False when the dispatch never gives the GPU a PCIe share (`pcie_num == 0`): the captured window then skips
+    /// that share's wait and its empty grouped launches.  Set before the first `run`.
+    void set_pcie_share(bool on) { pcie_share_ = on; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_launch = 0, ms_tail = 0;   // cudaGraphLaunch; after the last pool until the window's stream is done
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
@@ -202,6 +214,7 @@ private:
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
+    bool pcie_share_ = true;
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd

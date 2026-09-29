@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <vector>
 #include <stdexcept>
 
@@ -121,6 +122,23 @@ struct PleTable::Impl {
     bool pending = false;
     uint32_t rows[PLE_N_HEADS] = {};
     uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES] = {};
+    // #44 D4: prefetches in flight, each with the buffer its rows land in (the reader needs one per ticket)
+    struct Ahead {
+        strata::ngram::PleReader::Ticket ticket;
+        std::vector<uint8_t> raw;
+    };
+    std::deque<Ahead> ahead;
+    bool cached = false;   // the row cache is on: a prefetch is only worth its reads when it is
+
+    bool drain_ahead(std::string& err) {
+        bool ok = true;
+        while (!ahead.empty()) {
+            std::string e;
+            if (!reader.collect(ahead.front().ticket, e) && ok) { ok = false; err = e; }
+            ahead.pop_front();
+        }
+        return ok;
+    }
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -194,12 +212,15 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             return false;
         }
         impl_->n_rows = n_rows;
+        impl_->cached = io.cache_rows > 0;
     }
     impl_->mode = io.mode;
     return true;
 }
 
 void PleTable::close() {
+    std::string ignored;
+    impl_->drain_ahead(ignored);
     impl_->reader.close();
     impl_->pending = false;
     impl_->mode = PleIo::Mmap;
@@ -274,8 +295,26 @@ bool PleTable::collect(float* out2560, std::string& err) {
     return true;
 }
 
+bool PleTable::prefetch(const uint32_t* rows, size_t n) {
+    if (impl_->mode != PleIo::Direct || !impl_->reader.is_open() || !impl_->cached || n == 0) return true;
+    constexpr size_t kMaxAhead = 32;   // bounds the buffers; the oldest are the likeliest to have landed
+    std::string ignored;
+    while (impl_->ahead.size() >= kMaxAhead) {
+        impl_->reader.collect(impl_->ahead.front().ticket, ignored);
+        impl_->ahead.pop_front();
+    }
+    Impl::Ahead a;
+    a.raw.resize(n * PLE_ROW_BYTES);
+    a.ticket = impl_->reader.issue(rows, n, a.raw.data());
+    impl_->ahead.push_back(std::move(a));
+    return true;
+}
+
+uint64_t PleTable::cache_hits() const { return impl_->reader.stats().cache_hits; }
+
 bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
+    if (!impl_->drain_ahead(err)) return false;   // #44 D4: the prefetched rows are in the cache from here
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode == PleIo::Direct) {
         std::vector<uint8_t> raw(n * PLE_ROW_BYTES);

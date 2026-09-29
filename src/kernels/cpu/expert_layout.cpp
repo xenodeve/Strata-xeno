@@ -51,9 +51,29 @@ bool cpu_avx512_ok() {
     return ok;
 }
 
+bool cpu_avxvnni_ok() {
+    static const bool ok = [] {
+        if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
+#if defined(_MSC_VER)
+        int x[4];
+        __cpuidex(x, 0, 0);
+        if (x[0] < 7) return false;
+        __cpuidex(x, 1, 0);
+        if (!((x[2] >> 27) & 1)) return false;                  // OSXSAVE
+        if ((_xgetbv(0) & 0x6) != 0x6) return false;              // XMM + YMM state
+        __cpuidex(x, 7, 1);
+        return ((x[0] >> 4) & 1) != 0;                            // AVX-VNNI
+#else
+        return false;
+#endif
+    }();
+    return ok;
+}
+
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    else if (cpu_avxvnni_ok()) q2_0_gguf_rows_multi_avxvnni(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 

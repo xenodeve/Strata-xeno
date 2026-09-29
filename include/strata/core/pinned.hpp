@@ -36,11 +36,18 @@ struct PinnedArena {
 
     PinnedArena() = default;
     /// `slice`: the piece size for the per-slice registration fallback (0 = none).
-    explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
+    explicit PinnedArena(uint64_t bytes, uint64_t slice = 0, bool pin_for_cuda = true);
     /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
-    /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
-    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0);
+    /// `pin_for_cuda` false: a pageable arena (no CUDA registration, no lock).  `max_pinned_bytes`: optional cap on
+    /// CUDA registration (upstream); 0 preserves the normal unrestricted path.
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, bool pin_for_cuda = true,
+                uint64_t max_pinned_bytes = 0);
+    /// Placement-first cold start: address space only (MEM_RESERVE), nothing committed. The owner commits each
+    /// host-owned range with `commit_interior` before writing it, so neither RAM nor the commit charge ever holds
+    /// an expert the GPUs own. Pageable only (no CUDA registration, no lock).
+    static PinnedArena* reserve_only(uint64_t bytes);
+    bool reserved_only = false;
     std::vector<uint64_t> slice_starts;
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;
@@ -48,6 +55,9 @@ struct PinnedArena {
 
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }
+    bool decommit_interior(uint64_t offset, uint64_t bytes, uint64_t& released, std::string& err);
+    /// Re-commit exactly the pages decommit_interior released for the same range (their contents are zero).
+    bool commit_interior(uint64_t offset, uint64_t bytes, uint64_t& committed, std::string& err);
 };
 
 struct LoadStats {
