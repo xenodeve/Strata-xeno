@@ -73,6 +73,31 @@ runs or tools.
   single-digit %", built from an Nsight trace plus a different run's dispatch
   counters, is the example not to repeat.
 
+## Do not guess a fix: measure the mechanism, then design the fix from it
+
+The developer's rule (2026-09-30): **never write, propose or queue a fix from a guess about where the time goes.**
+A guessed fix wastes the build, the A/B and the write-up when the guess is wrong, and here it usually is. First
+measure the exact mechanism the fix would change, from the run itself. Then design the fix from that number.
+
+- **Before proposing a change, name the measurement that shows the time it removes.** Give the span, the counter or
+  the file. If no tool shows it, extend the tools first: a timeline span, `decode_paths.py`, `decode_gpu_layers.py`,
+  or `prefetch_sim.py`, with its test. Then measure.
+- **Measure the ceiling before the build.** Take the time the fix can remove at most from the measured spans. If
+  that ceiling is below what an ABBA here can resolve, do not build it.
+- **Averages hide the mechanism.** Split a wait by its cause before reading it.
+  - Example: the 4070 event sync is 0.9 ms/round on average.
+  - Split by whether the GPU had finished (`decode_paths.py`), it was 0.08 ms of sync cost and 0.77 ms of real
+    waiting for a 4070 still computing.
+- **The three guesses of 2026-09-30 that measurement overturned (#44),** each once written down as a plan:
+  1. "The 4070 already returns after the CPU pool every round." In fact the CPU pool is the tail: the 4070 finishes
+     first in 72 % of layers.
+  2. "A prefetch must cover every CPU expert of a layer." In fact the pool's time is per expert, so a partial cover
+     also shortens it.
+  3. "The 4070 sync mostly waits on a GPU that is already done; a spin or query-first wait would remove it." In fact
+     it saves at most 0.08-0.15 ms/round.
+
+  Two of them led to proposed work, the prefetch plan and D0, that the next measurement cancelled.
+
 ## Run every speed measurement at high CPU priority
 
 Other programs on this machine (browser, Discord, Wallpaper Engine, Defender scans) take CPU time from the pool's
