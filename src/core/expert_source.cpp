@@ -1164,6 +1164,7 @@ void ArenaExpertSource::admit_home(int64_t layer, int64_t expert) {
 }
 
 bool ArenaExpertSource::read_into(int64_t layer, int64_t expert, uint8_t* dst, std::string& err) {
+    if (tail_reader_ && tail_reader_(layer, expert, dst)) return true;   // #34: the tail file
     // the prompt path calls this from several stager threads: each thread keeps its own reader
     thread_local std::ifstream f;
     thread_local std::string name;

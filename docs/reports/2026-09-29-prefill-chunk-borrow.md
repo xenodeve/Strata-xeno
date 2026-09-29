@@ -87,6 +87,34 @@ Most of the size grows with **T·K**, the per-(token, k) buffers: 1.76 GB of 3.6
 Options 1 and 2 cut the borrowed size, and with it the tail's RAM, without changing any result. Option 3 moves
 the tail's RAM cost to disk reads. Together they would bring 8K chunks to, or below, today's 2048 RAM.
 
+## Done since this report (#34)
+
+The same 8,023-token prompt on the single-GPU serving config, `--prefill auto` (8K chunks) throughout. Every run
+gave identical greedy output (`8c6c97e1`).
+
+1. **Options 1 + 2 (`f801c5d`):** borrowed VRAM 3,660 -> 2,951 MiB, lendable tail 3,071 -> 2,533 slots, private
+   commit 41.86 -> 41.16 GiB, prefill -3.0 % (10.53 vs 10.86 s). `Dm` was left as it is.
+2. **Lazy exact refill: rejected.** `tests/xeno/perf/lazy_refill_sim.py` found that decode touches 69-82 % of the
+   tail within 256 tokens, which adds 1.5-1.9 s of stalls.
+3. **Option 3, refilling from disk.** From the model's GGUF this runs at 1.13-1.38 GB/s (2.33 s), whatever the reader
+   count, queue depth or batch size. Each expert is three role slices far apart (~465 KB requests), and the median
+   gap between tail experts is five experts, so coalescing does not pay. A contiguous **tail file**
+   (`packs/<pack>/tail-<key>.bin`, 3.5 GB, slot order, 4 KiB-padded) reads at 4.8-5.1 GB/s in 8 MB requests.
+   - The refill takes 0.63-0.65 s, with 99 % overlap between read and H2D.
+   - Same-session ABBA, prefill + refill: 10.57 / 10.54 / 10.36 s with the tail file, against 10.73 / 10.80 / 10.53 s
+     with host copies. Private commit: **37.90 vs 41.16 GiB**.
+   - The first boot builds the file in 2.9-3.3 s. Every later start spot-checks 4 slots against the model. A key
+     change deletes the old file, and the build refuses to run if less than 2 GiB would remain free afterwards.
+   - `--serve` gives the same tokens as generate mode (`serve_tail_check.py`).
+   - **On by default** with exclusive primary experts, on 2026-09-29, at the developer's request:
+     "if it only uses this much storage and it does well on memory, make it the default".
+     `--no-tail-file` keeps the host copies.
+   - When the file cannot be built, the refill reads the GGUF at ~2.3 s per prompt. The RAM saving is kept.
+
+Net: 8K chunks now cost 37.9 GiB of private commit against 39.4 GiB for today's `--prefill 2048`, at about half the
+prompt time. The serving profile still says 2048, and its engine (`engine-xeno/strata.exe`, 2026-09-27) predates all
+of this. Switching it is a deployment decision.
+
 ## Dual-GPU note
 
 The dual-GPU arms of the other reports use `--no-prefill-borrow`: the buffers are reserved in VRAM for the whole

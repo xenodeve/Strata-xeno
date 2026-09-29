@@ -47,6 +47,8 @@
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/timeline.hpp"
+#include "strata/core/pinned.hpp"
+#include "strata/platform/direct_file.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/core/native_dense.hpp"
@@ -92,6 +94,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <future>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -284,6 +288,11 @@ struct Options {
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
     bool no_prefill_borrow = false;
+    /// #34: with --exclusive-primary-experts, the cache slots the prompt path may borrow (the lendable tail) keep no
+    /// host copies; a contiguous tail file next to the pack (tail-<key>.bin, ~3.5 GB at 8K chunks) holds them and the
+    /// refill after a prompt reads it (8K: -3.26 GiB private commit, prefill + refill 10.49 vs 10.69 s).  Default on
+    /// (no trade-off measured; 3.5 GB of disk); --no-tail-file keeps the host copies.
+    bool tail_file = true;
     /// Plan v0.3 P5 validation: batch only positions [0, P) and run the rest of the prompt through the token path
     /// (teacher-forced), so the logits of positions >= P - which depend on the batched state - can be scored
     /// against the oracle at many positions.  0 = the whole prompt but the last position.
@@ -473,6 +482,9 @@ void usage() {
                      "  --secondary-stage-only  Stage/verify weights, but compute all experts as before.\n"
                      "  --exclusive-primary-experts  Phase 4 static primary ownership; decommit host copies.\n"
                      "                               Needs profile, --no-prefill-borrow, --adapt-swaps 0.\n"
+                     "  --no-tail-file       keep host copies of the prompt path's lendable cache slots (default with\n"
+                     "                       exclusive primary experts: none; a tail-<key>.bin next to the pack,\n"
+                     "                       ~3.5 GB at 8K chunks, refills them after a prompt; #34)\n"
                  "                            default keeps >=2560 MiB free; requires --pcie-frac 0.\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
@@ -574,6 +586,250 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
         std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing);
         std::fwrite(weights, sizeof(float), (size_t) k, t->routing);
     }
+}
+
+/// #34: the lendable tail's experts in one contiguous file, in slot order, each blob padded to 4 KiB, so the refill
+/// after a prompt reads large sequential ranges.  The pack's GGUF holds each expert as three role slices far apart:
+/// 465 KB requests read at 1.13-1.38 GB/s whatever the queue depth or reader count, where boot's 14.7 MB contiguous
+/// reads reach 4.8 GB/s.  The file is keyed by everything that decides its bytes (the slot -> expert map, the blob
+/// sizes, the model file), built once through a temporary file, and spot-checked against the model on every start:
+/// a stale file would give plausible wrong experts.
+struct TailFile {
+    bool ok = false;
+    int32_t first = 0;
+    uint64_t stride = 0;
+    std::string path;
+    std::vector<int32_t> slot_of_pair;   // layer * n_expert + expert -> slot, -1 = not in the file
+    strata::platform::DirectFile file;
+    /// one slot into `buf` (stride bytes, DirectFile-aligned) through `f`, a handle on `path`
+    bool read_slot(strata::platform::DirectFile& f, int32_t slot, uint8_t* buf, std::string& err) const {
+        strata::platform::Completion c[1];
+        return f.submit(offset(slot), buf, (uint32_t) stride, 0, err) && f.wait(c, 1, -1) == 1 && c[0].ok;
+    }
+    uint64_t offset(int32_t slot) const { return 4096 + (uint64_t) (slot - first) * stride; }
+};
+TailFile g_tail;
+/// the tail file's slot stride, also the refill's bounce stride: the largest blob, rounded up to 4 KiB
+uint64_t tail_stride() { return ((uint64_t) strata::kernels::cpu::expert_layout().max_blob + 4095) / 4096 * 4096; }
+
+bool setup_tail_file(TailFile& t, strata::core::ArenaExpertSource& arena,
+                     const std::vector<std::pair<int32_t, int32_t>>& at_slot, int32_t first, const std::string& dir,
+                     const std::string& model_file, std::string& err) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const int32_t n = (int32_t) at_slot.size();
+    t.first = first;
+    t.stride = tail_stride();
+    uint64_t key = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) { key = strata::core::fnv1a64((const uint8_t*) &v, sizeof v, key); };
+    mix((uint64_t) first); mix((uint64_t) n); mix(t.stride);
+    for (const auto& [l, e] : at_slot) { mix((uint64_t) (uint32_t) l); mix((uint64_t) (uint32_t) e); }
+    for (int64_t l = 0; l < lay.n_layers; ++l) mix((uint64_t) lay.blob_bytes(l));
+    key = strata::core::fnv1a64((const uint8_t*) model_file.data(), model_file.size(), key);
+    std::error_code ec;
+    mix((uint64_t) std::filesystem::file_size(model_file, ec));
+    char name[64];
+    std::snprintf(name, sizeof name, "tail-%016llx.bin", (unsigned long long) key);
+    const std::string path = dir + "/" + name;
+    const uint64_t size = 4096 + (uint64_t) n * t.stride;
+    auto spot_check = [&]() -> bool {   // four slots spread over the file, byte for byte against the model
+        uint8_t* fb = (uint8_t*) strata::platform::DirectFile::alloc_aligned((size_t) t.stride);
+        std::vector<uint8_t> mb((size_t) t.stride);
+        bool good = fb != nullptr;
+        for (int k = 0; k < 4 && good; ++k) {
+            const int32_t i = (int32_t) ((int64_t) (n - 1) * k / 3);
+            const auto [l, e] = at_slot[(size_t) i];
+            if (l < 0) continue;
+            std::string e2;
+            good = t.read_slot(t.file, first + i, fb, e2) && arena.read_experts(&l, &e, 1, mb.data(), (size_t) t.stride, e2) &&
+                   std::memcmp(fb, mb.data(), (size_t) lay.blob_bytes(l)) == 0;
+        }
+        if (fb) strata::platform::DirectFile::free_aligned(fb);
+        return good;
+    };
+    t.path = path;
+    if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) == size && t.file.open(path, err)) {
+        if (spot_check()) { t.ok = true; return true; }
+        t.file.close();
+        std::fprintf(stderr, "strata generate: tail file %s failed its check; rebuilding\n", path.c_str());
+    }
+    // a key change or a killed build leaves a file behind: remove our other tail files first (3.5 GB each)
+    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string nm = de.path().filename().string();
+        // tail-<16 hex>.bin, or its .tmp from a killed build
+        const bool ours = nm.rfind("tail-", 0) == 0 && (nm.size() == 25 || nm.size() == 29) && nm.compare(21, 4, ".bin") == 0;
+        if (ours && nm != name) std::filesystem::remove(de.path(), ec);
+    }
+    // default-on: never fill the disk - leave 2 GiB free after the file, else the refill reads the model instead
+    const auto sp = std::filesystem::space(dir, ec);
+    if (ec || sp.available < size + (2ull << 30)) {
+        err = "not enough free disk space next to the pack (" + std::to_string(sp.available >> 20) + " MiB free, " +
+              std::to_string((size + (2ull << 30)) >> 20) + " MiB needed)";
+        return false;
+    }
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) { err = "cannot write " + tmp; return false; }
+    std::vector<uint8_t> head(4096, 0);
+    std::memcpy(head.data(), "STRT", 4);
+    std::memcpy(head.data() + 8, &key, 8);
+    std::fwrite(head.data(), 1, head.size(), f);
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr int kChunk = 32;
+    std::vector<uint8_t> buf((size_t) kChunk * t.stride);
+    for (int32_t i0 = 0; i0 < n; i0 += kChunk) {
+        const int32_t m = std::min<int32_t>(kChunk, n - i0);
+        std::fill(buf.begin(), buf.end(), (uint8_t) 0);
+        std::vector<int32_t> ls, es, pos;
+        for (int32_t j = 0; j < m; ++j) {
+            const auto [l, e] = at_slot[(size_t) (i0 + j)];
+            if (l < 0) continue;   // an empty slot: zeros
+            ls.push_back(l); es.push_back(e); pos.push_back(j);
+        }
+        std::vector<uint8_t*> dsts;
+        for (int32_t j : pos) dsts.push_back(buf.data() + (size_t) j * t.stride);
+        if (!ls.empty() && !arena.read_experts_to(ls.data(), es.data(), (int) ls.size(), dsts.data(), err)) {
+            std::fclose(f);
+            std::remove(tmp.c_str());
+            return false;
+        }
+        if (std::fwrite(buf.data(), 1, (size_t) m * t.stride, f) != (size_t) m * t.stride) {
+            std::fclose(f);
+            std::remove(tmp.c_str());
+            err = "writing " + tmp + " failed";
+            return false;
+        }
+    }
+    std::fclose(f);
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) { err = "renaming the tail file: " + ec.message(); return false; }
+    std::fprintf(stderr, "strata generate: tail file %s built: %d slots, %.2f GB in %.1f s\n", path.c_str(), n,
+                 (double) size / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (!t.file.open(path, err) || !spot_check()) { err = "the new tail file failed its check"; return false; }
+    t.ok = true;
+    return true;
+}
+
+/// #34: refill the cache slots the prompt path borrowed.  An expert with a host copy is copied from RAM.  One whose
+/// host copy was released (the lendable tail, when the tail file is on) is read from the tail file, or from the model
+/// with the arena's unbuffered overlapped reads, kBatch at a time into one of two pinned buffers, the next batch read
+/// on a thread while the previous one is copied into its slots.  Every slot is filled before the first window, as before: a tail
+/// expert served by the CPU instead would give different floats.
+bool refill_lent(const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n_expert, strata::core::ExpertSource* src,
+                 strata::core::ArenaExpertSource* arena, strata::core::ExpertCache& cache, std::vector<int32_t>& host_res,
+                 std::string& err) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    std::vector<std::pair<int32_t, int32_t>> from_pack;   // (layer * n_expert + expert, slot)
+    for (const auto& [i, slot] : lent) {
+        const uint8_t* b = src->blob(i / n_expert, i % n_expert);
+        if (b == nullptr) { from_pack.emplace_back(i, slot); continue; }
+        if (!cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(i / n_expert))) return false;
+        host_res[(size_t) i] = slot;
+    }
+    if (from_pack.empty()) return true;
+    if (arena == nullptr) { err = "a lent expert has no host copy and no pack reader"; return false; }
+    // 32 experts per read (128 and 4-8 parallel readers measured no faster on the model's scattered slices, #34)
+    constexpr int kBatch = 32;
+    std::atomic<int64_t> io_requests{0}, io_bytes{0};
+    const size_t stride = (size_t) tail_stride();   // the tail file's, and the model path reads at the same spacing
+    static uint8_t* bounce[2] = {nullptr, nullptr};   // pinned, allocated once (2 x batch x 1.38 MB)
+    for (auto& b : bounce)
+        if (b == nullptr && cudaHostAlloc((void**) &b, (size_t) kBatch * stride, cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            err = "the pack refill's pinned buffers could not be allocated";
+            return false;
+        }
+    // #34 counters: the reads (on the reader thread), the copies into the slots (this thread), and the whole
+    std::atomic<int64_t> read_us{0};
+    int64_t fill_us = 0;
+    const auto t_all = std::chrono::steady_clock::now();
+    // with the tail file: the batch's slots, sorted, as contiguous runs read in 8 MB requests straight into the pinned
+    // buffer (the bounce stride is the file's)
+    const bool use_file = g_tail.ok;
+    if (use_file)
+        std::sort(from_pack.begin(), from_pack.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+    auto read_file_batch = [&](size_t at, int buf, std::string& e) -> bool {
+        const size_t nb = std::min<size_t>(kBatch, from_pack.size() - at);
+        std::vector<std::pair<uint64_t, uint32_t>> pieces;   // (file offset, bytes), into bounce at the running sum
+        std::vector<size_t> dst_off;
+        size_t filled = 0;
+        for (size_t j = 0; j < nb;) {
+            size_t k = j + 1;
+            while (k < nb && from_pack[at + k].second == from_pack[at + k - 1].second + 1) ++k;   // a run of slots
+            uint64_t off = g_tail.offset(from_pack[at + j].second), left = (uint64_t) (k - j) * g_tail.stride;
+            while (left > 0) {
+                const uint32_t len = (uint32_t) std::min<uint64_t>(left, 8ull << 20);
+                pieces.emplace_back(off, len);
+                dst_off.push_back(filled);
+                off += len; filled += len; left -= len;
+            }
+            j = k;
+        }
+        for (size_t q = 0; q < pieces.size(); ++q)
+            if (!g_tail.file.submit(pieces[q].first, bounce[buf] + dst_off[q], pieces[q].second, q, e)) return false;
+        io_requests += (int64_t) pieces.size();
+        io_bytes += (int64_t) filled;
+        size_t got = 0;
+        strata::platform::Completion c[64];
+        while (got < pieces.size()) {
+            const int k = g_tail.file.wait(c, 64, -1);
+            for (int i = 0; i < k; ++i) {
+                if (c[i].tag == strata::platform::DirectFile::WAKE_TAG) continue;
+                if (!c[i].ok || c[i].bytes != pieces[(size_t) c[i].tag].second) { e = "tail file: short read"; return false; }
+                ++got;
+            }
+        }
+        return true;
+    };
+    auto read_batch = [&](size_t at, int buf, std::string& e) -> bool {
+        const auto tr0 = std::chrono::steady_clock::now();
+        struct Acc { std::atomic<int64_t>& a; std::chrono::steady_clock::time_point t; ~Acc() {
+            a += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count(); } }
+            acc{read_us, tr0};
+        strata::timeline::Span sp("pack refill read", (int64_t) at);
+        if (use_file) return read_file_batch(at, buf, e);
+        const int n = (int) std::min<size_t>(kBatch, from_pack.size() - at);
+        std::vector<int32_t> ls((size_t) n), es((size_t) n);
+        for (int j = 0; j < n; ++j) {
+            ls[(size_t) j] = from_pack[at + (size_t) j].first / (int32_t) n_expert;
+            es[(size_t) j] = from_pack[at + (size_t) j].first % (int32_t) n_expert;
+        }
+        io_requests += 3 * n;   // a GGUF expert is three role slices
+        for (int j = 0; j < n; ++j) io_bytes += (int64_t) lay.blob_bytes(ls[(size_t) j]);
+        return arena->read_experts(ls.data(), es.data(), n, bounce[buf], stride, e);
+    };
+    std::string rerr;
+    if (!read_batch(0, 0, rerr)) { err = "pack refill: " + rerr; return false; }
+    for (size_t at = 0, k = 0; at < from_pack.size(); at += kBatch, ++k) {
+        const int buf = (int) (k & 1);
+        std::future<bool> next;
+        if (at + kBatch < from_pack.size()) next = std::async(std::launch::async, read_batch, at + kBatch, buf ^ 1, std::ref(rerr));
+        const size_t n = std::min<size_t>(kBatch, from_pack.size() - at);
+        const auto tf0 = std::chrono::steady_clock::now();
+        {
+            strata::timeline::Span sp("pack refill H2D", (int64_t) at);
+            for (size_t j = 0; j < n; ++j) {
+                const auto& [i, slot] = from_pack[at + j];
+                if (!cache.fill_slot_blocking(slot, bounce[buf] + j * stride, err, (int64_t) lay.blob_bytes(i / n_expert))) {
+                    if (next.valid()) next.wait();
+                    return false;
+                }
+                host_res[(size_t) i] = slot;
+            }
+        }
+        fill_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tf0).count();
+        if (next.valid() && !next.get()) { err = "pack refill: " + rerr; return false; }
+    }
+    const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_all).count();
+    double gb = 0;
+    for (const auto& pr : from_pack) gb += (double) lay.blob_bytes(pr.first / n_expert) / 1e9;
+    const double rd = read_us.load() / 1000.0, fl = fill_us / 1000.0;
+    std::fprintf(stderr, "strata generate: %s refill %zu experts, %.2f GB logical, %.2f GB read in %lld requests (avg %.0f KB) "
+                         "in %.0f ms: read %.0f ms (%.2f GB/s), H2D %.0f ms, overlap %.0f%%\n", use_file ? "tail file" : "model",
+                 from_pack.size(), gb, io_bytes.load() / 1e9, (long long) io_requests.load(),
+                 io_requests.load() ? io_bytes.load() / 1e3 / (double) io_requests.load() : 0.0, total_ms, rd,
+                 rd > 0 ? gb / (rd / 1000) : 0.0, fl,
+                 (rd + fl) > total_ms && total_ms > 0 ? 100.0 * (rd + fl - total_ms) / std::min(rd, fl) : 0.0);
+    return true;
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
@@ -1048,6 +1304,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
+        else if (a == "--tail-file") o.tail_file = true;
+        else if (a == "--no-tail-file") o.tail_file = false;
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
@@ -1317,6 +1575,9 @@ int main(int argc, char** argv) {
                             (o.exclusive_secondary_mode < 0 && o.secondary_expert_mib > 0 && !o.mmap_experts &&
                              !(o.serve && o.adapt_secondary > 0));
     const bool place_first = !o.mmap_experts && (o.exclusive_primary_experts || o.exclusive_secondary);
+    // #34 tail file (default; --no-tail-file): the lendable tail's host copies are released too; the prompt path and the refill after a prompt
+    // read those experts from a contiguous tail file (setup_tail_file, refill_lent)
+    const bool tail_from_pack = o.tail_file && o.exclusive_primary_experts && !o.mmap_experts;
     // adaptive tiers: measured wins with no trade-off inside the mode that enables them (AGENTS.md default rule)
     if (o.adapt_swaps < 0) o.adapt_swaps = o.exclusive_primary_experts ? 8 : 96;
     if (o.adapt_every < 0) o.adapt_every = o.exclusive_primary_experts ? 1 : 4;
@@ -1974,7 +2235,8 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     const size_t idx = (size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second;
-                    if (o.exclusive_primary_experts && batch[j].second < excl_keep_from && !owned_mark[idx]) {
+                    if (o.exclusive_primary_experts && (batch[j].second < excl_keep_from || tail_from_pack) &&
+                        !owned_mark[idx]) {
                         if (!arena_src.release_host_copy(pr.first, pr.second, err)) {
                             if (rd.joinable()) rd.join();
                             std::fprintf(stderr, "strata generate: placement-first primary (%d,%d): %s\n", pr.first,
@@ -2016,7 +2278,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             // placement-first ownership: never committed, so releasing it only records the owner
-            if (place_first && o.exclusive_primary_experts && slot < excl_keep_from) {
+            if (place_first && o.exclusive_primary_experts && (slot < excl_keep_from || tail_from_pack)) {
                 if (!arena_src.release_host_copy(pl, pe, err)) {
                     std::fprintf(stderr, "strata generate: placement-first primary (%d,%d): %s\n", pl, pe, err.c_str());
                     return 1;
@@ -2275,7 +2537,7 @@ int main(int argc, char** argv) {
             if (seen[index]) continue;
             seen[index] = 1;
             const int32_t slot = xcache.slot_of(layer, expert);
-            if (slot < 0 || slot >= excl_keep_from) continue;   // the lendable tail keeps its host copy
+            if (slot < 0 || (slot >= excl_keep_from && !tail_from_pack)) continue;   // the lendable tail keeps its host copy
             const uint8_t* blob = arena_src.blob(layer, expert);
             const int64_t bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
             if (blob == nullptr || !xcache.verify_slot(slot, blob, err, bytes)) {
@@ -2299,6 +2561,39 @@ int main(int argc, char** argv) {
                      (double) private_before / 1073741824.0,
                      (double) private_after / 1073741824.0,
                      ((double) private_before - (double) private_after) / 1073741824.0);
+    }
+    if (tail_from_pack && excl_keep_from < xcache.slots() && srcp == &arena_src) {   // #34: the tail file
+        std::vector<std::pair<int32_t, int32_t>> at_slot((size_t) (xcache.slots() - excl_keep_from), {-1, -1});
+        for (const auto& [layer, expert] : profile) {
+            const int32_t sl = xcache.slot_of(layer, expert);
+            if (sl >= excl_keep_from) at_slot[(size_t) (sl - excl_keep_from)] = {(int32_t) layer, (int32_t) expert};
+        }
+        std::string te;
+        const bool have_tail = setup_tail_file(g_tail, arena_src, at_slot, excl_keep_from, o.pack, o.native_preset, te);
+        if (have_tail) {
+            // the prompt path's stager reads a lent tail expert from the file too: one aligned read per expert, per
+            // stager thread its own handle and bounce (the stager's threads live for the process)
+            g_tail.slot_of_pair.assign((size_t) (g.n_layers * g.n_expert), -1);
+            for (size_t k = 0; k < at_slot.size(); ++k)
+                if (at_slot[k].first >= 0)
+                    g_tail.slot_of_pair[(size_t) at_slot[k].first * (size_t) g.n_expert + (size_t) at_slot[k].second] =
+                        excl_keep_from + (int32_t) k;
+            const int64_t ne = g.n_expert;
+            arena_src.set_tail_reader([ne](int64_t l, int64_t e, uint8_t* dst) -> bool {
+                const int32_t slot = g_tail.slot_of_pair[(size_t) (l * ne + e)];
+                if (slot < 0) return false;
+                thread_local strata::platform::DirectFile f;
+                thread_local uint8_t* bounce = nullptr;
+                std::string e2;
+                if (!f.is_open() && !f.open(g_tail.path, e2)) return false;
+                if (bounce == nullptr) bounce = (uint8_t*) strata::platform::DirectFile::alloc_aligned((size_t) g_tail.stride);
+                if (bounce == nullptr || !g_tail.read_slot(f, slot, bounce, e2)) return false;
+                std::memcpy(dst, bounce, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
+                return true;
+            });
+        } else {
+            std::fprintf(stderr, "strata generate: no tail file (%s): the refill reads the model\n", te.c_str());
+        }
     }
     if (o.lock_cpu_experts) {
         // Keep Windows from trimming the experts the CPU pool reads: every expert that neither GPU tier holds.
@@ -3827,12 +4122,11 @@ int main(int argc, char** argv) {
             auto refill = [&](std::string& e) -> bool {
                 if (lent_now.empty()) return true;
                 tr("refill start", (long long) lent_now.size());
-                for (const auto& [i, slot] : lent_now) {
-                    const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                    if (b == nullptr || !xcache.fill_slot_blocking(slot, b, e,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert)))
+                {
+                    strata::timeline::Span refill_span("refill lent slots", (long long) lent_now.size());
+                    if (!refill_lent(lent_now, g.n_expert, srcp, srcp == &arena_src ? &arena_src : nullptr, xcache,
+                                     host_res, e))
                         return false;
-                    host_res[(size_t) i] = slot;
                 }
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 lent_now.clear();
@@ -4296,14 +4590,9 @@ int main(int argc, char** argv) {
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
-            for (const auto& [i, slot] : lent) {
-                const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert))) {
-                    std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
-                    return 1;
-                }
-                host_res[(size_t) i] = slot;
+            if (!refill_lent(lent, g.n_expert, srcp, srcp == &arena_src ? &arena_src : nullptr, xcache, host_res, err)) {
+                std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
+                return 1;
             }
             cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             std::fprintf(stderr, "strata generate: %zu lent slots refilled in %.1f ms\n", lent.size(),

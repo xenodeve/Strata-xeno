@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <fstream>
 #include <mutex>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -375,6 +376,9 @@ public:
     bool resident(int64_t layer, int64_t expert) const override;
     const uint8_t* materialize(int64_t layer, int64_t expert, int64_t avoid_layer, std::string& err) override;
     bool read_into(int64_t layer, int64_t expert, uint8_t* dst, std::string& err) override;
+    /// #34: a faster copy of some experts (the lendable tail's contiguous file): read_into tries it first; it returns
+    /// false for an expert it does not hold.  Called from the prompt path's stager threads.
+    void set_tail_reader(std::function<bool(int64_t, int64_t, uint8_t*)> r) { tail_reader_ = std::move(r); }
     /// Evict down to the capacity (materialize may run over when every candidate sits in `avoid_layer`).
     void trim(int64_t avoid_layer);
     /// Decay the host experts' use scores (once per verify window).
@@ -410,6 +414,7 @@ public:
     double load_gib_per_second() const { return gib_per_s_; }
 
 private:
+    std::function<bool(int64_t, int64_t, uint8_t*)> tail_reader_;
     void* arena_ = nullptr;          ///< the PinnedArena, owned
     std::vector<uint8_t> exclusive_;
     uint64_t released_host_bytes_ = 0;
