@@ -156,6 +156,34 @@ bool run(const Layer& L, std::vector<float>& Dm, std::vector<float>& bo) {
 }
 }  // namespace
 
+// #41: the same layer with its experts relabelled (new id = order[old]), so they fall in different MMQ groups and
+// sub-products and run in a different order.  Weights move with their expert; every (t, k) row must keep its bytes.
+Layer relabel(const Layer& L, const std::vector<int32_t>& order) {
+    std::vector<int32_t> off((size_t) NEX + 1, 0), ex((size_t) (T * K));
+    for (int64_t e = 0; e < NEX; ++e) off[(size_t) e + 1] = off[(size_t) e] + L.cnt[(size_t) e];
+    for (int64_t i = 0; i < T * K; ++i) {   // the expert of (t, k): the one whose row range holds its row
+        const int32_t r = L.slot[(size_t) i];
+        ex[(size_t) i] = (int32_t) (std::upper_bound(off.begin(), off.end(), r) - off.begin() - 1);
+    }
+    Layer R = L;
+    const size_t gub = mmq::matrix_bytes(QT, 2 * NFF, N), db = mmq::matrix_bytes(QT, N, NFF);
+    for (int64_t e = 0; e < NEX; ++e) {
+        std::memcpy(&R.gu[(size_t) order[(size_t) e] * gub], &L.gu[(size_t) e * gub], gub);
+        std::memcpy(&R.down[(size_t) order[(size_t) e] * db], &L.down[(size_t) e * db], db);
+    }
+    R.cnt.assign((size_t) NEX, 0);
+    for (int32_t& e : ex) { e = order[(size_t) e]; ++R.cnt[(size_t) e]; }
+    std::vector<int32_t> off2((size_t) NEX + 1, 0);
+    for (int64_t e = 0; e < NEX; ++e) off2[(size_t) e + 1] = off2[(size_t) e] + R.cnt[(size_t) e];
+    std::vector<int32_t> at(off2.begin(), off2.end() - 1);
+    for (int64_t i = 0; i < T * K; ++i) {
+        const int32_t r = at[(size_t) ex[(size_t) i]]++;
+        R.src[(size_t) r] = (int32_t) (i / K);
+        R.slot[(size_t) i] = r;
+    }
+    return R;
+}
+
 int main() {
     int n_dev = 0;
     cudaGetDeviceCount(&n_dev);
@@ -179,7 +207,21 @@ int main() {
     for (size_t i = 0; i < bo[0].size(); ++i) db += std::memcmp(&bo[0][i], &bo[1][i], 4) != 0;
     std::printf("MoE layer sm_120 vs sm_89: expert rows %zu of %zu differ, output %zu of %zu differ "
                 "(%zu non-finite outputs, %zu all-zero rows)\n", dd, Dm[0].size(), db, bo[0].size(), bad, zero_rows);
-    const bool pass = dd == 0 && db == 0 && bad == 0 && zero_rows == 0;
+    // #41: relabelled experts (reversed ids: other groups, other sub-products, other order), on the 5060 Ti
+    std::vector<int32_t> order((size_t) NEX);
+    for (int64_t e = 0; e < NEX; ++e) order[(size_t) e] = (int32_t) (NEX - 1 - e);
+    const Layer L2 = relabel(L, order);
+    std::vector<float> Dm2, bo2;
+    cudaSetDevice(0);
+    if (!run(L2, Dm2, bo2)) return 1;
+    size_t rd = 0, rb = 0;
+    for (int64_t i = 0; i < T * K; ++i)
+        rd += std::memcmp(&Dm[0][(size_t) L.slot[(size_t) i] * N], &Dm2[(size_t) L2.slot[(size_t) i] * N],
+                          (size_t) N * 4) != 0;
+    for (size_t i = 0; i < bo[0].size(); ++i) rb += std::memcmp(&bo[0][i], &bo2[i], 4) != 0;
+    std::printf("relabelled experts (#41): %zu of %lld (t, k) rows differ, output %zu of %zu differ\n", rd,
+                (long long) (T * K), rb, bo[0].size());
+    const bool pass = dd == 0 && db == 0 && bad == 0 && zero_rows == 0 && rd == 0 && rb == 0;
     std::printf("%s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
