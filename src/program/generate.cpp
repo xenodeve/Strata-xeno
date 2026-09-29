@@ -212,6 +212,9 @@ struct Options {
     /// each: code 84.75 copy-kept vs 85.76, thai 51.64 vs 51.36, outputs identical; peak RAM 39.8 -> 31.3 GB);
     /// 1: --exclusive-secondary-experts; 0: --no-exclusive-secondary-experts.
     int exclusive_secondary_mode = -1;
+    /// #11 N1 capacity mode: keep at most this many GiB of host-owned experts in RAM; the rest stay on NVMe and a
+    /// CPU-pool miss reads them (0 = off, every host-owned expert in RAM). Opt-in: it trades decode time for RAM.
+    double ram_cache_gib = 0.0;
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -751,6 +754,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-exclusive-primary-experts") o.exclusive_mode = 0;
         else if (a == "--exclusive-secondary-experts") o.exclusive_secondary_mode = 1;
         else if (a == "--no-exclusive-secondary-experts") o.exclusive_secondary_mode = 0;
+        else if (a == "--ram-cache-gib") o.ram_cache_gib = std::atof(next("--ram-cache-gib"));
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--prefill") o.prefill_chunk = std::atoll(next("--prefill"));
@@ -1769,6 +1773,20 @@ if (o.expert_cache_per_layer) {
                      secondary_compute ? "SECONDARY COMPUTE" : "STAGING ONLY, no secondary compute");
     }
 
+    if (place_first && o.ram_cache_gib > 0.0) {
+        // host tier order: the prompt path's lendable tail first (it must stay resident), then the profile's ranking,
+        // then everything else layer by layer
+        std::vector<int32_t> order;
+        std::vector<uint8_t> in_order((size_t) (g.n_layers * g.n_expert), 0);
+        auto push = [&](int32_t i) { if (!in_order[(size_t) i]) { in_order[(size_t) i] = 1; order.push_back(i); } };
+        for (const auto& [l, e] : profile) {
+            const int32_t slot = xcache.slots() > 0 ? xcache.slot_of(l, e) : -1;
+            if (slot >= excl_keep_from) push(l * (int32_t) g.n_expert + e);
+        }
+        for (const auto& [l, e] : profile) push(l * (int32_t) g.n_expert + e);
+        for (int32_t i = 0; i < (int32_t) (g.n_layers * g.n_expert); ++i) push(i);
+        arena_src.set_capacity((uint64_t) (o.ram_cache_gib * 1073741824.0), order);
+    }
     if (place_first) {
         const uint64_t commit_before = private_commit_bytes();
         const auto tl = Clock::now();
@@ -2746,6 +2764,7 @@ if (o.expert_cache_per_layer) {
                         uint8_t* st = ps_stage + i * ps_blob;
                         std::string e;
                         const uint8_t* src = srcp->blob(s.layer, s.in);
+                        if (src == nullptr) src = srcp->materialize(s.layer, s.in, -1, e);   // #11
                         if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
                             uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
                             if (home == nullptr) {
@@ -2765,7 +2784,7 @@ if (o.expert_cache_per_layer) {
                     parallel_copy(in_jobs);
                     for (size_t i = 0; i < ps_d2h.size(); ++i) {
                         const PSwap& s = ps_d2h[i];
-                        if (went_home[i]) arena_src.publish_host_copy(s.layer, s.out);
+                        if (went_home[i]) { arena_src.publish_host_copy(s.layer, s.out); arena_src.admit_home(s.layer, s.out); }
                         host_res[(size_t) s.layer * g.n_expert + s.out] = strata::core::kNotResident;
                         if (cudaMemcpyAsync(xcache.device_slot(s.slot), in_jobs[i].dst, in_jobs[i].bytes,
                                             cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
@@ -3750,6 +3769,7 @@ if (o.expert_cache_per_layer) {
                     std::string e;
                     uint8_t* home = arena_src.recommit_host_copy(out_layer, x.out % (int32_t) g.n_expert, e);
                     const uint8_t* src = srcp->blob(in_layer, x.in % (int32_t) g.n_expert);
+                    if (src == nullptr) src = srcp->materialize(in_layer, x.in % (int32_t) g.n_expert, -1, e);
                     if (home == nullptr || src == nullptr) {
                         std::fprintf(stderr, "strata generate: paired 4070 swap copy-home: %s\n", e.c_str());
                         return false;
@@ -3762,6 +3782,7 @@ if (o.expert_cache_per_layer) {
                 for (size_t i = 0; i < sx_d2h.size(); ++i) {
                     const SSwap& x = sx_d2h[i];
                     arena_src.publish_host_copy(x.out / (int32_t) g.n_expert, x.out % (int32_t) g.n_expert);
+                    arena_src.admit_home(x.out / (int32_t) g.n_expert, x.out % (int32_t) g.n_expert);
                     secondary_residency[(size_t) x.out] = -1;   // CPU-served from now on, from the copy just made
                     if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) x.slot), in_jobs[i].dst, in_jobs[i].bytes,
                                         cudaMemcpyHostToDevice, ss_stream) != cudaSuccess)
@@ -3877,6 +3898,7 @@ if (o.expert_cache_per_layer) {
                         uint8_t* st = ps_stage + i * ps_blob;
                         std::string e;
                         const uint8_t* src = srcp->blob(s.layer, s.in);
+                        if (src == nullptr) src = srcp->materialize(s.layer, s.in, -1, e);   // #11
                         if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
                             uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
                             if (home == nullptr) {
@@ -3896,7 +3918,7 @@ if (o.expert_cache_per_layer) {
                     parallel_copy(in_jobs);
                     for (size_t i = 0; i < ps_d2h.size(); ++i) {
                         const PSwap& s = ps_d2h[i];
-                        if (went_home[i]) arena_src.publish_host_copy(s.layer, s.out);
+                        if (went_home[i]) { arena_src.publish_host_copy(s.layer, s.out); arena_src.admit_home(s.layer, s.out); }
                         host_res[(size_t) s.layer * g.n_expert + s.out] = strata::core::kNotResident;
                         if (cudaMemcpyAsync(xcache.device_slot(s.slot), in_jobs[i].dst, in_jobs[i].bytes,
                                             cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
@@ -4052,6 +4074,7 @@ if (o.expert_cache_per_layer) {
                 return 1;
             }
             if (o.pool_rest) pool.rest();   // the pool idles until the next window: free its cores for adapt/MTP
+            if (o.ram_cache_gib > 0.0) arena_src.decay_scores();   // #11: the host tier's scores age per window
             if (drive.d.failed) {
                 std::fprintf(stderr, "strata generate: the expert pool failed at layer %lld expert %lld: %s\n",
                              (long long) drive.d.fail_layer, (long long) drive.d.fail_expert,
@@ -4139,6 +4162,10 @@ if (o.expert_cache_per_layer) {
                         ver.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
+        if (rounds > 0 && o.ram_cache_gib > 0.0)
+            std::printf("%-24s %lld loads, %.3f per round, %.3f ms/round reading; host tier %.2f GiB\n", "nvme tier",
+                        (long long) arena_src.nvme_loads(), (double) arena_src.nvme_loads() / rounds,
+                        arena_src.nvme_ms() / rounds, (double) arena_src.host_cache_bytes() / 1073741824.0);
         if (rounds > 0)
             std::printf("%-24s launch %.3f  tail %.3f ms/round (graph launch; last pool until the stream is done)\n",
                         "verify edges", ver.ms_launch / rounds, ver.ms_tail / rounds);

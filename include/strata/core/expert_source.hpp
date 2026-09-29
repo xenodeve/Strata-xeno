@@ -65,6 +65,22 @@ public:
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+    /// #11 capacity mode: whether the host holds the expert now (a source without an NVMe tier always does).
+    virtual bool resident(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return true; }
+    /// #11: bring an NVMe-tier expert into the host tier and return its bytes (null on a read failure: never stale
+    /// data). Evicts the lowest-scored host expert outside `avoid_layer` when over capacity.
+    virtual const uint8_t* materialize(int64_t layer, int64_t expert, int64_t avoid_layer, std::string& err) {
+        (void) layer; (void) expert; (void) avoid_layer; err = "this expert source has no NVMe tier"; return nullptr;
+    }
+    /// #11: bring several NVMe-tier experts of one layer in with overlapped reads (one wait for the layer).
+    virtual bool materialize_batch(int64_t layer, const int32_t* experts, int n, std::string& err) {
+        for (int i = 0; i < n; ++i) if (!materialize(layer, experts[i], layer, err)) return false;
+        return true;
+    }
+    /// #11: the expert's bytes into `dst` straight from the pack, admitting nothing (the prompt path).
+    virtual bool read_into(int64_t layer, int64_t expert, uint8_t* dst, std::string& err) {
+        (void) layer; (void) expert; (void) dst; err = "this expert source cannot read the pack"; return false;
+    }
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
@@ -350,6 +366,24 @@ public:
     /// lands in the OS file cache) queued together. One caller thread at a time.
     bool read_experts(const int32_t* layers, const int32_t* experts, int n, uint8_t* dst, size_t stride,
                       std::string& err);
+    /// The same, each expert to its own destination.
+    bool read_experts_to(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts, std::string& err);
+    bool materialize_batch(int64_t layer, const int32_t* experts, int n, std::string& err) override;
+    /// #11 N1 capacity mode: before load_rest, keep at most `bytes` of host-owned experts, the first ones of
+    /// `order` (layer * n_expert + expert, best first); the rest stay on NVMe. 0 = no limit.
+    void set_capacity(uint64_t bytes, const std::vector<int32_t>& order);
+    bool resident(int64_t layer, int64_t expert) const override;
+    const uint8_t* materialize(int64_t layer, int64_t expert, int64_t avoid_layer, std::string& err) override;
+    bool read_into(int64_t layer, int64_t expert, uint8_t* dst, std::string& err) override;
+    /// Evict down to the capacity (materialize may run over when every candidate sits in `avoid_layer`).
+    void trim(int64_t avoid_layer);
+    /// Decay the host experts' use scores (once per verify window).
+    void decay_scores(float f = 0.97f);
+    uint64_t host_cache_bytes() const { return cache_used_; }
+    int64_t nvme_loads() const { return nvme_loads_; }
+    double nvme_ms() const { return nvme_ms_; }
+    /// A GPU-owned expert that comes home (paired swap copy-home) joins the host tier: account it and trim.
+    void admit_home(int64_t layer, int64_t expert);
     bool load_rest(int threads, std::string& err);
     bool deferred() const { return deferred_; }
     /// Caller must first fill and verify this pair in the primary GPU cache.
@@ -398,6 +432,14 @@ private:
     void* dscratch_ = nullptr;  ///< read_experts' aligned bounce buffer
     size_t dscratch_bytes_ = 0;
     std::vector<std::pair<std::string, void*>> dfiles_;   ///< read_experts' open DirectFiles, by name
+    // #11 N1 capacity mode
+    uint64_t cache_cap_ = 0;         ///< 0 = no limit
+    uint64_t cache_used_ = 0;        ///< host-owned expert bytes committed now
+    std::vector<uint8_t> nvme_;      ///< 1 = on NVMe only (never committed, or evicted)
+    std::vector<float> score_;       ///< decayed use count per expert
+    int64_t nvme_loads_ = 0;
+    double nvme_ms_ = 0;
+    bool evict_one(int64_t avoid_layer);
 };
 
 }  // namespace strata::core

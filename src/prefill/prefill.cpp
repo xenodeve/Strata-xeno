@@ -518,7 +518,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const auto th = Clock::now();
                         const int32_t peer_slot = m.peer_res ? m.peer_res[(size_t) l * NE + e] : -1;
                         const uint8_t* b = peer_slot >= 0 ? nullptr : m.src->blob(l, e);
-                        if (peer_slot < 0 && !b) { err = "prefill: expert source has no blob"; return false; }
+                        const bool from_pack = peer_slot < 0 && b == nullptr;   // #11: on NVMe - read, do not admit
                         if (peer_slot >= 0) {
                             // its only copy is on the 4070: a peer copy (staged through the host by the driver
                             // when the cards have no P2P path) into this slot
@@ -549,9 +549,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const bool live = m.stage_live[sl];
                             const size_t bytes = (size_t) lay.blob_bytes(l);
                             Impl* mp = &m;
-                            m.stager.submit([mp, sl, b, bytes, live] {
+                            const int64_t pl = l, pe = e;
+                            m.stager.submit([mp, sl, b, bytes, live, from_pack, pl, pe] {
                                 if (live) cudaEventSynchronize(mp->used[sl]);
-                                std::memcpy(mp->stage_host[sl], b, bytes);
+                                std::string re;
+                                if (from_pack) {
+                                    if (!mp->src->read_into(pl, pe, mp->stage_host[sl], re)) {
+                                        std::fprintf(stderr, "prefill: NVMe read of (%lld,%lld) failed: %s\n",
+                                                     (long long) pl, (long long) pe, re.c_str());
+                                        std::abort();   // never stale expert data
+                                    }
+                                } else {
+                                    std::memcpy(mp->stage_host[sl], b, bytes);
+                                }
                                 cudaMemcpyAsync(mp->stage_dev[sl], mp->stage_host[sl], bytes, cudaMemcpyHostToDevice, mp->copy);
                                 cudaEventRecord(mp->copied[sl], mp->copy);
                                 mp->stage_ready[sl].store(1, std::memory_order_release);
