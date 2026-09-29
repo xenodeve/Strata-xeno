@@ -611,6 +611,14 @@ struct TailFile {
 TailFile g_tail;
 // #35 D7 (STRATA_PREFILL_WAVE=1 with the split layout): two prompt-path lanes of half the chunk each
 bool g_prefill_wave = false;
+bool wave_on(int64_t prefill_chunk) { return g_prefill_wave && prefill_chunk >= 4096; }   // lanes of 2,048+ tokens
+/// #35 D7: the wave's lane streams on this card: lane 0 (the chunk ahead) at the highest priority, lane 1 the lowest
+void make_lane_streams(cudaStream_t& lane0, cudaStream_t& lane1) {
+    int least = 0, greatest = 0;
+    cudaDeviceGetStreamPriorityRange(&least, &greatest);
+    cudaStreamCreateWithPriority(&lane0, cudaStreamNonBlocking, greatest);
+    cudaStreamCreateWithPriority(&lane1, cudaStreamNonBlocking, least);
+}
 uint64_t prompt_bytes_needed(const strata::core::ModelGeometry& g, const strata::core::SessionState& ss, int64_t chunk) {
     if (!g_prefill_wave) return strata::prefill::Prefill::bytes_needed(g, ss, chunk);
     return strata::prefill::Prefill::wave_bytes_needed(g, ss, chunk);
@@ -1583,14 +1591,14 @@ int main(int argc, char** argv) {
     const bool place_first = !o.mmap_experts && (o.exclusive_primary_experts || o.exclusive_secondary);
     // #35 D6: with the peer tier and STRATA_PREFILL_EXPERT_SPLIT, big chunks run their routed experts on the 4070:
     // the prompt path's one-card MoE buffers are sized for the short chunks only, so it borrows fewer cache slots
+    const bool split_env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_EXPERT_SPLIT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (o.exclusive_secondary && split_env) strata::prefill::Prefill::set_split_layout(true);
     if (o.exclusive_secondary)
-        if (const char* v = std::getenv("STRATA_PREFILL_EXPERT_SPLIT"); v != nullptr && std::atoi(v) != 0)
-            strata::prefill::Prefill::set_split_layout(true);
-    if (o.exclusive_secondary)
-        if (const char* v = std::getenv("STRATA_PREFILL_WAVE"); v != nullptr && std::atoi(v) != 0) {
-            const char* sp = std::getenv("STRATA_PREFILL_EXPERT_SPLIT");
-            g_prefill_wave = sp != nullptr && std::atoi(sp) != 0;   // the wave overlaps the split's two cards
-        }
+        if (const char* v = std::getenv("STRATA_PREFILL_WAVE"); v != nullptr && std::atoi(v) != 0)
+            g_prefill_wave = split_env;   // the wave overlaps the split's two cards
     // #34 tail file (default; --no-tail-file): the lendable tail's host copies are released too; the prompt path and the refill after a prompt
     // read those experts from a contiguous tail file (setup_tail_file, refill_lent)
     const bool tail_from_pack = o.tail_file && o.exclusive_primary_experts && !o.mmap_experts;
@@ -3388,18 +3396,12 @@ int main(int argc, char** argv) {
         else
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         // #35 D7: with the wave, two lanes of half the chunk: half the borrowed region and a stream each
-        const bool sp_waving = g_prefill_wave && o.prefill_chunk >= 4096;
+        const bool sp_waving = wave_on(o.prefill_chunk);
         const int64_t sp_lane_chunk = sp_waving ? strata::prefill::Prefill::wave_lane_chunk(o.prefill_chunk) : o.prefill_chunk;
-        auto lane_bytes_for = [&](int64_t lane_chunk) -> uint64_t {
-            return (strata::prefill::Prefill::bytes_needed(g, ss, lane_chunk) + 4095) / 4096 * 4096;
-        };
         uint64_t sp_lane_bytes = borrow_bytes;
         if (sp_waving) {
-            int least = 0, greatest = 0;
-            cudaDeviceGetStreamPriorityRange(&least, &greatest);
-            cudaStreamCreateWithPriority(&sp_lane0_cs, cudaStreamNonBlocking, greatest);
-            cudaStreamCreateWithPriority(&sp_lane1_cs, cudaStreamNonBlocking, least);
-            if (borrow != nullptr) sp_lane_bytes = lane_bytes_for(sp_lane_chunk);
+            make_lane_streams(sp_lane0_cs, sp_lane1_cs);
+            if (borrow != nullptr) sp_lane_bytes = strata::prefill::Prefill::wave_lane_bytes(g, ss, sp_lane_chunk);
         }
         if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), sp_lane_chunk, sp_lane0_cs, err, borrow, sp_lane_bytes)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -4195,7 +4197,7 @@ int main(int argc, char** argv) {
                 const int64_t want = std::min<int64_t>(o.prefill_chunk, (tokens + 255) / 256 * 256);
                 if (!lent_now.empty()) {
                     if (want <= lent_chunk) {   // the lent layout holds it: a wave only if that layout is one
-                        sp_part_wave = sp_layout_wave && strata::prefill::Prefill::wave_lane_chunk(want) >= 2048;
+                        sp_part_wave = sp_layout_wave && strata::prefill::Prefill::wave_lane_splits(want);
                         return true;
                     }
                     if (!refill(e)) return false;
@@ -4203,11 +4205,11 @@ int main(int argc, char** argv) {
                 const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want)));
                 // #35 D7: the wave only where each lane's chunk still runs split (the review's 3,000-token request
                 // read 1,536-token chunks on one card each: 8.6 s against 3.8 s without the wave)
-                sp_part_wave = sp_wave && strata::prefill::Prefill::wave_lane_chunk(want) >= 2048;
+                sp_part_wave = sp_wave && strata::prefill::Prefill::wave_lane_splits(want);
                 if (sp_part_wave) {   // each lane half the chunk, in its half of the lent region
                     const int64_t lane_want = strata::prefill::Prefill::wave_lane_chunk(want);
                     if (lane_want != sp.chunk() || first != lend_first_now || !sp_layout_wave) {
-                        const uint64_t lb = lane_bytes_for(lane_want);
+                        const uint64_t lb = strata::prefill::Prefill::wave_lane_bytes(g, ss, lane_want);
                         uint8_t* base = (uint8_t*) xcache.device_slot(first);
                         if (2 * lb > lend_bytes(first)) { e = "the wave's lanes do not fit in the lent slots"; return false; }
                         if (!sp.relayout(lane_want, base, lb, e) || !sp2.relayout(lane_want, base + lb, lb, e)) return false;
@@ -4636,18 +4638,13 @@ int main(int argc, char** argv) {
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
         // #35 D7: with the wave, two lanes of half the chunk, each with half the borrowed region and its own stream
-        const bool wave = g_prefill_wave && o.prefill_chunk >= 4096;
+        const bool wave = wave_on(o.prefill_chunk);
         cudaStream_t lane0_cs = (cudaStream_t) main_cs;
-        if (wave) {   // #35 D7: the chunk ahead (lane 0) goes first on this card
-            int least = 0, greatest = 0;
-            cudaDeviceGetStreamPriorityRange(&least, &greatest);
-            cudaStreamCreateWithPriority(&lane0_cs, cudaStreamNonBlocking, greatest);
-            cudaStreamCreateWithPriority(&wave_cs, cudaStreamNonBlocking, least);
-        }
+        if (wave) make_lane_streams(lane0_cs, wave_cs);   // #35 D7: the chunk ahead (lane 0) goes first on this card
         const int64_t lane_chunk = wave ? strata::prefill::Prefill::wave_lane_chunk(o.prefill_chunk) : o.prefill_chunk;
         uint64_t lane_bytes = borrow_bytes;
         if (wave && borrow != nullptr) {
-            lane_bytes = (strata::prefill::Prefill::bytes_needed(g, ss, lane_chunk) + 4095) / 4096 * 4096;
+            lane_bytes = strata::prefill::Prefill::wave_lane_bytes(g, ss, lane_chunk);
             if (2 * lane_bytes > borrow_bytes) {
                 std::fprintf(stderr, "strata generate: the wave's two lanes need %.2f GiB, %.2f GiB is lent\n",
                              2.0 * lane_bytes / 1073741824.0, borrow_bytes / 1073741824.0);

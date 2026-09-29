@@ -289,15 +289,22 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     const int64_t r = i / per, j = i % per;
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
+// the routed sum of token t's column d: one fmaf chain in k order.  moe_combine and the split's moe_routed_sum share it,
+// so the two cards' halves (#35 D1) add in the same order by construction
+__device__ __forceinline__ float routed_sum(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                            const float* __restrict__ w, int64_t t, int64_t d) {
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    return s;
+}
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
                                    const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
-    float s = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    const float s = routed_sum(Dm, slot, w, t, d);
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
@@ -492,11 +499,7 @@ __global__ void moe_routed_sum_kernel(const float* __restrict__ Dm, const int32_
                                       const float* __restrict__ w, float* __restrict__ out, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
-    const int64_t t = i / N, d = i % N;
-    float s = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
-    out[i] = s;
+    out[i] = routed_sum(Dm, slot, w, i / N, i % N);
 }
 __global__ void moe_shared_finish_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
                                          float* __restrict__ bo, int64_t T) {

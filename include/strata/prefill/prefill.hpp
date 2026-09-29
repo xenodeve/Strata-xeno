@@ -83,8 +83,14 @@ public:
     /// bytes both lanes need - the one sizing rule for the lend, the layouts and the relayouts
     static int64_t wave_lane_chunk(int64_t chunk) { return chunk / 2 < 256 ? 256 : (chunk / 2 + 255) / 256 * 256; }
     static uint64_t wave_bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
-        return 2 * ((bytes_needed(g, ss, wave_lane_chunk(chunk)) + 4095) / 4096 * 4096);
+        return 2 * wave_lane_bytes(g, ss, wave_lane_chunk(chunk));
     }
+    /// one lane's share of a lent region for chunks of `lane_chunk` tokens (4 KiB aligned: lane 2's starts after it)
+    static uint64_t wave_lane_bytes(const core::ModelGeometry& g, const core::SessionState& ss, int64_t lane_chunk) {
+        return (bytes_needed(g, ss, lane_chunk) + 4095) / 4096 * 4096;
+    }
+    /// whether a wave over prompt-path chunks of `chunk` tokens still runs each lane's chunk split
+    static bool wave_lane_splits(int64_t chunk);
 
     /// #35 D7: the two-lane wavefront.  Two Prefill objects on one session read a prompt's chunks alternately
     /// (chunk c on lane c % 2, each lane on its own stream of the same GPU), and chunk c's layer l starts only once

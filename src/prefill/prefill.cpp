@@ -80,6 +80,12 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // attention halves instead of waiting for each layer's routing.
 constexpr int RING_MAX = 512;           // the arrays; the ring itself is ring_slots()
 constexpr int64_t STREAM_ALL_MIN = 2048;
+constexpr int MMQ_GROUP = 16;
+static_assert(MMQ_GROUP <= mmq::kGatherGroupMax, "one gather_native_group launch must hold an MMQ group");                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
+// MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
+// product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
+// llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
+constexpr size_t MMQ_TAIL = 4096;
 double g_pinned_share = 1.0;
 bool g_split_layout = false;   // #35 D6 (Prefill::set_split_layout)
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
@@ -318,9 +324,10 @@ struct SplitTier {
     int64_t hbounds_cap = 0;
     // on the 5060: the activations in host, the gates in host, the output uploaded, a resident
     // expert's blob in host
-    cudaEvent_t ev_x = nullptr, ev_sh = nullptr, ev_done = nullptr, ev_res[RES] = {};
+    cudaEvent_t ev_x = nullptr, ev_gates = nullptr, ev_done = nullptr, ev_res[RES] = {};
+    cudaEvent_t ev_q = nullptr;   // on the 5060: the relay stream waits for the compute stream's quantize
     // on the 4070: the inputs read, the uploads read, the output in host, a pinned slot / ring slot free, copied
-    cudaEvent_t ev_xread = nullptr, ev_shread = nullptr, ev_meta = nullptr, ev_bo = nullptr, ev_resread[RES] = {};
+    cudaEvent_t ev_xread = nullptr, ev_gatesread = nullptr, ev_meta = nullptr, ev_bo = nullptr, ev_resread[RES] = {};
     std::vector<cudaEvent_t> used, copied;   // per ring slot
     // the chunk's stream plan: every expert of every layer the 4070 does not own, in (layer, id) order; entry k lands
     // in ring slot k % RING and is issued (by the issuer thread) once entry k - RING is consumed
@@ -336,12 +343,12 @@ struct SplitTier {
     // plan is per unit (a chunk, or a wave's chunk pair): seq_start holds units * (layers + 1) entries.
     SplitTier* xs = this;
     bool stream_owner = true;              // false: lane 2's SplitTier (no ring, stager or plan of its own)
+    static constexpr size_t kNever = (size_t) 1 << 60;   // a counter past any entry (a lane that no longer holds)
     std::vector<cudaEvent_t> used1;        // lane 2's gathers, per ring slot
-    std::atomic<size_t> consumed1{((size_t) 1 << 60)};
+    std::atomic<size_t> consumed1{kNever};
     std::atomic<int> lanes_done{0};
     int lanes_expected = 1;                // the lanes that consume this plan (2: a wave whose lane 2 has a chunk)
     std::atomic<bool> aborted{false};      // a wave lane failed: every waiter below gives up
-    static constexpr size_t kNever = (size_t) 1 << 60;   // a counter past any entry (a lane that no longer holds)
     bool plan_live = false;
     int64_t layers = 0;
     std::vector<std::vector<Stager::Job>> unit_jobs;
@@ -379,6 +386,7 @@ struct SplitTier {
     timeline::GpuClock clk_s, clk_c, clk_relay, clk_res;   // clk_res: res_thread's (the 5060's resident copies)
     int tl_s = -1, tl_c = -1, tl_relay = -1, tl_res = -1, tl_in = -1;
     void resolve(bool wait) {   // clk_c is the issuer's: join_issuer resolves it
+        if (!timeline::enabled()) return;
         { Dev g(dev); clk_s.resolve(wait); }
         clk_relay.resolve(wait);
     }
@@ -402,14 +410,14 @@ struct SplitTier {
         stager.reset();
         { Dev g(dev); if (s) cudaStreamSynchronize(s); if (c) cudaStreamSynchronize(c); if (cr) cudaStreamSynchronize(cr);
           for (void* b : dev_bufs) cudaFree(b);
-          for (cudaEvent_t e : {ev_xread, ev_shread, ev_meta, ev_bo}) if (e) cudaEventDestroy(e);
+          for (cudaEvent_t e : {ev_xread, ev_gatesread, ev_meta, ev_bo}) if (e) cudaEventDestroy(e);
           for (cudaEvent_t e : ev_resread) if (e) cudaEventDestroy(e);
           for (size_t i = 0; i < used.size(); ++i) { if (used[i]) cudaEventDestroy(used[i]); if (copied[i]) cudaEventDestroy(copied[i]); }
           for (cudaEvent_t e : used1) if (e) cudaEventDestroy(e);
           if (s) cudaStreamDestroy(s); if (c) cudaStreamDestroy(c); if (cr) cudaStreamDestroy(cr);
           if (u) cudaStreamDestroy(u); ctx.reset(); }
         if (res_stream) { cudaStreamSynchronize(res_stream); cudaStreamDestroy(res_stream); }
-        for (cudaEvent_t e : {ev_x, ev_sh, ev_done}) if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : {ev_x, ev_gates, ev_done, ev_q}) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_res) if (e) cudaEventDestroy(e);
         for (void* b : {(void*) hx, (void*) hres, (void*) hw, (void*) hbo, (void*) hrows,
                         (void*) hslot, (void*) hbounds}) if (b) cudaFreeHost(b);
@@ -433,8 +441,9 @@ struct SplitTier {
         };
         // #35 D4: the cross-card events are waited on by the host (blocking), never by a stream of the other card:
         // such a wait sat in the copy engine's queue and held back every copy behind it (58 ms stalls, tlD4/tlD4b)
-        for (cudaEvent_t* e : {&ev_x, &ev_sh, &ev_done})
+        for (cudaEvent_t* e : {&ev_x, &ev_gates, &ev_done})
             ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
+        ok = ok && cudaEventCreateWithFlags(&ev_q, cudaEventDisableTiming) == cudaSuccess;   // a stream wait: no host sync
         ok = ok && make_stream(&res_stream, wave_priority(high));
         for (cudaEvent_t& e : ev_res)   // waited on by the host (blocking), never by a stream of the other card
             ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
@@ -450,11 +459,9 @@ struct SplitTier {
         Dev g(dev);
         size_t f0 = 0, tot = 0;
         cudaMemGetInfo(&f0, &tot);
-        ok = ok && make_stream(&s, wave_priority(high));
-        ok = ok && make_stream(&c, wave_priority(high));
-        ok = ok && make_stream(&u, wave_priority(high));
-        ok = ok && make_stream(&cr, wave_priority(high));
-        for (cudaEvent_t* e : {&ev_xread, &ev_shread, &ev_meta, &ev_bo})
+        const int prio = wave_priority(high);
+        for (cudaStream_t* st : {&s, &c, &u, &cr}) ok = ok && make_stream(st, prio);
+        for (cudaEvent_t* e : {&ev_xread, &ev_gatesread, &ev_meta, &ev_bo})
             ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
         for (cudaEvent_t& e : ev_resread)
             ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
@@ -473,7 +480,6 @@ struct SplitTier {
             dev_bufs.push_back(q);
             return q;
         };
-        constexpr size_t TAILB = 4096;
         xtok = d_alloc(mmq::q8_bytes(T, N));
         xq = d_alloc(mmq::q8_bytes(R, N));
         hq = d_alloc(mmq::q8_bytes(R, 640));
@@ -486,8 +492,8 @@ struct SplitTier {
         slot = (int32_t*) d_alloc((size_t) TK * 4);
         ids = (int32_t*) d_alloc((size_t) R * 4);
         bounds = (int32_t*) d_alloc((size_t) hbounds_cap * 4);
-        grp_gu = (uint8_t*) d_alloc(16 * gub + TAILB);
-        grp_d = (uint8_t*) d_alloc(16 * db + TAILB);
+        grp_gu = (uint8_t*) d_alloc(MMQ_GROUP * gub + MMQ_TAIL);
+        grp_d = (uint8_t*) d_alloc(MMQ_GROUP * db + MMQ_TAIL);
         if (RING > 0) ring = (uint8_t*) d_alloc((size_t) RING * blob);
         if (ok) {
             ctx = std::make_unique<mmq::Context>();
@@ -704,6 +710,7 @@ struct Prefill::WaveLink {
     }
 };
 std::shared_ptr<Prefill::WaveLink> Prefill::make_wave_link() { return std::make_shared<WaveLink>(); }
+bool Prefill::wave_lane_splits(int64_t chunk) { return wave_lane_chunk(chunk) >= STREAM_ALL_MIN; }
 bool Prefill::run_wave(Prefill& a, Prefill& b, WaveLink& link, const int64_t* tokens, int64_t n, int64_t pos0,
                        int64_t n_layers, std::string& err) {
     wave_reset(link, (n + a.chunk() - 1) / a.chunk(), n_layers);
@@ -776,22 +783,16 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
     const int64_t TK = T * K;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const auto& f = lay.fmt[(size_t) l];
-    const size_t bb = (size_t) lay.blob_bytes(l);
     const int64_t NE = m.g->n_expert;
     // 1. the 5060: this layer's inputs to host once the compute stream has made them (and the 4070 has read the
     //    previous layer's)
     const size_t xbytes = mmq::q8_bytes(T, N);
-    {
-        cudaEvent_t ev_q = nullptr;
-        cudaEventCreateWithFlags(&ev_q, cudaEventDisableTiming);
-        cudaEventRecord(ev_q, m.cs);
-        cudaStreamWaitEvent(m.relay, ev_q, 0);
-        cudaEventDestroy(ev_q);
-    }
+    cudaEventRecord(sp.ev_q, m.cs);
+    cudaStreamWaitEvent(m.relay, sp.ev_q, 0);
     {
         timeline::Span ws("split: sync prev reads", l);
         cudaEventSynchronize(sp.ev_xread);    // the 4070 has read the previous layer's activations and gates
-        cudaEventSynchronize(sp.ev_shread);
+        cudaEventSynchronize(sp.ev_gatesread);
     }
     sp.resolve(false);
     cudaEvent_t tr0 = sp.clk_relay.record(m.relay);
@@ -803,7 +804,7 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
     // the routed sum's gates: needed only at the end, so they cross while the experts run (#35 D1: the shared
     // output and its gate stay on the 5060, which finishes bo itself)
     cudaMemcpyAsync(sp.hw, m.w, (size_t) TK * 4, cudaMemcpyDeviceToHost, m.relay);
-    cudaEventRecord(sp.ev_sh, m.relay);
+    cudaEventRecord(sp.ev_gates, m.relay);
     sp.clk_relay.span(sp.tl_relay, "gates down", tr1, sp.clk_relay.record(m.relay), l);
     // 2. the host tables (rows by expert, (t, k) -> row) and the sub-products: row ranges cut at R within a group
     struct Sub { int grp; int64_t r0, nr, maxr; int q0, n; int64_t boff; };
@@ -815,9 +816,9 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
     std::memcpy(sp.hrows, m.src_host.data(), (size_t) TK * 4);
     std::memcpy(sp.hslot, m.slot_host.data(), (size_t) TK * 4);
     int64_t nb = 0;
-    const int ng = (int) ((order.size() + 15) / 16);
+    const int ng = (int) ((order.size() + MMQ_GROUP - 1) / MMQ_GROUP);
     for (int gi = 0; gi < ng; ++gi) {
-        const size_t a = (size_t) gi * 16, e_end = std::min(order.size(), a + 16);
+        const size_t a = (size_t) gi * MMQ_GROUP, e_end = std::min(order.size(), a + MMQ_GROUP);
         const int64_t g0 = m.off[(size_t) order[a]], g1 = m.off[(size_t) order[e_end - 1]] + m.cnt[(size_t) order[e_end - 1]];
         for (int64_t r0 = g0; r0 < g1; r0 += SplitTier::R) {
             const int64_t r1 = std::min(g1, r0 + SplitTier::R);
@@ -859,9 +860,9 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
     cudaEventRecord(sp.ev_xread, sp.s);
     // the gates on their own stream (the previous layer's routed sum has read them: u waits for s's last record)
     cudaStreamWaitEvent(sp.u, sp.ev_bo, 0);   // same card: the previous routed sum has read w
-    cudaEventSynchronize(sp.ev_sh);
+    cudaEventSynchronize(sp.ev_gates);
     cudaMemcpyAsync(sp.w, sp.hw, (size_t) TK * 4, cudaMemcpyHostToDevice, sp.u);
-    cudaEventRecord(sp.ev_shread, sp.u);
+    cudaEventRecord(sp.ev_gatesread, sp.u);
     cudaEvent_t t0 = sp.clk_s.record(sp.s);
     cudaMemcpyAsync(sp.rows, sp.hrows, (size_t) TK * 4, cudaMemcpyHostToDevice, sp.s);
     cudaMemcpyAsync(sp.slot, sp.hslot, (size_t) TK * 4, cudaMemcpyHostToDevice, sp.s);
@@ -871,24 +872,27 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
     // 4. the experts: each group gathers from the 4070's slots and the ring; a ring entry is released (consumed)
     //    once its group's gather is recorded, and a group whose entries span more than the ring holds gathers what it
     //    has first
-    auto wait_issued = [&](size_t k) -> bool {
-        if (xs.issued.load(std::memory_order_acquire) <= k) {
-            timeline::Span ws("split wait issuer", (int64_t) k, l);
-            for (size_t v; (v = xs.issued.load(std::memory_order_acquire)) <= k;) xs.issued.wait(v);
-        }
-        return !xs.aborted.load(std::memory_order_acquire);   // a failed wave publishes `issued` past everything
+    auto wait_issued = [&](size_t k) -> bool {   // false: a failed wave (it publishes `issued` past everything)
+        if (xs.issued.load(std::memory_order_acquire) > k) return !xs.aborted.load(std::memory_order_acquire);
+        timeline::Span ws("split wait issuer", (int64_t) k, l);
+        return SplitTier::wait_above(xs.issued, k, xs.aborted);
     };
     int cur_grp = -1;
     for (const Sub& sb : subs) {
         if (sb.grp != cur_grp) {   // gather the group's experts into the group buffers
             cur_grp = sb.grp;
-            const size_t a = (size_t) sb.grp * 16, e_end = std::min(order.size(), a + 16);
-            const uint8_t* blobs[16];
-            int64_t ents[16];
+            const size_t a = (size_t) sb.grp * MMQ_GROUP, e_end = std::min(order.size(), a + MMQ_GROUP);
+            const uint8_t* blobs[MMQ_GROUP];
+            int64_t ents[MMQ_GROUP];
             size_t p0 = a, pn = 0;   // pending gathers: group positions [p0, p0 + pn)
             int64_t k_first = -1;    // the first ring entry a pending gather reads
+            // the pending gathers' last ring entry per copy stream (cr: the 5060's experts, c: the rest).  Each copy
+            // stream runs its entries in order, so waiting for its last one covers every earlier one
+            int64_t k_wait[2] = {-1, -1};
             auto flush = [&]() {
                 if (pn == 0) return;
+                for (int64_t& kw : k_wait)
+                    if (kw >= 0) { cudaStreamWaitEvent(sp.s, xs.copied[kw % xs.RING], 0); kw = -1; }   // same card
                 sp.clk_s.mark(sp.tl_s, "gather", sp.s, l, sb.grp);
                 mmq::gather_native_group(blobs, (int) pn, f.up_off, f.down_off, gub / 2, db, sp.grp_gu + (p0 - a) * gub,
                                          gub, sp.grp_d + (p0 - a) * db, db, sp.s);
@@ -914,7 +918,7 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
                         if ((size_t) k > c) SplitTier::publish(my_consumed, (size_t) k);
                     }
                     if (!wait_issued((size_t) k)) { err = "prefill: the other wave lane failed"; return false; }
-                    cudaStreamWaitEvent(sp.s, xs.copied[k % xs.RING], 0);   // same card (the stream's copy streams)
+                    k_wait[xs.seq[(size_t) k].kind == 1 ? 0 : 1] = k;   // the copy stream it came on (the issuer's cs4)
                     blobs[pn] = xs.ring + (size_t) (k % xs.RING) * xs.blob;
                 }
                 ents[pn] = k;
@@ -922,8 +926,8 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
             }
             flush();
             const int gn = (int) (e_end - a);
-            cudaMemsetAsync(sp.grp_gu + (size_t) gn * gub, 0, 4096, sp.s);
-            cudaMemsetAsync(sp.grp_d + (size_t) gn * db, 0, 4096, sp.s);
+            cudaMemsetAsync(sp.grp_gu + (size_t) gn * gub, 0, MMQ_TAIL, sp.s);
+            cudaMemsetAsync(sp.grp_d + (size_t) gn * db, 0, MMQ_TAIL, sp.s);
         }
         mmq::ExpertRows a;
         a.xtok = sp.xtok; a.xtok_rows = T; a.rows = sp.rows + sb.r0; a.nr = sb.nr; a.max_rows = sb.maxr;
@@ -935,7 +939,7 @@ bool split_experts(Impl& m, int64_t l, int64_t T, size_t unit, int64_t chunk_i, 
         mmq::expert_rows(*sp.ctx, a, sp.s);
     }
     sp.clk_s.mark(sp.tl_s, "wait gates", sp.s, l);
-    cudaStreamWaitEvent(sp.s, sp.ev_shread, 0);
+    cudaStreamWaitEvent(sp.s, sp.ev_gatesread, 0);
     sp.clk_s.mark(sp.tl_s, "routed sum", sp.s, l);
     {
         const size_t end = xs.seq_start[us + (size_t) l + 1];
@@ -1000,12 +1004,6 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 // Step 2b: which layers' experts go through MMQ (both weight types covered; the Strata Q2_0 pack always - its blob
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
 // gate/up and down matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
-constexpr int MMQ_GROUP = 16;
-static_assert(MMQ_GROUP <= mmq::kGatherGroupMax, "one gather_native_group launch must hold an MMQ group");                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
-// MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
-// product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
-// llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
-constexpr size_t MMQ_TAIL = 4096;
 // #34: the MMQ products run one group at a time, so their scratch (the group's q8 activations, gate/up, SwiGLU and its
 // q8) needs only a group's rows, not the layer's T*K (0.9 GB at 8K).  A token routes to an expert at most once, so an
 // expert has at most T rows; a group with more rows than the cap runs as sub-products that each fit (a row's MMQ result
@@ -1563,18 +1561,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         const bool stream_all = m.ring > STAGE && T >= STREAM_ALL_MIN && m.src != nullptr;
         // #32 S4: expert_split for this chunk (MMQ layers of a native pack whose peer tier is set)
         static const bool split_env = [] { const char* v = std::getenv("STRATA_PREFILL_EXPERT_SPLIT"); return v && std::atoi(v) != 0; }();
-        bool split_on = split_env && m.peer_res != nullptr && m.peer_dev >= 0 && lay0.native && mmq_plan().any &&
-                        m.src != nullptr;
-        for (int64_t l = 0; split_on && l < g.n_layers; ++l) split_on = mmq_plan().layer[(size_t) l];
+        bool split_on = split_env && m.peer_res != nullptr && m.peer_dev >= 0 && m.src != nullptr && split_layout_usable();
         if (split_on && (!m.split || m.split->T < m.T)) {
             m.split.reset();
             std::string se;
             size_t gub = 0, db = 0;
-            for (int64_t l = 0; l < g.n_layers; ++l)
-                if (mmq_plan().layer[(size_t) l]) {
-                    gub = std::max(gub, mmq::matrix_bytes(lay0.fmt[(size_t) l].gu_type, 1280, N));
-                    db = std::max(db, mmq::matrix_bytes(lay0.fmt[(size_t) l].d_type, N, 640));
-                }
+            for (int64_t l = 0; l < g.n_layers; ++l) {   // every layer is on MMQ (split_layout_usable)
+                gub = std::max(gub, mmq::matrix_bytes(lay0.fmt[(size_t) l].gu_type, 1280, N));
+                db = std::max(db, mmq::matrix_bytes(lay0.fmt[(size_t) l].d_type, N, 640));
+            }
             auto sp = std::make_unique<SplitTier>();
             if (!m.relay && !make_stream(&m.relay, wave_priority(m.wave && m.wave_lane == 0))) m.relay = nullptr;
             sp->high = m.wave && m.wave_lane == 0;
@@ -1594,7 +1589,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                   "lines above); restart without STRATA_PREFILL_EXPERT_SPLIT";
             return false;
         }
-        auto split_layer = [&](int64_t l) { return split_on && mmq_plan().layer[(size_t) l]; };
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; int32_t peer; };   // peer: a 4070 slot or -1
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
@@ -1607,7 +1601,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 seq_start[(size_t) l] = seq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                    if (split_layer(l)) break;   // #32 S4: every routed expert of the layer runs on the 4070
+                    if (split_on) break;   // #32 S4: every routed expert of the layer runs on the 4070
                     const int32_t ps = m.peer_res ? m.peer_res[(size_t) l * m.g->n_expert + e] : -1;
                     const uint8_t* b = ps >= 0 ? nullptr : m.src->blob(l, e);
                     const bool from_pack = ps < 0 && b == nullptr;   // #11: on NVMe - read, do not admit
@@ -1662,7 +1656,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 std::vector<Stager::Job>& js4 = sp.unit_jobs[(size_t) u];
                 for (int64_t l = 0; l < g.n_layers; ++l) {
                     sp.seq_start[(size_t) (u * (g.n_layers + 1) + l)] = sp.seq.size();
-                    if (!split_layer(l)) continue;
                     for (int32_t e = 0; e < m.g->n_expert; ++e) {
                         if (m.peer_res[(size_t) l * m.g->n_expert + e] >= 0) continue;   // the 4070's own
                         if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) {
@@ -1749,7 +1742,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     uint8_t* dst = t.ring + (size_t) rs * t.blob;
                     const cudaStream_t cs4 = en.kind == 1 ? t.cr : t.c;
                     cudaStreamWaitEvent(cs4, t.used[rs], 0);   // the group that read this slot has gathered it
-                    cudaStreamWaitEvent(cs4, t.used1[rs], 0);  // and lane 2's (#35 D7; never recorded without a wave)
+                    if (t.lanes_expected == 2) cudaStreamWaitEvent(cs4, t.used1[rs], 0);   // and lane 2's (#35 D7)
                     cudaEvent_t c0 = nullptr;
                     if (en.kind == 1) {
                         // the 5060's own copy, brought down by res_thread into a pinned slot: up here
@@ -2112,7 +2105,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     ++qsa_index;
                 } else {
                     // ======================= MoE =======================
-                    if (split_on) cudaStreamWaitEvent(m.cs, m.split->ev_sh, 0);   // #32 S4: last layer's inputs are in host
+                    if (split_on) cudaStreamWaitEvent(m.cs, m.split->ev_gates, 0);   // #32 S4: last layer's inputs are in host
                     const core::WeightRef *wr = need(v, "ffn_gate_inp.weight", err),
                                           *wgi = need(v, "ffn_gate_inp_shexp.weight", err),
                                           *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -2133,8 +2126,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                         return true;
                     };
-                    const bool split_here = split_layer(l);
-                    if (!split_here && !shared_expert()) return false;
+                    if (!split_on && !shared_expert()) return false;
                     // group the (token, k) pairs by expert on the host
                     pt.mark(kPfHostGroup, cs);
                     {
@@ -2153,8 +2145,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         ++m.cnt[(size_t) e];
                     }
                     // #32 S4: with expert_split, the 5060's experts' rows first and the 4070's (the peer tier's) after
-                    const bool split_l = split_layer(l);
-                    auto on_4070 = [&](int32_t) { return split_l; };
+                    const bool split_l = split_on;   // a split chunk runs every layer's routed experts there
                     m.off[0] = 0;
                     for (int64_t e = 0; e < m.g->n_expert; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
                     // #32 STRATA_PREFILL_ROUTE_TRACE=<file>: this layer's routing for the 2-GPU simulator
@@ -2197,7 +2188,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     std::vector<int32_t> order;
                     std::vector<int32_t> order_4070;   // #32 S4
                     for (int32_t e = 0; e < m.g->n_expert; ++e)
-                        if (m.cnt[(size_t) e] > 0) (on_4070(e) ? order_4070 : order).push_back(e);
+                        if (m.cnt[(size_t) e] > 0) (split_l ? order_4070 : order).push_back(e);
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
@@ -2562,7 +2553,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
                 // #35 D7: chunk c+1 may start layer l - in a split layer only once this chunk's MoE is handed to the
                 // 4070 (split_experts), or its trunk occupies this card and delays that hand-off (tlS: 37 ms a layer)
-                if (wave && half == 0 && !(split_on && split_layer(l))) wave->publish_attn(chunk_i, l, m.cs);
+                if (wave && half == 0 && !split_on) wave->publish_attn(chunk_i, l, m.cs);
                 if (half == 1 && strata::kernels::cvec().covers(l))   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
