@@ -157,7 +157,9 @@ struct Stager {
                 pageable[(size_t) i].resize(blob_bytes);
                 buf[i] = pageable[(size_t) i].data();
             }
-            if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming) != cudaSuccess) return false;
+            // #35 D4: a thread that waits for a DMA sleeps instead of spinning (the host thread needs the core)
+            if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming | cudaEventBlockingSync) != cudaSuccess)
+                return false;
         }
         cudaGetDevice(&device);
         int n_pinned = 0;
@@ -200,7 +202,7 @@ struct Stager {
                 const int b = j % kRing;
                 if (j >= kRing) {
                     timeline::Span wait_span("stager wait buffer", j, j - kRing);
-                    while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
+                    for (int v; (v = issued.load(std::memory_order_acquire)) <= j - kRing;) issued.wait(v);
                     cudaEventSynchronize(dma_done[b]);
                 }
                 const Job& jb = jobs[(size_t) j];
@@ -215,6 +217,7 @@ struct Stager {
                     }
                 }
                 ready[(size_t) j].store(1, std::memory_order_release);
+                ready[(size_t) j].notify_all();
                 active.fetch_sub(1, std::memory_order_acq_rel);
             }
         }
@@ -245,18 +248,20 @@ struct Stager {
     }
     /// Job j's bytes, in a pinned buffer (waits for the copy).
     const uint8_t* wait(int j) {
-        while (!ready[(size_t) j].load(std::memory_order_acquire)) std::this_thread::yield();
+        while (!ready[(size_t) j].load(std::memory_order_acquire)) ready[(size_t) j].wait(0);
         return buf[j % kRing];
     }
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     void issued_one(int j, cudaStream_t copy) {
         cudaEventRecord(dma_done[j % kRing], copy);
         issued.store(j + 1, std::memory_order_release);
+        issued.notify_all();
     }
     /// No job is running after this (the end of a layer, or an early return in the middle of one).
     void finish() {
         head.store((uint64_t) gen << 32, std::memory_order_release);   // n = 0: nothing more to claim
         issued.store(1 << 30, std::memory_order_release);
+        issued.notify_all();
         while (active.load(std::memory_order_acquire) != 0) std::this_thread::yield();
     }
 };
@@ -273,7 +278,7 @@ struct SplitTier {
     static constexpr int64_t R = 4096;   // rows per sub-product (an expert with more rows spans several)
     // 4070 expert staging slots.  96, 192, 320, 480 and 512 measured the same (8.85-9.1 s at 8K) once the 5060's
     // experts came down on their own thread: the smallest keeps the VRAM
-    int RING = 96;
+    int RING = 96;   // #35 D4: 512 (a whole layer, +~500 MB of VRAM) measured 1.6 % vs 1.0 % faster than D1: not worth it
     static constexpr int RES = 32;       // pinned slots for the 5060's own experts on their way down
     int dev = -1, home = 0;
     int64_t T = 0;                       // the token capacity
@@ -314,8 +319,19 @@ struct SplitTier {
     std::vector<size_t> res_list;   // the stream plan's entries of kind 1, in order
     std::atomic<size_t> res_ready{0}, res_uploaded{0};
     std::thread res_thread;
+    // #35 D4: every wait below blocks on the atomic it watches (a spinning helper took the host thread's core: with a
+    // whole-layer ring, host grouping rose from 3.6 to 14.5 ms per layer); join sets them past any wait's target
+    template <class A> static void publish(A& a, size_t v) { a.store(v, std::memory_order_release); a.notify_all(); }
+    template <class A> static bool wait_above(A& a, size_t k, const std::atomic<bool>& stop) {   // until a > k
+        for (size_t v; (v = a.load(std::memory_order_acquire)) <= k;) {
+            if (stop.load(std::memory_order_acquire)) return false;
+            a.wait(v);
+        }
+        return !stop.load(std::memory_order_acquire);
+    }
     void join_issuer() {
         stop.store(true);
+        for (auto* a : {&consumed, &issued, &res_ready, &res_uploaded}) publish(*a, (size_t) 1 << 60);
         if (issuer.joinable()) issuer.join();
         if (res_thread.joinable()) res_thread.join();
         if (tl_res >= 0) clk_res.resolve(true);
@@ -327,7 +343,7 @@ struct SplitTier {
     int64_t last_l = -1, n_own = 0, n_res = 0, n_host = 0;
     // #33 STRATA_TIMELINE: the 4070's compute and copy streams and the 5060's relay stream, each on its own clock
     timeline::GpuClock clk_s, clk_c, clk_relay, clk_res;   // clk_res: res_thread's (the 5060's resident copies)
-    int tl_s = -1, tl_c = -1, tl_relay = -1, tl_res = -1;
+    int tl_s = -1, tl_c = -1, tl_relay = -1, tl_res = -1, tl_in = -1;
     void resolve(bool wait) {   // clk_c is the issuer's: join_issuer resolves it
         { Dev g(dev); clk_s.resolve(wait); }
         clk_relay.resolve(wait);
@@ -378,9 +394,13 @@ struct SplitTier {
             if (cudaHostAlloc(&q, n, cudaHostAllocPortable) != cudaSuccess) { ok = false; cudaGetLastError(); return nullptr; }
             return q;
         };
-        for (cudaEvent_t* e : {&ev_x, &ev_sh, &ev_done}) ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
+        // #35 D4: the cross-card events are waited on by the host (blocking), never by a stream of the other card:
+        // such a wait sat in the copy engine's queue and held back every copy behind it (58 ms stalls, tlD4/tlD4b)
+        for (cudaEvent_t* e : {&ev_x, &ev_sh, &ev_done})
+            ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
         ok = ok && cudaStreamCreateWithFlags(&res_stream, cudaStreamNonBlocking) == cudaSuccess;
-        for (cudaEvent_t& e : ev_res) ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+        for (cudaEvent_t& e : ev_res)   // waited on by the host (blocking), never by a stream of the other card
+            ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
         const int64_t TK = T * 10;
         hbounds_cap = 2 * n_expert + 2 * (TK / R + 2) + 8;
         hx = (uint8_t*) h_alloc(mmq::q8_bytes(T, N));
@@ -398,8 +418,9 @@ struct SplitTier {
         ok = ok && cudaStreamCreateWithFlags(&u, cudaStreamNonBlocking) == cudaSuccess;
         ok = ok && cudaStreamCreateWithFlags(&cr, cudaStreamNonBlocking) == cudaSuccess;
         for (cudaEvent_t* e : {&ev_xread, &ev_shread, &ev_meta, &ev_bo})
-            ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
-        for (cudaEvent_t& e : ev_resread) ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+            ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
+        for (cudaEvent_t& e : ev_resread)
+            ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
         used.assign((size_t) RING, nullptr);
         copied.assign((size_t) RING, nullptr);
         for (int i = 0; i < RING; ++i) {
@@ -434,6 +455,7 @@ struct SplitTier {
             cudaStreamSynchronize(s);
             if (timeline::enabled()) {
                 tl_s = timeline::lane("gpu1 compute (prefill split)");
+                tl_in = timeline::lane("gpu1 inputs (prefill split)");   // #35 D2: each upload alone
                 tl_c = timeline::lane("gpu1 copy engine (prefill split)");
                 clk_s.anchor(s);
                 clk_c.anchor(c);
@@ -616,8 +638,8 @@ bool split_experts(Impl& m, int64_t l, int64_t T, const std::vector<int32_t>& or
         cudaStreamWaitEvent(m.relay, ev_q, 0);
         cudaEventDestroy(ev_q);
     }
-    cudaStreamWaitEvent(m.relay, sp.ev_xread, 0);
-    cudaStreamWaitEvent(m.relay, sp.ev_shread, 0);
+    cudaEventSynchronize(sp.ev_xread);    // the 4070 has read the previous layer's activations and gates
+    cudaEventSynchronize(sp.ev_shread);
     sp.resolve(false);
     cudaEvent_t tr0 = sp.clk_relay.record(m.relay);
     cudaMemcpyAsync(sp.hx, m.Xtok, xbytes, cudaMemcpyDeviceToHost, m.relay);
@@ -668,18 +690,26 @@ bool split_experts(Impl& m, int64_t l, int64_t T, const std::vector<int32_t>& or
     SplitTier::Dev g(sp.dev);
     // 3. the 4070: the inputs up
     sp.clk_s.mark(sp.tl_s, "wait inputs", sp.s, l);
-    cudaStreamWaitEvent(sp.s, sp.ev_x, 0);
+    {
+        timeline::Span ws("split wait activations", l);
+        cudaEventSynchronize(sp.ev_x);   // the 5060's quantize and D2H (host-side: see ev_x's creation)
+    }
     sp.clk_s.mark(sp.tl_s, "inputs up", sp.s, l);
+    cudaEvent_t u0 = sp.clk_s.record(sp.s);
     cudaMemcpyAsync(sp.xtok, sp.hx, xbytes, cudaMemcpyHostToDevice, sp.s);
+    cudaEvent_t u1 = sp.clk_s.record(sp.s);
+    sp.clk_s.span(sp.tl_in, "activations up", u0, u1, l);
     cudaEventRecord(sp.ev_xread, sp.s);
     // the gates on their own stream (the previous layer's routed sum has read them: u waits for s's last record)
-    cudaStreamWaitEvent(sp.u, sp.ev_bo, 0);
-    cudaStreamWaitEvent(sp.u, sp.ev_sh, 0);
+    cudaStreamWaitEvent(sp.u, sp.ev_bo, 0);   // same card: the previous routed sum has read w
+    cudaEventSynchronize(sp.ev_sh);
     cudaMemcpyAsync(sp.w, sp.hw, (size_t) TK * 4, cudaMemcpyHostToDevice, sp.u);
     cudaEventRecord(sp.ev_shread, sp.u);
+    cudaEvent_t t0 = sp.clk_s.record(sp.s);
     cudaMemcpyAsync(sp.rows, sp.hrows, (size_t) TK * 4, cudaMemcpyHostToDevice, sp.s);
     cudaMemcpyAsync(sp.slot, sp.hslot, (size_t) TK * 4, cudaMemcpyHostToDevice, sp.s);
     cudaMemcpyAsync(sp.bounds, sp.hbounds, (size_t) nb * 4, cudaMemcpyHostToDevice, sp.s);
+    sp.clk_s.span(sp.tl_in, "tables up", t0, sp.clk_s.record(sp.s), l);
     cudaEventRecord(sp.ev_meta, sp.s);
     // 4. the experts: each group gathers from the 4070's slots and the ring; a ring entry is released (consumed)
     //    once its group's gather is recorded, and a group whose entries span more than the ring holds gathers what it
@@ -687,7 +717,7 @@ bool split_experts(Impl& m, int64_t l, int64_t T, const std::vector<int32_t>& or
     auto wait_issued = [&](size_t k) {
         if (sp.issued.load(std::memory_order_acquire) > k) return;
         timeline::Span ws("split wait issuer", (int64_t) k, l);
-        while (sp.issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
+        for (size_t v; (v = sp.issued.load(std::memory_order_acquire)) <= k;) sp.issued.wait(v);
     };
     int cur_grp = -1;
     for (const Sub& sb : subs) {
@@ -706,7 +736,7 @@ bool split_experts(Impl& m, int64_t l, int64_t T, const std::vector<int32_t>& or
                 int64_t k_last = -1;
                 for (size_t i = 0; i < pn; ++i)
                     if (ents[i] >= 0) { cudaEventRecord(sp.used[ents[i] % sp.RING], sp.s); k_last = ents[i]; }
-                if (k_last >= 0) sp.consumed.store((size_t) k_last + 1, std::memory_order_release);
+                if (k_last >= 0) SplitTier::publish(sp.consumed, (size_t) k_last + 1);
                 p0 += pn;
                 pn = 0;
                 k_first = -1;
@@ -722,7 +752,7 @@ bool split_experts(Impl& m, int64_t l, int64_t T, const std::vector<int32_t>& or
                     // the entries before k that this layer does not route are released now
                     if (pn == 0 || k_first == k) {
                         const size_t c = sp.consumed.load(std::memory_order_acquire);
-                        if ((size_t) k > c) sp.consumed.store((size_t) k, std::memory_order_release);
+                        if ((size_t) k > c) SplitTier::publish(sp.consumed, (size_t) k);
                     }
                     wait_issued((size_t) k);
                     cudaStreamWaitEvent(sp.s, sp.copied[k % sp.RING], 0);
@@ -750,25 +780,37 @@ bool split_experts(Impl& m, int64_t l, int64_t T, const std::vector<int32_t>& or
     sp.clk_s.mark(sp.tl_s, "routed sum", sp.s, l);
     {
         const size_t end = sp.seq_start[(size_t) l + 1];
-        if (sp.consumed.load(std::memory_order_acquire) < end) sp.consumed.store(end, std::memory_order_release);
+        if (sp.consumed.load(std::memory_order_acquire) < end) SplitTier::publish(sp.consumed, end);
     }
     // 5. combine here; the output down to host and up into the 5060's bo
     moe_routed_sum(sp.dm, sp.slot, sp.w, sp.bo, T, sp.s);
-    cudaStreamWaitEvent(sp.s, sp.ev_done, 0);   // the 5060 has uploaded the previous layer's output from hbo
+    cudaEventSynchronize(sp.ev_done);   // the 5060 has uploaded the previous layer's output from hbo
     sp.clk_s.mark(sp.tl_s, "output down", sp.s, l);
     cudaMemcpyAsync(sp.hbo, sp.bo, (size_t) (T * N) * 4, cudaMemcpyDeviceToHost, sp.s);
     cudaEventRecord(sp.ev_bo, sp.s);
+    (void) cudaStreamQuery(sp.s);
     sp.clk_s.mark(sp.tl_s, nullptr, sp.s);
-    {
-        SplitTier::Dev home(sp.home);
-        cudaStreamWaitEvent(m.relay, sp.ev_bo, 0);
-        cudaEvent_t o0 = sp.clk_relay.record(m.relay);
-        cudaMemcpyAsync(m.bo, sp.hbo, (size_t) (T * N) * 4, cudaMemcpyHostToDevice, m.relay);
-        cudaEventRecord(sp.ev_done, m.relay);
-        sp.clk_relay.span(sp.tl_relay, "output up", o0, sp.clk_relay.record(m.relay), l);
-    }
     const cudaError_t ce = cudaGetLastError();
     if (ce != cudaSuccess) { err = std::string("prefill: expert_split: ") + cudaGetErrorString(ce); return false; }
+    return true;
+}
+
+/// #32 S4 / #35 D4: the layer's routed sum up into the 5060's bo, queued once the host has seen the 4070's D2H
+/// complete (a 5060 stream waiting on the 4070's event held back the 5060's copy engine).  The caller has queued the
+/// shared expert on the 5060 first, so it runs meanwhile; afterwards ev_done marks bo complete.
+template <class Impl>
+bool split_output_up(Impl& m, int64_t l, int64_t T, std::string& err) {
+    SplitTier& sp = *m.split;
+    {
+        timeline::Span ws("split wait output", l);
+        cudaEventSynchronize(sp.ev_bo);
+    }
+    cudaEvent_t o0 = sp.clk_relay.record(m.relay);
+    cudaMemcpyAsync(m.bo, sp.hbo, (size_t) (T * N) * 4, cudaMemcpyHostToDevice, m.relay);
+    cudaEventRecord(sp.ev_done, m.relay);
+    sp.clk_relay.span(sp.tl_relay, "output up", o0, sp.clk_relay.record(m.relay), l);
+    const cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) { err = std::string("prefill: expert_split output: ") + cudaGetErrorString(ce); return false; }
     return true;
 }
 
@@ -1411,22 +1453,37 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 SplitTier& t = *m.split;
                 cudaSetDevice(t.home);
                 timeline::name_thread("prefill split resident copies");
-                for (size_t ri = 0; ri < t.res_list.size(); ++ri) {
-                    while (ri >= t.res_uploaded.load(std::memory_order_acquire) + (size_t) SplitTier::RES) {
-                        if (t.stop.load(std::memory_order_relaxed)) return;
-                        std::this_thread::yield();
+                // #35 D4: no stream of one card waits on an event of the other.  A 4070 copy that waited on this
+                // card's D2H blocked the 4070's copy engine for everything queued behind it (the stager's DMAs
+                // too), which stalled the issuer, which held back the D2H it waited for: 58 ms per layer (tlD4).
+                // Now the D2Hs are queued ahead into free slots, and an entry is published only once its bytes
+                // are in host memory; a slot is refilled only once the 4070's upload from it has completed.
+                const size_t n = t.res_list.size();
+                size_t enq = 0, done = 0;
+                while (done < n) {
+                    while (enq < n && enq < done + (size_t) SplitTier::RES) {
+                        const int hs = (int) (enq % SplitTier::RES);
+                        if (enq >= (size_t) SplitTier::RES) {   // the slot's previous upload was issued, and done
+                            if (t.res_uploaded.load(std::memory_order_acquire) <= enq - (size_t) SplitTier::RES) break;
+                            cudaEventSynchronize(t.ev_resread[hs]);
+                        }
+                        const SplitTier::Entry& en = t.seq[t.res_list[enq]];
+                        cudaEvent_t r0 = t.clk_res.record(t.res_stream);
+                        cudaMemcpyAsync(t.hres + (size_t) hs * t.blob,
+                                        m.cache->device_slot(m.host_res[(size_t) en.l * m.g->n_expert + en.e]),
+                                        (size_t) lay0.blob_bytes(en.l), cudaMemcpyDeviceToHost, t.res_stream);
+                        cudaEventRecord(t.ev_res[hs], t.res_stream);
+                        t.clk_res.span(t.tl_res, "resident down", r0, t.clk_res.record(t.res_stream), en.l, en.e);
+                        ++enq;
                     }
-                    const SplitTier::Entry& en = t.seq[t.res_list[ri]];
-                    const int hs = (int) (ri % SplitTier::RES);
-                    cudaStreamWaitEvent(t.res_stream, t.ev_resread[hs], 0);   // the 4070 has uploaded this slot's last
-                    cudaEvent_t r0 = t.clk_res.record(t.res_stream);
-                    cudaMemcpyAsync(t.hres + (size_t) hs * t.blob,
-                                    m.cache->device_slot(m.host_res[(size_t) en.l * m.g->n_expert + en.e]),
-                                    (size_t) lay0.blob_bytes(en.l), cudaMemcpyDeviceToHost, t.res_stream);
-                    cudaEventRecord(t.ev_res[hs], t.res_stream);
-                    t.clk_res.span(t.tl_res, "resident down", r0, t.clk_res.record(t.res_stream), en.l, en.e);
                     (void) cudaStreamQuery(t.res_stream);
-                    t.res_ready.store(ri + 1, std::memory_order_release);
+                    if (done < enq) {
+                        cudaEventSynchronize(t.ev_res[done % SplitTier::RES]);
+                        SplitTier::publish(t.res_ready, ++done);
+                    } else if (!SplitTier::wait_above(t.res_uploaded, enq - (size_t) SplitTier::RES, t.stop)) {
+                        return;   // every slot waits for an upload the issuer has not queued yet
+                    }
+                    if (t.stop.load(std::memory_order_acquire)) return;
                 }
             });
             sp.stager->start(std::move(js4));
@@ -1437,10 +1494,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 timeline::name_thread("prefill split issuer");
                 size_t ri = 0;   // the next kind-1 entry's index in res_list
                 for (size_t k = 0; k < t.seq.size(); ++k) {
-                    while (k >= t.consumed.load(std::memory_order_acquire) + (size_t) t.RING) {
-                        if (t.stop.load(std::memory_order_relaxed)) return;
-                        std::this_thread::yield();
-                    }
+                    if (k >= (size_t) t.RING && !SplitTier::wait_above(t.consumed, k - (size_t) t.RING, t.stop)) return;
                     if (t.stop.load(std::memory_order_relaxed)) return;
                     const SplitTier::Entry& en = t.seq[k];
                     timeline::Span issue_span(en.kind == 1 ? "split issue resident" : "split issue host", (int64_t) k, en.l);
@@ -1452,16 +1506,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     cudaEvent_t c0 = nullptr;
                     if (en.kind == 1) {
                         // the 5060's own copy, brought down by res_thread into a pinned slot: up here
-                        while (t.res_ready.load(std::memory_order_acquire) <= ri) {
-                            if (t.stop.load(std::memory_order_relaxed)) return;
-                            std::this_thread::yield();
-                        }
+                        if (!SplitTier::wait_above(t.res_ready, ri, t.stop)) return;
                         const int hs = (int) (ri % SplitTier::RES);
-                        cudaStreamWaitEvent(t.cr, t.ev_res[hs], 0);
                         c0 = t.clk_c.record(t.cr);
                         cudaMemcpyAsync(dst, t.hres + (size_t) hs * t.blob, bb, cudaMemcpyHostToDevice, t.cr);
                         cudaEventRecord(t.ev_resread[hs], t.cr);
-                        t.res_uploaded.store(++ri, std::memory_order_release);
+                        SplitTier::publish(t.res_uploaded, ++ri);
                     } else if (en.kind == 2) {
                         c0 = t.clk_c.record(t.c);
                         cudaMemcpyAsync(dst, m.src->blob(en.l, en.e), bb, cudaMemcpyHostToDevice, t.c);
@@ -1478,7 +1528,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     cudaEventRecord(t.copied[rs], cs4);
                     t.clk_c.span(t.tl_c, en.kind == 1 ? "copy resident" : en.kind == 2 ? "copy pinned" : "copy staged", c0,
                                  t.clk_c.record(cs4), en.l, en.e);
-                    t.issued.store(k + 1, std::memory_order_release);
+                    SplitTier::publish(t.issued, k + 1);
                 }
             });
         }
@@ -2213,7 +2263,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfCombine, cs);
                     if (split_l) {
                         if (!shared_expert()) return false;   // while the 4070 runs the routed experts
-                        cudaStreamWaitEvent(m.cs, m.split->ev_done, 0);   // the 4070's routed sum is in bo
+                        if (!split_output_up(m, l, T, err)) return false;
+                        cudaStreamWaitEvent(m.cs, m.split->ev_done, 0);   // same card: the 4070's routed sum is in bo
                         moe_shared_finish(m.shared, m.sg, m.bo, T, m.cs);
                     } else {
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
