@@ -48,6 +48,10 @@ struct NativeExpertLayout {
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 
+/// One native expert blob (device) dequantized in a single launch: gate/up into `gu` in the iq_dequant_gu_f16
+/// layout and down into `down` as iq_dequant_f16 writes it. Byte-identical to those two launches.
+void iq_dequant_expert_f16(const NativeExpertLayout& L, const void* blob, uint16_t* gu, uint16_t* down, void* stream);
+
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff, int64_t n_embd);
 

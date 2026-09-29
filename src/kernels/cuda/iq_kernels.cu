@@ -733,6 +733,20 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
     dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x);
 }
 
+// one expert blob in one launch: blockIdx.y 0/1 = the gate/up superblocks exactly as dequant_gu_kernel writes them,
+// 2 = the down superblocks exactly as dequant_flat_kernel writes them (the two roles have the same superblock count)
+__global__ void dequant_expert_kernel(int gty, int dty, const uint8_t* __restrict__ blob, size_t up_off, size_t down_off,
+                                      int64_t per_row, __half* __restrict__ gu, __half* __restrict__ dn) {
+    const int64_t i = blockIdx.x;
+    const int role = blockIdx.y;
+    if (role < 2) {
+        const int64_t r = i / per_row, c = i % per_row;
+        dq_dispatch<__half>(gty, role ? blob + up_off : blob, i, gu + ((2 * r + role) * per_row + c) * QK_K, threadIdx.x);
+    } else {
+        dq_dispatch<__half>(dty, blob + down_off, i, dn + i * QK_K, threadIdx.x);
+    }
+}
+
 bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11; }
 
 }  // namespace
@@ -828,6 +842,17 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
                                                                                            (__half*) dst);
     check("iq_dequant_gu_f16");
+}
+
+void iq_dequant_expert_f16(const NativeExpertLayout& L, const void* blob, uint16_t* gu, uint16_t* down, void* stream) {
+    const int64_t per_row = L.n_embd / 256;
+    if (L.n_embd % 256 != 0 || (L.n_embd * L.n_ff) % 256 != 0 || !is_iq(L.gu_type) || !is_iq(L.d_type)) {
+        std::fprintf(stderr, "iq_dequant_expert_f16: bad arguments\n");
+        std::exit(1);
+    }
+    dequant_expert_kernel<<<dim3((unsigned) (L.n_ff * per_row), 3), 32, 0, (cudaStream_t) stream>>>(
+        L.gu_type, L.d_type, (const uint8_t*) blob, L.up_off, L.down_off, per_row, (__half*) gu, (__half*) down);
+    check("iq_dequant_expert_f16");
 }
 
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
