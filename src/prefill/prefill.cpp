@@ -3,6 +3,7 @@
 #include "strata/core/progress.hpp"
 
 #include "strata/core/layout.hpp"
+#include "strata/core/native_head.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -830,7 +831,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         pt.layer = -1;
         pt.mark(kPfStart, cs);
         // ---- embeddings, broadcast to the four streams
-        for (int64_t t = 0; t < T; ++t) {
+        const double tl_embed = timeline::enabled() ? timeline::now_us() : 0;
+        // #31: a chunk with no image rows on a GGUF-form table is one gather launch (the verify window's and the
+        // drafter's; byte-identical to the per-token dequant, xeno_embed_batch_parity).  Token by token it was 8,023
+        // launches and ~0.6 s of host time while the GPU waited, on the 8K prompt.  The ids ride in slot_dev, which
+        // the chunk's first MoE layer overwrites later on the same stream.
+        bool any_image = false;
+        for (int64_t t = 0; t < T && embd_rows; ++t) any_image |= embd_rows[p0 + t] != nullptr;
+        const core::NativeEmbed* ne = core::native_embed();
+        const bool batched_embed = ne != nullptr && !any_image;
+        if (batched_embed) {
+            for (int64_t t = 0; t < T; ++t) m.slot_host[(size_t) t] = (int32_t) tokens[c0 + t];
+            cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * 4, cudaMemcpyHostToDevice, m.cs);
+            ne->gather_dev(m.slot_dev, T, m.emb, m.cs);
+        }
+        for (int64_t t = 0; t < T && !batched_embed; ++t) {
             const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
             if (row) {
                 if (cudaMemcpyAsync(m.emb + t * N, row, (size_t) N * 4, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
@@ -842,13 +857,23 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
         }
         gr_broadcast(m.emb, m.R, T, m.cs);
-        // ---- the PLE rows of the whole chunk, one batched SSD request (read ahead on a thread, see ple_gather)
-        if (ple_on) {
+        if (tl_embed > 0) timeline::complete("embed (host)", tl_embed, timeline::now_us(), c0, T);
+        // ---- the PLE rows of the whole chunk, one batched SSD request, read on a thread (see ple_gather).  Only the
+        // PLE block at layer 1 reads them, so the chunk waits for them there (ple_take below).  #31: the first chunk's
+        // rows used to be read in line here, 672 ms of an 8K prompt with the GPU idle; now they are read while the
+        // embeddings and layer 0 run.  Later chunks' rows are read a chunk ahead, as before.
+        auto ple_read = [&ple_gather, &ple_next_err](int64_t c, int b) {
+            return std::async(std::launch::async, [&ple_gather, &ple_next_err, c, b] {
+                timeline::name_thread("ple read-ahead");
+                timeline::Span sp("ple read-ahead", c);
+                return ple_gather(c, b, ple_next_err);
+            });
+        };
+        if (ple_on && !ple_next.valid()) ple_next = ple_read(c0, ple_buf);
+        auto ple_take = [&]() -> bool {
             const auto tp = Clock::now();
             timeline::Span ple_span("ple rows (host)", c0);
-            if (!ple_next.valid()) {
-                if (!ple_gather(c0, ple_buf, err)) return false;
-            } else if (!ple_next.get()) {
+            if (!ple_next.get()) {
                 err = ple_next_err;
                 return false;
             }
@@ -856,20 +881,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             cudaEventRecord(m.ple_copied[ple_buf], m.cs);
             if (c0 + m.T < n) {
                 cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
-                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
-                    timeline::name_thread("ple read-ahead");
-                    timeline::Span sp("ple read-ahead", c1);
-                    return ple_gather(c1, b, ple_next_err);
-                });
+                ple_next = ple_read(c0 + m.T, ple_buf ^ 1);
             }
             ple_buf ^= 1;
             stats_.ms_ple += ms_since(tp);
-        }
+            return true;
+        };
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
         // ---- the QSA step records of every position in the chunk
-        for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
-        cudaMemcpyAsync(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount * 4,
-                        cudaMemcpyHostToDevice, m.cs);
+        {
+            timeline::Span steps_span("qsa steps (host)", c0, T);
+            for (int64_t t = 0; t < T; ++t)
+                strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
+            cudaMemcpyAsync(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount * 4,
+                            cudaMemcpyHostToDevice, m.cs);
+        }
 
         int64_t qsa_index = 0, gdn_index = 0;
         // step 3: this chunk's stream - every non-resident expert of every layer, layer by layer in id order (entry
@@ -881,6 +907,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
         size_t issued = 0, consumed = 0;
+        const double tl_plan = timeline::enabled() ? timeline::now_us() : 0;
         if (stream_all) {
             seq_start.resize((size_t) g.n_layers + 1);
             std::vector<Stager::Job> js;
@@ -903,9 +930,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 }
             }
             seq_start[(size_t) g.n_layers] = seq.size();
-            timeline::instant("stream plan", (int64_t) seq.size(), (int64_t) js.size());
             m.stager->start(std::move(js));
         }
+        if (tl_plan > 0) timeline::complete("stream plan (host)", tl_plan, timeline::now_us(), (int64_t) seq.size(), c0);
         struct StagerDone {
             Stager* st;
             ~StagerDone() { if (st) st->finish(); }
@@ -998,6 +1025,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             timeline::Span layer_span("layer (host)", l, c0);
             pt.layer = l;
             const core::LayerView v(*m.wt, l);
+            if (l == 1 && ple_on && !ple_take()) return false;   // this chunk's PLE rows, uploaded
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
@@ -1539,10 +1567,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
         }
         if (on_chunk) {
-            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
-                err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
+            {
+                timeline::Span sync_span("chunk tail (sync)", c0, T);   // the GPU finishing the chunk's last layers
+                if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                    err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
             }
+            timeline::Span on_chunk_span("on_chunk (drafter)", c0, T);
             if (!on_chunk(m.R, T, p0, err)) return false;
         }
     }
