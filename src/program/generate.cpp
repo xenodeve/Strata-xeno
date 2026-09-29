@@ -4018,6 +4018,11 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                if (strata::timeline::enabled()) {   // #23: cumulative tier entries after each window
+                    const int64_t* te = drive.d.tier_entries;
+                    strata::timeline::instant("tiers primary/cpu", te[0], te[3]);
+                    strata::timeline::instant("tiers 4070/pcie", te[1], te[2]);
+                }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
@@ -5029,6 +5034,11 @@ int main(int argc, char** argv) {
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
+            }
+            if (strata::timeline::enabled()) {   // #23: cumulative tier entries after each window
+                const int64_t* te = drive.d.tier_entries;
+                strata::timeline::instant("tiers primary/cpu", te[0], te[3]);
+                strata::timeline::instant("tiers 4070/pcie", te[1], te[2]);
             }
             if (o.pool_rest) pool.rest();   // the pool idles until the next window: free its cores for adapt/MTP
             if (o.ram_cache_gib > 0.0) arena_src.decay_scores();   // #11: the host tier's scores age per window
