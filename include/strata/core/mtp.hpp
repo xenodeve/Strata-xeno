@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,9 @@ public:
     ~MtpDrafter();
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;
+
+    /// #44 D4: called with each draft as soon as its graph step returns (the next window's PLE rows start then).
+    std::function<void(int32_t)> on_draft;
 
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.

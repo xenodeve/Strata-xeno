@@ -165,6 +165,10 @@ struct Options {
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
+    /// #44 D4: read the next window's PLE rows as its tokens become known (the accepted token after the commit, each
+    /// draft as the MTP returns it) instead of when the window starts; 0 = at the window's start (A/B arm).  On by
+    /// default: same-session ABBA (2026-09-30) thai +2.2 %, code +0.1 %, output identical in generate and serve
+    int ple_ahead = 1;
     int ple_inflight = 64;
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
@@ -383,6 +387,7 @@ void usage() {
                  "                       reads, the table never enters RAM or the file cache; mmap: A/B arm\n"
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
                  "  --ple-inflight N     outstanding SSD reads (default 64)\n"
+                 "  --ple-ahead 0|1      read the next window's PLE rows while the GPU commits and drafts (#44; default 1)\n"
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
                  "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
@@ -1273,6 +1278,29 @@ double probe_pcie_h2d_gbps() {
     return bw;
 }
 
+// #44 D4: the next window's PLE rows, read as its tokens become known.  The rows are the verifier's own (the same
+// ngram_rows over the session's last two committed tokens and then the window's), so a later gather finds them in the
+// row cache; a window that ends up different (the suffix drafter, a shorter T) only wastes those reads.
+struct PleAhead {
+    strata::core::SessionState* ss = nullptr;
+    int32_t prev[2] = {-1, -1};
+    bool on = false;
+    void start(strata::core::SessionState& s, bool enable) {
+        ss = &s;
+        on = enable && s.ple.ready();
+        prev[0] = s.ple_prev[0];
+        prev[1] = s.ple_prev[1];
+    }
+    void push(int32_t tok) {
+        if (!on) return;
+        uint32_t rows[strata::kernels::PLE_N_HEADS];
+        strata::kernels::ngram_rows(&tok, prev, 1, ss->ple.consts, rows);
+        ss->ple.table->prefetch(rows, strata::kernels::PLE_N_HEADS);
+        prev[0] = prev[1];
+        prev[1] = tok;
+    }
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1346,6 +1374,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") o.ple_io = next("--ple-io");
         else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
+        else if (a == "--ple-ahead") o.ple_ahead = std::atoi(next("--ple-ahead"));
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
@@ -2051,6 +2080,8 @@ int main(int argc, char** argv) {
     }
     // Plan v0.3 P6: the MTP draft layer, loaded before the VRAM expert tier is sized from what is left.
     strata::core::MtpDrafter mtp;
+    PleAhead ple_ahead;   // #44 D4: lives as long as the drafter that calls into it
+    mtp.on_draft = [&ple_ahead](int32_t t) { ple_ahead.push(t); };
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -4552,6 +4583,8 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                ple_ahead.start(ss, o.ple_ahead > 0);   // #44 D4: the next window starts with outv[a]
+                ple_ahead.push(outv[(size_t) a]);
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
@@ -5637,6 +5670,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
+            ple_ahead.start(ss, o.ple_ahead > 0);   // #44 D4: the next window starts with outv[a]
+            ple_ahead.push(outv[(size_t) a]);
             ++rounds;
             drafts_total += T - 1;
             drafts_ok += a;
