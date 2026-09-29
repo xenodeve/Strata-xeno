@@ -31,6 +31,9 @@ struct PrefillStats {
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
+    /// #5 P5a: the streamed experts by source (count, bytes): pinned arena, pageable arena, the 4070 tier, NVMe
+    int64_t src_n[4] = {0, 0, 0, 0};
+    uint64_t src_bytes[4] = {0, 0, 0, 0};
     double ms_ple = 0;
 };
 

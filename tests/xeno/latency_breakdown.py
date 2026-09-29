@@ -70,6 +70,12 @@ def parse(stdout: str, stderr: str = '') -> dict:
     if m:
         out.update(prefill_tokens=int(m.group(1)), prefill_ms=float(m.group(3)), prefill_host_ms=float(m.group(4)),
                    prefill_ple_ms=float(m.group(6)))
+    tiers = ('pinned', 'pageable', 'peer', 'nvme')
+    m = re.search(r'prefill sources' + ''.join(rf' {k} (\d+) \(' + FLOAT + r' GB\)' for k in tiers), stderr)
+    if m:
+        for i, k in enumerate(tiers):
+            out[f'prefill_src_{k}'] = int(m.group(2 * i + 1))
+            out[f'prefill_src_{k}_gb'] = float(m.group(2 * i + 2))
     return out
 
 

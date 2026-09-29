@@ -3400,6 +3400,11 @@ if (o.expert_cache_per_layer) {
                      (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,
                      ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0, (long long) ps.experts_streamed,
                      (long long) ps.experts_dma, ps.ms_experts_host, (long long) ps.experts_resident, ps.ms_ple);
+        std::fprintf(stderr, "strata generate: prefill sources");
+        const char* tier_name[4] = {"pinned", "pageable", "peer", "nvme"};
+        for (int t = 0; t < 4; ++t)
+            std::fprintf(stderr, " %s %lld (%.2f GB)", tier_name[t], (long long) ps.src_n[t], (double) ps.src_bytes[t] / 1e9);
+        std::fprintf(stderr, "\n");
     }
     if (o.cache_cpu_only && !host_res.empty() && d_res != nullptr) {
         std::fill(host_res.begin(), host_res.end(), strata::core::kNotResident);

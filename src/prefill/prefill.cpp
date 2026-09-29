@@ -519,6 +519,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int32_t peer_slot = m.peer_res ? m.peer_res[(size_t) l * NE + e] : -1;
                         const uint8_t* b = peer_slot >= 0 ? nullptr : m.src->blob(l, e);
                         const bool from_pack = peer_slot < 0 && b == nullptr;   // #11: on NVMe - read, do not admit
+                        const int tier = peer_slot >= 0 ? 2 : from_pack ? 3 : m.src->pinned(l, e) ? 0 : 1;
+                        ++stats_.src_n[tier];
+                        stats_.src_bytes[tier] += lay.blob_bytes(l);
                         if (peer_slot >= 0) {
                             // its only copy is on the 4070: a peer copy (staged through the host by the driver
                             // when the cards have no P2P path) into this slot
