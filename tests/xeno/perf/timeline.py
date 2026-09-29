@@ -360,6 +360,36 @@ def utilisation(tl: Timeline) -> dict:
     return out
 
 
+def gpu_phase_report(tl: Timeline) -> dict:
+    """Every GPU lane (the ones added later too: the 4070's split streams, #32) split by span name, so a lane's waits
+    are not read as its work."""
+    out = {}
+    for ln, spans in tl.lanes.items():
+        if not ln.startswith("gpu") or not spans:
+            continue
+        d: dict[str, float] = defaultdict(float)
+        for s in spans:
+            d[s.name] += s.dur
+        out[ln] = dict(d)
+    return out
+
+
+def layer_window(tl: Timeline, layer: int) -> list[dict]:
+    """One layer across every lane whose spans carry it as `a`: per (lane, name) the window from the first start to
+    the last end, the busy time and the count, ordered by start - which lane waited on which (#32)."""
+    rows: dict[tuple, dict] = {}
+    for ln, spans in tl.lanes.items():
+        for s in spans:
+            if s.a != layer:
+                continue
+            r = rows.setdefault((ln, s.name), {"lane": ln, "name": s.name, "t0": s.t0, "t1": s.t1, "busy": 0.0, "n": 0})
+            r["t0"] = min(r["t0"], s.t0)
+            r["t1"] = max(r["t1"], s.t1)
+            r["busy"] += s.dur
+            r["n"] += 1
+    return sorted(rows.values(), key=lambda r: r["t0"])
+
+
 def thread_report(tl: Timeline) -> dict:
     """Host threads other than main, grouped by name without its number ("pool worker *"), each lane's active range
     split by innermost span: where a helper thread's time goes (a stager that waits for buffers, not for memcpy)."""
@@ -493,6 +523,13 @@ def render(tl: Timeline, top: int) -> str:
             tot = sum(g["ms"].values())
             parts = ", ".join(f"{n} {100.0 * v / tot:.1f}%" for n, v in sorted(g["ms"].items(), key=lambda kv: -kv[1])[:4])
             out.append(f"  {k} ({g['lanes']} lanes, {tot:.0f} ms): {parts}")
+    gp = gpu_phase_report(tl)
+    if gp:
+        out.append("\n== GPU lanes by phase (ms) ==")
+        for ln, d in sorted(gp.items()):
+            tot = sum(d.values())
+            out.append(f"  {ln} ({tot:.0f} ms): " + ", ".join(
+                f"{n} {v:.0f}" for n, v in sorted(d.items(), key=lambda kv: -kv[1])[:8]))
     u = utilisation(tl)
     out.append("\n== lanes ==")
     out.append(table([(k, f"{v['busy_ms']:.0f}", f"{v['span_ms']:.0f}", f"{v['busy_pct']:.1f}%", v["spans"])
@@ -504,11 +541,19 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("trace")
     ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--layer", type=int, help="lay one layer out across every lane (who waited on whom)")
     ap.add_argument("--json", help="write the reports as JSON (for comparing runs)")
     ap.add_argument("--perfetto", help="write the trace as a closed JSON array for ui.perfetto.dev")
     a = ap.parse_args(argv)
     tl = load(a.trace)
     print(render(tl, a.top))
+    if a.layer is not None:
+        w = layer_window(tl, a.layer)
+        if w:
+            base = min(r["t0"] for r in w)
+            print(f"\n== layer {a.layer} across the lanes (ms from its first span) ==")
+            print(table([(f"{r['lane']}: {r['name']}", f"{r['t0'] - base:.1f}", f"{r['t1'] - base:.1f}",
+                          f"{r['busy']:.1f}", r["n"]) for r in w], ("lane: span", "from", "to", "busy", "n")))
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"prefill": prefill_report(tl, a.top), "decode": decode_report(tl), "lanes": utilisation(tl),

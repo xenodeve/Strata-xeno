@@ -215,3 +215,29 @@ def test_copy_engine_busy_is_reported_per_layer(tmp_path):
     # spec: "per layer ... copy-engine busy"; layer 0 has the copies 1..11 and 20..30, layer 1 has 40.2..50
     r = timeline.prefill_report(timeline.load(write(tmp_path, PREFILL)))[0]
     assert r["layer_copy_ms"] == {0: pytest.approx(20.0), 1: pytest.approx(9.8)}
+
+
+def test_every_gpu_lane_is_split_by_phase(tmp_path):
+    # #32: a lane added later (the 4070's split stream) must be broken down like the standard ones, or its waits read
+    # as work: "wait copies" 0-5 and 7-8 is 6 ms of waiting, "products" 5-7 is 2 ms of work
+    lanes = {21: "gpu1 compute (prefill split)"}
+    ev = [{"ph": "M", "pid": PID, "tid": t, "name": "thread_name", "args": {"name": n}} for t, n in lanes.items()]
+    ev += [X(21, "wait copies", 0, 5, a=3), X(21, "products", 5, 7, a=3), X(21, "wait copies", 7, 8, a=3)]
+    r = timeline.gpu_phase_report(timeline.load(write(tmp_path, ev)))
+    assert r["gpu1 compute (prefill split)"] == {"wait copies": pytest.approx(6.0), "products": pytest.approx(2.0)}
+
+
+def test_one_layer_is_laid_out_across_every_lane(tmp_path):
+    # #32: who waits on whom in one layer - each lane's spans of that layer as a window (first start, last end), its
+    # busy time and count, ordered by start.  The copies of layer 20 trickle over 10 -> 121 ms but are busy 5 ms.
+    lanes = {21: "gpu1 compute (prefill split)", 22: "gpu1 copy engine (prefill split)"}
+    ev = [{"ph": "M", "pid": PID, "tid": t, "name": "thread_name", "args": {"name": n}} for t, n in lanes.items()]
+    ev += [X(22, "copy staged", 10, 12, a=20), X(22, "copy staged", 50, 52, a=20), X(22, "copy staged", 120, 121, a=20),
+           X(22, "copy staged", 130, 131, a=21),
+           X(3, "gather", 100, 160, a=20),
+           X(21, "wait copies", 105, 125, a=20), X(21, "products", 125, 140, a=20)]
+    w = timeline.layer_window(timeline.load(write(tmp_path, ev)), 20)
+    assert [(r["lane"], r["name"]) for r in w] == [
+        ("gpu1 copy engine (prefill split)", "copy staged"), ("gpu0 compute (prefill)", "gather"),
+        ("gpu1 compute (prefill split)", "wait copies"), ("gpu1 compute (prefill split)", "products")]
+    assert (w[0]["t0"], w[0]["t1"], w[0]["busy"], w[0]["n"]) == (pytest.approx(10), pytest.approx(121), pytest.approx(5), 3)
