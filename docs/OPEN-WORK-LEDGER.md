@@ -33,11 +33,10 @@ State on 2026-09-29. Every number comes from a same-session ABBA with identical 
 | #27 serving decode | Root cause: the PCIe read path stalls the verify window on the x4 primary. `--pcie-frac` now defaults to 0 (`704ac58`): serving 8K decode 3.24 -> 61.92 tok/s. |
 | Exclusive 5060 Ti, default | `fdaddbe`: it works together with prompt borrowing, and pageable staging runs on 4 workers. Serving 8K: -7.86 GiB host RAM, decode +5.3 %, TTFT unchanged. |
 | Placement-first cold start | `1d35b34`..`77bbd38`: the arena is reserve-only, GPU tiers fill straight from the pack with unbuffered pipelined reads, and only host-owned experts are committed. No boot spike: dual peak 31.0 GB (was 46.3), serving 38.9 GB (was 46.6). Boot ~161 s -> ~18 s. |
-| Exclusive 4070 (#4 A+B) | `5213b90`, `ea04a91`: opt-in `--exclusive-secondary-experts`, with paired 4070 swaps. -8.5 GB RAM for -2.5-3 % decode, so it is waiting for the developer. |
+| Exclusive 4070 (#4 A+B) | `5213b90`, `ea04a91`, default in `0a0791d`: paired 4070 swaps. The longer A/B showed no trade-off (code 84.75 vs 85.76, thai 51.64 vs 51.36); peak RAM 39.8 -> 31.3 GB. |
 | #28 P1 host-memory modes | Opened. Supersedes #17 (closed): normal / locked / hybrid, layer-contiguous layout. |
 
 **Waiting for the developer:**
-- Whether the dual-GPU default uses an exclusive 4070 (-8.5 GB RAM for -2.5-3 % decode).
 - Deploying the new engine to `engine-xeno/strata.exe`, which picks up the #27 fix, the exclusive default and placement-first.
 - Whether the serving default uses `--process-priority 2`, given the risk of desktop starvation.
 - The dual-GPU serving profile (#12/#21).
