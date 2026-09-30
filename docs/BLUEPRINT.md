@@ -355,7 +355,7 @@ into the sections above and delete the row.
 | same, `c54c337`, `284bb19` (#49 S6) | request life (§4) | the FIFO lock became `RequestGate`: streamed requests (priority 0) before non-streamed (1); image encoding takes the slot at the request's priority |
 | same, `80cd0b3` (#49 S8) | configuration (§7) | `"sampling": {"preset": "deterministic" / "balanced" / "reasoning"}` in the run config |
 | same, `1620329`, `284bb19` (#49 S4, server) | configuration (§7), request life (§4) | `serve/cjk_guard.py`: `"cjk_guard": true` writes the Han ids next to the config and starts the engine with `--ban-ids`; `ban=1` per request when the current turn has no Han and does not name Chinese; `cjk_chars` in `/metrics` |
-| `xeno/49-s4-engine` `761a1a8` (#49 S4, engine; NOT BUILT) | engine protocol, decode (§4, §5) | `--ban-ids FILE`, INFO `ban=<count>`, GEN/GENI key `ban=1`; `SamplerParams.ban` (a device bitmap; the sampler kernels are templated so no ban is the old code); the verifier re-picks a banned request's window |
+| same, `5f12d89` (#49 S4, engine; built and checked: `sampler_parity`, engine seam check) | engine protocol, decode (§4, §5) | `--ban-ids FILE`, INFO `ban=<count>`, GEN/GENI key `ban=1`; `SamplerParams.ban` (a device bitmap; the sampler kernels are templated so no ban is the old code); the verifier re-picks a banned request's window |
 
 ## Keeping this file current
 
