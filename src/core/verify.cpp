@@ -876,8 +876,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
+    // xeno #49 S4: a request with banned ids (`sampling_.ban`) is picked again here too, greedy or not: the captured
+    // greedy pick above has no ban, and every emitted token and every accepted draft is one of these picks.
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.ban != nullptr)) {
         timeline::Span sampling_span("head sampling", T);
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;

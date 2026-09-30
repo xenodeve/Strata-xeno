@@ -294,9 +294,13 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
-        if sampling.get("_ban") is True:                 # xeno #49 S4: the engine's --ban-ids list (Han)
-            keys += " ban=1"
-        return keys + StrataEngine.projection_key(sampling)
+        return keys + StrataEngine.ban_key(sampling) + StrataEngine.projection_key(sampling)
+
+    @staticmethod
+    def ban_key(sampling: dict) -> str:
+        """` ban=1` (xeno #49 S4): the engine's --ban-ids list (the CJK guard's Han ids) for this request - on the GEN
+        line and on an image request's GENI line alike."""
+        return " ban=1" if sampling.get("_ban") is True else ""
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -311,7 +315,8 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         self.progress = None
         self.drained = []           # xeno #49 review: tokens the engine committed after an early stop (read in the drain)
-        head = f"GENI {int(max_new)}{self.projection_key(sampling or {})} {embeddings}" if embeddings else \
+        head = f"GENI {int(max_new)}{self.ban_key(sampling or {})}{self.projection_key(sampling or {})} " \
+               f"{embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {}) if not embeddings else ''}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")

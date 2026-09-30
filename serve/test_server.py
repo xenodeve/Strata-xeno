@@ -1188,6 +1188,15 @@ class CjkGuard(unittest.TestCase):
         self.assertIn("ban=1", StrataEngine.sampling_keys({"_ban": True}).split())
         self.assertFalse([k for k in StrataEngine.sampling_keys({}).split() if k.startswith("ban=")])
 
+    def test_an_image_request_carries_the_ban(self):
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.proc, eng.lines, eng.QUIET_S = ExitedProc(None), queue.Queue(), 0.01
+        eng.lines.put("DONE 0 1 0 0 stop\n")
+        list(eng.generate([1, 2], 5, {"_ban": True}, threading.Event(), embeddings="req.sve"))
+        head = eng.proc.stdin.getvalue().split(" 1,2")[0]
+        self.assertTrue(head.startswith("GENI 5"), head)
+        self.assertIn("ban=1", head.split())
+
     def test_the_server_bans_per_request(self):
         class Recorder(MockEngine):
             def generate(self, ids, max_new, sampling, cancel, embeddings=None):

@@ -372,6 +372,9 @@ struct Options {
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
+    /// xeno #49 S4: a file of token ids (decimal, any separator) that --serve never emits for a request with ban=1
+    /// (the server's CJK guard: the Han ids).  Loaded once; nothing is allocated without it.
+    std::string ban_ids;
 };
 
 void usage() {
@@ -449,6 +452,7 @@ void usage() {
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
                  "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
+                 "  --ban-ids FILE       token ids (decimal, any separator) --serve never emits for a request with ban=1\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
@@ -1511,6 +1515,7 @@ int main(int argc, char** argv) {
             else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
             else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
         }
+        else if (a == "--ban-ids") o.ban_ids = next("--ban-ids");   // xeno #49 S4
         else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {
             std::string e;
@@ -1545,6 +1550,10 @@ int main(int argc, char** argv) {
             return 2;
         }
         }
+    }
+    if (!o.ban_ids.empty() && !o.serve) {   // xeno #49 S4: only the serve loop applies it; do not silently ignore it
+        std::fprintf(stderr, "--ban-ids needs --serve (requests switch it on with ban=1)\n");
+        return 2;
     }
     if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
@@ -3592,6 +3601,43 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
+        // xeno #49 S4: the banned ids (--ban-ids), a device bitmap the head's sampler skips for a request with
+        // ban=1.  Allocated only with the flag, after the expert cache is sized, so an engine without it is unchanged.
+        uint32_t* d_ban = nullptr;
+        long long ban_count = 0;
+        if (!o.ban_ids.empty()) {
+            std::ifstream bf(o.ban_ids, std::ios::binary);
+            std::stringstream text;
+            text << bf.rdbuf();
+            std::vector<int64_t> ban_list;
+            std::vector<uint32_t> ban_bits;
+            std::string berr;
+            if (!bf || !parse_i64_list(text.str().c_str(), ban_list, berr) ||
+                !strata::kernels::ban_words(ban_list, n_vocab, ban_bits, berr)) {
+                std::fprintf(stderr, "strata serve: --ban-ids %s: %s\n", o.ban_ids.c_str(),
+                             bf ? berr.c_str() : "cannot read the file");
+                return 2;
+            }
+            for (int64_t t : o.eos_ids)     // a banned end token would never let a request stop
+                if (t >= 0 && t < n_vocab && ((ban_bits[(size_t) (t >> 5)] >> (t & 31)) & 1u)) {
+                    std::fprintf(stderr, "strata serve: --ban-ids bans the end token %lld\n", (long long) t);
+                    return 2;
+                }
+            if (o.turn_token >= 0 && o.turn_token < n_vocab &&
+                ((ban_bits[(size_t) (o.turn_token >> 5)] >> (o.turn_token & 31)) & 1u)) {
+                std::fprintf(stderr, "strata serve: --ban-ids bans the turn token %lld\n", (long long) o.turn_token);
+                return 2;
+            }
+            for (uint32_t w : ban_bits) for (; w; w &= w - 1) ++ban_count;   // distinct ids (duplicates allowed)
+            if (cudaMalloc(&d_ban, ban_bits.size() * sizeof(uint32_t)) != cudaSuccess ||
+                cudaMemcpy(d_ban, ban_bits.data(), ban_bits.size() * sizeof(uint32_t), cudaMemcpyHostToDevice)
+                    != cudaSuccess) {
+                std::fprintf(stderr, "strata serve: the ban-list allocation failed\n");
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: %lld banned token ids from %s (ban=1 per request)\n", ban_count,
+                         o.ban_ids.c_str());
+        }
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
@@ -3986,14 +4032,14 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&free_b, &total_b);
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                        "spec_min_p=%.2f engine=" STRATA_VERSION "\n",
+                        "spec_min_p=%.2f ban=%lld engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
                         (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
-                        o.spec_min_p);
+                        o.spec_min_p, ban_count);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -4063,6 +4109,7 @@ int main(int argc, char** argv) {
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            int req_ban = 0;    // xeno #49 S4: ban=1 - never emit an id from --ban-ids in this request
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -4078,6 +4125,7 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "ban") req_ban = std::atoi(tok.c_str() + eq + 1);   // image requests too
                     else if (geni) {}   // image requests decode greedily
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -4197,6 +4245,10 @@ int main(int argc, char** argv) {
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
+            if (req_ban && d_ban == nullptr) {   // xeno #49 S4: fail loudly rather than skip the key
+                std::printf("ERR ban=1 needs an engine started with --ban-ids\n");
+                continue;
+            }
             cur = ids;
             const Clock::time_point r0 = Clock::now();
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
@@ -4401,6 +4453,8 @@ int main(int argc, char** argv) {
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
+            req_sp.ban = req_ban ? d_ban : nullptr;          // xeno #49 S4: no session state changes with it
+            req_sp.ban_vocab = req_ban ? (int) n_vocab : 0;
             ver.set_sampling(req_sp);
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);

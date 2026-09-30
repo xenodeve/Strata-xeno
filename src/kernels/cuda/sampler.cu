@@ -88,6 +88,9 @@ __device__ __forceinline__ float apply_penalties(float logit, int count, const S
 /// ascending with `if (s > bv)`, so the LOWEST index wins a tie.  Each thread keeps that rule over its own
 /// strided subset and the reduction resolves two candidates by taking the larger value and, on equality, the
 /// SMALLER index - the same total order, so `sampler_parity` and C1 see no change.
+/// xeno #49 S4: `kBan` true skips the ids set in `p.ban` - a skipped id is a -inf logit under the strict `s > bv`,
+/// so the tie rule is unchanged.  `kBan` false is the code as it was, instruction for instruction.
+template <bool kBan>
 __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vocab,
                                       const int* __restrict__ history, int history_len, const SamplerParams p,
                                       int pmin, int plen, int* __restrict__ out) {
@@ -130,6 +133,7 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
     float bv = __int_as_float(0xff800000);   // -inf
     int best = n_vocab;
     for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+        if constexpr (kBan) if ((__ldg(&p.ban[v >> 5]) >> (v & 31)) & 1u) continue;
         const float s = apply_penalties(l[v], hit_count(v), p);
         if (s > bv) { bv = s; best = v; }
     }
@@ -170,6 +174,7 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
 /// serial scan's strict `>` keeps the first maximum it meets), so the kept sequence - both its set and its
 /// order - is unchanged; `top_p`'s cut reads that order in double arithmetic as before; temperature and the
 /// Philox draw apply after the cut.  `sampler_parity` pins all of it against the host reference.
+template <bool kBan>   // xeno #49 S4: as in `sampler_greedy_kernel` - a banned id never enters the top_k list
 __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
                                const int* __restrict__ history, int history_len, const SamplerParams p,
                                int* __restrict__ out) {
@@ -229,6 +234,7 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         float bv = __int_as_float(0xff800000);   // -inf
         int best = n_vocab;
         for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+            if constexpr (kBan) if ((__ldg(&p.ban[v >> 5]) >> (v & 31)) & 1u) continue;
             bool taken = false;
             for (int j = 0; j < i; ++j) if (sel_ids[j] == v) { taken = true; break; }
             if (taken) continue;
@@ -312,19 +318,31 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                      p.penalty_last_n, (const void*) history, history_len);
         std::exit(1);
     }
+    if (p.ban != nullptr && p.ban_vocab != n_vocab) {   // xeno #49 S4: a mask for another vocabulary bans wrong ids
+        std::fprintf(stderr, "sample_tokens: the ban mask is for %d ids, the logits have %d\n", p.ban_vocab, n_vocab);
+        std::exit(1);
+    }
     const unsigned shmem = (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
                                ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)   // the penalty bitmap
                                : 0;
     if (p.greedy || p.temperature <= 0.0f) {
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
-        sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
-            logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
+        if (p.ban != nullptr)
+            sampler_greedy_kernel<true><<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
+                logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
+        else
+            sampler_greedy_kernel<false><<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
+                logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
     } else {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
-        sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
-            logits, n_vocab, n_tokens, history, history_len, p, out);
+        if (p.ban != nullptr)
+            sampler_kernel<true><<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+                logits, n_vocab, n_tokens, history, history_len, p, out);
+        else
+            sampler_kernel<false><<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+                logits, n_vocab, n_tokens, history, history_len, p, out);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

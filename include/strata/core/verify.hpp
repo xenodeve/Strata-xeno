@@ -74,7 +74,8 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
-    /// parameters would otherwise be baked forever - so this can change between requests freely.
+    /// parameters would otherwise be baked forever - so this can change between requests freely.  `sp.ban` (xeno
+    /// #49 S4) is a device bitmap on the head's device; with it set, every window is picked again with the ban.
     void set_sampling(const strata::kernels::SamplerParams& sp) {
         sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
     }
