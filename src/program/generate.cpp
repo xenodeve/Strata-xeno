@@ -5056,6 +5056,7 @@ int main(int argc, char** argv) {
             int req_slot = 0;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             int req_ban = 0;    // xeno #49 S4: ban=1 - never emit an id from --ban-ids in this request
+            int64_t req_ckpt_at = -1;   // xeno #49 S7 follow-up: ckpt_at=P - also a prompt checkpoint at P
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -5079,6 +5080,7 @@ int main(int argc, char** argv) {
                     }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ban") req_ban = std::atoi(tok.c_str() + eq + 1);   // image requests too
+                    else if (key == "ckpt_at") req_ckpt_at = std::atoll(tok.c_str() + eq + 1);
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -5536,8 +5538,13 @@ int main(int argc, char** argv) {
                         if (i >= o.prompt_cache_root) root_at = i;
                         break;
                     }
+            // xeno #49 S7 follow-up: where this prompt left its family's last one (the server's ckpt_at).  A
+            // transcript that grows inside one message (Claude Code's classifier) has no turn start between the root
+            // and its end, so without this every classifier request read its whole transcript again.
+            const int64_t shared_at = (o.prompt_cache > 0 && req_ckpt_at > std::max(read_from, root_at) &&
+                                       req_ckpt_at < turn_at) ? req_ckpt_at : -1;
             int64_t at = read_from;
-            for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
+            for (const int64_t to : {reread_to, root_at, shared_at, turn_at, n - 1}) {
                 if (to <= at) continue;
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
@@ -5560,8 +5567,8 @@ int main(int argc, char** argv) {
                                                at, to);
                 {   // #37: every prompt part, always - the read sizes decide what the dual-GPU prompt path is worth
                     // (tests/xeno/perf/read_sizes.py parses this line)
-                    const char* part = to == reread_to ? "reread" : to == root_at ? "root" : to == turn_at ? "history"
-                                                                                                           : "new turn";
+                    const char* part = to == reread_to ? "reread" : to == root_at ? "root" : to == shared_at ? "shared"
+                                     : to == turn_at ? "history" : "new turn";
                     std::fprintf(stderr, "strata serve: prompt part %s: %lld tokens [%lld, %lld) of %lld (%s) in %.1f ms\n",
                                  part, (long long) (to - at), (long long) at, (long long) to, (long long) n,
                                  win ? "windows" : "batched",
@@ -5578,7 +5585,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
+                if ((to == turn_at || to == root_at || to == shared_at) && !checkpoint_at(to)) {
                     std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
                 }

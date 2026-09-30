@@ -22,6 +22,12 @@ def test_every_part_line_is_parsed():
                         "ms": 12000.0}
 
 
+def test_a_shared_part_is_parsed_not_dropped():
+    # #49 S7 follow-up: the engine's checkpoint where a prompt left its family's last one (GEN key ckpt_at)
+    line = "strata serve: prompt part shared: 7750 tokens [28408, 36158) of 39994 (batched) in 6000.0 ms"
+    assert [p["kind"] for p in rs.parse(line)] == ["shared"]
+
+
 def test_the_histogram_counts_parts_and_prefill_time_per_bin():
     h = rs.histogram(rs.parse(LOG))
     assert h["< 2K"] == {"parts": 2, "tokens": 1239, "ms": 1590.0}

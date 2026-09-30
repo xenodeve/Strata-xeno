@@ -349,6 +349,9 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+        ck = sampling.get("_ckpt_at")                   # xeno #49 S7 follow-up: an extra prompt checkpoint
+        if isinstance(ck, int) and not isinstance(ck, bool) and ck > 0:
+            keys += f" ckpt_at={ck}"
         return keys + StrataEngine.ban_key(sampling) + StrataEngine.projection_key(sampling)
 
     @staticmethod
@@ -780,7 +783,10 @@ class Service:
             print(f"[strata] slot {slot}: {len(ids)} tokens, shares {shared} with the family's last, "
                   f"turns at {turns[:3]}{'...' if len(turns) > 6 else ''}{turns[-3:] if len(turns) > 3 else ''}",
                   flush=True)
-        return {**req, "strata_cache_slot": slot}
+        req = {**req, "strata_cache_slot": slot}
+        if shared:                                      # the engine keeps a checkpoint there (GEN key ckpt_at): the
+            req["_ckpt_at"] = shared                    # family's next prompt shares it (a transcript that grows
+        return req                                      # inside one message has no turn start to resume from)
 
     def cjk(self, req: dict, messages) -> dict:
         """The request with the Han ban on when the engine has the list and the prompt wants it (xeno #49 S4)."""

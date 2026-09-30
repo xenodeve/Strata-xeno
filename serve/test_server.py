@@ -1581,6 +1581,7 @@ class AutoCacheSlot(unittest.TestCase):
     class SlotEngine(MockEngine):
         def generate(self, ids, max_new, sampling, cancel, embeddings=None):
             self.slots = getattr(self, "slots", []) + [sampling.get("strata_cache_slot", 0)]
+            self.samplings = getattr(self, "samplings", []) + [dict(sampling)]
             yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
     def serve_with(self, slots):
@@ -1636,6 +1637,21 @@ class AutoCacheSlot(unittest.TestCase):
         slots.pick(head + [1, 2, 3])
         self.assertEqual(slots.shared(head + [1, 9, 9, 9]), 601)
         self.assertIsNone(slots.shared([7] * 600))      # a family never seen: nothing to compare with
+
+    def test_the_engine_checkpoints_where_the_family_last_parted(self):
+        """Live (2026-09-30, engine-s7.log): a classifier prompt of 39,994 tokens shared 36,158 with the one before
+        it but reused only its 28,408-token root - its transcript grows inside one message, and the engine keeps
+        checkpoints at turn starts only. The server names the shared length (GEN key ckpt_at) so the engine keeps a
+        checkpoint there, which the family's next prompt shares too."""
+        from serve.server import StrataEngine
+        eng, post = self.serve_with(4)
+        post(self.SIDE)
+        self.assertNotIn("_ckpt_at", eng.samplings[0])                # nothing to compare with yet
+        post(self.SIDE + " and more")
+        shared = eng.samplings[1]["_ckpt_at"]
+        self.assertGreater(shared, len(self.SIDE))
+        self.assertIn(f" ckpt_at={shared}", StrataEngine.sampling_keys(eng.samplings[1]))
+        self.assertNotIn("ckpt_at", StrataEngine.sampling_keys(eng.samplings[0]))
 
     def test_no_automatic_slot_without_engine_slots(self):
         for slots in (None, 1):
