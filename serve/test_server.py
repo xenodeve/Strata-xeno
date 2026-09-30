@@ -699,5 +699,76 @@ class ParallelToolUse(unittest.TestCase):
         self.assertEqual(self.uses(choice), (["first"], "tool_use"))
 
 
+THINK = "".join("abcdefghijklmnopqrstuvwxyz"[(i * 7919 + i * i * 104729) % 26] for i in range(4000))
+
+
+class PromptLog(MockEngine):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts = getattr(self, "prompts", []) + [list(ids)]
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class ThinkingBudget(unittest.TestCase):
+    """#49 S3 (xeno): Anthropic's thinking.budget_tokens closes the thinking block once spent (it only picked an
+    effort level), and a non-streamed side request - Claude Code's auto-mode classifier - thinks little: it held the
+    only slot for 30-130 s on the EXL3 server while the main turn queued."""
+
+    def run_request(self, scripts, body):
+        tok = ByteTokenizer()
+        eng = PromptLog(tok, scripts, max_context=16384)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            body = {"model": "m", "max_tokens": 4000, "messages": [{"role": "user", "content": "hi"}], **body}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/messages",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read().decode()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        if body.get("stream"):
+            thinking, text = "", ""
+            for line in raw.splitlines():
+                if line.startswith("data: "):
+                    d = json.loads(line[6:]).get("delta") or {}
+                    thinking += d.get("thinking", "")
+                    text += d.get("text", "")
+        else:
+            out = json.loads(raw)
+            thinking = "".join(b.get("thinking", "") for b in out["content"] if b["type"] == "thinking")
+            text = "".join(b.get("text", "") for b in out["content"] if b["type"] == "text")
+        return tok, eng, thinking, text
+
+    def test_the_budget_closes_thinking_and_the_answer_follows(self):
+        tok, eng, thinking, text = self.run_request(
+            [THINK[:600], "the answer"], {"stream": True, "thinking": {"type": "enabled", "budget_tokens": 100}})
+        self.assertEqual(thinking[:thinking.index("\n")], THINK[:100])    # cut at the budget, then the close
+        self.assertEqual(text, "the answer")
+        first, second = eng.prompts                     # the answer continues the cut prompt, closed by the server
+        self.assertEqual(second[:len(first)], first)
+        self.assertEqual(tok.decode(second[len(first):len(first) + 100]), THINK[:100])
+        self.assertTrue(tok.decode(second[len(first) + 100:]).endswith("</think>\n\n"))
+
+    def test_a_streamed_request_without_a_budget_thinks_freely(self):
+        _, eng, thinking, text = self.run_request([THINK[:1500] + "</think>\n\nok"], {"stream": True})
+        self.assertEqual(thinking.strip(), THINK[:1500])
+        self.assertEqual(text, "ok")
+        self.assertEqual(len(eng.prompts), 1)
+
+    def test_a_side_request_thinks_little(self):
+        tok, eng, thinking, text = self.run_request([THINK[:3000], "no"], {})
+        self.assertEqual(thinking[:thinking.index("\n")], THINK[:1024])
+        self.assertEqual(text, "no")
+        self.assertIn("Reasoning effort is set to low", tok.decode(eng.prompts[0]))
+
+    def test_side_budget_zero_leaves_side_requests_alone(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"STRATA_SIDE_BUDGET": "0"}):
+            tok, eng, thinking, _ = self.run_request([THINK[:3000] + "</think>\n\nno"], {})
+        self.assertEqual(thinking.strip(), THINK[:3000])
+        self.assertNotIn("Reasoning effort is set to low", tok.decode(eng.prompts[0]))
+
+
 if __name__ == "__main__":
     unittest.main()

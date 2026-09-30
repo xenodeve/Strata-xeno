@@ -44,6 +44,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.loop_guard import LoopGuard
+from serve import think_budget  # noqa: E402  (xeno #49 S3)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 
@@ -701,6 +702,39 @@ class Service:
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
+    def _engine(self, ids, max_new, sampling, cancel, emb):
+        return self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
+            self.engine.generate(ids, max_new, sampling, cancel)
+
+    def _generate(self, ids, max_new, sampling, cancel, emb, state):
+        """The engine's tokens, with the thinking budget (xeno #49 S3, serve/think_budget.py): once `budget` tokens
+        are out while state["thinking"] holds, stop the engine, yield CLOSE's tokens as if the model wrote them and
+        continue from (prompt + written + CLOSE), which reuses the engine's cached prefix."""
+        budget = (sampling or {}).get("_think_budget")
+        gen = self._engine(ids, max_new, sampling, cancel, emb)
+        if not budget:
+            yield from gen
+            return
+        written = []
+        try:
+            for t in gen:
+                yield t
+                if t is not None:
+                    written.append(t)
+                    if len(written) >= budget and state["thinking"]:
+                        break
+            else:
+                return
+        finally:
+            gen.close()
+        if cancel.is_set():
+            return
+        close = self.tok.encode(think_budget.CLOSE, parse_special=True)
+        print(f"[strata] thinking budget spent ({budget} tokens): closing the thinking block", flush=True)
+        yield from close
+        rest = max(1, max_new - len(written) - len(close)) if max_new else max_new
+        yield from self._engine(list(ids) + written + close, rest, sampling, cancel, emb)
+
     def _note(self, n, evs):
         with self.status_lock:
             s = self.status
@@ -770,8 +804,8 @@ class Service:
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
                 last_print = time.time()
                 t_engine = timeline.now_us()
-                gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
-                    self.engine.generate(ids, max_new, sampling, cancel)
+                state = {"thinking": thinking}         # still inside the thinking block (the budget's cut)
+                gen = self._generate(ids, max_new, sampling, cancel, emb, state)
                 try:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
@@ -787,6 +821,8 @@ class Service:
                             break
                         raw_ids.append(t)
                         evs = parser.feed(detok.push(t))
+                        if any(ev.kind != "reasoning" for ev in evs):
+                            state["thinking"] = False
                         self._note(n, evs)
                         last_print = self._progress(last_print)
                         for ev in evs:
@@ -1418,7 +1454,10 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, vision=svc.vision is not None)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            budget = think_budget.for_anthropic(req, kw, max_new)     # xeno #49 S3 (side requests: low effort)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            if budget and thinking:
+                req = {**req, "_think_budget": budget}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
