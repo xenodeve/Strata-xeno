@@ -11,9 +11,9 @@ result. The review of upstream's releases that led to it is in #45 (comment 5918
 | base | `xeno/exp-upstream-0.1.26-dyn` at `8f8098e` (upstream `v0.1.26` = `ac8b251` + the fork's dynamic experts, D2x, #49 S7, the Thai draft subset) |
 | merged | upstream tag `v0.1.30`: 112 commits after `v0.1.26`, 125 files, +11,397 / −880 |
 | branch | `xeno/exp-upstream-0.1.30-dyn` (local, not pushed), worktree `C:\Strata-exp\src-dyn` |
-| merge commit | `eb2ec1f` |
+| merge commit | `eb2ec1f`; review fixes `ac8b6be` (§8) |
 | files changed on both sides | 33 files, 18 of them with conflict markers |
-| engine exe | `C:\Strata-exp\build-130\strata.exe`, copied as `C:\Strata-exp\run\strata-a8f70684094de8af.exe` (build dir `build-130`, `STRATA_BUILD_TESTS=ON`, script `C:\Strata-exp\build-130.cmd`) |
+| engine exe | after the review fixes: sha256 `9b60d6e631c6ff48516684cb9d4d2231321703ca1f5fb990d95e17f958cbfdf9`, `C:\Strata-exp\run\strata-9b60d6e631c6ff48.exe` (build dir `build-130`, `STRATA_BUILD_TESTS=ON`, script `C:\Strata-exp\build-130.cmd`); at the merge commit `a8f70684094de8af` |
 | pre-merge line | worktree `C:\Strata-exp\src-126` on `xeno/exp-upstream-0.1.26-dyn`, engine `strata-26f5974288933cb3.exe` |
 
 ## 2. Upstream's changes, and what the fork does with them
@@ -26,14 +26,15 @@ result. The review of upstream's releases that led to it is in #45 (comment 5918
 | #210 tool-call values may contain `</parameter>` / `</tool_call>` | yes | auto-merged in `serve/` |
 | #183 cancelled request fails the next (`6cad1fe`) | one copy | the same fix as the fork's #53 (`e988f4d`); the fork's line and comment kept |
 | #224 CUDA fault in the prompt path exits at once | yes, as `serve_fatal()` | `serve_fatal()` already `_Exit`s |
-| 1024-token streaming for 1K-4K prompts (`8acd17c`) | off the split layout only | the split layout (#32/#35) keeps 2048: its one-card MoE buffers and wave lanes are sized for it; not measured lower |
+| 1024-token streaming for 1K-4K prompts (`8acd17c`) | off the split layout only | the split layout (#32/#35) keeps 2048 in `stream_all` and, since `ac8b6be`, in `ring_slots` too: its one-card MoE buffers and wave lanes are sized for it; not measured lower |
 | #216 multi-GPU session carve, per-stage prompt loans | carve yes; loans for CUDA0 only | a layer split with prompt borrowing is refused at start (§3, lending) |
 | #189 conversation cache | yes, opt-in, off | coexists with the fork's cache slots (§3, `want_cvec`) |
 | #84 rope scaling past 262K | yes, opt-in | the fork's #29 QSA append overload dropped (§3) |
 | #208 idle unload, `/load`, `/unload`, `--min-free-vram-mib`, `--before-load` | yes | `RequestGate` gained a non-blocking acquire (§3) |
 | #199 the draft head inside the cache's reserve | yes | slot counts unchanged here: 6,222 primary in both arms |
 | resident low-RAM variant, shared arena (#129), RDNA4, Pascal, RTX 20, Docker | yes, inert here | not used by this machine's configs |
-| CJK draft subset (`6e153c9`, 106,299 ids) | **no** | the fork keeps its Thai subset (46,252 ids): the CJK guard bans Han output, so CJK drafts would cost ~110 MiB and 1-2 % English decode (upstream's figures) for nothing |
+| CJK draft subset (`6e153c9`, 106,299 ids) | **no**, not measured | the fork keeps its Thai subset (46,252 ids). Not measured, by reasoning: the CJK guard bans Han output, so every Han draft is rejected by the verifier; the union can only add rejected drafts, ~110 MiB and 1-2 % English decode (upstream's figures) |
+| setup's `refresh_draft_vocab` (`319e4ef`, auto-merged) | yes, relabelled | it installs `data/draft_vocab.bin` over a shipped subset at setup and at every start; in this fork that file is the Thai subset, so the choice is `thai` (default) or `en` since `ac8b6be` (the merge had it labelled "with Chinese, Japanese and Korean") |
 | AVX2 i-quant prefetch (`fa6310b`) | yes | covers the i-quant rows only, not the Q2_0 kernel this machine runs (#55 W4) |
 
 ## 3. Every conflict, file by file
@@ -52,7 +53,7 @@ result. The review of upstream's releases that led to it is in #45 (comment 5918
 | `src/core/mtp.cpp` | the fork's timeline GPU spans around upstream's coupled / plain graph choice | |
 | `src/kernels/cuda/sampler.cu` | greedy and the old path: the fork's `kBan` templates; default path: upstream's split kernels **with the ban added** (`split_part`: a banned id is −inf after its penalty; `one_block`: skipped) | without it a sampled request (Claude Code's main turns) would have lost the CJK guard silently |
 | `src/prefill/prefill.cpp` | both constants; `stream_all = T >= (g_split_layout ? STREAM_ALL_MIN : stream_all_min())`; the fork's buffer report with `qsa_primary()`; upstream's per-token append comment | §2, 1024-token streaming |
-| `serve/server.py` | imports and fields: both; upstream's `ensure_loaded()` wrapped in the fork's `restarting` flag and `EngineDied` (a 529); `load()` answers 529 at once while restarting; the fork's stop-sequence tail plus #212's status pops; `/health`: the fork's 503 for a dead engine, not for an unloaded one, plus `loaded`; the cache-slot check before `svc.load()`; the fork's `cjk_ban` plus upstream's idle-unload settings | |
+| `serve/server.py` | imports and fields: both; upstream's `ensure_loaded()` wrapped in the fork's `restarting` flag and `EngineDied` (a 529); `load()` answers 529 at once while restarting; the fork's stop-sequence tail plus #212's status pops; `/health`: the fork's 503 for a dead engine, not for an unloaded one, plus `loaded` (the merge commit got this wrong; fixed in `ac8b6be`, §8); the cache-slot check before `svc.load()`; the fork's `cjk_ban` plus upstream's idle-unload settings | |
 | `serve/server.py`, `RequestGate` (auto-merged, broke a test) | `acquire(priority, blocking=False)` takes the gate only when free and nobody waits | upstream's idle unload called `fifo.acquire(blocking=False)` on what it assumed was a Lock |
 | `serve/test_server.py` | both test sets | |
 | `src/program/generate.cpp` | see below | |
@@ -94,17 +95,19 @@ Also seen once, not reproduced: `secondary expert (7,350) slot 313 failed its fi
 |---|---|---|
 | build (`build-130`, tests on) | pass | `scratchpad/live/build-130*.log` |
 | `sampler_parity --selftest` on the split (default), one-block and old paths | all pass, including the ban fixtures (greedy, tie, sampled seeds 1-7), run on the 5060 | console output |
+| `qsa_parity --selftest` (upstream's C-2 batch append against single appends, rope scaling) | 0 failures | console output |
 | `tests/xeno` | 109 passed | |
-| `pytest serve` | 136 passed, 3 skipped (121 of the 0.1.26 line + upstream's new ones) | |
+| `pytest serve` | 138 passed, 3 skipped after `ac8b6be` (121 of the 0.1.26 line + upstream's new ones + the `/health` crash test) | |
 | generate mode, the same args, 0.1.26 exe against the merge | code256: output `09c72854` in both, 92.2 / 91.0 tok/s; 11,893-token prompt: `66ab11a9` in both | `gen_pair.py` |
-| serve ABBA, the #54 request set, A = 0.1.26 line, B = merge, order A B B A | **20/20 outputs identical**: code `76ae5b9f`, thai `d91d1754`, read `d766075e`; drafts accepted identical (171/172, 87, 4) | `scratchpad/live/ab-130.jsonl` |
-| decode speed | equal where the machine was in its normal state (the ABBA run before the loan fix: code 87.0 / 91.0 and 86.2 / 90.3 against 86.9 / 90.3 and 86.7 / 90.1; Thai 55.0 / 60.3 and 55.0 / 59.7 against 54.8 / 59.5 and 54.0 / 59.8) | `ab-130-void-loan.jsonl` (decode rows; its B read8k rows failed) |
-| prompt read speed | **not settled**: the final ABBA's later boots ran in a slow machine state that hit both arms (A's last boot too) | `ab-130.jsonl` |
+| serve ABBA, the #54 request set, A = 0.1.26 line, B = merge, order A B B A | **20/20 outputs identical**: code `76ae5b9f`, thai `d91d1754`, read `d766075e`; drafts accepted identical (171/172, 87, 4) | `bench/results/2026-10-01-merge-0130/ab-130.jsonl` |
+| speed, greedy (after `ac8b6be`; A = 0.1.26, B = merge, A B B A, one session) | equal: code −0.8 / +1.3 %, Thai +1.5 / −0.9 %, 11K read +3.5 % (inside A's own spread, 1,375-1,509) | `bench/results/2026-10-01-merge-0130/ab-130m.jsonl` |
+| speed, sampled (temperature 1.0, top-p 0.95, top-k 20, seed 7) | **B faster in every decode row, every B run above every A run**: code +1.8 / +4.9 %, Thai +5.3 / +6.1 %; the same tokens as 0.1.26 (code `0e747eae`, Thai `dc7f1277`), as upstream #197 states. Below the 13.6 % cross-boot floor, but same-session pairs | `.../ab-130m-sampled.jsonl` |
+| earlier ABBA (before the loan fix), decode rows only | equal: code 87.0 / 91.0 and 86.2 / 90.3 against 86.9 / 90.3 and 86.7 / 90.1 | `.../ab-130-void-loan.jsonl` |
 | `check_cache_slots.py` | PASS: independent reuse, cold-output parity, retrieval, recovery after an interrupted stream | console output |
 | #53 cancel repro (`repro53.py`) | a 76K prompt dropped after 22 s, the next streamed and JSON requests answer (72919) | console output |
 | final exe (`a8f70684094de8af`) on the #54 set | outputs `76ae5b9f` / `d91d1754` / `d766075e` | `ab-130-final.jsonl` |
 
-**Not run:** `/code-review`, `/scrutinize`, `/simplify` on the merge; upstream's HIP tests; the conversation cache, rope scaling and idle unload in use; a layer split.
+**Not run:** `/scrutinize` and `/simplify` on the merge (the `/code-review` is §8); upstream's HIP tests; the conversation cache, rope scaling and idle unload in use; a layer split.
 
 ## 7. What is left
 
@@ -113,3 +116,28 @@ Also seen once, not reproduced: `secondary expert (7,350) slot 313 failed its fi
 - **Per-stage prompt loans** (upstream #216) with the wave are not supported: a layer split with borrowing is refused.
 - **The served engine** stays on the daily branch until the developer moves it. This branch becomes the blueprint's baseline when it does; until then the merge is a row in "Not yet in the baseline".
 - **Push and PR** wait for the developer's word, then `/code-review` and `/scrutinize` before merging to `main`.
+
+## 8. The review, and what it changed (`ac8b6be`)
+
+`/code-review` ran on the merge's resolution diff (`git show --remerge-diff eb2ec1f`) on two axes: the repo's standards, and #56 plus this report as the spec. The confirmed findings and their fixes:
+
+| finding | fix |
+|---|---|
+| `/health` answered 200 for a crashed engine: `not svc.loaded()` is true after a crash as well as after an unload | it reads the engine's `unloaded` flag; test `HealthTellsACrashFromAnUnload` (red first) |
+| `POST /load` dropped the connection when `load()` raised `EngineDied` during a restart | a 529 `overloaded_error` |
+| `ring_slots()` (auto-merged) used `stream_all_min()` (1024), so on the split layout a 1024+ chunk got the big ring and each wave lane's loan grew by ~0.5 GB, against this report's claim of keeping 2048 | the same `g_split_layout ? STREAM_ALL_MIN : stream_all_min()` as `stream_all` |
+| setup's auto-merged `refresh_draft_vocab` labelled the Thai subset as CJK, and the blueprint still said setup copies only when missing | relabelled (`thai` / `en`); the blueprint row updated |
+| a stale comment on the loan's sizing | updated |
+
+Recorded, not changed:
+- The MTP drafter's coupled sampling (`coupled_draft_sample`, opt-in `STRATA_SPEC_COUPLED=1`, off) does not apply the ban. The output stays correct, since the verifier re-picks; only acceptance could drop on banned requests.
+- `open(..., defer_load)` ignores `shared_arena_file`. That path is Linux only and unused here.
+- The ban in #197's kernels is a runtime `p.ban != nullptr` branch, not a template. With no ban the output is unchanged, but it is not the old machine code.
+- Smells, noted:
+  - the ban bit test is repeated four times;
+  - `lend_slots`/`lend_bytes` sit beside `part_slots`/`part_bytes`;
+  - the per-stage `PfPart` work is dead once the layer-split refusal fires;
+  - the arena/pinned parameter lists are positional (guarded by the `= delete` overloads);
+  - a new checkpoint field needs four edits in the slot serializer.
+
+The data of the final gates is in `bench/results/2026-10-01-merge-0130/`: the ABBA data, the bench and the A/B scripts.
