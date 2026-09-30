@@ -2,7 +2,7 @@
 
 The rules for every coding agent on this repository live in `AGENTS.md`, so Claude Code and Codex follow one file.
 
-The five rules agents miss most, all in full in `AGENTS.md`:
+The six rules agents miss most, all in full in `AGENTS.md`:
 
 1. **Run everything in the background,** with no window on the developer's display.
 2. **Update the issue as soon as a piece of work is done,** and open a new issue the moment a problem (perf, bug,
@@ -18,5 +18,9 @@ The five rules agents miss most, all in full in `AGENTS.md`:
    key / environment variable, a diagnostic, or the served engine's branch. Work not yet in its baseline goes into
    its "Not yet in the baseline" table. `tools/hooks/commit-msg` enforces the part a diff shows (flags, GEN keys,
    `STRATA_*` variables, config keys, new source files); the way out is a `Blueprint: n/a - <why>` trailer.
+6. **Every upstream merge ends with a merge report.** Once the merge is finished and verified, write
+   `docs/reports/<date>-merge-upstream-<version>.md` as its blueprint and checkpoint: what moved, each conflict and
+   the side kept, the hazards checked, the bugs the merge introduced, the verification with numbers, and what is left.
+   Link it from the tracking issue and the blueprint's revision log. A merge without it is not finished.
 
 @AGENTS.md
