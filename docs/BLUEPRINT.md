@@ -375,4 +375,7 @@ into the sections above and delete the row.
   then add a row to the revision log with the new commit and what was re-checked.
 - Do not copy measurements here: link the issue or report that holds them. This file says how the system works; the
   register and the reports say how fast it is.
-- The commit message says "blueprint updated" or, when a change in the list above needs no edit, why not.
+- When a change in the list above needs no edit, the commit message says why in a trailer:
+  `Blueprint: n/a - <why>`. `tools/hooks/commit-msg` (`git config core.hooksPath tools/hooks`) refuses a commit
+  whose diff adds or removes an engine flag, a GEN key, a `STRATA_*` variable, a run-config key or a source file
+  without this file or that trailer.

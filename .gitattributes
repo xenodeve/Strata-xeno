@@ -5,3 +5,4 @@ bench/prompts/** -text
 *.sh text eol=lf
 *.bat text eol=crlf
 *.pdf binary
+tools/hooks/* text eol=lf

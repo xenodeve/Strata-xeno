@@ -179,7 +179,12 @@ as the change, not at the end of the work:
   moves into the sections when the baseline includes it.
 - **Moving the baseline** (a merge, a new served engine) means re-checking the `file:line` references the moved code
   touches and adding a row to the revision log.
-- The commit message says "blueprint updated", or why a change in the list above needed no edit.
+- **A commit-time check enforces the floor of this rule.** `tools/hooks/commit-msg` runs `tools/blueprint_check.py`
+  on the staged diff: a new or removed engine flag, GEN key, `STRATA_*` environment variable or run-config key, or a
+  new source file, with `docs/BLUEPRINT.md` not in the commit, stops the commit. Update the blueprint, or add the
+  trailer `Blueprint: n/a - <why>` (a bare `n/a` is refused). Install it once per clone:
+  `git config core.hooksPath tools/hooks`. It cannot see a changed request path or a moved thread; those still need
+  judgment.
 
 The full procedure is the file's own "Keeping this file current" section.
 

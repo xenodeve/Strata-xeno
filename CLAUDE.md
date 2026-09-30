@@ -16,6 +16,7 @@ The five rules agents miss most, all in full in `AGENTS.md`:
 5. **Keep `docs/BLUEPRINT.md` current.** Read it before a structural change, and update it in the same commit when a
    change touches a process, the request path, the engine protocol, expert placement, the checkpoints, a flag / config
    key / environment variable, a diagnostic, or the served engine's branch. Work not yet in its baseline goes into
-   its "Not yet in the baseline" table.
+   its "Not yet in the baseline" table. `tools/hooks/commit-msg` enforces the part a diff shows (flags, GEN keys,
+   `STRATA_*` variables, config keys, new source files); the way out is a `Blueprint: n/a - <why>` trailer.
 
 @AGENTS.md
