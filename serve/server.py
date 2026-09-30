@@ -1884,8 +1884,8 @@ def make_handler(svc: Service):
                 self.wfile.write(body)
             elif path == "/health":
                 proc = getattr(svc.engine, "proc", None)
-                # an engine unloaded on purpose (#208) is not a dead one
-                alive = proc is None or proc.poll() is None or not svc.loaded()
+                # an engine unloaded on purpose (#208) is not a dead one; `not svc.loaded()` is true after a crash too
+                alive = proc is None or proc.poll() is None or bool(getattr(svc.engine, "unloaded", False))
                 self._json(200 if alive else 503, {"status": "ok" if alive else "engine_exited",
                                      "max_context": svc.engine.max_context, "model": svc.model,
                                      "images": svc.vision is not None, "api_key": bool(svc.api_key),
@@ -1952,6 +1952,8 @@ def make_handler(svc: Service):
                     self._json(200, {"status": "loaded"})
                 except GpuBusy as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                except EngineDied as e:                      # #56 review: while it restarts, a 529, not a dropped connection
+                    self._json(529, {"type": "error", "error": {"type": "overloaded_error", "message": str(e)}})
                 return
             try:
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")

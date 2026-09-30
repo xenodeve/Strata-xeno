@@ -187,7 +187,9 @@ inline int ring_slots(size_t T) {
     const int r = v ? std::atoi(v) : (g_pinned_share >= 0.9 ? 384 : 96);
     if (v && r == STAGE) return STAGE; // Explicit opt-in to routed-only staging, including large chunks.
     const int big = r < 16 ? 16 : r > RING_MAX ? RING_MAX : r;
-    return (int64_t) T >= stream_all_min() ? big : STAGE;
+    // xeno #56: the same threshold as `stream_all` - the split layout keeps 2048 (a ring for 1024+ chunks there grew each
+    // wave lane's loan by ~0.5 GB for a chunk that cannot stream all)
+    return (int64_t) T >= (g_split_layout ? STREAM_ALL_MIN : stream_all_min()) ? big : STAGE;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // F-1 (upstream 882bb6d, #42): STRATA_GR_UNFUSED=1 keeps the FP32 copy of the normalized rows (gr_norm + gr_mix, and

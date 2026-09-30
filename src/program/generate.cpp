@@ -4700,7 +4700,7 @@ int main(int argc, char** argv) {
         int32_t lend_first_now = -1;      // where its buffers are laid out now (xeno #35: the wave's relayout)
         // ---- WHO BORROWS, AND FROM WHOSE CACHE.  One entry per prompt path: CUDA0's (layers [0, split_at[0]),
         // which is the whole model without a split) borrowing the tail of CUDA0's cache, then one per stage
-        // borrowing the tail of ITS OWN cache.  A loan is sized by the exact `Prefill::bytes_needed` for the
+        // borrowing the tail of ITS OWN cache.  A loan is sized by `prompt_bytes_needed` (both wave lanes) for the
         // chunk, is laid out by `Prefill::relayout`, and is refilled before any window reads - so outside the
         // prompt the whole cache is expert cache.  THIS IS THE POINT OF THE STRUCT: the loan used to exist only
         // for CUDA0, and `no_prefill_borrow` made every stage instead withhold a chunk-sized reserve from its

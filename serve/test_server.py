@@ -2041,5 +2041,36 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
         self.assertEqual(self.req("/health")[1]["loaded"], True)
 
+class HealthTellsACrashFromAnUnload(unittest.TestCase):
+    """#56 review (xeno): after the 0.1.30 merge /health answered 200 for a crashed engine - its test for an unload
+    (`not loaded()`) is also true after a crash.  A crash is 503 `engine_exited`; an unload on purpose (#208) is 200."""
+
+    def health(self, crashed: bool):
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        eng.proc = ExitedProc()                         # the process has ended either way
+        if crashed:
+            eng.running = False
+        else:
+            eng.unload()
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_address[1]}/health", timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_a_crashed_engine_is_503(self):
+        status, body = self.health(crashed=True)
+        self.assertEqual((status, body["status"]), (503, "engine_exited"))
+
+    def test_an_unloaded_engine_is_ok(self):
+        status, body = self.health(crashed=False)
+        self.assertEqual((status, body["status"], body["loaded"]), (200, "ok", False))
+
 if __name__ == "__main__":
     unittest.main()
