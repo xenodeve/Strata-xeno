@@ -5,9 +5,10 @@ Over 43 Claude Code streams of a 2026-09-05 quality bench, a 4.0bpw EXL3 quant d
 token is diffuse, a Chinese token with the same meaning sits inside top-k and wins. A prompt line cannot reach
 that point; a token ban can.
 
-The rule: if the prompt has no Han character and does not name Chinese/China (จีน, china, chinese, mandarin),
-the model may not emit one (thinking included). A prompt that has one - pasted text, a request for Chinese, a
-tool result - lifts the ban for that request. STRATA_ALLOW_CJK=1 lifts it for the server.
+The rule: if the current turn (the user's message and the tool results since the last assistant message) has no
+Han character and does not name Chinese/China (จีน, china, chinese, mandarin), the model may not emit one (thinking
+included). A turn that has one - pasted text, a request for Chinese, a tool result - lifts the ban for that request.
+STRATA_ALLOW_CJK=1 lifts it for the server.
 
 The engine holds the id list (loaded once at start, `--ban-ids FILE`); the server switches it on per request
 with the GEN key `ban=1`, and only when the run config asks for the guard ("cjk_guard": true), because an
@@ -42,11 +43,20 @@ def _texts(messages):
                     yield part["text"]
 
 
+def current_turn(messages):
+    """The messages after the last assistant message: this turn's user text and tool results. Claude Code's system
+    prompt carries CLAUDE.md and memory files, and a long session carries every earlier Read - scanning all of it
+    lifted the ban for good after one mention (review of #49), which is the session the guard exists for."""
+    msgs = list(messages or [])
+    last = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=-1)
+    return [m for m in msgs[last + 1:] if m.get("role") != "system"]
+
+
 def wanted(messages):
-    """Ban for this request? Not with STRATA_ALLOW_CJK=1, and not when the prompt has Han or names Chinese."""
+    """Ban for this request? Not with STRATA_ALLOW_CJK=1, and not when the current turn has Han or names Chinese."""
     if os.environ.get(ENV, "").strip().lower() in ("1", "true", "yes"):
         return False
-    return not any(HAN.search(t) or MENTION.search(t) for t in _texts(messages))
+    return not any(HAN.search(t) or MENTION.search(t) for t in _texts(current_turn(messages)))
 
 
 def ban_ids(decode, vocab_size):

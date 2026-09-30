@@ -616,6 +616,165 @@ class QuietEngineLiveness(unittest.TestCase):
         self.assertFalse(eng.alive())                   # the next request starts it again (issue #27)
 
 
+class EnginePipe(unittest.TestCase):
+    """Review of #49 (xeno): the paths around the engine's pipe that the first S2 fix did not cover."""
+
+    def engine(self, lines, code=None):
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.proc, eng.lines, eng.QUIET_S, eng.can_stop = ExitedProc(code), queue.Queue(), 0.01, True
+        for line in lines:
+            eng.lines.put(line)
+        return eng
+
+    def test_an_engine_that_dies_during_the_stop_drain_does_not_hang(self):
+        # #48's pipe that stays open, met in the STOP-and-drain after an early stop (a cancel, a stop token, the
+        # budget cut): the drain waited on the queue for ever while holding the engine slot
+        eng = self.engine(["T 5\n"])
+        gen = eng.generate([1, 2], 10, {}, threading.Event())
+        self.assertEqual(next(gen), 5)
+        eng.proc.code = ExitedProc.returncode
+        closer = threading.Thread(target=gen.close, daemon=True)
+        closer.start()
+        closer.join(5)
+        self.assertFalse(closer.is_alive(), "the drain hangs on a dead engine")
+        self.assertFalse(eng.alive())
+
+    def test_tokens_drained_after_stop_are_kept(self):
+        # the engine commits tokens ahead of what the server has read; a continuation must carry them to reuse
+        # the engine's live session (its prefix match is on every committed token)
+        eng = self.engine(["T 5\n", "T 6\n", "T 7\n", "DONE 3 2 1.0 1.0 stop\n"])
+        gen = eng.generate([1, 2], 10, {}, threading.Event())
+        self.assertEqual(next(gen), 5)
+        gen.close()
+        self.assertEqual(eng.drained, [6, 7])
+        self.assertEqual(eng.last["generated"], 3)
+
+    def test_a_pump_from_before_a_restart_leaves_the_new_engine_alone(self):
+        # restart() replaces the process and the queue; the old pump, blocked on the old pipe until it closes,
+        # used to mark the NEW engine ended and put None into the NEW queue - a spurious death and restart
+        eng = StrataEngine.__new__(StrataEngine)
+        old_proc, old_lines = ExitedProc(1), queue.Queue()
+        old_proc.stdout = iter(["INFO x\n"])
+        eng.proc, eng.lines, eng.ended = ExitedProc(None), queue.Queue(), False
+        eng._pump(old_proc, old_lines)
+        self.assertFalse(eng.ended)
+        self.assertTrue(eng.lines.empty())
+        self.assertEqual([old_lines.get_nowait(), old_lines.get_nowait()], ["INFO x\n", None])
+
+
+class LegLog(MockEngine):
+    """A mock with the real engine's two habits the thinking budget meets: after an early stop it has committed a
+    few more tokens than were read (`drained`), and each call leaves its own DONE figures in `last`."""
+    LEGS = [{"prompt_ms": 5000.0, "decode_ms": 20000.0, "generated": 103, "reused": 0, "drafts_accepted": 60,
+             "drafts_offered": 80},
+            {"prompt_ms": 40.0, "decode_ms": 200.0, "generated": 10, "reused": 374, "drafts_accepted": 5,
+             "drafts_offered": 8}]
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts = getattr(self, "prompts", []) + [list(ids)]
+        leg = len(self.prompts) - 1
+        n = 0
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                n += 1
+                yield t
+        finally:
+            if leg == 0:
+                self.drained = list(self.script[n:n + 3])
+            self.last = dict(LegLog.LEGS[min(leg, 1)], prompt_tokens=len(ids))
+
+
+class BudgetContinuation(unittest.TestCase):
+    """Review of #49 S3 (xeno): the continuation after a thinking-budget cut."""
+
+    def run_cut(self):
+        tok = ByteTokenizer()
+        eng = LegLog(tok, [THINK[:600], "the answer"], max_context=16384)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ids, thinking, max_new = svc.prepare([{"role": "user", "content": "hi"}], None, {}, 4000)
+        out = list(svc.run(ids, thinking, None, max_new, {"_think_budget": 100}, threading.Event()))
+        return tok, eng, svc, ids, out
+
+    def test_the_continuation_carries_the_tokens_the_engine_wrote_past_the_cut(self):
+        tok, eng, svc, ids, out = self.run_cut()
+        first, second = eng.prompts
+        self.assertEqual(tok.decode(second[len(first):len(first) + 103]), THINK[:103])
+        self.assertTrue(tok.decode(second[len(first) + 103:]).startswith("\n\nI have thought enough"))
+        shown = "".join(x.text for k, x in out if k == "event" and x.kind == "reasoning")
+        self.assertTrue(shown.startswith(THINK[:103]))
+
+    def test_the_numbers_cover_both_legs(self):
+        tok, eng, svc, ids, out = self.run_cut()
+        h = svc.history[-1]
+        self.assertEqual(h["prompt_ms"], 5000.0)        # the real prompt read is leg 1's
+        self.assertEqual(h["reused"], 0)                 # not leg 2's reuse of its own continuation
+        self.assertEqual(h["decode_ms"], 20000.0 + 40.0 + 200.0)   # re-reading CLOSE is part of making the output
+
+
+class RestartOverloaded(unittest.TestCase):
+    """Review of #49 S2 (xeno): '529 overloaded_error while the engine is down or LOADING' - a failed restart was an
+    uncaught RuntimeError (a dropped connection), and a request during a restart waited minutes for it."""
+
+    def serve_with(self, eng):
+        tok = ByteTokenizer()
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}/v1/messages"
+
+        def post(timeout=30):
+            body = {"model": "m", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
+            req = urllib.request.Request(base, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                with e:
+                    return e.code, e.read().decode()
+        return svc, post
+
+    def test_a_failed_restart_is_529(self):
+        class FailsToRestart(MockEngine):
+            def alive(self):
+                return False
+
+            def restart(self):
+                raise RuntimeError("the engine exited before it was ready")
+
+        _, post = self.serve_with(FailsToRestart(ByteTokenizer(), "</think>\n\nok", max_context=CTX))
+        status, text = post()
+        self.assertEqual(status, 529, text)
+        self.assertEqual(json.loads(text)["error"]["type"], "overloaded_error")
+
+    def test_a_request_during_a_restart_is_529_at_once(self):
+        gate = threading.Event()
+
+        class SlowRestart(MockEngine):
+            dead = True
+
+            def alive(self):
+                return not self.dead
+
+            def restart(self):
+                gate.wait(20)
+                self.dead = False
+
+        svc, post = self.serve_with(SlowRestart(ByteTokenizer(), "</think>\n\nok", max_context=CTX))
+        first = threading.Thread(target=post, daemon=True)
+        first.start()
+        for _ in range(500):
+            if svc.restarting:
+                break
+            time.sleep(0.01)
+        t0 = time.time()
+        status, text = post(timeout=10)
+        gate.set()
+        first.join(20)
+        self.assertEqual(status, 529, text)
+        self.assertLess(time.time() - t0, 5)
+
+
 class DeadAtOnce(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         raise EngineDied("the engine stopped unexpectedly (exit code 3221225477)")
@@ -690,6 +849,7 @@ class ParallelToolUse(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+        self.history = svc.history
         return [b["name"] for b in out["content"] if b["type"] == "tool_use"], out["stop_reason"]
 
     def test_parallel_by_default(self):
@@ -698,6 +858,9 @@ class ParallelToolUse(unittest.TestCase):
     def test_one_tool_use_when_disabled(self):
         choice = {"tool_choice": {"type": "auto", "disable_parallel_tool_use": True}}
         self.assertEqual(self.uses(choice), (["first"], "tool_use"))
+        # the server's own stop is not a client cancel (review of #49): the engine stopped early, finish "stop"
+        self.assertEqual(self.history[-1]["finish"], "stop")
+        self.assertLess(self.history[-1]["output_tokens"], len("</think>\n\n" + _call("first") + "\n" + _call("second")))
 
 
 THINK = "".join("abcdefghijklmnopqrstuvwxyz"[(i * 7919 + i * i * 104729) % 26] for i in range(4000))
@@ -714,9 +877,9 @@ class ThinkingBudget(unittest.TestCase):
     effort level), and a non-streamed side request - Claude Code's auto-mode classifier - thinks little: it held the
     only slot for 30-130 s on the EXL3 server while the main turn queued."""
 
-    def run_request(self, scripts, body):
+    def run_request(self, scripts, body, max_context=16384):
         tok = ByteTokenizer()
-        eng = PromptLog(tok, scripts, max_context=16384)
+        eng = PromptLog(tok, scripts, max_context=max_context)
         svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         try:
@@ -750,6 +913,31 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(second[:len(first)], first)
         self.assertEqual(tok.decode(second[len(first):len(first) + 100]), THINK[:100])
         self.assertTrue(tok.decode(second[len(first) + 100:]).endswith("</think>\n\n"))
+
+    def test_a_budget_that_runs_out_after_the_model_closed_thinking_does_nothing(self):
+        # review of #49: the cut keyed on parser EVENTS, and '</think>', the newlines after it and a held
+        # '<tool_call>' prefix emit none - so a budget spent there injected CLOSE into the answer or the call
+        for tail in ("</think>\n\nthe answer",
+                     "</think>\n\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/x\n</parameter>\n</function>\n"
+                     "</tool_call>"):
+            for extra in (1, 3, 9):             # the budget lands this many tokens after '</think>' ends
+                budget = 92 + len("</think>") + extra
+                tok, eng, thinking, text = self.run_request(
+                    [THINK[:92] + tail, "LEG TWO"],
+                    {"stream": True, "thinking": {"type": "enabled", "budget_tokens": budget},
+                     "tools": [{"name": "Read", "description": "d", "input_schema": {"type": "object"}}]})
+                self.assertEqual(len(eng.prompts), 1, (tail[:20], extra))
+                self.assertNotIn("I have thought enough", thinking + text)
+                self.assertNotIn("LEG TWO", text)
+
+    def test_the_budget_is_capped_by_the_max_tokens_the_engine_really_gets(self):
+        # review of #49: the budget was capped against the raw max_tokens before prepare() - 0 means "the rest of
+        # the context", so a 31,999 budget never fired and the turn thought to the end with no answer
+        tok, eng, thinking, text = self.run_request(
+            [THINK[:3900], "the answer"], {"stream": True, "max_tokens": 0,
+                                           "thinking": {"type": "enabled", "budget_tokens": 31999}}, max_context=6000)
+        self.assertEqual(len(eng.prompts), 2)
+        self.assertEqual(text, "the answer")
 
     def test_a_streamed_request_without_a_budget_thinks_freely(self):
         _, eng, thinking, text = self.run_request([THINK[:1500] + "</think>\n\nok"], {"stream": True})
@@ -879,6 +1067,60 @@ class Priority(unittest.TestCase):
         self.assertEqual(Gated.order, ["running", "main", "side-1", "side-2"])
 
 
+class ImagePriority(unittest.TestCase):
+    """Review of #49 S6 (xeno): encoding a request's images takes the engine slot too; a main turn with a screenshot
+    in its history encoded at side-request priority, behind every queued classifier request."""
+
+    def test_a_main_turn_encodes_its_images_before_waiting_side_requests(self):
+        import tempfile
+        order, gate = [], threading.Event()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+
+        class FakeVision:
+            dir = Path(tmp.name)
+
+            def encode(self, src):
+                order.append("encode")
+                f = Path(tmp.name) / "img.bin"
+                f.write_bytes(b"x")
+                return f, 1
+
+        class Gated(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                order.append(sampling.get("tag"))
+                if sampling.get("tag") == "running":
+                    gate.wait(10)
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        tok = ByteTokenizer()
+        svc = Service(Gated(tok, "</think>\n\nok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=FakeVision())
+        ids, thinking, max_new = svc.prepare([{"role": "user", "content": "hi"}], None, {}, 20)
+
+        def run(tag, stream):
+            list(svc.run(ids, thinking, None, max_new, {"tag": tag, "stream": stream}, threading.Event()))
+
+        threads = [threading.Thread(target=run, args=("running", True), daemon=True)]
+        threads[0].start()
+        while "running" not in order:
+            time.sleep(0.01)
+        threads.append(threading.Thread(target=run, args=("side", False), daemon=True))
+        threads[-1].start()
+        while svc.status["queued"] < 1:
+            time.sleep(0.01)
+        image = [{"role": "user", "content": [{"type": "image", "source": "data:image/png;base64,AAAA"},
+                                              {"type": "text", "text": "look"}]}]
+        threads.append(threading.Thread(target=svc.prepare, args=(image, None, {}, 20), kwargs={"priority": 0},
+                                        daemon=True))
+        threads[-1].start()
+        time.sleep(0.3)                                 # the encode is now waiting for the slot
+        gate.set()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(order, ["running", "encode", "side"])
+
+
 class SamplingPresets(unittest.TestCase):
     """#49 S8 / story 20 (xeno): coding presets (deterministic, balanced, reasoning) chosen in the run config's
     sampling block - never switched automatically; the block's own keys override the preset's."""
@@ -922,6 +1164,20 @@ class CjkGuard(unittest.TestCase):
         from unittest import mock
         with mock.patch.dict(os.environ, {"STRATA_ALLOW_CJK": "1"}):
             self.assertFalse(wanted(self.msgs("hello")))
+
+    def test_only_the_current_turn_decides(self):
+        # review of #49: the whole conversation was scanned - the system prompt (CLAUDE.md, the memory index says
+        # "no Chinese unless asked") or one earlier Read of a file with Han lifted the ban for good
+        from serve.cjk_guard import wanted
+        convo = [{"role": "system", "content": "EXL3: no Chinese unless asked"},
+                 {"role": "user", "content": "อ่านไฟล์นี้"},
+                 {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "Read", "arguments": {}}}]},
+                 {"role": "tool", "content": "# 注释 a comment"},
+                 {"role": "assistant", "content": "สรุปแล้ว"},
+                 {"role": "user", "content": "ต่อเลย"}]
+        self.assertTrue(wanted(convo))
+        self.assertFalse(wanted(convo[:4]))             # the current turn IS the tool result with Han
+        self.assertFalse(wanted(convo[:-1] + [{"role": "user", "content": "แปลเป็นภาษาจีน"}]))
 
     def test_ban_ids(self):
         from serve.cjk_guard import ban_ids

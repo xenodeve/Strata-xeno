@@ -33,15 +33,24 @@ def side_budget():
         return 1024
 
 
-def for_anthropic(req: dict, kwargs: dict, max_new):
-    """The budget for an Anthropic request, or None. A side request also gets the low effort in `kwargs` (the
-    template's), unless its thinking is off."""
+def is_side(req: dict) -> bool:
+    return not req.get("stream") and side_budget() > 0
+
+
+def side_effort(req: dict, kwargs: dict) -> None:
+    """A side request thinks at the low effort: set in `kwargs` (the template's) before the prompt is rendered,
+    unless its thinking is off."""
+    if is_side(req) and kwargs.get("enable_thinking") is not False:
+        kwargs["reasoning_effort"] = "low"
+
+
+def for_anthropic(req: dict, max_new):
+    """The budget for an Anthropic request, or None - capped by `max_new`, the tokens the engine will really be
+    given (prepare() turns 0 into the rest of the context and --fit-max-tokens clamps it)."""
     thinking = req.get("thinking") if isinstance(req.get("thinking"), dict) else {}
     requested = thinking.get("budget_tokens") if thinking.get("type") == "enabled" else None
-    side = side_budget()
-    if req.get("stream") or not side:
+    if not is_side(req):
         return resolve(max_new, requested)
-    if kwargs.get("enable_thinking") is not False:
-        kwargs["reasoning_effort"] = "low"
+    side = side_budget()
     return resolve(max_new, min(requested, side) if isinstance(requested, int) and requested > 0 else side,
                    room=SIDE_ROOM)
