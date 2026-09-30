@@ -1462,6 +1462,26 @@ class SamplingPresets(unittest.TestCase):
             self.defaults({"preset": "creative"})
 
 
+class LogEncoding(unittest.TestCase):
+    """2026-09-30, live (xeno): with STRATA_DEBUG=1 the raw-output line went to a redirected stdout in cp1252; a Thai
+    answer raised UnicodeEncodeError - a ValueError - inside the request, the SSE loop sent an `error` event instead of
+    message_stop, and Claude Code showed "Server error mid-response" on 3 of 3 Thai tool-call turns."""
+
+    def test_a_log_line_the_console_cannot_encode_never_fails_the_request(self):
+        import contextlib
+        from unittest import mock
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nคำตอบภาษาไทย", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ids, thinking, max_new = svc.prepare([{"role": "user", "content": "hi"}], None, {}, 64)
+        cp1252 = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")        # as a redirected stdout on Windows
+        with mock.patch.dict(os.environ, {"STRATA_DEBUG": "1"}), contextlib.redirect_stdout(cp1252):
+            out = list(svc.run(ids, thinking, None, max_new, {}, threading.Event()))
+        self.assertEqual(out[-1][0], "done")
+        cp1252.flush()
+        self.assertIn(b"[strata] raw:", cp1252.buffer.getvalue())
+
+
 class CjkGuard(unittest.TestCase):
     """#49 S4 (xeno; the EXL3 server's #77): Han tokens are banned for a request whose prompt has no Han character
     and does not name Chinese - 4.0bpw dropped Han characters into Thai sentences by sampling drift."""
