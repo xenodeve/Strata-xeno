@@ -49,7 +49,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.loop_guard import LoopGuard
-from serve import cjk_guard, think_budget  # noqa: E402  (xeno #49 S4, S3)
+from serve import cjk_guard, forced_opening, think_budget  # noqa: E402  (xeno #49 S4, S7 follow-up, S3)
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -169,16 +169,30 @@ class CacheSlots:
         self.n = n
         self.families: "collections.OrderedDict[int, int]" = collections.OrderedDict()   # family -> slot, oldest first
         self.lock = threading.Lock()
+        self.last: dict = {}                             # family -> its last prompt's ids (for shared())
+
+    def shared(self, ids):
+        """How many leading tokens the prompt shares with the last prompt of its family; None for a new family."""
+        prev = self.last.get(hash(tuple(ids[:self.PREFIX])))
+        if prev is None:
+            return None
+        n = min(len(prev), len(ids))
+        return next((i for i in range(n) if prev[i] != ids[i]), n)
 
     def pick(self, ids) -> int:
         family = hash(tuple(ids[:self.PREFIX]))
         with self.lock:
+            self.last[family] = list(ids)
             if family in self.families:
                 self.families.move_to_end(family)
                 return self.families[family]
             used = set(self.families.values())
             free = [s for s in range(self.n) if s not in used]
-            slot = free[0] if free else self.families.popitem(last=False)[1]
+            if not free:
+                gone, slot = self.families.popitem(last=False)
+                self.last.pop(gone, None)
+            else:
+                slot = free[0]
             self.families[family] = slot
             return slot
 
@@ -706,6 +720,31 @@ class Service:
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.replays = collections.OrderedDict()        # xeno: replay_key -> the last greedy non-stream answer
+
+    REPLAY_KEYS = ("temperature", "top_p", "top_k", "min_p", "stop_sequences", "_opening", "_think_budget")
+
+    def replay_key(self, req: dict, ids, max_new):
+        """The key of a request whose answer can be given again, so Claude Code's repeats of one classifier request
+        cost nothing: only the classifier's fast stage (a required opening, serve/forced_opening.py) and only
+        greedy (no temperature, or 0 - the engine then writes the same tokens for the same prompt).  Any other
+        repeated request is generated again: a benchmark that repeats a prompt must never time a replay."""
+        if not req.get("_opening"):
+            return None
+        eff = {**self.sampling_defaults, **self.shared, **{k: v for k, v in req.items() if v is not None}}
+        try:
+            if float(eff.get("temperature") or 0) > 0:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return (tuple(ids), max_new, json.dumps({k: eff.get(k) for k in self.REPLAY_KEYS}, sort_keys=True))
+
+    def remember_reply(self, key, body: dict) -> None:
+        if body.get("stop_reason") in ("end_turn", "max_tokens", "stop_sequence"):
+            self.replays[key] = body
+            self.replays.move_to_end(key)
+            while len(self.replays) > 4:
+                self.replays.popitem(last=False)
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -733,7 +772,15 @@ class Service:
             return req
         if getattr(self, "slots", None) is None or self.slots.n != n:
             self.slots = CacheSlots(n)
-        return {**req, "strata_cache_slot": self.slots.pick(ids)}
+        shared = self.slots.shared(ids)
+        slot = self.slots.pick(ids)
+        if os.environ.get("STRATA_DEBUG"):              # where the prompt leaves its family's last one, and its turns
+            start = self.tok.encode("<|im_start|>", parse_special=True)
+            turns = [i for i, t in enumerate(ids) if len(start) == 1 and t == start[0]]
+            print(f"[strata] slot {slot}: {len(ids)} tokens, shares {shared} with the family's last, "
+                  f"turns at {turns[:3]}{'...' if len(turns) > 6 else ''}{turns[-3:] if len(turns) > 3 else ''}",
+                  flush=True)
+        return {**req, "strata_cache_slot": slot}
 
     def cjk(self, req: dict, messages) -> dict:
         """The request with the Han ban on when the engine has the list and the prompt wants it (xeno #49 S4)."""
@@ -921,6 +968,11 @@ class Service:
         """The engine's tokens, with the thinking budget (xeno #49 S3, serve/think_budget.py): once `budget` tokens
         are out while state["thinking"] holds, stop the engine, yield CLOSE's tokens as if the model wrote them and
         continue from (prompt + written + CLOSE), which reuses the engine's cached prefix."""
+        opening = (sampling or {}).get("_opening")      # xeno (serve/forced_opening.py): written for the model,
+        if opening:                                     # which continues from it
+            head = self.tok.encode(opening)
+            yield from head
+            ids, max_new = list(ids) + head, (max(1, max_new - len(head)) if max_new else max_new)
         budget = (sampling or {}).get("_think_budget")
         gen = self._engine(ids, max_new, sampling, cancel, emb)
         if not budget:
@@ -1852,11 +1904,23 @@ def make_handler(svc: Service):
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
             if budget and thinking:
                 req = {**req, "_think_budget": budget}
+            opening = forced_opening.required(messages, thinking)      # xeno: the classifier's <block>
+            if opening:
+                req = {**req, "_opening": opening}
+                print(f"[strata] the request requires its reply to begin with {opening}: written for the model",
+                      flush=True)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                key = svc.replay_key(req, ids, max_new)
+                if key is not None and key in svc.replays:
+                    print("[strata] the same greedy request again: its last answer, not generated again", flush=True)
+                    return self._json(200, {**svc.replays[key], "id": f"msg_{uuid.uuid4().hex[:24]}"})
+                body = anthropic_collect(anthropic_events(svc, req, ids, thinking, tools, max_new, cancel))
+                if key is not None:
+                    svc.remember_reply(key, body)
+                return self._json(200, body)
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             self._sse()
             trace = sse_tracer()                             # xeno #49 S5: STRATA_TRACE_SSE=<file>
             try:

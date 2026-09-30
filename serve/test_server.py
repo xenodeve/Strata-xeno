@@ -1627,12 +1627,89 @@ class AutoCacheSlot(unittest.TestCase):
         post(self.MAIN, {"strata_cache_slot": 3})
         self.assertEqual(eng.slots, [3])
 
+    def test_a_family_reports_where_its_prompt_leaves_the_last_one(self):
+        """#49 S7 follow-up: the classifier's stage 2 reused only the 28,408-token root of its stage 1, though both
+        render the same transcript. Where the two prompts part is the evidence for where a checkpoint would help."""
+        from serve.server import CacheSlots
+        slots = CacheSlots(4)
+        head = list(range(600))
+        slots.pick(head + [1, 2, 3])
+        self.assertEqual(slots.shared(head + [1, 9, 9, 9]), 601)
+        self.assertIsNone(slots.shared([7] * 600))      # a family never seen: nothing to compare with
+
     def test_no_automatic_slot_without_engine_slots(self):
         for slots in (None, 1):
             eng, post = self.serve_with(slots)
             post(self.MAIN)
             post(self.SIDE)
             self.assertEqual(eng.slots, [0, 0], slots)
+
+
+class ClassifierStageOne(unittest.TestCase):
+    """#49 S7 follow-up (xeno, decided by the developer 2026-09-30): Claude Code's auto-mode classifier asks its fast
+    stage for a reply that MUST begin with <block>, reads it with `<block>(yes|no)`, and gives it 64 tokens without
+    thinking. Qwen answered in prose ("Evaluating the final action: ..."), was cut at 64 tokens, and the stage was
+    sent again 4 times with the same greedy answer before the slow stage ran - every round, in real use.
+    A: the server writes the required opening for the model. B: an identical greedy request is answered again from
+    the last answer instead of being generated again."""
+
+    MUST = "Err on the side of blocking. Your ENTIRE response MUST begin with <block>. Do NOT output anything else."
+
+    class Counting(MockEngine):
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            self.calls = getattr(self, "calls", 0) + 1
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+    def serve_with(self, script):
+        tok = ByteTokenizer()
+        eng = self.Counting(tok, script, max_context=16384)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+
+        def post(last, system="You judge actions.", extra=None):
+            body = {"model": "m", "max_tokens": 64, "stream": False, "system": system,
+                    "thinking": {"type": "disabled"},        # as the classifier sends it (thinking=False in the log)
+                    "messages": [{"role": "user", "content": last}], **(extra or {})}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/messages",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        return tok, eng, post
+
+    @staticmethod
+    def text(body):
+        return "".join(b.get("text", "") for b in body["content"] if b["type"] == "text")
+
+    def test_A_the_required_opening_is_written_for_the_model(self):
+        tok, eng, post = self.serve_with("no</block>")
+        body = post("<transcript>ls</transcript>\n" + self.MUST)
+        self.assertEqual(self.text(body), "<block>no</block>")
+        self.assertEqual(eng.last_prompt[-len("<block>"):], tok.encode("<block>"))   # the model continues it
+
+    def test_A_no_opening_without_the_rule_in_the_last_message(self):
+        tok, eng, post = self.serve_with("fine")
+        self.assertEqual(self.text(post("<transcript>ls</transcript>")), "fine")
+        self.assertEqual(self.text(post("<transcript>ls</transcript>", system=self.MUST)), "fine")   # stage 2's system
+
+    def test_B_an_identical_greedy_request_is_answered_again(self):
+        tok, eng, post = self.serve_with("Evaluating the final action")
+        first = post("<transcript>ls</transcript>\n" + self.MUST)
+        again = post("<transcript>ls</transcript>\n" + self.MUST)
+        self.assertEqual(eng.calls, 1)
+        self.assertEqual(again["content"], first["content"])
+        self.assertNotEqual(again["id"], first["id"])
+
+    def test_B_sampled_different_or_ordinary_requests_are_generated(self):
+        tok, eng, post = self.serve_with("x")
+        post("<transcript>ls</transcript>\n" + self.MUST, extra={"temperature": 0.7})
+        post("<transcript>ls</transcript>\n" + self.MUST, extra={"temperature": 0.7})
+        post("<transcript>ls -la</transcript>\n" + self.MUST)
+        post("<transcript>ls</transcript>\n" + self.MUST)
+        post("the same benchmark prompt")                # a repeated prompt is timed, never replayed
+        post("the same benchmark prompt")
+        self.assertEqual(eng.calls, 6)
 
 
 if __name__ == "__main__":
