@@ -879,5 +879,30 @@ class Priority(unittest.TestCase):
         self.assertEqual(Gated.order, ["running", "main", "side-1", "side-2"])
 
 
+class SamplingPresets(unittest.TestCase):
+    """#49 S8 / story 20 (xeno): coding presets (deterministic, balanced, reasoning) chosen in the run config's
+    sampling block - never switched automatically; the block's own keys override the preset's."""
+
+    def defaults(self, block):
+        from serve.server import sampling_defaults_from_config
+        return sampling_defaults_from_config({"sampling": block})
+
+    def test_presets(self):
+        self.assertEqual(self.defaults({"preset": "deterministic"}), {"temperature": 0.0})
+        self.assertEqual(self.defaults({"preset": "balanced"}), {"temperature": 0.6, "top_p": 0.95, "top_k": 20})
+        self.assertEqual(self.defaults({"preset": "reasoning"}), {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
+
+    def test_own_keys_win(self):
+        self.assertEqual(self.defaults({"preset": "reasoning", "top_k": 40}),
+                         {"temperature": 1.0, "top_p": 0.95, "top_k": 40})
+
+    def test_no_preset_is_unchanged(self):
+        self.assertEqual(self.defaults({"temperature": 0.7}), {"temperature": 0.7})
+
+    def test_an_unknown_preset_refuses_to_start(self):
+        with self.assertRaises(SystemExit):
+            self.defaults({"preset": "creative"})
+
+
 if __name__ == "__main__":
     unittest.main()

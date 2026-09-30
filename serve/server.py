@@ -1651,6 +1651,16 @@ def clean_shared_defaults(d) -> dict:
     return out
 
 
+# xeno #49 S8 / story 20: coding presets, chosen in the run config ("sampling": {"preset": "balanced"}) and never
+# switched automatically. None of them is measured here yet. reasoning = the sampling docs/DETAILS.md shows for this
+# model; balanced = the Qwen3 family's thinking-mode recommendation (VENDOR); deterministic = greedy.
+SAMPLING_PRESETS = {
+    "deterministic": {"temperature": 0.0},
+    "balanced": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+    "reasoning": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+}
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
@@ -1659,7 +1669,14 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
     are named at startup and ignored."""
     out = {}
-    for key, value in (cfg.get("sampling") or {}).items():
+    block = dict(cfg.get("sampling") or {})
+    preset = block.pop("preset", None)
+    if preset is not None:
+        if preset not in SAMPLING_PRESETS:
+            raise SystemExit(f"[strata] config sampling.preset={preset!r}: expected one of "
+                             f"{', '.join(SAMPLING_PRESETS)}")
+        block = {**SAMPLING_PRESETS[preset], **block}         # the block's own keys win
+    for key, value in block.items():
         if value is None:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
