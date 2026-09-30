@@ -1910,7 +1910,8 @@ def make_handler(svc: Service):
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
             if budget and thinking:
                 req = {**req, "_think_budget": budget}
-            opening = forced_opening.required(messages, thinking)      # xeno: the classifier's <block>
+            opening = forced_opening.required(messages, thinking, max_new,     # xeno: the classifier's <block>
+                                              side=not req.get("stream") and not tools)
             if opening:
                 req = {**req, "_opening": opening}
                 print(f"[strata] the request requires its reply to begin with {opening}: written for the model",
@@ -1996,6 +1997,35 @@ def lan_addresses() -> list[str]:
         pass
     ok = lambda ip: ip and not ip.startswith(("127.", "169.254.", "0."))
     return ([first] if ok(first) else []) + sorted(ip for ip in ips if ok(ip) and ip != first)
+
+
+def loading_server(host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+    """The port's answer while the model loads (xeno, as EXL3's a04b381): every POST is Anthropic's retryable 529
+    overloaded_error and every GET a 503 "loading".  Without it the port was closed for the 1-2 minutes of a start,
+    and Claude Code took each refused connection for a network fault and backed off (once to "retry in 29m")."""
+    class Loading(BaseHTTPRequestHandler):
+        def _send(self, code, body):
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            self._send(503, {"status": "loading"})
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self._send(529, {"type": "error", "error": {"type": "overloaded_error",
+                                                        "message": "the model is loading; retry shortly"}})
+
+        def log_message(self, *args):
+            pass
+
+    httpd = Server((host, port), Loading)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
 
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
@@ -2178,6 +2208,7 @@ def main() -> int:
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
+    placeholder = None
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -2200,6 +2231,7 @@ def main() -> int:
             args += ["--ban-ids", str(ban_path)]
             print(f"[strata] CJK guard: {len(ids)} Han token ids banned unless a prompt has or names Chinese",
                   flush=True)
+        placeholder = loading_server(a.host, a.port)    # xeno: 529 while loading, never a refused connection
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
@@ -2234,6 +2266,9 @@ def main() -> int:
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
+    if placeholder is not None:
+        placeholder.shutdown()
+        placeholder.server_close()
     httpd = serve(svc, host=a.host, port=a.port)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "

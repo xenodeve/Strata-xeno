@@ -1267,6 +1267,16 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(text, "no")
         self.assertIn("Reasoning effort is set to low", tok.decode(eng.prompts[0]))
 
+    def test_a_main_turn_resent_without_streaming_thinks_freely(self):
+        """Live (2026-09-30): after a failed stream Claude Code sent its main turn again without streaming (102,165
+        tokens, 33 tools), and it was taken for a side request: its thinking was closed at 1,024 tokens. The side
+        requests (the classifier, titles) carry no tools; a request with tools is a main turn."""
+        tool = {"name": "Read", "description": "read a file", "input_schema": {"type": "object", "properties": {}}}
+        tok, eng, thinking, text = self.run_request([THINK[:3000] + "</think>\n\nok"], {"tools": [tool]})
+        self.assertEqual(thinking.strip(), THINK[:3000])
+        self.assertEqual(len(eng.prompts), 1)
+        self.assertNotIn("Reasoning effort is set to low", tok.decode(eng.prompts[0]))
+
     def test_side_budget_zero_leaves_side_requests_alone(self):
         from unittest import mock
         with mock.patch.dict(os.environ, {"STRATA_SIDE_BUDGET": "0"}):
@@ -1707,7 +1717,23 @@ class ClassifierStageOne(unittest.TestCase):
     def test_A_no_opening_without_the_rule_in_the_last_message(self):
         tok, eng, post = self.serve_with("fine")
         self.assertEqual(self.text(post("<transcript>ls</transcript>")), "fine")
-        self.assertEqual(self.text(post("<transcript>ls</transcript>", system=self.MUST)), "fine")   # stage 2's system
+        self.assertEqual(self.text(post("<transcript>ls</transcript>", system=self.MUST,      # stage 2: it thinks
+                                        extra={"max_tokens": 8192})), "fine")               # before its <block>
+
+    FORMAT = "Answer in this format: <block>yes</block> or <block>no</block>."
+
+    def test_A_the_fast_stage_is_known_by_its_shape_when_the_wording_differs(self):
+        """Live (2026-09-30): the real requests did not contain the "MUST begin with" wording (the opening-rule log
+        found it in none of their 3 messages). The fast stage is also known by its shape: not streamed, no tools,
+        thinking off, at most 128 tokens, and a prompt that names the <block> reply."""
+        tok, eng, post = self.serve_with("no</block>")
+        self.assertEqual(self.text(post("<transcript>ls</transcript>", system=self.FORMAT)), "<block>no</block>")
+
+    def test_A_the_shape_alone_is_not_enough(self):
+        tok, eng, post = self.serve_with("fine")
+        self.assertEqual(self.text(post("<transcript>ls</transcript>")), "fine")                 # no <block> named
+        self.assertEqual(self.text(post("<transcript>ls</transcript>", system=self.FORMAT,
+                                        extra={"max_tokens": 8192})), "fine")               # the slow stage
 
     def test_B_an_identical_greedy_request_is_answered_again(self):
         tok, eng, post = self.serve_with("Evaluating the final action")
@@ -1726,6 +1752,38 @@ class ClassifierStageOne(unittest.TestCase):
         post("the same benchmark prompt")                # a repeated prompt is timed, never replayed
         post("the same benchmark prompt")
         self.assertEqual(eng.calls, 6)
+
+
+class LoadingAnswers529(unittest.TestCase):
+    """Live (2026-09-30): the server bound its port only after the model loaded (1-2 minutes), so every restart
+    refused Claude Code's connections; it took them for a network fault and backed off until "will retry in 29m".
+    EXL3 (C:\\AI a04b381) answers 529 overloaded_error while loading, which Claude Code retries soon. So does this."""
+
+    def test_a_request_while_loading_is_529_overloaded_and_the_real_server_takes_the_port_after(self):
+        from serve.server import loading_server
+        placeholder = loading_server("127.0.0.1", 0)
+        port = placeholder.server_address[1]
+        body = json.dumps({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/messages", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(req, timeout=10)
+        with caught.exception as e:
+            self.assertEqual(e.code, 529)
+            self.assertEqual(json.loads(e.read())["error"]["type"], "overloaded_error")
+        with self.assertRaises(urllib.error.HTTPError) as health:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10)
+        with health.exception as e:
+            self.assertEqual(e.code, 503)
+        placeholder.shutdown()
+        placeholder.server_close()
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=port)                   # the same port, at once
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            self.assertEqual(r.status, 200)
 
 
 if __name__ == "__main__":

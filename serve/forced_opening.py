@@ -21,9 +21,20 @@ def _text(content) -> str:
     return ""
 
 
-def required(messages, thinking: bool):
-    """The opening the last user message requires (e.g. "<block>"), or None."""
+BLOCK = "<block>"
+FAST_MAX = 128          # the fast stage asks for 64 tokens; the slow one for 8192 and thinks before its <block>
+
+
+def required(messages, thinking: bool, max_new=None, side: bool = False):
+    """The opening the request requires (e.g. "<block>"), or None: the one its last user message states, or - since
+    the real requests use other wording (live, 2026-09-30) - "<block>" for the classifier's fast stage, known by its
+    shape: a side request (not streamed, no tools), thinking off, at most FAST_MAX tokens, naming the <block> reply."""
     if thinking or not messages or messages[-1].get("role") != "user":
         return None
     m = MUST.search(_text(messages[-1].get("content")))
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    if side and max_new is not None and 0 < max_new <= FAST_MAX and \
+            any(BLOCK in _text(x.get("content")) for x in messages):
+        return BLOCK
+    return None
