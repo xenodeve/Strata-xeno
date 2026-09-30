@@ -245,6 +245,12 @@ tier_entries[0..3] = primary / 4070 / pcie / cpu                               (
 - Usage decays ×0.7 per adapt call. A swap needs usage ≥ 2 and a gain ≥ 1.5.
 - **D2x in serve:** paired primary swaps 8 every round; the 4070 tier is static (`adapt_secondary` resolves to 0).
 
+**The CPU pool under `--serve`** (`docs/reports/2026-09-30-cpu-pool-and-kernel-survey.md` §2): an idle worker spins
+`_mm_pause` for 20 ms (`pool.hpp:167`, `STRATA_POOL_SPIN_US`) before it sleeps, and the serve loop never calls `rest()`
+(only generate mode does, `generate.cpp:6592`), so during decode the 13 workers spin at priority 15 (HIGH class +
+HIGHEST) on logical CPUs 2, 4, 6, 8, 10 and 12-19, with the host on 0. Between requests and during batched prompt reads
+they sleep.
+
 ## 6. KV cache and checkpoints
 
 - **QSA KV** (`--kv fp16|int8|q4_0|k8v4`): D2x uses int8, all in VRAM (`--kv-resident 0`).
