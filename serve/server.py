@@ -1017,7 +1017,7 @@ class Service:
                         for line in timing_report(last, len(ids), el):
                             print(line, flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
-                        print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                        print(f"[strata] raw: {ascii(self.tok.decode(raw_ids))}", flush=True)   # xeno: never a UnicodeEncodeError
                 self.status["busy"] = False
                 self.status["last_stop_reason"] = stop_detail or finish
         if not matched_sequence:
@@ -1833,6 +1833,11 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):          # xeno (2026-09-30): a log line must never fail a request
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     if os.environ.get("STRATA_TIMELINE"):   # #33: the engine writes the file, the server the one beside it
         timeline.configure(os.environ["STRATA_TIMELINE"] + ".server.json")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
