@@ -528,5 +528,49 @@ class WebApp(unittest.TestCase):
             self.svc.api_key = ""
 
 
+class ToolResultContent(unittest.TestCase):
+    """#46 (xeno): Claude Code's Read returns a PDF as a `document` block and a screenshot as an `image` block
+    INSIDE a tool_result. The translation kept only the text parts, so the model never saw either."""
+
+    REQ = {"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": [
+        {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "PDF TEXT HERE"}},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+        {"type": "text", "text": "tool text"}]}]}]}
+
+    def tool_message(self, vision):
+        from serve.frontend import anthropic_to_messages
+        msgs, _, _ = anthropic_to_messages(json.loads(json.dumps(self.REQ)), vision=vision)
+        tools = [m for m in msgs if m["role"] == "tool"]
+        self.assertEqual(len(tools), 1, msgs)
+        return msgs, tools[0]
+
+    @staticmethod
+    def text(content):
+        return content if isinstance(content, str) else "".join(i.get("text", "") for i in content)
+
+    def test_a_pdf_returned_by_read_reaches_the_tool_message(self):
+        for vision in (False, True):
+            _, tool = self.tool_message(vision)
+            self.assertIn("PDF TEXT HERE", self.text(tool["content"]))
+            self.assertIn("tool text", self.text(tool["content"]))
+
+    def test_a_screenshot_returned_by_read_reaches_the_prompt_with_vision(self):
+        from serve.frontend import images_of
+        msgs, tool = self.tool_message(vision=True)
+        self.assertEqual(images_of(msgs), ["data:image/png;base64,AAAA"])
+        prompt = ChatTemplate(ROOT / "serve" / "chat_template.jinja").render(msgs)
+        response = prompt[prompt.index("<tool_response>"):prompt.index("</tool_response>")]
+        self.assertIn("<|vision_start|><|image_pad|><|vision_end|>", response)
+        self.assertLess(response.index("PDF TEXT HERE"), response.index("<|vision_start|>"))
+        self.assertLess(response.index("<|vision_end|>"), response.index("tool text"))
+
+    def test_a_screenshot_without_vision_is_a_note_not_an_error(self):
+        from serve.frontend import images_of
+        msgs, tool = self.tool_message(vision=False)
+        self.assertEqual(images_of(msgs), [])
+        self.assertIn("image", self.text(tool["content"]).lower())
+        self.assertIn("not enabled", self.text(tool["content"]))
+
+
 if __name__ == "__main__":
     unittest.main()
