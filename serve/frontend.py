@@ -175,6 +175,26 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     return _late_system_to_user(messages), tools, kwargs
 
 
+def _tool_result_content(content, vision: bool):
+    """A tool_result's content for the tool message (xeno, #46). Claude Code's Read returns a PDF as a `document`
+    block and a screenshot as an `image` block in here; both used to be dropped. Documents expand as top-level ones
+    do; an image stays an image item with vision, else it becomes a note instead of failing the request."""
+    if not isinstance(content, list):
+        return _text_of(content)
+    parts = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "document":
+            parts.extend(document_parts(part, vision))
+        elif part.get("type") in IMAGE_PARTS and not vision:
+            parts.append({"type": "text", "text": "(an image returned by the tool; images are not enabled on this "
+                                                  "server)"})
+        else:
+            parts.append(part)
+    return _parts_of(parts)
+
+
 def anthropic_to_messages(req: dict, vision: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -205,7 +225,7 @@ def anthropic_to_messages(req: dict, vision: bool = False) -> tuple[list[dict], 
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
             elif kind == "tool_result":
-                messages.append({"role": "tool", "content": _text_of(block.get("content"))})
+                messages.append({"role": "tool", "content": _tool_result_content(block.get("content"), vision)})
         if text or calls or reasoning:
             out = {"role": m["role"], "content": "".join(text)}
             if reasoning:

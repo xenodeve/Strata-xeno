@@ -162,6 +162,32 @@ with no console window:
   window for every child.
 - Do not use `start`, `cmd /c start`, a visible PowerShell `Start-Process` or anything else that opens a window.
 
+## Keep `docs/BLUEPRINT.md` current
+
+`docs/BLUEPRINT.md` is the system blueprint: the processes, the life of a request, the memory hierarchy, the
+checkpoints, every flag / config key / environment variable, and the diagnostics (the developer, 2026-09-30). A
+blueprint that describes old code sends the next session down the wrong path, so it is updated **in the same commit**
+as the change, not at the end of the work:
+
+- **Read it first** before a structural change, and check that its baseline commit is the code you are changing.
+- **Update it when a change** adds or removes a process, a per-request or per-round thread, or a file with its own
+  responsibility; changes the request path, the engine protocol (`GEN` keys, reply lines), prefix reuse, the prompt
+  parts or the decode round; changes expert placement, tiers, profiles, swaps or the CPU pool; changes the KV cache or
+  the checkpoints; adds, removes or changes the default of a flag, a JSON config key or an environment variable; adds
+  a diagnostic; or merges upstream / moves the served engine to another branch.
+- **Work on a branch that is not the blueprint's baseline** goes into its "Not yet in the baseline" table first, and
+  moves into the sections when the baseline includes it.
+- **Moving the baseline** (a merge, a new served engine) means re-checking the `file:line` references the moved code
+  touches and adding a row to the revision log.
+- **A commit-time check enforces the floor of this rule.** `tools/hooks/commit-msg` runs `tools/blueprint_check.py`
+  on the staged diff: a new or removed engine flag, GEN key, `STRATA_*` environment variable or run-config key, or a
+  new source file, with `docs/BLUEPRINT.md` not in the commit, stops the commit. Update the blueprint, or add the
+  trailer `Blueprint: n/a - <why>` (a bare `n/a` is refused). Install it once per clone:
+  `git config core.hooksPath tools/hooks`. It cannot see a changed request path or a moved thread; those still need
+  judgment.
+
+The full procedure is the file's own "Keeping this file current" section.
+
 ## Other standing rules
 
 - **The correctness gate is greedy raw-token parity against a same-session

@@ -22,9 +22,12 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import base64
 import hashlib
 import codecs
+import heapq
+import itertools
 import json
 import os
 import queue
@@ -46,6 +49,8 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.loop_guard import LoopGuard
+from serve import cjk_guard, think_budget  # noqa: E402  (xeno #49 S4, S3)
+from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 
@@ -153,6 +158,7 @@ class StrataEngine:
     (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
     engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
     """
+    QUIET_S = 10          # how long a quiet engine waits for a line before a heartbeat and a liveness check
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
@@ -195,13 +201,14 @@ class StrataEngine:
             self.info["version"] = str(self.info["engine"])
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
-        threading.Thread(target=self._pump, daemon=True).start()
+        threading.Thread(target=self._pump, args=(self.proc, self.lines), daemon=True).start()
 
-    def _pump(self):
-        for line in self.proc.stdout:
-            self.lines.put(line)
-        self.ended = True                               # its output closed: it is gone, even before the OS says so
-        self.lines.put(None)
+    def _pump(self, proc, lines):
+        for line in proc.stdout:
+            lines.put(line)
+        lines.put(None)
+        if self.proc is proc:                           # xeno #49 review: a pump left over from before restart()
+            self.ended = True                           # its output closed: it is gone, even before the OS says so
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -295,7 +302,13 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
-        return keys + StrataEngine.projection_key(sampling)
+        return keys + StrataEngine.ban_key(sampling) + StrataEngine.projection_key(sampling)
+
+    @staticmethod
+    def ban_key(sampling: dict) -> str:
+        """` ban=1` (xeno #49 S4): the engine's --ban-ids list (the CJK guard's Han ids) for this request - on the GEN
+        line and on an image request's GENI line alike."""
+        return " ban=1" if sampling.get("_ban") is True else ""
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -309,6 +322,7 @@ class StrataEngine:
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         self.progress = None
+        self.drained = []           # xeno #49 review: tokens the engine committed after an early stop (read in the drain)
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -321,8 +335,11 @@ class StrataEngine:
         try:
             while True:
                 try:
-                    line = self.lines.get(timeout=10)
+                    line = self.lines.get(timeout=self.QUIET_S)
                 except queue.Empty:
+                    if self.proc.poll() is not None:     # xeno #48: it exited but its output never closed (a
+                        done = self.ended = True         # crashed CUDA process can keep the pipe): fail, not wait
+                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.proc.poll()})")
                     if cancel.is_set():
                         return
                     yield None
@@ -357,10 +374,19 @@ class StrataEngine:
                     except OSError:
                         pass
                 while True:
-                    line = self.lines.get()
+                    try:
+                        line = self.lines.get(timeout=self.QUIET_S)
+                    except queue.Empty:
+                        if self.proc.poll() is not None:     # xeno #48 in the drain: exited, output never closed
+                            self.ended, self.last = True, {}
+                            break
+                        continue
                     if line is None or line.startswith("ERR"):
+                        self.last = {}                        # no DONE: the previous request's figures are not ours
                         break
-                    if line.startswith("DONE"):
+                    if line.startswith("T "):
+                        self.drained.append(int(line[2:]))
+                    elif line.startswith("DONE"):
                         self._parse_done(line)
                         break
 
@@ -579,6 +605,47 @@ class StopSequenceFilter:
         return visible
 
 
+class RequestGate:
+    """One request on the engine at a time (xeno #49 S6). Waiting requests go in (priority, arrival) order: Claude
+    Code's main turn streams (priority 0), its title and auto-mode classifier requests do not (1), and they used to
+    hold the only slot while the main turn queued. The running request is never pre-empted. Used as a plain lock
+    (`with gate:`) it is priority 1, first come first served."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._busy = False
+        self._waiting: list = []
+        self._arrival = itertools.count()
+
+    def acquire(self, priority: int = 1):
+        ticket = (priority, next(self._arrival))
+        with self._cv:
+            heapq.heappush(self._waiting, ticket)
+            while self._busy or self._waiting[0] != ticket:
+                self._cv.wait()
+            heapq.heappop(self._waiting)
+            self._busy = True
+
+    def release(self):
+        with self._cv:
+            self._busy = False
+            self._cv.notify_all()
+
+    @contextlib.contextmanager
+    def slot(self, priority: int = 1):
+        self.acquire(priority)
+        try:
+            yield
+        finally:
+            self.release()
+
+    def __enter__(self):
+        self.acquire()
+
+    def __exit__(self, *exc):
+        self.release()
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -586,9 +653,11 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+        self.restarting = False         # xeno #49 review: the engine is loading again (requests get 529 meanwhile)
+        self.cjk_ban = False            # xeno #49 S4: the engine was started with the Han ban list (--ban-ids)
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
-        self.fifo = threading.Lock()
+        self.fifo = RequestGate()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.status = {"busy": False, "queued": 0, "loops_stopped": 0}  # GET /status: what the model is doing right now
@@ -617,6 +686,10 @@ class Service:
             except OSError as e:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
+
+    def cjk(self, req: dict, messages) -> dict:
+        """The request with the Han ban on when the engine has the list and the prompt wants it (xeno #49 S4)."""
+        return {**req, "_ban": True} if self.cjk_ban and cjk_guard.wanted(messages) else req
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
@@ -738,7 +811,7 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, priority: int = 1):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
         t_tl = timeline.now_us()
@@ -756,7 +829,7 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
-            with self.fifo:
+            with self.fifo.slot(priority):              # xeno #49 review: at the request's own priority (S6)
                 encoded = [self.vision.encode(src) for src in images]
             out, k = [], 0
             for t in ids:                               # one <|image_pad|> per image -> one per image token
@@ -791,6 +864,62 @@ class Service:
                                  f"({self.engine.max_context}); requests are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    def _engine(self, ids, max_new, sampling, cancel, emb):
+        return self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
+            self.engine.generate(ids, max_new, sampling, cancel)
+
+    def _generate(self, ids, max_new, sampling, cancel, emb, state):
+        """The engine's tokens, with the thinking budget (xeno #49 S3, serve/think_budget.py): once `budget` tokens
+        are out while state["thinking"] holds, stop the engine, yield CLOSE's tokens as if the model wrote them and
+        continue from (prompt + written + CLOSE), which reuses the engine's cached prefix."""
+        budget = (sampling or {}).get("_think_budget")
+        gen = self._engine(ids, max_new, sampling, cancel, emb)
+        if not budget:
+            yield from gen
+            return
+        written = []
+        try:
+            for t in gen:
+                yield t
+                if t is not None:
+                    written.append(t)
+                    if len(written) >= budget and state["thinking"]:
+                        break
+            else:
+                return
+        finally:
+            gen.close()
+        if cancel.is_set():
+            return
+        # the engine committed a few tokens past the cut before it read STOP: they are part of the answer (and of
+        # its live session, whose whole length must be a prefix of the next prompt for the cache to be reused)
+        for t in list(getattr(self.engine, "drained", None) or []):
+            written.append(t)
+            yield t
+        first = dict(getattr(self.engine, "last", None) or {})
+        close = self.tok.encode(think_budget.CLOSE, parse_special=True)
+        print(f"[strata] thinking budget spent ({budget} tokens): closing the thinking block", flush=True)
+        yield from close
+        rest = max(1, max_new - len(written) - len(close)) if max_new else max_new
+        try:
+            yield from self._engine(list(ids) + written + close, rest, sampling, cancel, emb)
+        finally:
+            self._merge_legs(first, len(close))
+
+    def _merge_legs(self, first: dict, n_close: int):
+        """One request's DONE figures from its two engine calls (xeno #49 review): the prompt read is the first
+        call's; re-reading the written tokens + CLOSE is part of making the output, so it counts as decode time."""
+        second = dict(getattr(self.engine, "last", None) or {})
+        if not first or not second:
+            return
+        merged = dict(first)
+        merged["decode_ms"] = first.get("decode_ms", 0.0) + second.get("prompt_ms", 0.0) + second.get("decode_ms", 0.0)
+        merged["generated"] = first.get("generated", 0) + n_close + second.get("generated", 0)
+        for k in ("drafts_accepted", "drafts_offered", "hits", "lookups"):
+            if k in first or k in second:
+                merged[k] = first.get(k, 0) + second.get(k, 0)
+        self.engine.last = merged
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -843,6 +972,8 @@ class Service:
         stop_detail = None
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
+        if self.restarting:            # xeno #49 S2: the native API's answer while the model loads - retry later
+            raise EngineDied("the engine is loading again after it stopped")
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
@@ -850,7 +981,7 @@ class Service:
             self.status["queued"] += 1
         t_queue = timeline.now_us()
         try:
-            with self.fifo:
+            with self.fifo.slot(0 if (sampling or {}).get("stream") else 1):   # xeno #49 S6: main turn first
                 timeline.complete("queue wait", t_queue, timeline.now_us())
                 with self.status_lock:
                     self.status["queued"] -= 1
@@ -859,7 +990,15 @@ class Service:
                     code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
                     print(f"[strata] the engine had stopped (exit code {code}); starting it again "
                           "(a minute or two) ...", flush=True)
-                    self.engine.restart()
+                    self.restarting = True
+                    try:
+                        self.engine.restart()
+                    except EngineDied:
+                        raise
+                    except (RuntimeError, OSError) as e:          # xeno #49 review: a 529, not a dropped connection
+                        raise EngineDied(f"the engine could not be started again: {e}") from e
+                    finally:
+                        self.restarting = False
                     print("[strata] the engine is running again", flush=True)
                 with self.status_lock:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
@@ -869,8 +1008,10 @@ class Service:
                 before = getattr(self.engine, "last", None)
                 last_print = time.time()
                 t_engine = timeline.now_us()
-                gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
-                    self.engine.generate(ids, max_new, sampling, cancel)
+                state = {"thinking": thinking}         # still inside the thinking block (the budget's cut)
+                if hasattr(self.engine, "last"):
+                    self.engine.last = {}              # this request's DONE only, never the previous one's
+                gen = self._generate(ids, max_new, sampling, cancel, emb, state)
                 try:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
@@ -886,6 +1027,7 @@ class Service:
                             break
                         raw_ids.append(t)
                         evs = parser.feed(detok.push(t))
+                        state["thinking"] = parser.state == "reasoning"   # not from events: '</think>' emits none
                         self._note(n, evs)
                         last_print = self._progress(last_print)
                         for ev in evs:
@@ -917,7 +1059,7 @@ class Service:
                             break
                     # the loop guard and a stop sequence cancel the engine themselves; only a client cancel is one
                     if cancel.is_set() and not matched_sequence and not guard.reason:
-                        finish = "cancel"
+                        finish = "stop" if getattr(cancel, "server_stop", False) else "cancel"
                 except EngineDied as e:
                     finish = "error"
                     note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
@@ -957,6 +1099,7 @@ class Service:
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
+                        "cjk_chars": cjk_guard.count_han(self.tok.decode(raw_ids)) if raw_ids else 0,   # #49 S4
                         "hit_rate": hit_rate})
                     t = self.totals
                     t["requests"] += 1
@@ -977,6 +1120,9 @@ class Service:
                     hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                     print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                    if finish != "error" and last.get("prompt_ms") is not None:   # xeno #49 S5
+                        for line in timing_report(last, len(ids), el):
+                            print(line, flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
@@ -1130,7 +1276,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
-        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
+        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, 0 if sampling.get("stream") else 1)
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -1238,12 +1384,20 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         yield "content_block_stop", {"type": "content_block_stop", "index": index}
 
     streamed = set()
+    choice = req.get("tool_choice") if isinstance(req.get("tool_choice"), dict) else {}
+    one_call, first_done = bool(choice.get("disable_parallel_tool_use")), False   # xeno #49 S2
     for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
         if kind == "ping":
             yield None
             continue
         if kind == "event":
             ev: Event = x
+            if first_done:                          # disable_parallel_tool_use: nothing after the first call
+                continue
+            if one_call and ev.kind == "tool_call":
+                first_done = True
+                cancel.server_stop = True           # the server's own stop, not a client cancel (Service.run)
+                cancel.set()
             if ev.kind == "tool_args":
                 yield "content_block_delta", {"type": "content_block_delta", "index": index,
                                               "delta": {"type": "input_json_delta", "partial_json": ev.text}}
@@ -1281,7 +1435,9 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         else:
             if open_kind is not None:
                 yield from close()
-            stop = "stop_sequence" if x.get("stop_sequence") else                    "tool_use" if used_tool and x["finish"] == "stop" else                    {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
+            stop = "stop_sequence" if x.get("stop_sequence") else \
+                   "tool_use" if used_tool and (x["finish"] == "stop" or first_done) else \
+                   {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             # the final counts, Anthropic's way: input_tokens leaves out what the conversation cache already held,
             # which is cache_read_input_tokens (message_start could only say the whole prompt)
             reused = min(x.get("reused") or 0, len(ids))
@@ -1290,6 +1446,28 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                                     "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
                                               "output_tokens": x["completion_tokens"]}}
             yield "message_stop", {"type": "message_stop"}
+
+
+def sse_tracer():
+    """STRATA_TRACE_SSE=<file> (xeno #49 S5): one JSON line per SSE event sent on /v1/messages - what the client got
+    and when (seconds since the stream began), to diagnose what Claude Code shows. Unset: a no-op."""
+    path = os.environ.get("STRATA_TRACE_SSE")
+    if not path:
+        return lambda name, e: None
+    rid, t0 = uuid.uuid4().hex[:12], time.perf_counter()
+
+    def trace(name, e):
+        rec = {"rid": rid, "t": round(time.perf_counter() - t0, 3), "ev": name}
+        if isinstance(e, dict):
+            for k in ("index", "delta", "content_block", "usage"):
+                if k in e:
+                    rec[k] = e[k]
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError as err:
+            print(f"[strata] SSE trace write failed ({path}): {err}", flush=True)
+    return trace
 
 
 def anthropic_collect(events) -> dict:
@@ -1480,7 +1658,36 @@ def make_handler(svc: Service):
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                if self.path.startswith("/v1/messages"):     # xeno #49 S2: the native API's retryable error
+                    self._json(529, {"type": "error", "error": {"type": "overloaded_error",
+                                                                "message": f"{e}; the next request restarts it"}})
+                else:
+                    self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+
+        def _props(self):
+            model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
+            if model != svc.model:
+                self._json(404, {"error": {"message": "model not found"}})
+                return
+            if hasattr(svc.engine, "alive") and not svc.engine.alive():
+                self._json(503, {"error": {"message": "the engine is not running"}})
+                return
+            defaults = {**svc.sampling_defaults, **svc.shared}
+            names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
+            params = {names.get(k, k): v for k, v in defaults.items()
+                      if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
+                               "presence_penalty", "frequency_penalty", "penalty_last_n")}
+            params["n_predict"] = svc.shared.get("max_tokens", -1)
+            props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
+                     "total_slots": 1, "model_alias": svc.model, "chat_template": svc.template.source,
+                     "modalities": {"vision": svc.vision is not None}, "models_autoload": False,
+                     "is_sleeping": False}
+            if getattr(svc.engine, "model_path", None):
+                props["model_path"] = svc.engine.model_path
+            version = getattr(svc.engine, "info", {}).get("version")
+            if version:
+                props["build_info"] = "Strata " + str(version)
+            self._json(200, props)
 
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
@@ -1543,6 +1750,7 @@ def make_handler(svc: Service):
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             messages, tools, kw = openai_to_messages(req)
+            req = svc.cjk(req, messages)                                # xeno #49 S4
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or []}
@@ -1553,7 +1761,7 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -1583,14 +1791,20 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, vision=svc.vision is not None)
+            req = svc.cjk(req, messages)                                # xeno #49 S4
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            think_budget.side_effort(req, kw)                         # xeno #49 S3: before the template renders
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
+            budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
+            if budget and thinking:
+                req = {**req, "_think_budget": budget}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()
+            trace = sse_tracer()                             # xeno #49 S5: STRATA_TRACE_SSE=<file>
             try:
                 for item in events:
                     if item is None:
@@ -1599,12 +1813,14 @@ def make_handler(svc: Service):
                         name, e = item
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
+                        trace(name, e)
                     self.wfile.flush()
             except OSError:
                 cancel.set()
                 events.close()
-            except EngineDied as e:                          # mid-stream: Anthropic's error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+            except EngineDied as e:                          # mid-stream: Anthropic's retryable error event (#49 S2)
+                err = {"type": "error", "error": {"type": "overloaded_error",
+                                                  "message": f"{e}; the next request restarts it"}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
@@ -1705,6 +1921,16 @@ def clean_shared_defaults(d) -> dict:
     return out
 
 
+# xeno #49 S8 / story 20: coding presets, chosen in the run config ("sampling": {"preset": "balanced"}) and never
+# switched automatically. None of them is measured here yet. reasoning = the sampling docs/DETAILS.md shows for this
+# model; balanced = the Qwen3 family's thinking-mode recommendation (VENDOR); deterministic = greedy.
+SAMPLING_PRESETS = {
+    "deterministic": {"temperature": 0.0},
+    "balanced": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+    "reasoning": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+}
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
@@ -1713,7 +1939,14 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
     are named at startup and ignored."""
     out = {}
-    for key, value in (cfg.get("sampling") or {}).items():
+    block = dict(cfg.get("sampling") or {})
+    preset = block.pop("preset", None)
+    if preset is not None:
+        if preset not in SAMPLING_PRESETS:
+            raise SystemExit(f"[strata] config sampling.preset={preset!r}: expected one of "
+                             f"{', '.join(SAMPLING_PRESETS)}")
+        block = {**SAMPLING_PRESETS[preset], **block}         # the block's own keys win
+    for key, value in block.items():
         if value is None:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -1829,10 +2062,19 @@ def main() -> int:
             print("loading the vision encoder ...", flush=True)
             vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=env)
+        args = engine_args(cfg)
+        if cfg.get("cjk_guard"):                        # xeno #49 S4: an engine without --ban-ids would not start
+            # next to the run config: one per server, not purged with %TEMP% before a restart() reads it again
+            ban_path = Path(a.config).with_suffix(".cjk-ban-ids.txt")
+            ids = cjk_guard.ban_ids(lambda i: tok.decode([i]), len(tokens))
+            ban_path.write_text("\n".join(map(str, ids)) + "\n", encoding="ascii")
+            args += ["--ban-ids", str(ban_path)]
+            print(f"[strata] CJK guard: {len(ids)} Han token ids banned unless a prompt has or names Chinese",
+                  flush=True)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
-        engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
+        engine = StrataEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
@@ -1844,6 +2086,7 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.cjk_ban = a.engine == "strata" and bool(cfg.get("cjk_guard"))   # xeno #49 S4: --ban-ids was passed
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.config:                                        # the Chat settings shared with other apps, from last time

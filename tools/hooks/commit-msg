@@ -1,0 +1,5 @@
+#!/bin/sh
+# xeno: the commit-time blueprint check (tools/blueprint_check.py; AGENTS.md "Keep docs/BLUEPRINT.md current").
+# Install once per clone: git config core.hooksPath tools/hooks
+# A commit that changes what docs/BLUEPRINT.md describes updates it, or carries "Blueprint: n/a - <why>".
+exec python "$(git rev-parse --show-toplevel)/tools/blueprint_check.py" "$1"

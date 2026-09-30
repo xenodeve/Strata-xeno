@@ -817,6 +817,119 @@ int main(int argc, char** argv) {
         bad += wrong;
     }
 
+    // ---- fixture 16 (xeno #49 S4): `ban_words`, host only - the bitmap of a banned-id list: bit v set exactly for
+    // the listed ids, (n+31)/32 words, the last id of the vocabulary in the last word, duplicates allowed, and an
+    // id outside [0, n) an error (a wrong list must not start an engine that then bans the wrong tokens).
+    {
+        int wrong = 0;
+        const int64_t n = 100;
+        std::vector<uint32_t> w;
+        std::string err;
+        const std::vector<int64_t> ids = {0, 31, 32, 63, 64, 99, 31};
+        if (!strata::kernels::ban_words(ids, n, w, err) || w.size() != 4) ++wrong;
+        for (int64_t v = 0; v < n && !wrong; ++v) {
+            const bool want = v == 0 || v == 31 || v == 32 || v == 63 || v == 64 || v == 99;
+            if (((w[(size_t) (v >> 5)] >> (v & 31)) & 1u) != (want ? 1u : 0u)) ++wrong;
+        }
+        std::vector<uint32_t> w2;
+        if (strata::kernels::ban_words({5, 100}, n, w2, err) || err.empty()) ++wrong;
+        if (strata::kernels::ban_words({-1}, n, w2, err)) ++wrong;
+        std::printf("  %-34s %s\n", "ban_words bitmap", wrong ? "*** WRONG ***" : "matches");
+        bad += wrong;
+    }
+
+    // ---- fixture 17 (xeno #49 S4): THE BAN.  A banned id is never picked, greedy or sampled, and a mask with no
+    // bit set picks exactly what no mask picks.  The expected picks come from the plain definition - the banned
+    // logits set to -inf in a host copy, then the unchanged references - against the kernel's skip.
+    {
+        std::mt19937 rng(17); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::vector<float> l((size_t) NV * NT);
+        for (auto& v : l) v = g(rng);
+        // ban each row's greedy argmax (so the ban is observable) plus a few fixed ids
+        std::vector<int64_t> banned = {1, 2, 3};
+        for (int t = 0; t < NT; ++t) {
+            auto b = l.begin() + (size_t) t * NV;
+            banned.push_back((int64_t) (std::max_element(b, b + NV) - b));
+        }
+        std::vector<uint32_t> words;
+        std::string err;
+        if (!strata::kernels::ban_words(banned, NV, words, err)) { std::printf("ban_words: %s\n", err.c_str()); ++bad; }
+        uint32_t* d_ban = nullptr;
+        check(cudaMalloc(&d_ban, words.size() * sizeof(uint32_t)), "malloc ban");
+        check(cudaMemcpy(d_ban, words.data(), words.size() * sizeof(uint32_t), cudaMemcpyHostToDevice), "copy ban");
+        auto is_banned = [&](int v) { return ((words[(size_t) (v >> 5)] >> (v & 31)) & 1u) != 0; };
+        auto masked_row = [&](int t) {
+            std::vector<float> r(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
+            for (int v = 0; v < NV; ++v) if (is_banned(v)) r[(size_t) v] = -INFINITY;
+            return r;
+        };
+
+        strata::kernels::SamplerParams gp;
+        gp.greedy = true; gp.temperature = 0.0f; gp.top_k = 0; gp.top_p = 1.0f;
+        std::vector<int> gwant((size_t) NT), gfree((size_t) NT);
+        int changed = 0;
+        for (int t = 0; t < NT; ++t) {
+            const auto r = masked_row(t);
+            gwant[(size_t) t] = (int) (std::max_element(r.begin(), r.end()) - r.begin());   // lowest index on a tie
+            auto b = l.begin() + (size_t) t * NV;
+            gfree[(size_t) t] = (int) (std::max_element(b, b + NV) - b);
+            changed += gwant[(size_t) t] != gfree[(size_t) t];
+        }
+        std::printf("  %-34s %s (%d of %d rows)\n", "the greedy ban is observable", changed == NT ? "yes" : "*** NO ***",
+                    changed, NT);
+        bad += changed != NT;
+        strata::kernels::SamplerParams gb = gp; gb.ban = d_ban; gb.ban_vocab = NV;
+        bad += run("greedy with a ban", l, NT, gb, gwant);
+
+        // a tie: ids 7 and 9 share the row maximum; banning 7 must give 9, not 0 and not 7
+        std::vector<float> tie((size_t) NV, 0.0f);
+        tie[7] = tie[9] = 5.0f;
+        std::vector<uint32_t> w7;
+        strata::kernels::ban_words({7}, NV, w7, err);
+        uint32_t* d_w7 = nullptr;
+        check(cudaMalloc(&d_w7, w7.size() * sizeof(uint32_t)), "malloc ban7");
+        check(cudaMemcpy(d_w7, w7.data(), w7.size() * sizeof(uint32_t), cudaMemcpyHostToDevice), "copy ban7");
+        strata::kernels::SamplerParams gt = gp; gt.ban = d_w7; gt.ban_vocab = NV;
+        bad += run("greedy tie with the lower id banned", tie, 1, gt, {9});
+
+        strata::kernels::SamplerParams sp;
+        sp.top_k = 20; sp.top_p = 0.95f; sp.temperature = 1.2f;
+        int draws_changed = 0, banned_seen = 0;
+        for (uint64_t seed = 1; seed <= 16; ++seed) {
+            sp.seed = seed;
+            std::vector<int> swant((size_t) NT);
+            for (int t = 0; t < NT; ++t) {
+                swant[(size_t) t] = sampled_reference(masked_row(t), {}, sp, t);
+                banned_seen += is_banned(swant[(size_t) t]);
+                std::vector<float> free_row(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
+                draws_changed += swant[(size_t) t] != sampled_reference(free_row, {}, sp, t);
+            }
+            strata::kernels::SamplerParams sb = sp; sb.ban = d_ban; sb.ban_vocab = NV;
+            char name[64];
+            std::snprintf(name, sizeof name, "sampled with a ban, seed %llu", (unsigned long long) seed);
+            bad += run(name, l, NT, sb, swant);
+        }
+        std::printf("  %-34s %s (%d draws changed, %d banned in the reference)\n", "the sampled ban is observable",
+                    draws_changed > 0 && banned_seen == 0 ? "yes" : "*** NO ***", draws_changed, banned_seen);
+        bad += !(draws_changed > 0 && banned_seen == 0);
+
+        // an all-zero mask is no ban: the same picks as no mask, greedy and sampled
+        std::vector<uint32_t> zero(words.size(), 0u);
+        uint32_t* d_zero = nullptr;
+        check(cudaMalloc(&d_zero, zero.size() * sizeof(uint32_t)), "malloc zero");
+        check(cudaMemcpy(d_zero, zero.data(), zero.size() * sizeof(uint32_t), cudaMemcpyHostToDevice), "copy zero");
+        strata::kernels::SamplerParams gz = gp; gz.ban = d_zero; gz.ban_vocab = NV;
+        bad += run("greedy, empty mask = no mask", l, NT, gz, gfree);
+        sp.seed = 3;
+        std::vector<int> sfree((size_t) NT);
+        for (int t = 0; t < NT; ++t)
+            sfree[(size_t) t] = sampled_reference({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV},
+                                                  {}, sp, t);
+        strata::kernels::SamplerParams sz = sp; sz.ban = d_zero; sz.ban_vocab = NV;
+        bad += run("sampled, empty mask = no mask", l, NT, sz, sfree);
+        cudaFree(d_ban); cudaFree(d_w7); cudaFree(d_zero);
+    }
+
     // A continuous stream and individual decode calls consume the same draw counters.
     {
         constexpr int count = 32, vocab = 16;
