@@ -51,9 +51,29 @@ bool cpu_avx512_ok() {
     return ok;
 }
 
+bool cpu_avxvnni_ok() {
+    static const bool ok = [] {
+        if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
+#if defined(_MSC_VER)
+        int x[4];
+        __cpuidex(x, 0, 0);
+        if (x[0] < 7) return false;
+        __cpuidex(x, 1, 0);
+        if (!((x[2] >> 27) & 1)) return false;                  // OSXSAVE
+        if ((_xgetbv(0) & 0x6) != 0x6) return false;              // XMM + YMM state
+        __cpuidex(x, 7, 1);
+        return ((x[0] >> 4) & 1) != 0;                            // AVX-VNNI
+#else
+        return false;
+#endif
+    }();
+    return ok;
+}
+
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    else if (cpu_avxvnni_ok()) q2_0_gguf_rows_multi_avxvnni(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
@@ -93,7 +113,16 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.max_blob = 0;
     std::string line;
     while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '#') continue;
+        if (line.empty() || line[0] == '#') {
+            if (!line.empty() && line[0] == '#') {
+                // v3 packs record their expert count in the header; a pruned model (GSQ-RCO Coder) ships
+                // fewer experts than the canonical geometry the caller passes, which is a compile-time
+                // default, so the header wins.
+                const size_t at = line.find("(n_expert ");
+                if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+            }
+            continue;
+        }
         std::istringstream ss(line);
         long long l = -1, gt = -1, dt = -1;
         unsigned long long off = 0, blob = 0, go = 0, uo = 0, dox = 0;
@@ -130,7 +159,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
         }
-        at += L.bytes[(size_t) l] * (uint64_t) n_expert;
+        at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
     }
     L.total = at;
     g_layout = L;

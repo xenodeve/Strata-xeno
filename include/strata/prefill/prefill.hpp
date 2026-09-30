@@ -31,7 +31,18 @@ struct PrefillStats {
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
+    /// #5 P5a: the streamed experts by source (count, bytes): pinned arena, pageable arena, the 4070 tier, NVMe
+    int64_t src_n[4] = {0, 0, 0, 0};
+    uint64_t src_bytes[4] = {0, 0, 0, 0};
+    int64_t src_rows[4] = {0, 0, 0, 0};   ///< routed token rows those experts served (small chunks; 0 on stream-all)
     double ms_ple = 0;
+    /// #35 D7: another lane's stats of the same prompt: counts add up, the wall time is the longer lane's
+    void merge_lane(const PrefillStats& o) {
+        tokens += o.tokens; chunks += o.chunks; ms_total = ms_total > o.ms_total ? ms_total : o.ms_total;
+        ms_experts_host += o.ms_experts_host; experts_streamed += o.experts_streamed; experts_dma += o.experts_dma;
+        experts_resident += o.experts_resident; ms_ple += o.ms_ple;
+        for (int i = 0; i < 4; ++i) { src_n[i] += o.src_n[i]; src_bytes[i] += o.src_bytes[i]; src_rows[i] += o.src_rows[i]; }
+    }
 };
 
 class Prefill {
@@ -48,8 +59,52 @@ public:
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
               void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0);
 
+    /// Exclusive 4070 tier (#4): experts whose only copy lives on another device. `res` is (n_layers x n_expert)
+    /// slot or -1 and `slot_ptr(slot)` that slot's pointer on `device`; the prompt path stages such an expert with a
+    /// peer copy instead of reading its (released) host pages.
+    void set_peer_tier(const int32_t* res, std::function<const void*(int32_t)> slot_ptr, int device);
+    /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
+    /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
+    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+    int64_t chunk() const;
+
+    /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
+    /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
+    static void set_pinned_share(double share);
+    /// #35 D6: the split layout (STRATA_PREFILL_EXPERT_SPLIT with the peer tier): a chunk of STREAM_ALL_MIN tokens or
+    /// more runs its routed experts on the peer card, so the one-card MoE buffers (expert rows, MMQ scratch, stream
+    /// ring) are sized only for the shorter chunks that still run here.  Set before bytes_needed and init.
+    static void set_split_layout(bool on);
+    static double pinned_share();
+
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
+    /// #35 D7: a wave lane's chunk for a prompt-path chunk of `chunk` tokens (half, rounded up to 256), and the device
+    /// bytes both lanes need - the one sizing rule for the lend, the layouts and the relayouts
+    static int64_t wave_lane_chunk(int64_t chunk) { return chunk / 2 < 256 ? 256 : (chunk / 2 + 255) / 256 * 256; }
+    static uint64_t wave_bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+        return 2 * wave_lane_bytes(g, ss, wave_lane_chunk(chunk));
+    }
+    /// one lane's share of a lent region for chunks of `lane_chunk` tokens (4 KiB aligned: lane 2's starts after it)
+    static uint64_t wave_lane_bytes(const core::ModelGeometry& g, const core::SessionState& ss, int64_t lane_chunk) {
+        return (bytes_needed(g, ss, lane_chunk) + 4095) / 4096 * 4096;
+    }
+    /// whether a wave over prompt-path chunks of `chunk` tokens still runs each lane's chunk split
+    static bool wave_lane_splits(int64_t chunk);
+
+    /// #35 D7: the two-lane wavefront.  Two Prefill objects on one session read a prompt's chunks alternately
+    /// (chunk c on lane c % 2, each lane on its own stream of the same GPU), and chunk c's layer l starts only once
+    /// chunk c-1 has queued that layer's attention half (its KV, GDN and PLE state) - the order one lane keeps, so
+    /// the output is the same bytes.  With expert_split, one lane's chunk runs its routed experts on the 4070 while
+    /// the other lane's runs its trunk on this card.  Both lanes' run() get the whole prompt; reset() first.
+    struct WaveLink;
+    static std::shared_ptr<WaveLink> make_wave_link();
+    static void wave_reset(WaveLink& link, int64_t n_chunks, int64_t n_layers);
+    void set_wave(std::shared_ptr<WaveLink> link, int lane);
+    /// Read [pos0, pos0 + n) through both lanes (`b` on its own thread; b's stream is synchronized before return).
+    /// The first lane's error wins unless it only reports the other lane's failure.
+    static bool run_wave(Prefill& a, Prefill& b, WaveLink& link, const int64_t* tokens, int64_t n, int64_t pos0,
+                         int64_t n_layers, std::string& err);
 
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
@@ -70,6 +125,7 @@ public:
     const float* const* embd_rows = nullptr;
 
 private:
+    bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     struct Impl;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;

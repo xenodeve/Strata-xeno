@@ -1,0 +1,20 @@
+speculation              77 rounds of 4, drafts accepted 182 of 218 (0.835), 3.36 tokens per round
+window sizes             T1:3 T2:0 T3:4 T4:70  (min draft probability 0.50)
+accepted per round       0:4 1:11 2:15 3:47
+verify window            wait for rings 18.991  pool 14.462  host 1.037  commit 0.936 ms/round; CPU experts 4.04 distinct / 4.86 routed per layer
+verify edges             launch 0.028  tail 1.841 ms/round (graph launch; last pool until the stream is done)
+tier hits                primary 58.3%  secondary 29.0%  pcie 0.0%  cpu 12.7% of 141600 routed entries
+pool multi               gate/up 6.744  quantize 0.099  down 3.321 ms/round; 26.6 GB/s over the rows phases; expert callback 14.451 ms/round
+dispatch                 plan 2.005  activation quantize 0.289  jobs 0.577  run 11.567 ms/round
+dispatch detail          CPU pool 10.171 secondary finish 1.392 ms/round
+secondary Q2 tier        41109 entries in 29386 groups (stage-only=0)
+secondary reserve        160 samples, minimum 1.54 GiB free
+secondary timing         launch 1.846  wait 1.043 ms/round (wait > 0: the 4070 SUPER finished after the CPU pool)
+adaptive tier            302 experts swapped into the VRAM tier (every 1 rounds); adapt thread 2.867, apply 0.000, join wait 0.224 ms/round
+adapt detail             4070 swaps 2.104  paired stage 2 1.384  stage 3 0.693 ms/round
+adaptive 4070            1194 experts swapped into the 4070 tier
+mtp                      2.398 ms/round drafting (76 rounds), MTP prompt 11.5 ms, 869 MiB of VRAM
+prompt  : 248045 846 198 7734 264 12654 709 421 4523 279 307 7324 76938 1324 5199 7638 13 248046 198 248045 74455 198 248068 271 248069 271
+output  : 71093 12305 198 727 73111 1393 25 514 8 1411 514 25 198 262 4071 198 262 3301 279 307 7324 76938 1324 1608 449 83876 5313 13 198 1031 262 561 76938 8240 369 4364 430 25 198 285 426 7 15 8 283 220 15 198 285 426 7 16 8 283 220 16 198 285 426 1393 8 283 426 1393 12 16 8 478 426 1393 12 17 8 364 307 2518 220 17 6987 262 13131 25 198 285 307 318 390 1590 561 1857 314 279 76938 1324 310 460 318 15 5792 553 198 1031 262 5019 25 198 285 514 25 561 307 7324 76938 1324 13 198 1031 262 58276 25 198 285 14953 25 1368 307 369 7968 13 198 262 4071 198 262 413 307 361 220 15 25 198 285 4673 14953 437 77 1902 381 264 2397 58883 7308 871 198 1031 262 413 307 606 220 15 25 198 285 460 220 15 198 262 413 307 606 220 16 25 198 285 460 220 16 6987 262 7624 11 9512 283 220 15 11 220 16 198 262 364 696 303 2020 7 17 11 307 478 220 16 1590 198 285 7624 11 9512 283 9512 11 7624 478 9512 6987 262 460 9512 198 71093 248046 198 248044 248045 846 198 248046 198 248045 74455 198 248068 198 760 1156 4816 310 599 3106 449 4147 1876 466 1066 264 24009 13 2302 8334 4439 728 310 3165 264
+decode                   256 tokens in 3153.8 ms  ->  81.17 tok/s
+prefill                  25 tokens in 1555.1 ms  ->  16.08 tok/s  (time to first token 1655.3 ms)

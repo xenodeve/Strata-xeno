@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace strata::platform {
 
@@ -19,6 +21,10 @@ struct LockResult {
 
 /// Lock [p, p + bytes) into physical memory. Partial success is reported, not hidden.
 LockResult lock_resident(void* p, uint64_t bytes);
+
+/// Lock many disjoint regions: the working-set minimum is raised once by their page-rounded total (plus a
+/// margin), then each region is VirtualLocked. Regions are rounded out to whole 4 KiB pages.
+LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& ranges);
 
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);

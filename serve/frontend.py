@@ -16,12 +16,14 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from serve.pdf_blocks import document_parts
 
 
 # ------------------------------------------------------------------------------------------------ template
@@ -129,6 +131,14 @@ def images_of(messages: list[dict]) -> list[str]:
             for item in m["content"] if item.get("type") == "image"]
 
 
+def _late_system_to_user(messages: list[dict]) -> list[dict]:
+    """The chat template takes a system message only at the start ("System message must be at the beginning").
+    Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
+    turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages, in place:
+    merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
+    return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -161,20 +171,45 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
-    return messages, tools, kwargs
+    return _late_system_to_user(messages), tools, kwargs
 
 
-def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+def _tool_result_content(content, vision: bool):
+    """A tool_result's content for the tool message (xeno, #46). Claude Code's Read returns a PDF as a `document`
+    block and a screenshot as an `image` block in here; both used to be dropped. Documents expand as top-level ones
+    do; an image stays an image item with vision, else it becomes a note instead of failing the request."""
+    if not isinstance(content, list):
+        return _text_of(content)
+    parts = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "document":
+            parts.extend(document_parts(part, vision))
+        elif part.get("type") in IMAGE_PARTS and not vision:
+            parts.append({"type": "text", "text": "(an image returned by the tool; images are not enabled on this "
+                                                  "server)"})
+        else:
+            parts.append(part)
+    return _parts_of(parts)
+
+
+def anthropic_to_messages(req: dict, vision: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs)."""
     messages = []
     system = req.get("system")
     if system:
-        messages.append({"role": "system", "content": _text_of(system)})
+        text = _text_of(system)
+        text = re.sub(r"\A\s*x-anthropic-billing-header:(?:\s*(?:cc_[\w.-]+|cch)=[^;\n]*;)*\s*", "", text)
+        messages.append({"role": "system", "content": text})
     for m in req.get("messages", []):
         content = m.get("content")
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
+        content = [part for block in content or []
+                   for part in (document_parts(block, vision) if isinstance(block, dict)
+                                and block.get("type") == "document" else [block])]
         if m.get("role") == "user" and _has_image(content) and not any(
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
             messages.append({"role": "user", "content": _parts_of(content)})
@@ -189,7 +224,7 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
             elif kind == "tool_result":
-                messages.append({"role": "tool", "content": _text_of(block.get("content"))})
+                messages.append({"role": "tool", "content": _tool_result_content(block.get("content"), vision)})
         if text or calls or reasoning:
             out = {"role": m["role"], "content": "".join(text)}
             if reasoning:
@@ -210,7 +245,7 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
         kwargs.update(effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
-    return messages, tools, kwargs
+    return _late_system_to_user(messages), tools, kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output parser

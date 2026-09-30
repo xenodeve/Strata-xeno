@@ -51,6 +51,51 @@ LockResult lock_resident(void* p, uint64_t bytes) {
     return r;
 }
 
+LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& ranges) {
+    LockResult r;
+    const uint64_t page = 4096;
+    std::vector<std::pair<uint8_t*, uint64_t>> pages;
+    uint64_t total = 0;
+    for (const auto& [p, n] : ranges) {
+        if (p == nullptr || n == 0) continue;
+        uint8_t* lo = (uint8_t*) ((uintptr_t) p & ~(uintptr_t) (page - 1));
+        uint8_t* hi = (uint8_t*) (((uintptr_t) p + n + page - 1) & ~(uintptr_t) (page - 1));
+        pages.emplace_back(lo, (uint64_t) (hi - lo));
+        total += (uint64_t) (hi - lo);
+    }
+    if (pages.empty()) { r.note = "nothing to lock"; return r; }
+    HANDLE self = GetCurrentProcess();
+    SIZE_T min_ws = 0, max_ws = 0;
+    DWORD flags = 0;
+    if (!GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) {
+        r.note = "GetProcessWorkingSetSizeEx failed (error " + std::to_string(GetLastError()) + ")";
+        return r;
+    }
+    const SIZE_T margin = (SIZE_T) 512 << 20;
+    const SIZE_T new_min = min_ws + (SIZE_T) total + margin;
+    const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
+    if (!SetProcessWorkingSetSizeEx(self, new_min, new_max,
+                                    QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+        r.note = "SetProcessWorkingSetSizeEx(" + std::to_string((unsigned long long) (new_min >> 20)) +
+                 " MiB) failed (error " + std::to_string(GetLastError()) + ")";
+        return r;
+    }
+    for (const auto& [p, n] : pages) {
+        if (!VirtualLock(p, (SIZE_T) n)) {
+            r.note = "VirtualLock stopped after " + std::to_string((unsigned long long) (r.locked_bytes >> 20)) +
+                     " of " + std::to_string((unsigned long long) (total >> 20)) + " MiB (error " +
+                     std::to_string(GetLastError()) + ")";
+            r.ok = r.locked_bytes > 0;
+            return r;
+        }
+        r.locked_bytes += n;
+    }
+    r.ok = true;
+    r.note = "locked " + std::to_string((unsigned long long) (total >> 20)) + " MiB in " +
+             std::to_string(pages.size()) + " ranges via working-set minimum + VirtualLock";
+    return r;
+}
+
 void unlock_resident(void* p, uint64_t bytes) {
     if (p == nullptr || bytes == 0) return;
     const uint64_t chunk = 1ull << 30;
@@ -64,6 +109,18 @@ LockResult lock_resident(void* p, uint64_t bytes) {
     if (mlock(p, bytes) != 0) { r.note = "mlock failed (raise ulimit -l)"; return r; }
     r.ok = true;
     r.locked_bytes = bytes;
+    r.note = "mlock";
+    return r;
+}
+
+LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& ranges) {
+    LockResult r;
+    for (const auto& [p, n] : ranges) {
+        if (p == nullptr || n == 0) continue;
+        if (mlock(p, n) != 0) { r.note = "mlock failed (raise ulimit -l)"; r.ok = r.locked_bytes > 0; return r; }
+        r.locked_bytes += n;
+    }
+    r.ok = r.locked_bytes > 0;
     r.note = "mlock";
     return r;
 }

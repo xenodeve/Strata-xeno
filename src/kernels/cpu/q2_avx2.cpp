@@ -34,7 +34,7 @@ inline void unpack64(const uint8_t* codes, __m256i& lo, __m256i& hi) {
     hi = _mm256_set_m128i(_mm_unpackhi_epi16(b0, b1), _mm_unpacklo_epi16(b0, b1));  // values 32..63
 }
 
-template <int NT>
+template <int NT, bool Vnni>
 inline void row_multi(const uint8_t* row, const ActQ* const* a, int nblocks, float* res) {
     __m256 acc[NT];
     float corr[NT];
@@ -47,8 +47,16 @@ inline void row_multi(const uint8_t* row, const ActQ* const* a, int nblocks, flo
         unpack64(blk + 2, lo, hi);
         for (int t = 0; t < NT; ++t) {
             const int8_t* q = a[t]->q + b * 64;
-            const __m256i s0 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i*) q)), ones);
-            const __m256i s1 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i*) (q + 32))), ones);
+            __m256i s0, s1;
+            if constexpr (Vnni) {
+                // xeno: AVX-VNNI (VEX vpdpbusd, Alder/Raptor Lake). Codes are u8 0..3, activations s8, so
+                // one dot sums the same four products the maddubs+madd pair does: bit-exact with it
+                s0 = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), lo, _mm256_loadu_si256((const __m256i*) q));
+                s1 = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), hi, _mm256_loadu_si256((const __m256i*) (q + 32)));
+            } else {
+                s0 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i*) q)), ones);
+                s1 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i*) (q + 32))), ones);
+            }
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b]), _mm256_cvtepi32_ps(s0), acc[t]);
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b + 1]), _mm256_cvtepi32_ps(s1), acc[t]);
             corr[t] += d * (a[t]->hx[2 * b] + a[t]->hx[2 * b + 1]);
@@ -61,30 +69,41 @@ inline void row_multi(const uint8_t* row, const ActQ* const* a, int nblocks, flo
     }
 }
 
-template <int NT>
+template <int NT, bool Vnni>
 void rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, float* const* out, int r0, int r1) {
     float res[NT];
     for (int r = r0; r < r1; ++r) {
-        row_multi<NT>(w + (size_t) r * row_bytes, a, nblocks, res);
+        row_multi<NT, Vnni>(w + (size_t) r * row_bytes, a, nblocks, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
 
 }  // namespace
 
-void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
-                               float* const* out, int r0, int r1) {
+template <bool Vnni>
+void rows_multi_t(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                  float* const* out, int r0, int r1) {
     switch (nt) {
-        case 1: rows<1>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        case 2: rows<2>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        case 3: rows<3>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        case 4: rows<4>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        case 1: rows<1, Vnni>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        case 2: rows<2, Vnni>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        case 3: rows<3, Vnni>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        case 4: rows<4, Vnni>(w, row_bytes, nblocks, a, out, r0, r1); break;
         default:
             for (int t0 = 0; t0 < nt; t0 += 4) {
                 const int k = nt - t0 < 4 ? nt - t0 : 4;
-                q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a + t0, k, out + t0, r0, r1);
+                rows_multi_t<Vnni>(w, row_bytes, nblocks, a + t0, k, out + t0, r0, r1);
             }
     }
+}
+
+void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                               float* const* out, int r0, int r1) {
+    rows_multi_t<false>(w, row_bytes, nblocks, a, nt, out, r0, r1);
+}
+
+void q2_0_gguf_rows_multi_avxvnni(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                                  float* const* out, int r0, int r1) {
+    rows_multi_t<true>(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
 void act_quant_q8_1_avx2(const float* x, int n, ActQ& a) {

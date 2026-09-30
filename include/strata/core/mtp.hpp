@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -39,13 +40,23 @@ public:
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;
 
+    /// #44 D4: called with each draft as soon as its graph step returns (the next window's PLE rows start then).
+    std::function<void(int32_t)> on_draft;
+
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
+    /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
+    void set_max_drafts(int k) { max_drafts_ = k; }
     uint64_t vram_bytes() const { return vram_; }
+    /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
+    const QsaState& kv_state() const { return st_; }
+    /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
+    /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
+    void kv_restore(int64_t upto);
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
@@ -82,6 +93,7 @@ private:
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
     int max_t_ = 0;
+    int max_drafts_ = 1 << 30;
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;

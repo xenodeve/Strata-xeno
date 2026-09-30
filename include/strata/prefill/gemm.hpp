@@ -11,6 +11,11 @@
 
 namespace strata::prefill {
 
+/// Creates and drops a cuBLAS handle on `device`: with CUDA_MODULE_LOADING=EAGER (set by strata generate) the first
+/// handle loads every cuBLAS kernel into the context, ~2.7 s here.  Called on a thread during load, so the prompt
+/// path's own handle is fast (#30: TTFT 3.9 -> 1.3 s on the code prompt).
+void warm_cublas(int device);
+
 class Gemm {
 public:
     Gemm() = default;
@@ -35,6 +40,9 @@ public:
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f);
+
+    /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
+    void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
 
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }

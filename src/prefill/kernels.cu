@@ -1,6 +1,7 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/router_top10.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -74,6 +75,68 @@ __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restric
     if (i >= n) return;
     const float x = lo[i] / (float) HC;
     lo16[i] = bf(x / (1.0f + __expf(-x)));
+}
+// F-1: the row scale only (and the BF16 image); gr_mix_r_kernel recomputes r * rs * w itself, in the same order,
+// so the FP32 copy of the normalized rows (T x 10240 floats) is neither written nor read
+__global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
+                                  float* __restrict__ rs_out, uint16_t* __restrict__ xn16) {
+    __shared__ float sh[32];
+    const int64_t row = blockIdx.x;                 // t * 4 + c
+    const int c = (int) (row % HC);
+    const float* r = R + row * N;
+    float ss = 0.0f;
+    for (int d = threadIdx.x; d < N; d += blockDim.x) ss += r[d] * r[d];
+    const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+    if (threadIdx.x == 0) rs_out[row] = rs;
+    for (int d = threadIdx.x; d < N; d += blockDim.x) xn16[row * N + d] = bf(r[d] * rs * w[c * N + d]);
+}
+__global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
+                                const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
+                                int64_t T, uint16_t* __restrict__ mixed_h) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const int64_t j = t * D + c * N + d;
+        const float x = R[j] * rs[t * HC + c] * w[c * N + d];   // gr_norm_kernel's value, bit for bit
+        s = fmaf(x, sigm(g[j]), s);
+    }
+    s /= (float) HC;
+    mixed[i] = s;
+    if (mixed16) mixed16[i] = bf(s);
+    if (mixed_h) mixed_h[i] = hf(s);
+}
+// F-2: gr_write_kernel for one row (t, c), then gr_norm_rs_kernel's reduction over it with the next half's norm
+// weights - the same thread-to-element mapping (256 threads, stride 256) and block_sum, so rs and the BF16 image are
+// the same bits, and R is not read back
+constexpr int GRW_PER = (N + 255) / 256;
+__global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict__ R, const float* __restrict__ bo,
+                                                               const float* __restrict__ inj, int64_t inj_ld,
+                                                               const float* __restrict__ w, float eps,
+                                                               float* __restrict__ rs_out, uint16_t* __restrict__ xn16) {
+    __shared__ float sh[32];
+    const int64_t row = blockIdx.x;                 // t * 4 + c
+    const int64_t t = row / HC;
+    const int c = (int) (row % HC);
+    float* r = R + row * N;
+    const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+    float v[GRW_PER];
+    float ss = 0.0f;
+    int k = 0;
+#pragma unroll
+    for (int d = threadIdx.x; d < N; d += 256, ++k) {
+        const float x = fmaf(bo[t * N + d], sc, r[d]);
+        r[d] = x;
+        v[k] = x;
+        ss += x * x;
+    }
+    const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+    if (threadIdx.x == 0) rs_out[row] = rs;
+    k = 0;
+#pragma unroll
+    for (int d = threadIdx.x; d < N; d += 256, ++k) xn16[row * N + d] = bf(v[k] * rs * w[c * N + d]);
 }
 __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
                               uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h) {
@@ -201,31 +264,32 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
 }
 
 // ---------------------------------------------------------------- MoE
+template <int REG>
 __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ wout,
                              int64_t T) {
     const int64_t t = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (t >= T) return;
     const int lane = threadIdx.x & 31;
-    const float* lg = logits + t * 512;
-    float v[16];
+    const float* lg = logits + t * (REG * 32);
+    float v[REG];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) v[i] = lg[lane + i * 32];
+    for (int i = 0; i < REG; ++i) v[i] = lg[lane + i * 32];
     float mx = -INFINITY;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) mx = fmaxf(mx, v[i]);
+    for (int i = 0; i < REG; ++i) mx = fmaxf(mx, v[i]);
     mx = warp_max(mx);
     float sum = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) { v[i] = expf(v[i] - mx); sum += v[i]; }
+    for (int i = 0; i < REG; ++i) { v[i] = expf(v[i] - mx); sum += v[i]; }
     const float rcp = 1.0f / warp_sum(sum);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) { v[i] *= rcp; if (isnan(v[i])) v[i] = -FLT_MAX; }
+    for (int i = 0; i < REG; ++i) { v[i] *= rcp; if (isnan(v[i])) v[i] = -FLT_MAX; }
     float selected = 0.0f, selected_sum = 0.0f;
     for (int rank = 0; rank < 10; ++rank) {
         float best = v[0];
         int ex = lane;
 #pragma unroll
-        for (int i = 1; i < 16; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
+        for (int i = 1; i < REG; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
 #pragma unroll
         for (int m = 16; m; m >>= 1) {
             const float ob = __shfl_xor_sync(0xffffffffu, best, m);
@@ -287,15 +351,22 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     const int64_t r = i / per, j = i % per;
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
+// the routed sum of token t's column d: one fmaf chain in k order.  moe_combine and the split's moe_routed_sum share it,
+// so the two cards' halves (#35 D1) add in the same order by construction
+__device__ __forceinline__ float routed_sum(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                            const float* __restrict__ w, int64_t t, int64_t d) {
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    return s;
+}
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
                                    const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
-    float s = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    const float s = routed_sum(Dm, slot, w, t, d);
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
@@ -335,10 +406,12 @@ __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __res
     o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
 }
 
-// one block per (token, kv head, 64-value group); 64 threads
+// one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
+// resident (table >= 0), and the host copy and the prompt path's staging pool (both identity layout) when given.
 __global__ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, int64_t pos0,
                                  const int32_t* __restrict__ table, int64_t page_size, uint16_t* k_pool,
-                                 uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale) {
+                                 uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
+                                 strata::kernels::KvHostPools host, strata::kernels::KvHostPools stage) {
     const int64_t t = blockIdx.x;
     const int kvh = blockIdx.y, g = blockIdx.z >> 1;
     const bool is_v = (blockIdx.z & 1) != 0;
@@ -347,8 +420,12 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
     const int64_t pos = pos0 + t;
     const int64_t page = table[pos / page_size];
     const int64_t row = (page * 2 + kvh) * page_size + pos % page_size;
+    const int64_t row_id = ((pos / page_size) * 2 + kvh) * page_size + pos % page_size;
     if (k_pool != nullptr) {
-        (is_v ? v_pool : k_pool)[row * 256 + d] = hf(x);
+        const uint16_t h = hf(x);
+        if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = h;
+        if (host.k_pool != nullptr) (is_v ? host.v_pool : host.k_pool)[row_id * 256 + d] = h;
+        if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = h;
         return;
     }
     float a = fabsf(x);
@@ -361,12 +438,26 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
     const float sf = __half2float(__ushort_as_half(sb));
     int q = 0;
     if (sf > 0.0f) { q = __float2int_rn(x / sf); q = q < -127 ? -127 : (q > 127 ? 127 : q); }
-    (is_v ? v_q : k_q)[row * 256 + d] = (int8_t) q;
-    if (threadIdx.x == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
+    if (page >= 0) {
+        (is_v ? v_q : k_q)[row * 256 + d] = (int8_t) q;
+        if (threadIdx.x == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
+    }
+    if (host.k_q != nullptr) {
+        (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t) q;
+        if (threadIdx.x == 0) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
+    }
+    if (stage.k_q != nullptr) {
+        (is_v ? stage.v_q : stage.k_q)[row_id * 256 + d] = (int8_t) q;
+        if (threadIdx.x == 0) (is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
+    }
 }
 __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         y[i] = hf(x[i]);
+}
+__global__ void round_f16_kernel(const float* __restrict__ x, float* __restrict__ y, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        y[i] = __half2float(__float2half_rn(x[i]));
 }
 __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
@@ -377,16 +468,22 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
 
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-               void* stream) {
+               void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage) {
     if (T <= 0) return;
-    kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(K, V, pos0, page_table, page_size, k_pool,
-                                                                                  v_pool, k_q, v_q, k_scale, v_scale);
+    kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(
+        K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale,
+        host ? *host : strata::kernels::KvHostPools{}, stage ? *stage : strata::kernels::KvHostPools{});
     check("kv_append");
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     to_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
     check("to_f16");
+}
+void round_f16(const float* x, float* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    round_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+    check("round_f16");
 }
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
@@ -401,6 +498,22 @@ void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream) {
     gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, T * LR);
     check("gr_silu");
+}
+void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream) {
+    gr_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, rs, xn16);
+    check("gr_norm_rs");
+}
+void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
+              int64_t T, void* stream, uint16_t* mixed_h) {
+    gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
+                                                                          mixed_h);
+    check("gr_mix_r");
+}
+void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
+                      float* rs, uint16_t* xn16, int64_t T, void* stream) {
+    gr_write_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
+                                                                                      rs, xn16);
+    check("gr_write_norm_rs");
 }
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h) {
@@ -429,8 +542,13 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
     check("gdn_recurrence");
 }
-void route(const float* logits, int32_t* ids, float* weights, int64_t T, void* stream) {
-    route_kernel<<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
+    if (n_expert == 512)
+        route_kernel<16><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    else if (n_expert == 256)
+        route_kernel<8><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    else
+        strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
     check("route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
@@ -446,6 +564,18 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
     swiglu_il_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(gu, h16, n);
     check("swiglu_interleaved");
 }
+namespace {
+__global__ void copy_i32_kernel(int32_t* __restrict__ dst, const int32_t* __restrict__ src, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+}  // namespace
+void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const int64_t b = (n + 255) / 256;
+    copy_i32_kernel<<<(unsigned) (b < 256 ? b : 256), 256, 0, (cudaStream_t) stream>>>(dst, src, n);
+    check("copy_i32");
+}
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
     swiglu_pair_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(g, u, h16, n);
     check("swiglu_pair");
@@ -454,6 +584,27 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     if (n <= 0) return;
     gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
     check("gather_rows16");
+}
+__global__ void moe_routed_sum_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                      const float* __restrict__ w, float* __restrict__ out, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    out[i] = routed_sum(Dm, slot, w, i / N, i % N);
+}
+__global__ void moe_shared_finish_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
+                                         float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const float s = bo[i];
+    bo[i] = s + shared[i] * sigm(sg[i / N]);
+}
+void moe_routed_sum(const float* Dm, const int32_t* slot, const float* w, float* s, int64_t T, void* stream) {
+    moe_routed_sum_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, s, T);
+    check("moe_routed_sum");
+}
+void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
+    moe_shared_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(shared, sg, bo, T);
+    check("moe_shared_finish");
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {

@@ -28,6 +28,12 @@ Gemm::~Gemm() {
     }
 }
 
+void warm_cublas(int device) {
+    if (cudaSetDevice(device) != cudaSuccess) return;
+    cublasHandle_t h = nullptr;
+    if (cublasCreate(&h) == CUBLAS_STATUS_SUCCESS) cublasDestroy(h);
+}
+
 bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
                          std::string& err) {
     cublasHandle_t h = nullptr;
@@ -42,6 +48,13 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
     return true;
+}
+
+void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes) {
+    scratch_ = scratch;
+    scratch_elems_ = scratch_elems;
+    workspace_ = workspace;
+    cublasSetWorkspace((cublasHandle_t) handle_, workspace_, ws_bytes);
 }
 
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {

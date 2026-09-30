@@ -3,6 +3,7 @@
 //   ple_reader_test --selftest [--dir D]        synthetic table file; CPU and disk only, no model, no GPU
 //   ple_reader_test --gguf SHARD2 [--rows N]    the real table: Direct vs Mmap bytes for N random rows (+ the
 //                                               16 rows of every token in --tokens FILE), with read latencies
+//   ple_reader_test --gguf SHARD2 --prefetch    #44: rows read ahead, then gathered: same floats, all from the cache
 //
 // Every row the synthetic table holds encodes its own index, so a wrong offset, a straddle mishandled or a
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
@@ -140,6 +141,49 @@ int selftest(const std::string& dir) {
     return g_fail ? 1 : 0;
 }
 
+// #44 D4: a window's rows read ahead with PleTable::prefetch (as each token becomes known) and gathered later must
+// give the same floats as a plain gather_batch, and the gather must then be served from the row cache.
+int prefetch_check(const std::string& gguf, int n_windows) {
+    k::PleIoOptions plain, ahead;
+    plain.cache_rows = 0;
+    ahead.cache_rows = 1 << 20;
+    k::PleTable a, b;
+    std::string err;
+    if (!a.open(gguf, err, plain) || !b.open(gguf, err, ahead)) { std::fprintf(stderr, "open: %s\n", err.c_str()); return 2; }
+    std::mt19937_64 rng(44);
+    const size_t T = 4;
+    std::vector<float> fa(T * k::NG_N_EMBD), fb(T * k::NG_N_EMBD);
+    uint64_t asked = 0;
+    for (int w = 0; w < n_windows; ++w) {
+        std::vector<uint32_t> rows(T * 16);
+        for (auto& x : rows) x = (uint32_t) (rng() % a.rows());
+        for (size_t t = 0; t < T; ++t) CHECK(b.prefetch(rows.data() + t * 16, 16), "prefetch refused");
+        if (w % 3 == 0) {   // a window whose drafts were not used: its reads are still in flight at the next gather
+            std::vector<uint32_t> unused(16);
+            for (auto& x : unused) x = (uint32_t) (rng() % a.rows());
+            CHECK(b.prefetch(unused.data(), 16), "prefetch refused");
+        }
+        const uint64_t hits0 = b.cache_hits();
+        CHECK(a.gather_batch(rows.data(), T, fa.data(), err), "plain gather: %s", err.c_str());
+        CHECK(b.gather_batch(rows.data(), T, fb.data(), err), "gather after prefetch: %s", err.c_str());
+        CHECK(!std::memcmp(fa.data(), fb.data(), fa.size() * sizeof(float)), "window %d: prefetched rows differ", w);
+        CHECK(b.cache_hits() - hits0 == T * 16, "window %d: %llu of %zu rows from the cache", w,
+              (unsigned long long) (b.cache_hits() - hits0), T * 16);
+        asked += T * 16;
+    }
+    // the single-token path still works after prefetches
+    std::vector<uint32_t> one(16);
+    for (auto& x : one) x = (uint32_t) (rng() % a.rows());
+    CHECK(b.prefetch(one.data(), 16), "prefetch refused");
+    std::vector<float> g(k::NG_N_EMBD), h(k::NG_N_EMBD);
+    CHECK(b.issue(one.data()) && b.collect(g.data(), err), "issue after prefetch: %s", err.c_str());
+    a.gather(one.data(), h.data());
+    CHECK(!std::memcmp(g.data(), h.data(), g.size() * sizeof(float)), "single token after prefetch differs");
+    std::printf("ple prefetch check (%llu rows): %s\n%s\n", (unsigned long long) asked, g_fail ? "FAILED" : "OK",
+                b.io_report().c_str());
+    return g_fail ? 1 : 0;
+}
+
 int real(const std::string& gguf, int n_random, const std::string& tokens_path, uint32_t inflight, bool direct_first,
          bool direct_only, bool sync_submit) {
     k::PleTable mm, direct;
@@ -217,6 +261,7 @@ int main(int argc, char** argv) {
     bool direct_only = false;
     bool sync_submit = false;
     bool self = false;
+    bool prefetch = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") self = true;
@@ -228,9 +273,11 @@ int main(int argc, char** argv) {
         else if (a == "--direct-first") direct_first = true;
         else if (a == "--direct-only") direct_only = true;
         else if (a == "--sync") sync_submit = true;
+        else if (a == "--prefetch") prefetch = true;
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
     }
     if (self) return selftest(dir);
+    if (prefetch && !gguf.empty()) return prefetch_check(gguf, rows / 64);
     if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit);
     std::fprintf(stderr, "nothing to do\n");
     return 2;
