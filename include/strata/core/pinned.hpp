@@ -41,14 +41,23 @@ struct PinnedArena {
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
     /// `pin_for_cuda` false: a pageable arena (no CUDA registration, no lock).  `max_pinned_bytes`: optional cap on
     /// CUDA registration (upstream); 0 preserves the normal unrestricted path.
+    /// `shared_file`: on Linux, use a file-backed MAP_SHARED mapping instead of anonymous memory.
+    /// `shared_pack_hash` identifies the pack that is allowed to populate that backing.  The file carries a
+    /// small header and is refused when its stored hash does not match.  Empty `shared_file` preserves the
+    /// existing allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, bool pin_for_cuda = true,
-                uint64_t max_pinned_bytes = 0);
+                uint64_t max_pinned_bytes = 0, const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
+    /// xeno merge guard (#56): upstream's third parameter is max_pinned_bytes, this one's is pin_for_cuda; a call in
+    /// upstream's order would convert the byte cap to a bool without a word. It does not compile.
+    PinnedArena(uint64_t, const std::vector<uint64_t>&, uint64_t, const std::string& = {}, uint64_t = 0) = delete;
     /// Placement-first cold start: address space only (MEM_RESERVE), nothing committed. The owner commits each
     /// host-owned range with `commit_interior` before writing it, so neither RAM nor the commit charge ever holds
     /// an expert the GPUs own. Pageable only (no CUDA registration, no lock).
     static PinnedArena* reserve_only(uint64_t bytes);
     bool reserved_only = false;
     std::vector<uint64_t> slice_starts;
+    void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
+    uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;
     PinnedArena& operator=(const PinnedArena&) = delete;

@@ -8,6 +8,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import queue
@@ -18,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Service, StrataEngine, request_timings, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, StrataEngine, request_timings, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -199,6 +200,90 @@ class FitMaxTokens(unittest.TestCase):
         s, b, _, _ = self.call("openai", text="y" * (CTX - CTX_SLACK - overhead), max_tokens=100)
         self.assertEqual(s, 400, b)
         self.assertIn("no room to answer", b["error"]["message"])
+
+
+class ImageMarkers(unittest.TestCase):
+    """#150: the text "<|image_pad|>" inside a message is text, not an image's place."""
+
+    class FakeVision:
+        def __init__(self, d):
+            self.dir = Path(d)
+            self.rows = self.dir / "img.sve"
+            self.rows.write_bytes(b"rows")
+
+        def encode(self, source):
+            return self.rows, 3
+
+    def test_literal_marker_with_an_image(self):
+        import tempfile
+        tok = ByteTokenizer()
+        with tempfile.TemporaryDirectory() as d:
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                          vision=self.FakeVision(d))
+            pad = tok.encode("<|image_pad|>", parse_special=True)[0]
+            for text in ("the docs say <|image_pad|> marks an image", "plain"):
+                with self.subTest(text=text):
+                    msgs = [{"role": "user", "content": [{"type": "text", "text": text},
+                                                         {"type": "image", "source": "x.png"}]}]
+                    ids, _, _ = svc.prepare(msgs, None, {})
+                    self.assertEqual(ids.count(pad), 3)          # the image's three rows, nothing else
+                    self.assertIn("<|image_pad|> marks" if "docs" in text else "plain", tok.decode(ids))
+            svc.embeddings.path.unlink(missing_ok=True)
+
+
+class StatusNeedsTheKey(unittest.TestCase):
+    """#212: /status shows the end of the answer being written, so it needs the key like /v1/*."""
+
+    def test_status(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.api_key = "k3y"
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}/status"
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(base, timeout=10)
+            self.assertEqual(e.exception.code, 401)
+            e.exception.close()
+            req = urllib.request.Request(base, headers={"Authorization": "Bearer k3y"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertEqual(r.status, 200)
+                self.assertNotIn("tail", json.loads(r.read()))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class ToolCallTerminators(unittest.TestCase):
+    """#210: a value that contains </parameter> or </tool_call> (a file documenting the call format) is kept whole."""
+    CONTENT = ("Close each value with </parameter> and the call with </function></tool_call>.\n"
+               "<parameter=x>\nnot a parameter\n</parameter>\nend")
+    SCHEMA = [{"name": "write", "parameters": {"properties": {"path": {"type": "string"},
+                                                              "content": {"type": "string"}}}}]
+
+    def run_parser(self, stream_tools, step):
+        from serve.frontend import OutputParser
+        text = ("</think>\n\n<tool_call>\n<function=write>\n<parameter=path>\ndoc.md\n</parameter>\n"
+                f"<parameter=content>\n{self.CONTENT}\n</parameter>\n</function>\n</tool_call>")
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=stream_tools)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        evs += p.finish()
+        return evs
+
+    def test_values_keep_the_terminators(self):
+        for stream_tools in (False, True):
+            for step in (1, 7, 10_000):
+                with self.subTest(stream_tools=stream_tools, step=step):
+                    evs = self.run_parser(stream_tools, step)
+                    calls = [e.call for e in evs if e.kind == "tool_call"]
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0].arguments, {"path": "doc.md", "content": self.CONTENT})
+                    self.assertFalse([e for e in evs if e.kind == "content" and e.text.strip()])
+                    if stream_tools:
+                        streamed = "".join(e.text for e in evs if e.kind == "tool_args")
+                        self.assertEqual(json.loads(streamed), {"path": "doc.md", "content": self.CONTENT})
 
 
 class ClientShapes(unittest.TestCase):
@@ -429,6 +514,41 @@ class LiveRate(unittest.TestCase):
     def metrics(self):
         with urllib.request.urlopen(self.base + "/metrics", timeout=10) as r:
             return json.loads(r.read())
+
+    def test_prefill_rate_excludes_cached_tokens(self):
+        import io
+        import queue
+        from types import SimpleNamespace
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)   # alive() asks it (#208)
+        engine.lines = queue.Queue()
+        engine.can_stop = False
+        engine.max_context = 262144
+        engine.prefill_tok_s_mean = 9999.0
+        engine.lines.put("PP 10000 12000 2000 1000.0")  # 8000 cached, 2000 newly read in two seconds
+        engine.lines.put("DONE 1 12000 4000 10 stop 0 0 8000")
+        gen = engine.generate([1], 1, {}, threading.Event())
+        self.assertIsNone(next(gen))
+        self.assertEqual(engine.progress, (10000, 12000))
+        self.assertEqual(engine.prefill_tok_s_mean, 1000.0)
+        self.svc.engine = engine
+        self.svc.status.update(busy=True, first_token=None)
+        self.assertEqual(self.metrics()["live"]["prefill_tok_s_mean"], 1000.0)
+        self.assertNotIn("prefill_tok_s", self.metrics()["live"])
+        self.assertEqual(self.svc._prefill_tok_s_mean(), 1000.0)
+        self.svc.status.update(first_token=time.time(), generated=1)
+        self.assertEqual(self.svc._prefill_tok_s_mean(), 0.0)
+        self.assertEqual(list(gen), [])
+        timings = request_timings(12000, 1, engine.last)
+        self.assertEqual(timings["prompt_per_second"], 1000.0)
+        engine.lines.put("PP 8000 12000")
+        engine.lines.put("DONE 0 12000 0 0 stop 0 0 12000")
+        gen = engine.generate([1], 1, {}, threading.Event())
+        next(gen)
+        self.assertIsNone(engine.prefill_tok_s_mean)
+        list(gen)
+        self.svc.status["busy"] = False
+        self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
 
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()
@@ -1785,6 +1905,141 @@ class LoadingAnswers529(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=10) as r:
             self.assertEqual(r.status, 200)
 
+class UnloadableEngine(MockEngine):
+    """A mock engine that can be stopped and started again like StrataEngine (alive / unload / restart)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.running, self.unloaded, self.starts = True, False, 0
+
+    def alive(self):
+        return self.running
+
+    def unload(self):
+        self.running, self.unloaded = False, True
+
+    def restart(self):
+        self.running, self.unloaded = True, False
+        self.starts += 1
+
+
+class SharingTheGpu(unittest.TestCase):
+    """Idle unload, POST /unload and /load, the free-VRAM guard and the before_load hook (all off by default)."""
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        self.engine = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def req(self, path, body=None):
+        r = urllib.request.Request(self.base + path, data=None if body is None else json.dumps(body).encode(),
+                                   headers={"Content-Type": "application/json"}, method="GET" if body is None else "POST")
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def chat(self):
+        return self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+
+    def test_unload_then_the_next_request_loads(self):
+        self.assertEqual(self.req("/unload", {}), (200, {"status": "unloaded"}))
+        self.assertFalse(self.engine.alive())
+        self.assertEqual(self.req("/health")[1]["loaded"], False)
+        self.assertEqual(self.req("/v1/models")[1]["data"][0]["status"]["value"], "unloaded")
+        self.assertEqual(self.req("/unload", {}), (200, {"status": "not loaded"}))
+        s, b = self.chat()
+        self.assertEqual(s, 200)
+        self.assertEqual(b["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(self.engine.starts, 1)
+        self.assertEqual(self.req("/health")[1]["loaded"], True)
+
+    def test_load_endpoint(self):
+        self.svc.unload()
+        self.assertEqual(self.req("/load", {}), (200, {"status": "loaded"}))
+        self.assertTrue(self.engine.alive())
+        self.assertEqual(self.req("/load", {}), (200, {"status": "loaded"}))
+        self.assertEqual(self.engine.starts, 1)
+
+    def test_unload_refused_while_a_request_runs(self):
+        with self.svc.fifo:
+            self.assertEqual(self.svc.unload(), "busy")
+        self.assertTrue(self.engine.alive())
+
+    def test_idle_unload(self):
+        self.svc.idle_unload_s = 1
+        self.svc.last_request_at = time.time()
+        self.assertEqual(self.svc.unload(idle_for=1), "busy")       # a request just now: not idle yet
+        self.svc.start_idle_unload()
+        deadline = time.time() + 10
+        while self.engine.alive() and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(self.engine.alive())
+        self.assertEqual(self.chat()[0], 200)
+
+    def test_min_free_vram_refuses_to_load(self):
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000
+        self.svc.unload()
+        t0 = time.time()
+        s, b = self.chat()
+        self.assertEqual(s, 503)
+        self.assertIn("in use by another program", b["error"]["message"])
+        self.assertFalse(self.engine.alive())
+        self.assertGreater(time.time() - t0, 10)                    # waited for memory being given back first
+        self.svc.free_vram_mib = lambda: 9000
+        self.assertEqual(self.chat()[0], 200)
+
+    def test_min_free_vram_unreadable_loads(self):
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: None                       # no NVML: never refuse
+        self.svc.unload()
+        self.assertEqual(self.chat()[0], 200)
+
+    def test_before_load_runs_first(self):
+        mark = Path(tempfile.mkdtemp()) / "ran"
+        self.svc.before_load = [sys.executable, "-c", f"open({str(mark)!r}, 'w').close()"]
+        self.svc.unload()
+        self.assertFalse(mark.exists())
+        self.assertEqual(self.chat()[0], 200)
+        self.assertTrue(mark.exists())
+
+    def test_vision_encoder_unloads_and_starts_first(self):
+        order = []
+
+        class FakeVision:
+            running = True
+
+            def alive(self):
+                return self.running
+
+            def unload(self):
+                self.running = False
+
+            def restart(self):
+                order.append("vision")
+                self.running = True
+
+        engine_restart = self.engine.restart
+        self.engine.restart = lambda: (order.append("engine"), engine_restart())
+        self.svc.vision = FakeVision()
+        self.assertEqual(self.svc.unload(), "unloaded")
+        self.assertFalse(self.svc.vision.alive())
+        self.assertEqual(self.chat()[0], 200)
+        self.assertEqual(order, ["vision", "engine"])             # the encoder first, as at a start
+        self.assertTrue(self.svc.vision.alive())
+
+    def test_off_by_default(self):
+        self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
+        self.assertEqual(self.req("/health")[1]["loaded"], True)
 
 if __name__ == "__main__":
     unittest.main()
