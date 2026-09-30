@@ -904,5 +904,62 @@ class SamplingPresets(unittest.TestCase):
             self.defaults({"preset": "creative"})
 
 
+class CjkGuard(unittest.TestCase):
+    """#49 S4 (xeno; the EXL3 server's #77): Han tokens are banned for a request whose prompt has no Han character
+    and does not name Chinese - 4.0bpw dropped Han characters into Thai sentences by sampling drift."""
+
+    def msgs(self, text):
+        return [{"role": "user", "content": text}]
+
+    def test_wanted(self):
+        from serve.cjk_guard import wanted
+        self.assertTrue(wanted(self.msgs("ช่วยสรุปไฟล์นี้หน่อย")))
+        self.assertTrue(wanted(self.msgs("explain these machinations")))       # word-bounded: not "china"
+        self.assertFalse(wanted(self.msgs("翻译这个")))
+        self.assertFalse(wanted(self.msgs("แปลเป็นภาษาจีน")))
+        self.assertFalse(wanted(self.msgs("reply in Chinese")))
+        self.assertFalse(wanted([{"role": "tool", "content": [{"type": "text", "text": "注释"}]}]))
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"STRATA_ALLOW_CJK": "1"}):
+            self.assertFalse(wanted(self.msgs("hello")))
+
+    def test_ban_ids(self):
+        from serve.cjk_guard import ban_ids
+        pieces = ["a", "中", " 文字", "ก", "�", "の"]         # kana and a broken byte are not Han
+        self.assertEqual(ban_ids(lambda i: pieces[i], len(pieces)), [1, 2])
+
+    def test_the_gen_key(self):
+        self.assertIn("ban=1", StrataEngine.sampling_keys({"_ban": True}).split())
+        self.assertFalse([k for k in StrataEngine.sampling_keys({}).split() if k.startswith("ban=")])
+
+    def test_the_server_bans_per_request(self):
+        class Recorder(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                self.bans = getattr(self, "bans", []) + [bool(sampling.get("_ban"))]
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        tok = ByteTokenizer()
+        eng = Recorder(tok, "</think>\n\nok 中文", max_context=CTX)        # a leak, as the instrument sees it
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            def post(path, text):
+                body = {"model": "m", "max_tokens": 20, "stream": True, "messages": self.msgs(text)}
+                req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}{path}",
+                                             data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    r.read()
+            post("/v1/messages", "สวัสดี")                   # the engine has no ban list: never sent
+            svc.cjk_ban = True
+            post("/v1/messages", "สวัสดี")
+            post("/v1/messages", "翻译")
+            post("/v1/chat/completions", "hello")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual(eng.bans, [False, True, False, True])
+        self.assertEqual([r["cjk_chars"] for r in svc.metrics()["requests"]], [2, 2, 2, 2])
+
+
 if __name__ == "__main__":
     unittest.main()

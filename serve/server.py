@@ -47,7 +47,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.loop_guard import LoopGuard
-from serve import think_budget  # noqa: E402  (xeno #49 S3)
+from serve import cjk_guard, think_budget  # noqa: E402  (xeno #49 S4, S3)
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -293,6 +293,8 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+        if sampling.get("_ban") is True:                 # xeno #49 S4: the engine's --ban-ids list (Han)
+            keys += " ban=1"
         return keys + StrataEngine.projection_key(sampling)
 
     @staticmethod
@@ -598,6 +600,7 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+        self.cjk_ban = False            # xeno #49 S4: the engine was started with the Han ban list (--ban-ids)
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = RequestGate()
@@ -625,6 +628,10 @@ class Service:
             except OSError as e:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
+
+    def cjk(self, req: dict, messages) -> dict:
+        """The request with the Han ban on when the engine has the list and the prompt wants it (xeno #49 S4)."""
+        return {**req, "_ban": True} if self.cjk_ban and cjk_guard.wanted(messages) else req
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
@@ -936,6 +943,7 @@ class Service:
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
+                        "cjk_chars": cjk_guard.count_han(self.tok.decode(raw_ids)) if raw_ids else 0,   # #49 S4
                         "hit_rate": hit_rate})
                     t = self.totals
                     t["requests"] += 1
@@ -1483,6 +1491,7 @@ def make_handler(svc: Service):
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             messages, tools, kw = openai_to_messages(req)
+            req = svc.cjk(req, messages)                                # xeno #49 S4
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or []}
@@ -1523,6 +1532,7 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, vision=svc.vision is not None)
+            req = svc.cjk(req, messages)                                # xeno #49 S4
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             budget = think_budget.for_anthropic(req, kw, max_new)     # xeno #49 S3 (side requests: low effort)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
@@ -1791,8 +1801,16 @@ def main() -> int:
             print("loading the vision encoder ...", flush=True)
             vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=env)
+        args = list(cfg["args"])
+        if cfg.get("cjk_guard"):                        # xeno #49 S4: an engine without --ban-ids would not start
+            ban_path = Path(tempfile.gettempdir()) / "strata-cjk-ban-ids.txt"
+            ids = cjk_guard.ban_ids(lambda i: tok.decode([i]), len(tokens))
+            ban_path.write_text("\n".join(map(str, ids)) + "\n", encoding="ascii")
+            args += ["--ban-ids", str(ban_path)]
+            print(f"[strata] CJK guard: {len(ids)} Han token ids banned unless a prompt has or names Chinese",
+                  flush=True)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
-        engine = StrataEngine(cfg["exe"], cfg["args"], cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
+        engine = StrataEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
@@ -1804,6 +1822,7 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.cjk_ban = a.engine == "strata" and bool(cfg.get("cjk_guard"))   # xeno #49 S4: --ban-ids was passed
     svc.gpu_index = cfg.get("gpu") or 0                 # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
