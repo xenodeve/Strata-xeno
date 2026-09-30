@@ -1552,5 +1552,68 @@ class CacheSlotProtocol(unittest.TestCase):
                 StrataEngine.sampling_keys({"strata_cache_slot":slot})
 
 
+class AutoCacheSlot(unittest.TestCase):
+    """#49 S7 (xeno, on upstream PR #175's slots): Claude Code cannot send strata_cache_slot, and its side requests
+    (the auto-mode classifier, titles) have their own prompt, so each one wiped the main session's cache - a 52.6K
+    re-read (55 s) in real use (#50). The server picks a slot per prompt family (the prompt's first tokens), keeps a
+    family on its slot, and reuses the least recently used slot when there are more families than slots."""
+
+    class SlotEngine(MockEngine):
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            self.slots = getattr(self, "slots", []) + [sampling.get("strata_cache_slot", 0)]
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+    def serve_with(self, slots):
+        tok = ByteTokenizer()
+        eng = self.SlotEngine(tok, "</think>\n\nok", max_context=16384)
+        if slots is not None:
+            eng.info = {"cache_slots": slots}
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+
+        def post(system, extra=None):
+            body = {"model": "m", "max_tokens": 8, "stream": True, "system": system,
+                    "messages": [{"role": "user", "content": "hi"}], **(extra or {})}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/messages",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
+        return eng, post
+
+    MAIN, SIDE = "You are the main agent. " * 40, "You are a classifier. " * 40
+
+    def test_families_keep_their_own_slot(self):
+        eng, post = self.serve_with(4)
+        for system in (self.MAIN, self.SIDE, self.MAIN, self.SIDE, self.MAIN):
+            post(system)
+        self.assertEqual(eng.slots[0], eng.slots[2])
+        self.assertEqual(eng.slots[0], eng.slots[4])
+        self.assertEqual(eng.slots[1], eng.slots[3])
+        self.assertNotEqual(eng.slots[0], eng.slots[1])
+
+    def test_the_least_recently_used_family_gives_up_its_slot(self):
+        eng, post = self.serve_with(2)
+        post("family A " * 80)
+        post("family B " * 80)
+        post("family A " * 80)          # A is now the more recent
+        post("family C " * 80)          # takes B's slot, not A's
+        self.assertEqual(eng.slots[3], eng.slots[1])
+        self.assertNotEqual(eng.slots[3], eng.slots[0])
+
+    def test_an_explicit_slot_wins(self):
+        eng, post = self.serve_with(4)
+        post(self.MAIN, {"strata_cache_slot": 3})
+        self.assertEqual(eng.slots, [3])
+
+    def test_no_automatic_slot_without_engine_slots(self):
+        for slots in (None, 1):
+            eng, post = self.serve_with(slots)
+            post(self.MAIN)
+            post(self.SIDE)
+            self.assertEqual(eng.slots, [0, 0], slots)
+
+
 if __name__ == "__main__":
     unittest.main()

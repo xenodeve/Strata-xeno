@@ -158,6 +158,31 @@ def cache_slot(request: dict) -> int:
     return slot
 
 
+class CacheSlots:
+    """The server's choice of the engine's cache slot (xeno #49 S7, on upstream PR #175): Claude Code cannot send
+    strata_cache_slot, and its side requests (the auto-mode classifier, titles) start from their own prompt, so on
+    one slot each of them wiped the main session's cache (#50). A prompt family is its first PREFIX tokens; a family
+    keeps its slot, and a new family takes a free slot or the least recently used one."""
+    PREFIX = 512
+
+    def __init__(self, n: int):
+        self.n = n
+        self.families: "collections.OrderedDict[int, int]" = collections.OrderedDict()   # family -> slot, oldest first
+        self.lock = threading.Lock()
+
+    def pick(self, ids) -> int:
+        family = hash(tuple(ids[:self.PREFIX]))
+        with self.lock:
+            if family in self.families:
+                self.families.move_to_end(family)
+                return self.families[family]
+            used = set(self.families.values())
+            free = [s for s in range(self.n) if s not in used]
+            slot = free[0] if free else self.families.popitem(last=False)[1]
+            self.families[family] = slot
+            return slot
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -694,6 +719,21 @@ class Service:
             except OSError as e:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
+
+    def with_slot(self, req: dict, ids) -> dict:
+        """The request with the cache slot of its prompt family (xeno #49 S7), when the engine has several slots
+        (INFO cache_slots) and the client chose none."""
+        if "strata_cache_slot" in req:
+            return req
+        try:
+            n = int((getattr(self.engine, "info", {}) or {}).get("cache_slots", 1))
+        except (TypeError, ValueError):
+            n = 1
+        if n <= 1:
+            return req
+        if getattr(self, "slots", None) is None or self.slots.n != n:
+            self.slots = CacheSlots(n)
+        return {**req, "strata_cache_slot": self.slots.pick(ids)}
 
     def cjk(self, req: dict, messages) -> dict:
         """The request with the Han ban on when the engine has the list and the prompt wants it (xeno #49 S4)."""
@@ -1774,6 +1814,7 @@ def make_handler(svc: Service):
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
+            req = svc.with_slot(req, ids)                               # xeno #49 S7
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -1807,6 +1848,7 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             think_budget.side_effort(req, kw)                         # xeno #49 S3: before the template renders
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
+            req = svc.with_slot(req, ids)                               # xeno #49 S7
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
             if budget and thinking:
                 req = {**req, "_think_budget": budget}
