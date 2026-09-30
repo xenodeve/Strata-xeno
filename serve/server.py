@@ -1910,9 +1910,7 @@ def make_handler(svc: Service):
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
             if budget and thinking:
                 req = {**req, "_think_budget": budget}
-            opening = forced_opening.required(messages, thinking, max_new,     # xeno: the classifier's <block>
-                                              side=not req.get("stream") and not tools)
-            if opening:
+            opening = forced_opening.required(messages, thinking)      # xeno: the classifier's <severity>            if opening:
                 req = {**req, "_opening": opening}
                 print(f"[strata] the request requires its reply to begin with {opening}: written for the model",
                       flush=True)
