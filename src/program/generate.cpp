@@ -4413,11 +4413,13 @@ int main(int argc, char** argv) {
             }
             return true;
         };
-        sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+        // #48: per wave lane - each lane batches the drafter's K/V through its own prompt path (see the generate path)
+        auto serve_chunk = [&](strata::prefill::Prefill& lane) -> std::function<bool(const float*, int64_t, int64_t, std::string&)> {
+          return [&, lp = &lane](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
-            const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+            const bool batched = !multi_gpu && lp->draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
@@ -4447,7 +4449,9 @@ int main(int argc, char** argv) {
                 pp_next_check = done + o.prompt_cache_every;
             }
             return true;
+          };
         };
+        sp.on_chunk = serve_chunk(sp);
         if (multi_gpu) {   // the batched prompt is reported by its last stage (the drafter's rows are there)
             stages.back()->sp.on_chunk = std::move(sp.on_chunk);
             sp.on_chunk = nullptr;
@@ -4780,7 +4784,7 @@ int main(int argc, char** argv) {
         };
         sp.should_stop = [&] { return stop_req.load(); };
         sp2.should_stop = sp.should_stop;
-        sp2.on_chunk = sp.on_chunk;   // #35 D7: the wave calls it in chunk order
+        sp2.on_chunk = serve_chunk(sp2);   // #35 D7: the wave calls them in chunk order (#48: each with its own lane)
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
@@ -5794,14 +5798,20 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
-            prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
-                // cell i pairs R_i with the token at i + 1 (every such token is in the prompt)
-                std::vector<int32_t> nxt((size_t) T);
-                for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p0 + t + 1)];
-                if (prefill.draft_kv(mtp, R_rows, nxt.data(), T, p0, e)) return true;   // E-9
-                return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
+            // #48: each wave lane batches the drafter's K/V through ITS OWN prompt path (scratch region and stream).
+            // A shared callback ran lane 1's draft_kv from lane 2's thread, on lane 1's stream and scratch while lane 1
+            // read its next chunk there: its row tables were overwritten (an illegal address on the 5060).
+            auto drafter_rows = [&](strata::prefill::Prefill& lane) {
+                return [&, lp = &lane](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                    // cell i pairs R_i with the token at i + 1 (every such token is in the prompt)
+                    std::vector<int32_t> nxt((size_t) T);
+                    for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p0 + t + 1)];
+                    if (lp->draft_kv(mtp, R_rows, nxt.data(), T, p0, e)) return true;   // E-9
+                    return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
+                };
             };
-            prefill2.on_chunk = prefill.on_chunk;   // #35 D7: the wave calls it in chunk order
+            prefill.on_chunk = drafter_rows(prefill);
+            prefill2.on_chunk = drafter_rows(prefill2);   // #35 D7: the wave calls them in chunk order
         }
         const Clock::time_point tp0 = Clock::now();
         const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
