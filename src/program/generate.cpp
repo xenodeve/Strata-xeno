@@ -5030,6 +5030,9 @@ int main(int argc, char** argv) {
         bool mrope_identity = true;
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
+        // xeno #53: a fatal ERR ends the engine at once.  Returning ran the destructors, and that teardown can hang
+        // (#45's exit hang): the process stayed alive, the server saw no exit and every later request hung.
+        auto serve_fatal = []() -> int { std::fflush(stdout); std::fflush(stderr); std::_Exit(1); };
         while (next_line(line)) {
             if (line == "QUIT") break;
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
@@ -5038,6 +5041,7 @@ int main(int argc, char** argv) {
                 ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            err.clear();   // xeno #53: a cancelled request left "cancelled" here, and the next one's first prompt chunk read it as its own error
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
@@ -5246,7 +5250,7 @@ int main(int argc, char** argv) {
                 // A cancelled request has usable checkpoints but no valid live state.
                 if (!live_ok && !checks.empty()) {
                     const auto& last = checks.back();
-                    if (!checkpoint_restore(last,ss,g)) { std::printf("ERR cache checkpoint restore failed\n"); return 1; }
+                    if (!checkpoint_restore(last,ss,g)) { std::printf("ERR cache checkpoint restore failed\n"); return serve_fatal(); }
                     live = last.ids; live_imgs = last.imgs; live_ok = true;
                 }
                 if (live_ok && !live.empty()) {
@@ -5255,7 +5259,7 @@ int main(int argc, char** argv) {
                     wchar_t temp_dir[MAX_PATH], temp_file[MAX_PATH];
                     const DWORD count = GetTempPathW(MAX_PATH, temp_dir);
                     if (!count || count >= MAX_PATH || !GetTempFileNameW(temp_dir,L"stc",0,temp_file)) {
-                        std::printf("ERR creating cache snapshot file failed\n"); return 1;
+                        std::printf("ERR creating cache snapshot file failed\n"); return serve_fatal();
                     }
                     saved.file.reset(_wfopen(temp_file,L"w+bD"));
                     if (!saved.file) DeleteFileW(temp_file);
@@ -5266,11 +5270,11 @@ int main(int argc, char** argv) {
                     saved.running.ids = live; saved.running.imgs = live_imgs;
                     saved.cvec = cvec_cached;
                     if (!saved.file || !checkpoint_save(saved.running,ss,g) || !slot_positional(saved,ss,g,mtp,false)) {
-                        std::printf("ERR saving conversation cache slot failed\n"); return 1;
+                        std::printf("ERR saving conversation cache slot failed\n"); return serve_fatal();
                     }
                     saved.checks = std::move(checks);
                     if (!slot_checkpoints(saved,false)) {
-                        std::printf("ERR saving cache checkpoints to disk failed\n"); return 1;
+                        std::printf("ERR saving cache checkpoints to disk failed\n"); return serve_fatal();
                     }
                     std::fprintf(stderr,"strata cache: slot %d offloaded %.1f MiB of checkpoint state\n",
                         active_slot,saved.state_bytes/(1024.0*1024.0));
@@ -5280,7 +5284,7 @@ int main(int argc, char** argv) {
                 if (incoming.file) {
                     if (!slot_positional(incoming,ss,g,mtp,true) || !slot_checkpoints(incoming,true)
                         || !checkpoint_restore(incoming.running,ss,g)) {
-                        std::printf("ERR loading conversation cache slot failed\n"); return 1;
+                        std::printf("ERR loading conversation cache slot failed\n"); return serve_fatal();
                     }
                     live = incoming.running.ids; live_imgs = incoming.running.imgs; live_ok = true;
                     checks = std::move(incoming.checks); cvec_cached = incoming.cvec;
@@ -5357,7 +5361,7 @@ int main(int argc, char** argv) {
                                return false;
                            }()) {
                     std::printf("ERR restoring a conversation checkpoint failed\n");
-                    return 1;
+                    return serve_fatal();
                 }
             }
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
@@ -5549,11 +5553,11 @@ int main(int argc, char** argv) {
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
-                    return 1;
+                    return serve_fatal();
                 }
                 if (!win && !lend(to - at, err)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
-                    return 1;
+                    return serve_fatal();
                 }
                 const auto tsp = Clock::now();
                 auto run_prompt = [&](int64_t a, int64_t b, std::string& e) -> bool {
@@ -5579,7 +5583,7 @@ int main(int argc, char** argv) {
                     if (!stop_req.load()) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
-                        return 1;
+                        return serve_fatal();
                     }
                     cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
                     break;
@@ -5587,12 +5591,12 @@ int main(int argc, char** argv) {
                 at = to;
                 if ((to == turn_at || to == root_at || to == shared_at) && !checkpoint_at(to)) {
                     std::printf("ERR saving a conversation checkpoint failed\n");
-                    return 1;
+                    return serve_fatal();
                 }
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
-                return 1;
+                return serve_fatal();
             }
             tr("prompt done (slots refilled)");
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
@@ -5686,7 +5690,7 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
-                    return 1;
+                    return serve_fatal();
                 }
                 if (strata::timeline::enabled()) {   // #23: cumulative tier entries after each window
                     const int64_t* te = drive.d.tier_entries;
@@ -5714,7 +5718,7 @@ int main(int argc, char** argv) {
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
-                    return 1;
+                    return serve_fatal();
                 }
                 ple_ahead.start(ss, o.ple_ahead > 0);   // #44 D4: the next window starts with outv[a]
                 ple_ahead.push(outv[(size_t) a]);
@@ -5751,11 +5755,11 @@ int main(int argc, char** argv) {
                 if (strata::timeline::enabled()) strata::timeline::complete("adapt join", tl_join, Clock::now());
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
-                    return 1;
+                    return serve_fatal();
                 }
                 if (!drafted) {
                     std::printf("ERR %s\n", err.c_str());
-                    return 1;
+                    return serve_fatal();
                 }
                 if (timed_round && !eos)
                     policy.observe(from_sfx, T, a, sfx_match,
