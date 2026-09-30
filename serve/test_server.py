@@ -10,6 +10,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -834,6 +835,48 @@ class SseTrace(unittest.TestCase):
         self.assertEqual(len({r["rid"] for r in recs}), 1)
         self.assertTrue(all(isinstance(r["t"], float) for r in recs))
         self.assertEqual("".join((r.get("delta") or {}).get("text", "") for r in recs), "ok")
+
+
+class Priority(unittest.TestCase):
+    """#49 S6 (xeno): Claude Code's main turn streams; its title and auto-mode classifier requests do not. A queued
+    streamed request goes before queued non-streamed ones; the running request is never pre-empted."""
+
+    def test_a_streamed_request_goes_before_waiting_side_requests(self):
+        class Gated(MockEngine):
+            order, gate = [], threading.Event()
+
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                Gated.order.append(sampling.get("tag"))
+                if sampling.get("tag") == "running":
+                    Gated.gate.wait(10)
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        tok = ByteTokenizer()
+        svc = Service(Gated(tok, "</think>\n\nok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ids, thinking, max_new = svc.prepare([{"role": "user", "content": "hi"}], None, {}, 20)
+
+        def request(tag, stream):
+            list(svc.run(ids, thinking, None, max_new, {"tag": tag, "stream": stream}, threading.Event()))
+
+        def queued(k):
+            for _ in range(500):
+                if svc.status["queued"] >= k:
+                    return
+                time.sleep(0.01)
+            self.fail(f"{k} requests never queued")
+
+        threads = [threading.Thread(target=request, args=("running", True))]
+        threads[0].start()
+        while not Gated.order:
+            time.sleep(0.01)
+        for i, (tag, stream) in enumerate([("side-1", False), ("side-2", False), ("main", True)]):
+            threads.append(threading.Thread(target=request, args=(tag, stream)))
+            threads[-1].start()
+            queued(i + 1)
+        Gated.gate.set()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(Gated.order, ["running", "main", "side-1", "side-2"])
 
 
 if __name__ == "__main__":

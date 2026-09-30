@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import base64
 import hashlib
+import heapq
+import itertools
 import json
 import os
 import queue
@@ -547,6 +550,47 @@ class StopSequenceFilter:
         return visible
 
 
+class RequestGate:
+    """One request on the engine at a time (xeno #49 S6). Waiting requests go in (priority, arrival) order: Claude
+    Code's main turn streams (priority 0), its title and auto-mode classifier requests do not (1), and they used to
+    hold the only slot while the main turn queued. The running request is never pre-empted. Used as a plain lock
+    (`with gate:`) it is priority 1, first come first served."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._busy = False
+        self._waiting: list = []
+        self._arrival = itertools.count()
+
+    def acquire(self, priority: int = 1):
+        ticket = (priority, next(self._arrival))
+        with self._cv:
+            heapq.heappush(self._waiting, ticket)
+            while self._busy or self._waiting[0] != ticket:
+                self._cv.wait()
+            heapq.heappop(self._waiting)
+            self._busy = True
+
+    def release(self):
+        with self._cv:
+            self._busy = False
+            self._cv.notify_all()
+
+    @contextlib.contextmanager
+    def slot(self, priority: int = 1):
+        self.acquire(priority)
+        try:
+            yield
+        finally:
+            self.release()
+
+    def __enter__(self):
+        self.acquire()
+
+    def __exit__(self, *exc):
+        self.release()
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -556,7 +600,7 @@ class Service:
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
-        self.fifo = threading.Lock()
+        self.fifo = RequestGate()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.status = {"busy": False, "queued": 0, "loops_stopped": 0}  # GET /status: what the model is doing right now
@@ -789,7 +833,7 @@ class Service:
             self.status["queued"] += 1
         t_queue = timeline.now_us()
         try:
-            with self.fifo:
+            with self.fifo.slot(0 if (sampling or {}).get("stream") else 1):   # xeno #49 S6: main turn first
                 timeline.complete("queue wait", t_queue, timeline.now_us())
                 with self.status_lock:
                     self.status["queued"] -= 1
