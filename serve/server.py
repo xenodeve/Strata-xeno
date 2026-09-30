@@ -147,6 +147,7 @@ class StrataEngine:
     (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
     engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
     """
+    QUIET_S = 10          # how long a quiet engine waits for a line before a heartbeat and a liveness check
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
@@ -312,8 +313,11 @@ class StrataEngine:
         try:
             while True:
                 try:
-                    line = self.lines.get(timeout=10)
+                    line = self.lines.get(timeout=self.QUIET_S)
                 except queue.Empty:
+                    if self.proc.poll() is not None:     # xeno #48: it exited but its output never closed (a
+                        done = self.ended = True         # crashed CUDA process can keep the pipe): fail, not wait
+                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.proc.poll()})")
                     if cancel.is_set():
                         return
                     yield None
@@ -1103,12 +1107,19 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         yield "content_block_stop", {"type": "content_block_stop", "index": index}
 
     streamed = set()
+    choice = req.get("tool_choice") if isinstance(req.get("tool_choice"), dict) else {}
+    one_call, first_done = bool(choice.get("disable_parallel_tool_use")), False   # xeno #49 S2
     for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
         if kind == "ping":
             yield None
             continue
         if kind == "event":
             ev: Event = x
+            if first_done:                          # disable_parallel_tool_use: nothing after the first call
+                continue
+            if one_call and ev.kind == "tool_call":
+                first_done = True
+                cancel.set()
             if ev.kind == "tool_args":
                 yield "content_block_delta", {"type": "content_block_delta", "index": index,
                                               "delta": {"type": "input_json_delta", "partial_json": ev.text}}
@@ -1147,7 +1158,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             if open_kind is not None:
                 yield from close()
             stop = "stop_sequence" if x.get("stop_sequence") else \
-                   "tool_use" if used_tool and x["finish"] == "stop" else \
+                   "tool_use" if used_tool and (x["finish"] == "stop" or first_done) else \
                    {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             yield "message_delta", {"type": "message_delta",
                                     "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
@@ -1324,7 +1335,11 @@ def make_handler(svc: Service):
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                if self.path.startswith("/v1/messages"):     # xeno #49 S2: the native API's retryable error
+                    self._json(529, {"type": "error", "error": {"type": "overloaded_error",
+                                                                "message": f"{e}; the next request restarts it"}})
+                else:
+                    self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -1422,8 +1437,9 @@ def make_handler(svc: Service):
             except OSError:
                 cancel.set()
                 events.close()
-            except EngineDied as e:                          # mid-stream: Anthropic's error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+            except EngineDied as e:                          # mid-stream: Anthropic's retryable error event (#49 S2)
+                err = {"type": "error", "error": {"type": "overloaded_error",
+                                                  "message": f"{e}; the next request restarts it"}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}

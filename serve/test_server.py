@@ -4,9 +4,12 @@
 """
 from __future__ import annotations
 
+import io
 import json
 import os
+import queue
 import sys
+import threading
 import unittest
 import urllib.error
 import urllib.request
@@ -570,6 +573,130 @@ class ToolResultContent(unittest.TestCase):
         self.assertEqual(images_of(msgs), [])
         self.assertIn("image", self.text(tool["content"]).lower())
         self.assertIn("not enabled", self.text(tool["content"]))
+
+
+class ExitedProc:
+    """#48 defect 2 (xeno): the engine process has exited (Windows showed HasExited = True) but its stdout never
+    reached end-of-file, so no None ever arrived on the line queue."""
+    returncode = 3221225477                             # 0xC0000005, an access violation
+
+    def __init__(self, code=returncode):
+        self.stdin, self.code = io.StringIO(), code
+
+    def poll(self):
+        return self.code
+
+    def wait(self, timeout=None):
+        return self.code
+
+
+class QuietEngineLiveness(unittest.TestCase):
+    """#49 S2 / #48 defect 2 (xeno): while the engine is quiet (reading a prompt), the server must notice that its
+    process has ended; it used to print "reading the prompt" for minutes and Claude Code waited instead of retrying."""
+
+    def engine(self, code):
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.proc, eng.lines, eng.QUIET_S = ExitedProc(code), queue.Queue(), 0.01
+        return eng
+
+    def test_an_engine_that_exits_mid_prompt_ends_the_request(self):
+        gen = self.engine(ExitedProc.returncode).generate([1, 2, 3], 10, {}, threading.Event())
+        with self.assertRaises(EngineDied):
+            for _ in zip(range(200), gen):
+                pass
+
+    def test_a_live_quiet_engine_keeps_sending_heartbeats_until_it_exits(self):
+        eng = self.engine(None)
+        gen = eng.generate([1, 2, 3], 10, {}, threading.Event())
+        self.assertEqual([next(gen) for _ in range(3)], [None, None, None])
+        eng.proc.code = ExitedProc.returncode
+        with self.assertRaises(EngineDied):
+            next(gen)
+        self.assertFalse(eng.alive())                   # the next request starts it again (issue #27)
+
+
+class DeadAtOnce(MockEngine):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        raise EngineDied("the engine stopped unexpectedly (exit code 3221225477)")
+        yield                                           # a generator, as the real one is
+
+
+class AnthropicOverloaded(unittest.TestCase):
+    """#49 S2 (xeno): a dead engine is the native API's `529 overloaded_error` on /v1/messages - the error Claude Code
+    retries with backoff (it was 503 server_error / an api_error event, which it shows as a failed turn)."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(DeadAtOnce(tok, ANSWER, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, body):
+        req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.read().decode()
+
+    BODY = {"model": "m", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_not_streamed(self):
+        status, text = self.post(self.BODY)
+        self.assertEqual(status, 529, text)
+        body = json.loads(text)
+        self.assertEqual(body["type"], "error")
+        self.assertEqual(body["error"]["type"], "overloaded_error")
+
+    def test_streamed(self):
+        status, text = self.post({**self.BODY, "stream": True})
+        self.assertEqual(status, 200)
+        self.assertIn("event: error", text)
+        err = json.loads(text.split("event: error\ndata: ", 1)[1].split("\n", 1)[0])
+        self.assertEqual(err["error"]["type"], "overloaded_error")
+
+
+def _call(name):
+    return f"<tool_call>\n<function={name}>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
+
+
+class ParallelToolUse(unittest.TestCase):
+    """#49 S2 (xeno): tool_choice.disable_parallel_tool_use - the native API returns at most one tool_use."""
+
+    TOOLS = [{"name": n, "description": "d", "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}}}
+             for n in ("first", "second")]
+
+    def uses(self, tool_choice):
+        tok = ByteTokenizer()
+        eng = MockEngine(tok, "</think>\n\n" + _call("first") + "\n" + _call("second"), max_context=CTX)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            body = {"model": "m", "max_tokens": 400, "tools": self.TOOLS,
+                    "messages": [{"role": "user", "content": "go"}], **tool_choice}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/messages",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out = json.loads(r.read())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        return [b["name"] for b in out["content"] if b["type"] == "tool_use"], out["stop_reason"]
+
+    def test_parallel_by_default(self):
+        self.assertEqual(self.uses({}), (["first", "second"], "tool_use"))
+
+    def test_one_tool_use_when_disabled(self):
+        choice = {"tool_choice": {"type": "auto", "disable_parallel_tool_use": True}}
+        self.assertEqual(self.uses(choice), (["first"], "tool_use"))
 
 
 if __name__ == "__main__":
