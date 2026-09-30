@@ -45,6 +45,7 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             images_of, openai_to_messages)
 from serve.loop_guard import LoopGuard
 from serve import think_budget  # noqa: E402  (xeno #49 S3)
+from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 
@@ -906,6 +907,9 @@ class Service:
                     hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                     print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                    if finish != "error" and last.get("prompt_ms") is not None:   # xeno #49 S5
+                        for line in timing_report(last, len(ids), el):
+                            print(line, flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
@@ -1202,6 +1206,28 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             yield "message_stop", {"type": "message_stop"}
 
 
+def sse_tracer():
+    """STRATA_TRACE_SSE=<file> (xeno #49 S5): one JSON line per SSE event sent on /v1/messages - what the client got
+    and when (seconds since the stream began), to diagnose what Claude Code shows. Unset: a no-op."""
+    path = os.environ.get("STRATA_TRACE_SSE")
+    if not path:
+        return lambda name, e: None
+    rid, t0 = uuid.uuid4().hex[:12], time.perf_counter()
+
+    def trace(name, e):
+        rec = {"rid": rid, "t": round(time.perf_counter() - t0, 3), "ev": name}
+        if isinstance(e, dict):
+            for k in ("index", "delta", "content_block", "usage"):
+                if k in e:
+                    rec[k] = e[k]
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError as err:
+            print(f"[strata] SSE trace write failed ({path}): {err}", flush=True)
+    return trace
+
+
 def anthropic_collect(events) -> dict:
     msg, blocks = None, []
     for item in events:
@@ -1464,6 +1490,7 @@ def make_handler(svc: Service):
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()
+            trace = sse_tracer()                             # xeno #49 S5: STRATA_TRACE_SSE=<file>
             try:
                 for item in events:
                     if item is None:
@@ -1472,6 +1499,7 @@ def make_handler(svc: Service):
                         name, e = item
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
+                        trace(name, e)
                     self.wfile.flush()
             except OSError:
                 cancel.set()

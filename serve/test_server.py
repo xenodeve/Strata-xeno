@@ -770,5 +770,71 @@ class ThinkingBudget(unittest.TestCase):
         self.assertNotIn("Reasoning effort is set to low", tok.decode(eng.prompts[0]))
 
 
+class TimingLine(unittest.TestCase):
+    """#49 S5 (xeno): the end-of-request timing in llama-server's shape, which our tools and eyes already read."""
+
+    LAST = {"prompt_ms": 500.0, "decode_ms": 1000.0, "generated": 50, "reused": 900,
+            "drafts_accepted": 30, "drafts_offered": 40}
+
+    def test_the_block(self):
+        from serve.timing_line import report
+        lines = report(self.LAST, prompt_tokens=1000, wall_s=1.75)
+        self.assertEqual(lines[0], "prompt eval time =     500.00 ms /   100 tokens (    5.00 ms per token,   "
+                                   "200.00 tokens per second)  [900 cached]")
+        self.assertEqual(lines[1], "       eval time =    1000.00 ms /    50 tokens (   20.00 ms per token,    "
+                                   "50.00 tokens per second)")
+        self.assertEqual(lines[2], "      total time =    1750.00 ms /   150 tokens")
+        self.assertEqual(lines[3], "draft acceptance = 0.75000 (   30 accepted /    40 generated)")
+
+    def test_a_request_prints_it(self):
+        class Timed(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                self.last = dict(TimingLine.LAST, prompt_tokens=len(ids))   # the real one: at DONE, which the
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)   # stop-token drain reads
+
+        import contextlib
+        tok = ByteTokenizer()
+        svc = Service(Timed(tok, "</think>\n\nok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ids, thinking, max_new = svc.prepare([{"role": "user", "content": "hi"}], None, {}, 20)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            list(svc.run(ids, thinking, None, max_new, {}, threading.Event()))
+        self.assertIn("prompt eval time =     500.00 ms", out.getvalue())
+        self.assertIn("draft acceptance = 0.75000", out.getvalue())
+
+
+class SseTrace(unittest.TestCase):
+    """#49 S5 (xeno): STRATA_TRACE_SSE=<file> records every SSE event sent on /v1/messages, one JSON line each."""
+
+    def test_trace(self):
+        import tempfile
+        from unittest import mock
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "trace.jsonl"
+            try:
+                with mock.patch.dict(os.environ, {"STRATA_TRACE_SSE": str(path)}):
+                    body = {"model": "m", "max_tokens": 20, "stream": True,
+                            "messages": [{"role": "user", "content": "hi"}]}
+                    req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/messages",
+                                                 data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        sent = [ln[7:] for ln in r.read().decode().splitlines() if ln.startswith("event: ")]
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+            recs = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([r["ev"] for r in recs], sent)
+        self.assertEqual(sent[0], "message_start")
+        self.assertEqual(sent[-1], "message_stop")
+        self.assertEqual(len({r["rid"] for r in recs}), 1)
+        self.assertTrue(all(isinstance(r["t"], float) for r in recs))
+        self.assertEqual("".join((r.get("delta") or {}).get("text", "") for r in recs), "ok")
+
+
 if __name__ == "__main__":
     unittest.main()
