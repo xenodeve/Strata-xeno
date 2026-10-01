@@ -52,6 +52,7 @@ class Trace:
         self.owned: set = set()
         self.boot: list = []
         self.dangling = 0   # route records after the last commit (a cut-off run)
+        self.orphans = 0    # uncommitted route records before a later window (a cancelled window, the per-token loop)
 
 
 def key_of(flat, n_expert):
@@ -62,14 +63,21 @@ def load(path, n_expert):
     t = Trace()
     pending: dict = {}
     phase = request = None
+    last_layer = -1
     for layer, ids in iter_records(path):
         if layer >= 0:
+            if layer < last_layer and pending:   # a new window began with no commit for the last: drop the orphans
+                t.orphans += sum(len(v) for v in pending.values())
+                pending = {}
+            last_layer = layer
             pending.setdefault(layer, []).append(ids)
-        elif layer == T_FORMAT:
+            continue
+        if layer == T_FORMAT:
             t.version = ids[0]
             if t.version not in FORMAT_VERSIONS:
                 raise ValueError(f"{path}: trace format version {t.version}, this reader handles {FORMAT_VERSIONS}")
         elif layer == T_COMMIT:
+            last_layer = -1
             wid, n_pos, n_acc = ids[:3]
             if len(ids) > 3:
                 phase = ids[3]

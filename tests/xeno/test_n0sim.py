@@ -302,3 +302,14 @@ def test_hit_rate_after_a_request_start_counts_the_first_decode_windows_of_each_
     s = sim(p, 300, start_windows=2)
     assert s.start_hits == 1 and s.start_loads == 1
     assert s.start_hit_rate == pytest.approx(0.5)
+
+
+def test_reader_drops_uncommitted_records_when_a_new_window_starts():
+    # scrutinize: a cancelled window (or the per-token loop) leaves route records with no commit; the next window
+    # starts again at layer 0.  The orphans are dropped and counted, not folded into the next window.
+    orphan = rec(0, [7]) + rec(0, [7]) + rec(1, [7])            # two positions at layer 0, one at layer 1, no commit
+    p = trace(orphan + window(0, {0: [[1], [2]], 1: [[3], [4]]}, 1))
+    t = n0sim.load(p, n_expert=NE)
+    assert len(t.windows) == 1
+    assert t.windows[0].routes[0] == [(1,), (2,)]
+    assert t.orphans == 3
