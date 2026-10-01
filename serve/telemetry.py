@@ -58,6 +58,15 @@ class _Nvml:
     def ok(self):
         return self.lib is not None and self.dev is not None
 
+    def count(self):
+        """How many cards NVML sees (0 when it cannot say)."""
+        n = ctypes.c_uint()
+        try:
+            fn = getattr(self.lib, "nvmlDeviceGetCount_v2", None) or self.lib.nvmlDeviceGetCount
+            return n.value if fn(ctypes.byref(n)) == 0 else 0
+        except (AttributeError, OSError):
+            return 0
+
     def _uint(self, fn, *args):
         v = ctypes.c_uint()
         try:
@@ -101,6 +110,11 @@ class _Nvml:
         out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
         out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
         return out
+
+
+def nvml_device_count():
+    g = _Nvml(0)
+    return g.count() if g.ok() else 0
 
 
 # ------------------------------------------------------------------------------------------------ CPU / RAM

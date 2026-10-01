@@ -398,6 +398,35 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
 
 
+class MonitorGpus(unittest.TestCase):
+    """The Monitor lists every card the engine can see, not only the config's \"gpu\" (xeno UI S0): the D2x config has
+    no \"gpu\" key and the launcher sets CUDA_VISIBLE_DEVICES=1,0, so the old code watched NVML card 0 alone."""
+
+    def pick(self, cfg, env, count):
+        from serve.server import monitor_gpus
+        return monitor_gpus(cfg, env, lambda: count)
+
+    def test_config_gpu_wins(self):
+        self.assertEqual(self.pick({"gpu": [0, 2]}, {"CUDA_VISIBLE_DEVICES": "1"}, 4), [0, 2])
+
+    def test_no_key_follows_the_launchers_visible_devices(self):
+        self.assertEqual(self.pick({}, {"CUDA_VISIBLE_DEVICES": "1,0"}, 2), [0, 1])     # a set, nvidia-smi order
+        self.assertEqual(self.pick({}, {"CUDA_VISIBLE_DEVICES": "1"}, 2), [1])
+
+    def test_no_key_no_env_lists_every_card(self):
+        self.assertEqual(self.pick({}, {}, 2), [0, 1])
+        self.assertEqual(self.pick({}, {"CUDA_VISIBLE_DEVICES": ""}, 3), [0, 1, 2])
+
+    def test_unreadable_env_falls_back_to_every_card(self):
+        self.assertEqual(self.pick({}, {"CUDA_VISIBLE_DEVICES": "GPU-1234abcd"}, 2), [0, 1])
+
+    def test_ids_beyond_the_card_count_are_dropped(self):
+        self.assertEqual(self.pick({}, {"CUDA_VISIBLE_DEVICES": "0,5"}, 2), [0])
+
+    def test_no_nvml_keeps_the_old_default(self):
+        self.assertEqual(self.pick({}, {}, 0), [])
+
+
 class RecordingPrompt(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_ids = list(ids)

@@ -616,6 +616,26 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
+def monitor_gpus(cfg: dict, env=None, count=None) -> list[int]:
+    """The cards the Monitor reads: the config's "gpu" when it names any; else the launcher's CUDA_VISIBLE_DEVICES
+    (numbers, taken as nvidia-smi numbers them, the same as the "gpu" key); else every card NVML sees. A config
+    with no "gpu" key (D2x) used to leave only card 0 on the Monitor."""
+    named = gpu_list(cfg)
+    if named:
+        return named
+    if count is None:
+        from serve.telemetry import nvml_device_count as count
+    n = count()
+    if n <= 0:
+        return []
+    raw = ((os.environ if env is None else env).get("CUDA_VISIBLE_DEVICES") or "").strip()
+    try:
+        ids = sorted({int(x) for x in raw.split(",") if x.strip() != ""})
+    except ValueError:                                  # UUIDs: not mappable here, show every card
+        ids = []
+    return [i for i in ids if 0 <= i < n] or list(range(n))
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
@@ -2485,8 +2505,8 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
-    svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
-    svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+    svc.gpu_indices = monitor_gpus(cfg)                 # every card the engine can see (issue #112; UI S0: no "gpu" key)
+    svc.gpu_index = (svc.gpu_indices or [0])[0]         # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
