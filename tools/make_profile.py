@@ -34,17 +34,29 @@ def read_profile(path, n_expert=N_EXPERT):
     return [struct.unpack_from("<HH", blob, 24 + 4 * i) for i in range(n)]
 
 
-def read_trace(path, n_expert=N_EXPERT):
-    """(layer, k, k expert ids, k weights) records, as `--dump-routing` writes them."""
+def iter_records(path, strict=True):
+    """Every (layer, ids) record of a `--dump-routing` file, tags included (a negative layer is a tag;
+    include/strata/core/routing_trace.hpp).  `strict`: a truncated record raises ValueError; otherwise the reading
+    stops there (a trace cut by a crash still ranks)."""
     blob = Path(path).read_bytes()
-    off, freq = 0, defaultdict(int)
+    off = 0
     while off + 8 <= len(blob):
         layer, k = struct.unpack_from("<ii", blob, off)
-        off += 8
-        for e in struct.unpack_from("<%di" % k, blob, off):
+        if k < 0 or off + 8 + 8 * k > len(blob):
+            break
+        yield layer, struct.unpack_from("<%di" % k, blob, off + 8)
+        off += 8 + 8 * k                                # the header, the ids and the weights
+    if strict and off != len(blob):
+        raise ValueError(f"{path}: truncated record at byte {off}")
+
+
+def read_trace(path, n_expert=N_EXPERT):
+    """(layer, k, k expert ids, k weights) records, as `--dump-routing` writes them; tag records are skipped."""
+    freq = defaultdict(int)
+    for layer, ids in iter_records(path, strict=False):
+        for e in ids:
             if 0 <= layer < N_LAYER and 0 <= e < n_expert:
                 freq[(layer, e)] += 1
-        off += 8 * k                                    # the ids and the weights
     return freq
 
 

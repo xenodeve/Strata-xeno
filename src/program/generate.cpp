@@ -541,9 +541,10 @@ void usage() {
                  "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8),\n"
-                 "                       plus tag records with a negative layer: the format version first and\n"
-                 "                       a commit tag (window, positions, accepted) after each verify window\n"
-                 "                       (#85; include/strata/core/routing_trace.hpp)\n"
+                 "                       plus tag records with a negative layer: the format version, the GPU-owned\n"
+                 "                       and boot host sets, a request tag per served request, and a commit tag\n"
+                 "                       (window, positions, accepted, phase) after each verify window\n"
+                 "                       (#85/#86; include/strata/core/routing_trace.hpp)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
@@ -708,15 +709,7 @@ struct Drive {
     std::FILE* routing = nullptr;
     int32_t trace_windows = 0;   ///< #85: verify windows committed to the routing trace so far (the commit tag's id)
     int32_t trace_requests = 0;  ///< #86: served requests seen by the routing trace (the request tag's id)
-    int32_t trace_phase = -1;    ///< #86: the phase the last phase tag named (-1: none written yet)
 };
-
-/// #86: a phase tag (0 prefill, 1 decode) before a verify window's route records, only when the phase changes.
-void trace_phase(Drive& d, int phase) {
-    if (d.routing == nullptr || d.trace_phase == phase) return;
-    d.trace_phase = phase;
-    strata::core::routing_trace::write_phase(d.routing, (int32_t) phase);
-}
 
 /// #86: a request tag as a served request starts.
 void trace_request(Drive& d) {
@@ -724,10 +717,12 @@ void trace_request(Drive& d) {
     strata::core::routing_trace::write_request(d.routing, d.trace_requests++);
 }
 
-/// #85: the routing trace's commit tag for a verify window of `n_positions` with `n_accepted` drafts accepted.
-void trace_commit(Drive& d, int n_positions, int n_accepted) {
+/// #85/#86: the routing trace's commit tag for a verify window of `n_positions` with `n_accepted` drafts accepted;
+/// `phase` 0 = prompt tokens read through windows, 1 = decode.
+void trace_commit(Drive& d, int n_positions, int n_accepted, int phase) {
     if (d.routing == nullptr) return;
-    strata::core::routing_trace::write_commit(d.routing, d.trace_windows++, (int32_t) n_positions, (int32_t) n_accepted);
+    strata::core::routing_trace::write_commit(d.routing, d.trace_windows++, (int32_t) n_positions, (int32_t) n_accepted,
+                                              (int32_t) phase);
 }
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
@@ -4087,8 +4082,9 @@ int main(int argc, char** argv) {
                 if (arena_src.owned_by_gpu(l, e)) owned.push_back(i);
                 else if (o.ram_cache_gib > 0.0 && arena_src.resident(l, e)) boot.push_back(i);
             }
-            strata::core::routing_trace::write_owned(routing, owned);
-            if (o.ram_cache_gib > 0.0) strata::core::routing_trace::write_boot(routing, boot);
+            namespace rt = strata::core::routing_trace;
+            rt::write_ids(routing, rt::kTagOwned, owned);
+            if (o.ram_cache_gib > 0.0) rt::write_ids(routing, rt::kTagBoot, boot);
         }
         drive.routing = routing;
     }
@@ -6147,12 +6143,11 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
-                    trace_phase(drive, 0);   // #86: the prompt read through verify windows
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
-                    trace_commit(drive, T, T - 1);   // #85: prompt windows commit every position
+                    trace_commit(drive, T, T - 1, 0);   // #85: prompt windows commit every position
                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
                     q += T;
                 }
@@ -6423,7 +6418,6 @@ int main(int argc, char** argv) {
                 }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
-                trace_phase(drive, 1);   // #86
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return serve_fatal();
@@ -6435,7 +6429,7 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-                trace_commit(drive, T, a);   // #85
+                trace_commit(drive, T, a, 1);   // #85
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -7624,7 +7618,6 @@ int main(int argc, char** argv) {
             apply_pending(false);
             ms_apply += std::chrono::duration<double, std::milli>(Clock::now() - tap).count();
             if (strata::timeline::enabled()) strata::timeline::complete("adapt apply", tap, Clock::now());
-            trace_phase(drive, 1);   // #86
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -7644,7 +7637,7 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-            trace_commit(drive, T, a);   // #85
+            trace_commit(drive, T, a, 1);   // #85
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
