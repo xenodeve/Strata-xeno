@@ -613,7 +613,9 @@ void usage() {
                      "                       stops with an error when neither that nor the 4070 tier can be had.\n"
                      "  --expert-mirror DIR  #62: DIR holds byte-identical copies of the expert files (GGUF shards or\n"
                      "                       experts.bin) on another drive; repeatable, a partial copy is fine.  Each\n"
-                     "                       NVMe-tier miss is read whole from the copy with the fewest bytes queued.\n"
+                     "                       read of the capacity-mode reader (NVMe-tier misses, the boot fill, the\n"
+                     "                       lent-slot refills) takes a whole expert from the copy with the fewest\n"
+                     "                       bytes queued.\n"
                      "                       Copies are checked against their source on first use (size and sampled\n"
                      "                       pages); a mismatch stops the run.  Needs --ram-cache-gib.\n"
                      "  --no-tail-file       keep host copies of the prompt path's lendable cache slots (default with\n"
@@ -2291,8 +2293,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!o.expert_mirrors.empty() && (o.ram_cache_gib <= 0.0 || o.mmap_experts)) {   // #62: never silently unused
-        std::fprintf(stderr, "strata generate: --expert-mirror serves the --ram-cache-gib NVMe tier; without it no "
-                             "expert is read from a file after boot\n");
+        std::fprintf(stderr, "strata generate: --expert-mirror serves the capacity-mode reader (the NVMe tier, its "
+                             "boot fill and the lent-slot refills); it needs --ram-cache-gib\n");
         return 2;
     }
     // #35 D6: with the peer tier and STRATA_PREFILL_EXPERT_SPLIT, big chunks run their routed experts on the 4070:
@@ -5398,6 +5400,8 @@ int main(int argc, char** argv) {
                         std::string e;
                         const uint8_t* src = srcp->blob(s.layer, s.in);
                         if (src == nullptr) src = srcp->materialize(s.layer, s.in, -1, e);   // #11
+                        // #62 crash: a later newcomer's materialize may evict this one before the copy below
+                        if (src != nullptr) arena_src.hold(s.layer, s.in);
                         if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
                             uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
                             if (home == nullptr) {
@@ -5415,6 +5419,7 @@ int main(int argc, char** argv) {
                     }
                     parallel_copy(home_jobs);
                     parallel_copy(in_jobs);
+                    for (const PSwap& s : ps_d2h) arena_src.release_hold(s.layer, s.in);
                     for (size_t i = 0; i < ps_d2h.size(); ++i) {
                         const PSwap& s = ps_d2h[i];
                         if (went_home[i]) { arena_src.publish_host_copy(s.layer, s.out); arena_src.admit_home(s.layer, s.out); }
@@ -6632,9 +6637,10 @@ int main(int argc, char** argv) {
                              (long long) (arena_src.nvme_loads() - nvme0), private_commit_bytes() / 1073741824.0);
                 if (!o.expert_mirrors.empty())   // #62: each copy's share so far (cumulative over the session)
                     for (const auto& f : arena_src.nvme_file_stats())
-                        std::fprintf(stderr, "strata serve: nvme file %s: %lld experts, %.2f GiB, %.3f ms per batch "
-                                             "(session so far)\n", f.path.c_str(), (long long) f.reads,
-                                     (double) f.bytes / 1073741824.0, f.batches > 0 ? f.ms / (double) f.batches : 0.0);
+                        std::fprintf(stderr, "strata serve: nvme file %s: %lld experts, %.2f GiB, %.3f ms per batch, "
+                                             "read p50 %.0f p99 %.0f us (every read since boot)\n", f.path.c_str(),
+                                     (long long) f.reads, (double) f.bytes / 1073741824.0,
+                                     f.batches > 0 ? f.ms / (double) f.batches : 0.0, f.p50_us, f.p99_us);
             }
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count
@@ -7243,11 +7249,14 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata generate: paired 4070 swap copy-home: %s\n", e.c_str());
                         return false;
                     }
+                    // #62 crash: a later newcomer's materialize may evict this one's host copy before the copy below
+                    arena_src.hold(in_layer, x.in % (int32_t) g.n_expert);
                     home_jobs.push_back({home, st, (size_t) lay.blob_bytes(out_layer)});
                     in_jobs.push_back({st, src, (size_t) lay.blob_bytes(in_layer)});
                 }
                 parallel_copy(home_jobs);
                 parallel_copy(in_jobs);
+                for (const SSwap& x : sx_d2h) arena_src.release_hold(x.in / (int32_t) g.n_expert, x.in % (int32_t) g.n_expert);
                 for (size_t i = 0; i < sx_d2h.size(); ++i) {
                     const SSwap& x = sx_d2h[i];
                     arena_src.publish_host_copy(x.out / (int32_t) g.n_expert, x.out % (int32_t) g.n_expert);
@@ -7372,6 +7381,8 @@ int main(int argc, char** argv) {
                         std::string e;
                         const uint8_t* src = srcp->blob(s.layer, s.in);
                         if (src == nullptr) src = srcp->materialize(s.layer, s.in, -1, e);   // #11
+                        // #62 crash: a later newcomer's materialize may evict this one before the copy below
+                        if (src != nullptr) arena_src.hold(s.layer, s.in);
                         if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
                             uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
                             if (home == nullptr) {
@@ -7389,6 +7400,7 @@ int main(int argc, char** argv) {
                     }
                     parallel_copy(home_jobs);
                     parallel_copy(in_jobs);
+                    for (const PSwap& s : ps_d2h) arena_src.release_hold(s.layer, s.in);
                     for (size_t i = 0; i < ps_d2h.size(); ++i) {
                         const PSwap& s = ps_d2h[i];
                         if (went_home[i]) { arena_src.publish_host_copy(s.layer, s.out); arena_src.admit_home(s.layer, s.out); }
@@ -7696,9 +7708,11 @@ int main(int argc, char** argv) {
                         arena_src.nvme_ms() / rounds, (double) arena_src.host_cache_bytes() / 1073741824.0);
         if (rounds > 0 && !o.expert_mirrors.empty())   // #62: each copy's share
             for (const auto& f : arena_src.nvme_file_stats())
-                std::printf("%-24s %lld experts, %.2f GiB, %.3f ms per batch it served: %s\n", "nvme file",
+                std::printf("%-24s %lld experts, %.2f GiB, %.3f ms per batch it served, read p50 %.0f p99 %.0f "
+                            "max %.0f us (every read since boot: fill, refills, misses): %s\n", "nvme file",
                             (long long) f.reads, (double) f.bytes / 1073741824.0,
-                            f.batches > 0 ? f.ms / (double) f.batches : 0.0, f.path.c_str());
+                            f.batches > 0 ? f.ms / (double) f.batches : 0.0, f.p50_us, f.p99_us, f.max_us,
+                            f.path.c_str());
         if (rounds > 0)
             std::printf("%-24s launch %.3f  tail %.3f ms/round (graph launch; last pool until the stream is done)\n",
                         "verify edges", ver.ms_launch / rounds, ver.ms_tail / rounds);

@@ -80,6 +80,9 @@ int main() {
         for (const auto& f : st) { serving += f.reads > 0; reads += f.reads; }
         expect(st.size() == 2 && serving == 2, "both copies received reads");
         expect(reads == 5, "one read per expert across the copies");
+        // equal blobs, least-queued first, ties to the source: source, copy, source, copy, source
+        expect(st.size() == 2 && st[0].reads == 3 && st[1].reads == 2, "the split is 3 / 2, source first");
+        expect(st.size() == 2 && st[1].batches == 1 && st[1].max_us > 0, "the copy's batch and read latency are timed");
         for (const auto& f : st)
             std::printf("  %s: %lld experts, %llu bytes\n", f.path.c_str(), (long long) f.reads,
                         (unsigned long long) f.bytes);
@@ -91,6 +94,22 @@ int main() {
         err.clear();
         expect(!s.materialize_batch(0, miss, 5, err) && err.find("mirror") != std::string::npos,
                "a mismatching mirror fails the read and says so");
+    }
+    {   // a copy that differs only near its end is refused too (the last MiB is always compared)
+        const fs::path tail = root / "tail";
+        fs::create_directories(tail);
+        fs::copy_file(a / "experts.bin", tail / "experts.bin");
+        const uint64_t size = fs::file_size(tail / "experts.bin");
+        std::fstream f(tail / "experts.bin", std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp((std::streamoff) (size - 1000));
+        f.put((char) 0x5a);
+        f.close();
+        strata::core::ArenaExpertSource s;
+        if (!open_source(s, a, err)) { std::fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
+        s.add_mirror(tail.string());
+        err.clear();
+        expect(!s.materialize_batch(0, miss, 5, err) && err.find("mirror") != std::string::npos,
+               "a mirror differing in its last MiB is refused");
     }
     {   // a directory without the file: the source stays on one drive
         strata::core::ArenaExpertSource s;
