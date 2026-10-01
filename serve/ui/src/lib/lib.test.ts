@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { rootOf } from "./api"
-import { gpuDesign, replyDesign, serverDesign, toolDesign } from "./orbs"
+import { gpuDesign, latticePattern, replyDesign, serverDesign, toolDesign } from "./orbs"
 import { clientName } from "./format"
 import { promptSplit } from "./metrics"
 import { apiMessages, type Message } from "./chat"
@@ -192,5 +192,13 @@ describe("which orb says what", () => {
     expect(replyDesign({ streaming: true, reasoning: "hm", text: "Hel", tools: [] })).toBe("composing")
     expect(replyDesign({ streaming: true, reasoning: "", text: "Hi", tools: [{ name: "x__read", state: "done" }] })).toBe("composing")
     expect(replyDesign({ streaming: false, reasoning: "", text: "Hi", tools: [] })).toBeNull()
+  })
+  test("the lattice beside a thought runs the pattern of what the agent is doing", () => {
+    expect(latticePattern("solving")).toBe("orbit")
+    expect(latticePattern("breathing")).toBe("orbit")
+    expect(latticePattern("searching")).toBe("ripple")
+    expect(latticePattern("connecting")).toBe("snake")
+    expect(latticePattern("weaving")).toBe("spiral")
+    expect(latticePattern(null)).toBe("orbit")
   })
 })

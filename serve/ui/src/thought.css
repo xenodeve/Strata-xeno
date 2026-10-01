@@ -1,0 +1,46 @@
+/* The lattice and the thought line (components/thought.tsx): React Bits LatticeLoader and ThoughtLine, adapted. */
+
+/* ---- the lattice: 3 x 3 dots; they light in a pattern while the agent works, then become a tick or a cross ---- */
+.lat { --lat-cell: 4px; --lat-gap: 1.5px; --lat-idle: 0.15; --lat-cycle: 864ms; display: inline-grid; flex: none; vertical-align: middle; color: var(--ink-2); }
+.lat-layer { grid-area: 1 / 1; display: grid; grid-template-columns: repeat(3, var(--lat-cell)); gap: var(--lat-gap); }
+.lat-cell { width: var(--lat-cell); height: var(--lat-cell); border-radius: 50%; background: currentColor; opacity: var(--lat-idle); }
+.lat-run { transition: opacity 200ms ease; }
+.lat-run .lat-cell { animation: lat-on var(--lat-cycle) cubic-bezier(0.77, 0, 0.175, 1) infinite; }
+.lat-run .lat-cell[data-lit="35"] { animation-name: lat-on-35; }
+.lat-run .lat-cell[data-hole] { animation: none; opacity: calc(var(--lat-idle) * 0.47); }
+.lat-mark { opacity: 0; transform: scale(0.9); transition: opacity 160ms var(--ease), transform 160ms var(--ease); }
+.lat-mark .lat-cell { transition: opacity 200ms ease, background-color 200ms ease; }
+.lat-mark .lat-cell[data-on] { background: var(--ok); opacity: 1; }
+.lat[data-status="error"] .lat-mark .lat-cell[data-on] { background: var(--bad); }
+.lat:not([data-status="working"]) .lat-run { opacity: 0; }
+.lat:not([data-status="working"]) .lat-run .lat-cell { animation-play-state: paused; }
+.lat:not([data-status="working"]) .lat-mark { opacity: 1; transform: none; transition: opacity 200ms ease, transform 200ms var(--ease); }
+@keyframes lat-on { 0%, 100% { opacity: var(--lat-idle); } 18%, 42% { opacity: 1; } 62% { opacity: var(--lat-idle); } }
+@keyframes lat-on-35 { 0%, 100% { opacity: var(--lat-idle); } 10%, 24% { opacity: 1; } 35% { opacity: var(--lat-idle); } }
+
+/* ---- the thought line: shimmering label while it thinks, "Thought for 2.4s" once it has ---- */
+.thought { --th-settle: 350ms; --th-done: 0.75; --th-timer: 0.55; color: var(--ink); font-size: 13px; font-weight: 500; line-height: 1.2; }
+.thought-head { display: inline-flex; align-items: center; gap: 0.5em; padding: 0.25rem 0; border-radius: var(--radius-sm, 6px); color: inherit; font: inherit; text-align: left; white-space: nowrap; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.thought-glyph { display: inline-flex; flex: none; align-items: center; }
+.thought-label { display: inline-grid; }
+.thought-text { grid-area: 1 / 1; width: max-content; opacity: 0; filter: blur(2px); transition: opacity var(--th-settle) var(--ease), filter var(--th-settle) var(--ease); }
+.thought-text[data-active] { opacity: 1; filter: blur(0); }
+.thought-text--done[data-active] { opacity: var(--th-done); }
+.thought-shimmer { display: inline-block; }
+.thought[data-working] .thought-shimmer {
+  background: linear-gradient(100deg, color-mix(in srgb, var(--ink) 50%, transparent) 30%, var(--ink) 50%, color-mix(in srgb, var(--ink) 50%, transparent) 70%);
+  background-size: 250% 100%; background-position: 125% 0;
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; color: transparent;
+  animation: thought-shimmer 1.8s linear infinite;
+}
+@keyframes thought-shimmer { to { background-position: -125% 0; } }
+.thought-timer { opacity: var(--th-timer); transition: opacity var(--th-settle) ease, transform var(--th-settle) cubic-bezier(0.77, 0, 0.175, 1); }
+.thought-timer[data-done] { opacity: var(--th-done); }
+.thought-chevron { flex: none; margin-left: 0.1em; opacity: 0.55; transition: transform 200ms var(--ease), rotate 200ms var(--ease); }
+.thought-head:hover .thought-chevron { opacity: 0.9; }
+@media (prefers-reduced-motion: reduce) {
+  .lat-run .lat-cell { animation-delay: 0ms !important; animation-duration: 1400ms !important; }
+  .lat-mark { transform: none; }
+  .thought-text { filter: none; }
+  .thought[data-working] .thought-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; color: inherit; }
+}

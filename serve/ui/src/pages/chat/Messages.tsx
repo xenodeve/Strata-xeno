@@ -5,7 +5,8 @@ import { chat, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
 import { Collapse } from "../../components/motion"
 import { Orb, StatusLabel } from "../../components/orb"
-import { replyDesign, toolDesign } from "../../lib/orbs"
+import { latticePattern, replyDesign, toolDesign, type OrbDesign } from "../../lib/orbs"
+import { Lattice, Thought, type LatticeStatus } from "../../components/thought"
 import { cn } from "../../lib/cn"
 import { fmt, timeStr } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
@@ -75,26 +76,24 @@ function Answer({ m }: { m: Message }) {
   return <>{parts}</>
 }
 
-function Thinking({ m, streaming, show }: { m: Message; streaming: boolean; show: boolean }) {
+// The agent's thinking: a lattice that runs the pattern of what it is doing, beside a line that shimmers while it thinks
+// and settles into "Thought for 2.4s"; it opens to the reasoning text.
+function Thinking({ m, streaming, show, phase }: { m: Message; streaming: boolean; show: boolean; phase: OrbDesign | null }) {
   const [touched, setTouched] = useState<boolean | null>(null)       // the user's own choice, once made
   const thinkingNow = streaming && !m.text
   const open = touched ?? (thinkingNow && show)                      // open while it streams (if wanted), closed once the answer starts
-  const title = thinkingNow ? "Thinking…" : m.thinkSecs != null ? `Thought for ${fmt(m.thinkSecs, 1)} s` : "Thoughts"
+  const status: LatticeStatus = thinkingNow ? "working" : m.error ? "error" : "done"
   return (
     <div className="mb-2">
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={() => setTouched(!open)}
-        className="flex items-center gap-1.5 rounded-sm py-0.5 text-[13px] text-ink-2 transition-colors hover:text-ink"
+      <Thought
+        working={thinkingNow}
+        glyph={<Lattice status={status} pattern={latticePattern(phase)} />}
+        open={open}
+        onToggle={() => setTouched(!open)}
+        elapsed={thinkingNow ? null : m.thinkSecs}
       >
-        {thinkingNow && <Orb design="solving" size={20} />}
-        <span className={cn(thinkingNow && "t-shimmer")}>{title}</span>
-        <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("transition-transform duration-200", open && "rotate-180")} />
-      </button>
-      <Collapse open={open}>
-        <div className="mt-1 max-h-72 overflow-y-auto whitespace-pre-wrap border-l border-line pl-3 text-[13px] leading-relaxed text-ink-2 [overflow-wrap:anywhere]">{m.reasoning}</div>
-      </Collapse>
+        <div className="mt-1 max-h-72 overflow-y-auto whitespace-pre-wrap border-l border-line pl-3 text-[13px] font-normal leading-relaxed text-ink-2 [overflow-wrap:anywhere]">{m.reasoning}</div>
+      </Thought>
     </div>
   )
 }
@@ -129,7 +128,7 @@ export function MessageView({ m, streaming, show }: { m: Message; streaming: boo
   const phase = replyDesign({ streaming, reasoning: m.reasoning, text: m.text, tools: m.tools })
   return (
     <div ref={ref} className="msg-in max-w-[min(100%,65ch)] text-[15px] tracking-[-0.011em] lg:max-w-[72ch]">
-      {m.reasoning && <Thinking m={m} streaming={streaming} show={show} />}
+      {m.reasoning && <Thinking m={m} streaming={streaming} show={show} phase={phase} />}
       {m.error ? (
         <div className="rounded-md border border-line px-3 py-2 text-[13px] text-bad [overflow-wrap:anywhere]">{m.error}</div>
       ) : waiting ? (

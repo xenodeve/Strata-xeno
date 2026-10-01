@@ -51,3 +51,14 @@ export function replyDesign(m: {
   if (tools.some((t) => t.state === "done" || t.state === "error")) return "weaving"      // a tool has answered: the agent plans the next step
   return m.reasoning ? "solving" : "breathing"
 }
+
+export type LatticePattern = "orbit" | "ripple" | "snake" | "spiral"
+
+/** The lattice that sits beside a thought (components/thought.tsx) runs the pattern of what the agent is doing: thinking
+ *  circles, a lookup ripples outward, a call to a tool snakes through, planning the next step spirals in. */
+export function latticePattern(phase: OrbDesign | null): LatticePattern {
+  if (phase === "searching") return "ripple"
+  if (phase === "connecting") return "snake"
+  if (phase === "weaving") return "spiral"
+  return "orbit"
+}
