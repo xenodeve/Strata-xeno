@@ -178,8 +178,8 @@ class Baseline:
                 best = h[0]
             for e in held:
                 heapq.heappush(h, e)
-        if best is None and skip:
-            return self.victim(resident, avoid_layer)
+        if best is None and skip:   # Baseline's own pick, not a subclass's override (which would pass skip again)
+            return Baseline.victim(self, resident, avoid_layer)
         return best[3] if best else None
 
 
@@ -200,9 +200,12 @@ class _RecentWindow:
             h = self.hist.setdefault(layer, self.deque(maxlen=self.k))
             for ids in w.committed(layer):
                 h.append({e for e in ids if e >= 0})
+        self._prot = None
 
     def protected(self):
-        return {(layer, e) for layer, h in self.hist.items() for s in h for e in s}
+        if getattr(self, "_prot", None) is None:   # cached until the next update
+            self._prot = frozenset((layer, e) for layer, h in self.hist.items() for s in h for e in s)
+        return self._prot
 
 
 class WindowLFU(Baseline):
@@ -406,6 +409,13 @@ class Stats:
         self.seed_loads = self.seed_bytes = 0
         self.start_hits = self.start_loads = 0
         self.emitted = self.rounds = 0
+        self.reload_distances: list = []   # #89: windows from an eviction to the same expert's next load
+        self._share_sum = 0.0              # #89: the protected share of the resident bytes, summed per window
+
+    @property
+    def window_share(self):
+        """#89: the mean (over windows) share of the resident bytes a recent-tokens window protects."""
+        return self._share_sum / self.rounds if self.rounds else 0.0
 
     @property
     def start_hit_rate(self):
@@ -446,6 +456,7 @@ def simulate(trace, sizes, cap_bytes, boot_order, owned, n_expert, policy="basel
         pol.bind(sizes, cap_bytes)
     s = Stats(pol)
     resident, used = s.resident, 0
+    evicted_at, wi = {}, 0
 
     def make_room(b, avoid_layer):
         nonlocal used
@@ -457,6 +468,7 @@ def simulate(trace, sizes, cap_bytes, boot_order, owned, n_expert, policy="basel
             used -= sizes[v[0]]
             pol.on_evict(v)
             s.evicted.append(v)
+            evicted_at[v] = wi
         if used + b > cap_bytes:
             s.over_cap += 1
     for x in boot_order:
@@ -517,6 +529,8 @@ def simulate(trace, sizes, cap_bytes, boot_order, owned, n_expert, policy="basel
                     s.rejected_only_loads += 1   # #88: loaded (and admitted) for a rejected draft only
                 b = sizes[layer]
                 make_room(b, layer)
+                if key in evicted_at:
+                    s.reload_distances.append(wi - evicted_at.pop(key))
                 resident.add(key)
                 used += b
                 s.loads += 1
@@ -528,6 +542,10 @@ def simulate(trace, sizes, cap_bytes, boot_order, owned, n_expert, policy="basel
             s.start_hits += s.hits - hits0
             s.start_loads += s.loads - loads0
         pol.on_window_end(w)
+        if hasattr(pol, "win") and resident:
+            prot = pol.win.protected()
+            s._share_sum += sum(sizes[k[0]] for k in resident if k in prot) / sum(sizes[k[0]] for k in resident)
+        wi += 1
         s.emitted += w.n_acc + 1
         s.rounds += 1
     return s

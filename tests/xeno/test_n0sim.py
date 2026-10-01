@@ -313,3 +313,26 @@ def test_reader_drops_uncommitted_records_when_a_new_window_starts():
     assert len(t.windows) == 1
     assert t.windows[0].routes[0] == [(1,), (2,)]
     assert t.orphans == 3
+
+
+def test_reload_distance_counts_windows_between_an_eviction_and_the_next_load():
+    # cap 1 expert at layers 0/1 by turns: w0 loads (0,1); w1 loads (1,2) evicting (0,1); w2 reloads (0,1) - distance
+    # from its eviction (window 1) to its reload (window 2) is 1
+    p = trace(window(0, {0: [[1]]}, 0), window(1, {1: [[2]]}, 0), window(2, {0: [[1]]}, 0))
+    s = sim(p, 100)
+    assert s.reload_distances == [1]
+
+
+def test_cache_split_reports_the_protected_share_of_the_resident_bytes():
+    # window_lfu k=1: after w1 the window protects (0,2) only, while (0,1) and (0,2) are resident -> half
+    p = trace(window(0, {0: [[1]]}, 0), window(1, {0: [[2]]}, 0))
+    s = sim(p, 1000, policy="window_lfu", k=1)
+    assert s.window_share == pytest.approx((1.0 + 0.5) / 2)   # after w0: 1 of 1; after w1: 1 of 2
+
+
+def test_window_lfu_falls_back_to_the_lowest_score_when_the_window_protects_every_candidate():
+    # cap 2.  w0: layer 0 routes 1 and 2 (both now in the k=4 window).  w1: layer 1 routes 6 -> an eviction is needed
+    # and every candidate is protected: the policy must still evict (the lowest score), not loop or stall
+    p = trace(window(0, {0: [[1, 2]]}, 0), window(1, {1: [[6]]}, 0))
+    s = sim(p, 200, policy="window_lfu", k=4)
+    assert s.evicted == [(0, 1)] and s.over_cap == 0
