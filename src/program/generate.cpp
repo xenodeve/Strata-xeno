@@ -327,6 +327,7 @@ struct Options {
     /// #11 N1 capacity mode: keep at most this many GiB of host-owned experts in RAM; the rest stay on NVMe and a
     /// CPU-pool miss reads them (0 = off, every host-owned expert in RAM). Opt-in: it trades decode time for RAM.
     double ram_cache_gib = 0.0;
+    std::vector<std::string> expert_mirrors;   ///< #62: --expert-mirror DIR, repeatable
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -609,6 +610,11 @@ void usage() {
                      "                       rest are read from the pack or GGUF on a miss (NVMe tier).  Needs\n"
                      "                       placement-first: it asks for --exclusive-primary-experts itself, and\n"
                      "                       stops with an error when neither that nor the 4070 tier can be had.\n"
+                     "  --expert-mirror DIR  #62: DIR holds byte-identical copies of the expert files (GGUF shards or\n"
+                     "                       experts.bin) on another drive; repeatable, a partial copy is fine.  Each\n"
+                     "                       NVMe-tier miss is read whole from the copy with the fewest bytes queued.\n"
+                     "                       Copies are checked against their source on first use (size and sampled\n"
+                     "                       pages); a mismatch stops the run.  Needs --ram-cache-gib.\n"
                      "  --no-tail-file       keep host copies of the prompt path's lendable cache slots (default with\n"
                      "                       exclusive primary experts: none; a tail-<key>.bin next to the pack,\n"
                      "                       ~3.5 GB at 8K chunks, refills them after a prompt; #34)\n"
@@ -1746,6 +1752,7 @@ int main(int argc, char** argv) {
         else if (a == "--exclusive-secondary-experts") o.exclusive_secondary_mode = 1;
         else if (a == "--no-exclusive-secondary-experts") o.exclusive_secondary_mode = 0;
         else if (a == "--ram-cache-gib") o.ram_cache_gib = std::atof(next("--ram-cache-gib"));
+        else if (a == "--expert-mirror") o.expert_mirrors.push_back(next("--expert-mirror"));
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--prefill") {
@@ -2279,6 +2286,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --ram-cache-gib needs placement-first (exclusive primary experts: a "
                              "native pack, spec >=2, a profile, an expert cache, --pcie-frac 0 and the CPU pool, "
                              "no mmap; or the 4070 tier); without it every host expert would stay in RAM\n");
+        return 2;
+    }
+    if (!o.expert_mirrors.empty() && (o.ram_cache_gib <= 0.0 || o.mmap_experts)) {   // #62: never silently unused
+        std::fprintf(stderr, "strata generate: --expert-mirror serves the --ram-cache-gib NVMe tier; without it no "
+                             "expert is read from a file after boot\n");
         return 2;
     }
     // #35 D6: with the peer tier and STRATA_PREFILL_EXPERT_SPLIT, big chunks run their routed experts on the 4070:
@@ -3055,6 +3067,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
+        for (const std::string& d : o.expert_mirrors) arena_src.add_mirror(d);   // #62
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
@@ -6615,6 +6628,11 @@ int main(int argc, char** argv) {
                                      "%.2f GiB\n", (long long) sum, (long long) te[0], (long long) te[1],
                              (long long) te[2], (long long) te[3], drive.cpu_ms - cpu_ms0,
                              (long long) (arena_src.nvme_loads() - nvme0), private_commit_bytes() / 1073741824.0);
+                if (!o.expert_mirrors.empty())   // #62: each copy's share so far (cumulative over the session)
+                    for (const auto& f : arena_src.nvme_file_stats())
+                        std::fprintf(stderr, "strata serve: nvme file %s: %lld experts, %.2f GiB, %.3f ms per batch "
+                                             "(session so far)\n", f.path.c_str(), (long long) f.reads,
+                                     (double) f.bytes / 1073741824.0, f.batches > 0 ? f.ms / (double) f.batches : 0.0);
             }
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count
@@ -7674,6 +7692,11 @@ int main(int argc, char** argv) {
             std::printf("%-24s %lld loads, %.3f per round, %.3f ms/round reading; host tier %.2f GiB\n", "nvme tier",
                         (long long) arena_src.nvme_loads(), (double) arena_src.nvme_loads() / rounds,
                         arena_src.nvme_ms() / rounds, (double) arena_src.host_cache_bytes() / 1073741824.0);
+        if (rounds > 0 && !o.expert_mirrors.empty())   // #62: each copy's share
+            for (const auto& f : arena_src.nvme_file_stats())
+                std::printf("%-24s %lld experts, %.2f GiB, %.3f ms per batch it served: %s\n", "nvme file",
+                            (long long) f.reads, (double) f.bytes / 1073741824.0,
+                            f.batches > 0 ? f.ms / (double) f.batches : 0.0, f.path.c_str());
         if (rounds > 0)
             std::printf("%-24s launch %.3f  tail %.3f ms/round (graph launch; last pool until the stream is done)\n",
                         "verify edges", ver.ms_launch / rounds, ver.ms_tail / rounds);

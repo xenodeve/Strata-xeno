@@ -517,6 +517,20 @@ public:
     uint64_t host_cache_bytes() const { return cache_used_; }
     int64_t nvme_loads() const { return nvme_loads_; }
     double nvme_ms() const { return nvme_ms_; }
+    /// #62: a directory holding byte-identical copies of the expert source files (a GGUF shard, experts.bin) on
+    /// another drive; repeatable.  read_experts_to sends each expert, all its ranges, to the copy with the fewest
+    /// bytes queued in that batch (ties: the source).  A copy is checked against its source when first used (size,
+    /// then the first, last and sampled pages); a mismatch fails the read.  A directory without the file is ignored.
+    void add_mirror(const std::string& dir) { mirror_dirs_.push_back(dir); }
+    struct NvmeFileStat {
+        std::string path;
+        int64_t reads = 0;    ///< experts read from this copy
+        uint64_t bytes = 0;   ///< aligned bytes requested
+        double ms = 0;        ///< per batch: submit to this copy's last completion, summed
+        int64_t batches = 0;
+    };
+    /// One entry per file read_experts_to has opened, the source first.
+    std::vector<NvmeFileStat> nvme_file_stats() const;
     /// A GPU-owned expert that comes home (paired swap copy-home) joins the host tier: account it and trim.
     void admit_home(int64_t layer, int64_t expert);
     bool load_rest(int threads, std::string& err);
@@ -577,6 +591,11 @@ private:
     void* dscratch_ = nullptr;  ///< read_experts' aligned bounce buffer
     size_t dscratch_bytes_ = 0;
     std::vector<std::pair<std::string, void*>> dfiles_;   ///< read_experts' open DirectFiles, by name
+    std::vector<NvmeFileStat> dstats_;                     ///< #62: per dfiles_ entry, same index
+    std::vector<std::string> mirror_dirs_;                 ///< #62: add_mirror's directories
+    /// #62: per source file, its verified copies (resolved on first use)
+    std::vector<std::pair<std::string, std::vector<std::string>>> copies_;
+    bool copies_of(const std::string& source, const std::vector<std::string>*& out, std::string& err);
     // #11 N1 capacity mode
     uint64_t cache_cap_ = 0;         ///< 0 = no limit
     uint64_t cache_used_ = 0;        ///< host-owned expert bytes committed now

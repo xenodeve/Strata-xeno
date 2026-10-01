@@ -1758,6 +1758,61 @@ bool ArenaExpertSource::read_experts(const int32_t* layers, const int32_t* exper
     return read_experts_to(layers, experts, n, dsts.data(), err);
 }
 
+// #62: the same bytes at the same offsets?  Sizes first, then the first and last MiB and eight 64 KiB pages spread
+// over the file: a copy cut short, of another quant or another revision differs in its header or tensor data.
+static bool same_file_sampled(const std::string& a, const std::string& b, std::string& why) {
+    namespace fs = std::filesystem;
+    std::error_code ea, eb;
+    const uint64_t na = fs::file_size(a, ea), nb = fs::file_size(b, eb);
+    if (ea || eb) { why = "cannot read its size"; return false; }
+    if (na != nb) { why = "size " + std::to_string(nb) + " B, the source has " + std::to_string(na); return false; }
+    std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+    if (!fa || !fb) { why = "cannot open it"; return false; }
+    constexpr uint64_t MIB = 1ull << 20, PAGE = 64ull << 10;
+    std::vector<std::pair<uint64_t, uint64_t>> at = {{0, std::min(MIB, na)}, {na > MIB ? na - MIB : 0, std::min(MIB, na)}};
+    uint64_t x = na ^ 0x9e3779b97f4a7c15ull;
+    for (int i = 0; i < 8 && na > PAGE; ++i) {
+        x = x * 6364136223846793005ull + 1442695040888963407ull;
+        at.emplace_back((x >> 11) % (na - PAGE) & ~(uint64_t) 4095, PAGE);
+    }
+    std::vector<char> ba, bb;
+    for (const auto& [off, len] : at) {
+        ba.resize((size_t) len);
+        bb.resize((size_t) len);
+        fa.seekg((std::streamoff) off);
+        fb.seekg((std::streamoff) off);
+        if (!fa.read(ba.data(), (std::streamsize) len) || !fb.read(bb.data(), (std::streamsize) len)) {
+            why = "short read at " + std::to_string(off);
+            return false;
+        }
+        if (std::memcmp(ba.data(), bb.data(), (size_t) len) != 0) { why = "bytes differ at " + std::to_string(off); return false; }
+    }
+    return true;
+}
+
+bool ArenaExpertSource::copies_of(const std::string& source, const std::vector<std::string>*& out, std::string& err) {
+    for (const auto& [src, cs] : copies_) if (src == source) { out = &cs; return true; }
+    std::vector<std::string> cs;
+    const std::string name = std::filesystem::path(source).filename().string();
+    for (const std::string& dir : mirror_dirs_) {
+        const std::string copy = (std::filesystem::path(dir) / name).string();
+        std::error_code ec;
+        if (!std::filesystem::exists(copy, ec)) continue;           // this drive holds no copy of this file
+        if (std::filesystem::equivalent(copy, source, ec)) continue;
+        std::string why;
+        if (!same_file_sampled(source, copy, why)) {
+            err = "expert mirror " + copy + " is not a copy of " + source + ": " + why;
+            return false;
+        }
+        std::fprintf(stderr, "strata experts: mirror %s verified (size and 10 sampled regions match %s)\n",
+                     copy.c_str(), source.c_str());
+        cs.push_back(copy);
+    }
+    copies_.emplace_back(source, std::move(cs));
+    out = &copies_.back().second;
+    return true;
+}
+
 bool ArenaExpertSource::read_experts_to(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts,
                                         std::string& err) {
     using strata::platform::DirectFile;
@@ -1776,21 +1831,49 @@ bool ArenaExpertSource::read_experts_to(const int32_t* layers, const int32_t* ex
         auto* f = new DirectFile();
         if (!f->open(name, err)) { delete f; return nullptr; }
         dfiles_.emplace_back(name, f);
+        dstats_.push_back(NvmeFileStat{name});
         return f;
+    };
+    auto stat_of = [&](const DirectFile* f) -> NvmeFileStat& {
+        size_t i = 0;
+        while (i + 1 < dfiles_.size() && dfiles_[i].second != f) ++i;
+        return dstats_[i];
     };
     struct Req { DirectFile* f; uint64_t skip, len; uint8_t* to; };
     std::vector<Req> reqs;
     reqs.reserve((size_t) n * 3);
+    const auto t_submit = std::chrono::steady_clock::now();
+    std::vector<std::pair<const DirectFile*, uint64_t>> base;   // each copy's byte count when this batch began
+    auto batch_base = [&](const DirectFile* f) -> uint64_t {
+        for (const auto& [g, b] : base) if (g == f) return b;
+        base.emplace_back(f, stat_of(f).bytes);
+        return base.back().second;
+    };
     for (int i = 0; i < n; ++i) {
         uint64_t off[3], len[3], at[3];
         const int nr = expert_ranges(lay, from_gguf_, layers[i], experts[i], off, len, at);
-        DirectFile* f = file_for(expert_file(gguf_, path_, from_gguf_, lay, layers[i]));
+        const std::string source = expert_file(gguf_, path_, from_gguf_, lay, layers[i]);
+        DirectFile* f = file_for(source);
         if (f == nullptr) return false;
+        if (!mirror_dirs_.empty()) {   // #62: the whole expert to the copy with the fewest bytes queued in this batch
+            const std::vector<std::string>* cs = nullptr;
+            if (!copies_of(source, cs, err)) return false;
+            uint64_t best = stat_of(f).bytes - batch_base(f);
+            for (const std::string& c : *cs) {
+                DirectFile* g = file_for(c);
+                if (g == nullptr) return false;
+                const uint64_t q = stat_of(g).bytes - batch_base(g);
+                if (q < best) { best = q; f = g; }
+            }
+        }
+        NvmeFileStat& st = stat_of(f);
+        ++st.reads;
         for (int r = 0; r < nr; ++r) {
             const uint64_t a0 = off[r] & ~(A - 1), a1 = (off[r] + len[r] + A - 1) & ~(A - 1);
             uint8_t* bounce = (uint8_t*) dscratch_ + reqs.size() * slot_bytes;
             if (!f->submit(a0, bounce, (uint32_t) (a1 - a0), (uint64_t) reqs.size(), err)) return false;
             reqs.push_back({f, off[r] - a0, len[r], dsts[i] + at[r]});
+            st.bytes += a1 - a0;
         }
     }
     // collect every completion (each file's port reports its own requests)
@@ -1800,6 +1883,7 @@ bool ArenaExpertSource::read_experts_to(const int32_t* layers, const int32_t* ex
         DirectFile* f = (DirectFile*) fp;
         size_t mine = 0;
         for (const Req& q : reqs) mine += q.f == f;
+        const bool used = mine > 0;
         strata::platform::Completion c[64];
         while (mine > 0) {
             const int k = f->wait(c, 64, -1);
@@ -1813,10 +1897,17 @@ bool ArenaExpertSource::read_experts_to(const int32_t* layers, const int32_t* ex
                 --mine;
             }
         }
+        if (used) {   // #62: this copy's share of the batch, submit to its last completion
+            NvmeFileStat& st = stat_of(f);
+            st.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_submit).count();
+            ++st.batches;
+        }
     }
     if (got != reqs.size()) { err = "read_experts: missing completions"; return false; }
     return true;
 }
+
+std::vector<ArenaExpertSource::NvmeFileStat> ArenaExpertSource::nvme_file_stats() const { return dstats_; }
 
 // load_rest's reader: each worker takes a layer and reads each role's 512 slices in aligned chunks of 32 experts
 // with its own unbuffered file, copying only the host-owned experts into the arena.
@@ -2065,6 +2156,7 @@ void ArenaExpertSource::close() {
     rf_name_.clear();
     for (auto& [nm, f] : dfiles_) delete (strata::platform::DirectFile*) f;
     dfiles_.clear();
+    dstats_.clear();
     if (dscratch_ != nullptr) strata::platform::DirectFile::free_aligned(dscratch_);
     dscratch_ = nullptr;
     dscratch_bytes_ = 0;
