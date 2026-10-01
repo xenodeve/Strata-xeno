@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { apiMessages, type Message } from "./chat"
+import { archOf, parseArch } from "./arch"
 import { markdown } from "./markdown"
 import { parse } from "./router"
 
@@ -58,5 +59,18 @@ describe("router", () => {
     expect(parse("#/hardware/gpu/0")).toEqual({ page: "hardware", params: ["gpu", "0"] })
     expect(parse("")).toEqual({ page: "chat", params: [] })
     expect(parse("#/nope")).toEqual({ page: "chat", params: [] })
+  })
+})
+
+describe("arch", () => {
+  const list = parseArch("sm120@NVIDIA_GeForce_RTX_5060_Ti,sm89@NVIDIA_GeForce_RTX_4070_SUPER")
+  test("a card is matched by name, not by position", () => {
+    expect(archOf(list, "NVIDIA GeForce RTX 4070 SUPER")).toBe("sm89")        // NVML 0, CUDA 1
+    expect(archOf(list, "NVIDIA GeForce RTX 5060 Ti")).toBe("sm120")
+  })
+  test("an unknown card or an old engine is null, not a guess", () => {
+    expect(archOf(list, "Some Other Card")).toBeNull()
+    expect(parseArch("")).toEqual([])
+    expect(parseArch("none")).toEqual([])
   })
 })

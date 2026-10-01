@@ -5621,11 +5621,12 @@ int main(int argc, char** argv) {
             std::string arch;
             int n_dev = 0;
             if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
-            for (int dv = 0; dv < n_dev; ++dv) {
-                int maj = 0, mnr = 0;
-                cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dv);
-                cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dv);
-                arch += (dv ? ",sm" : "sm") + std::to_string(maj * 10 + mnr);
+            for (int dv = 0; dv < n_dev; ++dv) {   // sm<N>@<card name, spaces as _>: the Hardware page matches by name
+                cudaDeviceProp pr{};
+                if (cudaGetDeviceProperties(&pr, dv) != cudaSuccess) continue;
+                std::string nm = pr.name;
+                for (char& ch : nm) if (ch == ' ') ch = '_';
+                arch += (arch.empty() ? "sm" : ",sm") + std::to_string(pr.major * 10 + pr.minor) + "@" + nm;
             }
             std::printf("INFO cpu_isa=%s gpu_arch=%s\n", strata::kernels::cpu::cpu_expert_isa(), arch.empty() ? "none" : arch.c_str());
         }

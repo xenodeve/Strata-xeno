@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react"
 import { apiHeaders, getHealth, getMcp, NO_HEALTH, root, url, type Health, type McpInfo } from "../lib/api"
+import { parseArch } from "../lib/arch"
 import { fmt } from "../lib/format"
 import { store } from "../lib/store"
 import { toast } from "../components/toast"
@@ -48,7 +49,7 @@ export function About() {
           <Row k="Pictures" v={health.images ? "on" : "off"} />
           <Row k="Engine" v={engine.engine || engine.version || "–"} />
           {engine.cpu_isa && <Row k="CPU kernels" v={engine.cpu_isa} />}
-          {engine.gpu_arch && <Row k="GPU architecture" v={engine.gpu_arch.replaceAll(",", ", ")} />}
+          {engine.gpu_arch && <Row k="GPU architecture" v={parseArch(engine.gpu_arch).map((a) => `${a.sm} ${a.name.replace("NVIDIA GeForce ", "")}`).join(", ")} />}
         </dl>
       </section>
 
