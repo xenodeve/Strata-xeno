@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from "react"
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon } from "@hugeicons/core-free-icons"
 import { cn } from "../lib/cn"
@@ -60,6 +60,28 @@ export function Disclosure({ title, hint, children, defaultOpen = false, block =
         <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("shrink-0 text-ink-3 transition-transform duration-300 ease-[var(--ease)]", open && "rotate-180")} />
       </button>
       <div id={id}><Collapse open={open}>{children}</Collapse></div>
+    </div>
+  )
+}
+
+/** A box (full width) that takes the height of what is in it, and glides there when that changes: a bubble becomes an edit box and the
+ *  box stretches open, the box closes and it shrinks back. A little padding (offset by a negative margin) keeps a focus ring
+ *  from being clipped by the overflow it needs. */
+export function Fit({ children, className }: { children: ReactNode; className?: string }) {
+  const inner = useRef<HTMLDivElement>(null)
+  const [h, setH] = useState<number | null>(null)       // unknown on the first paint: the box is as tall as it is, with no glide
+  useLayoutEffect(() => {
+    const el = inner.current
+    if (!el) return
+    const measure = () => setH(el.offsetHeight)
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  return (
+    <div className="fit-box -m-1 w-[calc(100%+0.5rem)] overflow-hidden p-1" style={h == null ? undefined : { height: h + 8 }}>
+      <div ref={inner} className={className}>{children}</div>
     </div>
   )
 }

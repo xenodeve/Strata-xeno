@@ -5,6 +5,7 @@ import { apiHeaders, errorMessage, url, type Health, type McpInfo } from "./api"
 import { fmt } from "./format"
 import { store } from "./store"
 import { PrefillMeter, type Prefill } from "./prefill"
+import { t, tn } from "./i18n"
 
 export interface ToolCall {
   id: string; name: string; at: number; rat: number
@@ -13,11 +14,34 @@ export interface ToolCall {
   result?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number | null; open?: boolean
 }
 export interface Attachment { kind: "image" | "file"; name: string; url?: string; text?: string }
+/** What the line under an answer says, as numbers: it is turned into words by `metaText` when it is shown, so that the line
+ *  follows the language in use (a stored answer has no text of its own in either language). */
+export interface Stats { tokens?: number; tokS?: number | null; stopped?: boolean; tools?: number; limit?: number; projection?: "on" | "off" }
 export interface Message {
   role: "user" | "assistant"; text: string; time: number
   prefill?: Prefill                                              // on a prompt: the speed it was read at
-  reasoning?: string; thinkSecs?: number | null; meta?: string; error?: string; stopped?: boolean; limit?: number
+  reasoning?: string; thinkSecs?: number | null; stats?: Stats; meta?: string /* legacy: the line as text, from an older version */
+  error?: string; stopped?: boolean; limit?: number
   images?: { name: string; url?: string }[]; files?: { name: string; text?: string }[]; tools?: ToolCall[]
+}
+
+/** The line under an answer ("40 tokens · 38.2 tok/s · 1 tool call"), in the language in use now. An answer stored by an
+ *  older version has only the text, which is shown as it was written. */
+export function metaText(m: Message): string {
+  const s = m.stats
+  if (!s) return m.meta || ""
+  const parts: string[] = []
+  if (s.tokens) {
+    parts.push(t("{n} tokens", { n: fmt(s.tokens) }))
+    if (s.tokS != null) parts.push(`${fmt(s.tokS, 1)} tok/s`)
+    if (s.stopped) parts.push(t("stopped"))
+    if (s.projection) parts.push(s.projection === "on" ? t("projection on") : t("projection off"))
+  } else if (s.stopped) {
+    parts.push(t("Stopped"))
+  }
+  if (s.tools) parts.push(tn(s.tools, "{n} tool call", "{n} tool calls"))
+  if (s.limit) parts.push(t("stopped at the limit of {n} tool rounds (mcp.max_rounds)", { n: s.limit }))
+  return parts.join(" · ")
 }
 export interface Settings {
   thinking: "none" | "low" | "medium" | "high"; temperature: number; top_p: number; top_k: number
@@ -151,22 +175,23 @@ export class ChatController {
   }
 
   private lostNote(lost: number) {
-    if (lost) this.onError("Attachments not restored", `${lost} attachment${lost > 1 ? "s were" : " was"} not kept: only the names of attachments are stored, so a file or an image is gone after the page is reloaded.`)
+    if (lost) this.onError(t("Attachments not restored"), tn(lost, "{n} attachment was not kept: only the names of attachments are stored, so a file or an image is gone after the page is reloaded.", "{n} attachments were not kept: only the names of attachments are stored, so a file or an image is gone after the page is reloaded."))
   }
 
   /** Takes the last prompt back, with its answer: both leave the chat and the prompt (with the attachments that are still
    *  held) is returned to be put in the composer. Not while an answer is being written. */
-  undoLast(): { text: string; attachments: Attachment[] } | null {
+  undoLast(): { text: string; attachments: Attachment[]; removed: Message[] } | null {
     if (this.busy) return null
     let at = -1
     for (let i = this.messages.length - 1; i >= 0 && at < 0; i--) if (this.messages[i].role === "user") at = i
     if (at < 0) return null
     const m = this.messages[at]
     const { kept, lost } = attachmentsOf(m)
+    const removed = this.messages.slice(at)
     this.messages = this.messages.slice(0, at)
     this.save(); this.notify()
     this.lostNote(lost)
-    return { text: m.text, attachments: kept }
+    return { text: m.text, attachments: kept, removed }
   }
 
   /** Rewrites the prompt at `index`: it and everything after it are replaced by the new prompt (with its own attachments
@@ -242,7 +267,7 @@ export class ChatController {
           if (data === "[DONE]") continue
           let j: any
           try { j = JSON.parse(data) } catch { continue }
-          if (j.error) throw new Error(j.error.message || "the engine reported an error")
+          if (j.error) throw new Error(j.error.message || t("the engine reported an error"))
           if (j.usage) usage = j.usage
           if (j.timings) timings = j.timings
           if (j.strata_mcp) onTool(m, j.strata_mcp)
@@ -266,7 +291,7 @@ export class ChatController {
     } catch (e) {
       const err = e as Error
       if (err.name === "AbortError") m.stopped = true
-      else { m.error = err.message || String(err); this.onError("The request failed", m.error) }
+      else { m.error = err.message || String(err); this.onError(t("The request failed"), m.error) }
     }
     if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000
     // The read is over: the engine's own mean replaces the live speed. After a tool round the final timings are the last
@@ -276,17 +301,22 @@ export class ChatController {
     um.prefill = { state: "done", rate: null, mean: own ? own.prompt_per_second ?? null : sampled, read: own?.prompt_n ?? null, cached: own?.cache_n ?? null }
     this.meter = null
     const n = usage?.completion_tokens ?? null
+    // what the line under the answer says, kept as numbers (metaText words it when it is shown)
+    const stats: Stats = {}
     if (n && firstAt) {
       const secs = (performance.now() - firstAt) / 1000
-      m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
-        (ctx.projectionLoaded ? (s.esp ? " · projection on" : " · projection off") : "")
+      stats.tokens = n
+      if (secs > 0.25) stats.tokS = n / secs
+      if (m.stopped) stats.stopped = true
+      if (ctx.projectionLoaded) stats.projection = s.esp ? "on" : "off"
     } else if (m.stopped) {
-      m.meta = "Stopped"
+      stats.stopped = true
     }
-    for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null }
-    const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length
-    if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`
-    if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`
+    for (const tc of m.tools || []) if (tc.state === "writing" || tc.state === "running") { tc.state = "skipped"; tc.ms = null }
+    const ran = (m.tools || []).filter((tc) => tc.state === "done" || tc.state === "error").length
+    if (ran) stats.tools = ran
+    if (m.limit) stats.limit = m.limit
+    if (Object.keys(stats).length) m.stats = stats
     this.busy = null
     if (this.frame) { cancelAnimationFrame(this.frame); this.frame = 0 }
     this.save()

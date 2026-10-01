@@ -1,6 +1,16 @@
 import type { ReactNode } from "react"
+import { t } from "../lib/i18n"
 
-export const NOT_MEASURED = <span className="text-ink-3">not measured</span>
+// A module-level element is built once, so the words are looked up when it renders, not when it is made.
+function NotMeasured() { return <span className="text-ink-3">{t("not measured")}</span> }
+export const NOT_MEASURED = <NotMeasured />
+
+/** Where a node goes inside a translated sentence: put SLOT in the text (t("... {n} ...", { n: SLOT })) and show it with <Sentence>. */
+export const SLOT = "\u0001"
+export function Sentence({ text, node }: { text: string; node: ReactNode }) {
+  const [a, b = ""] = text.split(SLOT)
+  return <>{a}{node}{b}</>
+}
 
 /** A figure, or "not measured": a tile with no instrument behind it never shows a guess. */
 export function val(v: number | null | undefined, fmt: (n: number) => string, unit = ""): ReactNode {

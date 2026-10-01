@@ -3,7 +3,9 @@
 //   working: general work · searching: a scan or a lookup, and the idle look of the server and a GPU · solving: reasoning, or struggling · listening: taking input
 //   connecting: a call, a queue, reaching out · weaving: a multi-step plan, heavy parallel work · composing: writing
 //   breathing: at rest, waiting · shaping: dormant, a different mode
-export type OrbDesign = "working" | "searching" | "solving" | "listening" | "connecting" | "weaving" | "composing" | "breathing" | "shaping"
+import { msg, t } from "./i18n"
+
+export type OrbDesign ="working" | "searching" | "solving" | "listening" | "connecting" | "weaving" | "composing" | "breathing" | "shaping"
 
 export interface OrbLook { design: OrbDesign; moving: boolean; speed?: number; fps?: number }
 
@@ -72,7 +74,11 @@ export function latticePattern(phase: OrbDesign | null): LatticePattern {
 export const ORB_DESIGNS: readonly OrbDesign[] = ["working", "searching", "solving", "listening", "connecting", "weaving", "composing", "breathing", "shaping"]
 
 /** The words for a form, for the orb's accessible name when it is shown for its own sake (the empty chat). */
-export const orbLabel = (d: OrbDesign) => d[0].toUpperCase() + d.slice(1)
+const ORB_LABEL: Record<OrbDesign, string> = {
+  working: msg("Working"), searching: msg("Searching"), solving: msg("Solving"), listening: msg("Listening"), connecting: msg("Connecting"),
+  weaving: msg("Weaving"), composing: msg("Composing"), breathing: msg("Breathing"), shaping: msg("Shaping"),
+}
+export const orbLabel = (d: OrbDesign) => t(ORB_LABEL[d])
 
 /** One of the other forms (any of the nine when none is shown yet); `r` in [0, 1) picks it. */
 export function nextDesign(prev: OrbDesign | null, r: number): OrbDesign {

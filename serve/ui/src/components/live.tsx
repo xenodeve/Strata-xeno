@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { serverDesign, type OrbDesign } from "../lib/orbs"
+import { t } from "../lib/i18n"
 import { Orb } from "./orb"
 import type { Live } from "../lib/metrics"
 
@@ -11,8 +12,8 @@ export function StatusOrb({ live, stale = false, size = 64, scale = 1, override 
   live: Pick<Live, "state" | "queued" | "tok_s">; stale?: boolean; size?: 64 | 32 | 20; scale?: number; override?: { design: OrbDesign; label: string }
 }) {
   const look = serverDesign(live, stale)
-  const label = stale ? "Not answering" : live.state === "reading" ? "Reading the prompt" : live.state === "generating" ? "Writing"
-    : live.state === "unloaded" ? "Model unloaded" : (live.queued ?? 0) > 0 ? "Waiting in the queue" : "Idle"
+  const label = stale ? t("Not answering") : live.state === "reading" ? t("Reading the prompt") : live.state === "generating" ? t("Writing")
+    : live.state === "unloaded" ? t("Model unloaded") : (live.queued ?? 0) > 0 ? t("Waiting in the queue") : t("Idle")
   return override
     ? <Orb design={override.design} size={size} scale={scale} moving label={override.label} />
     : <Orb design={look.design} size={size} scale={scale} moving={look.moving} speed={look.speed} fps={look.fps} label={label} />

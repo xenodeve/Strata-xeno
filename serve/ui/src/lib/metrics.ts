@@ -1,6 +1,7 @@
 // GET /metrics, polled while the tab is visible and not at all while it is hidden (nothing loops in the background).
 import { createContext, createElement, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { apiHeaders, url } from "./api"
+import { t } from "./i18n"
 
 export interface Gpu { index: number; util: number | null; mem_used: number | null; mem_total: number | null; temp: number | null; power: number | null }
 export interface Hardware {
@@ -67,7 +68,7 @@ function usePoll(): MetricsState {
       let busy = false
       try {
         const r = await fetch(url("metrics"), { headers: apiHeaders() })
-        if (!r.ok) throw new Error(r.status === 401 ? "This server needs an API key (About)." : `HTTP ${r.status}`)
+        if (!r.ok) throw new Error(r.status === 401 ? t("This server needs an API key (About).") : `HTTP ${r.status}`)
         const data = (await r.json()) as Metrics
         fails.current = 0
         busy = data.live.state === "reading" || data.live.state === "generating"
@@ -95,7 +96,7 @@ export interface RequestDetail {
 
 export async function getRequestPage(page: number, size: number): Promise<RequestPage> {
   const r = await fetch(url(`metrics/requests?page=${page}&size=${size}`), { headers: apiHeaders() })
-  if (!r.ok) throw new Error(r.status === 401 ? "This server needs an API key (About)." : `HTTP ${r.status}`)
+  if (!r.ok) throw new Error(r.status === 401 ? t("This server needs an API key (About).") : `HTTP ${r.status}`)
   return (await r.json()) as RequestPage
 }
 
@@ -114,7 +115,7 @@ export async function getKeepLeft(): Promise<number> {
 
 export async function setKeep(n: number): Promise<number> {
   const r = await fetch(url("metrics/keep"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify({ next: n }) })
-  if (!r.ok) throw new Error(r.status === 401 ? "This server needs an API key (About)." : `HTTP ${r.status}`)
+  if (!r.ok) throw new Error(r.status === 401 ? t("This server needs an API key (About).") : `HTTP ${r.status}`)
   return ((await r.json()) as { keep_prompts_left: number }).keep_prompts_left
 }
 

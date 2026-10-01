@@ -3,6 +3,7 @@ import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
   Attachment01Icon, Cancel01Icon, Download01Icon, File02Icon, HelpCircleIcon, PlusSignIcon, Settings02Icon, SparklesIcon, MessageAdd01Icon,
 } from "@hugeicons/core-free-icons"
+import { t } from "../lib/i18n"
 
 // The composer: the field, and one bar of tools under it. Adapted from React Bits' PromptBar (MIT + Commons Clause: used
 // inside this app only, see REFERENCES.md). Changes: our tokens instead of fixed colours; the arrow-to-stop morph is a
@@ -94,9 +95,9 @@ export function PromptBar(p: PromptBarProps) {
   const [pressed, setPressed] = useState(false)
 
   const list: Row[] = [
-    { key: "attach", name: "Photos & files", description: p.attachTitle, icon: Attachment01Icon },
-    { key: "new", name: "New chat", description: "Clears this chat, with undo", icon: MessageAdd01Icon, disabled: p.busy },
-    { key: "save", name: "Save as Markdown", description: "Download the conversation", icon: Download01Icon },
+    { key: "attach", name: t("Photos & files"), description: p.attachTitle, icon: Attachment01Icon },
+    { key: "new", name: t("New chat"), description: t("Clears this chat, with undo"), icon: MessageAdd01Icon, disabled: p.busy },
+    { key: "save", name: t("Save as Markdown"), description: t("Download the conversation"), icon: Download01Icon },
   ]
   const cursor = Math.min(active, list.length - 1)
   const canSend = p.value.trim().length > 0 || p.attachments.length > 0
@@ -237,22 +238,22 @@ export function PromptBar(p: PromptBarProps) {
     <div ref={root} className="prompt-bar" data-busy={p.busy ? "" : undefined}>
       {p.children}
       {menu && (
-        <div className="prompt-bar__menu" role={menu === "effort" ? "dialog" : "listbox"} aria-label={menu === "effort" ? "Thinking effort" : "Actions"} data-kind={menu}>
+        <div className="prompt-bar__menu" role={menu === "effort" ? "dialog" : "listbox"} aria-label={menu === "effort" ? t("Thinking effort") : t("Actions")} data-kind={menu}>
           {menu === "effort" ? (
             <>
               <div className="prompt-bar__effort-head">
-                <span className="prompt-bar__effort-title">Thinking</span>
+                <span className="prompt-bar__effort-title">{t("Thinking")}</span>
                 <span className="prompt-bar__effort-level">{level}</span>
-                <span className="prompt-bar__effort-help" title="More thinking takes longer before the answer starts">
+                <span className="prompt-bar__effort-help" title={t("More thinking takes longer before the answer starts")}>
                   <HugeiconsIcon icon={HelpCircleIcon} size={14} strokeWidth={1.8} />
                 </span>
               </div>
-              <div className="prompt-bar__effort-ends"><span>Faster</span><span>Deeper</span></div>
+              <div className="prompt-bar__effort-ends"><span>{t("Faster")}</span><span>{t("Deeper")}</span></div>
               <div
                 className="prompt-bar__effort-track"
                 role="slider"
                 tabIndex={0}
-                aria-label="Thinking effort"
+                aria-label={t("Thinking effort")}
                 aria-valuemin={0}
                 aria-valuemax={p.efforts.length - 1}
                 aria-valuenow={p.effort}
@@ -315,7 +316,7 @@ export function PromptBar(p: PromptBarProps) {
               <span key={`${f.name}-${i}`} className="prompt-bar__chip">
                 <HugeiconsIcon icon={File02Icon} size={12} strokeWidth={2} />
                 <span className="prompt-bar__chip-name">{f.name}</span>
-                <button type="button" className="prompt-bar__chip-x" aria-label={`Remove ${f.name}`} onClick={() => p.onRemoveAttachment(i)}>
+                <button type="button" className="prompt-bar__chip-x" aria-label={t("Remove {name}", { name: f.name })} onClick={() => p.onRemoveAttachment(i)}>
                   <HugeiconsIcon icon={Cancel01Icon} size={10} strokeWidth={2.5} />
                 </button>
               </span>
@@ -328,8 +329,8 @@ export function PromptBar(p: PromptBarProps) {
           className="prompt-bar__input"
           rows={1}
           value={p.value}
-          placeholder="Message"
-          aria-label="Message"
+          placeholder={t("Message")}
+          aria-label={t("Message")}
           onChange={(e) => {
             p.onChange(e.target.value)
             typing.current.energy = Math.min(1.6, typing.current.energy + 0.22)
@@ -345,7 +346,7 @@ export function PromptBar(p: PromptBarProps) {
           <button
             type="button"
             className="prompt-bar__tool"
-            aria-label="Photos, files, new chat, save"
+            aria-label={t("Photos, files, new chat, save")}
             aria-expanded={menu === "plus"}
             data-on={menu === "plus" ? "" : undefined}
             onMouseDown={(e) => e.preventDefault()}
@@ -353,11 +354,11 @@ export function PromptBar(p: PromptBarProps) {
           >
             <HugeiconsIcon icon={PlusSignIcon} size={16} strokeWidth={2} />
           </button>
-          <input ref={file} type="file" multiple hidden aria-label="Attach files" onChange={(e) => { p.onFiles(Array.from(e.target.files || [])); e.target.value = "" }} />
+          <input ref={file} type="file" multiple hidden aria-label={t("Attach files")} onChange={(e) => { p.onFiles(Array.from(e.target.files || [])); e.target.value = "" }} />
           <button
             type="button"
             className="prompt-bar__pick"
-            aria-label="Thinking effort"
+            aria-label={t("Thinking effort")}
             aria-expanded={menu === "effort"}
             data-on={menu === "effort" ? "" : undefined}
             data-max={maxed ? "" : undefined}
@@ -367,16 +368,16 @@ export function PromptBar(p: PromptBarProps) {
             <HugeiconsIcon icon={SparklesIcon} size={13} strokeWidth={2} />
             <span>{level}</span>
           </button>
-          <button type="button" className="prompt-bar__tool" aria-label="Sampling" title="Sampling" onMouseDown={(e) => e.preventDefault()} onClick={() => { closeMenu(); p.onSampling() }}>
+          <button type="button" className="prompt-bar__tool" aria-label={t("Sampling")} title={t("Sampling")} onMouseDown={(e) => e.preventDefault()} onClick={() => { closeMenu(); p.onSampling() }}>
             <HugeiconsIcon icon={Settings02Icon} size={15} strokeWidth={2} />
           </button>
           <span className="prompt-bar__spacer" />
-          {!p.busy && <span className="prompt-bar__hint">Shift+Enter: new line</span>}
+          {!p.busy && <span className="prompt-bar__hint">{t("Shift+Enter: new line")}</span>}
           <button
             type="button"
             className="prompt-bar__send"
             disabled={!armed}
-            aria-label={p.busy ? "Stop" : "Send"}
+            aria-label={p.busy ? t("Stop") : t("Send")}
             data-armed={armed ? "" : undefined}
             data-pressed={pressed ? "" : undefined}
             onMouseDown={(e) => e.preventDefault()}

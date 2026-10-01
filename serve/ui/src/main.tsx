@@ -4,5 +4,7 @@ import "./styles.css"
 import "./prompt-bar.css"
 import "./thought.css"
 import { App } from "./App"
+import { initLang } from "./lib/i18n"
 
+initLang()
 createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>)

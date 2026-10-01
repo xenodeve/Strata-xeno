@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, test } from "bun:test"
 // The chat's real path: POST /v1/chat/completions, an SSE stream (reasoning, text, MCP tool events, usage), and the next
 // request carrying the tool rounds back. fetch is replaced by a stream cut at awkward places, as a network does.
 let ChatController: typeof import("./chat").ChatController
+let metaText: typeof import("./chat").metaText
 
 beforeAll(async () => {
   const g = globalThis as Record<string, unknown>
@@ -10,7 +11,7 @@ beforeAll(async () => {
   g.requestAnimationFrame = (f: () => void) => setTimeout(f, 0)
   g.cancelAnimationFrame = clearTimeout
   g.location = { pathname: "/next/", search: "" }
-  ;({ ChatController } = await import("./chat"))
+  ;({ ChatController, metaText } = await import("./chat"))
 })
 
 const enc = new TextEncoder()
@@ -58,8 +59,8 @@ describe("chat stream", () => {
     expect(m.reasoning).toBe("I should look. \n\nGot it.")             // a new round after a tool starts a new paragraph
     expect(m.tools).toHaveLength(1)
     expect(m.tools![0]).toMatchObject({ id: "c1", state: "done", server: "fs", tool: "read", round: 1, result: "file says สวัสดี", ok: true })
-    expect(m.meta).toContain("40 tokens")
-    expect(m.meta).toContain("1 tool call")
+    expect(metaText(m)).toContain("40 tokens")
+    expect(metaText(m)).toContain("1 tool call")
     expect(c.busy).toBeNull()
     expect(seen[0]).toMatchObject({ model: "m", stream: true, reasoning_effort: "high", strata_mcp: true })
   })
@@ -119,8 +120,18 @@ describe("chat stream", () => {
     await new Promise((r) => setTimeout(r, 30))
     c.stop()
     await p
-    expect(c.messages[1]).toMatchObject({ text: "so far", stopped: true, meta: "Stopped" })
+    expect(c.messages[1]).toMatchObject({ text: "so far", stopped: true })
+    expect(metaText(c.messages[1])).toBe("Stopped")
     expect(c.messages[1].error).toBeUndefined()
+  })
+
+  test("the line under an answer is worded when it is shown: the numbers are stored, an older stored text still shows", () => {
+    const a = { role: "assistant" as const, text: "x", time: 1 }
+    expect(metaText({ ...a, stats: { tokens: 40, tokS: 38.24, tools: 2, projection: "on" } })).toBe("40 tokens · 38.2 tok/s · projection on · 2 tool calls")
+    expect(metaText({ ...a, stats: { tokens: 1, stopped: true, projection: "off" } })).toBe("1 tokens · stopped · projection off")
+    expect(metaText({ ...a, stats: { tokens: 5, tools: 1, limit: 3 } })).toBe("5 tokens · 1 tool call · stopped at the limit of 3 tool rounds (mcp.max_rounds)")
+    expect(metaText({ ...a, meta: "12 tokens · 3.0 tok/s" })).toBe("12 tokens · 3.0 tok/s")
+    expect(metaText(a)).toBe("")
   })
 
   // The speed at which the prompt is read, under the prompt: sampled from the server's progress while it reads, replaced
@@ -191,7 +202,8 @@ describe("chat stream", () => {
   test("undo takes the last prompt back with its answer, and returns what was sent", async () => {
     const { c } = await two()
     const back = c.undoLast()
-    expect(back).toEqual({ text: "second", attachments: [{ kind: "image", name: "p.png", url: "data:image/png;base64,xx" }] })
+    expect(back).toMatchObject({ text: "second", attachments: [{ kind: "image", name: "p.png", url: "data:image/png;base64,xx" }] })
+    expect(back!.removed.map((m) => m.text)).toEqual(["second", "two"])               // what left, for the page to close up gently
     expect(c.messages.map((m) => m.text)).toEqual(["first", "one"])
     expect(c.undoLast()!.text).toBe("first")
     expect(c.messages).toHaveLength(0)
@@ -201,7 +213,7 @@ describe("chat stream", () => {
   test("undo keeps only the attachments that still hold their data (a reload keeps names alone)", () => {
     const c = new ChatController()
     c.messages = [{ role: "user", text: "q", time: 1, images: [{ name: "gone.png" }], files: [{ name: "gone.txt" }, { name: "kept.txt", text: "K" }] }, { role: "assistant", text: "a", time: 2 }]
-    expect(c.undoLast()).toEqual({ text: "q", attachments: [{ kind: "file", name: "kept.txt", text: "K" }] })
+    expect(c.undoLast()).toMatchObject({ text: "q", attachments: [{ kind: "file", name: "kept.txt", text: "K" }] })
   })
 
   test("nothing is undone or edited while an answer is being written", async () => {

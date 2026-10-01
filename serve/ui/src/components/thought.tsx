@@ -4,6 +4,7 @@ import { ArrowDown01Icon } from "@hugeicons/core-free-icons"
 import { Collapse } from "./motion"
 import type { LatticePattern } from "../lib/orbs"
 import { cn } from "../lib/cn"
+import { t } from "../lib/i18n"
 
 // Two React Bits components, adapted and used as a pair for the agent's thinking (MIT + Commons Clause: in this app only):
 // LatticeLoader (a 3 x 3 grid of dots that runs a pattern while the agent works, then settles into a tick or a cross) and
@@ -45,11 +46,12 @@ const clock = (ds: number) => (ds < 600 ? `${(ds / 10).toFixed(1)}s` : `${Math.f
 /** The thinking line. While `working` the label shimmers and a timer counts; when it stops the label becomes `doneLabel`
  *  (with the timer, "Thought for 2.4s", when the time is known) and the timer glides to the end of the shorter text.
  *  `elapsed` (seconds) fixes the timer to a known length. The thought itself is `children`, shown while `open`. */
-export function Thought({ working, glyph, open, onToggle, elapsed, label = "Thinking…", children }: {
+export function Thought({ working, glyph, open, onToggle, elapsed, label, children }: {
   working: boolean; glyph: ReactNode; open: boolean; onToggle: () => void; elapsed?: number | null; label?: string; children: ReactNode
 }) {
   const timed = working || elapsed != null
-  const doneText = timed ? "Thought for" : "Thoughts"
+  const doneText = timed ? t("Thought for") : t("Thoughts")
+  const workText = label ?? t("Thinking…")
   const timerRef = useRef<HTMLSpanElement>(null)
   const stackRef = useRef<HTMLSpanElement>(null)
   const workRef = useRef<HTMLSpanElement>(null)
@@ -85,19 +87,19 @@ export function Thought({ working, glyph, open, onToggle, elapsed, label = "Thin
     if (workRef.current) ro.observe(workRef.current)
     if (doneRef.current) ro.observe(doneRef.current)
     return () => ro.disconnect()
-  }, [working, label, doneText, timed])
+  }, [working, workText, doneText, timed])
 
   return (
     <div className="thought" data-working={working ? "" : undefined} data-open={open ? "" : undefined}>
       <button type="button" className="thought-head" aria-expanded={open} onClick={onToggle}>
         <span className="thought-glyph" aria-hidden>{glyph}</span>
         <span ref={stackRef} className="thought-label" aria-hidden>
-          <span ref={workRef} className="thought-text" data-active={working ? "" : undefined}><span className="thought-shimmer">{label}</span></span>
+          <span ref={workRef} className="thought-text" data-active={working ? "" : undefined}><span className="thought-shimmer">{workText}</span></span>
           <span ref={doneRef} className="thought-text thought-text--done" data-active={working ? undefined : ""}>{doneText}</span>
         </span>
         {timed && <span ref={timerRef} className="thought-timer num" data-done={working ? undefined : ""} aria-hidden>0.0s</span>}
         <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("thought-chevron", open && "rotate-180")} />
-        <span className="sr-only" role="status">{working ? label : `${doneText}${timed ? ` ${clock(dsRef.current)}` : ""}`}</span>
+        <span className="sr-only" role="status">{working ? workText : `${doneText}${timed ? ` ${clock(dsRef.current)}` : ""}`}</span>
       </button>
       <Collapse open={open}>{children}</Collapse>
     </div>

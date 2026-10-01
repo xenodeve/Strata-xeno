@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react"
 import { ThinkingOrb } from "../vendor/thinking-orbs/orb"
 import { SLOW, type OrbDesign } from "../lib/orbs"
+import { t } from "../lib/i18n"
 
 // thinking-orbs by Jakub Antalik (Libraries.dev, MIT), vendored in src/vendor/thinking-orbs. The orb pauses itself offscreen and
 // in a hidden tab, and is a still frame under reduced motion. These three components only decide where and how it is shown.
@@ -40,7 +41,7 @@ export function StatusLabel({ design, children, size = 20, moving = true, classN
 }
 
 /** A page or a block that is waiting for data: the orb and what it waits for. An error shows as plain text, not as a wait. */
-export function Loading({ children = "Connecting…", error, design = "connecting" }: { children?: ReactNode; error?: string | null; design?: OrbDesign }) {
+export function Loading({ children = t("Connecting…"), error, design = "connecting" }: { children?: ReactNode; error?: string | null; design?: OrbDesign }) {
   if (error) return <p className="text-ink-2">{error}</p>
   return <p className="py-6 text-ink-2" role="status"><StatusLabel design={design}>{children}</StatusLabel></p>
 }

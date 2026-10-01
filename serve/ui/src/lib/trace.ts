@@ -1,6 +1,8 @@
 // The engine's STRATA_TIMELINE file (#33) in the browser. It is a Chrome trace: a JSON array of events, one per line,
 // left OPEN (no closing bracket) because the engine appends after every request. "X" events are spans on a thread (a
 // lane), "M" events name the threads. Times are microseconds on the engine's own clock.
+import { t } from "./i18n"
+
 export interface Lane {
   pid: number; tid: number; name: string
   ts: Float64Array; dur: Float64Array; nameIdx: Uint32Array; args: (Record<string, unknown> | undefined)[]
@@ -28,7 +30,7 @@ function events(text: string): { evs: Ev[]; lines: string[] } {
     if (!l.startsWith("{") || !l.endsWith("}")) continue         // blank, the bracket, or a line the engine did not finish
     try { evs.push(JSON.parse(l)); lines.push(l) } catch { /* a torn line */ }
   }
-  if (!evs.length) throw new Error("This is not a trace file (a Chrome trace array, as STRATA_TIMELINE writes).")
+  if (!evs.length) throw new Error(t("This is not a trace file (a Chrome trace array, as STRATA_TIMELINE writes)."))
   return { evs, lines }
 }
 

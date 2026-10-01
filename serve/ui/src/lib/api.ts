@@ -1,4 +1,5 @@
 import { store } from "./store"
+import { t } from "./i18n"
 
 export const apiHeaders = (json = false): Record<string, string> => {
   const h: Record<string, string> = {}
@@ -38,6 +39,6 @@ export async function getMcp(): Promise<McpInfo | null> {
 export async function errorMessage(r: Response): Promise<string> {
   let msg = `HTTP ${r.status}`
   try { msg = ((await r.json()) as { error?: { message?: string } }).error?.message || msg } catch { /* not json */ }
-  if (r.status === 401) msg = "This server needs an API key: add it under About > Settings."
+  if (r.status === 401) msg = t("This server needs an API key: add it under About > Settings.")
   return msg
 }

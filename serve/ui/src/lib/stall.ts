@@ -4,6 +4,9 @@
 // waiting on at that moment. Cycle-level stalls (CPU PMU, GPU warp stalls) come only from the Nsight capture.
 // Stages overlap in places, so a bucket's share is of the decode wall time and the "other" bucket is what the
 // counters do not name.
+import { msg } from "./i18n"
+
+// Labels and resource names are English here (the tests and the `resource === "CPU pool"` check read them); the page shows them through t().
 export type Stats = Record<string, number>
 
 export interface Bucket { key: string; label: string; ms: number; kind: "busy" | "wait" | "idle" }
@@ -22,7 +25,7 @@ function build(resource: string, total: number, parts: Omit<Bucket, "ms">[], s: 
   const scale = named > total && total > 0 ? total / named : 1                 // overlapping stages never exceed the wall time
   const scaled = buckets.map((b) => ({ ...b, ms: b.ms * scale }))
   const other = Math.max(0, total - scaled.reduce((a, b) => a + b.ms, 0))
-  if (other > total * 0.005) scaled.push({ key: "other", label: "Not named by the counters", ms: other, kind: "idle" })
+  if (other > total * 0.005) scaled.push({ key: "other", label: msg("Not named by the counters"), ms: other, kind: "idle" })
   return { resource, total, buckets: scaled, overhead: null }
 }
 
@@ -30,22 +33,22 @@ function build(resource: string, total: number, parts: Omit<Bucket, "ms">[], s: 
 export function attribute(stats: Stats | null | undefined, decodeMs: number | null | undefined): Attribution[] | null {
   if (!stats || !decodeMs || decodeMs <= 0) return null
   return [
-    build("CPU pool", decodeMs, [
-      { key: "ms_cpu", label: "Computing experts", kind: "busy" },
-      { key: "ms_gpu_wait", label: "Waiting for the GPU's output", kind: "wait" },
-      { key: "ms_plan", label: "Waiting for the dispatch plan", kind: "wait" },
-      { key: "ms_actq", label: "Waiting for the activation quantize", kind: "wait" },
-      { key: "ms_jobs", label: "Waiting for jobs to be handed out", kind: "wait" },
-      { key: "ms_stage", label: "Waiting for the host to stage the window", kind: "wait" },
-      { key: "ms_commit", label: "Idle: the host commits and emits", kind: "idle" },
-      { key: "ms_draft", label: "Idle: the host drafts the next window", kind: "idle" },
+    build(msg("CPU pool"), decodeMs, [
+      { key: "ms_cpu", label: msg("Computing experts"), kind: "busy" },
+      { key: "ms_gpu_wait", label: msg("Waiting for the GPU's output"), kind: "wait" },
+      { key: "ms_plan", label: msg("Waiting for the dispatch plan"), kind: "wait" },
+      { key: "ms_actq", label: msg("Waiting for the activation quantize"), kind: "wait" },
+      { key: "ms_jobs", label: msg("Waiting for jobs to be handed out"), kind: "wait" },
+      { key: "ms_stage", label: msg("Waiting for the host to stage the window"), kind: "wait" },
+      { key: "ms_commit", label: msg("Idle: the host commits and emits"), kind: "idle" },
+      { key: "ms_draft", label: msg("Idle: the host drafts the next window"), kind: "idle" },
     ], stats),
-    build("GPUs", decodeMs, [
-      { key: "ms_gpu_wait", label: "Computing a layer (the host waits for it)", kind: "busy" },
-      { key: "ms_pool", label: "Waiting for the CPU's experts", kind: "wait" },
-      { key: "ms_stage", label: "Waiting for the host to launch the window", kind: "wait" },
-      { key: "ms_commit", label: "Idle: the host commits and emits", kind: "idle" },
-      { key: "ms_draft", label: "Idle: the host drafts the next window", kind: "idle" },
+    build(msg("GPUs"), decodeMs, [
+      { key: "ms_gpu_wait", label: msg("Computing a layer (the host waits for it)"), kind: "busy" },
+      { key: "ms_pool", label: msg("Waiting for the CPU's experts"), kind: "wait" },
+      { key: "ms_stage", label: msg("Waiting for the host to launch the window"), kind: "wait" },
+      { key: "ms_commit", label: msg("Idle: the host commits and emits"), kind: "idle" },
+      { key: "ms_draft", label: msg("Idle: the host drafts the next window"), kind: "idle" },
     ], stats),
   ]
 }

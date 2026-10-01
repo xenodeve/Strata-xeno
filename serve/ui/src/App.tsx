@@ -7,20 +7,41 @@ import { cn } from "./lib/cn"
 import { MetricsProvider, useMetrics } from "./lib/metrics"
 import { href, PAGES, useRoute, type Page } from "./lib/router"
 import { useTheme, type Theme } from "./lib/theme"
+import { msg, setLang, t, useLang } from "./lib/i18n"
 import { PageView } from "./pages"
 import { StatusOrb } from "./components/live"
 import { ToastHost } from "./components/toast"
 
 const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
-  chat: { label: "Chat", icon: Message01Icon },
-  dashboard: { label: "Dashboard", icon: DashboardSquare01Icon },
-  live: { label: "Live", icon: Activity01Icon },
-  requests: { label: "Requests", icon: Task01Icon },
-  hardware: { label: "Hardware", icon: CpuIcon },
-  about: { label: "About", icon: InformationCircleIcon },
+  chat: { label: msg("Chat"), icon: Message01Icon },
+  dashboard: { label: msg("Dashboard"), icon: DashboardSquare01Icon },
+  live: { label: msg("Live"), icon: Activity01Icon },
+  requests: { label: msg("Requests"), icon: Task01Icon },
+  hardware: { label: msg("Hardware"), icon: CpuIcon },
+  about: { label: msg("About"), icon: InformationCircleIcon },
 }
 
 const THEME_ICON: Record<Theme, IconSvgElement> = { system: ComputerIcon, light: Sun03Icon, dark: Moon02Icon }
+const THEME_NAME: Record<Theme, string> = { system: msg("System"), light: msg("Light"), dark: msg("Dark") }
+
+/** The language switch: both names are shown, each in its own language, and the one in use is the strong one. */
+export function LangSwitch() {
+  const lang = useLang()
+  const to = lang === "th" ? "en" : "th"
+  return (
+    <button
+      type="button"
+      onClick={() => setLang(to)}
+      title={t("Language: {name}. Change", { name: lang === "th" ? "ไทย" : "English" })}
+      aria-label={t("Language: {name}. Change", { name: lang === "th" ? "ไทย" : "English" })}
+      className="flex h-8 shrink-0 items-center gap-1 rounded-sm px-2 text-[12px] text-ink-3 transition-[color,background-color,transform] duration-200 hover:bg-hover hover:text-ink active:scale-95"
+    >
+      <span lang="en" className={lang === "en" ? "font-semibold text-ink" : ""}>EN</span>
+      <span aria-hidden>/</span>
+      <span lang="th" className={lang === "th" ? "font-semibold text-ink" : ""}>ไทย</span>
+    </button>
+  )
+}
 
 /** The page links, with one pill that glides to the current page (measured, then moved with transform and width). */
 function Nav({ page }: { page: Page }) {
@@ -42,7 +63,7 @@ function Nav({ page }: { page: Page }) {
     return () => { ro.disconnect(); cancelAnimationFrame(id) }
   }, [page])
   return (
-    <nav ref={nav} aria-label="Pages" className="relative -mx-1 flex min-w-0 flex-1 gap-0.5 overflow-x-auto px-1">
+    <nav ref={nav} aria-label={t("Pages")} className="relative -mx-1 flex min-w-0 flex-1 gap-0.5 overflow-x-auto px-1">
       {pill && (
         <span
           aria-hidden
@@ -55,14 +76,14 @@ function Nav({ page }: { page: Page }) {
           key={p}
           href={href(p)}
           aria-current={page === p ? "page" : undefined}
-          aria-label={NAV[p].label}
+          aria-label={t(NAV[p].label)}
           className={cn(
             "relative flex h-8 shrink-0 items-center gap-1.5 rounded-sm px-2 text-[13px] sm:px-2.5 no-underline transition-colors duration-200",
             page === p ? "text-ink" : "text-ink-2 hover:text-ink",
           )}
         >
           <HugeiconsIcon icon={NAV[p].icon} size={16} strokeWidth={1.6} aria-hidden />
-          <span className={page === p ? "" : "max-sm:sr-only"}>{NAV[p].label}</span>
+          <span className={page === p ? "" : "max-sm:sr-only"}>{t(NAV[p].label)}</span>
         </a>
       ))}
     </nav>
@@ -72,7 +93,7 @@ function Nav({ page }: { page: Page }) {
 function Brand() {
   const { data, stale } = useMetrics()
   return (
-    <a href={href("dashboard")} className="flex items-center gap-2 no-underline" aria-label="Strata, the dashboard">
+    <a href={href("dashboard")} className="flex items-center gap-2 no-underline" aria-label={t("Strata, the dashboard")}>
       <StatusOrb live={data?.live ?? { state: "idle", queued: 0, tok_s: null }} stale={stale} size={20} />
       <span className="text-[15px] font-semibold tracking-[-0.02em] max-[430px]:sr-only">Strata</span>
     </a>
@@ -82,6 +103,7 @@ function Brand() {
 function Shell() {
   const route = useRoute()
   const { theme, cycle } = useTheme()
+  useLang()                                                       // the whole page below is drawn again when the language changes
   const [scrolled, setScrolled] = useState(false)
   // A new page opens at its top. (Layout effect: it runs before the chat's own effect, which takes the page to the end of the chat.)
   const first = useRef(true)
@@ -110,12 +132,13 @@ function Shell() {
           <button
             type="button"
             onClick={cycle}
-            title={`Theme: ${theme}`}
-            aria-label={`Theme: ${theme}. Change`}
+            title={t("Theme: {name}", { name: t(THEME_NAME[theme]) })}
+            aria-label={t("Theme: {name}. Change", { name: t(THEME_NAME[theme]) })}
             className="flex size-8 shrink-0 items-center justify-center rounded-sm text-ink-2 transition-[color,background-color,transform] duration-200 hover:bg-hover hover:text-ink active:scale-90"
           >
             <HugeiconsIcon icon={THEME_ICON[theme]} size={16} strokeWidth={1.6} aria-hidden />
           </button>
+          <LangSwitch />
         </div>
       </header>
       <ToastHost />

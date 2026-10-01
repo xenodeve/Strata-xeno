@@ -2,13 +2,15 @@ import { useCallback, useEffect, useRef, useState, type DragEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon } from "@hugeicons/core-free-icons"
 import { apiHeaders, getHealth, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
-import { chat, exportMarkdown, useChatVersion, type Attachment, type Settings } from "../../lib/chat"
+import { chat, exportMarkdown, useChatVersion, type Attachment, type Message, type Settings } from "../../lib/chat"
 import { readFiles } from "../../lib/files"
+import { cn } from "../../lib/cn"
 import { toast } from "../../components/toast"
 import { StatusOrb } from "../../components/live"
 import { PromptBar } from "../../components/PromptBar"
 import { useMetrics } from "../../lib/metrics"
-import { nextDesign, orbLabel, type OrbDesign } from "../../lib/orbs"
+import { nextDesign, type OrbDesign } from "../../lib/orbs"
+import { msg, t } from "../../lib/i18n"
 import { MessageView } from "./Messages"
 import { SettingsSheet } from "./SettingsSheet"
 
@@ -16,8 +18,35 @@ const NO_MCP: McpInfo = { servers: [], tools: 0 }
 
 // The thinking levels the chat offers, as the server's reasoning_effort names them.
 const EFFORTS: { label: string; value: Settings["thinking"] }[] = [
-  { label: "Off", value: "none" }, { label: "Low", value: "low" }, { label: "Medium", value: "medium" }, { label: "High", value: "high" },
+  { label: msg("Off"), value: "none" }, { label: msg("Low"), value: "low" }, { label: msg("Medium"), value: "medium" }, { label: msg("High"), value: "high" },
 ]
+
+// The orb's accessible name in the empty chat: one of the nine forms, as words.
+const ORB_NAMES: Record<OrbDesign, string> = {
+  working: msg("Working"), searching: msg("Searching"), solving: msg("Solving"), listening: msg("Listening"), connecting: msg("Connecting"),
+  weaving: msg("Weaving"), composing: msg("Composing"), breathing: msg("Breathing"), shaping: msg("Shaping"),
+}
+
+/** Messages an undo took away, still drawn for the length of their closing: the box shrinks to nothing while it fades. A
+ *  negative top margin cancels the gap the message before it leaves (the gap is part of what closes), so nothing jumps
+ *  when they are gone. Not interactive, and read by nobody. */
+function Leaving({ messages, onGone }: { messages: Message[]; onGone: () => void }) {
+  const [open, setOpen] = useState(true)
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => requestAnimationFrame(() => setOpen(false)))
+    const done = setTimeout(onGone, 420)
+    return () => { cancelAnimationFrame(raf); clearTimeout(done) }
+  }, [onGone])
+  return (
+    <div className="ghost -mt-6" aria-hidden inert>
+      <div className={cn("collapse-grid", open && "is-open")}>
+        <div className="min-h-0 overflow-hidden"><div className="space-y-6 pt-6">
+          {messages.map((m, i) => <MessageView key={i} m={m} streaming={false} show={false} prefill={false} />)}
+        </div></div>
+      </div>
+    </div>
+  )
+}
 
 /** The empty chat's orb shows a different one of the nine forms every 5 s while the server has nothing to do (`on`); when it
  *  is busy, or the reader types, the orb goes back to saying what is really happening. */
@@ -54,7 +83,7 @@ export function Chat() {
   useEffect(() => { if (metrics) chat.samplePrefill(metrics.live, performance.now()) }, [metrics])      // each /metrics reply while a prompt is read
 
   useEffect(() => {
-    chat.onError = (title, t) => toast("error", title, t, 6000)
+    chat.onError = (title, text) => toast("error", title, text, 6000)
     let cancelled = false
     const load = async () => {
       for (;;) {                                                // the server may still be starting
@@ -133,12 +162,12 @@ export function Chat() {
   }
   const ctx = () => ({ health, mcp, projectionLoaded: projection })
   const editPrompt = (i: number, t: string) => { pinned.current = true; setAway(false); void chat.edit(i, t, ctx()) }
+  const [leaving, setLeaving] = useState<Message[]>([])        // what an undo took away: it closes up (height and fade) before it is gone
   const undoPrompt = () => {
     const back = chat.undoLast()
     if (!back) return
-    setText((cur) => back.text + (cur.trim() ? `
-
-${cur}` : ""))      // a draft already in the composer stays
+    setLeaving(back.removed)
+    setText((cur) => (cur.trim() ? back.text + "\n\n" + cur : back.text))      // a draft already in the composer stays
     setFiles((f) => [...back.attachments, ...f])
     input.current?.focus()
   }
@@ -158,12 +187,12 @@ ${cur}` : ""))      // a draft already in the composer stays
   }
 
   const newChat = () => {
-    if (busy) { toast("warn", "Still writing", "Stop the answer first."); return }
+    if (busy) { toast("warn", t("Still writing"), t("Stop the answer first.")); return }
     const undo = chat.clear()
-    if (undo) toast("info", "New chat", "The last one was cleared.", 6000, { label: "Undo", run: undo })
+    if (undo) toast("info", t("New chat"), t("The last one was cleared."), 6000, { label: t("Undo"), run: undo })
   }
   const download = () => {
-    if (!chat.messages.length) { toast("info", "Nothing to save yet"); return }
+    if (!chat.messages.length) { toast("info", t("Nothing to save yet")); return }
     const a = document.createElement("a")
     a.href = URL.createObjectURL(new Blob([exportMarkdown(chat.messages, health.model)], { type: "text/markdown" }))
     a.download = `strata-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`
@@ -176,15 +205,16 @@ ${cur}` : ""))      // a draft already in the composer stays
       <div ref={list} className="flex-1 space-y-6 pb-6" aria-live="off">
         {chat.messages.length === 0 && (
           <div className="mx-auto mt-[11vh] flex max-w-[44ch] flex-col items-center text-center">
-            <StatusOrb live={live} stale={stale} size={64} scale={2.5} override={typing ? { design: "listening", label: "Listening" } : ambient ? { design: ambient, label: orbLabel(ambient) } : undefined} />
-            <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>What can I help with?</h1>
-            <p className="lede mt-3">{metrics?.model_info?.name ? [metrics.model_info.name, metrics.model_info.variant].filter(Boolean).join(" · ") : health.model} runs on this PC. Nothing leaves it.</p>
+            <StatusOrb live={live} stale={stale} size={64} scale={2.5} override={typing ? { design: "listening", label: t(ORB_NAMES.listening) } : ambient ? { design: ambient, label: t(ORB_NAMES[ambient]) } : undefined} />
+            <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>{t("What can I help with?")}</h1>
+            <p className="lede mt-3">{t("{name} runs on this PC. Nothing leaves it.", { name: metrics?.model_info?.name ? [metrics.model_info.name, metrics.model_info.variant].filter(Boolean).join(" · ") : health.model })}</p>
           </div>
         )}
         {chat.messages.map((m, i) => (
           <MessageView key={i} m={m} streaming={busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill}
             actions={m.role === "user" ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt } : undefined} />
         ))}
+        {leaving.length > 0 && <Leaving messages={leaving} onGone={() => setLeaving([])} />}
       </div>
 
       <div className="sticky bottom-3 z-10">
@@ -205,20 +235,20 @@ ${cur}` : ""))      // a draft already in the composer stays
           onNewChat={newChat}
           onSave={download}
           onSampling={() => setSheet(true)}
-          efforts={EFFORTS.map((e) => e.label)}
+          efforts={EFFORTS.map((e) => t(e.label))}
           effort={Math.max(0, EFFORTS.findIndex((e) => e.value === chat.settings.thinking))}
           onEffort={(i) => chat.setSettings({ ...chat.settings, thinking: EFFORTS[i].value })}
-          attachTitle={health.images ? "Text files and pictures" : "Text files"}
+          attachTitle={health.images ? t("Text files and pictures") : t("Text files")}
           dragging={dragging}
         >
           {away && busy && (
             <button
               type="button"
               onClick={toLatest}
-              aria-label="Jump to the latest"
+              aria-label={t("Jump to the latest")}
               className="msg-in absolute -top-11 left-1/2 z-[2] flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-line bg-surface px-3 text-[13px] shadow-[0_4px_16px_rgb(0_0_0/0.10)] transition-colors hover:bg-hover"
             >
-              <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden />Latest
+              <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden />{t("Latest")}
             </button>
           )}
         </PromptBar>

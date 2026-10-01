@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type DragEvent, type PointerEvent
 import { Row, Rows, Section } from "../components/bits"
 import { Empty, Loading, StatusLabel } from "../components/orb"
 import { fmt } from "../lib/format"
+import { t, tn } from "../lib/i18n"
 import { href } from "../lib/router"
 import { closeTrace, parseTrace, spansIn, topNames, type Trace } from "../lib/trace"
 
@@ -31,9 +32,9 @@ export function TracePage() {
     setBusy(true); setError(null)
     try {
       const text = await file.text()
-      const t = parseTrace(text)
-      if (!t.count) throw new Error("There is no span in this file.")
-      setTrace(t); setSource({ name: file.name, text }); setView([t.t0, t.t1]); setHover(null)
+      const parsed = parseTrace(text)
+      if (!parsed.count) throw new Error(t("There is no span in this file."))
+      setTrace(parsed); setSource({ name: file.name, text }); setView([parsed.t0, parsed.t1]); setHover(null)
     } catch (e) { setError((e as Error).message) } finally { setBusy(false) }
   }
   const onDrop = (e: DragEvent) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) void open(f) }
@@ -135,6 +136,7 @@ export function TracePage() {
     return () => c.removeEventListener("wheel", on)
   }, [trace])
 
+  const intro = t("The engine's pipeline timeline: start the engine with {cmd}, then open the file here. It is read in this browser and goes nowhere. Scroll to zoom, drag to move, double-click to see it all.").split("{cmd}")
   const top = useMemo(() => (trace ? topNames(trace, view[0], view[1], 12) : []), [trace, view])
   const download = () => {
     if (!source) return
@@ -146,29 +148,28 @@ export function TracePage() {
 
   return (
     <div onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
-      <p className="mb-3 text-[13px]"><a href={href("requests")}>← Requests</a></p>
-      <h1 className="page-title">Timeline</h1>
+      <p className="mb-3 text-[13px]"><a href={href("requests")}>← {t("Requests")}</a></p>
+      <h1 className="page-title">{t("Timeline")}</h1>
       <p className="page-sub">
-        The engine's pipeline timeline: start the engine with <code>STRATA_TIMELINE=run.json</code>, then open the file here. It is read in this
-        browser and goes nowhere. Scroll to zoom, drag to move, double-click to see it all.
+        {intro[0]}<code>STRATA_TIMELINE=run.json</code>{intro[1]}
       </p>
       <div className="mt-4 flex flex-wrap items-center gap-2 text-[13px]">
         <label className="inline-flex h-8 cursor-pointer items-center rounded-sm bg-fill px-3 font-medium transition-colors hover:bg-fill-2">
-          {busy ? <StatusLabel design="working" className="text-ink">Reading…</StatusLabel> : "Open a timeline file"}
+          {busy ? <StatusLabel design="working" className="text-ink">{t("Reading…")}</StatusLabel> : t("Open a timeline file")}
           <input type="file" hidden accept=".json,application/json" onChange={(e) => { const f = e.target.files?.[0]; if (f) void open(f); e.target.value = "" }} />
         </label>
         {trace && source && (
           <>
-            <span className="text-ink-2">{source.name} · <span className="num">{fmt(trace.count)}</span> spans · <span className="num">{trace.lanes.length}</span> lanes · <span className="num">{us(trace.t1 - trace.t0)}</span></span>
-            <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Find a span name" aria-label="Find a span name" className="h-8 w-44 rounded-sm border border-line bg-surface px-2.5 outline-none focus:border-accent" />
-            <button type="button" onClick={download} className="h-8 rounded-sm px-3 text-ink-2 transition-colors hover:bg-hover hover:text-ink">Download for Perfetto</button>
+            <span className="text-ink-2">{source.name} · <span className="num">{fmt(trace.count)}</span> {t("spans")} · <span className="num">{trace.lanes.length}</span> {t("lanes")} · <span className="num">{us(trace.t1 - trace.t0)}</span></span>
+            <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder={t("Find a span name")} aria-label={t("Find a span name")} className="h-8 w-44 rounded-sm border border-line bg-surface px-2.5 outline-none focus:border-accent" />
+            <button type="button" onClick={download} className="h-8 rounded-sm px-3 text-ink-2 transition-colors hover:bg-hover hover:text-ink">{t("Download for Perfetto")}</button>
           </>
         )}
       </div>
       {error && <p className="mt-3 text-bad">{error}</p>}
 
       {!trace ? (
-        busy ? <Loading design="working">Reading the file…</Loading> : <p className="mt-8"><Empty>Drop a timeline file here, or open one.</Empty></p>
+        busy ? <Loading design="working">{t("Reading the file…")}</Loading> : <p className="mt-8"><Empty>{t("Drop a timeline file here, or open one.")}</Empty></p>
       ) : (
         <>
           <div ref={box} className="relative mt-4 overflow-hidden rounded-md border border-line">
@@ -176,22 +177,22 @@ export function TracePage() {
               ref={canvas}
               style={{ width, height, touchAction: "none", cursor: drag.current ? "grabbing" : "grab", display: "block" }}
               role="img"
-              aria-label={`Timeline of ${trace.lanes.length} lanes; the table below lists what the visible window spent its time on`}
+              aria-label={t("Timeline of {n} lanes; the table below lists what the visible window spent its time on", { n: trace.lanes.length })}
               onPointerDown={onDown} onPointerUp={onUp} onPointerMove={onMove} onPointerLeave={() => setHover(null)}
               onDoubleClick={() => setView([trace.t0, trace.t1])}
             />
             {hover && (
               <div className="pointer-events-none absolute z-10 max-w-xs rounded-md border border-line bg-surface px-2.5 py-1.5 text-[12px] shadow-[0_6px_24px_rgb(0_0_0/0.12)]" style={{ left: Math.min(hover.x + 12, width - 240), top: hover.y + 14 }}>
                 <div className="font-medium">{hover.name}</div>
-                <div className="num text-ink-2">{hover.lane} · {us(hover.dur)} · at {us(hover.at)}</div>
+                <div className="num text-ink-2">{t("{lane} · {dur} · at {at}", { lane: hover.lane, dur: us(hover.dur), at: us(hover.at) })}</div>
                 {hover.args && <div className="num text-ink-3">{Object.entries(hover.args).map(([k, v]) => `${k}=${String(v)}`).join(" ")}</div>}
               </div>
             )}
           </div>
-          <Section title="In the window" aside={<span className="num">{us(view[1] - view[0])}</span>}>
-            <p className="mb-1 text-[12px] text-ink-3">Lanes run in parallel, so these totals can add up to more than the window.</p>
+          <Section title={t("In the window")} aside={<span className="num">{us(view[1] - view[0])}</span>}>
+            <p className="mb-1 text-[12px] text-ink-3">{t("Lanes run in parallel, so these totals can add up to more than the window.")}</p>
             <Rows>
-              {top.map((r) => <Row key={r.name} k={r.name} hint={`${fmt(r.count)} span${r.count === 1 ? "" : "s"}`} v={<span className="num">{us(r.total)}</span>} />)}
+              {top.map((r) => <Row key={r.name} k={r.name} hint={tn(r.count, "{c} span", "{c} spans", { c: fmt(r.count) })} v={<span className="num">{us(r.total)}</span>} />)}
             </Rows>
           </Section>
         </>

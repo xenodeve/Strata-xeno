@@ -168,3 +168,16 @@
   .orb-in, .orb-out, .fade-swap { animation: none; } .orb-out { display: none; }
   .t-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; color: inherit; }
 }
+
+/* Thai (the page's lang is "th"): vowels and tone marks stack above and below the line, so a tight line height clips them and
+   a negative letter-spacing makes them collide. Tracking is off everywhere, and every tight line gets room. */
+html:lang(th) * { letter-spacing: 0 !important; }
+html:lang(th) .display, html:lang(th) .page-title, html:lang(th) h1, html:lang(th) h2, html:lang(th) h3 { line-height: 1.35; }
+html:lang(th) .lede, html:lang(th) .page-sub { line-height: 1.7; }
+html:lang(th) .prose-chat p, html:lang(th) .prose-chat li { line-height: 1.8; }
+html:lang(th) .thought { line-height: 1.6; }
+html:lang(th) .prompt-bar__input { line-height: 28px; min-height: 28px; }
+html:lang(th) .prompt-bar { line-height: 24px; }
+.fit-box { transition: height 300ms var(--ease); }
+.ghost .msg-in { animation: none; }       /* a message that is leaving must not play its entrance */
+@media (prefers-reduced-motion: reduce) { .fit-box { transition: none; } }

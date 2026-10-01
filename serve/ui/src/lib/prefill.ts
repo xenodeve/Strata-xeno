@@ -2,6 +2,7 @@
 // is read, then the mean of the whole read once it is done. The tokens the conversation cache already held are never part
 // of a speed (no compute) and are never added to the tokens read; they are named beside them.
 import { fmt } from "./format"
+import { t } from "./i18n"
 
 export interface Prefill {
   state: "reading" | "done"
@@ -48,11 +49,11 @@ export class PrefillMeter {
 
 /** The line under the prompt; null when there is nothing to say. */
 export function prefillText(p: Prefill): string | null {
-  if (p.state === "reading") return p.rate != null ? `Reading the prompt · ${fmt(p.rate)} tok/s · last second` : "Reading the prompt…"
+  if (p.state === "reading") return p.rate != null ? t("Reading the prompt · {rate} tok/s · last second", { rate: fmt(p.rate) }) : t("Reading the prompt…")
   const cached = p.cached ?? 0
-  if (p.read === 0 && cached > 0) return `Nothing to read: all ${fmt(cached)} tokens came from the cache`
-  if (p.read == null) return p.mean != null ? `Prefill ${fmt(p.mean)} tok/s mean` : null
+  if (p.read === 0 && cached > 0) return t("Nothing to read: all {n} tokens came from the cache", { n: fmt(cached) })
+  if (p.read == null) return p.mean != null ? t("Prefill {rate} tok/s mean", { rate: fmt(p.mean) }) : null
   if (p.read <= 0) return null
-  const tail = `${fmt(p.read)} tokens read${cached > 0 ? ` · ${fmt(cached)} from the cache` : ""}`
-  return p.mean != null ? `Prefill ${fmt(p.mean)} tok/s mean · ${tail}` : tail
+  const tail = cached > 0 ? t("{n} tokens read · {cached} from the cache", { n: fmt(p.read), cached: fmt(cached) }) : t("{n} tokens read", { n: fmt(p.read) })
+  return p.mean != null ? t("Prefill {rate} tok/s mean · {tail}", { rate: fmt(p.mean), tail }) : tail
 }
