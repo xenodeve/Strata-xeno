@@ -33,6 +33,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/platform/crash_report.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -1591,6 +1592,7 @@ struct ExitTrace {
 };
 
 int main(int argc, char** argv) {
+    strata::platform::install_crash_report();   // #62 crash: where a crashed engine was, in its log
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
