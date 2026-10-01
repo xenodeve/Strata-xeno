@@ -262,3 +262,42 @@ html:lang(th) .t-reason-text { line-height: 1.8; }
 
 .side-in { animation: orb-fade 260ms var(--ease) backwards; }
 @media (prefers-reduced-motion: reduce) { .side-in { animation: none; } }
+
+/* ---- Code in an answer is coloured like an IDE (lib/highlight.ts; the classes are highlight.js's). The colours are VS Code's Light+ and Dark+,
+   as tokens that follow the app's theme, in the same three places as the other tokens. ---- */
+:root {
+  --syn-keyword: #0000ff; --syn-string: #a31515; --syn-comment: #008000; --syn-number: #098658; --syn-func: #795e26; --syn-type: #267f99;
+  --syn-var: #001080; --syn-attr: #0451a5; --syn-meta: #af00db; --syn-regexp: #811f3f; --syn-tag: #800000; --syn-add: #098658; --syn-del: #a31515;
+  --code-bg: color-mix(in srgb, var(--ink) 3.5%, var(--surface));
+}
+:root[data-theme="dark"] {
+  --syn-keyword: #569cd6; --syn-string: #ce9178; --syn-comment: #6a9955; --syn-number: #b5cea8; --syn-func: #dcdcaa; --syn-type: #4ec9b0;
+  --syn-var: #9cdcfe; --syn-attr: #9cdcfe; --syn-meta: #c586c0; --syn-regexp: #d16969; --syn-tag: #569cd6; --syn-add: #b5cea8; --syn-del: #ce9178;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --syn-keyword: #569cd6; --syn-string: #ce9178; --syn-comment: #6a9955; --syn-number: #b5cea8; --syn-func: #dcdcaa; --syn-type: #4ec9b0;
+    --syn-var: #9cdcfe; --syn-attr: #9cdcfe; --syn-meta: #c586c0; --syn-regexp: #d16969; --syn-tag: #569cd6; --syn-add: #b5cea8; --syn-del: #ce9178;
+  }
+}
+.code-block pre { background: var(--code-bg); }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-symbol, .hljs-bullet, .hljs-doctag { color: var(--syn-keyword); }
+.hljs-string, .hljs-template-variable { color: var(--syn-string); }
+.hljs-comment, .hljs-quote { color: var(--syn-comment); font-style: italic; }
+.hljs-number { color: var(--syn-number); }
+.hljs-built_in, .hljs-title, .hljs-title.function_, .hljs-function { color: var(--syn-func); }
+.hljs-title.class_, .hljs-title.class_.inherited__, .hljs-type, .hljs-class .hljs-title { color: var(--syn-type); }
+.hljs-variable, .hljs-params, .hljs-property, .hljs-subst { color: var(--syn-var); }
+.hljs-subst { color: inherit; }
+.hljs-attr, .hljs-attribute, .hljs-selector-attr, .hljs-selector-pseudo { color: var(--syn-attr); }
+.hljs-meta, .hljs-meta .hljs-keyword, .hljs-meta-keyword { color: var(--syn-meta); }
+.hljs-meta .hljs-string, .hljs-meta-string { color: var(--syn-string); }
+.hljs-regexp { color: var(--syn-regexp); }
+.hljs-tag, .hljs-name, .hljs-selector-class, .hljs-selector-id { color: var(--syn-tag); }
+.hljs-tag .hljs-attr { color: var(--syn-attr); }
+.hljs-section { color: var(--syn-keyword); font-weight: 600; }
+.hljs-link { color: var(--syn-attr); text-decoration: underline; }
+.hljs-addition { color: var(--syn-add); background: color-mix(in srgb, var(--syn-add) 14%, transparent); }
+.hljs-deletion { color: var(--syn-del); background: color-mix(in srgb, var(--syn-del) 14%, transparent); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }

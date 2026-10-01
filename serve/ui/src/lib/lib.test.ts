@@ -24,7 +24,10 @@ describe("markdown", () => {
     expect(tag.match(/=/g)!.length).toBe(3 + 1)                   // href, target, rel + the escaped "=" inside the href
   })
   test("an unfinished code fence still renders while streaming", () => {
-    expect(markdown("```py\nprint(1)")).toContain("<pre><code>print(1)</code></pre>")
+    const html = markdown("```py\nprint(1)")
+    expect(html).toMatch(/<pre><code[^>]*>.*<\/code><\/pre>/s)
+    expect(html.replace(/<[^>]+>/g, "")).toContain("print(1)")           // coloured (lib/markdown.test.ts), and the text is the same
+    expect(markdown("```\nprint(1)")).toContain("<pre><code>print(1)</code></pre>")      // with no language it stays plain
   })
   test("a horizontal rule needs three of the same mark", () => {
     expect(markdown("---")).toContain("<hr>")

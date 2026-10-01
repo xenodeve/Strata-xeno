@@ -1,5 +1,8 @@
 // Markdown for the chat: the text is escaped first, then formatted (the classic app's renderer, ported as it was).
-// Output is an HTML string for dangerouslySetInnerHTML; nothing but this module's own tags can appear in it.
+// Output is an HTML string for dangerouslySetInnerHTML; nothing but this module's own tags (and, inside a code block, the highlighter's
+// own <span class="hljs-..."> around text it has escaped) can appear in it.
+import { highlight } from "./highlight"
+
 const esc = (s: string) =>
   String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!)
 
@@ -13,10 +16,11 @@ function inline(s: string): string {
   return s.replace(/\u0000(\d+)\u0000/g, (_, i: string) => `<code class="inline">${esc(codes[+i])}</code>`)
 }
 
-function codeBlock(lang: string, code: string): string {
+function codeBlock(lang: string, code: string, open = false): string {
+  const coloured = highlight(lang, code, open)                  // null: no language, one that is not known, or too long: plain
   return `<div class="code-block"><div class="code-head"><span>${esc(lang || "code")}</span>` +
     `<button type="button" data-code-copy aria-label="Copy code">Copy</button></div>` +
-    `<pre><code>${esc(code)}</code></pre></div>`
+    `<pre><code${coloured === null ? "" : ' class="hljs"'}>${coloured ?? esc(code)}</code></pre></div>`
 }
 
 function blocks(text: string): string {
@@ -75,7 +79,7 @@ export function markdown(text: string): string {
     html += blocks(rest.slice(0, m.index))
     rest = rest.slice(m.index! + m[0].length)
     const end = rest.match(/(^|\n)```[ \t]*(\n|$)/)
-    if (!end) { html += codeBlock(m[2].trim(), rest); break }          // still streaming
+    if (!end) { html += codeBlock(m[2].trim(), rest, true); break }          // still streaming
     html += codeBlock(m[2].trim(), rest.slice(0, end.index))
     rest = rest.slice(end.index! + end[0].length)
   }

@@ -916,4 +916,43 @@ export const checks = [
       await th.context().close()
     },
   },
+  {
+    // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
+    name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
+    async run({ browser, fast, t, errors }) {
+      const want = {
+        light: { builtin: "rgb(121, 94, 38)", number: "rgb(9, 134, 88)" },          // VS Code Light+: function, number
+        dark: { builtin: "rgb(220, 220, 170)", number: "rgb(181, 206, 168)" },      // Dark+
+      }
+      const got = {}
+      for (const scheme of ["light", "dark"]) {
+        const ctx = await browser.newContext({ viewport: { width: 1000, height: 760 }, colorScheme: scheme })
+        await ctx.grantPermissions(["clipboard-read", "clipboard-write"], { origin: fast.base })
+        await ctx.addInitScript(() => { try { localStorage.setItem("strata.lang", JSON.stringify("en")) } catch { /* private window */ } })
+        const pg = await ctx.newPage()
+        pg.on("pageerror", (e) => errors.push(`pageerror: ${e}`))
+        pg.on("console", (m) => m.type() === "error" && errors.push(`console: ${m.text()}`))
+        await pg.goto(fast.base + "/#/chat")
+        await pg.waitForSelector("textarea")
+        await send(pg, "show code")
+        const colours = await pg.evaluate(() => {
+          const c = (sel) => { const e = document.querySelector(`.code-block code ${sel}`); return e ? getComputedStyle(e).color : null }
+          const base = getComputedStyle(document.querySelector(".code-block code")).color
+          return { base, builtin: c(".hljs-built_in"), number: c(".hljs-number"), marked: !!document.querySelector(".code-block code.hljs"), bg: getComputedStyle(document.querySelector(".code-block pre")).backgroundColor }
+        })
+        got[scheme] = colours
+        t.ok(`${scheme}: the code is coloured (function and number in the theme's colours, not the text colour)`, colours.marked && colours.builtin === want[scheme].builtin && colours.number === want[scheme].number && colours.builtin !== colours.base, JSON.stringify(colours))
+        if (scheme === "dark") {
+          await pg.click("[data-code-copy]")
+          await pg.waitForTimeout(300)
+          const copied = await pg.evaluate(() => navigator.clipboard.readText())
+          t.ok("Copy copies the code as plain text, with no markup", copied === "print(1)", JSON.stringify(copied))
+          const sel = await pg.evaluate(() => document.querySelector(".code-block code").textContent)
+          t.ok("and the text of the block is the code, nothing added", sel === "print(1)", JSON.stringify(sel))
+        }
+        await ctx.close()
+      }
+      t.ok("the two themes use different colours", got.light.builtin !== got.dark.builtin && got.light.bg !== got.dark.bg)
+    },
+  },
 ]
