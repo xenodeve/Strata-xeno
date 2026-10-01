@@ -838,7 +838,7 @@ class Service:
         self.model_info = None                          # the model's name and quantization, from its GGUF headers (main() fills it)
         self.keep_prompts = 0                           # POST /metrics/keep: the next N requests keep their full prompt (Q8)
         self.keep_lock = threading.Lock()
-        self.ui = "classic"                             # which web app "/" serves; config "ui": "next" for the new one
+        self.ui = "next"                                # which web app "/" serves: the new one; config "ui": "classic" brings the old one back
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0}
@@ -1942,7 +1942,7 @@ def make_handler(svc: Service):
             rel = None                                       # the path inside dist/, when this request is for the new app
             if p.startswith("/next/"):
                 rel = p[len("/next/"):]
-            elif getattr(svc, "ui", "classic") == "next":    # config "ui": "next": the new app at / (its assets at /assets/)
+            elif getattr(svc, "ui", "next") == "next":       # the new app at / unless the config says "ui": "classic" (its assets at /assets/)
                 if p == "/":
                     rel = ""
                 elif p.startswith("/assets/"):
@@ -2429,6 +2429,11 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
+def ui_choice(cfg: dict) -> str:
+    """Which web app `/` serves: the new one, unless the run config says `"ui": "classic"` (the classic app is at /classic/ either way)."""
+    return "classic" if (cfg or {}).get("ui") == "classic" else "next"
+
+
 SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection")
 
 
@@ -2668,7 +2673,7 @@ def main() -> int:
     def _model_info(files=gguf_info.files_from_args(list(cfg.get("args") or []))):
         svc.model_info = gguf_info.model_info(files)        # reads headers only (~0.1 s); a model with no GGUF gives None
     threading.Thread(target=_model_info, daemon=True).start()
-    svc.ui = "next" if cfg.get("ui") == "next" else "classic"          # xeno UI S2: "/" serves the new web app
+    svc.ui = ui_choice(cfg)                                            # which web app "/" serves (xeno UI)
     svc.gpu_indices = monitor_gpus(cfg)               # every card the engine can see (issue #112; UI S0: no "gpu" key)
     svc.gpu_index = (svc.gpu_indices or [0])[0]         # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time

@@ -69,10 +69,13 @@ class Routes(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, e.headers, e.read()
 
-    def test_root_is_still_the_classic_app(self):
+    def test_root_is_the_new_app_by_default(self):
         code, _, body = self.get("/")
         self.assertEqual(code, 200)
-        self.assertIn(b'"web/app.js"', body)
+        self.assertIn(b'id="root"', body)
+        self.assertNotIn(b'"web/app.js"', body)
+        asset = next((UI / "dist" / "assets").glob("*.js")).name
+        self.assertEqual(self.get("/assets/" + asset)[0], 200)            # its relative asset URLs land at the root
 
     def test_classic_is_the_same_app_under_a_prefix(self):
         code, _, body = self.get("/classic/")
@@ -112,19 +115,24 @@ class Routes(unittest.TestCase):
         font = next((UI / "dist" / "assets").glob("*.woff2")).name
         self.assertEqual(self.get("/next/assets/" + font)[1]["Content-Type"], "font/woff2")
 
-    def test_the_config_can_serve_the_new_app_at_root(self):
-        self.assertEqual(self.svc.ui, "classic")                          # the default until the Monitor has a successor
-        self.svc.ui = "next"
+    def test_the_new_app_is_the_default_and_assets_stay_inside_dist(self):
+        self.assertEqual(self.svc.ui, "next")                             # chat parity is reached: a plain start serves the new app
+        self.assertEqual(self.get("/assets/..%2Fx.js")[0], 404)
+        self.assertIn(b'"web/app.js"', self.get("/classic/")[2])          # the classic app is still there
+
+    def test_the_config_can_bring_the_classic_app_back_at_root(self):
+        from serve.server import ui_choice
+        self.assertEqual((ui_choice({}), ui_choice({"ui": "next"}), ui_choice({"ui": "classic"}), ui_choice({"ui": "other"})),
+                         ("next", "next", "classic", "next"))
+        self.svc.ui = ui_choice({"ui": "classic"})
         try:
-            code, headers, body = self.get("/")
+            code, _, body = self.get("/")
             self.assertEqual(code, 200)
-            self.assertIn(b'id="root"', body)
-            asset = next((UI / "dist" / "assets").glob("*.js")).name
-            self.assertEqual(self.get("/assets/" + asset)[0], 200)        # its relative asset URLs land at the root
-            self.assertEqual(self.get("/assets/..%2Fx.js")[0], 404)
-            self.assertIn(b'"web/app.js"', self.get("/classic/")[2])      # the classic app is still there
+            self.assertIn(b'"web/app.js"', body)
+            self.assertEqual(self.get("/web/app.js")[0], 200)
+            self.assertIn(b'id="root"', self.get("/next/")[2])            # the new app keeps its own address
         finally:
-            self.svc.ui = "classic"
+            self.svc.ui = "next"
 
     def test_next_serves_only_dist(self):
         for path in ("/next/assets/..%2F..%2Fpackage.json", "/next/assets/..%5C..%5Cpackage.json", "/next/package.json",

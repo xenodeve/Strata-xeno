@@ -900,7 +900,7 @@ class WebApp(unittest.TestCase):
             return e.code, e.headers.get("Content-Type", ""), e.read()
 
     def test_page_and_files(self):
-        code, ctype, body = self.get("/")
+        code, ctype, body = self.get("/classic/")                  # the classic app, which "/" no longer is by default
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
         self.assertIn(b"\"web/app.js\"", body)   # relative since #82 (works behind a path-prefixed proxy)
