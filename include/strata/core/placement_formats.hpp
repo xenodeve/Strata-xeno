@@ -3,7 +3,9 @@
 // The 4070 tier and the automatic exclusive-primary default need every layer in native Q2_0 (gate/up and down
 // type 42): the 4070's kernels and the bit-exact pool-hit parity exist for Q2_0 only.  An explicit
 // --exclusive-primary-experts (placement-first, and with it the --ram-cache-gib NVMe tier) only needs the primary
-// GPU and the CPU pool to compute every layer's formats natively.
+// GPU and the CPU pool to compute every layer's formats natively.  The CPU side holds for any layout that loaded:
+// expert_layout.cpp refuses a layer whose types ggml-cpu has no vec_dot for (native_fmt), so `supported` is the
+// GPU kernels' check alone.
 #pragma once
 
 #include <algorithm>
