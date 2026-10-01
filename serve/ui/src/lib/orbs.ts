@@ -67,3 +67,14 @@ export function latticePattern(phase: OrbDesign | null): LatticePattern {
   if (phase === "weaving") return "spiral"
   return "orbit"
 }
+
+export const ORB_DESIGNS: readonly OrbDesign[] = ["working", "searching", "solving", "listening", "connecting", "weaving", "composing", "breathing", "shaping"]
+
+/** The words for a form, for the orb's accessible name when it is shown for its own sake (the empty chat). */
+export const orbLabel = (d: OrbDesign) => d[0].toUpperCase() + d.slice(1)
+
+/** One of the other forms (any of the nine when none is shown yet); `r` in [0, 1) picks it. */
+export function nextDesign(prev: OrbDesign | null, r: number): OrbDesign {
+  const rest = ORB_DESIGNS.filter((d) => d !== prev)
+  return rest[Math.min(rest.length - 1, Math.floor(r * rest.length))]
+}

@@ -58,6 +58,8 @@ export interface ThinkingOrbProps extends Omit<CanvasHTMLAttributes<HTMLCanvasEl
     paused?: boolean;
     /** xeno patch, not in the upstream library: draw at most this many frames a second (the default is every display frame). */
     fps?: number;
+    /** xeno patch, not in the upstream library: draw the tuned `size` orb this many times bigger (the canvas is `size * scale` CSS px, drawn sharp). @default 1 */
+    scale?: number;
     /**
      * Optional ink tint — any `#rgb`, `#rrggbb` or `rgb()` color. The orb's
      * depth-shading ramp is preserved on the tint (fading toward black on

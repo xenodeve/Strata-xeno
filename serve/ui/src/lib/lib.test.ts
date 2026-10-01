@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { rootOf } from "./api"
-import { gpuDesign, latticePattern, replyDesign, serverDesign, toolDesign } from "./orbs"
+import { gpuDesign, latticePattern, nextDesign, ORB_DESIGNS, replyDesign, serverDesign, toolDesign } from "./orbs"
 import { clientName } from "./format"
 import { promptSplit } from "./metrics"
 import { apiMessages, type Message } from "./chat"
@@ -192,6 +192,16 @@ describe("which orb says what", () => {
     expect(replyDesign({ streaming: true, reasoning: "hm", text: "Hel", tools: [] })).toBe("composing")
     expect(replyDesign({ streaming: true, reasoning: "", text: "Hi", tools: [{ name: "x__read", state: "done" }] })).toBe("composing")
     expect(replyDesign({ streaming: false, reasoning: "", text: "Hi", tools: [] })).toBeNull()
+  })
+  test("the empty chat's orb picks another of the nine forms, never the one it has", () => {
+    expect(ORB_DESIGNS).toHaveLength(9)
+    for (const prev of ORB_DESIGNS) {
+      const seen = new Set<string>()
+      for (let i = 0; i < 100; i++) { const d = nextDesign(prev, i / 100); expect(d).not.toBe(prev); seen.add(d) }
+      expect(seen.size).toBe(8)                      // every other form can come up
+    }
+    expect(nextDesign("working", 0.999999)).toBe("shaping")
+    expect(nextDesign(null, 0)).toBe("working")      // nothing shown yet: any of the nine
   })
   test("the lattice beside a thought runs the pattern of what the agent is doing", () => {
     expect(latticePattern("solving")).toBe("orbit")

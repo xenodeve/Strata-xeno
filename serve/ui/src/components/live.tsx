@@ -7,15 +7,15 @@ const reduce = () => typeof matchMedia !== "undefined" && matchMedia("(prefers-r
 
 /** The server's state as a dotted orb: the searching globe turning slowly while idle, listening while a prompt is read, flowing while it writes.
  *  (vendor/thinking-orbs, MIT: it pauses itself offscreen and in a hidden tab, and is a still frame under reduced motion.) */
-export function StatusOrb({ live, stale = false, size = 64, override }: {
-  live: Pick<Live, "state" | "queued" | "tok_s">; stale?: boolean; size?: 64 | 32 | 20; override?: { design: OrbDesign; label: string }
+export function StatusOrb({ live, stale = false, size = 64, scale = 1, override }: {
+  live: Pick<Live, "state" | "queued" | "tok_s">; stale?: boolean; size?: 64 | 32 | 20; scale?: number; override?: { design: OrbDesign; label: string }
 }) {
   const look = serverDesign(live, stale)
   const label = stale ? "Not answering" : live.state === "reading" ? "Reading the prompt" : live.state === "generating" ? "Writing"
     : live.state === "unloaded" ? "Model unloaded" : (live.queued ?? 0) > 0 ? "Waiting in the queue" : "Idle"
   return override
-    ? <Orb design={override.design} size={size} moving label={override.label} />
-    : <Orb design={look.design} size={size} moving={look.moving} speed={look.speed} fps={look.fps} label={label} />
+    ? <Orb design={override.design} size={size} scale={scale} moving label={override.label} />
+    : <Orb design={look.design} size={size} scale={scale} moving={look.moving} speed={look.speed} fps={look.fps} label={label} />
 }
 
 /** A figure that glides to its new value (cubic ease-out, 500 ms) instead of jumping. Only moves when the value changes. */

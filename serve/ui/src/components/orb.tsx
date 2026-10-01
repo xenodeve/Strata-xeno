@@ -9,7 +9,7 @@ type Size = 64 | 32 | 20
 /** An orb in a fixed slot. When the design changes the old form dissolves (it swells a little and blurs away) while the new
  *  one resolves out of a blur (it settles from a little smaller), 450 ms, so a state change reads as one orb changing form,
  *  not two orbs swapped. */
-export function Orb({ design, size = 20, moving = true, label, color, speed = 1, fps }: { design: OrbDesign; size?: Size; moving?: boolean; label?: string; color?: string; speed?: number; fps?: number }) {
+export function Orb({ design, size = 20, moving = true, label, color, speed = 1, fps, scale = 1 }: { design: OrbDesign; size?: Size; moving?: boolean; label?: string; color?: string; speed?: number; fps?: number; scale?: number }) {
   const [shown, setShown] = useState(design)
   const [leaving, setLeaving] = useState<OrbDesign | null>(null)
   const was = useRef(design)
@@ -22,9 +22,9 @@ export function Orb({ design, size = 20, moving = true, label, color, speed = 1,
     return () => clearTimeout(t)
   }, [design])
   return (
-    <span className="orb-slot" style={{ width: size, height: size }}>
-      {leaving && <span className="orb-layer orb-out" aria-hidden><ThinkingOrb state={leaving} size={size} paused={!moving} color={color} speed={speed} fps={fps} /></span>}
-      <span key={shown} className="orb-layer orb-in"><ThinkingOrb state={shown} size={size} paused={!moving} {...(label ? { "aria-label": label } : { "aria-hidden": true, role: "presentation" })} color={color} speed={speed} fps={fps} /></span>
+    <span className="orb-slot" style={{ width: size * scale, height: size * scale }}>
+      {leaving && <span className="orb-layer orb-out" aria-hidden><ThinkingOrb state={leaving} size={size} paused={!moving} color={color} speed={speed} fps={fps} scale={scale} /></span>}
+      <span key={shown} className="orb-layer orb-in"><ThinkingOrb state={shown} size={size} paused={!moving} {...(label ? { "aria-label": label } : { "aria-hidden": true, role: "presentation" })} color={color} speed={speed} fps={fps} scale={scale} /></span>
     </span>
   )
 }

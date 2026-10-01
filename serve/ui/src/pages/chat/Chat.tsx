@@ -8,6 +8,7 @@ import { toast } from "../../components/toast"
 import { StatusOrb } from "../../components/live"
 import { PromptBar } from "../../components/PromptBar"
 import { useMetrics } from "../../lib/metrics"
+import { nextDesign, orbLabel, type OrbDesign } from "../../lib/orbs"
 import { MessageView } from "./Messages"
 import { SettingsSheet } from "./SettingsSheet"
 
@@ -17,6 +18,19 @@ const NO_MCP: McpInfo = { servers: [], tools: 0 }
 const EFFORTS: { label: string; value: Settings["thinking"] }[] = [
   { label: "Off", value: "none" }, { label: "Low", value: "low" }, { label: "Medium", value: "medium" }, { label: "High", value: "high" },
 ]
+
+/** The empty chat's orb shows a different one of the nine forms every 5 s while the server has nothing to do (`on`); when it
+ *  is busy, or the reader types, the orb goes back to saying what is really happening. */
+function useAmbientOrb(on: boolean, every = 5000): OrbDesign | null {
+  const [design, setDesign] = useState<OrbDesign | null>(null)
+  useEffect(() => {
+    if (!on) { setDesign(null); return }
+    setDesign((d) => nextDesign(d, Math.random()))
+    const id = setInterval(() => setDesign((d) => nextDesign(d, Math.random())), every)
+    return () => clearInterval(id)
+  }, [on, every])
+  return on ? design : null
+}
 
 export function Chat() {
   useChatVersion()
@@ -35,6 +49,8 @@ export function Chat() {
   const { data: metrics, stale } = useMetrics()
   const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
   const closeSheet = useCallback(() => setSheet(false), [])
+  const typing = text.trim() !== ""
+  const ambient = useAmbientOrb(chat.messages.length === 0 && !typing && !stale && live.state === "idle" && !(live.queued > 0))
   useEffect(() => { if (metrics) chat.samplePrefill(metrics.live, performance.now()) }, [metrics])      // each /metrics reply while a prompt is read
 
   useEffect(() => {
@@ -134,7 +150,7 @@ export function Chat() {
       <div ref={list} className="flex-1 space-y-6 pb-6" aria-live="off">
         {chat.messages.length === 0 && (
           <div className="mx-auto mt-[11vh] flex max-w-[44ch] flex-col items-center text-center">
-            <StatusOrb live={live} stale={stale} size={64} override={text.trim() ? { design: "listening", label: "Listening" } : undefined} />
+            <StatusOrb live={live} stale={stale} size={64} scale={2.5} override={typing ? { design: "listening", label: "Listening" } : ambient ? { design: ambient, label: orbLabel(ambient) } : undefined} />
             <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>What can I help with?</h1>
             <p className="lede mt-3">{health.model} runs on this PC. Nothing leaves it.</p>
           </div>

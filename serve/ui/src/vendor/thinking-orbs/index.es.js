@@ -653,6 +653,7 @@ function ThinkingOrb({
   speed = 1,
   paused = false,
   fps,
+  scale = 1,
   color,
   dots = 1,
   dotSize = 1,
@@ -677,8 +678,8 @@ function ThinkingOrb({
     const canvas = ref.current;
     if (!canvas) return;
     const dpr = Math.min(2, typeof devicePixelRatio !== "undefined" && devicePixelRatio || 1);
-    canvas.width = Math.round(size * dpr);
-    canvas.height = Math.round(size * dpr);
+    canvas.width = Math.round(size * scale * dpr);      // xeno: `scale` draws the tuned size-N orb bigger, as vectors, not as a stretched bitmap
+    canvas.height = Math.round(size * scale * dpr);
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const { mode, speed: baseSpeed, opts: presetOpts } = resolvePreset(state, size);
@@ -689,7 +690,7 @@ function ThinkingOrb({
     const tint = parseTint(color);
     const effSpeed = baseSpeed * speed;
     const frame = (tSec) => {
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
       ctx.clearRect(0, 0, size, size);
       paintFrame(ctx, frameFn(size, tSec, opts), dark, tint);
     };
@@ -736,14 +737,14 @@ function ThinkingOrb({
       io == null ? void 0 : io.disconnect();
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [state, size, dark, speed, paused, fps, reduced, color, dots, dotSize, optsKey, customFrame]);
+  }, [state, size, dark, speed, paused, fps, scale, reduced, color, dots, dotSize, optsKey, customFrame]);
   return /* @__PURE__ */ jsx(
     "canvas",
     {
       ref,
       role: "img",
       "aria-label": ariaLabel ?? LABELS[state],
-      style: { width: size, height: size, display: "block", ...style },
+      style: { width: size * scale, height: size * scale, display: "block", ...style },
       ...rest
     }
   );
