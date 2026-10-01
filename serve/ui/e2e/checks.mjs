@@ -740,4 +740,41 @@ export const checks = [
       await ph.context().close()
     },
   },
+  {
+    // when a status ends it gives way smoothly: "Thinking…" to "Thought for 2.4s" (the shimmer goes on while it fades, no pop), and
+    // "Answering…" to the figures under the answer (the status leaves as they arrive); measured frame by frame
+    name: "handover: the live status gives way to what it becomes without a jump",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors)
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea")
+      await pg.waitForTimeout(1200)
+      await pg.evaluate(() => {
+        window.__f = []
+        const num = (e) => (e ? +getComputedStyle(e).opacity : null)
+        const tick = () => {
+          const w = document.querySelector(".thought-text:not(.thought-text--done)"), d = document.querySelector(".thought-text--done")
+          const sh = document.querySelector(".thought-shimmer"), o = document.querySelector(".handover-out"), i = document.querySelector(".handover-in")
+          window.__f.push({ w: num(w), d: num(d), fill: sh ? getComputedStyle(sh).webkitTextFillColor : null, wy: w ? getComputedStyle(w).transform : null, o: num(o), i: num(i), it: i ? i.textContent : null })
+          window.__raf = requestAnimationFrame(tick)
+        }
+        tick()
+      })
+      await pg.fill("textarea", "hi")
+      await pg.keyboard.press("Enter")
+      await finished(pg)
+      await pg.waitForTimeout(900)
+      const f = await pg.evaluate(() => { cancelAnimationFrame(window.__raf); return window.__f })
+      const mid = (k) => f.filter((x) => x[k] != null && x[k] > 0.05 && x[k] < 0.95)
+      const transparent = (s) => s === "rgba(0, 0, 0, 0)"
+      t.ok("Thinking… fades over several frames while Thought for… arrives", mid("w").length >= 4 && f.filter((x) => x.d != null && x.d > 0.05 && x.d < 0.7).length >= 4, `work ${mid("w").length}, done ${f.filter((x) => x.d != null && x.d > 0.05 && x.d < 0.7).length} frames`)
+      t.ok("the shimmer goes on while Thinking… fades: it does not turn into a solid word first", mid("w").length > 0 && mid("w").every((x) => transparent(x.fill)), JSON.stringify(mid("w").slice(0, 2).map((x) => x.fill)))
+      t.ok("Thinking… rises a little as it leaves", mid("w").some((x) => x.wy && x.wy !== "none" && x.wy !== "matrix(1, 0, 0, 1, 0, 0)"), JSON.stringify(mid("w")[0]?.wy))
+      t.ok("Answering… leaves over several frames while the figures arrive", mid("o").length >= 4 && mid("i").length >= 4, `status ${mid("o").length}, figures ${mid("i").length} frames`)
+      t.ok("for a moment both are on screen (a handover, not a gap)", f.some((x) => x.o != null && x.o > 0.05 && x.i != null && x.i > 0.05))
+      const last = f[f.length - 1]
+      t.ok("in the end the figures are there, with the speed, and the status is gone", last.o == null && last.i === 1 && /tok\/s/.test(last.it || ""), JSON.stringify([last.o, last.i, last.it]))
+      await pg.context().close()
+    },
+  },
 ]

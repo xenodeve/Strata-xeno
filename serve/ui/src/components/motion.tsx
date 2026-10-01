@@ -10,7 +10,7 @@ export const SOFT_MS = 520
 
 /** Mounted while open and for the length of the closing animation: a body that is expensive to build (a 20,000
  *  character tool result) exists only while it is visible. */
-function useMounted(open: boolean, ms: number) {
+export function useMounted(open: boolean, ms: number) {
   const [mounted, setMounted] = useState(open)
   useEffect(() => {
     if (open) { setMounted(true); return }
@@ -117,4 +117,19 @@ export function GlidePanel({ children, className, inner = "", cap, ...rest }: { 
  *  edit of the text, so a counter inside the label does not flicker. */
 export function Swap({ k, children }: { k: string; children: ReactNode }) {
   return <span key={k} className="swap-in inline-block">{children}</span>
+}
+
+/** A live status that gives way to what it becomes (the speed under an answer once it is written): the figures arrive from a little
+ *  below while the status keeps its place, fading, blurring and rising away. `live` null ends the status; it is unmounted when the
+ *  fade is done. The status is out of the flow, so what follows the figures does not move when it goes. */
+export function Handover({ live, children }: { live: ReactNode | null; children: ReactNode }) {
+  const last = useRef<ReactNode>(live)
+  if (live != null) last.current = live
+  const mounted = useMounted(live != null, 460)
+  return (
+    <span className="handover">
+      <span className="handover-in" data-show={live == null ? "" : undefined}>{children}</span>
+      {mounted && <span className="handover-out" data-show={live != null ? "" : undefined}>{last.current}</span>}
+    </span>
+  )
 }

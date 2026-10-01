@@ -3,7 +3,7 @@ import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, Copy01Icon, AttachmentIcon, PencilEdit01Icon, Undo02Icon } from "@hugeicons/core-free-icons"
 import { chat, metaText, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
-import { Collapse, Fit } from "../../components/motion"
+import { Collapse, Fit, Handover } from "../../components/motion"
 import { Orb, StatusLabel } from "../../components/orb"
 import { latticePattern, phaseKind, replyDesign, toolDesign, type OrbDesign } from "../../lib/orbs"
 import { useAvatar } from "../../lib/avatar"
@@ -220,9 +220,10 @@ export function MessageView({ m, streaming, show, prefill, actions, serverPhase 
         <div className={cn(streaming && "streaming")}><Answer m={m} /></div>
       )}
       <div className="mt-1 flex min-h-6 items-center gap-2 text-[12px] text-ink-3">
-        {phase === "composing" ? <StatusLabel design="composing" className="text-[13px] text-ink-2">{t("Answering…")}</StatusLabel>
-          : phase === "weaving" ? <StatusLabel design="weaving" className="text-[13px] text-ink-2">{t("Planning the next step…")}</StatusLabel>
-          : <span className="num">{metaText(m) || (streaming ? "" : m.stopped ? t("Stopped") : "")}</span>}
+        <Handover live={phase === "composing" ? <StatusLabel design="composing" className="text-[13px] text-ink-2">{t("Answering…")}</StatusLabel>
+          : phase === "weaving" ? <StatusLabel design="weaving" className="text-[13px] text-ink-2">{t("Planning the next step…")}</StatusLabel> : null}>
+          <span className="num">{metaText(m) || (streaming ? "" : m.stopped ? t("Stopped") : "")}</span>
+        </Handover>
         {!streaming && !!m.text && (
           <button
             type="button"

@@ -19,21 +19,23 @@
 @keyframes lat-on-35 { 0%, 100% { opacity: var(--lat-idle); } 10%, 24% { opacity: 1; } 35% { opacity: var(--lat-idle); } }
 
 /* ---- the thought line: shimmering label while it thinks, "Thought for 2.4s" once it has ---- */
-.thought { --th-settle: 350ms; --th-done: 0.75; --th-timer: 0.55; color: var(--ink); font-size: 13px; font-weight: 500; line-height: 1.2; }
+.thought { --th-settle: 450ms; --th-done: 0.75; --th-timer: 0.55; color: var(--ink); font-size: 13px; font-weight: 500; line-height: 1.2; }
 .thought-head { display: inline-flex; align-items: center; gap: 0.5em; padding: 0.25rem 0; border-radius: var(--radius-sm, 6px); color: inherit; font: inherit; text-align: left; white-space: nowrap; cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .thought-glyph { display: inline-flex; flex: none; align-items: center; }
 .thought-label { display: inline-grid; }
-.thought-text { grid-area: 1 / 1; width: max-content; opacity: 0; filter: blur(2px); transition: opacity var(--th-settle) var(--ease), filter var(--th-settle) var(--ease); }
-.thought-text[data-active] { opacity: 1; filter: blur(0); }
+.thought-text { grid-area: 1 / 1; width: max-content; opacity: 0; filter: blur(2px); transform: translateY(-3px); transition: opacity var(--th-settle) var(--ease), filter var(--th-settle) var(--ease), transform var(--th-settle) var(--ease); }
+.thought-text--done { transform: translateY(3px); }                    /* the words that arrive come up from below, those that leave go up */
+.thought-text[data-active] { opacity: 1; filter: blur(0); transform: none; }
 .thought-text--done[data-active] { opacity: var(--th-done); }
 .thought-shimmer { display: inline-block; }
-.thought[data-working] .thought-shimmer {
+.thought-shimmer {
   background: linear-gradient(100deg, color-mix(in srgb, var(--ink) 50%, transparent) 30%, var(--ink) 50%, color-mix(in srgb, var(--ink) 50%, transparent) 70%);
   background-size: 250% 100%; background-position: 125% 0;
   -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; color: transparent;
   animation: thought-shimmer 1.8s linear infinite;
 }
 @keyframes thought-shimmer { to { background-position: -125% 0; } }
+.thought:not([data-working]) .thought-shimmer { animation-play-state: paused; }       /* it stops where it is: the words fade out still shimmering, they do not turn solid first */
 .thought-timer { opacity: var(--th-timer); transition: opacity var(--th-settle) ease, transform var(--th-settle) cubic-bezier(0.77, 0, 0.175, 1); }
 .thought-timer[data-done] { opacity: var(--th-done); }
 .thought-chevron { flex: none; margin-left: 0.1em; opacity: 0.55; transition: transform 200ms var(--ease), rotate 200ms var(--ease); }
@@ -41,7 +43,7 @@
 @media (prefers-reduced-motion: reduce) {
   .lat-run .lat-cell { animation-delay: 0ms !important; animation-duration: 1400ms !important; }
   .lat-mark { transform: none; }
-  .thought-text { filter: none; }
-  .thought[data-working] .thought-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; color: inherit; }
+  .thought-text { filter: none; transform: none; }
+  .thought-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; color: inherit; }
 }
 .lat[data-paused] .lat-run .lat-cell { animation-play-state: paused; }
