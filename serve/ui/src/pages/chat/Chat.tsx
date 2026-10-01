@@ -2,24 +2,20 @@ import { useCallback, useEffect, useRef, useState, type DragEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon } from "@hugeicons/core-free-icons"
 import { apiHeaders, getHealth, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
-import { chat, exportMarkdown, useChatVersion, type Attachment, type Message, type Settings } from "../../lib/chat"
+import { chat, exportMarkdown, useChatVersion, type Attachment, type Message } from "../../lib/chat"
 import { readFiles } from "../../lib/files"
 import { cn } from "../../lib/cn"
 import { toast } from "../../components/toast"
 import { StatusOrb } from "../../components/live"
 import { PromptBar } from "../../components/PromptBar"
 import { useMetrics } from "../../lib/metrics"
+import { effortChoices, settleEffort } from "../../lib/effort"
 import { nextDesign, type OrbDesign } from "../../lib/orbs"
 import { msg, t } from "../../lib/i18n"
 import { MessageView } from "./Messages"
 import { SettingsSheet } from "./SettingsSheet"
 
 const NO_MCP: McpInfo = { servers: [], tools: 0 }
-
-// The thinking levels the chat offers, as the server's reasoning_effort names them.
-const EFFORTS: { label: string; value: Settings["thinking"] }[] = [
-  { label: msg("Off"), value: "none" }, { label: msg("Low"), value: "low" }, { label: msg("Medium"), value: "medium" }, { label: msg("High"), value: "high" },
-]
 
 // The orb's accessible name in the empty chat: one of the nine forms, as words.
 const ORB_NAMES: Record<OrbDesign, string> = {
@@ -78,6 +74,16 @@ export function Chat() {
   const { data: metrics, stale } = useMetrics()
   const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
   const closeSheet = useCallback(() => setSheet(false), [])
+  // The thinking levels are the model's: what its template accepts, as the server lists them. A level saved for another model
+  // (or "high" where this one calls it "xhigh") is moved onto one this model has.
+  const offered = (metrics?.engine.efforts as string[] | undefined) ?? []
+  const choices = effortChoices(offered)
+  const offeredKey = offered.join(",")
+  useEffect(() => {
+    const now = settleEffort(chat.settings.thinking, offered, metrics?.engine.effort_default as string | null | undefined)
+    if (now !== chat.settings.thinking) chat.setSettings({ ...chat.settings, thinking: now })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [offeredKey])
   const typing = text.trim() !== ""
   const ambient = useAmbientOrb(chat.messages.length === 0 && !typing && !stale && live.state === "idle" && !(live.queued > 0))
   useEffect(() => { if (metrics) chat.samplePrefill(metrics.live, performance.now()) }, [metrics])      // each /metrics reply while a prompt is read
@@ -235,9 +241,9 @@ export function Chat() {
           onNewChat={newChat}
           onSave={download}
           onSampling={() => setSheet(true)}
-          efforts={EFFORTS.map((e) => t(e.label))}
-          effort={Math.max(0, EFFORTS.findIndex((e) => e.value === chat.settings.thinking))}
-          onEffort={(i) => chat.setSettings({ ...chat.settings, thinking: EFFORTS[i].value })}
+          efforts={choices.map((c) => t(c.label))}
+          effort={Math.max(0, choices.findIndex((c) => c.value === chat.settings.thinking))}
+          onEffort={(i) => chat.setSettings({ ...chat.settings, thinking: choices[i].value })}
           attachTitle={health.images ? t("Text files and pictures") : t("Text files")}
           dragging={dragging}
         >
@@ -254,7 +260,7 @@ export function Chat() {
         </PromptBar>
       </div>
 
-      <SettingsSheet open={sheet} onClose={closeSheet} mcp={mcp} projectionLoaded={projection} />
+      <SettingsSheet open={sheet} onClose={closeSheet} efforts={choices} mcp={mcp} projectionLoaded={projection} />
     </section>
   )
 }

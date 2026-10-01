@@ -74,6 +74,7 @@ export const part: Record<string, string> = {
   "Low": "ต่ำ",
   "Medium": "กลาง",
   "High": "สูง",
+  "XHigh": "สูงมาก",
   "Working": "ทำงาน",
   "Searching": "กำลังค้นหา",
   "Solving": "กำลังแก้โจทย์",

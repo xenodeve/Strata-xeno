@@ -41,7 +41,7 @@ export function promptSplit(prompt: number, reused: number | null | undefined): 
 }
 
 export interface Metrics {
-  engine: Record<string, string | number | null>
+  engine: Record<string, string | number | string[] | null>
   live: Live
   requests: RequestRow[]
   requests_kept: number

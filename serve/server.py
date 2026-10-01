@@ -821,6 +821,7 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.efforts = template.efforts() if hasattr(template, "efforts") else {"levels": [], "default": None, "off": False}
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.restarting = False         # xeno #49 review: the engine is loading again (requests get 529 meanwhile)
@@ -1132,6 +1133,8 @@ class Service:
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
+                  "efforts": (["none"] if self.efforts["off"] else []) + self.efforts["levels"],      # what the model's template accepts
+                  "effort_default": self.efforts["default"],
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
@@ -2441,8 +2444,8 @@ def clean_shared_defaults(d) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
-                raise ValueError("reasoning_effort: none, low, medium or high")
+            if value not in ("none", "low", "medium", "high", "xhigh"):
+                raise ValueError("reasoning_effort: none, low, medium, high or xhigh")
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")

@@ -4,8 +4,9 @@ import { apiHeaders, url, type McpInfo } from "../../lib/api"
 import { toast } from "../../components/toast"
 import { Button, Field, inputCls, Segmented, Switch } from "../../components/ui"
 import { msg, t, tn } from "../../lib/i18n"
+import type { EffortChoice } from "../../lib/effort"
 
-const THINKING_TEXT: Record<Settings["thinking"], string> = { none: msg("answers right away"), low: msg("short"), medium: msg("medium"), high: msg("thorough (default)") }
+const THINKING_TEXT: Record<string, string> = { none: msg("answers right away"), low: msg("short"), medium: msg("medium"), high: msg("thorough (default)"), xhigh: msg("thorough (default)") }
 
 async function savedShared(): Promise<boolean> {
   try {
@@ -23,7 +24,7 @@ function sharedDefaults(s: Settings, projection: boolean) {
   return d
 }
 
-export function SettingsSheet({ open, onClose, mcp, projectionLoaded }: { open: boolean; onClose: () => void; mcp: McpInfo; projectionLoaded: boolean }) {
+export function SettingsSheet({ open, onClose, mcp, projectionLoaded, efforts }: { open: boolean; onClose: () => void; mcp: McpInfo; projectionLoaded: boolean; efforts: EffortChoice[] }) {
   const [s, setS] = useState<Settings>(chat.settings)
   const [shared, setShared] = useState(false)
   const [wasShared, setWasShared] = useState(false)
@@ -72,9 +73,9 @@ export function SettingsSheet({ open, onClose, mcp, projectionLoaded }: { open: 
           <Button kind="quiet" onClick={onClose} label={t("Close")}>{t("Close")}</Button>
         </div>
         <div className="flex-1 overflow-y-auto px-5 pb-4">
-          <Field label={t("Thinking")} value={t(THINKING_TEXT[s.thinking])}>
+          <Field label={t("Thinking")} value={THINKING_TEXT[s.thinking] ? t(THINKING_TEXT[s.thinking]) : s.thinking}>
             <Segmented label={t("Thinking")} value={s.thinking} onChange={(v) => patch({ thinking: v })}
-              options={[{ value: "none", label: t("Off") }, { value: "low", label: t("Low") }, { value: "medium", label: t("Medium") }, { value: "high", label: t("High") }]} />
+              options={efforts.map((e) => ({ value: e.value, label: t(e.label) }))} />
           </Field>
           <Switch label={t("Show the thinking while it streams")} checked={s.show} onChange={(v) => patch({ show: v })} />
           <Switch label={t("Show the prompt reading speed under each prompt")} checked={s.prefill} onChange={(v) => patch({ prefill: v })} />

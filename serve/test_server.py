@@ -2314,5 +2314,42 @@ class HealthTellsACrashFromAnUnload(unittest.TestCase):
         status, body = self.health(crashed=False)
         self.assertEqual((status, body["status"], body["loaded"]), (200, "ok", False))
 
+class EffortLevelsTests(unittest.TestCase):
+    """The thinking levels a model's chat template accepts, so a client offers those and no others (the shipped template:
+    low, medium and xhigh, which is also its default, and no thinking at all)."""
+
+    def template(self, source):
+        d = tempfile.mkdtemp(prefix="strata-tpl-")
+        p = Path(d) / "t.jinja"
+        p.write_text(source, encoding="utf-8")
+        return ChatTemplate(p)
+
+    def test_the_shipped_template_offers_low_medium_xhigh_and_off(self):
+        t = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        self.assertEqual(t.efforts(), {"levels": ["low", "medium", "xhigh"], "default": "xhigh", "off": True})
+
+    def test_a_template_that_knows_no_effort_offers_none(self):
+        t = self.template("{{ messages[0].content }}")
+        self.assertEqual(t.efforts(), {"levels": [], "default": None, "off": False})
+
+    def test_levels_are_what_it_renders_without_an_error(self):
+        t = self.template("{% set e = reasoning_effort|default('high') %}{% if e not in ('low', 'high') %}"
+                          "{{ raise_exception('no') }}{% endif %}{{ e }}:{{ messages[0].content }}")
+        self.assertEqual(t.efforts(), {"levels": ["low", "high"], "default": "high", "off": False})
+
+    def test_metrics_lists_them_for_the_client(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        eng = svc.metrics()["engine"]
+        self.assertEqual(eng["efforts"], ["none", "low", "medium", "xhigh"])
+        self.assertEqual(eng["effort_default"], "xhigh")
+
+    def test_other_apps_may_be_given_xhigh_as_their_default(self):
+        from serve.server import clean_shared_defaults
+        self.assertEqual(clean_shared_defaults({"reasoning_effort": "xhigh"}), {"reasoning_effort": "xhigh"})
+        with self.assertRaises(ValueError):
+            clean_shared_defaults({"reasoning_effort": "extreme"})
+
+
 if __name__ == "__main__":
     unittest.main()

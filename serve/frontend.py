@@ -48,6 +48,28 @@ class ChatTemplate:
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
+    def efforts(self) -> dict:
+        """The thinking levels this template accepts, found by rendering a one-line chat at each: {"levels": [...] (a level
+        another one renders the same as, like "high" for "xhigh", is left out), "default": the level a request with none
+        gets, "off": whether enable_thinking=false changes the prompt}.  A template that knows no effort gives no levels."""
+        chat = [{"role": "user", "content": "hi"}]
+
+        def rendered(**kw):
+            try:
+                return self.render(chat, **kw)
+            except Exception:  # noqa: BLE001 - a level the template refuses (raise_exception) is one it does not offer
+                return None
+
+        base = rendered()
+        if base is None or "reasoning_effort" not in self.source:
+            return {"levels": [], "default": None, "off": False}
+        got = [(lvl, rendered(reasoning_effort=lvl)) for lvl in ("low", "medium", "high", "xhigh")]
+        got = [(lvl, r) for lvl, r in got if r is not None]
+        kept = [(lvl, r) for i, (lvl, r) in enumerate(got) if all(r != later for _, later in got[i + 1:])]
+        default = next((lvl for lvl, r in kept if r == base), None)
+        off = "enable_thinking" in self.source and rendered(enable_thinking=False) not in (None, base)
+        return {"levels": [lvl for lvl, _ in kept], "default": default, "off": off}
+
 
 # ------------------------------------------------------------------------------------------------ requests
 def _text_of(content) -> str:

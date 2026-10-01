@@ -44,7 +44,7 @@ export function metaText(m: Message): string {
   return parts.join(" · ")
 }
 export interface Settings {
-  thinking: "none" | "low" | "medium" | "high"; temperature: number; top_p: number; top_k: number
+  thinking: string; temperature: number; top_p: number; top_k: number
   max: string; seed: string; show: boolean; esp: boolean; mcp: boolean; prefill: boolean
 }
 export const DEFAULTS: Settings = { thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, prefill: true }
