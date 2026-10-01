@@ -93,6 +93,18 @@ export function Chat() {
     const onTouchStart = (e: TouchEvent) => { touchY = e.touches[0].clientY }
     const onTouchMove = (e: TouchEvent) => { if (e.touches[0].clientY > touchY + 6) release() }        // a finger moving down scrolls up
     const onKey = (e: globalThis.KeyboardEvent) => { if (["ArrowUp", "PageUp", "Home"].includes(e.key) && !(e.target as HTMLElement)?.closest("textarea")) release() }
+    // Opening or closing a part of the conversation (the thinking, a tool call) changes the list's height: that must not be
+    // followed like new text, or the page scrolls with it and the part seems to open upward. The reader chose to look at it,
+    // so the follow lets go for the length of the animation, then holds again only if the reader is still at the end.
+    let settle = 0
+    const onToggle = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement)?.closest?.("[aria-expanded]") || !list.current?.contains(e.target as Node)) return
+      pinned.current = false
+      clearTimeout(settle)
+      settle = window.setTimeout(() => { if (bottom() < 40) pinned.current = true; else setAway(true) }, 450)
+    }
+    list.current?.addEventListener("click", onToggle, true)
+    const listEl = list.current
     const ro = new ResizeObserver(follow)
     if (list.current) ro.observe(list.current)
     addEventListener("scroll", onScroll, { passive: true })
@@ -103,6 +115,8 @@ export function Chat() {
     follow()                                                      // opening a chat that already has messages: the end of it
     return () => {
       ro.disconnect()
+      clearTimeout(settle)
+      listEl?.removeEventListener("click", onToggle, true)
       removeEventListener("scroll", onScroll); removeEventListener("wheel", onWheel)
       removeEventListener("touchstart", onTouchStart); removeEventListener("touchmove", onTouchMove); removeEventListener("keydown", onKey)
     }
