@@ -645,7 +645,8 @@ def gpu_list(cfg: dict) -> list[int]:
 
 def monitor_gpus(cfg: dict, env=None, count=None) -> list[int]:
     """The cards the Monitor reads: the config's "gpu" when it names any; else the launcher's CUDA_VISIBLE_DEVICES
-    (numbers, taken as nvidia-smi numbers them, the same as the "gpu" key); else every card NVML sees. A config
+    (numbers, taken as NVML numbers them: right where CUDA's order matches the PCI order, and when it does not the
+    set of two cards is still both); else every card NVML sees. A config
     with no "gpu" key (D2x) used to leave only card 0 on the Monitor."""
     named = gpu_list(cfg)
     if named:
@@ -1440,7 +1441,15 @@ class Service:
                     started = self.status.get("started", time.time())
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
-                    meta = (sampling or {}).get("_meta") or request_meta("", [], None, None)
+                    meta = dict((sampling or {}).get("_meta") or request_meta("", [], None, None))
+                    # one request can call run() several times (an MCP tool round, the thinking budget's second call):
+                    # the first keeps the request's id, the later ones get -2, -3 ... so no row or detail overwrites another
+                    shared = (sampling or {}).get("_meta")
+                    if shared is not None:
+                        calls = shared["calls"] = shared.get("calls", 0) + 1
+                        if calls > 1:
+                            meta["id"] = f"{shared['id']}-{calls}"
+                    meta.pop("calls", None)
                     chunks = chunk_stats(last.get("prefill_points") or [], last.get("reused") or 0)
                     decode = window_rates(tok_times)
                     rec = summary_record({

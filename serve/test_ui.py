@@ -86,6 +86,14 @@ class Routes(unittest.TestCase):
                 self.assertIn(want, headers["Content-Type"])
         self.assertEqual(self.get("/classic/metrics")[0], 200)          # its relative API calls land on the API
 
+    def test_classic_posts_reach_the_api_too(self):
+        import json
+        req = urllib.request.Request(self.base + "/classic/v1/chat/completions", method="POST",
+                                     data=json.dumps({"model": "m", "max_tokens": 2, "messages": [{"role": "user", "content": "hi"}]}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            self.assertEqual(r.status, 200)
+
     def test_a_missing_slash_redirects_relatively(self):
         for name in ("classic", "next"):
             code, headers, _ = self.get("/" + name)

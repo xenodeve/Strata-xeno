@@ -475,6 +475,20 @@ class RequestHistory(unittest.TestCase):
         self.assertIn("decode_series", one["detail"])
         self.assertEqual(set(row["decode"]), {"windows", "tok_s_min", "tok_s_max", "tok_s_mean"})   # no series in the row
 
+    def test_every_engine_call_of_one_request_has_its_own_history_row(self):
+        # an MCP request calls Service.run once per tool round with the same request: one id, one row per round
+        from serve.history import request_meta
+        req = {"_meta": request_meta("openai", [{"role": "user", "content": "q"}], None, "ua")}
+        for _ in range(3):
+            list(self.svc.run([1, 2, 3], False, None, 4, req, threading.Event()))
+        ids = [r["id"] for r in self.get("/metrics/requests")[1]["items"]]
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(len(set(ids)), 3)
+        self.assertEqual(ids[-1], req["_meta"]["id"])                      # the first round keeps the request's own id
+        self.assertTrue(all(i.startswith(req["_meta"]["id"]) for i in ids))
+        for i in ids:
+            self.assertIsNotNone(self.svc.hstore.detail(i))                # no round overwrote another's detail
+
     def test_the_history_needs_the_key_when_one_is_set(self):
         self.svc.api_key = "secret"
         self.assertEqual(self.get("/metrics/requests")[0], 401)

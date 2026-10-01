@@ -23,6 +23,12 @@ moment it is looked at.
 
 (none yet)
 
+## Developing without the GPUs
+
+`python serve/ui/dev/mock_server.py [port]` (default 8099) serves the app at `/next/` with no model: hardware, routes and history are real,
+the answer and the engine's STATS / prefill chunks are labelled fixtures. `serve/ui/fixtures/` holds a real `/metrics` and `/health` recorded from
+the daily server on 2026-10-01 (idle, one card visible: the S0 bug). The daily server on :8091 is never touched.
+
 ## Build
 
 `cd serve/ui && bun install && bun run build` writes `dist/` and `dist/source-hash.txt`. `dist/` is committed so the
