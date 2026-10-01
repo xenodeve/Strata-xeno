@@ -833,6 +833,7 @@ class Service:
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         self.hstore = HistoryStore(Path(tempfile.gettempdir()) / "strata-history-off", enabled=False)  # main() turns it on
+        self.ui = "classic"                             # which web app "/" serves; config "ui": "next" for the new one
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0}
@@ -1904,11 +1905,18 @@ def make_handler(svc: Service):
             if p.startswith("/classic/"):
                 self.path = self.path[len("/classic"):]
                 return False
-            if not p.startswith("/next/"):
+            rel = None                                       # the path inside dist/, when this request is for the new app
+            if p.startswith("/next/"):
+                rel = p[len("/next/"):]
+            elif getattr(svc, "ui", "classic") == "next":    # config "ui": "next": the new app at / (its assets at /assets/)
+                if p == "/":
+                    rel = ""
+                elif p.startswith("/assets/"):
+                    rel = p[1:]
+            if rel is None:
                 return False
             types = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
                      ".woff2": "font/woff2", ".svg": "image/svg+xml", ".png": "image/png", ".webp": "image/webp"}
-            rel = p[len("/next/"):]
             f, ctype, cache = None, "text/html; charset=utf-8", "no-cache"
             if rel == "":
                 f = ROOT / "serve" / "ui" / "dist" / "index.html"
@@ -2613,7 +2621,8 @@ def main() -> int:
     from serve.history import default_dir
     svc.hstore = HistoryStore(hist.get("dir") or default_dir(), enabled=hist.get("enabled", True) is not False,
                               detail_cap_bytes=int(float(hist.get("detail_cap_gb", 2)) * 2**30))
-    svc.gpu_indices = monitor_gpus(cfg)                # every card the engine can see (issue #112; UI S0: no "gpu" key)
+    svc.ui = "next" if cfg.get("ui") == "next" else "classic"          # xeno UI S2: "/" serves the new web app
+    svc.gpu_indices = monitor_gpus(cfg)               # every card the engine can see (issue #112; UI S0: no "gpu" key)
     svc.gpu_index = (svc.gpu_indices or [0])[0]         # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"

@@ -33,6 +33,19 @@ class DistMatchesSource(unittest.TestCase):
         self.assertNotIn("url(/", css)
 
 
+class UiLibTests(unittest.TestCase):
+    """The TypeScript lib's own tests (markdown escaping, the API messages, the router): `bun test` in serve/ui."""
+
+    def test_bun(self):
+        import shutil
+        import subprocess
+        bun = shutil.which("bun", path=str(UI / "node_modules" / ".bin"))
+        if bun is None:
+            self.skipTest("serve/ui/node_modules is not installed (cd serve/ui && bun install)")
+        r = subprocess.run([bun, "test"], cwd=UI, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
 class Routes(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -90,6 +103,20 @@ class Routes(unittest.TestCase):
         self.assertIn("immutable", headers["Cache-Control"])            # hashed names never change
         font = next((UI / "dist" / "assets").glob("*.woff2")).name
         self.assertEqual(self.get("/next/assets/" + font)[1]["Content-Type"], "font/woff2")
+
+    def test_the_config_can_serve_the_new_app_at_root(self):
+        self.assertEqual(self.svc.ui, "classic")                          # the default until the Monitor has a successor
+        self.svc.ui = "next"
+        try:
+            code, headers, body = self.get("/")
+            self.assertEqual(code, 200)
+            self.assertIn(b'id="root"', body)
+            asset = next((UI / "dist" / "assets").glob("*.js")).name
+            self.assertEqual(self.get("/assets/" + asset)[0], 200)        # its relative asset URLs land at the root
+            self.assertEqual(self.get("/assets/..%2Fx.js")[0], 404)
+            self.assertIn(b'"web/app.js"', self.get("/classic/")[2])      # the classic app is still there
+        finally:
+            self.svc.ui = "classic"
 
     def test_next_serves_only_dist(self):
         for path in ("/next/assets/..%2F..%2Fpackage.json", "/next/assets/..%5C..%5Cpackage.json", "/next/package.json",

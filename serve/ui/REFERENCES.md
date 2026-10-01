@@ -11,6 +11,11 @@ What ships in `dist/` and under which licence. Full texts are in `licenses/`.
 
 SF Pro / SF Thai are named first in the font stack and used only where the OS has them. They are never shipped (Apple licence).
 
+## Ship-gate exceptions
+
+- `design-ship-gate` check 1 (at most two font families): three ship (Inter, Anuphan for Thai, JetBrains Mono for code). Decided in the UI handoff (Q11), so the gate's number gives way; mono is used only for code and measurements.
+- Checks 2 (Open Graph), 4 and 6 (hero) are for static landing pages and do not apply to this app.
+
 ## Reference only, own implementation (no code copied)
 
 Paid or unclear-licence work that informed the design. Recorded here as the handoff requires; add each one the

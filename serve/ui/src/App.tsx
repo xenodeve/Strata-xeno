@@ -6,6 +6,7 @@ import { cn } from "./lib/cn"
 import { href, PAGES, useRoute, type Page } from "./lib/router"
 import { useTheme, type Theme } from "./lib/theme"
 import { PageView } from "./pages"
+import { ToastHost } from "./components/toast"
 
 const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
   chat: { label: "Chat", icon: Message01Icon },
@@ -51,6 +52,7 @@ export function App() {
           <HugeiconsIcon icon={THEME_ICON[theme]} size={16} strokeWidth={1.6} aria-hidden />
         </button>
       </header>
+      <ToastHost />
       <main key={route.page} className="page-in flex-1 pb-12 pt-4">
         <PageView route={route} />
       </main>
