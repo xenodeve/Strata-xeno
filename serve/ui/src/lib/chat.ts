@@ -99,6 +99,15 @@ export function exportMarkdown(messages: Message[], model: string): string {
     `## ${model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n")
 }
 
+/** The attachments of a sent message that can be sent again: a reload keeps only their names (the data is not stored). */
+function attachmentsOf(m: Message): { kept: Attachment[]; lost: number } {
+  const kept: Attachment[] = []
+  let lost = 0
+  for (const i of m.images || []) i.url ? kept.push({ kind: "image", name: i.name, url: i.url }) : lost++
+  for (const f of m.files || []) f.text != null ? kept.push({ kind: "file", name: f.name, text: f.text }) : lost++
+  return { kept, lost }
+}
+
 export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean }
 
 export class ChatController {
@@ -139,6 +148,40 @@ export class ChatController {
       um.prefill = { state: "reading", rate: meter.rate(), mean: null, read: null, cached: null }
     } else return
     this.notify()
+  }
+
+  private lostNote(lost: number) {
+    if (lost) this.onError("Attachments not restored", `${lost} attachment${lost > 1 ? "s were" : " was"} not kept: only the names of attachments are stored, so a file or an image is gone after the page is reloaded.`)
+  }
+
+  /** Takes the last prompt back, with its answer: both leave the chat and the prompt (with the attachments that are still
+   *  held) is returned to be put in the composer. Not while an answer is being written. */
+  undoLast(): { text: string; attachments: Attachment[] } | null {
+    if (this.busy) return null
+    let at = -1
+    for (let i = this.messages.length - 1; i >= 0 && at < 0; i--) if (this.messages[i].role === "user") at = i
+    if (at < 0) return null
+    const m = this.messages[at]
+    const { kept, lost } = attachmentsOf(m)
+    this.messages = this.messages.slice(0, at)
+    this.save(); this.notify()
+    this.lostNote(lost)
+    return { text: m.text, attachments: kept }
+  }
+
+  /** Rewrites the prompt at `index`: it and everything after it are replaced by the new prompt (with its own attachments
+   *  that are still held) and a new answer. False when it cannot be done: an answer is being written, the message is not a
+   *  prompt, or nothing would be sent. */
+  async edit(index: number, text: string, ctx: SendContext): Promise<boolean> {
+    const m = this.messages[index]
+    if (this.busy || !m || m.role !== "user") return false
+    const { kept, lost } = attachmentsOf(m)
+    if (!text.trim() && !kept.length) return false
+    this.messages = this.messages.slice(0, index)
+    this.save(); this.notify()
+    this.lostNote(lost)
+    await this.send(text, kept, ctx)
+    return true
   }
 
   /** Clears the chat; returns what undoes it. */

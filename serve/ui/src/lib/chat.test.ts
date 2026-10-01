@@ -177,4 +177,62 @@ describe("chat stream", () => {
     release(); await p
     expect(c.messages[0].prefill).toMatchObject({ state: "done", mean: 2000, read: null })
   })
+
+  // Taking a prompt back (undo) and rewriting one (edit): both end the conversation at that prompt.
+  const two = async () => {
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(delta({ content: "one" }), { choices: [], usage: { completion_tokens: 1 } }), sse(delta({ content: "two" }), { choices: [], usage: { completion_tokens: 1 } })], seen)
+    const c = new ChatController()
+    await c.send("first", [{ kind: "file", name: "a.txt", text: "AAA" }], ctx)
+    await c.send("second", [{ kind: "image", name: "p.png", url: "data:image/png;base64,xx" }], ctx)
+    return { c, seen }
+  }
+
+  test("undo takes the last prompt back with its answer, and returns what was sent", async () => {
+    const { c } = await two()
+    const back = c.undoLast()
+    expect(back).toEqual({ text: "second", attachments: [{ kind: "image", name: "p.png", url: "data:image/png;base64,xx" }] })
+    expect(c.messages.map((m) => m.text)).toEqual(["first", "one"])
+    expect(c.undoLast()!.text).toBe("first")
+    expect(c.messages).toHaveLength(0)
+    expect(c.undoLast()).toBeNull()
+  })
+
+  test("undo keeps only the attachments that still hold their data (a reload keeps names alone)", () => {
+    const c = new ChatController()
+    c.messages = [{ role: "user", text: "q", time: 1, images: [{ name: "gone.png" }], files: [{ name: "gone.txt" }, { name: "kept.txt", text: "K" }] }, { role: "assistant", text: "a", time: 2 }]
+    expect(c.undoLast()).toEqual({ text: "q", attachments: [{ kind: "file", name: "kept.txt", text: "K" }] })
+  })
+
+  test("nothing is undone or edited while an answer is being written", async () => {
+    const release = held([delta({ content: "ok" })])
+    const c = new ChatController()
+    const p = c.send("hi", [], ctx)
+    expect(c.undoLast()).toBeNull()
+    expect(await c.edit(0, "other", ctx)).toBe(false)
+    expect(c.messages).toHaveLength(2)
+    release(); await p
+  })
+
+  test("edit rewrites an earlier prompt: what came after it is replaced, and only the new text goes to the model", async () => {
+    const { c, seen } = await two()
+    expect(await c.edit(0, "first, reworded", ctx)).toBe(true)
+    const sent = seen[2].messages as { role: string; content: unknown }[]
+    expect(sent).toHaveLength(1)
+    expect(String(sent[0].content)).toContain("first, reworded")
+    expect(String(sent[0].content)).toContain("AAA")                  // its attachment goes with it
+    expect(c.messages.map((m) => m.role)).toEqual(["user", "assistant"])
+    expect(c.messages[0].text).toBe("first, reworded")
+  })
+
+  test("edit refuses an answer, an index that is not there, and an empty prompt with nothing attached", async () => {
+    const { c } = await two()
+    expect(await c.edit(1, "x", ctx)).toBe(false)
+    expect(await c.edit(9, "x", ctx)).toBe(false)
+    expect(await c.edit(2, "   ", ctx)).toBe(true)                    // the second prompt still has its image: allowed
+    const c2 = new ChatController()
+    c2.messages = [{ role: "user", text: "q", time: 1 }, { role: "assistant", text: "a", time: 2 }]
+    expect(await c2.edit(0, "  ", ctx)).toBe(false)
+    expect(c2.messages).toHaveLength(2)
+  })
 })

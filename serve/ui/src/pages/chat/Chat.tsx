@@ -131,6 +131,18 @@ export function Chat() {
     setAway(false)
     void chat.send(t, f, { health, mcp, projectionLoaded: projection })
   }
+  const ctx = () => ({ health, mcp, projectionLoaded: projection })
+  const editPrompt = (i: number, t: string) => { pinned.current = true; setAway(false); void chat.edit(i, t, ctx()) }
+  const undoPrompt = () => {
+    const back = chat.undoLast()
+    if (!back) return
+    setText((cur) => back.text + (cur.trim() ? `
+
+${cur}` : ""))      // a draft already in the composer stays
+    setFiles((f) => [...back.attachments, ...f])
+    input.current?.focus()
+  }
+  const lastPrompt = chat.messages.reduce((at, m, i) => (m.role === "user" ? i : at), -1)
   const add = async (list: Iterable<File>) => { const a = await readFiles(list, health); if (a.length) setFiles((x) => [...x, ...a]) }
   const onDrop = (e: DragEvent) => {
     setDragging(false)
@@ -170,7 +182,8 @@ export function Chat() {
           </div>
         )}
         {chat.messages.map((m, i) => (
-          <MessageView key={i} m={m} streaming={busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} />
+          <MessageView key={i} m={m} streaming={busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill}
+            actions={m.role === "user" ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt } : undefined} />
         ))}
       </div>
 

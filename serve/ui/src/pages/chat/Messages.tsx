@@ -1,6 +1,6 @@
-import { useRef, useState, type MouseEvent } from "react"
+import { useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
-import { ArrowDown01Icon, Copy01Icon, AttachmentIcon } from "@hugeicons/core-free-icons"
+import { ArrowDown01Icon, Copy01Icon, AttachmentIcon, PencilEdit01Icon, Undo02Icon } from "@hugeicons/core-free-icons"
 import { chat, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
 import { Collapse } from "../../components/motion"
@@ -99,11 +99,42 @@ function Thinking({ m, streaming, show, phase }: { m: Message; streaming: boolea
   )
 }
 
-export function MessageView({ m, streaming, show, prefill }: { m: Message; streaming: boolean; show: boolean; prefill: boolean }) {
+// What can be done to a prompt that was sent: rewrite it (it and everything after it are replaced), or, on the last one, take
+// it back (the prompt returns to the composer and its answer goes). Not offered while an answer is being written.
+export interface PromptActions { canAct: boolean; last: boolean; onEdit: (text: string) => void; onUndo: () => void }
+
+function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: boolean; onSend: (t: string) => void; onCancel: () => void }) {
+  const [value, setValue] = useState(text)
+  const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Escape") { e.preventDefault(); onCancel() }
+    else if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); if (value.trim()) onSend(value) }
+  }
+  return (
+    <div className="msg-in w-full max-w-[85%] space-y-2">
+      <textarea
+        autoFocus
+        aria-label="Edit the prompt"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={onKey}
+        onFocus={(e) => e.currentTarget.setSelectionRange(e.currentTarget.value.length, e.currentTarget.value.length)}
+        className="field-sizing-content block max-h-72 min-h-12 w-full resize-none rounded-[20px] bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] outline-none ring-1 ring-line focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+      />
+      <div className="flex items-center justify-end gap-2 text-[13px]">
+        {!last && <span className="mr-auto text-ink-3">Everything after this prompt is replaced.</span>}
+        <button type="button" onClick={onCancel} className="rounded-sm px-2.5 py-1 text-ink-2 transition-colors hover:bg-hover hover:text-ink">Cancel</button>
+        <button type="button" disabled={!value.trim()} onClick={() => onSend(value)} className="rounded-sm bg-ink px-3 py-1 font-medium text-surface transition-opacity disabled:opacity-40">Send</button>
+      </div>
+    </div>
+  )
+}
+
+export function MessageView({ m, streaming, show, prefill, actions }: { m: Message; streaming: boolean; show: boolean; prefill: boolean; actions?: PromptActions }) {
   const ref = useRef<HTMLDivElement>(null)
+  const [editing, setEditing] = useState(false)
   if (m.role === "user") {
     return (
-      <div className="msg-in flex flex-col items-end gap-1">
+      <div className="msg-in group flex flex-col items-end gap-1">
         {!!m.files?.length && (
           <div className="flex flex-wrap justify-end gap-1.5">
             {m.files.map((f, i) => (
@@ -120,8 +151,18 @@ export function MessageView({ m, streaming, show, prefill }: { m: Message; strea
               : <span key={i} className="inline-flex items-center gap-1 rounded-sm bg-fill px-2 py-1 text-[12px]">{im.name || "image"}</span>)}
           </div>
         )}
-        <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] [overflow-wrap:anywhere]">{m.text}</div>
-        <div className="num px-1 text-[12px] text-ink-3">You · {timeStr(m.time)}</div>
+        {editing && actions
+          ? <PromptEditor text={m.text} last={actions.last} onCancel={() => setEditing(false)} onSend={(t) => { setEditing(false); actions.onEdit(t) }} />
+          : <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] [overflow-wrap:anywhere]">{m.text}</div>}
+        <div className="num flex items-center gap-1 px-1 text-[12px] text-ink-3">
+          <span>You · {timeStr(m.time)}</span>
+          {actions?.canAct && !editing && (
+            <span className="flex items-center opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100 [@media(hover:none)]:opacity-100">
+              <button type="button" aria-label="Edit this prompt" title="Edit" onClick={() => setEditing(true)} className="flex size-6 items-center justify-center rounded-sm transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={PencilEdit01Icon} size={14} aria-hidden /></button>
+              {actions.last && <button type="button" aria-label="Take this prompt back" title="Undo: take the prompt back" onClick={actions.onUndo} className="flex size-6 items-center justify-center rounded-sm transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={Undo02Icon} size={14} aria-hidden /></button>}
+            </span>
+          )}
+        </div>
         {prefill && m.prefill && prefillText(m.prefill) && (
           <div key={m.prefill.state} className="num fade-swap px-1 text-[12px] text-ink-3" role={m.prefill.state === "reading" ? "status" : undefined}>{prefillText(m.prefill)}</div>
         )}
