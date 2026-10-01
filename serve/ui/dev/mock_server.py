@@ -22,10 +22,16 @@ from serve.frontend import ChatTemplate  # noqa: E402
 from serve.history import HistoryStore  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
-ANSWER = ("Let me think about this.</think>\n\nสวัสดีครับ **bold** and `code`\n\n- one\n- two\n\n```py\nprint(1)\n```\n\n"
+THINKING = ("The user asks something open, so first I should work out what they actually want to know.\n\n"
+            "There are two readings of the question. The narrow one has a short answer; the wide one needs the background first. I will check which one the wording supports, and note what each would cost to answer.\n\n"
+            "The wide reading fits better: they mention the setup as well as the symptom. So the answer should start from the setup, then name the likely cause, then say how to confirm it.\n\n"
+            "Before writing, check the numbers I intend to quote: nothing measured here, so say so instead of guessing. Keep the answer short, with one example and one list.")
+ANSWER = (THINKING + "</think>\n\nสวัสดีครับ **bold** and `code`\n\n- one\n- two\n\n```py\nprint(1)\n```\n\n"
           "| a | b |\n|---|---|\n| 1 | 2 |\n")
 if os.environ.get("STRATA_MOCK_LONG"):          # an answer longer than a screen, streamed slowly: for the chat's follow-the-answer scroll
-    ANSWER = "Thinking it through. " * 24 + "</think>\n\n" + "\n\n".join(f"Paragraph {i}: " + "word " * 40 for i in range(1, 15))
+    ANSWER = THINKING + "</think>\n\n" + "\n\n".join(f"Paragraph {i}: " + "word " * 40 for i in range(1, 15))
+THINK_BYTES = len(ANSWER.split("</think>")[0].encode())
+THINK_MS = float(os.environ.get("STRATA_MOCK_THINK_MS", "30"))   # per token while it thinks (about 12 s of thinking by default): the thinking line stays on screen long enough to look at
 FAKE_STATS = dict(windows=40, tier_primary=5200, tier_secondary=1800, tier_pcie=300, tier_cpu=2700, cpu_expert_ms=950.5,
                   nvme_loads=12, nvme_ms=83.2, ms_verify=2100.0, ms_gpu_wait=800.0, ms_pool=1000.0, ms_plan=40.0,
                   ms_actq=60.0, ms_jobs=70.0, ms_cpu=800.0, ms_stage=120.0, ms_commit=60.0, ms_draft=90.0)
@@ -45,7 +51,7 @@ class FakeEngine(MockEngine):
         try:
             for t in super().generate(ids, max_new, sampling, cancel, embeddings):
                 n += 1
-                time.sleep(0.004)
+                time.sleep((THINK_MS if n <= THINK_BYTES else 4) / 1000)
                 yield t
         finally:
             self.last = {"generated": n, "prompt_tokens": len(ids), "prompt_ms": 40.0, "decode_ms": 2400.0,
