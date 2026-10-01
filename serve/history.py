@@ -52,6 +52,41 @@ def summary_record(rec: dict) -> dict:
     return {**rec, "prefill_tok_s": round(read / (ms / 1000), 1) if read > 0 and ms else None}
 
 
+def chunk_stats(points, start: int):
+    """Prefill speed per chunk from the engine's PP lines: `points` are (position reached, ms since that read began),
+    `start` the position the read began at (the cached prefix). None when nothing was read."""
+    items, pos, prev_ms = [], start, 0.0
+    for p, ms in points:
+        if ms < prev_ms:                            # a second engine call: its clock began again, the position did not
+            prev_ms = 0.0
+        tokens, dms = p - pos, ms - prev_ms
+        if tokens > 0 and dms > 0:
+            items.append([tokens, round(dms, 3)])
+        pos, prev_ms = p, ms
+    if not items:
+        return None
+    rates = [t / (ms / 1000) for t, ms in items]
+    total_t, total_ms = sum(t for t, _ in items), sum(ms for _, ms in items)
+    return {"chunks": len(items), "items": items, "tok_s_max": round(max(rates), 1), "tok_s_min": round(min(rates), 1),
+            "tok_s_mean": round(total_t / (total_ms / 1000), 1)}
+
+
+def window_rates(times, window: int = 16):
+    """Decode speed from the time each token reached the server: tok/s over every sliding `window` of tokens (min /
+    max / the series for the trend), and the mean over the whole run. Never a per-token speed. None below 2 tokens."""
+    n = len(times)
+    if n < 2:
+        return None
+    span = times[-1] - times[0]
+    mean = round((n - 1) / span, 1) if span > 0 else None
+    rates = [window / (times[i] - times[i - window]) for i in range(window, n) if times[i] > times[i - window]]
+    if not rates:
+        return {"windows": 0, "tok_s_min": None, "tok_s_max": None, "tok_s_mean": mean, "series": []}
+    step = max(1, -(-len(rates) // 120))                       # at most 120 points
+    return {"windows": len(rates), "tok_s_min": round(min(rates), 1), "tok_s_max": round(max(rates), 1),
+            "tok_s_mean": mean, "series": [round(r, 1) for r in rates[::step]]}
+
+
 class HistoryStore:
     def __init__(self, directory, enabled=True, detail_cap_bytes=DEFAULT_DETAIL_CAP):
         self.dir = Path(directory)

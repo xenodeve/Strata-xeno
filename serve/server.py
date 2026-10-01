@@ -55,7 +55,7 @@ from serve.loop_guard import LoopGuard
 from serve import cjk_guard, forced_opening, think_budget  # noqa: E402  (xeno #49 S4, S7 follow-up, S3)
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
-from serve.history import HistoryStore, request_meta, summary_record  # noqa: E402  (xeno UI S3)
+from serve.history import HistoryStore, chunk_stats, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -341,6 +341,22 @@ class StrataEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+        if getattr(self, "_stats", None):                 # the STATS line just before it (xeno UI S4)
+            self.last["stats"], self._stats = self._stats, None
+        if getattr(self, "_pp", None):                    # and the PP lines of its prompt read
+            self.last["prefill_points"], self._pp = self._pp, []
+
+    def _parse_stats(self, line):
+        """`STATS key=value ...` (xeno UI S4): this request's decode counters, printed by the engine just before its
+        DONE. Numbers only; a malformed line is skipped, never fatal."""
+        stats = {}
+        for kv in line.split()[1:]:
+            k, _, v = kv.partition("=")
+            try:
+                stats[k] = int(v) if v.lstrip("-").isdigit() else float(v)
+            except ValueError:
+                return
+        self._stats = stats or None
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -410,6 +426,8 @@ class StrataEngine:
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         self.progress = None
+        self._stats = None          # xeno UI S4: this request's STATS line, once the engine sends it
+        self._pp = []               # ... and its PP lines (position, ms): the prefill speed per chunk
         self.drained = []           # xeno #49 review: tokens the engine committed after an early stop (read in the drain)
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
@@ -444,10 +462,16 @@ class StrataEngine:
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                         self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+                        try:                                              # xeno UI S4: (position, ms since the read began), per chunk
+                            self._pp.append((int(f[1]), float(f[3]))) if len(f) >= 4 else None
+                        except ValueError:
+                            pass
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
+                elif line.startswith("STATS "):
+                    self._parse_stats(line)
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
@@ -476,6 +500,8 @@ class StrataEngine:
                         break
                     if line.startswith("T "):
                         self.drained.append(int(line[2:]))
+                    elif line.startswith("STATS "):
+                        self._parse_stats(line)
                     elif line.startswith("DONE"):
                         self._parse_done(line)
                         break
@@ -1303,6 +1329,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         stop_detail = None
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        tok_times = []                                  # when each token reached the server
         emb = getattr(self.embeddings, "path", None)
         if self.restarting:            # xeno #49 S2: the native API's answer while the model loads - retry later
             raise EngineDied("the engine is loading again after it stopped")
@@ -1338,6 +1365,7 @@ class Service:
                             yield "ping", None
                             continue
                         n += 1
+                        tok_times.append(time.monotonic())      # xeno UI S3: the decode speed over a sliding window
                         if n == 1:
                             timeline.instant("first token", len(ids))
                         if t in self.stop_ids:
@@ -1410,13 +1438,17 @@ class Service:
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                     meta = (sampling or {}).get("_meta") or request_meta("", [], None, None)
+                    chunks = chunk_stats(last.get("prefill_points") or [], last.get("reused") or 0)
+                    decode = window_rates(tok_times)
                     rec = summary_record({
                         **meta,
+                        "decode": {k: v for k, v in decode.items() if k != "series"} if decode else None,
+                        "prefill": {k: v for k, v in chunks.items() if k != "items"} if chunks else None,
                         "projection": (sampling or {}).get("experimental_speed_projection") is not False
                         if loaded else None,
                         "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                         "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
-                        "engine_generated": last.get("generated"),
+                        "engine_generated": last.get("generated"), "stats": last.get("stats"),
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
@@ -1425,6 +1457,9 @@ class Service:
                     self.history.append(rec)
                     try:
                         self.hstore.append(rec)         # on disk, kept (a full disk must not fail the request)
+                        self.hstore.write_detail(rec["id"], {"prefill_chunks": chunks["items"] if chunks else [],
+                                                             "decode_series": decode["series"] if decode else [],
+                                                             "stats": last.get("stats")})
                     except OSError as e:
                         print(f"[strata] history not saved: {e}", flush=True)
                     t = self.totals

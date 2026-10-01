@@ -447,6 +447,7 @@ class RequestHistory(unittest.TestCase):
     def test_one_request_by_id_and_a_deleted_detail(self):
         self.call("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5})
         rid = self.get("/metrics/requests")[1]["items"][0]["id"]
+        (Path(self.tmp.name) / "detail" / f"{rid}.json.gz").unlink()      # the cap deleted it, the summary stays
         code, one = self.get(f"/metrics/requests/{rid}")
         self.assertEqual((code, one["summary"]["id"], one["detail_state"], one["detail"]), (200, rid, "deleted", None))
         self.svc.hstore.write_detail(rid, {"rounds": [1]})
@@ -454,6 +455,25 @@ class RequestHistory(unittest.TestCase):
         self.assertEqual(self.get("/metrics/requests/nope")[0], 404)
         self.assertEqual(self.get("/metrics/requests/..%2F..%2Fx")[0], 404)
         self.assertEqual(self.get("/metrics/requests?page=x")[0], 400)
+
+    def test_prefill_chunks_and_stats_go_to_the_summary_and_the_detail(self):
+        class PrefillEngine(ClockedEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+                self.last["prefill_points"] = [(2005, 1000.0), (4005, 3000.0)]   # REUSED = 5: two 2000-token chunks
+                self.last["stats"] = {"windows": 4}
+        tok = ByteTokenizer()
+        self.svc.engine = PrefillEngine(tok, "</think>\n\nhi", max_context=CTX)
+        self.call("/v1/chat/completions", {"model": "m", "max_tokens": 3,
+                                           "messages": [{"role": "user", "content": "x" * 50}]})
+        row = self.get("/metrics/requests")[1]["items"][0]
+        self.assertEqual(row["prefill"], {"chunks": 2, "tok_s_max": 2000.0, "tok_s_min": 1000.0, "tok_s_mean": 1333.3})
+        one = self.get(f"/metrics/requests/{row['id']}")[1]
+        self.assertEqual(one["detail_state"], "kept")
+        self.assertEqual(one["detail"]["prefill_chunks"], [[2000, 1000.0], [2000, 2000.0]])
+        self.assertEqual(one["detail"]["stats"], {"windows": 4})
+        self.assertIn("decode_series", one["detail"])
+        self.assertEqual(set(row["decode"]), {"windows", "tok_s_min", "tok_s_max", "tok_s_mean"})   # no series in the row
 
     def test_the_history_needs_the_key_when_one_is_set(self):
         self.svc.api_key = "secret"
@@ -1058,6 +1078,81 @@ class TimingsDrafts(unittest.TestCase):
         self.assertEqual((t["prompt_n"], t["cache_n"]), (20, 4))
         self.assertNotIn("draft_n", request_timings(24, 20, base))
         self.assertIsNone(request_timings(24, 20, {}))
+
+
+class EngineStats(unittest.TestCase):
+    """xeno UI S4: the engine's per-request `STATS key=value ...` line, just before DONE, reaches engine.last["stats"];
+    a reader that does not know it (and DONE itself) is unchanged."""
+
+    STATS = ("STATS windows=12 tier_primary=100 tier_secondary=40 tier_pcie=7 tier_cpu=53 cpu_expert_ms=81.5 "
+             "nvme_loads=3 nvme_ms=12.25 ms_verify=900.5 ms_gpu_wait=300.0 ms_pool=410.1 ms_plan=20.0 ms_actq=15.5 "
+             "ms_jobs=30.0 ms_cpu=345.0 ms_stage=60.0 ms_commit=8.5 ms_draft=40.0")
+    DONE = "DONE 24 100 250.0 1900.5 stop 5 9 0 700 1000"
+
+    def engine(self, lines):
+        class Proc:
+            class stdin:
+                written = []
+                write = staticmethod(lambda s: Proc.stdin.written.append(s))
+                flush = staticmethod(lambda: None)
+            poll = staticmethod(lambda: None)
+        e = StrataEngine.__new__(StrataEngine)
+        e.proc, e.lines, e.QUIET_S, e.last, e.can_stop = Proc, queue.Queue(), 1, {}, False
+        for ln in lines:
+            e.lines.put(ln)
+        return e
+
+    def run_generate(self, lines):
+        e = self.engine(lines)
+        toks = [t for t in e.generate([1, 2, 3], 24, {}, threading.Event()) if t is not None]
+        return e, toks
+
+    def test_stats_before_done_lands_in_last(self):
+        e, toks = self.run_generate(["T 5", "T 6", self.STATS, self.DONE])
+        self.assertEqual(toks, [5, 6])
+        s = e.last["stats"]
+        self.assertEqual((s["windows"], s["tier_primary"], s["tier_cpu"], s["nvme_loads"]), (12, 100, 53, 3))
+        self.assertEqual((s["cpu_expert_ms"], s["ms_gpu_wait"], s["ms_draft"]), (81.5, 300.0, 40.0))
+        self.assertEqual((e.last["generated"], e.last["prompt_ms"], e.last["lookups"]), (24, 250.0, 1000))   # DONE as before
+
+    def test_no_stats_line_is_an_engine_without_it(self):
+        e, _ = self.run_generate(["T 5", self.DONE])
+        self.assertNotIn("stats", e.last)
+        self.assertEqual(e.last["generated"], 24)
+
+    def test_stats_of_one_request_do_not_leak_into_the_next(self):
+        e, _ = self.run_generate([self.STATS, self.DONE])
+        e.last = {}
+        for ln in ("T 1", self.DONE):                       # the next request: an engine that sent no STATS
+            e.lines.put(ln)
+        list(e.generate([1], 1, {}, threading.Event()))
+        self.assertNotIn("stats", e.last)
+
+    def test_a_malformed_stats_line_is_skipped_not_fatal(self):
+        e, toks = self.run_generate(["T 5", "STATS windows=x broken", "STATS", self.DONE])
+        self.assertEqual(toks, [5])
+        self.assertNotIn("stats", e.last)
+        self.assertEqual(e.last["generated"], 24)
+
+    def test_the_request_record_keeps_the_stats(self):
+        class StatsEngine(ClockedEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+                self.last["stats"] = {"windows": 3, "tier_cpu": 9}
+        tok = ByteTokenizer()
+        svc = Service(StatsEngine(tok, "</think>\n\nhi", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps({"model": "m", "max_tokens": 3,
+                                                          "messages": [{"role": "user", "content": "hello"}]}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=30).read()
+            self.assertEqual(svc.metrics()["requests"][0]["stats"], {"windows": 3, "tier_cpu": 9})
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 class ToolResultContent(unittest.TestCase):

@@ -136,5 +136,73 @@ class Meta(unittest.TestCase):
         self.assertIsNone(summary_record({"id": "r1", "prompt_tokens": 10, "prompt_ms": None})["prefill_tok_s"])
 
 
+class PrefillChunks(unittest.TestCase):
+    """Prefill speed per chunk (max / min / mean) from the engine's PP lines: (position reached, ms since the read began)."""
+
+    def test_chunks_from_cumulative_points(self):
+        from serve.history import chunk_stats
+        # 100 cached tokens, then chunks of 2048 (1 s), 2048 (2 s), 904 (0.5 s)
+        s = chunk_stats([(2148, 1000.0), (4196, 3000.0), (5100, 3500.0)], start=100)
+        self.assertEqual(s["chunks"], 3)
+        self.assertEqual(s["items"], [[2048, 1000.0], [2048, 2000.0], [904, 500.0]])
+        self.assertAlmostEqual(s["tok_s_max"], 2048.0)           # the 1 s chunk
+        self.assertAlmostEqual(s["tok_s_min"], 1024.0)           # the 2 s chunk
+        self.assertAlmostEqual(s["tok_s_mean"], 5000 / 3.5, places=1)    # all tokens over all time, not a mean of means
+
+    def test_one_chunk_has_no_spread(self):
+        from serve.history import chunk_stats
+        s = chunk_stats([(600, 300.0)], start=0)
+        self.assertEqual((s["chunks"], s["tok_s_max"], s["tok_s_min"], s["tok_s_mean"]), (1, 2000.0, 2000.0, 2000.0))
+
+    def test_a_second_engine_call_restarts_the_clock_but_not_the_position(self):
+        from serve.history import chunk_stats
+        s = chunk_stats([(1000, 500.0), (1500, 100.0)], start=0)     # ms went back: a new read began at 1000
+        self.assertEqual(s["items"], [[1000, 500.0], [500, 100.0]])
+
+    def test_nothing_read_is_none(self):
+        from serve.history import chunk_stats
+        self.assertIsNone(chunk_stats([], start=0))
+        self.assertIsNone(chunk_stats([(100, 0.0)], start=100))      # no tokens, no time: nothing to rate
+
+
+class DecodeWindows(unittest.TestCase):
+    """Decode speed over a sliding 16-token window: MTP lands tokens in bursts, so a per-token speed means nothing."""
+
+    def test_steady_rate_has_no_spread(self):
+        from serve.history import window_rates
+        s = window_rates([i * 0.05 for i in range(101)])         # 20 tok/s, 101 tokens
+        self.assertEqual((s["windows"], s["tok_s_min"], s["tok_s_max"], s["tok_s_mean"]), (85, 20.0, 20.0, 20.0))
+
+    def test_bursts_do_not_make_an_instantaneous_peak(self):
+        from serve.history import window_rates
+        times, t = [], 0.0
+        for _ in range(40):                                        # 3 tokens land together every 150 ms: 20 tok/s
+            times += [t, t, t]
+            t += 0.15
+        s = window_rates(times)
+        self.assertLess(s["tok_s_max"], 25.0)                      # the burst's own gap would read as infinity
+        self.assertGreater(s["tok_s_min"], 15.0)
+
+    def test_a_slow_stretch_shows_as_the_min(self):
+        from serve.history import window_rates
+        times = [i * 0.05 for i in range(50)]                      # 20 tok/s ...
+        t0 = times[-1]
+        times += [t0 + (i + 1) * 0.2 for i in range(50)]           # ... then 5 tok/s
+        s = window_rates(times)
+        self.assertEqual((s["tok_s_max"], s["tok_s_min"]), (20.0, 5.0))
+        self.assertLess(s["series"][-1], s["series"][0])            # the trend over the request
+
+    def test_series_is_downsampled(self):
+        from serve.history import window_rates
+        self.assertLessEqual(len(window_rates([i * 0.01 for i in range(5000)])["series"]), 120)
+
+    def test_fewer_tokens_than_a_window_report_the_mean_only(self):
+        from serve.history import window_rates
+        s = window_rates([0.0, 0.1, 0.2, 0.3])                      # 3 intervals in 0.3 s
+        self.assertEqual((s["windows"], s["tok_s_min"], s["tok_s_max"], s["tok_s_mean"]), (0, None, None, 10.0))
+        self.assertIsNone(window_rates([0.0]))
+        self.assertIsNone(window_rates([]))
+
+
 if __name__ == "__main__":
     unittest.main()
