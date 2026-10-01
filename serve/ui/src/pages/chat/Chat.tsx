@@ -245,7 +245,7 @@ export function Chat() {
           onNewChat={newChat}
           onSave={download}
           mcp={{
-            servers: mcp.servers, tools: mcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings"),
+            servers: mcp.servers, tools: mcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings", "mcp-servers"),
             onToggleAll: () => chat.setSettings({ ...chat.settings, mcp: chat.settings.mcp === false }),
             onToggleServer: (name) => { const off = Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : []; chat.setSettings({ ...chat.settings, mcpOff: off.includes(name) ? off.filter((n) => n !== name) : [...off, name] }) },
           }}

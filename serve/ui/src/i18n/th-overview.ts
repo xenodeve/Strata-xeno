@@ -157,7 +157,7 @@ export const part: Record<string, string> = {
   "{name} must be a number.": "{name} ต้องเป็นตัวเลข",
   "No server is set up yet. A server gives the model tools: files, a browser, a database.": "ยังไม่ได้ตั้งเซิร์ฟเวอร์ เซิร์ฟเวอร์ให้เครื่องมือแก่โมเดล เช่น ไฟล์ เบราว์เซอร์ ฐานข้อมูล",
   "This server was started without a run config file, so there is nowhere to save the servers. Start it with --config to set them up here.": "เซิร์ฟเวอร์นี้เริ่มโดยไม่มีไฟล์ run config จึงไม่มีที่บันทึก เริ่มด้วย --config เพื่อตั้งค่าที่นี่",
-  "MCP servers are programs Strata starts, so they can be changed only from this PC itself, or when Strata has an API key and it is entered under API key above.": "เซิร์ฟเวอร์ MCP คือโปรแกรมที่ Strata เป็นผู้เปิด จึงแก้ได้เฉพาะจากเครื่องนี้เอง หรือเมื่อ Strata ตั้ง API key ไว้และกรอก key ไว้ใต้หัวข้อ “API key” ด้านบน",
+  "MCP servers are programs Strata starts, so they can be changed only from this PC itself, or when Strata has an API key and it is entered in Settings, under API key.": "เซิร์ฟเวอร์ MCP คือโปรแกรมที่ Strata เป็นผู้เปิด จึงแก้ได้เฉพาะจากเครื่องนี้เอง หรือเมื่อ Strata ตั้ง API key ไว้และกรอก key ไว้ที่ ตั้งค่า ใต้หัวข้อ “API key”",
   "Address": "ที่อยู่",
   "Program": "โปรแกรม",
   "From {file}: edit that file to change it.": "มาจาก {file}: แก้ที่ไฟล์นั้นเพื่อเปลี่ยน",

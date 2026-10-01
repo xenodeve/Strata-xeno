@@ -493,14 +493,14 @@ Or keep them in their own file and start the server with `--mcp-config path\to\c
 with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change to
 these files.
 
-**Or set them up in the web app** (new app, **Settings > MCP servers**; needs the server started with `--config`): the list
+**Or set them up in the web app** (new app, **Settings > MCP tools > Servers**; needs the server started with `--config`): the list
 shows each server's state and tools, and you can add, edit, turn off and delete one, paste a block from Claude Desktop,
 and set the three limits. A change is written to the run config (its other keys are kept; the original is copied once
 to `<config>.bak-mcp`) and the servers start again at once - no restart. Servers from `--mcp-config` are listed but
 only edited in that file. The values of `env` and `headers` are never sent to the browser: they show as `********`, and
 leaving that in keeps the stored value. Because this decides which programs Strata starts, it works **only from this
 PC itself** (open the page as `localhost` or `127.0.0.1`) **or when the server has an API key** and it is entered under
-Settings > API key; from any other address the section is a read-only list.
+Settings > General > API key; from any other address the section is a read-only list.
 
 - **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
   stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`

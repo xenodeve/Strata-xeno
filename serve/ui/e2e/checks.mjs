@@ -22,7 +22,7 @@ export const checks = [
     async run({ browser, fast, t, errors }) {
       const rows = await (await fetch(fast.base + "/metrics/requests?page=1&size=1")).json()
       const id = rows.items?.[0]?.id
-      const pages = ["#/chat", "#/dashboard", "#/live", "#/requests", id ? `#/requests/${id}` : null, "#/hardware", "#/settings", "#/about", "#/requests/trace"].filter(Boolean)
+      const pages = ["#/chat", "#/dashboard", "#/live", "#/requests", id ? `#/requests/${id}` : null, "#/hardware", "#/settings", "#/settings/mcp-servers", "#/about", "#/requests/trace"].filter(Boolean)
       for (const lang of ["en", "th"]) for (const width of [1280, 390]) {
         const pg = await open(browser, errors, { lang, width, height: 800 })
         for (const hash of pages) {
@@ -452,7 +452,7 @@ export const checks = [
       t.ok("it opens a list that says so, with no switch", (await panel.innerText()).includes("No server is set up") && (await panel.locator("[role=switch]").count()) === 0)
       await panel.getByRole("link", { name: "Set up servers" }).click()
       await pg.waitForTimeout(800)
-      t.ok("and the link goes to Settings", pg.url().endsWith("#/settings") && (await panel.count()) === 0)
+      t.ok("and the link goes to Settings", pg.url().endsWith("#/settings/mcp-servers") && (await panel.count()) === 0)
       await pg.context().close()
     },
   },
@@ -540,7 +540,7 @@ export const checks = [
       const fs = await import("node:fs")
       const disk = () => JSON.parse(fs.readFileSync(admin.config, "utf8"))
       const pg = await open(browser, errors)
-      await pg.goto(admin.base + "/#/settings")
+      await pg.goto(admin.base + "/#/settings/mcp-servers")
       const row = (n) => pg.locator(`li[data-server='${n}']`)
       const connected = (n) => pg.waitForFunction((x) => document.querySelector(`li[data-server='${x}']`)?.innerText.includes("Connected"), n, { timeout: 40000 })
       await row("fake").waitFor({ timeout: 15000 })
@@ -596,6 +596,8 @@ export const checks = [
       await row("pasted").waitFor({ timeout: 15000 })
       t.ok("a Claude Desktop block adds its servers", disk().mcp_servers.pasted.command === admin.py)
 
+      await pg.locator(".branched-menu__item", { hasText: "Limits" }).click()
+      await pg.waitForSelector("input[aria-label='Tool rounds in one answer']")
       const rounds = pg.locator("input[aria-label='Tool rounds in one answer']")
       await rounds.fill("99")
       await pg.getByRole("button", { name: "Save the limits" }).click()
@@ -611,14 +613,14 @@ export const checks = [
       await pg.context().close()
 
       const ph = await open(browser, errors, { width: 390, height: 800 })
-      await ph.goto(admin.base + "/#/settings")
+      await ph.goto(admin.base + "/#/settings/mcp-servers")
       await ph.getByRole("button", { name: "Add a server", exact: true }).click()
       await ph.waitForTimeout(900)
       t.ok("on a phone the open form fits the screen", (await ph.evaluate(() => document.documentElement.scrollWidth - innerWidth)) <= 1)
       await ph.context().close()
 
       const th = await open(browser, errors, { lang: "th" })
-      await th.goto(admin.base + "/#/settings")
+      await th.goto(admin.base + "/#/settings/mcp-servers")
       await th.getByRole("button", { name: "เพิ่มเซิร์ฟเวอร์", exact: true }).waitFor({ timeout: 15000 })
       await th.waitForFunction(() => document.querySelector("li[data-server='fake']")?.innerText.includes("เชื่อมต่อแล้ว"), null, { timeout: 40000 })
       t.ok("in Thai the button and the state are Thai", true)
@@ -630,17 +632,20 @@ export const checks = [
     name: "mcpro: where MCP servers cannot be changed the section is read-only and says why",
     async run({ browser, fast, t, errors }) {
       const pg = await open(browser, errors)
-      await pg.goto(fast.base + "/#/settings")
+      await pg.goto(fast.base + "/#/settings/mcp-servers")
       await pg.waitForTimeout(1500)
       t.ok("with no run config file it says there is nowhere to save, and offers no Add", (await pg.locator("[role=note]").innerText()).includes("without a run config file") && (await pg.getByRole("button", { name: "Add a server", exact: true }).count()) === 0)
       await pg.context().close()
       const other = await open(browser, errors)
       const server = { name: "files", kind: "address", disabled: false, source: "config", editable: true, status: "ready", error: null, tools: [{ tool: "read" }], info: {} }
       await other.route("**/mcp/config", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ servers: [server], editable: false, reason: "x", settings: { timeout_s: 60, max_result_chars: 20000, max_rounds: 8 }, config_file: "run.json", tools: 1 }) }))
-      await other.goto(fast.base + "/#/settings")
+      await other.goto(fast.base + "/#/settings/mcp-servers")
       await other.waitForSelector("li[data-server='files']")
       t.ok("from another address it lists the server and says only this PC or an API key may change it", (await other.locator("[role=note]").innerText()).includes("only from this PC") && (await other.locator("li[data-server='files']").innerText()).includes("Address"))
-      t.ok("and has no Edit, Turn off, Delete, Add or Save", (await other.locator("li[data-server='files'] button").count()) === 0 && (await other.getByRole("button", { name: "Add a server", exact: true }).count()) === 0 && (await other.getByRole("button", { name: "Save the limits" }).count()) === 0 && (await other.locator("input[aria-label='Tool rounds in one answer']").isDisabled()))
+      t.ok("and has no Edit, Turn off, Delete or Add", (await other.locator("li[data-server='files'] button").count()) === 0 && (await other.getByRole("button", { name: "Add a server", exact: true }).count()) === 0)
+      await other.locator(".branched-menu__item", { hasText: "Limits" }).click()
+      await other.waitForSelector("input[aria-label='Tool rounds in one answer']")
+      t.ok("the limits are shown, cannot be changed, and say why", (await other.getByRole("button", { name: "Save the limits" }).count()) === 0 && (await other.locator("input[aria-label='Tool rounds in one answer']").isDisabled()) && (await other.locator("[role=note]").innerText()).includes("only from this PC"))
       await other.context().close()
     },
   },
@@ -672,26 +677,67 @@ export const checks = [
     },
   },
   {
-    // Settings is a page of its own: the status marks, the API key and the MCP servers are there, and About keeps only what it tells
-    name: "settings: the settings are a page of their own, apart from About",
+    // Settings is a page of its own, with a branched menu of sections and topics; the route says which topic shows; About keeps what it tells
+    name: "settings: the settings are a page of their own, in a branched menu, apart from About",
     async run({ browser, fast, t, errors }) {
       const pg = await open(browser, errors)
+      const menu = pg.locator("nav[aria-label='Settings sections']")
+      const heads = () => menu.locator(".branched-menu__head").allInnerTexts()
+      const topic = (name) => menu.locator(".branched-menu__item", { hasText: name })
+      const h2 = () => pg.locator("main h2").allInnerTexts()
       await pg.goto(fast.base + "/#/settings")
-      await pg.waitForTimeout(1500)
-      const heads = (page) => page.locator("main h2").allInnerTexts()
-      const h = await heads(pg)
-      t.ok("Settings has the status marks, the API key and the MCP servers", ["Status marks", "API key", "MCP servers"].every((x) => h.includes(x)), h.join(", "))
-      t.ok("its title is Settings and the navigation marks it", (await pg.locator("main h1").innerText()) === "Settings" && (await pg.locator("nav a[aria-current='page']").getAttribute("aria-label")) === "Settings")
+      await pg.waitForSelector("nav[aria-label='Settings sections']")
+      await pg.waitForTimeout(1200)
+      t.ok("the menu has two sections, General and MCP tools", (await heads()).join(",") === "General,MCP tools", (await heads()).join(","))
+      t.ok("it opens on Status marks: its section is open, the other closed, and the topic is marked", (await menu.locator(".branched-menu__head").nth(0).getAttribute("aria-expanded")) === "true" && (await menu.locator(".branched-menu__head").nth(1).getAttribute("aria-expanded")) === "false" && (await topic("Status marks").getAttribute("aria-current")) === "true")
+      t.ok("only that topic is shown, with its content", (await h2()).join(",") === "Status marks" && (await pg.locator("main [role=radiogroup][aria-label='Status marks']").count()) === 1, (await h2()).join(","))
+      t.ok("its title is Settings and the top navigation marks it", (await pg.locator("main h1").innerText()) === "Settings" && (await pg.locator("nav a[aria-current='page']").getAttribute("aria-label")) === "Settings")
+      await menu.locator(".branched-menu__head", { hasText: "MCP tools" }).click()
+      await pg.waitForTimeout(500)
+      t.ok("opening a section shows its topics", (await menu.locator(".branched-menu__head").nth(1).getAttribute("aria-expanded")) === "true" && (await topic("Servers").isVisible()) && (await topic("Limits").isVisible()))
+      await topic("Servers").click()
+      await pg.waitForTimeout(600)
+      t.ok("choosing Servers puts it in the address and shows it", pg.url().endsWith("#/settings/mcp-servers") && (await h2()).join(",") === "MCP servers" && (await topic("Servers").getAttribute("aria-current")) === "true" && (await topic("Status marks").getAttribute("aria-current")) === null, pg.url())
+      await topic("Limits").click()
+      await pg.waitForTimeout(600)
+      t.ok("and Limits shows the limits and not the servers", pg.url().endsWith("#/settings/mcp-limits") && (await h2()).join(",") === "Limits" && (await pg.locator("input[aria-label='Tool rounds in one answer']").count()) === 1 && (await pg.getByRole("button", { name: "Add a server", exact: true }).count()) === 0, (await h2()).join(","))
+      const line = await pg.evaluate(() => { const p = document.querySelector(".branched-menu__base"); const s = p ? getComputedStyle(p) : null; return s ? { stroke: s.stroke, w: s.strokeWidth } : null })
+      t.ok("the branch lines are drawn in a colour", line && line.stroke !== "none" && !/rgba?\(0, 0, 0(, 0)?\)$/.test(line.stroke), JSON.stringify(line))
+
+      await pg.goto(fast.base + "/#/settings/api-key")
+      await pg.reload()
+      await pg.waitForSelector("nav[aria-label='Settings sections']")
+      await pg.waitForTimeout(1000)
+      t.ok("a link to a topic opens its section and shows it", (await menu.locator(".branched-menu__head").nth(0).getAttribute("aria-expanded")) === "true" && (await topic("API key").getAttribute("aria-current")) === "true" && (await h2()).join(",") === "API key" && (await pg.locator("input[type=password]").count()) === 1)
+      await pg.goto(fast.base + "/#/settings/mcp-limits")
+      await pg.reload()
+      await pg.waitForSelector("nav[aria-label='Settings sections']")
+      await pg.waitForTimeout(1000)
+      t.ok("a link into the other section opens that one", (await menu.locator(".branched-menu__head").nth(1).getAttribute("aria-expanded")) === "true" && (await h2()).join(",") === "Limits")
+      await pg.goto(fast.base + "/#/settings/nope")
+      await pg.waitForTimeout(800)
+      t.ok("a topic that does not exist shows Status marks", (await h2()).join(",") === "Status marks")
+
       await pg.goto(fast.base + "/#/about")
-      await pg.waitForTimeout(1500)
-      const a = await heads(pg)
-      t.ok("About keeps the model and the server, and none of the settings", a.includes("The model") && a.includes("This server") && !["Status marks", "API key", "MCP servers"].some((x) => a.includes(x)), a.join(", "))
+      await pg.waitForTimeout(1200)
+      const a = await h2()
+      t.ok("About keeps the model and the server, and none of the settings", a.includes("The model") && a.includes("This server") && !["Status marks", "API key", "MCP servers", "Limits"].some((x) => a.includes(x)), a.join(", "))
       await pg.context().close()
+
       const th = await open(browser, errors, { lang: "th" })
       await th.goto(fast.base + "/#/settings")
-      await th.waitForTimeout(1500)
-      t.ok("in Thai the page is ตั้งค่า", (await th.locator("main h1").innerText()) === "ตั้งค่า")
+      await th.waitForSelector("nav[aria-label='หัวข้อในหน้าตั้งค่า']")
+      await th.waitForTimeout(1000)
+      t.ok("in Thai the page and its sections are Thai", (await th.locator("main h1").innerText()) === "ตั้งค่า" && (await th.locator(".branched-menu__head").allInnerTexts()).join(",") === "ทั่วไป,เครื่องมือ MCP")
       await th.context().close()
+
+      const ph = await open(browser, errors, { width: 390, height: 800 })
+      await ph.goto(fast.base + "/#/settings/mcp-servers")
+      await ph.waitForSelector("nav[aria-label='Settings sections']")
+      await ph.waitForTimeout(1000)
+      const box = await ph.evaluate(() => { const m = document.querySelector("nav[aria-label='Settings sections']").getBoundingClientRect(); const c = document.querySelector("main h2").getBoundingClientRect(); return { over: document.documentElement.scrollWidth - innerWidth, menuBottom: m.bottom, contentTop: c.top } })
+      t.ok("on a phone the menu is above the content and nothing is wider than the screen", box.over <= 1 && box.menuBottom <= box.contentTop + 1, JSON.stringify(box))
+      await ph.context().close()
     },
   },
 ]

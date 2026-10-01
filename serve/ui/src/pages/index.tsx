@@ -23,7 +23,7 @@ export function PageView({ route }: { route: Route }) {
       return kind === "gpu" && n ? <GpuPage n={n} /> : kind === "ssd" && n ? <SsdPage n={n} /> : <Hardware />
     }
     case "settings":
-      return <Settings />
+      return <Settings topic={route.params[0]} />
     case "about":
       return <About />
   }

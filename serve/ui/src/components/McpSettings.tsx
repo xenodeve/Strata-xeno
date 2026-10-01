@@ -19,7 +19,7 @@ const areaCls = "w-full resize-y rounded-sm border border-line bg-surface px-2.5
 
 type Form = { mode: "new" | "edit"; draft: Draft; problems: Record<string, string>; failure: string | null }
 
-export function McpSettings() {
+export function McpSettings({ part }: { part: "servers" | "limits" }) {
   const [view, setView] = useState<McpConfigView | null>(null)
   const [busy, setBusy] = useState(false)
   const [form, setForm] = useState<Form | null>(null)
@@ -107,6 +107,37 @@ export function McpSettings() {
     else toast("success", t("Saved"), t("The limits apply from the next tool call."))
   }
 
+  const limitsForm = limits && (
+    <div className="mt-3">
+      <div className="grid gap-x-4 sm:grid-cols-3">
+        {(["timeout_s", "max_result_chars", "max_rounds"] as const).map((k) => (
+          <Field key={k} label={t(LIMIT_NAME[k])} hint={t(LIMIT_HINT[k])}>
+            <input className={`${inputCls} num`} inputMode="numeric" value={limits[k]} disabled={!can} aria-label={t(LIMIT_NAME[k])} onChange={(e) => setLimits({ ...limits, [k]: e.target.value })} />
+          </Field>
+        ))}
+      </div>
+      {can && <Button disabled={busy} onClick={() => void saveLimits()}>{t("Save the limits")}</Button>}
+    </div>
+  )
+  const readOnly = !can && (
+    <p role="note" className="mt-2 rounded-md bg-fill px-3 py-2 text-[12px] text-ink-2">
+      {view.config_file === null
+        ? t("This server was started without a run config file, so there is nowhere to save the servers. Start it with --config to set them up here.")
+        : t("MCP servers are programs Strata starts, so they can be changed only from this PC itself, or when Strata has an API key and it is entered in Settings, under API key.")}
+    </p>
+  )
+  if (part === "limits") {
+    return (
+      <section>
+        <h2 className="text-[15px] font-semibold">{t("Limits")}</h2>
+        <p className="mt-1 text-[13px] text-ink-2">{t("What one answer may ask of the tools: how long a call may take, how much of a result the model reads, how many rounds of calls.")}</p>
+        {readOnly}
+        {limitsForm}
+        {notice && <p role="alert" className="mt-2 text-[12px] text-bad [overflow-wrap:anywhere]">{notice}</p>}
+      </section>
+    )
+  }
+
   const nTools = view.tools
   return (
     <section>
@@ -114,13 +145,7 @@ export function McpSettings() {
       <p className="mt-1 text-[13px] text-ink-2">
         {rows.length ? t("{n} tools; the model calls them when it decides to.", { n: fmt(nTools) }) : t("No server is set up yet. A server gives the model tools: files, a browser, a database.")}
       </p>
-      {!can && (
-        <p role="note" className="mt-2 rounded-md bg-fill px-3 py-2 text-[12px] text-ink-2">
-          {view.config_file === null
-            ? t("This server was started without a run config file, so there is nowhere to save the servers. Start it with --config to set them up here.")
-            : t("MCP servers are programs Strata starts, so they can be changed only from this PC itself, or when Strata has an API key and it is entered under API key above.")}
-        </p>
-      )}
+      {readOnly}
 
       <ul className="m-0 mt-2 list-none p-0" aria-label={t("MCP servers")}>
         {rows.map((s) => {
@@ -221,19 +246,6 @@ export function McpSettings() {
         ) : null}
       </Reveal>
 
-      {limits && (
-        <div className="mt-5">
-          <h3 className="text-[13px] font-medium">{t("Limits")}</h3>
-          <div className="grid gap-x-4 sm:grid-cols-3">
-            {(["timeout_s", "max_result_chars", "max_rounds"] as const).map((k) => (
-              <Field key={k} label={t(LIMIT_NAME[k])} hint={t(LIMIT_HINT[k])}>
-                <input className={`${inputCls} num`} inputMode="numeric" value={limits[k]} disabled={!can} aria-label={t(LIMIT_NAME[k])} onChange={(e) => setLimits({ ...limits, [k]: e.target.value })} />
-              </Field>
-            ))}
-          </div>
-          {can && <Button disabled={busy} onClick={() => void saveLimits()}>{t("Save the limits")}</Button>}
-        </div>
-      )}
     </section>
   )
 }

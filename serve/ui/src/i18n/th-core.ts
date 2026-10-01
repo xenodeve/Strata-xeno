@@ -29,4 +29,8 @@ export const part: Record<string, string> = {
   "Theme: {name}": "ธีม: {name}",
   "Theme: {name}. Change": "ธีม: {name} กดเพื่อเปลี่ยน",
   "Language: {name}. Change": "ภาษา: {name} กดเพื่อเปลี่ยน",
+  "General": "ทั่วไป",
+  "Servers": "เซิร์ฟเวอร์",
+  "Settings sections": "หัวข้อในหน้าตั้งค่า",
+  "What one answer may ask of the tools: how long a call may take, how much of a result the model reads, how many rounds of calls.": "สิ่งที่หนึ่งคำตอบขอจากเครื่องมือได้: เรียกนานแค่ไหน โมเดลอ่านผลได้มากแค่ไหน และเรียกได้กี่รอบ",
 }
