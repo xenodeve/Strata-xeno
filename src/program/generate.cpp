@@ -597,7 +597,7 @@ void usage() {
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                  "                       layers across CUDA1..3 (default: stripe)\n"
                  "  --cache-cpu-only     Diagnostic: prefill normally, then route verify experts to CPU.\n"
-                 "  --secondary-expert-mib N  Phase 3 Q2_0 tier on RTX 4070 SUPER;\n"
+                 "  --secondary-expert-mib N  Phase 3 expert tier on RTX 4070 SUPER (any native pack, #11);\n"
                  "  --secondary-free-floor-mib N  Experimental free floor on 4070; default 2560.\n"
                  "  --secondary-profile-timing  Opt-in CUDA event timing for secondary transfer/compute.\n"
                      "  --secondary-stage-only  Stage/verify weights, but compute all experts as before.\n"
@@ -2243,12 +2243,13 @@ int main(int argc, char** argv) {
     if (o.pcie_frac < 0.0) o.pcie_frac = 0.0;
     const auto pack_formats = strata::core::placement_formats(native_pack, strata::kernels::cpu::expert_layout().fmt,
                                                               strata::kernels::iq_supported);
-    const bool secondary_q2 = pack_formats.all_q2;
+    // #11: the 4070 tier computes any native format the kernels know (SecondaryRunner quantizes the activations as
+    // the 5060's verify path does, xeno_secondary_iq_parity); --secondary-expert-mib is itself the request
     if (o.secondary_expert_mib > 0 &&
         (!native_pack || (!o.secondary_stage_only && !o.cache_cpu_only &&
-                          (!secondary_q2 || o.pcie_frac != 0.0 || o.no_pool || o.spec < 2)))) {
-        std::fprintf(stderr, "strata generate: secondary compute needs native Q2_0, spec >=2, "
-                             "expert pool and --pcie-frac 0 until combined routing is validated\n");
+                          (!pack_formats.all_native || o.pcie_frac != 0.0 || o.no_pool || o.spec < 2)))) {
+        std::fprintf(stderr, "strata generate: secondary compute needs a native pack in formats the GPU kernels "
+                             "compute, spec >=2, expert pool and --pcie-frac 0\n");
         return 2;
     }
     {
@@ -3487,7 +3488,7 @@ int main(int argc, char** argv) {
     std::vector<int32_t> secondary_residency;
     if (o.secondary_expert_mib > 0) {
         if (!native_pack || profile.empty() || o.expert_cache <= 0 || srcp == nullptr) {
-            std::fprintf(stderr, "strata generate: secondary experts need native Q2_0, a profile and a primary cache\n");
+            std::fprintf(stderr, "strata generate: secondary experts need a native pack, a profile and a primary cache\n");
             return 2;
         }
         std::vector<int32_t> primary_residency((size_t) (g.n_layers * g.n_expert), -1);
@@ -7257,6 +7258,9 @@ int main(int argc, char** argv) {
                 const int32_t slot = secondary_residency[(size_t) out];
                 const int32_t layer = out / (int32_t) g.n_expert;
                 if (srcp->blob(in / (int32_t) g.n_expert, in % (int32_t) g.n_expert) == nullptr) break;
+                // #11: a newcomer from another layer must fit the victim's slot (native blobs differ per layer)
+                if ((uint64_t) lay.blob_bytes(in / (int32_t) g.n_expert) > secondary_arena.slot_bytes((uint64_t) slot))
+                    continue;
                 if (cudaMemcpyAsync(ss_stage + sx_d2h.size() * ps_blob, secondary_arena.slot_ptr((uint64_t) slot),
                                     (size_t) lay.blob_bytes(layer), cudaMemcpyDeviceToHost, ss_stream) != cudaSuccess)
                     return false;
@@ -7299,6 +7303,9 @@ int main(int argc, char** argv) {
                     const uint8_t* src = srcp->blob(layer, in % (int32_t) g.n_expert);
                     const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
                     if (src == nullptr) break;
+                    // #11: the pair may span layers, and a native pack's blobs differ per layer: a newcomer larger
+                    // than the victim's slot would overwrite the next slot's expert
+                    if (bytes > secondary_arena.slot_bytes((uint64_t) slot)) continue;
                     secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
                     jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
                     ss_pending.emplace_back(in, slot);
