@@ -1447,6 +1447,7 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
+            to_disk = None
             with self.status_lock:
                 if self.status.get("busy"):
                     # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
@@ -1483,14 +1484,10 @@ class Service:
                         "cjk_chars": cjk_guard.count_han(self.tok.decode(raw_ids)) if raw_ids else 0,   # #49 S4
                         "hit_rate": hit_rate})
                     self.history.append(rec)
-                    try:
-                        self.hstore.append(rec)         # on disk, kept (a full disk must not fail the request)
-                        self.hstore.write_detail(rec["id"], {"prefill_chunks": chunks["items"] if chunks else [],
-                                                             "decode_series": decode["series"] if decode else [],
-                                                             "stats": last.get("stats"),
-                                                             **({"prompt": prompt} if prompt is not None else {})})
-                    except OSError as e:
-                        print(f"[strata] history not saved: {e}", flush=True)
+                    to_disk = (rec, {"prefill_chunks": chunks["items"] if chunks else [],
+                                     "decode_series": decode["series"] if decode else [],
+                                     "stats": last.get("stats"),
+                                     **({"prompt": prompt} if prompt is not None else {})})   # written after the lock is let go
                     t = self.totals
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
@@ -1519,6 +1516,12 @@ class Service:
                 self.status["last_stop_reason"] = stop_detail or finish
                 self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
                 self.status.pop("tool", None)
+            if to_disk is not None:                     # on disk, kept: outside status_lock (it is /status's and /metrics's lock),
+                try:                                    # and a full disk must not fail the request
+                    self.hstore.append(to_disk[0])
+                    self.hstore.write_detail(to_disk[0]["id"], to_disk[1])
+                except OSError as e:
+                    print(f"[strata] history not saved: {e}", flush=True)
         if not matched_sequence:
             for ev in parser.finish():
                 if ev.kind == "content" and stop_filter:

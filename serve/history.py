@@ -105,7 +105,8 @@ class HistoryStore:
         self.dir = Path(directory)
         self.enabled = enabled
         self.cap = int(detail_cap_bytes)
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()              # writers only (append, write_detail, prune)
+        self._counts: dict = {}
 
     # ------------------------------------------------------------------------------------------ summaries
     def append(self, record: dict) -> None:
@@ -136,37 +137,55 @@ class HistoryStore:
                 continue
         return out
 
+    def _count(self, path: Path) -> int:
+        """Rows in a month file, remembered per (size, mtime): an old month is parsed once, not on every page."""
+        try:
+            st = path.stat()
+        except OSError:
+            return 0
+        key = (st.st_size, st.st_mtime_ns)
+        hit = self._counts.get(path.name)
+        if hit and hit[0] == key:
+            return hit[1]
+        n = len(self._read(path))
+        self._counts[path.name] = (key, n)
+        return n
+
     def page(self, page: int, size: int) -> dict:
-        """Newest first. {"items": [...], "total": n, "page": p, "size": s}."""
+        """Newest first. {"items": [...], "total": n, "page": p, "size": s}. Nothing here takes the write lock: the
+        files are append-only and a torn last line is skipped, so a page read never holds up a request that is ending."""
         size = max(1, min(int(size), 500))
         page = max(0, int(page))
-        with self.lock:
-            files = self._files_newest_first()
-            per_file = [self._read(f) for f in files]
-        total = sum(len(r) for r in per_file)
-        skip, items = page * size, []
-        for recs in per_file:
-            for r in reversed(recs):
-                if skip:
-                    skip -= 1
-                elif len(items) < size:
-                    items.append(r)
-        return {"items": items, "total": total, "page": page, "size": size}
+        files = self._files_newest_first()
+        need, rows, total = (page + 1) * size, [], 0
+        for f in files:
+            if len(rows) < need:                    # newest files first, and only as many as this page reaches
+                recs = self._read(f)
+                self._counts[f.name] = (self._stat_key(f), len(recs))
+                rows.extend(reversed(recs))
+                total += len(recs)
+            else:
+                total += self._count(f)             # older months only counted (cached)
+        return {"items": rows[page * size:need], "total": total, "page": page, "size": size}
+
+    @staticmethod
+    def _stat_key(path: Path):
+        try:
+            st = path.stat()
+            return (st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
 
     def has_summary(self, rid: str) -> bool:
-        if not isinstance(rid, str) or not _ID.match(rid):
-            return False
-        with self.lock:
-            return any(r.get("id") == rid for f in self._files_newest_first() for r in self._read(f))
+        return self.summary(rid) is not None
 
     def summary(self, rid: str):
         if not isinstance(rid, str) or not _ID.match(rid):
             return None
-        with self.lock:
-            for f in self._files_newest_first():
-                for r in self._read(f):
-                    if r.get("id") == rid:
-                        return r
+        for f in self._files_newest_first():
+            for r in self._read(f):
+                if r.get("id") == rid:
+                    return r
         return None
 
     # ------------------------------------------------------------------------------------------ details

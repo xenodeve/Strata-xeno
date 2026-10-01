@@ -57,6 +57,45 @@ class Summaries(unittest.TestCase):
             fh.write('{"id": "r0002", "tim')                # a crash mid-write
         self.assertEqual([r["id"] for r in HistoryStore(self.dir).page(0, 10)["items"]], ["r0001"])
 
+    def test_reading_a_page_never_holds_the_write_lock(self):
+        # append() runs when a request ends; a page read that held the same lock would stall that request
+        import threading
+        h = HistoryStore(self.dir)
+        for i in range(30):
+            h.append(rec(i))
+        done = []
+        with h.lock:                                        # a writer is mid-append
+            t = threading.Thread(target=lambda: done.append(h.page(0, 10)), daemon=True)
+            t.start()
+            t.join(2)
+            self.assertFalse(t.is_alive(), "page() waited for the write lock")
+        self.assertEqual(len(done[0]["items"]), 10)
+
+    def test_a_page_reads_only_the_newest_files_it_needs(self):
+        h = HistoryStore(self.dir)
+        for month in (8, 9, 10):
+            for i in range(5):
+                h.append(rec(month * 10 + i, t=time.mktime((2026, month, 10, 12, 0, i, 0, 0, -1))))
+        reads = []
+        saved = HistoryStore.__dict__["_read"]                       # the staticmethod object itself, so it can be put back
+        orig = saved.__func__
+        HistoryStore._read = staticmethod(lambda p: (reads.append(p.name), orig(p))[1])
+        try:
+            h2 = HistoryStore(self.dir)
+            page = h2.page(0, 3)
+            self.assertEqual([r["id"] for r in page["items"]], ["r0104", "r0103", "r0102"])
+            self.assertEqual(page["total"], 15)
+        finally:
+            HistoryStore._read = saved
+        self.assertEqual(reads.count("requests-2026-10.jsonl"), 1)       # read once, not once per question
+        reads.clear()
+        HistoryStore._read = staticmethod(lambda p: (reads.append(p.name), orig(p))[1])
+        try:
+            h2.page(0, 3)                                                # the same instance again: the older months are counted from memory
+        finally:
+            HistoryStore._read = saved
+        self.assertEqual(reads, ["requests-2026-10.jsonl"])              # only the newest, which this page reaches
+
     def test_off_writes_nothing(self):
         h = HistoryStore(self.dir, enabled=False)
         h.append(rec(1))
