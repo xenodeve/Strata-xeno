@@ -4,6 +4,7 @@ import { ArrowDown01Icon, Copy01Icon, AttachmentIcon } from "@hugeicons/core-fre
 import { chat, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
 import { Collapse } from "../../components/motion"
+import { ThinkingOrb } from "../../vendor/thinking-orbs/orb"
 import { cn } from "../../lib/cn"
 import { fmt, timeStr } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
@@ -116,20 +117,20 @@ export function MessageView({ m, streaming, show }: { m: Message; streaming: boo
               : <span key={i} className="inline-flex items-center gap-1 rounded-sm bg-fill px-2 py-1 text-[12px]">{im.name || "image"}</span>)}
           </div>
         )}
-        <div className="max-w-[85%] whitespace-pre-wrap rounded-lg bg-fill px-3.5 py-2 [overflow-wrap:anywhere]">{m.text}</div>
+        <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] [overflow-wrap:anywhere]">{m.text}</div>
         <div className="num px-1 text-[12px] text-ink-3">You · {timeStr(m.time)}</div>
       </div>
     )
   }
   const waiting = streaming && !m.text && !m.tools?.length
   return (
-    <div ref={ref} className="msg-in max-w-[min(100%,65ch)] lg:max-w-[72ch]">
+    <div ref={ref} className="msg-in max-w-[min(100%,65ch)] text-[15px] tracking-[-0.011em] lg:max-w-[72ch]">
       {m.reasoning && <Thinking m={m} streaming={streaming} show={show} />}
       {m.error ? (
         <div className="rounded-md border border-line px-3 py-2 text-[13px] text-bad [overflow-wrap:anywhere]">{m.error}</div>
       ) : waiting ? (
-        <span className="text-ink-3" aria-label={m.reasoning ? "Writing" : "Waiting"}>
-          <span className="pulse-dot" />
+        <span className="inline-flex h-6 items-center" aria-label={m.reasoning ? "Thinking" : "Waiting"}>
+          <ThinkingOrb state={m.reasoning ? "solving" : "breathing"} size={20} />
         </span>
       ) : (
         <div className={cn(streaming && "streaming")}><Answer m={m} /></div>

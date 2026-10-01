@@ -57,8 +57,8 @@ export function Hardware() {
 
   return (
     <div>
-      <h1 className="text-xl font-semibold">Hardware</h1>
-      <p className="mt-1 text-[13px] text-ink-2">What each part is doing for the model. A figure the engine does not measure says so.</p>
+      <h1 className="page-title">Hardware</h1>
+      <p className="page-sub">What each part is doing for the model. A figure the engine does not measure says so.</p>
 
       <Section title="GPUs">
         {cards(m).length === 0 ? <p className="text-ink-2">No GPU is reporting.</p> : cards(m).map((g) => (
@@ -128,8 +128,8 @@ export function GpuPage({ n }: { n: string }) {
   return (
     <div>
       <p className="mb-3 text-[13px]"><a href={href("hardware")}>← Hardware</a></p>
-      <h1 className="text-xl font-semibold">{g.name || `GPU ${g.index}`}</h1>
-      <p className="mt-1 text-[13px] text-ink-2">NVML index {g.index}{arch && ` · ${arch}`}</p>
+      <h1 className="page-title">{g.name || `GPU ${g.index}`}</h1>
+      <p className="page-sub">NVML index {g.index}{arch && ` · ${arch}`}</p>
 
       <Section title="Now">
         <Rows>
@@ -188,8 +188,8 @@ export function SsdPage({ n }: { n: string }) {
   return (
     <div>
       <p className="mb-3 text-[13px]"><a href={href("hardware")}>← Hardware</a></p>
-      <h1 className="text-xl font-semibold">{d.model || `Disk ${d.index}`}</h1>
-      <p className="mt-1 text-[13px] text-ink-2">Disk {d.index}{modelDisk(m) === d.index && " · holds the model"}</p>
+      <h1 className="page-title">{d.model || `Disk ${d.index}`}</h1>
+      <p className="page-sub">Disk {d.index}{modelDisk(m) === d.index && " · holds the model"}</p>
 
       <Section title="The disk">
         <Rows>

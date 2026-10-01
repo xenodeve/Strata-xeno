@@ -1,5 +1,5 @@
 // GET /metrics, polled while the tab is visible and not at all while it is hidden (nothing loops in the background).
-import { useEffect, useRef, useState } from "react"
+import { createContext, createElement, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { apiHeaders, url } from "./api"
 
 export interface Gpu { index: number; util: number | null; mem_used: number | null; mem_total: number | null; temp: number | null; power: number | null }
@@ -55,7 +55,7 @@ export interface Metrics {
 
 export type MetricsState = { data: Metrics | null; error: string | null; stale: boolean }
 
-export function useMetrics(): MetricsState {
+function usePoll(): MetricsState {
   const [state, set] = useState<MetricsState>({ data: null, error: null, stale: false })
   const fails = useRef(0)
   useEffect(() => {
@@ -117,3 +117,10 @@ export async function setKeep(n: number): Promise<number> {
   if (!r.ok) throw new Error(r.status === 401 ? "This server needs an API key (About)." : `HTTP ${r.status}`)
   return ((await r.json()) as { keep_prompts_left: number }).keep_prompts_left
 }
+
+// One poll for the whole app: the navbar's orb and the page under it read the same numbers.
+const Ctx = createContext<MetricsState>({ data: null, error: null, stale: false })
+export function MetricsProvider({ children }: { children: ReactNode }) {
+  return createElement(Ctx.Provider, { value: usePoll() }, children)
+}
+export const useMetrics = (): MetricsState => useContext(Ctx)

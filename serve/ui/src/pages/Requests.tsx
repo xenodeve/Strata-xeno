@@ -1,8 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Chart } from "../components/Chart"
 import { Disclosure } from "../components/motion"
-import { NOT_MEASURED, Row, Rows, Section, ms, pct, val, when } from "../components/bits"
-import { fmt } from "../lib/format"
+import { Facts, NOT_MEASURED, Row, Rows, Section, ms, pct, val, when } from "../components/bits"
+import { clientName, fmt } from "../lib/format"
 import { attribute, overlapOpportunityMs } from "../lib/stall"
 import { getKeepLeft, getRequest, getRequestPage, promptSplit, setKeep, type RequestDetail, type RequestRow } from "../lib/metrics"
 import { href } from "../lib/router"
@@ -46,12 +46,12 @@ export function RequestList({ rows, empty }: { rows: RequestRow[]; empty: string
     <ul className="m-0 list-none p-0">
       {rows.map((r) => (
         <li key={r.id} className="row-in border-b border-line last:border-0">
-          <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1 py-2.5">
+          <div className="row-wash flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1 py-2.5">
             <a href={href("requests", r.id)} className="min-w-0 flex-1 basis-56 no-underline">
               <div className="truncate">{r.preview || <span className="text-ink-3">(no text)</span>}</div>
               <div className="mt-0.5 truncate text-[12px] text-ink-2">
                 <span className="num">{when(r.time)}</span> · {r.dialect === "anthropic" ? "Anthropic" : r.dialect === "openai" ? "OpenAI" : "unknown API"}
-                {r.client && ` · ${r.client}`}{r.tools.length > 0 && ` · ${r.tools.length} tools`}
+                {r.client && ` · ${clientName(r.client)}`}{r.tools.length > 0 && ` · ${r.tools.length} tools`}
                 {r.finish !== "stop" && r.finish !== "length" && ` · ${r.finish}`}
               </div>
             </a>
@@ -94,8 +94,8 @@ export function Requests() {
 
   return (
     <div>
-      <h1 className="text-xl font-semibold">Requests</h1>
-      <p className="mt-1 text-[13px] text-ink-2">
+      <h1 className="page-title">Requests</h1>
+      <p className="page-sub">
         {total ? `${fmt(total)} kept on this PC.` : "Every finished request is kept here."} Hover a speed for its spread.
       </p>
       {error && <p className="mt-4 text-bad">{error}</p>}
@@ -143,35 +143,38 @@ export function RequestDetailPage({ id }: { id: string }) {
   return (
     <div>
       <p className="mb-3 text-[13px]"><a href={href("requests")}>← Requests</a></p>
-      <h1 className="text-xl font-semibold [overflow-wrap:anywhere]">{r.preview || "(no text)"}</h1>
-      <p className="mt-1 text-[13px] text-ink-2"><span className="num">{when(r.time)}</span> · {r.dialect}{r.client && ` · ${r.client}`}</p>
+      <h1 className="page-title line-clamp-2 !text-[clamp(22px,2.8vw,30px)] [overflow-wrap:anywhere]">{r.preview || "(no text)"}</h1>
+      <p className="page-sub"><span className="num">{when(r.time)}</span> · {r.dialect}{r.client && ` · ${clientName(r.client)}`}</p>
 
       <Section title="Overview">
-        <Rows>
-          <Row k="Prefill" hint="read from scratch" v={<span className="num">{fmt(split.read)} tokens</span>} />
-          <Row k="Conversation cache" hint="held already, no compute" v={<span className="num">{fmt(split.cached)} tokens{split.cached > 0 && <span className="text-ink-2"> · {pct(split.cachedShare)} of the prompt</span>}</span>} />
-          <Row k="Answer" v={<span className="num">{fmt(r.output_tokens)} tokens</span>} />
-          <Row k="Took" v={val(r.duration_s, (n) => n.toFixed(1), "s")} />
-          <Row k="Ended" v={r.finish} />
-          {det?.prompt && <Row k="Prompt" hint="kept for replay" v={<span className="num">{det.prompt.length} messages</span>} />}
-          {r.tools.length > 0 && <Row k="Tools offered" v={<span className="text-ink-2">{r.tools.join(", ")}</span>} />}
-          <Row k="Expert cache hit rate" v={val(r.hit_rate, (n) => pct(n, 1))} />
-        </Rows>
+        <Facts items={[
+          ["Prefill, read", <>{fmt(split.read)} tokens</>],
+          ["From the cache", <>{fmt(split.cached)} tokens{split.cached > 0 && <span className="text-ink-2"> · {pct(split.cachedShare)}</span>}</>],
+          ["Answer", <>{fmt(r.output_tokens)} tokens</>],
+          ["Took", val(r.duration_s, (n) => n.toFixed(1), "s")],
+          ["Ended", r.finish],
+          ["Expert cache hit", val(r.hit_rate, (n) => pct(n, 1))],
+        ]} />
+        {(det?.prompt || r.tools.length > 0) && (
+          <Rows>
+            {det?.prompt && <Row k="Prompt" hint="kept for replay" v={<span className="num">{det.prompt.length} messages</span>} />}
+            {r.tools.length > 0 && <Row k="Tools offered" v={<span className="text-ink-2">{r.tools.join(", ")}</span>} />}
+          </Rows>
+        )}
       </Section>
 
       <Section title="Prefill" aside={`the ${fmt(split.read)} tokens read, per chunk`}>
         {r.prefill ? (
           <>
-            <Rows>
-              <Row k="Chunks" v={r.prefill.chunks === 1 ? "1 chunk" : <span className="num">{r.prefill.chunks}</span>} />
-              {r.prefill.chunks > 1 && <Row k="Slowest chunk" v={val(r.prefill.tok_s_min, (n) => n.toFixed(0), "tok/s")} />}
-              {r.prefill.chunks > 1 && <Row k="Fastest chunk" v={val(r.prefill.tok_s_max, (n) => n.toFixed(0), "tok/s")} />}
-              <Row k="Mean" hint="all tokens over all time" v={val(r.prefill.tok_s_mean, (n) => n.toFixed(0), "tok/s")} />
-            </Rows>
+            <Facts items={[
+              ["Chunks", r.prefill.chunks === 1 ? "1 chunk" : String(r.prefill.chunks)],
+              ...(r.prefill.chunks > 1 ? [["Slowest", val(r.prefill.tok_s_min, (n) => n.toFixed(0), "tok/s")], ["Fastest", val(r.prefill.tok_s_max, (n) => n.toFixed(0), "tok/s")]] as [string, ReactNode][] : []),
+              ["Mean", val(r.prefill.tok_s_mean, (n) => n.toFixed(0), "tok/s")],
+            ]} />
             {det?.prefill_chunks && det.prefill_chunks.length > 1 && (
-              <div className="mt-3">
-                <div className="mb-1 text-[12px] text-ink-2">Speed of each chunk, tok/s</div>
-                <Chart series={[{ label: "tok/s", values: det.prefill_chunks.map(([t, m]) => (m > 0 ? t / (m / 1000) : null)) }]} height={90} />
+              <div className="mt-4">
+                <div className="mb-1 text-[12px] text-ink-3">Speed of each chunk, tok/s</div>
+                <Chart series={[{ label: "tok/s", values: det.prefill_chunks.map(([t, m]) => (m > 0 ? t / (m / 1000) : null)) }]} height={96} />
               </div>
             )}
           </>
@@ -181,15 +184,14 @@ export function RequestDetailPage({ id }: { id: string }) {
       <Section title="Decode" aside="over a sliding 16-token window">
         {r.decode ? (
           <>
-            <Rows>
-              <Row k="Mean" v={val(r.decode.tok_s_mean, r1, "tok/s")} />
-              {r.decode.windows > 0 && <Row k="Slowest window" v={val(r.decode.tok_s_min, r1, "tok/s")} />}
-              {r.decode.windows > 0 && <Row k="Fastest window" v={val(r.decode.tok_s_max, r1, "tok/s")} />}
-            </Rows>
+            <Facts items={[
+              ["Mean", val(r.decode.tok_s_mean, r1, "tok/s")],
+              ...(r.decode.windows > 0 ? [["Slowest window", val(r.decode.tok_s_min, r1, "tok/s")], ["Fastest window", val(r.decode.tok_s_max, r1, "tok/s")]] as [string, ReactNode][] : []),
+            ]} />
             {det?.decode_series && det.decode_series.length > 1 && (
-              <div className="mt-3">
-                <div className="mb-1 text-[12px] text-ink-2">Trend over the answer, tok/s</div>
-                <Chart series={[{ label: "tok/s", values: det.decode_series }]} area height={110} />
+              <div className="mt-4">
+                <div className="mb-1 text-[12px] text-ink-3">Trend over the answer, tok/s</div>
+                <Chart series={[{ label: "tok/s", values: det.decode_series }]} area height={120} />
               </div>
             )}
           </>

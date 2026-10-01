@@ -1,12 +1,14 @@
+import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
-  Activity01Icon, ComputerIcon, DashboardSquare01Icon, CpuIcon, InformationCircleIcon, Message01Icon, Moon02Icon, Sun03Icon, Task01Icon,
+  Activity01Icon, ComputerIcon, CpuIcon, DashboardSquare01Icon, InformationCircleIcon, Message01Icon, Moon02Icon, Sun03Icon, Task01Icon,
 } from "@hugeicons/core-free-icons"
-import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { cn } from "./lib/cn"
+import { MetricsProvider, useMetrics } from "./lib/metrics"
 import { href, PAGES, useRoute, type Page } from "./lib/router"
 import { useTheme, type Theme } from "./lib/theme"
 import { PageView } from "./pages"
+import { StatusOrb } from "./components/live"
 import { ToastHost } from "./components/toast"
 
 const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
@@ -20,7 +22,64 @@ const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
 
 const THEME_ICON: Record<Theme, IconSvgElement> = { system: ComputerIcon, light: Sun03Icon, dark: Moon02Icon }
 
-export function App() {
+/** The page links, with one pill that glides to the current page (measured, then moved with transform and width). */
+function Nav({ page }: { page: Page }) {
+  const nav = useRef<HTMLElement>(null)
+  const [pill, setPill] = useState<{ x: number; w: number } | null>(null)
+  const [ready, setReady] = useState(false)               // no glide on the first placement
+  useLayoutEffect(() => {
+    const el = nav.current
+    if (!el) return
+    const place = () => {
+      const a = el.querySelector<HTMLElement>('[aria-current="page"]')
+      if (a) setPill({ x: a.offsetLeft, w: a.offsetWidth })
+    }
+    place()
+    const ro = new ResizeObserver(place)
+    ro.observe(el)
+    document.fonts?.ready.then(place)
+    const id = requestAnimationFrame(() => setReady(true))
+    return () => { ro.disconnect(); cancelAnimationFrame(id) }
+  }, [page])
+  return (
+    <nav ref={nav} aria-label="Pages" className="relative -mx-1 flex min-w-0 flex-1 gap-0.5 overflow-x-auto px-1">
+      {pill && (
+        <span
+          aria-hidden
+          className={cn("absolute inset-y-0 left-0 my-auto h-8 rounded-sm bg-fill", ready && "transition-[transform,width] duration-[420ms] ease-[var(--ease)]")}
+          style={{ transform: `translateX(${pill.x}px)`, width: pill.w }}
+        />
+      )}
+      {PAGES.map((p) => (
+        <a
+          key={p}
+          href={href(p)}
+          aria-current={page === p ? "page" : undefined}
+          aria-label={NAV[p].label}
+          className={cn(
+            "relative flex h-8 shrink-0 items-center gap-1.5 rounded-sm px-2 text-[13px] sm:px-2.5 no-underline transition-colors duration-200",
+            page === p ? "text-ink" : "text-ink-2 hover:text-ink",
+          )}
+        >
+          <HugeiconsIcon icon={NAV[p].icon} size={16} strokeWidth={1.6} aria-hidden />
+          <span className={page === p ? "" : "max-sm:sr-only"}>{NAV[p].label}</span>
+        </a>
+      ))}
+    </nav>
+  )
+}
+
+function Brand() {
+  const { data } = useMetrics()
+  return (
+    <a href={href("dashboard")} className="flex items-center gap-2 no-underline" aria-label="Strata, the dashboard">
+      <StatusOrb state={data?.live.state ?? "idle"} size={20} />
+      <span className="text-[15px] font-semibold tracking-[-0.02em] max-[430px]:sr-only">Strata</span>
+    </a>
+  )
+}
+
+function Shell() {
   const route = useRoute()
   const { theme, cycle } = useTheme()
   const [scrolled, setScrolled] = useState(false)
@@ -45,40 +104,28 @@ export function App() {
           scrolled ? "border-line bg-[color-mix(in_srgb,var(--bg)_82%,transparent)]" : "border-transparent bg-bg",
         )}
       >
-      <div className="mx-auto flex max-w-5xl items-center gap-3 px-4 py-3 sm:px-6">
-        <span className="text-[15px] font-semibold tracking-tight">Strata</span>
-        <nav aria-label="Pages" className="-mx-1 flex min-w-0 flex-1 gap-0.5 overflow-x-auto px-1">
-          {PAGES.map((p) => (
-            <a
-              key={p}
-              href={href(p)}
-              aria-current={route.page === p ? "page" : undefined}
-              aria-label={NAV[p].label}
-              className={cn(
-                "flex h-8 shrink-0 items-center gap-1.5 rounded-sm px-2.5 text-[13px] no-underline transition-colors duration-150",
-                route.page === p ? "bg-fill text-ink" : "text-ink-2 hover:bg-hover hover:text-ink",
-              )}
-            >
-              <HugeiconsIcon icon={NAV[p].icon} size={16} strokeWidth={1.6} aria-hidden />
-              <span className={route.page === p ? "" : "max-sm:sr-only"}>{NAV[p].label}</span>
-            </a>
-          ))}
-        </nav>
-        <button
-          type="button"
-          onClick={cycle}
-          title={`Theme: ${theme}`}
-          aria-label={`Theme: ${theme}. Change`}
-          className="flex size-8 shrink-0 items-center justify-center rounded-sm text-ink-2 transition-colors duration-150 hover:bg-hover hover:text-ink"
-        >
-          <HugeiconsIcon icon={THEME_ICON[theme]} size={16} strokeWidth={1.6} aria-hidden />
-        </button>
-      </div>
+        <div className="mx-auto flex max-w-5xl items-center gap-2 px-3 py-3 sm:gap-4 sm:px-6">
+          <Brand />
+          <Nav page={route.page} />
+          <button
+            type="button"
+            onClick={cycle}
+            title={`Theme: ${theme}`}
+            aria-label={`Theme: ${theme}. Change`}
+            className="flex size-8 shrink-0 items-center justify-center rounded-sm text-ink-2 transition-[color,background-color,transform] duration-200 hover:bg-hover hover:text-ink active:scale-90"
+          >
+            <HugeiconsIcon icon={THEME_ICON[theme]} size={16} strokeWidth={1.6} aria-hidden />
+          </button>
+        </div>
       </header>
       <ToastHost />
-      <main key={route.page} className="page-in mx-auto w-full max-w-5xl flex-1 px-4 pb-12 pt-4 sm:px-6">
+      <main key={route.page} className="page-in mx-auto w-full max-w-5xl flex-1 px-4 pb-16 pt-6 sm:px-6">
         <PageView route={route} />
       </main>
     </div>
   )
+}
+
+export function App() {
+  return <MetricsProvider><Shell /></MetricsProvider>
 }

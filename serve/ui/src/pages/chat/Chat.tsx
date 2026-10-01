@@ -6,6 +6,8 @@ import { chat, exportMarkdown, useChatVersion, type Attachment } from "../../lib
 import { readFiles } from "../../lib/files"
 import { cn } from "../../lib/cn"
 import { toast } from "../../components/toast"
+import { StatusOrb } from "../../components/live"
+import { useMetrics } from "../../lib/metrics"
 import { MessageView } from "./Messages"
 import { SettingsSheet } from "./SettingsSheet"
 
@@ -40,6 +42,7 @@ export function Chat() {
   const input = useRef<HTMLTextAreaElement>(null)
   const pinned = useRef(true)                                   // follow the answer while the reader is at the bottom
   const busy = chat.busy
+  const live = useMetrics().data?.live.state ?? "idle"
   const closeSheet = useCallback(() => setSheet(false), [])
 
   useEffect(() => {
@@ -148,9 +151,10 @@ export function Chat() {
 
       <div ref={list} className="flex-1 space-y-6 pb-6" aria-live="off">
         {chat.messages.length === 0 && (
-          <div className="mx-auto mt-[12vh] max-w-[40ch] text-center">
-            <h1 className="text-xl font-semibold">What can I help with?</h1>
-            <p className="mt-2 text-ink-2">{health.model} runs on this PC. Nothing leaves it.</p>
+          <div className="mx-auto mt-[11vh] flex max-w-[44ch] flex-col items-center text-center">
+            <StatusOrb state={live} size={64} />
+            <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>What can I help with?</h1>
+            <p className="lede mt-3">{health.model} runs on this PC. Nothing leaves it.</p>
           </div>
         )}
         {chat.messages.map((m, i) => (
@@ -161,8 +165,8 @@ export function Chat() {
       <form
         onSubmit={onSubmit}
         className={cn(
-          "sticky bottom-3 rounded-lg border bg-surface p-2 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors duration-150",
-          dragging ? "border-accent" : "border-line focus-within:border-fill-2",
+          "sticky bottom-3 rounded-[20px] border bg-surface p-2.5 shadow-[0_8px_32px_rgb(0_0_0/0.07)] transition-[border-color,box-shadow] duration-300 ease-[var(--ease)]",
+          dragging ? "border-accent" : "border-line focus-within:border-[color-mix(in_srgb,var(--accent)_38%,transparent)] focus-within:shadow-[0_0_0_4px_color-mix(in_srgb,var(--accent)_9%,transparent),0_8px_32px_rgb(0_0_0/0.07)]",
         )}
       >
         {away && busy && (
@@ -199,7 +203,7 @@ export function Chat() {
           }}
           placeholder="Message"
           aria-label="Message"
-          className="block max-h-[40dvh] min-h-9 w-full resize-none bg-transparent px-2 py-1.5 text-[14px] outline-none placeholder:text-ink-3 [field-sizing:content]"
+          className="block max-h-[40dvh] min-h-10 w-full resize-none bg-transparent px-2.5 py-2 text-[15px] tracking-[-0.011em] outline-none placeholder:text-ink-3 [field-sizing:content]"
         />
         <div className="flex items-center justify-between">
           <label className="flex size-8 cursor-pointer items-center justify-center rounded-sm text-ink-2 transition-colors hover:bg-hover hover:text-ink" title={health.images ? "Attach a text file or a picture (or drop it here)" : "Attach a text file (or drop it here)"}>
@@ -213,8 +217,8 @@ export function Chat() {
                 <HugeiconsIcon icon={StopIcon} size={14} aria-hidden />Stop
               </button>
             ) : (
-              <button type="submit" aria-label="Send" disabled={!text.trim() && !files.length} className="flex size-8 items-center justify-center rounded-full bg-ink text-surface transition-[opacity,transform] duration-150 active:scale-95 disabled:opacity-25">
-                <HugeiconsIcon icon={ArrowUp02Icon} size={16} strokeWidth={2} aria-hidden />
+              <button type="submit" aria-label="Send" disabled={!text.trim() && !files.length} className="group flex size-9 items-center justify-center rounded-full bg-ink text-surface transition-[opacity,transform] duration-200 ease-[var(--ease)] hover:scale-105 active:scale-90 disabled:scale-100 disabled:opacity-25">
+                <HugeiconsIcon icon={ArrowUp02Icon} size={17} strokeWidth={2} aria-hidden className="transition-transform duration-200 ease-[var(--ease)] group-hover:-translate-y-px" />
               </button>
             )}
           </div>

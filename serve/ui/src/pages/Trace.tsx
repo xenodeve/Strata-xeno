@@ -146,8 +146,8 @@ export function TracePage() {
   return (
     <div onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
       <p className="mb-3 text-[13px]"><a href={href("requests")}>← Requests</a></p>
-      <h1 className="text-xl font-semibold">Timeline</h1>
-      <p className="mt-1 max-w-[65ch] text-[13px] text-ink-2">
+      <h1 className="page-title">Timeline</h1>
+      <p className="page-sub">
         The engine's pipeline timeline: start the engine with <code>STRATA_TIMELINE=run.json</code>, then open the file here. It is read in this
         browser and goes nowhere. Scroll to zoom, drag to move, double-click to see it all.
       </p>

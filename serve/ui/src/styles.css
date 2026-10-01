@@ -86,7 +86,7 @@
 /* Chat */
 .prose-chat { overflow-wrap: anywhere; }
 .prose-chat > :first-child { margin-top: 0; } .prose-chat > :last-child { margin-bottom: 0; }
-.prose-chat p { margin: 0 0 0.75em; line-height: 1.6; }
+.prose-chat p { margin: 0 0 0.8em; line-height: 1.68; }
 .prose-chat h3, .prose-chat h4 { margin: 1.1em 0 0.4em; font-weight: 600; }
 .prose-chat h3 { font-size: 15px; } .prose-chat h4 { font-size: 14px; }
 .prose-chat ul, .prose-chat ol { margin: 0 0 0.75em; padding-left: 1.4em; } .prose-chat ul { list-style: disc; } .prose-chat ol { list-style: decimal; } .prose-chat li { margin: 0.2em 0; }
@@ -132,3 +132,22 @@
 @media (prefers-reduced-motion: reduce) {
   .collapse-grid { transition: none; } .stagger > *, main > * > *, .row-in, .msg-in, .swap-in { animation: none; }
 }
+
+/* Type: one display size for the moment that matters, a quiet lede under it. Tracking tightens with size; Thai is never tracked. */
+.display { font-size: clamp(30px, 4.6vw, 48px); line-height: 1.02; letter-spacing: -0.04em; font-weight: 600; text-wrap: balance; }
+.lede { font-size: 15px; line-height: 1.5; color: var(--ink-2); letter-spacing: -0.012em; }
+.num-lg { font-variant-numeric: tabular-nums; letter-spacing: -0.03em; }
+:lang(th), .th { letter-spacing: 0; }
+/* A block's "Open" arrow slides in a little when its heading is reached; rows wash on hover. */
+.open-link { color: var(--ink-3); transition: color 200ms var(--ease); }
+.open-link .arrow { display: inline-block; transition: transform 260ms var(--ease); }
+.block-head:hover .open-link, .open-link:focus-visible { color: var(--ink); }
+.block-head:hover .open-link .arrow { transform: translateX(3px); }
+/* the wash reaches 8px past the row on each side (a shadow, not a margin), so borders and columns keep their alignment */
+.row-wash { transition: background-color 180ms var(--ease), box-shadow 180ms var(--ease); }
+.row-wash:hover { background: var(--hover); box-shadow: -8px 0 0 var(--hover), 8px 0 0 var(--hover); }
+
+/* Page heads: every page opens the same way - a title at a confident size, one quiet line under it. */
+.page-title { font-size: clamp(26px, 3.4vw, 34px); line-height: 1.08; letter-spacing: -0.035em; font-weight: 600; text-wrap: balance; margin: 0; }
+.page-sub { text-wrap: pretty; margin: 0.6rem 0 0; max-width: 62ch; font-size: 14.5px; line-height: 1.55; color: var(--ink-2); letter-spacing: -0.01em; }
+.page-head { padding-bottom: 2rem; }

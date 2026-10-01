@@ -33,3 +33,5 @@ the daily server on 2026-10-01 (idle, one card visible: the S0 bug). The daily s
 
 `cd serve/ui && bun install && bun run build` writes `dist/` and `dist/source-hash.txt`. `dist/` is committed so the
 runtime needs no Node; `python -m unittest serve.test_ui` fails when `src/` changed and `dist/` did not.
+
+| thinking-orbs 0.3.2 | MIT | `licenses/ThinkingOrbs-MIT.txt`, vendored into `src/vendor/thinking-orbs/` |

@@ -40,8 +40,8 @@ export function About() {
   return (
     <div className="max-w-[65ch] space-y-8">
       <section>
-        <h1 className="text-xl font-semibold">About</h1>
-        <p className="mt-2 text-ink-2">Strata runs a large mixture-of-experts model on this PC. Nothing leaves it.</p>
+        <h1 className="page-title">About</h1>
+        <p className="page-sub">Strata runs a large mixture-of-experts model on this PC. Nothing leaves it.</p>
       </section>
 
       <section>

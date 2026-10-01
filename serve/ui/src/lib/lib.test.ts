@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { rootOf } from "./api"
+import { clientName } from "./format"
 import { promptSplit } from "./metrics"
 import { apiMessages, type Message } from "./chat"
 import { archOf, parseArch } from "./arch"
@@ -132,5 +133,21 @@ describe("prompt split", () => {
     expect(promptSplit(10, 99)).toEqual({ read: 0, cached: 10, cachedShare: 1 })
     expect(promptSplit(10, null)).toEqual({ read: 10, cached: 0, cachedShare: 0 })
     expect(promptSplit(0, 0).cachedShare).toBe(0)
+  })
+})
+
+describe("client name", () => {
+  test("a raw User-Agent becomes the name a person knows", () => {
+    expect(clientName("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36")).toBe("Chrome")
+    expect(clientName("Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/120 Safari/537.36 Edg/120.0")).toBe("Edge")
+    expect(clientName("Mozilla/5.0 (X11; Linux) Gecko/20100101 Firefox/121.0")).toBe("Firefox")
+    expect(clientName("claude-cli/2.1.281 (external, cli)")).toBe("Claude Code")
+    expect(clientName("curl/8.19.0")).toBe("curl")
+    expect(clientName("open-webui/0.6")).toBe("Open WebUI")
+  })
+  test("anything else is its first product token, and nothing is nothing", () => {
+    expect(clientName("python-httpx/0.27.0")).toBe("python-httpx")
+    expect(clientName("MyApp 3.2 (Linux)")).toBe("MyApp")
+    expect(clientName("")).toBe("")
   })
 })
