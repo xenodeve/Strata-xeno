@@ -70,6 +70,10 @@ bool cpu_avxvnni_ok() {
     return ok;
 }
 
+const char* cpu_expert_isa() {      // the same order as q2_rows_any below
+    return cpu_avx512_ok() ? "AVX-512" : cpu_avxvnni_ok() ? "AVX-VNNI" : "AVX2";
+}
+
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);

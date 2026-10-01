@@ -136,8 +136,10 @@ client            server.py                                  strata --serve (gen
 
 - **Boot:** `INFO key=value…`, then `READY <ctx> stop`.
 - **Server → engine:** `GEN` / `GENI` / `STOP` / `QUIT`.
-- **Engine → server, per request:** `RESUME` → `PP`* → `REUSED` → `T`* → `DONE`, or `ERR`. Several paths
-  `return 1` after `ERR`; the process exits and the server restarts it.
+- **Engine → server, per request:** `RESUME` → `PP`* → `REUSED` → `T`* → `STATS` → `DONE`, or `ERR`. Several paths
+  `return 1` after `ERR`; the process exits and the server restarts it. `STATS key=value…` ([XENO], UI S4) is one
+  line just before `DONE`: this request's decode counters (tiers, stage ms, NVMe), parsed into `engine.last["stats"]`;
+  a reader that does not know it skips it. A second `INFO cpu_isa=… gpu_arch=…` is printed at boot.
 - **Watchdog:** `STRATA_WATCHDOG_S` (60).
 
 **Prefix reuse** (`:5044-5146`). `resume` is `live` if it is a prefix of the prompt, else the longest checkpoint that
