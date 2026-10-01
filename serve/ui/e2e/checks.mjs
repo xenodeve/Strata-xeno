@@ -922,7 +922,7 @@ export const checks = [
     async run({ browser, fast, t, errors }) {
       const want = {
         light: { builtin: "rgb(121, 94, 38)", number: "rgb(9, 134, 88)" },          // VS Code Light+: function, number
-        dark: { builtin: "rgb(220, 220, 170)", number: "rgb(181, 206, 168)" },      // Dark+
+        dark: { builtin: "rgb(102, 217, 239)", number: "rgb(174, 129, 255)" },      // Monokai (the theme of Claude Code's own code): built-in cyan, number purple
       }
       const got = {}
       for (const scheme of ["light", "dark"]) {

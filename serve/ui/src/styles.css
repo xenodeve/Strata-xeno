@@ -263,31 +263,37 @@ html:lang(th) .t-reason-text { line-height: 1.8; }
 .side-in { animation: orb-fade 260ms var(--ease) backwards; }
 @media (prefers-reduced-motion: reduce) { .side-in { animation: none; } }
 
-/* ---- Code in an answer is coloured like an IDE (lib/highlight.ts; the classes are highlight.js's). The colours are VS Code's Light+ and Dark+,
+/* ---- Code in an answer is coloured like an IDE (lib/highlight.ts; the classes are highlight.js's). The colours are VS Code's Light+ (light) and Monokai, the theme of Claude Code's own code (dark),
    as tokens that follow the app's theme, in the same three places as the other tokens. ---- */
 :root {
   --syn-keyword: #0000ff; --syn-string: #a31515; --syn-comment: #008000; --syn-number: #098658; --syn-func: #795e26; --syn-type: #267f99;
   --syn-var: #001080; --syn-attr: #0451a5; --syn-meta: #af00db; --syn-regexp: #811f3f; --syn-tag: #800000; --syn-add: #098658; --syn-del: #a31515;
+  --syn-literal: #0000ff; --syn-builtin: #795e26; --syn-param: #001080;
   --code-bg: color-mix(in srgb, var(--ink) 3.5%, var(--surface));
 }
 :root[data-theme="dark"] {
-  --syn-keyword: #569cd6; --syn-string: #ce9178; --syn-comment: #6a9955; --syn-number: #b5cea8; --syn-func: #dcdcaa; --syn-type: #4ec9b0;
-  --syn-var: #9cdcfe; --syn-attr: #9cdcfe; --syn-meta: #c586c0; --syn-regexp: #d16969; --syn-tag: #569cd6; --syn-add: #b5cea8; --syn-del: #ce9178;
+  --syn-keyword: #f92672; --syn-string: #e6db74; --syn-comment: #75715e; --syn-number: #ae81ff; --syn-func: #a6e22e; --syn-type: #66d9ef;
+  --syn-var: #f8f8f2; --syn-attr: #a6e22e; --syn-meta: #a6e22e; --syn-regexp: #e6db74; --syn-tag: #f92672; --syn-add: #a6e22e; --syn-del: #f92672;
+  --syn-literal: #ae81ff; --syn-builtin: #66d9ef; --syn-param: #fd971f;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --syn-keyword: #569cd6; --syn-string: #ce9178; --syn-comment: #6a9955; --syn-number: #b5cea8; --syn-func: #dcdcaa; --syn-type: #4ec9b0;
-    --syn-var: #9cdcfe; --syn-attr: #9cdcfe; --syn-meta: #c586c0; --syn-regexp: #d16969; --syn-tag: #569cd6; --syn-add: #b5cea8; --syn-del: #ce9178;
+    --syn-keyword: #f92672; --syn-string: #e6db74; --syn-comment: #75715e; --syn-number: #ae81ff; --syn-func: #a6e22e; --syn-type: #66d9ef;
+    --syn-var: #f8f8f2; --syn-attr: #a6e22e; --syn-meta: #a6e22e; --syn-regexp: #e6db74; --syn-tag: #f92672; --syn-add: #a6e22e; --syn-del: #f92672;
+    --syn-literal: #ae81ff; --syn-builtin: #66d9ef; --syn-param: #fd971f;
   }
 }
 .code-block pre { background: var(--code-bg); }
-.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-symbol, .hljs-bullet, .hljs-doctag { color: var(--syn-keyword); }
+.hljs-keyword, .hljs-selector-tag, .hljs-doctag { color: var(--syn-keyword); }
+.hljs-literal, .hljs-symbol, .hljs-bullet { color: var(--syn-literal); }
 .hljs-string, .hljs-template-variable { color: var(--syn-string); }
 .hljs-comment, .hljs-quote { color: var(--syn-comment); font-style: italic; }
 .hljs-number { color: var(--syn-number); }
-.hljs-built_in, .hljs-title, .hljs-title.function_, .hljs-function { color: var(--syn-func); }
+.hljs-title, .hljs-title.function_, .hljs-function { color: var(--syn-func); }
+.hljs-built_in { color: var(--syn-builtin); }
 .hljs-title.class_, .hljs-title.class_.inherited__, .hljs-type, .hljs-class .hljs-title { color: var(--syn-type); }
-.hljs-variable, .hljs-params, .hljs-property, .hljs-subst { color: var(--syn-var); }
+.hljs-variable, .hljs-property, .hljs-subst { color: var(--syn-var); }
+.hljs-params { color: var(--syn-param); }
 .hljs-subst { color: inherit; }
 .hljs-attr, .hljs-attribute, .hljs-selector-attr, .hljs-selector-pseudo { color: var(--syn-attr); }
 .hljs-meta, .hljs-meta .hljs-keyword, .hljs-meta-keyword { color: var(--syn-meta); }
