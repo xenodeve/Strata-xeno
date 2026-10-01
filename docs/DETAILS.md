@@ -525,6 +525,26 @@ it needs, prefer read-only tools, and don't add servers you don't trust. The too
 page itself (a request with another site's Origin or without a JSON content type is refused); if Strata is reachable
 from other devices, set an API key.
 
+**Skills and MCP servers from your other coding apps.** The web app can use what Claude Code, Codex, Antigravity, Gemini CLI,
+Cursor, Claude Desktop and the shared `~/.agents/skills` folder already have on this PC. It only reads their files; it never
+writes there.
+
+- **Skills are imported automatically and are on** (Settings > Import > Skills): the model gets three tools, `find_skills`
+  (search by a few words), `use_skill` (loads a skill's instructions) and `read_skill_file` (a file bundled with it). A skill
+  is not in the prompt until the model loads it. Switch off the whole import, an app, or one skill; a skill found later is on,
+  one you switched off stays off (the choices are saved in the run config under `import`). The same skill in several apps is one.
+  On the PC this was written on that was 755 skills found, 462 in use, and the three tools' descriptions together 466 characters.
+  A skill's files are read inside the skill's own folder only (no `..`, no links out, no hidden files or keys, text under 100 KB).
+  A skill may tell the model to run a script: Strata has no shell of its own, so that works only if you import and enable a shell
+  MCP server (the model decides when to call tools, as with any MCP server).
+- **MCP servers are listed by app and imported by a click** (Settings > Import > MCP servers): nothing is started until you press
+  **Import** on one. Import copies the server (with its environment variables and headers, on the server: they never go to the
+  browser) into Strata's own `mcp_servers`; from then on it is an ordinary server of Strata's (Settings > MCP tools > Servers), which
+  you can edit, turn off or delete. A name Strata already uses gets the app's name added; a server Strata already has shows "Already
+  in Strata"; one that is off in its own app is imported off; SSE-only servers cannot be imported.
+- Like setting up MCP servers, changing any of this works only from this PC itself or with the API key; from elsewhere the page is a
+  list of names. `STRATA_HOME` (an environment variable) makes Strata read another folder instead of your home folder (for tests).
+
 **Context extension past 262K (rope scaling, EXPERIMENTAL, off unless you pick it).** The model was trained on
 262,144 positions (rotary base 1e7). Rope scaling rescales the rotation angles so that longer contexts stay usable,
 with llama.cpp's types and flag names. `linear` is Position Interpolation: every angle is shrunk by the factor.

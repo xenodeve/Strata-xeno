@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Key01Icon, PaintBoardIcon, PlugSocketIcon, ServerStack01Icon } from "@hugeicons/core-free-icons"
+import { BookOpen01Icon, Download04Icon, Key01Icon, PaintBoardIcon, PlugSocketIcon, ServerStack01Icon } from "@hugeicons/core-free-icons"
 import { href } from "../lib/router"
 import { msg, t, useLang } from "../lib/i18n"
 import { store } from "../lib/store"
@@ -8,18 +8,20 @@ import { inputCls } from "../components/ui"
 import { BranchedMenu, type BranchSection } from "../components/BranchedMenu"
 import { StatusMarkSettings } from "../components/StatusMarks"
 import { McpSettings } from "../components/McpSettings"
+import { ImportSettings } from "../components/ImportSettings"
 
 // What can be set in the app, apart from what About tells. A menu of sections and topics; the address says which topic shows
 // (#/settings/mcp-servers), so a link can point at one. The status marks and the API key are kept in this browser; the MCP
 // servers and their limits are saved in the run config, from this PC.
-const TOPICS = ["status-marks", "api-key", "mcp-servers", "mcp-limits"] as const
+const TOPICS = ["status-marks", "api-key", "mcp-servers", "mcp-limits", "import-skills", "import-mcp"] as const
 type Topic = (typeof TOPICS)[number]
-const LABEL: Record<Topic, string> = { "status-marks": msg("Status marks"), "api-key": msg("API key"), "mcp-servers": msg("Servers"), "mcp-limits": msg("Limits") }
+const LABEL: Record<Topic, string> = { "status-marks": msg("Status marks"), "api-key": msg("API key"), "mcp-servers": msg("Servers"), "mcp-limits": msg("Limits"), "import-skills": msg("Skills"), "import-mcp": msg("MCP servers") }
 const SECTIONS: { value: string; label: string; topics: Topic[] }[] = [
   { value: "general", label: msg("General"), topics: ["status-marks", "api-key"] },
   { value: "mcp", label: msg("MCP tools"), topics: ["mcp-servers", "mcp-limits"] },
+  { value: "import", label: msg("Import"), topics: ["import-skills", "import-mcp"] },
 ]
-const ICON = { "status-marks": PaintBoardIcon, "api-key": Key01Icon, "mcp-servers": ServerStack01Icon, "mcp-limits": PlugSocketIcon }
+const ICON = { "status-marks": PaintBoardIcon, "api-key": Key01Icon, "mcp-servers": ServerStack01Icon, "mcp-limits": PlugSocketIcon, "import-skills": BookOpen01Icon, "import-mcp": Download04Icon }
 
 function ApiKey() {
   const [key, setKey] = useState(() => store.get("apikey", ""))
@@ -66,7 +68,7 @@ export function Settings({ topic }: { topic?: string }) {
           <BranchedMenu sections={sections} active={active} label={t("Settings sections")} onSelect={(x) => { location.hash = href("settings", x) }} />
         </aside>
         <div key={active} className="panel-in min-w-0 max-w-[65ch] flex-1">
-          {active === "status-marks" ? <Marks /> : active === "api-key" ? <ApiKey /> : <McpSettings part={active === "mcp-servers" ? "servers" : "limits"} />}
+          {active === "status-marks" ? <Marks /> : active === "api-key" ? <ApiKey /> : active === "import-skills" ? <ImportSettings part="skills" /> : active === "import-mcp" ? <ImportSettings part="mcp" /> : <McpSettings part={active === "mcp-servers" ? "servers" : "limits"} />}
         </div>
       </div>
     </div>

@@ -4,12 +4,14 @@
     GGUF files given after the port are read for real (the model's name and quantization); without them a fixture shows.
 
 What is fake: the answer text, and the engine's per-request STATS and prefill chunks (fixtures below, labelled as such).
-STRATA_MOCK_MCP_CONFIG=file.json: the MCP servers of that run config are started and can be set up from About (issue #79).
+STRATA_MOCK_MCP_CONFIG=file.json: the MCP servers of that run config are started and can be set up in Settings (issue #79).
+STRATA_HOME=folder: the "other apps" whose skills and MCP servers Settings > Import shows are read from there, never from the real home (issue #94).
 What is real: the hardware (GPUs, CPU, RAM, disks of THIS PC), the routes, the history on disk (a temp dir), the pages.
 The daily server (:8091) is never touched; this one is its own process and port.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -18,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-from serve import gguf_info, mcp_admin  # noqa: E402
+from serve import gguf_info, harness, mcp_admin  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.history import HistoryStore  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
@@ -82,8 +84,13 @@ def main(port: int = 8099, model_files: list[str] | None = None):
                        "gpu_arch": "sm120@NVIDIA_GeForce_RTX_5060_Ti,sm89@NVIDIA_GeForce_RTX_4070_SUPER"}
     svc.model_info = gguf_info.model_info(model_files or []) or FIXTURE_MODEL     # real headers when files are given
     svc.hstore = HistoryStore(tempfile.mkdtemp(prefix="strata-ui-history-"))
-    if os.environ.get("STRATA_MOCK_MCP_CONFIG"):     # a run config file (JSON with "mcp_servers"): the MCP servers can be set up from About
-        svc.config_path = os.environ["STRATA_MOCK_MCP_CONFIG"]
+    config = os.environ.get("STRATA_MOCK_MCP_CONFIG")
+    if os.environ.get("STRATA_HOME"):                # the skills and MCP servers of "other apps" are read from this (fake) folder: Settings > Import (#94)
+        svc.importer = harness.Importer()
+        svc.importer.rescan(json.loads(Path(config).read_text(encoding="utf-8")) if config else {})
+    if config:                                       # a run config file (JSON with "mcp_servers"): the MCP servers can be set up in Settings
+        svc.config_path = config
+    if config or svc.importer is not None:
         mcp_admin.reload_hub(svc)
     httpd = serve(svc, port=port)
     print(f"mock server on http://127.0.0.1:{port}/  (new app at /next/, classic at /classic/)", flush=True)

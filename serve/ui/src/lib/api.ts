@@ -1,6 +1,7 @@
 import { store } from "./store"
 import { t } from "./i18n"
 import type { McpConfigView } from "./mcpconfig"
+import type { ImportView } from "./importer"
 
 export const apiHeaders = (json = false): Record<string, string> => {
   const h: Record<string, string> = {}
@@ -49,6 +50,23 @@ export async function saveMcpConfig(body: unknown): Promise<{ view: McpConfigVie
   try {
     const r = await fetch(url("mcp/config"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body) })
     if (r.ok) return { view: (await r.json()) as McpConfigView }
+    return { error: await errorMessage(r) }
+  } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
+}
+
+/** The skills and MCP servers of the other apps on this PC (issue #94); `rescan` reads their folders again. */
+export async function getImport(rescan = false): Promise<ImportView | null> {
+  try {
+    const r = await fetch(url("import" + (rescan ? "?rescan=1" : "")), { headers: apiHeaders() })
+    return r.ok ? ((await r.json()) as ImportView) : null
+  } catch { return null }
+}
+
+/** Change the skill switches, import one MCP server, or rescan; the answer is the new state, or why not. */
+export async function postImport(body: unknown): Promise<{ view: ImportView } | { error: string }> {
+  try {
+    const r = await fetch(url("import"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body) })
+    if (r.ok) return { view: (await r.json()) as ImportView }
     return { error: await errorMessage(r) }
   } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
 }

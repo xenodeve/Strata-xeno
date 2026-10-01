@@ -688,12 +688,12 @@ export const checks = [
       const pg = await open(browser, errors)
       const menu = pg.locator("nav[aria-label='Settings sections']")
       const heads = () => menu.locator(".branched-menu__head").allInnerTexts()
-      const topic = (name) => menu.locator(".branched-menu__item", { hasText: name })
+      const topic = (name) => menu.locator(".branched-menu__item", { hasText: new RegExp("^" + name + "$") })          // exact: "Servers" is not "MCP servers"
       const h2 = () => pg.locator("main h2").allInnerTexts()
       await pg.goto(fast.base + "/#/settings")
       await pg.waitForSelector("nav[aria-label='Settings sections']")
       await pg.waitForTimeout(1200)
-      t.ok("the menu has two sections, General and MCP tools", (await heads()).join(",") === "General,MCP tools", (await heads()).join(","))
+      t.ok("the menu has three sections, General, MCP tools and Import", (await heads()).join(",") === "General,MCP tools,Import", (await heads()).join(","))
       t.ok("it opens on Status marks: its section is open, the other closed, and the topic is marked", (await menu.locator(".branched-menu__head").nth(0).getAttribute("aria-expanded")) === "true" && (await menu.locator(".branched-menu__head").nth(1).getAttribute("aria-expanded")) === "false" && (await topic("Status marks").getAttribute("aria-current")) === "true")
       t.ok("only that topic is shown, with its content", (await h2()).join(",") === "Status marks" && (await pg.locator("main [role=radiogroup][aria-label='Status marks']").count()) === 1, (await h2()).join(","))
       t.ok("its title is Settings and the top navigation marks it", (await pg.locator("main h1").innerText()) === "Settings" && (await pg.locator("nav a[aria-current='page']").getAttribute("aria-label")) === "Settings")
@@ -733,7 +733,7 @@ export const checks = [
       await th.goto(fast.base + "/#/settings")
       await th.waitForSelector("nav[aria-label='หัวข้อในหน้าตั้งค่า']")
       await th.waitForTimeout(1000)
-      t.ok("in Thai the page and its sections are Thai", (await th.locator("main h1").innerText()) === "ตั้งค่า" && (await th.locator(".branched-menu__head").allInnerTexts()).join(",") === "ทั่วไป,เครื่องมือ MCP")
+      t.ok("in Thai the page and its sections are Thai", (await th.locator("main h1").innerText()) === "ตั้งค่า" && (await th.locator(".branched-menu__head").allInnerTexts()).join(",") === "ทั่วไป,เครื่องมือ MCP,นำเข้า")
       await th.context().close()
 
       const ph = await open(browser, errors, { width: 390, height: 800 })
@@ -1023,6 +1023,132 @@ export const checks = [
       await th.click("button[aria-label='เอา prompt นี้กลับมา']")
       await th.waitForTimeout(400)
       t.ok("in Thai the question is Thai", (await th.locator("[role=alertdialog]").innerText()).includes("ลบการสนทนานี้ไหม"))
+      await th.context().close()
+    },
+  },
+  {
+    // Settings > Import (#94), against a mock that reads a FAKE home folder: skills of other apps are on until switched off (the whole import,
+    // an app, a skill); MCP servers of other apps are listed by app and imported by a click, and nothing starts before that
+    name: "import: skills of other apps are on until switched off, MCP servers of other apps are imported by a click",
+    async run({ browser, importer, t, errors }) {
+      const fs = await import("node:fs")
+      const saved = () => JSON.parse(fs.readFileSync(importer.config, "utf8"))
+      const pg = await open(browser, errors)
+      const sw = (label) => pg.locator(`button[role=switch][aria-label='${label}']`)
+      const on = async (label) => (await sw(label).getAttribute("aria-checked")) === "true"
+      const summary = () => pg.locator("main").innerText().then((x) => (x.match(/(\d+) skills in use \((\d+) found in (\d+) apps\)/) || []).slice(1).join("/"))
+      const served = (path) => pg.evaluate(async (p) => (await fetch(p)).json(), path)
+      await pg.goto(importer.base + "/#/settings/import-skills")
+      await pg.waitForSelector("[data-harness='claude']")
+      await pg.waitForTimeout(400)
+      t.ok("the skills of the other apps are in use from the start, one of each name", (await summary()) === "4/5/3", await summary())
+      t.ok("the whole import, and each app, is on", (await on("Import skills")) && (await on("Import from Claude Code")) && (await on("Import from Codex")) && (await on("Import from Shared agents folder")))
+      t.ok("an app that has nothing is not listed as one that has", (await pg.locator("[data-harness='cursor']").count()) === 0)
+      t.ok("the files it was read from are named", (await pg.locator("[data-harness='codex']").innerText()).includes("~/.codex/skills"))
+      const tools = (await served("/mcp")).servers.find((s) => s.name === "skills")
+      t.ok("the model has the skills as a server with three tools", !!tools && tools.tools.map((x) => x.tool).join(",") === "find_skills,use_skill,read_skill_file", JSON.stringify(tools && tools.tools.map((x) => x.tool)))
+
+      await pg.click("[data-harness='codex'] button[aria-expanded]")
+      await pg.waitForTimeout(500)
+      t.ok("a skill that another app has too is marked as the same as that one, and is not the copy in use", (await pg.locator("li[data-skill='codex:shared-skill']").innerText()).includes("Same as Claude Code") && (await pg.locator("li[data-skill='codex:codex-only']").innerText()).includes("codex-only"))
+
+      await sw("Import from Codex").click()
+      await pg.waitForTimeout(700)
+      t.ok("switching an app off is saved as an off-list and takes effect", JSON.stringify(saved().import.skills.harness_off) === '["codex"]' && (await summary()) === "3/5/3" && !(await on("Import from Codex")), JSON.stringify(saved().import))
+      t.ok("the rest of the run config is kept", saved().model === "m")
+      await pg.click("[data-harness='claude'] button[aria-expanded]")
+      await pg.waitForTimeout(500)
+      await sw("Use pdf-tools").click()
+      await pg.waitForTimeout(700)
+      t.ok("one skill off is saved too, by app and name", JSON.stringify(saved().import.skills.off) === '{"claude":["pdf-tools"]}' && (await summary()) === "2/5/3", JSON.stringify(saved().import.skills))
+      const served2 = await served("/import")
+      t.ok("the server says the same", served2.skills.used === 2 && served2.skills.settings.off.claude[0] === "pdf-tools")
+
+      await pg.fill("input[aria-label='Filter by name or what it does']", "agents")
+      await pg.waitForTimeout(400)
+      t.ok("the filter keeps what matches, in every app", (await pg.locator("li[data-skill]").count()) === 1 && (await pg.locator("li[data-skill='agents:agents-skill']").count()) === 1)
+      await pg.fill("input[aria-label='Filter by name or what it does']", "zzzz")
+      await pg.waitForTimeout(300)
+      t.ok("and says when nothing does", (await pg.locator("main").innerText()).includes("No skill matches."))
+      await pg.fill("input[aria-label='Filter by name or what it does']", "")
+
+      await sw("Import skills").click()
+      await pg.waitForTimeout(700)
+      t.ok("the whole import off: the other switches cannot be used and the model has no skills", saved().import.skills.enabled === false && (await sw("Import from Claude Code").isDisabled()) && !(await served("/mcp")).servers.some((s) => s.name === "skills"))
+      await sw("Import skills").click()
+      await pg.waitForTimeout(700)
+      t.ok("and on again: the same choices are back", saved().import.skills.enabled === true && (await summary()) === "2/5/3" && (await served("/mcp")).servers.some((s) => s.name === "skills"))
+
+      fs.mkdirSync(`${importer.home}/.claude/skills/later-one`, { recursive: true })
+      fs.writeFileSync(`${importer.home}/.claude/skills/later-one/SKILL.md`, "---\nname: later-one\ndescription: turned up later\n---\nx\n", { flag: "w" })
+      await pg.click("button:has-text('Rescan')")
+      await pg.waitForFunction(() => document.querySelector("main")?.innerText.includes("3 skills in use"), null, { timeout: 15000 })
+      t.ok("a rescan finds a skill added since, and it is on; the one switched off stays off", (await summary()) === "3/6/3" && saved().import.skills.off.claude[0] === "pdf-tools")
+
+      // the chat's + menu lists the skills as a server of its own
+      await pg.goto(importer.base + "/#/chat")
+      await pg.waitForSelector("textarea")
+      await pg.waitForTimeout(2000)
+      await pg.click("button[aria-label='Photos, files, new chat, save']")
+      await pg.waitForTimeout(500)
+      await pg.locator(".t-morph-menu [role=option]", { hasText: "MCP tools" }).click()
+      await pg.waitForTimeout(500)
+      const row = pg.locator("[role=dialog][aria-label='MCP tools'] li[data-server='skills']")
+      t.ok("in the chat's MCP list the skills are a server with their three tools, to switch per chat", (await row.count()) === 1 && (await row.locator(".prompt-bar__mcp-tools li").allInnerTexts()).join(",") === "find_skills,use_skill,read_skill_file")
+
+      // MCP servers: listed by app, nothing started, imported by a click
+      await pg.goto(importer.base + "/#/settings/import-mcp")
+      await pg.waitForSelector("[data-harness='cursor']")
+      await pg.waitForTimeout(400)
+      const cand = (id) => pg.locator(`li[data-candidate='${id}']`)
+      t.ok("the servers are listed by app, with what each is", (await pg.locator("[data-harness='cursor'] li[data-candidate]").count()) === 3 && (await cand("cursor:fake").innerText()).includes("Program"))
+      t.ok("nothing was started: Strata runs only its own servers and the skills", (await served("/mcp")).servers.map((s) => s.name).join(",") === "skills")
+      t.ok("the command line of a server is shown to who may change things, its secret is not", (await cand("cursor:fake").innerText()).includes("mcp_fake_server.py") && !(await pg.content()).includes(importer.secret))
+      t.ok("one that cannot be imported says why and has no button", (await cand("codex:nothing").innerText()).includes("no command or address") && (await cand("gemini:g-sse").innerText()).includes("SSE") && (await cand("codex:nothing").locator("button").count()) === 0)
+      t.ok("one that is off in its own app says so", (await cand("codex:off-here").innerText()).includes("Off in Codex"))
+
+      await pg.click("button[aria-label='Import fake']")
+      await pg.waitForFunction(() => document.querySelector("li[data-candidate='cursor:fake']")?.innerText.includes("Already in Strata as fake"), null, { timeout: 20000 })
+      t.ok("importing copies it into Strata's own servers, and the row says it is there", saved().mcp_servers.fake.command === saved().mcp_servers.fake.command && saved().mcp_servers.fake.args.length === 1 && saved().mcp_servers.fake.disabled === undefined)
+      let ready = false
+      for (let i = 0; i < 40 && !ready; i++) { ready = ((await served("/mcp")).servers.find((s) => s.name === "fake") || {}).status === "ready"; if (!ready) await pg.waitForTimeout(500) }
+      t.ok("and it runs now, like any server of Strata's", ready)
+      await pg.click("button[aria-label='Import quiet']")
+      await pg.waitForFunction(() => document.querySelector("li[data-candidate='cursor:quiet']")?.innerText.includes("Already in Strata"), null, { timeout: 15000 })
+      t.ok("one that was off in its own app is imported off", saved().mcp_servers.quiet.disabled === true)
+      await pg.click("button[aria-label='Import secret-off']")
+      await pg.waitForFunction(() => document.querySelector("li[data-candidate='cursor:secret-off']")?.innerText.includes("Already in Strata"), null, { timeout: 15000 })
+      t.ok("a secret is copied on the server into the run config and never shown on the page", saved().mcp_servers["secret-off"].env.TOKEN === importer.secret && !(await pg.content()).includes(importer.secret))
+      t.ok("the imported servers are in MCP tools > Servers", (await (async () => { await pg.goto(importer.base + "/#/settings/mcp-servers"); await pg.waitForSelector("li[data-server='fake']", { timeout: 15000 }); return pg.locator("li[data-server='quiet']").count() })()) === 1)
+      await pg.context().close()
+
+      // where nothing can be changed, it is a list that says why
+      const ro = await open(browser, errors)
+      const view = { available: true, editable: false, reason: "x", config_file: "run.json",
+        harnesses: [{ id: "claude", label: "Claude Code", found: true, files: ["~/.claude/skills"], errors: [], skills: 1, skills_used: 1, skills_off: false, servers: 1 }],
+        skills: { settings: { enabled: true, harness_off: [], off: {} }, used: 1, total: 1, items: [{ id: "claude:a", harness: "claude", name: "a", description: "d", origin: "user", off: false, used: true, same_as: null }] },
+        mcp: { harnesses: [{ id: "claude", label: "Claude Code", servers: [{ id: "claude:s", harness: "claude", name: "s", kind: "program", state: "available", reason: null, note: null, disabled_in_source: false, already_as: null }] }] } }
+      await ro.route("**/import", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(view) }))
+      await ro.goto(importer.base + "/#/settings/import-skills")
+      await ro.waitForSelector("[data-harness='claude']")
+      t.ok("without the right to change it, the skills are a list that says why, and no switch can be used", (await ro.locator("[role=note]").innerText()).includes("only from this PC") && (await ro.locator("button[role=switch]").evaluateAll((els) => els.every((e) => e.disabled))))
+      await ro.goto(importer.base + "/#/settings/import-mcp")
+      await ro.waitForSelector("li[data-candidate]")
+      t.ok("and the servers show no command line and cannot be imported", (await ro.locator("li[data-candidate]").innerText()).trim().split(String.fromCharCode(10)).join(" ").indexOf("npx") < 0 && (await ro.locator("button[aria-label='Import s']").isDisabled()))
+      await ro.context().close()
+
+      const ph = await open(browser, errors, { width: 390, height: 800 })
+      await ph.goto(importer.base + "/#/settings/import-skills")
+      await ph.waitForSelector("[data-harness='claude']")
+      await ph.click("[data-harness='claude'] button[aria-expanded]")
+      await ph.waitForTimeout(700)
+      t.ok("on a phone it fits the screen", (await ph.evaluate(() => document.documentElement.scrollWidth - innerWidth)) <= 1)
+      await ph.context().close()
+
+      const th = await open(browser, errors, { lang: "th" })
+      await th.goto(importer.base + "/#/settings/import-skills")
+      await th.waitForSelector("[data-harness='claude']")
+      t.ok("in Thai the page is Thai", (await th.locator("main h2").innerText()) === "Skill จากแอปอื่น")
       await th.context().close()
     },
   },

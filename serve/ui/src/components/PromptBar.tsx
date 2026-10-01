@@ -5,6 +5,7 @@ import {
 } from "@hugeicons/core-free-icons"
 import { msg, t } from "../lib/i18n"
 import type { McpServer } from "../lib/api"
+import { MiniSwitch } from "./ui"
 
 // The composer: the field, and one bar of tools under it. Adapted from React Bits' PromptBar (MIT + Commons Clause: used
 // inside this app only, see REFERENCES.md). Changes: our tokens instead of fixed colours; the arrow-to-stop morph is a
@@ -58,10 +59,6 @@ function SendGlyph({ busy }: { busy: boolean }) {
 }
 
 const MCP_STATE: Record<string, string> = { ready: msg("Connected"), starting: msg("Starting"), failed: msg("Failed"), stopped: msg("Stopped"), idle: msg("Waiting") }
-
-function McpSwitch({ on, label, onClick, disabled }: { on: boolean; label: string; onClick: () => void; disabled?: boolean }) {
-  return <button type="button" role="switch" aria-checked={on} aria-label={label} disabled={disabled} className="prompt-bar__sw" onMouseDown={(e) => e.preventDefault()} onClick={onClick}><span aria-hidden /></button>
-}
 
 interface Row { key: string; name: string; description: string; icon: IconSvgElement; disabled?: boolean; state?: string; checked?: boolean }
 
@@ -258,7 +255,7 @@ export function PromptBar(p: PromptBarProps) {
           <div className="prompt-bar__mcp-head">
             <span className="prompt-bar__mcp-title">{t("MCP tools")}</span>
             <span className="prompt-bar__mcp-count">{p.mcp.servers.length ? t("{n} tools", { n: p.mcp.tools }) : ""}</span>
-            {p.mcp.servers.length > 0 && <McpSwitch on={p.mcp.on} label={t("All MCP tools")} onClick={p.mcp.onToggleAll} />}
+            {p.mcp.servers.length > 0 && <MiniSwitch on={p.mcp.on} label={t("All MCP tools")} onClick={p.mcp.onToggleAll} />}
           </div>
           {p.mcp.servers.length === 0 ? (
             <p className="prompt-bar__mcp-empty">{t("No server is set up. Add them in Settings.")}</p>
@@ -272,7 +269,7 @@ export function PromptBar(p: PromptBarProps) {
                     <div className="prompt-bar__mcp-line">
                       <span className="prompt-bar__mcp-name">{x.name}</span>
                       <span className="prompt-bar__mcp-state" data-bad={x.status === "failed" ? "" : undefined}>{MCP_STATE[x.status] ? t(MCP_STATE[x.status]) : x.status}</span>
-                      <McpSwitch on={on} disabled={!can || !p.mcp.on} label={t("Use {name}", { name: x.name })} onClick={() => p.mcp.onToggleServer(x.name)} />
+                      <MiniSwitch on={on} disabled={!can || !p.mcp.on} label={t("Use {name}", { name: x.name })} onClick={() => p.mcp.onToggleServer(x.name)} />
                     </div>
                     {x.error && <div className="prompt-bar__mcp-error">{x.error}</div>}
                     {x.tools.length > 0 && (

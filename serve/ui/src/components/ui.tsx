@@ -65,6 +65,11 @@ export function Field({ label, value, hint, children }: { label: string; value?:
   )
 }
 
+/** The small switch of a row in a list (a server, a skill, an app): on or off, no label beside it (the label is for a screen reader). */
+export function MiniSwitch({ on, label, onClick, disabled }: { on: boolean; label: string; onClick: () => void; disabled?: boolean }) {
+  return <button type="button" role="switch" aria-checked={on} aria-label={label} disabled={disabled} className="prompt-bar__sw" onMouseDown={(e) => e.preventDefault()} onClick={onClick}><span aria-hidden /></button>
+}
+
 export const inputCls =
   "h-8 w-full rounded-sm border border-line bg-surface px-2.5 text-[13px] outline-none transition-colors placeholder:text-ink-3 hover:border-fill-2 focus:border-accent disabled:opacity-50"
 

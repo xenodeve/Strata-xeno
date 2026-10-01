@@ -6,7 +6,7 @@
 // Python is `python` unless STRATA_E2E_PYTHON says otherwise.
 import { chromium } from "playwright-core"
 import { spawn } from "node:child_process"
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import { fileURLToPath } from "node:url"
 import path from "node:path"
@@ -46,6 +46,26 @@ const FAKE_MCP = path.join(ROOT, "serve", "mcp_fake_server.py")
 const SECRET = "s3cret-e2e-value"
 const adminConfig = path.join(mkdtempSync(path.join(os.tmpdir(), "strata-e2e-")), "strata-e2e.json")
 writeFileSync(adminConfig, JSON.stringify({ model: "m", mcp_servers: { fake: { command: PY, args: [FAKE_MCP], env: { TOKEN: SECRET } } } }, null, 2))
+// importer: a mock that reads a FAKE home folder (other apps' skills and MCP servers, issue #94); the real one is never read
+const SECRET_IMPORT = "tok-imported-secret"
+const fakeHome = mkdtempSync(path.join(os.tmpdir(), "strata-e2e-home-"))
+const put = (rel, text) => { const f = path.join(fakeHome, rel); mkdirSync(path.dirname(f), { recursive: true }); writeFileSync(f, text) }
+const skill = (rel, name, description) => put(`${rel}/${name}/SKILL.md`, `---\nname: ${name}\ndescription: ${description}\n---\n\n# ${name}\nsteps\n`)
+skill(".claude/skills", "pdf-tools", "Read and write PDF files")
+skill(".claude/skills", "shared-skill", "in two apps")
+skill(".codex/skills", "codex-only", "only in Codex")
+skill(".codex/skills", "shared-skill", "in two apps")
+skill(".agents/skills", "agents-skill", "in the shared folder")
+put(".cursor/mcp.json", JSON.stringify({ mcpServers: {
+  fake: { command: PY, args: [FAKE_MCP] },
+  quiet: { command: "node", args: ["q.js"], disabled: true },
+  "secret-off": { command: "node", args: ["s.js"], env: { TOKEN: SECRET_IMPORT }, disabled: true },
+} }))
+put(".codex/config.toml", '[mcp_servers.off-here]\ncommand = "node"\nargs = ["off.js"]\nenabled = false\n\n[mcp_servers.nothing]\nenabled = true\n')
+put(".gemini/settings.json", JSON.stringify({ mcpServers: { "g-sse": { url: "https://g.example.com/sse" } } }))
+const importConfig = path.join(mkdtempSync(path.join(os.tmpdir(), "strata-e2e-imp-")), "strata-e2e-import.json")
+writeFileSync(importConfig, JSON.stringify({ model: "m" }, null, 2))
+const importer = { ...(await startMock({ STRATA_MOCK_THINK_MS: "2", STRATA_MOCK_PREFILL_TPS: "20000", STRATA_MOCK_MCP_CONFIG: importConfig, STRATA_HOME: fakeHome, APPDATA: path.join(fakeHome, "AppData") }, 18774)), config: importConfig, home: fakeHome, secret: SECRET_IMPORT }
 const admin = { ...(await startMock({ STRATA_MOCK_THINK_MS: "2", STRATA_MOCK_PREFILL_TPS: "20000", STRATA_MOCK_MCP_CONFIG: adminConfig }, 18773)), config: adminConfig, py: PY, fakeMcp: FAKE_MCP, secret: SECRET }
 let failed = 0
 try {
@@ -57,14 +77,14 @@ try {
     const results = []
     const t = { ok: (name, pass, detail = "") => results.push({ name, pass: !!pass, detail }) }
     const t0 = Date.now()
-    try { await c.run({ browser, fast, long, admin, t, errors }) } catch (e) { results.push({ name: "the check ran to its end", pass: false, detail: String(e).split("\n")[0] }) }
+    try { await c.run({ browser, fast, long, admin, importer, t, errors }) } catch (e) { results.push({ name: "the check ran to its end", pass: false, detail: String(e).split("\n")[0] }) }
     if (errors.length) results.push({ name: "no console error or page error", pass: false, detail: errors.slice(0, 3).join(" | ") })
     for (const r of results) { console.log(`${r.pass ? "PASS" : "FAIL"} ${c.name.split(":")[0]}: ${r.name}${r.detail ? "  " + r.detail : ""}`); if (!r.pass) failed++ }
     console.log(`     (${c.name.split(":")[0]}: ${((Date.now() - t0) / 1000).toFixed(1)} s)`)
   }
 } finally {
   await browser.close()
-  fast.stop(); long.stop(); admin.stop()
+  fast.stop(); long.stop(); admin.stop(); importer.stop()
 }
 console.log(failed ? `\n${failed} check(s) failed` : "\nall browser checks passed")
 process.exit(failed ? 1 : 0)
