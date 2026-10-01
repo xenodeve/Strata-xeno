@@ -221,6 +221,9 @@ class Endpoints(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertFalse(d["editable"])
         self.assertIn("API key", d["reason"])
+        for s in d["servers"]:                                # a caller who may not change them sees what runs, not how it is started
+            self.assertFalse({"command", "args", "cwd", "url", "env", "headers"} & set(s), s["name"])
+        self.assertEqual({s["name"] for s in d["servers"]}, {"fake", "off"})
         self.assertEqual(self.call("/mcp/config", "POST", {"servers": {}}, host)[0], 403)
         self.svc.api_key = "k"
         ok = {**host, "Authorization": "Bearer k"}

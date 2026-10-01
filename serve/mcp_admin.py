@@ -260,6 +260,10 @@ def view(svc, client_ip: str, host: str) -> dict:
         s["tools"] = r["tools"] if r else []
         s["info"] = r["info"] if r else {}
     ok, why = may_edit(bool(svc.api_key), client_ip, host)
+    if not ok:                                               # how a server is started (a token can sit in an argument or a URL) is for those who may change it
+        for s in v["servers"]:
+            for k in ("command", "args", "cwd", "url", "env", "headers"):
+                s.pop(k, None)
     if ok and not svc.config_path:
         ok, why = False, "this server was started without a run config file (--config), so there is nowhere to save the servers"
     v.update(editable=ok, reason=why, settings={k: (svc.mcp.settings if svc.mcp else DEFAULTS)[k] for k in LIMITS},

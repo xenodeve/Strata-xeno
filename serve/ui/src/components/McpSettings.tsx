@@ -135,7 +135,7 @@ export function McpSettings() {
                   : <span className={state === "failed" ? "text-bad" : "text-ink-2"}>{STATE[state] ? t(STATE[state]) : state}</span>}
               </div>
               <div className="text-[12px] text-ink-2 [overflow-wrap:anywhere]">
-                {s.url ? t("Address") : t("Program")} · {t("{n} tools", { n: fmt(s.tools.length) })}
+                {s.kind === "address" ? t("Address") : t("Program")} · {t("{n} tools", { n: fmt(s.tools.length) })}
                 {s.url && <> · {s.url}</>}
                 {s.command && <> · <span className="font-mono">{[s.command, ...(s.args ?? [])].join(" ")}</span></>}
               </div>
