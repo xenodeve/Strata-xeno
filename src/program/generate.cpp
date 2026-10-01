@@ -5336,10 +5336,11 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                         const int32_t in = sc[k].second, out = sv[k].second;
                         const int32_t slot = secondary_residency[(size_t) out];
-                        const int32_t layer = in / (int32_t) g.n_expert;
-                        const uint8_t* src = srcp->blob(layer, in % (int32_t) g.n_expert);
-                        const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+                        const int32_t in_layer = in / (int32_t) g.n_expert;
+                        const uint8_t* src = srcp->blob(in_layer, in % (int32_t) g.n_expert);
+                        const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(in_layer);
                         if (src == nullptr) break;
+                        if (!secondary_arena.fits((uint64_t) slot, bytes)) continue;   // #11: pairs span layers
                         secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
                         jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
                         ss_pending.emplace_back(in, slot);
@@ -7256,13 +7257,11 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                 const int32_t in = sc[k].second, out = sv[k].second;
                 const int32_t slot = secondary_residency[(size_t) out];
-                const int32_t layer = out / (int32_t) g.n_expert;
-                if (srcp->blob(in / (int32_t) g.n_expert, in % (int32_t) g.n_expert) == nullptr) break;
-                // #11: a newcomer from another layer must fit the victim's slot (native blobs differ per layer)
-                if ((uint64_t) lay.blob_bytes(in / (int32_t) g.n_expert) > secondary_arena.slot_bytes((uint64_t) slot))
-                    continue;
+                const int32_t out_layer = out / (int32_t) g.n_expert, in_layer = in / (int32_t) g.n_expert;
+                if (srcp->blob(in_layer, in % (int32_t) g.n_expert) == nullptr) break;
+                if (!secondary_arena.fits((uint64_t) slot, (uint64_t) lay.blob_bytes(in_layer))) continue;   // #11
                 if (cudaMemcpyAsync(ss_stage + sx_d2h.size() * ps_blob, secondary_arena.slot_ptr((uint64_t) slot),
-                                    (size_t) lay.blob_bytes(layer), cudaMemcpyDeviceToHost, ss_stream) != cudaSuccess)
+                                    (size_t) lay.blob_bytes(out_layer), cudaMemcpyDeviceToHost, ss_stream) != cudaSuccess)
                     return false;
                 sx_d2h.push_back({in, out, slot});
             }
@@ -7299,13 +7298,11 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                     const int32_t in = sc[k].second, out = sv[k].second;
                     const int32_t slot = secondary_residency[(size_t) out];
-                    const int32_t layer = in / (int32_t) g.n_expert;
-                    const uint8_t* src = srcp->blob(layer, in % (int32_t) g.n_expert);
-                    const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+                    const int32_t in_layer = in / (int32_t) g.n_expert;
+                    const uint8_t* src = srcp->blob(in_layer, in % (int32_t) g.n_expert);
+                    const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(in_layer);
                     if (src == nullptr) break;
-                    // #11: the pair may span layers, and a native pack's blobs differ per layer: a newcomer larger
-                    // than the victim's slot would overwrite the next slot's expert
-                    if (bytes > secondary_arena.slot_bytes((uint64_t) slot)) continue;
+                    if (!secondary_arena.fits((uint64_t) slot, bytes)) continue;   // #11: pairs span layers
                     secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
                     jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
                     ss_pending.emplace_back(in, slot);

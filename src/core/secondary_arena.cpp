@@ -191,8 +191,7 @@ uint8_t* SecondaryArena::slot_ptr(uint64_t slot) const {
 }
 
 bool SecondaryArena::fill_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err) {
-    if (blob == nullptr || bytes == 0 || slot >= slots() ||
-        bytes > offsets_[(size_t) slot + 1] - offsets_[(size_t) slot]) {
+    if (blob == nullptr || !fits(slot, bytes)) {
         err = "secondary fill needs an open slot and a blob fitting that slot";
         return false;
     }
@@ -235,8 +234,7 @@ bool SecondaryArena::check_free_floor(std::string& err) {
 }
 
 bool SecondaryArena::verify_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err) {
-    if (blob == nullptr || bytes == 0 || slot >= slots() ||
-        bytes > offsets_[(size_t) slot + 1] - offsets_[(size_t) slot]) {
+    if (blob == nullptr || !fits(slot, bytes)) {
         err = "secondary verify needs an open slot and a blob fitting that slot";
         return false;
     }
