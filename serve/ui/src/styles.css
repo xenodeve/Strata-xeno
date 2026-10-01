@@ -151,7 +151,7 @@
 /* Orbs: one slot, the old design fades out while the new fades in; a live status line shimmers (a band of full ink travels
    over text at half strength, left to right, 2 s, linear - the thinking-orbs web demo's t-shimmer). */
 .orb-slot { position: relative; display: inline-block; flex: none; vertical-align: middle; }
-.orb-layer { position: absolute; inset: 0; display: block; }
+.orb-layer { position: absolute; inset: 0; display: grid; place-items: center; }      /* a grid, so an inline child (a loader, an svg) is centered in the slot and not set on the text baseline */
 .orb-layer canvas { display: block; }
 .orb-in { animation: orb-in 450ms var(--ease) both; }
 .orb-out { animation: orb-out 450ms var(--ease) both; pointer-events: none; }

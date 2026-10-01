@@ -595,4 +595,31 @@ export const checks = [
       await other.context().close()
     },
   },
+  {
+    // whatever stands for a status sits in the middle of its slot, in every way it can be shown (the loaders once sat on the text baseline, 9 px low)
+    name: "slot: a status mark is centered in its slot in every way, in the header and in the chat",
+    async run({ browser, fast, t, errors }) {
+      for (const kind of ["orbs", "mixed", "loading", "bots"]) {
+        const ctx = await browser.newContext({ viewport: { width: 1100, height: 700 } })
+        await ctx.addInitScript((k) => { try { localStorage.setItem("strata.lang", JSON.stringify("en")); localStorage.setItem("strata.avatar", JSON.stringify(k)) } catch { /* private window */ } }, kind)
+        const pg = await ctx.newPage()
+        pg.on("pageerror", (e) => errors.push(`pageerror: ${e}`))
+        await pg.goto(fast.base + "/#/chat")
+        await pg.waitForSelector("main .orb-slot")
+        await pg.waitForTimeout(kind === "bots" ? 3000 : 1500)
+        const off = await pg.evaluate(() => [...document.querySelectorAll(".orb-slot")].map((s) => {
+          const b = s.getBoundingClientRect()
+          const inner = [...s.querySelectorAll(".lat, .t-matrix, canvas, svg")].filter((e) => e.getBoundingClientRect().width > 1)[0]
+          if (!inner) return null
+          const c = inner.getBoundingClientRect()
+          const m = getComputedStyle(inner)                    // the avatars draw a canvas bigger than their box and say so with a negative margin: the box is the margin box
+          const [t, r, bo, l] = ["Top", "Right", "Bottom", "Left"].map((x) => parseFloat(m["margin" + x]) || 0)
+          const x0 = c.x - l, y0 = c.y - t, w = c.width + l + r, h = c.height + t + bo
+          return { dx: Math.round(x0 + w / 2 - (b.x + b.width / 2)), dy: Math.round(y0 + h / 2 - (b.y + b.height / 2)), size: Math.round(b.width) }
+        }).filter(Boolean))
+        t.ok(`${kind}: every mark is centered in its slot (${off.length} marks)`, off.length >= 2 && off.every((o) => Math.abs(o.dx) <= 1 && Math.abs(o.dy) <= 1), JSON.stringify(off))
+        await ctx.close()
+      }
+    },
+  },
 ]
