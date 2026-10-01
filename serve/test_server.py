@@ -525,6 +525,11 @@ class RequestHistory(unittest.TestCase):
         for i in ids:
             self.assertIsNotNone(self.svc.hstore.detail(i))                # no round overwrote another's detail
 
+    def test_metrics_carries_the_models_name_and_quantization(self):
+        self.assertIsNone(self.get("/metrics")[1]["model_info"])                    # until main() has read the headers
+        self.svc.model_info = {"name": "M", "variant": "Q2_0", "bpw": 3.0, "roles": [{"role": "experts", "types": ["Q2_0"], "bpw": 2.25}]}
+        self.assertEqual(self.get("/metrics")[1]["model_info"]["roles"][0]["types"], ["Q2_0"])
+
     def test_the_history_needs_the_key_when_one_is_set(self):
         self.svc.api_key = "secret"
         self.assertEqual(self.get("/metrics/requests")[0], 401)

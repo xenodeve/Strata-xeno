@@ -1,4 +1,5 @@
 import { Chart } from "../components/Chart"
+import { Swap } from "../components/motion"
 import { Dot, Row, Rows, Section, val } from "../components/bits"
 import { fmt, gb } from "../lib/format"
 import { href } from "../lib/router"
@@ -28,7 +29,7 @@ export function Live() {
     <div>
       <div className="flex items-center gap-2.5">
         <Dot tone={h.tone} pulse={busy} />
-        <h1 className="text-xl font-semibold">{h.text}</h1>
+        <h1 className="text-xl font-semibold"><Swap k={m.live.state}>{h.text}</Swap></h1>
       </div>
       <p className="mt-1 text-[13px] text-ink-2">
         {stale ? "The server is not answering. Showing the last numbers it gave." : l.queued ? `${l.queued} waiting in the queue` : m.engine.model as string}

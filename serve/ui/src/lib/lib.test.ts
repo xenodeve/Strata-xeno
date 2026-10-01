@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { rootOf } from "./api"
+import { promptSplit } from "./metrics"
 import { apiMessages, type Message } from "./chat"
 import { archOf, parseArch } from "./arch"
 import { markdown } from "./markdown"
@@ -120,5 +121,16 @@ describe("api root", () => {
   test("a path that starts with // can never point at another origin", () => {
     expect(rootOf("//evil.test/next/")).toBe("/evil.test/")
     expect(rootOf("///x/")).toBe("/x/")
+  })
+})
+
+describe("prompt split", () => {
+  test("read and cached are separate and add up to the prompt", () => {
+    expect(promptSplit(1000, 250)).toEqual({ read: 750, cached: 250, cachedShare: 0.25 })
+  })
+  test("a cache bigger than the prompt, or none, never goes negative", () => {
+    expect(promptSplit(10, 99)).toEqual({ read: 0, cached: 10, cachedShare: 1 })
+    expect(promptSplit(10, null)).toEqual({ read: 10, cached: 0, cachedShare: 0 })
+    expect(promptSplit(0, 0).cachedShare).toBe(0)
   })
 })

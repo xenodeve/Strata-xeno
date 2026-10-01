@@ -3,6 +3,7 @@ import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, Copy01Icon, AttachmentIcon } from "@hugeicons/core-free-icons"
 import { chat, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
+import { Collapse } from "../../components/motion"
 import { cn } from "../../lib/cn"
 import { fmt, timeStr } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
@@ -38,7 +39,7 @@ function Tool({ t }: { t: ToolCall }) {
         {t.ms != null && t.state !== "skipped" && <span className="num shrink-0 text-ink-3">{fmt(t.ms / 1000, 1)} s</span>}
         <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("shrink-0 text-ink-3 transition-transform duration-200", t.open && "rotate-180")} />
       </button>
-      {t.open && (
+      <Collapse open={!!t.open}>
         <div className="space-y-2 border-t border-line px-3 py-2.5">
           <div className="text-[12px] text-ink-2">Arguments</div>
           <pre className="tool-pre">{args || "(being written)"}</pre>
@@ -51,7 +52,7 @@ function Tool({ t }: { t: ToolCall }) {
             </>
           )}
         </div>
-      )}
+      </Collapse>
     </div>
   )
 }
@@ -87,7 +88,9 @@ function Thinking({ m, streaming, show }: { m: Message; streaming: boolean; show
         <span className={cn(thinkingNow && "thinking-label")}>{title}</span>
         <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("transition-transform duration-200", open && "rotate-180")} />
       </button>
-      {open && <div className="mt-1 max-h-72 overflow-y-auto whitespace-pre-wrap border-l border-line pl-3 text-[13px] leading-relaxed text-ink-2 [overflow-wrap:anywhere]">{m.reasoning}</div>}
+      <Collapse open={open}>
+        <div className="mt-1 max-h-72 overflow-y-auto whitespace-pre-wrap border-l border-line pl-3 text-[13px] leading-relaxed text-ink-2 [overflow-wrap:anywhere]">{m.reasoning}</div>
+      </Collapse>
     </div>
   )
 }
@@ -96,7 +99,7 @@ export function MessageView({ m, streaming, show }: { m: Message; streaming: boo
   const ref = useRef<HTMLDivElement>(null)
   if (m.role === "user") {
     return (
-      <div className="flex flex-col items-end gap-1">
+      <div className="msg-in flex flex-col items-end gap-1">
         {!!m.files?.length && (
           <div className="flex flex-wrap justify-end gap-1.5">
             {m.files.map((f, i) => (
@@ -120,7 +123,7 @@ export function MessageView({ m, streaming, show }: { m: Message; streaming: boo
   }
   const waiting = streaming && !m.text && !m.tools?.length
   return (
-    <div ref={ref} className="max-w-[min(100%,65ch)] lg:max-w-[72ch]">
+    <div ref={ref} className="msg-in max-w-[min(100%,65ch)] lg:max-w-[72ch]">
       {m.reasoning && <Thinking m={m} streaming={streaming} show={show} />}
       {m.error ? (
         <div className="rounded-md border border-line px-3 py-2 text-[13px] text-bad [overflow-wrap:anywhere]">{m.error}</div>

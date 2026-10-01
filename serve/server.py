@@ -52,7 +52,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.loop_guard import LoopGuard
-from serve import cjk_guard, forced_opening, think_budget  # noqa: E402  (xeno #49 S4, S7 follow-up, S3)
+from serve import cjk_guard, forced_opening, gguf_info, think_budget  # noqa: E402  (xeno #49 S4, S7 follow-up, S3)
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
@@ -834,6 +834,7 @@ class Service:
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         self.hstore = HistoryStore(Path(tempfile.gettempdir()) / "strata-history-off", enabled=False)  # main() turns it on
+        self.model_info = None                          # the model's name and quantization, from its GGUF headers (main() fills it)
         self.keep_prompts = 0                           # POST /metrics/keep: the next N requests keep their full prompt (Q8)
         self.keep_lock = threading.Lock()
         self.ui = "classic"                             # which web app "/" serves; config "ui": "next" for the new one
@@ -1136,7 +1137,8 @@ class Service:
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
-                tel["static"], "history": tel["history"], "time": now, "keep_prompts_left": self.keep_prompts}
+                tel["static"], "history": tel["history"], "time": now, "keep_prompts_left": self.keep_prompts,
+                "model_info": self.model_info}
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -2657,6 +2659,9 @@ def main() -> int:
     from serve.history import default_dir
     svc.hstore = HistoryStore(hist.get("dir") or default_dir(), enabled=hist.get("enabled", True) is not False,
                               detail_cap_bytes=int(float(hist.get("detail_cap_gb", 2)) * 2**30))
+    def _model_info(files=gguf_info.files_from_args(list(cfg.get("args") or []))):
+        svc.model_info = gguf_info.model_info(files)        # reads headers only (~0.1 s); a model with no GGUF gives None
+    threading.Thread(target=_model_info, daemon=True).start()
     svc.ui = "next" if cfg.get("ui") == "next" else "classic"          # xeno UI S2: "/" serves the new web app
     svc.gpu_indices = monitor_gpus(cfg)               # every card the engine can see (issue #112; UI S0: no "gpu" key)
     svc.gpu_index = (svc.gpu_indices or [0])[0]         # the Monitor reads the card the engine runs on (issue #51)

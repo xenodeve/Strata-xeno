@@ -1,9 +1,10 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Chart } from "../components/Chart"
+import { Disclosure } from "../components/motion"
 import { NOT_MEASURED, Row, Rows, Section, ms, pct, val, when } from "../components/bits"
 import { fmt } from "../lib/format"
 import { attribute, overlapOpportunityMs } from "../lib/stall"
-import { getKeepLeft, getRequest, getRequestPage, setKeep, type RequestDetail, type RequestRow } from "../lib/metrics"
+import { getKeepLeft, getRequest, getRequestPage, promptSplit, setKeep, type RequestDetail, type RequestRow } from "../lib/metrics"
 import { href } from "../lib/router"
 
 /** A figure with its spread on hover or focus: the first depth of detail. */
@@ -44,7 +45,7 @@ export function RequestList({ rows, empty }: { rows: RequestRow[]; empty: string
   return (
     <ul className="m-0 list-none p-0">
       {rows.map((r) => (
-        <li key={r.id} className="border-b border-line last:border-0">
+        <li key={r.id} className="row-in border-b border-line last:border-0">
           <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1 py-2.5">
             <a href={href("requests", r.id)} className="min-w-0 flex-1 basis-56 no-underline">
               <div className="truncate">{r.preview || <span className="text-ink-3">(no text)</span>}</div>
@@ -55,7 +56,14 @@ export function RequestList({ rows, empty }: { rows: RequestRow[]; empty: string
               </div>
             </a>
             <div className="flex shrink-0 items-baseline gap-5 text-[13px]">
-              <span className="num text-ink-2">{fmt(r.prompt_tokens)} → {fmt(r.output_tokens)}</span>
+              {(() => {
+                const sp = promptSplit(r.prompt_tokens, r.reused)
+                return (
+                  <span className="num text-ink-2" title="Prompt tokens the engine read (prefill) and tokens it already held in the conversation cache, then the answer">
+                    {fmt(sp.read)} read{sp.cached > 0 && <> · {fmt(sp.cached)} cached</>} → {fmt(r.output_tokens)}
+                  </span>
+                )
+              })()}
               <span title="Prefill">{prefillCell(r)}</span>
               <span title="Decode">{decodeCell(r)}</span>
             </div>
@@ -128,6 +136,7 @@ export function RequestDetailPage({ id }: { id: string }) {
   const r = d.summary
   const det = d.detail
   const stats = det?.stats ?? r.stats
+  const split = promptSplit(r.prompt_tokens, r.reused)
   const tierTotal = stats ? TIERS.reduce((a, [k]) => a + (stats[k] ?? 0), 0) : 0
 
   return (
@@ -138,7 +147,8 @@ export function RequestDetailPage({ id }: { id: string }) {
 
       <Section title="Overview">
         <Rows>
-          <Row k="Prompt" v={<span className="num">{fmt(r.prompt_tokens)} tokens{r.reused ? `, ${fmt(r.reused)} already cached` : ""}</span>} />
+          <Row k="Prefill" hint="read from scratch" v={<span className="num">{fmt(split.read)} tokens</span>} />
+          <Row k="Conversation cache" hint="held already, no compute" v={<span className="num">{fmt(split.cached)} tokens{split.cached > 0 && <span className="text-ink-2"> · {pct(split.cachedShare)} of the prompt</span>}</span>} />
           <Row k="Answer" v={<span className="num">{fmt(r.output_tokens)} tokens</span>} />
           <Row k="Took" v={val(r.duration_s, (n) => n.toFixed(1), "s")} />
           <Row k="Ended" v={r.finish} />
@@ -148,7 +158,7 @@ export function RequestDetailPage({ id }: { id: string }) {
         </Rows>
       </Section>
 
-      <Section title="Prefill" aside="per chunk">
+      <Section title="Prefill" aside={`the ${fmt(split.read)} tokens read, per chunk`}>
         {r.prefill ? (
           <>
             <Rows>
@@ -164,7 +174,7 @@ export function RequestDetailPage({ id }: { id: string }) {
               </div>
             )}
           </>
-        ) : <p className="text-ink-2">{r.prompt_tokens && r.reused === r.prompt_tokens ? "Nothing to read: the whole prompt was cached." : <>Not measured.</>}</p>}
+        ) : <p className="text-ink-2">{split.read === 0 && r.prompt_tokens ? "Nothing was read: the whole prompt came from the conversation cache." : <>Not measured.</>}</p>}
       </Section>
 
       <Section title="Decode" aside="over a sliding 16-token window">
@@ -196,13 +206,18 @@ export function RequestDetailPage({ id }: { id: string }) {
               ))}
               <Row k="Loaded from the SSD into RAM" v={<span className="num">{fmt(stats.nvme_loads ?? 0)}{(stats.nvme_loads ?? 0) > 0 && <span className="text-ink-2"> · {ms(stats.nvme_ms ?? 0)}</span>}</span>} />
             </Rows>
-            <div className="mt-4 text-[12px] text-ink-2">Host time per stage{r.decode_ms ? ` of ${ms(r.decode_ms)}` : ""}</div>
-            <Rows>
+            <div className="mt-4">
+              <Disclosure title="Host time per stage" hint={r.decode_ms ? `of ${ms(r.decode_ms)}` : undefined}>
+              <Rows>
               {STAGES.map(([k, label, hint]) => stats[k] != null && (
                 <Row key={k} k={label} hint={hint} v={<span className="num">{ms(stats[k])}{r.decode_ms ? <span className="text-ink-2"> · {pct(stats[k] / r.decode_ms, 0)}</span> : null}</span>} />
               ))}
-            </Rows>
-            <Stall stats={stats} decodeMs={r.decode_ms} />
+              </Rows>
+              </Disclosure>
+              <Disclosure title="Who waited for whom" hint="a dependency definition">
+                <Stall stats={stats} decodeMs={r.decode_ms} />
+              </Disclosure>
+            </div>
             <p className="mt-3 text-[12px] text-ink-3">Counted by the engine over {fmt(stats.windows ?? 0)} verify windows. Stages overlap, so they do not add up to the total.</p>
           </>
         )}
@@ -219,9 +234,8 @@ function Stall({ stats, decodeMs }: { stats: Record<string, number>; decodeMs: n
   if (!a) return null
   const opp = overlapOpportunityMs(stats)
   return (
-    <div className="mt-6">
-      <div className="text-[12px] text-ink-2">Who waited for whom</div>
-      <p className="mt-1 text-[12px] text-ink-3">A dependency definition from the engine's counters: idle time is put down to what the host was waiting on. It is not a hardware measurement; cycle-level stalls need the Nsight capture.</p>
+    <div className="pb-2 pt-1">
+      <p className="text-[12px] text-ink-3">A dependency definition from the engine's counters: idle time is put down to what the host was waiting on. It is not a hardware measurement; cycle-level stalls need the Nsight capture.</p>
       {a.map((res) => (
         <div key={res.resource} className="mt-3">
           <div className="mb-1 text-[13px] font-medium">{res.resource}</div>

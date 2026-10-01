@@ -26,6 +26,19 @@ export interface RequestRow {
   decode: (Rate & { windows: number }) | null
   stats: Record<string, number> | null
 }
+export interface ModelRole { role: string; tensors: number; bytes: number; types: string[]; bpw: number | null }
+export interface ModelInfo {
+  name: string | null; basename: string | null; variant: string | null; source: string | null; size_label: string | null
+  architecture: string | null; files: string[]; bytes: number; bpw: number | null; roles: ModelRole[]
+}
+
+/** A prompt is two different things: the tokens the engine read (prefill: compute, with a speed) and the tokens it
+ *  already held in the conversation cache (no compute, no speed). They are never added into one number. */
+export function promptSplit(prompt: number, reused: number | null | undefined): { read: number; cached: number; cachedShare: number } {
+  const cached = Math.max(0, Math.min(prompt, reused ?? 0))
+  return { read: prompt - cached, cached, cachedShare: prompt > 0 ? cached / prompt : 0 }
+}
+
 export interface Metrics {
   engine: Record<string, string | number | null>
   live: Live
@@ -37,6 +50,7 @@ export interface Metrics {
   history: Record<string, (number | null)[]>
   time: number
   keep_prompts_left?: number
+  model_info?: ModelInfo | null
 }
 
 export type MetricsState = { data: Metrics | null; error: string | null; stale: boolean }

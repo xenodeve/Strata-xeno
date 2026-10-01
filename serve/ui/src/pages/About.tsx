@@ -3,6 +3,8 @@ import { apiHeaders, getHealth, getMcp, NO_HEALTH, root, url, type Health, type 
 import { parseArch } from "../lib/arch"
 import { fmt } from "../lib/format"
 import { store } from "../lib/store"
+import { ModelFacts } from "../components/ModelBlock"
+import type { ModelInfo } from "../lib/metrics"
 import { toast } from "../components/toast"
 import { inputCls } from "../components/ui"
 
@@ -22,6 +24,7 @@ const MCP_STATE: Record<string, string> = { ready: "Connected", starting: "Start
 export function About() {
   const [health, setHealth] = useState<Health>(NO_HEALTH)
   const [engine, setEngine] = useState<Engine>({})
+  const [model, setModel] = useState<ModelInfo | null>(null)
   const [mcp, setMcp] = useState<McpInfo>({ servers: [], tools: 0 })
   const [key, setKey] = useState(() => store.get("apikey", ""))
 
@@ -30,7 +33,7 @@ export function About() {
     void getMcp().then((m) => m && setMcp(m))
     void fetch(url("metrics"), { headers: apiHeaders() })
       .then((r) => (r.ok ? r.json() : null))
-      .then((m: { engine?: Engine } | null) => m?.engine && setEngine(m.engine))
+      .then((m: { engine?: Engine; model_info?: ModelInfo | null } | null) => { if (m?.engine) setEngine(m.engine); setModel(m?.model_info ?? null) })
       .catch(() => {})
   }, [])
 
@@ -39,6 +42,11 @@ export function About() {
       <section>
         <h1 className="text-xl font-semibold">About</h1>
         <p className="mt-2 text-ink-2">Strata runs a large mixture-of-experts model on this PC. Nothing leaves it.</p>
+      </section>
+
+      <section>
+        <h2 className="text-[15px] font-semibold">The model</h2>
+        <div className="mt-2"><ModelFacts info={model} kv={engine.kv} /></div>
       </section>
 
       <section>
