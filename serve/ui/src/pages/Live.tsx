@@ -1,3 +1,4 @@
+import { Loading } from "../components/orb"
 import { Chart } from "../components/Chart"
 import { Swap } from "../components/motion"
 import { StatusOrb } from "../components/live"
@@ -18,7 +19,7 @@ function headline(l: LiveT): { tone: "ok" | "busy" | "idle"; text: string } {
 
 export function Live() {
   const { data: m, error, stale } = useMetrics()
-  if (!m) return <p className="text-ink-2">{error || "Connecting…"}</p>
+  if (!m) return <Loading error={error} />
   const l = m.live
   const running = l.state === "reading" || l.state === "generating"       // no request: idle, which is not the same as not measured
   const IDLE = <span className="text-ink-3">idle</span>

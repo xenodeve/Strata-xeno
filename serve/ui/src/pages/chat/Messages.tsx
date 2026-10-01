@@ -4,7 +4,8 @@ import { ArrowDown01Icon, Copy01Icon, AttachmentIcon } from "@hugeicons/core-fre
 import { chat, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
 import { Collapse } from "../../components/motion"
-import { ThinkingOrb } from "../../vendor/thinking-orbs/orb"
+import { Orb, StatusLabel } from "../../components/orb"
+import { toolDesign } from "../../lib/orbs"
 import { cn } from "../../lib/cn"
 import { fmt, timeStr } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
@@ -33,7 +34,8 @@ function Tool({ t }: { t: ToolCall }) {
         onClick={() => { t.open = !t.open; chat.notify() }}
         className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-[13px] transition-colors hover:bg-hover"
       >
-        <span className="font-medium" title={t.name}>{t.tool || t.name || "tool"}</span>
+        {(t.state === "running" || t.state === "writing") && <Orb design={toolDesign(t.name)} size={20} />}
+        <span className={cn("font-medium", (t.state === "running" || t.state === "writing") && "t-shimmer")} title={t.name}>{t.tool || t.name || "tool"}</span>
         {t.server && <span className="text-ink-2">{t.server}</span>}
         <span className="min-w-0 flex-1 truncate text-ink-3">{preview.slice(0, 200)}</span>
         <span className={cn("shrink-0", t.state === "error" ? "text-bad" : "text-ink-2")}>{TOOL_STATE[t.state]}</span>
@@ -86,7 +88,8 @@ function Thinking({ m, streaming, show }: { m: Message; streaming: boolean; show
         onClick={() => setTouched(!open)}
         className="flex items-center gap-1.5 rounded-sm py-0.5 text-[13px] text-ink-2 transition-colors hover:text-ink"
       >
-        <span className={cn(thinkingNow && "thinking-label")}>{title}</span>
+        {thinkingNow && <Orb design="solving" size={20} />}
+        <span className={cn(thinkingNow && "t-shimmer")}>{title}</span>
         <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("transition-transform duration-200", open && "rotate-180")} />
       </button>
       <Collapse open={open}>
@@ -129,14 +132,14 @@ export function MessageView({ m, streaming, show }: { m: Message; streaming: boo
       {m.error ? (
         <div className="rounded-md border border-line px-3 py-2 text-[13px] text-bad [overflow-wrap:anywhere]">{m.error}</div>
       ) : waiting ? (
-        <span className="inline-flex h-6 items-center" aria-label={m.reasoning ? "Thinking" : "Waiting"}>
-          <ThinkingOrb state={m.reasoning ? "solving" : "breathing"} size={20} />
-        </span>
+        m.reasoning ? null : <StatusLabel design="breathing" className="text-[13px] text-ink-2">Waiting for the model…</StatusLabel>
       ) : (
         <div className={cn(streaming && "streaming")}><Answer m={m} /></div>
       )}
       <div className="mt-1 flex min-h-6 items-center gap-2 text-[12px] text-ink-3">
-        <span className="num">{m.meta || (streaming ? "" : m.stopped ? "Stopped" : "")}</span>
+        {streaming && m.text && !m.tools?.some((t) => t.state === "running" || t.state === "writing")
+          ? <StatusLabel design="composing" className="text-[13px] text-ink-2">Writing…</StatusLabel>
+          : <span className="num">{m.meta || (streaming ? "" : m.stopped ? "Stopped" : "")}</span>}
         {!streaming && !!m.text && (
           <button
             type="button"

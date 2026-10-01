@@ -151,3 +151,23 @@
 .page-title { font-size: clamp(26px, 3.4vw, 34px); line-height: 1.08; letter-spacing: -0.035em; font-weight: 600; text-wrap: balance; margin: 0; }
 .page-sub { text-wrap: pretty; margin: 0.6rem 0 0; max-width: 62ch; font-size: 14.5px; line-height: 1.55; color: var(--ink-2); letter-spacing: -0.01em; }
 .page-head { padding-bottom: 2rem; }
+
+/* Orbs: one slot, the old design fades out while the new fades in; a live status line shimmers (a band of full ink travels
+   over text at half strength, left to right, 2 s, linear - the thinking-orbs web demo's t-shimmer). */
+.orb-slot { position: relative; display: inline-block; flex: none; vertical-align: middle; }
+.orb-layer { position: absolute; inset: 0; display: block; }
+.orb-layer canvas { display: block; }
+.orb-in { animation: orb-fade 250ms var(--ease) both; }
+.orb-out { animation: orb-fade 250ms var(--ease) reverse both; pointer-events: none; }
+@keyframes orb-fade { from { opacity: 0; } to { opacity: 1; } }
+.t-shimmer {
+  background: linear-gradient(90deg, transparent, var(--ink), transparent) no-repeat, linear-gradient(color-mix(in srgb, var(--ink) 48%, transparent), color-mix(in srgb, var(--ink) 48%, transparent));
+  background-size: 80% 100%, 100% 100%; background-position: -400% 0, 0 0;
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; color: transparent;
+  animation: t-shimmer 2s linear infinite;
+}
+@keyframes t-shimmer { to { background-position: 500% 0, 0 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .orb-in, .orb-out { animation: none; } .orb-out { display: none; }
+  .t-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; color: inherit; }
+}

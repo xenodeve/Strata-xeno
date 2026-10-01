@@ -5,6 +5,7 @@ import { fmt } from "../lib/format"
 import { store } from "../lib/store"
 import { ModelFacts } from "../components/ModelBlock"
 import type { ModelInfo } from "../lib/metrics"
+import { StatusLabel } from "../components/orb"
 import { toast } from "../components/toast"
 import { inputCls } from "../components/ui"
 
@@ -85,7 +86,9 @@ export function About() {
               <li key={s.name} className="border-b border-line py-2 last:border-0">
                 <div className="flex items-baseline justify-between gap-4">
                   <span className="font-medium">{s.name}</span>
-                  <span className={s.status === "failed" ? "text-bad" : "text-ink-2"}>{MCP_STATE[s.status] || s.status}</span>
+                  {s.status === "starting"
+                    ? <StatusLabel design="connecting" className="text-ink-2">{MCP_STATE[s.status]}</StatusLabel>
+                    : <span className={s.status === "failed" ? "text-bad" : "text-ink-2"}>{MCP_STATE[s.status] || s.status}</span>}
                 </div>
                 <div className="text-[12px] text-ink-2">{s.transport} · {fmt(s.tools.length)} tools</div>
                 {s.error && <div className="mt-1 text-[12px] text-bad [overflow-wrap:anywhere]">{s.error}</div>}

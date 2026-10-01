@@ -25,7 +25,7 @@ from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 ANSWER = ("Let me think about this.</think>\n\nสวัสดีครับ **bold** and `code`\n\n- one\n- two\n\n```py\nprint(1)\n```\n\n"
           "| a | b |\n|---|---|\n| 1 | 2 |\n")
 if os.environ.get("STRATA_MOCK_LONG"):          # an answer longer than a screen, streamed slowly: for the chat's follow-the-answer scroll
-    ANSWER = "Thinking it through.</think>\n\n" + "\n\n".join(f"Paragraph {i}: " + "word " * 40 for i in range(1, 15))
+    ANSWER = "Thinking it through. " * 24 + "</think>\n\n" + "\n\n".join(f"Paragraph {i}: " + "word " * 40 for i in range(1, 15))
 FAKE_STATS = dict(windows=40, tier_primary=5200, tier_secondary=1800, tier_pcie=300, tier_cpu=2700, cpu_expert_ms=950.5,
                   nvme_loads=12, nvme_ms=83.2, ms_verify=2100.0, ms_gpu_wait=800.0, ms_pool=1000.0, ms_plan=40.0,
                   ms_actq=60.0, ms_jobs=70.0, ms_cpu=800.0, ms_stage=120.0, ms_commit=60.0, ms_draft=90.0)

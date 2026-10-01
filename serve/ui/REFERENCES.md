@@ -38,4 +38,4 @@ the daily server on 2026-10-01 (idle, one card visible: the S0 bug). The daily s
 `cd serve/ui && bun install && bun run build` writes `dist/` and `dist/source-hash.txt`. `dist/` is committed so the
 runtime needs no Node; `python -m unittest serve.test_ui` fails when `src/` changed and `dist/` did not.
 
-| thinking-orbs 0.3.2 | MIT | `licenses/ThinkingOrbs-MIT.txt`, vendored into `src/vendor/thinking-orbs/` |
+| thinking-orbs 0.3.2 (Libraries.dev, Jakub Antalik) | MIT | `licenses/ThinkingOrbs-MIT.txt`, vendored into `src/vendor/thinking-orbs/`. Used in: the navbar and Dashboard/Live heads and the empty chat (the server's state), an assistant message (waiting = breathing, thinking = solving, a tool running = connecting, or searching for lookup tools, writing = composing), pages that wait for data (connecting, working), the timeline file reading, an MCP server starting. The status line's shimmer is the library web demo's `t-shimmer`, re-written in CSS. `haplollc/ThinkingOrbs` (a SwiftUI port of the same designs, MIT) was read for its state-to-design recipe and not used: a Swift package cannot run in a page. |

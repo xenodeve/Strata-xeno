@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent, type PointerEvent as RPointerEvent } from "react"
 import { Row, Rows, Section } from "../components/bits"
+import { Loading, StatusLabel } from "../components/orb"
 import { fmt } from "../lib/format"
 import { href } from "../lib/router"
 import { closeTrace, parseTrace, spansIn, topNames, type Trace } from "../lib/trace"
@@ -153,7 +154,7 @@ export function TracePage() {
       </p>
       <div className="mt-4 flex flex-wrap items-center gap-2 text-[13px]">
         <label className="inline-flex h-8 cursor-pointer items-center rounded-sm bg-fill px-3 font-medium transition-colors hover:bg-fill-2">
-          {busy ? "Reading…" : "Open a timeline file"}
+          {busy ? <StatusLabel design="working" className="text-ink">Reading…</StatusLabel> : "Open a timeline file"}
           <input type="file" hidden accept=".json,application/json" onChange={(e) => { const f = e.target.files?.[0]; if (f) void open(f); e.target.value = "" }} />
         </label>
         {trace && source && (
@@ -167,7 +168,7 @@ export function TracePage() {
       {error && <p className="mt-3 text-bad">{error}</p>}
 
       {!trace ? (
-        <p className="mt-8 text-ink-2">{busy ? "Reading the file…" : "Drop a timeline file here, or open one."}</p>
+        busy ? <Loading design="working">Reading the file…</Loading> : <p className="mt-8 text-ink-2">Drop a timeline file here, or open one.</p>
       ) : (
         <>
           <div ref={box} className="relative mt-4 overflow-hidden rounded-md border border-line">

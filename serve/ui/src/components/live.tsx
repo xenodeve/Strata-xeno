@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react"
-import { ThinkingOrb } from "../vendor/thinking-orbs/orb"
+import { serverDesign } from "../lib/orbs"
+import { Orb } from "./orb"
 import type { Live } from "../lib/metrics"
 
 const reduce = () => typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches
@@ -7,13 +8,13 @@ const reduce = () => typeof matchMedia !== "undefined" && matchMedia("(prefers-r
 /** The server's state as a dotted orb: still while idle, breathing while a prompt is read, flowing while it writes.
  *  (vendor/thinking-orbs, MIT: it pauses itself offscreen and in a hidden tab, and is a still frame under reduced motion.) */
 export function StatusOrb({ state, size = 64 }: { state: Live["state"]; size?: 64 | 32 | 20 }) {
-  const busy = state === "reading" || state === "generating"
+  const { design, moving } = serverDesign(state)
   return (
-    <ThinkingOrb
-      state={state === "generating" ? "composing" : "breathing"}
+    <Orb
+      design={design}
       size={size}
-      paused={!busy}
-      aria-label={state === "reading" ? "Reading the prompt" : state === "generating" ? "Writing" : state === "unloaded" ? "Model unloaded" : "Idle"}
+      moving={moving}
+      label={state === "reading" ? "Reading the prompt" : state === "generating" ? "Writing" : state === "unloaded" ? "Model unloaded" : "Idle"}
     />
   )
 }

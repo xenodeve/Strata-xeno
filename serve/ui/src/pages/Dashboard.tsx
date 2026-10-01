@@ -1,3 +1,4 @@
+import { Loading } from "../components/orb"
 import { useEffect, useState, type ReactNode } from "react"
 import { Chart } from "../components/Chart"
 import { Facts, NOT_MEASURED, Row, Rows, ms, pct, val } from "../components/bits"
@@ -50,7 +51,7 @@ export function Dashboard() {
   const { data: m, error, stale } = useMetrics()
   const [mcp, setMcp] = useState<McpInfo | null>(null)
   useEffect(() => { void getMcp().then(setMcp) }, [])
-  if (!m) return <p className="text-ink-2">{error || "Connecting…"}</p>
+  if (!m) return <Loading error={error} />
 
   const l = m.live
   const hw = m.hardware

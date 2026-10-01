@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { rootOf } from "./api"
+import { replyDesign, serverDesign, toolDesign } from "./orbs"
 import { clientName } from "./format"
 import { promptSplit } from "./metrics"
 import { apiMessages, type Message } from "./chat"
@@ -149,5 +150,29 @@ describe("client name", () => {
     expect(clientName("python-httpx/0.27.0")).toBe("python-httpx")
     expect(clientName("MyApp 3.2 (Linux)")).toBe("MyApp")
     expect(clientName("")).toBe("")
+  })
+})
+
+describe("which orb says what", () => {
+  test("the server: a prompt being read breathes, an answer being written flows, otherwise it rests as a ring", () => {
+    expect(serverDesign("reading")).toEqual({ design: "breathing", moving: true })
+    expect(serverDesign("generating")).toEqual({ design: "composing", moving: true })
+    expect(serverDesign("idle")).toEqual({ design: "breathing", moving: false })
+    expect(serverDesign("unloaded")).toEqual({ design: "breathing", moving: false })
+  })
+  test("a tool call: connecting, or searching when the tool looks things up", () => {
+    expect(toolDesign("fs__read_file")).toBe("connecting")
+    expect(toolDesign("brave__web_search")).toBe("searching")
+    expect(toolDesign("github__find_issues")).toBe("searching")
+    expect(toolDesign("")).toBe("connecting")
+  })
+  test("a reply: waiting, thinking, a tool running, writing, and nothing once it is done", () => {
+    expect(replyDesign({ streaming: true, reasoning: "", text: "", tools: [] })).toBe("breathing")
+    expect(replyDesign({ streaming: true, reasoning: "hm", text: "", tools: [] })).toBe("solving")
+    expect(replyDesign({ streaming: true, reasoning: "hm", text: "", tools: [{ name: "x__search", state: "running" }] })).toBe("searching")
+    expect(replyDesign({ streaming: true, reasoning: "hm", text: "", tools: [{ name: "x__read", state: "writing" }] })).toBe("connecting")
+    expect(replyDesign({ streaming: true, reasoning: "hm", text: "Hel", tools: [] })).toBe("composing")
+    expect(replyDesign({ streaming: true, reasoning: "", text: "Hi", tools: [{ name: "x__read", state: "done" }] })).toBe("composing")
+    expect(replyDesign({ streaming: false, reasoning: "", text: "Hi", tools: [] })).toBeNull()
   })
 })

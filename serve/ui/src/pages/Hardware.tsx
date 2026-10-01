@@ -1,3 +1,4 @@
+import { Loading } from "../components/orb"
 import { useEffect, useRef, type ReactNode } from "react"
 import { Chart } from "../components/Chart"
 import { NOT_MEASURED, Row, Rows, Section, val } from "../components/bits"
@@ -47,7 +48,7 @@ function Device({ title, to, children, sub }: { title: ReactNode; to?: string; c
 
 export function Hardware() {
   const { data: m, error } = useMetrics()
-  if (!m) return <p className="text-ink-2">{error || "Connecting…"}</p>
+  if (!m) return <Loading error={error} />
   const hw = m.hardware
   const arch = parseArch(String(m.engine.gpu_arch ?? ""))
   const ds = disksOf(m)
@@ -120,7 +121,7 @@ const HISTORY: [string, string, string][] = [
 
 export function GpuPage({ n }: { n: string }) {
   const { data: m, error } = useMetrics()
-  if (!m) return <p className="text-ink-2">{error || "Connecting…"}</p>
+  if (!m) return <Loading error={error} />
   const g = cards(m).find((c) => String(c.index) === n)
   if (!g) return <div><p>This card is not reporting.</p><p><a href={href("hardware")}>Back to Hardware</a></p></div>
   const arch = archOf(parseArch(String(m.engine.gpu_arch ?? "")), g.name)
@@ -180,7 +181,7 @@ export function SsdPage({ n }: { n: string }) {
     const push = (a: (number | null)[], v: number | null) => { a.push(v); if (a.length > 120) a.shift() }
     push(t.read, r?.read_mb ?? null); push(t.write, r?.write_mb ?? null); push(t.lat, r?.read_ms_op ?? null)
   }, [m?.time]) // eslint-disable-line react-hooks/exhaustive-deps
-  if (!m) return <p className="text-ink-2">{error || "Connecting…"}</p>
+  if (!m) return <Loading error={error} />
   const d = disksOf(m).find((x) => x.index === idx)
   if (!d) return <div><p>This disk is not listed.</p><p><a href={href("hardware")}>Back to Hardware</a></p></div>
   const dr = rates(m)
