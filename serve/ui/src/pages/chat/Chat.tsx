@@ -35,6 +35,7 @@ export function Chat() {
   const { data: metrics, stale } = useMetrics()
   const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
   const closeSheet = useCallback(() => setSheet(false), [])
+  useEffect(() => { if (metrics) chat.samplePrefill(metrics.live, performance.now()) }, [metrics])      // each /metrics reply while a prompt is read
 
   useEffect(() => {
     chat.onError = (title, t) => toast("error", title, t, 6000)
@@ -139,7 +140,7 @@ export function Chat() {
           </div>
         )}
         {chat.messages.map((m, i) => (
-          <MessageView key={i} m={m} streaming={busy?.msg === m} show={chat.settings.show} />
+          <MessageView key={i} m={m} streaming={busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} />
         ))}
       </div>
 

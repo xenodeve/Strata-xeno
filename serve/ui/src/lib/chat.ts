@@ -4,6 +4,7 @@ import { useSyncExternalStore } from "react"
 import { apiHeaders, errorMessage, url, type Health, type McpInfo } from "./api"
 import { fmt } from "./format"
 import { store } from "./store"
+import { PrefillMeter, type Prefill } from "./prefill"
 
 export interface ToolCall {
   id: string; name: string; at: number; rat: number
@@ -14,14 +15,15 @@ export interface ToolCall {
 export interface Attachment { kind: "image" | "file"; name: string; url?: string; text?: string }
 export interface Message {
   role: "user" | "assistant"; text: string; time: number
+  prefill?: Prefill                                              // on a prompt: the speed it was read at
   reasoning?: string; thinkSecs?: number | null; meta?: string; error?: string; stopped?: boolean; limit?: number
   images?: { name: string; url?: string }[]; files?: { name: string; text?: string }[]; tools?: ToolCall[]
 }
 export interface Settings {
   thinking: "none" | "low" | "medium" | "high"; temperature: number; top_p: number; top_k: number
-  max: string; seed: string; show: boolean; esp: boolean; mcp: boolean
+  max: string; seed: string; show: boolean; esp: boolean; mcp: boolean; prefill: boolean
 }
-export const DEFAULTS: Settings = { thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true }
+export const DEFAULTS: Settings = { thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, prefill: true }
 
 // a file's text in the message, fenced with more backticks than it contains itself
 const fileBlock = (f: { name: string; text: string }) => {
@@ -100,10 +102,12 @@ export function exportMarkdown(messages: Message[], model: string): string {
 export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean }
 
 export class ChatController {
-  messages: Message[] = store.get<Message[]>("chat", [])
+  // a read that was cut off by closing the page is not still reading
+  messages: Message[] = store.get<Message[]>("chat", []).map((m) => (m.prefill?.state === "reading" ? { ...m, prefill: { ...m.prefill, state: "done" as const, rate: null } } : m))
   settings: Settings = { ...DEFAULTS, ...store.get<Partial<Settings>>("sampling", {}) }
   busy: { abort: AbortController; msg: Message } | null = null
   onError: (title: string, text: string) => void = () => {}
+  private meter: PrefillMeter | null = null
   private version = 0
   private listeners = new Set<() => void>()
   private frame = 0
@@ -119,6 +123,23 @@ export class ChatController {
   setSettings(s: Settings) { this.settings = s; store.set("sampling", s); this.notify() }
 
   stop() { this.busy?.abort.abort() }
+
+  /** One look at /metrics while a request runs: the engine's position in the prompt gives the speed under the prompt that
+   *  was sent (the mean over the last second) while it is read, and the engine's own mean as soon as it is read. The tokens
+   *  read and cached come with the final timings, at the end of the answer. */
+  samplePrefill(live: { state: string; prompt_read: number | null; prefill_tok_s_mean?: number | null }, ms: number) {
+    const b = this.busy, meter = this.meter
+    if (!b || !meter) return
+    const um = this.messages[this.messages.indexOf(b.msg) - 1]
+    if (!um || um.role !== "user" || um.prefill?.state !== "reading") return
+    if (live.state === "generating") {
+      um.prefill = { state: "done", rate: null, mean: live.prefill_tok_s_mean ?? meter.mean(), read: null, cached: null }
+    } else if (live.state === "reading" && live.prompt_read != null) {
+      meter.push(ms, live.prompt_read)
+      um.prefill = { state: "reading", rate: meter.rate(), mean: null, read: null, cached: null }
+    } else return
+    this.notify()
+  }
 
   /** Clears the chat; returns what undoes it. */
   clear(): (() => void) | null {
@@ -137,6 +158,9 @@ export class ChatController {
       images: attachments.filter((a) => a.kind === "image").map((a) => ({ name: a.name, url: a.url })),
       files: attachments.filter((a) => a.kind === "file").map((a) => ({ name: a.name, text: a.text })),
     })
+    const um = this.messages[this.messages.length - 1]
+    um.prefill = { state: "reading", rate: null, mean: null, read: null, cached: null }
+    this.meter = new PrefillMeter()
     const m: Message = { role: "assistant", text: "", reasoning: "", time: Date.now() }
     this.messages.push(m)
     const abort = new AbortController()
@@ -155,6 +179,7 @@ export class ChatController {
     let firstAt: number | null = null
     let thinkStart: number | null = null
     let usage: { completion_tokens?: number } | null = null
+    let timings: { prompt_n?: number; prompt_per_second?: number | null; cache_n?: number } | null = null
     try {
       const r = await fetch(url("v1/chat/completions"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body), signal: abort.signal })
       if (!r.ok) throw new Error(await errorMessage(r))
@@ -176,6 +201,7 @@ export class ChatController {
           try { j = JSON.parse(data) } catch { continue }
           if (j.error) throw new Error(j.error.message || "the engine reported an error")
           if (j.usage) usage = j.usage
+          if (j.timings) timings = j.timings
           if (j.strata_mcp) onTool(m, j.strata_mcp)
           const d = j.choices?.[0]?.delta || {}
           const lastTool = m.tools?.length ? m.tools[m.tools.length - 1] : null    // a new round after a tool
@@ -200,6 +226,12 @@ export class ChatController {
       else { m.error = err.message || String(err); this.onError("The request failed", m.error) }
     }
     if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000
+    // The read is over: the engine's own mean replaces the live speed. After a tool round the final timings are the last
+    // round's (a different prompt), so then the mean is the one measured while the first prompt was read.
+    const sampled = this.meter?.mean() ?? null
+    const own = timings && !(m.tools || []).length ? timings : null
+    um.prefill = { state: "done", rate: null, mean: own ? own.prompt_per_second ?? null : sampled, read: own?.prompt_n ?? null, cached: own?.cache_n ?? null }
+    this.meter = null
     const n = usage?.completion_tokens ?? null
     if (n && firstAt) {
       const secs = (performance.now() - firstAt) / 1000

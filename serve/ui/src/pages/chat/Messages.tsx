@@ -10,6 +10,7 @@ import { Lattice, Thought, type LatticeStatus } from "../../components/thought"
 import { cn } from "../../lib/cn"
 import { fmt, timeStr } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
+import { prefillText } from "../../lib/prefill"
 
 const TOOL_STATE: Record<ToolCall["state"], string> = { writing: "Writing", running: "Running", done: "Done", error: "Error", skipped: "Not run" }
 
@@ -98,7 +99,7 @@ function Thinking({ m, streaming, show, phase }: { m: Message; streaming: boolea
   )
 }
 
-export function MessageView({ m, streaming, show }: { m: Message; streaming: boolean; show: boolean }) {
+export function MessageView({ m, streaming, show, prefill }: { m: Message; streaming: boolean; show: boolean; prefill: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
   if (m.role === "user") {
     return (
@@ -121,6 +122,9 @@ export function MessageView({ m, streaming, show }: { m: Message; streaming: boo
         )}
         <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] [overflow-wrap:anywhere]">{m.text}</div>
         <div className="num px-1 text-[12px] text-ink-3">You · {timeStr(m.time)}</div>
+        {prefill && m.prefill && prefillText(m.prefill) && (
+          <div key={m.prefill.state} className="num fade-swap px-1 text-[12px] text-ink-3" role={m.prefill.state === "reading" ? "status" : undefined}>{prefillText(m.prefill)}</div>
+        )}
       </div>
     )
   }

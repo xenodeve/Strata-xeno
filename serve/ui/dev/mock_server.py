@@ -32,6 +32,8 @@ if os.environ.get("STRATA_MOCK_LONG"):          # an answer longer than a screen
     ANSWER = THINKING + "</think>\n\n" + "\n\n".join(f"Paragraph {i}: " + "word " * 40 for i in range(1, 15))
 THINK_BYTES = len(ANSWER.split("</think>")[0].encode())
 THINK_MS = float(os.environ.get("STRATA_MOCK_THINK_MS", "30"))   # per token while it thinks (about 12 s of thinking by default): the thinking line stays on screen long enough to look at
+PREFILL_TPS = float(os.environ.get("STRATA_MOCK_PREFILL_TPS", "300"))   # the prompt is read at this speed (the byte tokenizer: one token per byte, so paste a few thousand characters to see it)
+PREFILL_CHUNK = 32
 FAKE_STATS = dict(windows=40, tier_primary=5200, tier_secondary=1800, tier_pcie=300, tier_cpu=2700, cpu_expert_ms=950.5,
                   nvme_loads=12, nvme_ms=83.2, ms_verify=2100.0, ms_gpu_wait=800.0, ms_pool=1000.0, ms_plan=40.0,
                   ms_actq=60.0, ms_jobs=70.0, ms_cpu=800.0, ms_stage=120.0, ms_commit=60.0, ms_draft=90.0)
@@ -48,14 +50,26 @@ class FakeEngine(MockEngine):
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         n = 0
+        reused = min(5, len(ids))
+        t0 = time.time()
+        self.progress = (reused, len(ids))                   # as the engine's PP lines give it: the position counts the reused prefix
+        pos = reused
+        while pos < len(ids) and not cancel.is_set():        # the prompt is read at PREFILL_TPS tokens a second, in chunks
+            step = min(PREFILL_CHUNK, len(ids) - pos)
+            time.sleep(step / PREFILL_TPS)
+            pos += step
+            self.progress = (pos, len(ids))
+        prompt_ms = (time.time() - t0) * 1000
+        self.progress = None
+        self.prefill_tok_s_mean = round((len(ids) - reused) / (prompt_ms / 1000), 1) if prompt_ms > 0 and len(ids) > reused else None
         try:
             for t in super().generate(ids, max_new, sampling, cancel, embeddings):
                 n += 1
                 time.sleep((THINK_MS if n <= THINK_BYTES else 4) / 1000)
                 yield t
         finally:
-            self.last = {"generated": n, "prompt_tokens": len(ids), "prompt_ms": 40.0, "decode_ms": 2400.0,
-                         "finish": "stop", "reused": min(5, len(ids)), "hits": 9, "lookups": 10,
+            self.last = {"generated": n, "prompt_tokens": len(ids), "prompt_ms": prompt_ms, "decode_ms": 2400.0,
+                         "finish": "stop", "reused": reused, "hits": 9, "lookups": 10,
                          "prefill_points": [(2005, 1000.0), (4005, 3000.0), (4805, 3400.0)], "stats": dict(FAKE_STATS)}
 
 

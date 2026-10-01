@@ -122,4 +122,59 @@ describe("chat stream", () => {
     expect(c.messages[1]).toMatchObject({ text: "so far", stopped: true, meta: "Stopped" })
     expect(c.messages[1].error).toBeUndefined()
   })
+
+  // The speed at which the prompt is read, under the prompt: sampled from the server's progress while it reads, replaced
+  // by the engine's own mean (the final chunk's timings) when the request is done.
+  const held = (final: unknown[]) => {
+    let release!: () => void
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(new ReadableStream<Uint8Array>({
+      start(ctl) { release = () => { ctl.enqueue(enc.encode(sse(...final))); ctl.close() } },
+    }), { status: 200 })
+    return () => release()
+  }
+
+  test("prefill: a speed from the last second while the prompt is read, the engine's mean when it is done", async () => {
+    const release = held([delta({ content: "ok" }),
+      { choices: [], usage: { completion_tokens: 3 }, timings: { prompt_n: 2400, prompt_ms: 2000, prompt_per_second: 1200, cache_n: 5000 } }])
+    const c = new ChatController()
+    const p = c.send("hi", [], ctx)
+    c.samplePrefill({ state: "reading", prompt_read: 5000 }, 0)
+    expect(c.messages[0].prefill).toMatchObject({ state: "reading", rate: null })
+    c.samplePrefill({ state: "reading", prompt_read: 5600 }, 500)
+    expect(c.messages[0].prefill).toMatchObject({ state: "reading", rate: 1200 })
+    c.samplePrefill({ state: "generating", prompt_read: null, prefill_tok_s_mean: 1190 }, 900)     // the read is over: the engine's mean now, at once
+    expect(c.messages[0].prefill).toEqual({ state: "done", rate: null, mean: 1190, read: null, cached: null })
+    c.samplePrefill({ state: "reading", prompt_read: 9000 }, 1400)         // a later look (another request) changes nothing
+    expect(c.messages[0].prefill!.state).toBe("done")
+    release(); await p
+    expect(c.messages[0].prefill).toEqual({ state: "done", rate: null, mean: 1200, read: 2400, cached: 5000 })
+  })
+
+  test("prefill: with no timings the mean comes from the samples; a cache that held it all has no speed", async () => {
+    let release = held([delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 } }])
+    const c = new ChatController()
+    let p = c.send("hi", [], ctx)
+    c.samplePrefill({ state: "reading", prompt_read: 100 }, 0)
+    c.samplePrefill({ state: "reading", prompt_read: 1100 }, 1000)
+    c.samplePrefill({ state: "generating", prompt_read: null, prefill_tok_s_mean: null }, 1500)   // no engine mean: the samples' own
+    expect(c.messages[0].prefill).toEqual({ state: "done", rate: null, mean: 1000, read: null, cached: null })
+    release(); await p
+    expect(c.messages[0].prefill).toEqual({ state: "done", rate: null, mean: 1000, read: null, cached: null })
+    release = held([delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 }, timings: { prompt_n: 0, prompt_ms: 0, prompt_per_second: null, cache_n: 800 } }])
+    p = c.send("again", [], ctx)
+    release(); await p
+    expect(c.messages[2].prefill).toEqual({ state: "done", rate: null, mean: null, read: 0, cached: 800 })
+  })
+
+  test("prefill: after a tool round the final timings are the last round's, so the mean is the first read's", async () => {
+    const release = held([{ strata_mcp: { event: "call", id: "c1", name: "fs__read", server: "fs", tool: "read", arguments: {}, round: 1 } },
+      { strata_mcp: { event: "result", id: "c1", ok: true, text: "x", chars: 1, ms: 1 } }, delta({ content: "ok" }),
+      { choices: [], usage: { completion_tokens: 1 }, timings: { prompt_n: 50, prompt_ms: 100, prompt_per_second: 500, cache_n: 3000 } }])
+    const c = new ChatController()
+    const p = c.send("hi", [], ctx)
+    c.samplePrefill({ state: "reading", prompt_read: 0 }, 0)
+    c.samplePrefill({ state: "reading", prompt_read: 2000 }, 1000)
+    release(); await p
+    expect(c.messages[0].prefill).toMatchObject({ state: "done", mean: 2000, read: null })
+  })
 })

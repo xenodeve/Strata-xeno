@@ -76,6 +76,7 @@ export function SettingsSheet({ open, onClose, mcp, projectionLoaded }: { open: 
               options={[{ value: "none", label: "Off" }, { value: "low", label: "Low" }, { value: "medium", label: "Medium" }, { value: "high", label: "High" }]} />
           </Field>
           <Switch label="Show the thinking while it streams" checked={s.show} onChange={(v) => patch({ show: v })} />
+          <Switch label="Show the prompt reading speed under each prompt" checked={s.prefill} onChange={(v) => patch({ prefill: v })} />
           <Field label="Temperature" value={s.temperature === 0 ? "0 · greedy" : s.temperature.toFixed(2)}>
             <input type="range" min={0} max={1.5} step={0.05} value={s.temperature} onChange={(e) => patch({ temperature: +e.target.value })} className="w-full accent-[var(--accent)]" />
           </Field>
