@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { apiMessages, type Message } from "./chat"
 import { archOf, parseArch } from "./arch"
 import { markdown } from "./markdown"
+import { attribute, overlapOpportunityMs } from "./stall"
 import { parse } from "./router"
 
 describe("markdown", () => {
@@ -72,5 +73,38 @@ describe("arch", () => {
     expect(archOf(list, "Some Other Card")).toBeNull()
     expect(parseArch("")).toEqual([])
     expect(parseArch("none")).toEqual([])
+  })
+})
+
+describe("stall attribution", () => {
+  const stats = { ms_cpu: 800, ms_gpu_wait: 800, ms_pool: 1000, ms_plan: 40, ms_actq: 60, ms_jobs: 70, ms_stage: 120, ms_commit: 60, ms_draft: 90, nvme_ms: 83 }
+  test("each resource's buckets add up to the decode time, never more", () => {
+    for (const a of attribute(stats, 2400)!) {
+      expect(a.buckets.reduce((x, b) => x + b.ms, 0)).toBeCloseTo(2400, 5)
+      expect(a.buckets.every((b) => b.ms >= 0)).toBe(true)
+    }
+  })
+  test("the CPU waits on the GPU, the GPU waits on the CPU", () => {
+    const [cpu, gpu] = attribute(stats, 2400)!
+    expect(cpu.buckets.find((b) => b.key === "ms_gpu_wait")!.kind).toBe("wait")
+    expect(gpu.buckets.find((b) => b.key === "ms_pool")!.kind).toBe("wait")
+    expect(gpu.buckets.find((b) => b.key === "ms_gpu_wait")!.kind).toBe("busy")
+  })
+  test("stages that overlap past the wall time are scaled down, not shown as more than 100%", () => {
+    const [cpu] = attribute({ ms_cpu: 2000, ms_gpu_wait: 2000 }, 2000)!
+    expect(cpu.buckets.reduce((x, b) => x + b.ms, 0)).toBeCloseTo(2000, 5)
+  })
+  test("overhead is not a number until it is measured", () => {
+    expect(attribute(stats, 2400)![0].overhead).toBeNull()
+  })
+  test("no counters or no time: nothing to attribute", () => {
+    expect(attribute(null, 2400)).toBeNull()
+    expect(attribute(stats, 0)).toBeNull()
+    expect(attribute(stats, null)).toBeNull()
+  })
+  test("the overlap opportunity is the SSD wait, an upper bound, and null when not measured", () => {
+    expect(overlapOpportunityMs(stats)).toBe(83)
+    expect(overlapOpportunityMs({})).toBeNull()
+    expect(overlapOpportunityMs(null)).toBeNull()
   })
 })

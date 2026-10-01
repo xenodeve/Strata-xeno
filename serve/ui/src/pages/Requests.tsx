@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react"
 import { Chart } from "../components/Chart"
 import { NOT_MEASURED, Row, Rows, Section, ms, pct, val, when } from "../components/bits"
 import { fmt } from "../lib/format"
+import { attribute, overlapOpportunityMs } from "../lib/stall"
 import { getRequest, getRequestPage, type RequestDetail, type RequestRow } from "../lib/metrics"
 import { href } from "../lib/router"
 
@@ -199,10 +200,42 @@ export function RequestDetailPage({ id }: { id: string }) {
                 <Row key={k} k={label} hint={hint} v={<span className="num">{ms(stats[k])}{r.decode_ms ? <span className="text-ink-2"> · {pct(stats[k] / r.decode_ms, 0)}</span> : null}</span>} />
               ))}
             </Rows>
+            <Stall stats={stats} decodeMs={r.decode_ms} />
             <p className="mt-3 text-[12px] text-ink-3">Counted by the engine over {fmt(stats.windows ?? 0)} verify windows. Stages overlap, so they do not add up to the total.</p>
           </>
         )}
       </Section>
+    </div>
+  )
+}
+
+const KIND_TONE = { busy: "bg-ink", wait: "bg-ink-2", idle: "bg-fill-2" } as const
+
+/** Who waited for whom: each resource's decode time split into busy, waiting (named) and idle. */
+function Stall({ stats, decodeMs }: { stats: Record<string, number>; decodeMs: number | null }) {
+  const a = attribute(stats, decodeMs)
+  if (!a) return null
+  const opp = overlapOpportunityMs(stats)
+  return (
+    <div className="mt-6">
+      <div className="text-[12px] text-ink-2">Who waited for whom</div>
+      <p className="mt-1 text-[12px] text-ink-3">A dependency definition from the engine's counters: idle time is put down to what the host was waiting on. It is not a hardware measurement; cycle-level stalls need the Nsight capture.</p>
+      {a.map((res) => (
+        <div key={res.resource} className="mt-3">
+          <div className="mb-1 text-[13px] font-medium">{res.resource}</div>
+          <div className="flex h-2 w-full overflow-hidden rounded-full bg-fill" role="img" aria-label={`${res.resource}: ${res.buckets.map((b) => `${b.label} ${pct(b.ms / res.total)}`).join(", ")}`}>
+            {res.buckets.map((b) => <div key={b.key} className={KIND_TONE[b.kind]} style={{ width: `${(b.ms / res.total) * 100}%`, opacity: b.kind === "busy" ? 1 : b.kind === "wait" ? 0.55 : 0.35 }} title={`${b.label}: ${ms(b.ms)}`} />)}
+          </div>
+          <Rows>
+            {res.buckets.map((b) => <Row key={b.key} k={b.label} v={<span className="num">{ms(b.ms)}<span className="text-ink-2"> · {pct(b.ms / res.total)}</span></span>} />)}
+            {res.resource === "CPU pool" && <Row k="Wake, park and repark of the pool" v={NOT_MEASURED} />}
+          </Rows>
+        </div>
+      ))}
+      <Rows>
+        <Row k="Overlap opportunity" hint="upper bound: SSD time only" v={opp == null ? NOT_MEASURED : <span className="num">{ms(opp)}</span>} />
+        <Row k="PCIe copy waits" hint="not in the bound" v={NOT_MEASURED} />
+      </Rows>
     </div>
   )
 }
