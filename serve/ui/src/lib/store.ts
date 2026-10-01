@@ -7,7 +7,11 @@ export const store = {
       return v === null ? d : (JSON.parse(v) as T)
     } catch { return d }
   },
-  set(k: string, v: unknown) {
-    try { localStorage.setItem("strata." + k, JSON.stringify(v)) } catch { /* private window: in memory only */ }
+  /** False when the browser refused the write (its storage is full, or a private window): the caller says so, nobody is left thinking it was kept. */
+  set(k: string, v: unknown): boolean {
+    try { localStorage.setItem("strata." + k, JSON.stringify(v)); return true } catch { return false }
+  },
+  remove(k: string) {
+    try { localStorage.removeItem("strata." + k) } catch { /* nothing to remove */ }
   },
 }

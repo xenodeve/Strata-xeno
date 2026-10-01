@@ -5,6 +5,7 @@ import {
 } from "@hugeicons/core-free-icons"
 import { cn } from "./lib/cn"
 import { MetricsProvider, useMetrics } from "./lib/metrics"
+import { chat } from "./lib/chat"
 import { href, PAGES, useRoute, type Page } from "./lib/router"
 import { useTheme, type Theme } from "./lib/theme"
 import { msg, setLang, t, useLang } from "./lib/i18n"
@@ -121,7 +122,7 @@ function Nav({ page }: { page: Page }) {
       {PAGES.map((p) => (
         <a
           key={p}
-          href={href(p)}
+          href={p === "chat" && chat.index.active ? href("chat", chat.index.active) : href(p)}      // back to the conversation that is open
           aria-current={page === p ? "page" : undefined}
           aria-label={t(NAV[p].label)}
           className={cn(

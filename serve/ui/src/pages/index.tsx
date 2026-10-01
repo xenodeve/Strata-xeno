@@ -11,7 +11,7 @@ import type { Route } from "../lib/router"
 export function PageView({ route }: { route: Route }) {
   switch (route.page) {
     case "chat":
-      return <Chat />
+      return <Chat id={route.params[0]} />
     case "dashboard":
       return <Dashboard />
     case "live":

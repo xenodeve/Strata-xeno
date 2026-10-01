@@ -106,7 +106,7 @@ export function PromptBar(p: PromptBarProps) {
   const mcpOn = p.mcp.on ? p.mcp.servers.filter((x) => usable(x) && !p.mcp.off.includes(x.name)).length : 0
   const list: Row[] = [
     { key: "attach", name: t("Photos & files"), description: p.attachTitle, icon: Attachment01Icon },
-    { key: "new", name: t("New chat"), description: t("Clears this chat, with undo"), icon: MessageAdd01Icon, disabled: p.busy },
+    { key: "new", name: t("New chat"), description: t("Starts a new chat; this one stays in Recents"), icon: MessageAdd01Icon, disabled: p.busy },
     { key: "save", name: t("Save as Markdown"), description: t("Download the conversation"), icon: Download01Icon },
     {
       key: "mcp", name: t("MCP tools"), icon: PlugSocketIcon, checked: mcpOn > 0,

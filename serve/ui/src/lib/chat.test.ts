@@ -277,3 +277,101 @@ describe("which MCP servers a request uses", () => {
     expect(mcpRequest(DEFAULTS, { servers: [], tools: 2 })).toEqual({ strata_mcp: true })
   })
 })
+
+// Many conversations (issue #92) through the controller, over a localStorage that really keeps things.
+describe("conversations", () => {
+  function keep(limit = Infinity) {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null,
+      setItem: (k: string, v: string) => { if (v.length > limit) throw new Error("QuotaExceededError"); data.set(k, v) },
+      removeItem: (k: string) => { data.delete(k) },
+    }
+    return data
+  }
+  const answer = (text: string) => sse(delta({ content: text }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]\n\n")
+
+  test("a conversation is added with its first prompt, and New chat keeps it in the list", async () => {
+    keep()
+    mockFetch([answer("a"), answer("b")], [])
+    const c = new ChatController()
+    expect(c.index.items).toEqual([])
+    await c.send("first question", [], ctx)
+    expect(c.index.items).toHaveLength(1)
+    expect(c.index.items[0].title).toBe("first question")
+    expect(c.index.active).toBe(c.index.items[0].id)
+    expect(c.newSession()).toBe(true)
+    expect(c.messages).toEqual([])
+    expect(c.index.items).toHaveLength(1)
+    await c.send("second question", [], ctx)
+    expect(c.index.items.map((i) => i.title).sort()).toEqual(["first question", "second question"])
+  })
+
+  test("opening one restores its messages, and a reload comes back to the one that was open", async () => {
+    keep()
+    mockFetch([answer("a"), answer("b")], [])
+    const c = new ChatController()
+    await c.send("one", [], ctx)
+    const first = c.index.active!
+    c.newSession()
+    await c.send("two", [], ctx)
+    expect(c.open(first)).toBe(true)
+    expect(c.messages.map((m) => m.text)).toEqual(["one", "a"])
+    const again = new ChatController()
+    expect(again.index.active).toBe(first)
+    expect(again.messages.map((m) => m.text)).toEqual(["one", "a"])
+    expect(again.index.items).toHaveLength(2)
+  })
+
+  test("nothing changes while an answer is being written", async () => {
+    keep()
+    mockFetch([answer("a")], [])
+    const c = new ChatController()
+    await c.send("one", [], ctx)
+    const first = c.index.active!
+    c.busy = { abort: new AbortController(), msg: c.messages[1] }
+    expect(c.newSession()).toBe(false)
+    expect(c.open(first)).toBe(true)                       // the one that is open is already open
+    expect(c.remove(first)).toBe(false)
+    expect(c.messages).toHaveLength(2)
+    c.busy = null
+  })
+
+  test("a conversation the app already had becomes the first one", () => {
+    const data = keep()
+    data.set("strata.chat", JSON.stringify([{ role: "user", text: "from before", time: 5 }, { role: "assistant", text: "yes", time: 6 }]))
+    const c = new ChatController()
+    expect(c.index.items).toHaveLength(1)
+    expect(c.index.items[0].title).toBe("from before")
+    expect(c.messages).toHaveLength(2)
+  })
+
+  test("deleting, renaming, and projects reach the controller's index and the storage", async () => {
+    const data = keep()
+    mockFetch([answer("a")], [])
+    const c = new ChatController()
+    await c.send("one", [], ctx)
+    const id = c.index.active!
+    c.rename(id, "Kept")
+    const p = c.addProject("Work")!
+    c.move(id, p)
+    expect(c.index.items[0]).toMatchObject({ title: "Kept", project: p })
+    expect(JSON.parse(data.get("strata.chats")!).projects).toEqual([{ id: p, name: "Work" }])
+    c.removeProject(p)
+    expect(c.index.items[0].project).toBeUndefined()
+    expect(c.remove(id)).toBe(true)
+    expect(c.messages).toEqual([])
+    expect(c.index.items).toEqual([])
+  })
+
+  test("storage that is full is said once, not kept silently", async () => {
+    keep(300)
+    mockFetch([answer("x".repeat(50))], [])
+    const c = new ChatController()
+    const said: string[] = []
+    c.onError = (title) => said.push(title)
+    await c.send("q".repeat(400), [], ctx)
+    expect(said.length).toBe(1)
+    expect(said[0]).toContain("storage is full")
+  })
+})

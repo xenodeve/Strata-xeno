@@ -6,6 +6,7 @@ import { fmt } from "./format"
 import { store } from "./store"
 import { PrefillMeter, type Prefill } from "./prefill"
 import { t, tn } from "./i18n"
+import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, type SessionIndex, type StoredMessage } from "./sessions"
 
 export interface ToolCall {
   id: string; name: string; at: number; rat: number
@@ -141,11 +142,17 @@ function attachmentsOf(m: Message): { kept: Attachment[]; lost: number } {
   return { kept, lost }
 }
 
+/** Messages as they come back from storage: a read that was cut off by closing the page is not still reading. */
+function restore(msgs: Message[]): Message[] {
+  return msgs.map((m) => (m.prefill?.state === "reading" ? { ...m, prefill: { ...m.prefill, state: "done" as const, rate: null } } : m))
+}
+
 export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean }
 
 export class ChatController {
   // a read that was cut off by closing the page is not still reading
-  messages: Message[] = store.get<Message[]>("chat", []).map((m) => (m.prefill?.state === "reading" ? { ...m, prefill: { ...m.prefill, state: "done" as const, rate: null } } : m))
+  index: SessionIndex = loadIndex(store, Date.now())             // the conversations, and which is open (lib/sessions.ts)
+  messages: Message[] = restore(store.get<Message[]>("chat", []))   // the open one
   settings: Settings = { ...DEFAULTS, ...store.get<Partial<Settings>>("sampling", {}) }
   busy: { abort: AbortController; msg: Message } | null = null
   onError: (title: string, text: string) => void = () => {}
@@ -159,9 +166,67 @@ export class ChatController {
   notify() { this.version++; this.listeners.forEach((l) => l()) }
   private paint() { if (!this.frame) this.frame = requestAnimationFrame(() => { this.frame = 0; this.notify() }) }
 
-  save() {
-    store.set("chat", this.messages.map((m) => ({ ...m, images: (m.images || []).map((i) => ({ name: i.name })), files: (m.files || []).map((f) => ({ name: f.name })) })))
+  private fullNoted = false
+  /** The open conversation as it is stored: attachments are kept by name only. */
+  private stored(): StoredMessage[] {
+    return this.messages.map((m) => ({ ...m, images: (m.images || []).map((i) => ({ name: i.name })), files: (m.files || []).map((f) => ({ name: f.name })) }))
   }
+  /** The browser refused a write: said once, until a write works again. */
+  private storageFull() {
+    if (this.fullNoted) return
+    this.fullNoted = true
+    this.onError(t("This browser's storage is full"), t("The conversation may not be kept. Delete some from Recents to make room."))
+  }
+  save() {
+    const r = saveActive(store, this.index, this.stored(), Date.now())
+    this.index = r.index
+    if (r.ok) this.fullNoted = false
+    else this.storageFull()
+  }
+  private saveIndex() { if (persistIndex(store, this.index)) this.fullNoted = false; else this.storageFull(); this.notify() }
+
+  /** Starts an empty conversation; the one that was open stays in Recents. Not while an answer is being written. */
+  newSession(): boolean {
+    if (this.busy) return false
+    if (!this.messages.length) return true
+    const next = newSession(store, this.index, this.stored())
+    if (next === this.index) { this.storageFull(); return false }
+    this.index = next
+    this.messages = []
+    this.notify()
+    return true
+  }
+  /** Opens a conversation of the list. False when there is none with that id, an answer is being written, or the open one could not be kept. */
+  open(id: string): boolean {
+    if (id === this.index.active) return true              // already open (also fine while it is being written)
+    if (this.busy) return false
+    const r = openSession(store, this.index, this.stored(), id)
+    if (!r) return false
+    if (!r.ok) { this.storageFull(); return false }
+    this.index = r.index
+    this.messages = restore(r.messages as Message[])
+    this.notify()
+    return true
+  }
+  remove(id: string): boolean {
+    if (this.busy && this.index.active === id) return false
+    const r = removeSession(store, this.index, id)
+    this.index = r.index
+    if (r.clearedActive) this.messages = []
+    this.notify()
+    return true
+  }
+  rename(id: string, title: string) { this.index = renameSession(this.index, id, title); this.saveIndex() }
+  move(id: string, project: string | undefined) { this.index = moveSession(this.index, id, project); this.saveIndex() }
+  addProject(name: string): string | null {
+    const before = this.index.projects.length
+    const id = Math.random().toString(36).slice(2, 10)
+    this.index = addProject(this.index, name, id)
+    this.saveIndex()
+    return this.index.projects.length > before ? id : null
+  }
+  renameProject(id: string, name: string) { this.index = renameProject(this.index, id, name); this.saveIndex() }
+  removeProject(id: string) { this.index = removeProject(this.index, id); this.saveIndex() }
   setSettings(s: Settings) { this.settings = s; store.set("sampling", s); this.notify() }
 
   stop() { this.busy?.abort.abort() }
@@ -216,15 +281,6 @@ export class ChatController {
     this.lostNote(lost)
     await this.send(text, kept, ctx)
     return true
-  }
-
-  /** Clears the chat; returns what undoes it. */
-  clear(): (() => void) | null {
-    if (this.busy || !this.messages.length) return null
-    const backup = this.messages
-    this.messages = []
-    this.save(); this.notify()
-    return () => { this.messages = backup; this.save(); this.notify() }
   }
 
   async send(text: string, attachments: Attachment[], ctx: SendContext) {

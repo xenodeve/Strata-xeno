@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
-import { ArrowDown01Icon } from "@hugeicons/core-free-icons"
+import { ArrowDown01Icon, Menu01Icon } from "@hugeicons/core-free-icons"
 import { apiHeaders, getHealth, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
 import { chat, exportMarkdown, useChatVersion, type Attachment, type Message } from "../../lib/chat"
 import { readFiles } from "../../lib/files"
@@ -8,6 +8,7 @@ import { cn } from "../../lib/cn"
 import { toast } from "../../components/toast"
 import { StatusOrb } from "../../components/live"
 import { PromptBar } from "../../components/PromptBar"
+import { Sidebar } from "../../components/Sidebar"
 import { useMetrics } from "../../lib/metrics"
 import { href } from "../../lib/router"
 import { effortChoices, settleEffort } from "../../lib/effort"
@@ -60,8 +61,9 @@ function useAmbientOrb(on: boolean, every = 5000): OrbDesign | null {
   return on ? design : null
 }
 
-export function Chat() {
+export function Chat({ id }: { id?: string }) {
   useChatVersion()
+  const [drawer, setDrawer] = useState(false)                  // the list as a drawer on a phone
   const [health, setHealth] = useState<Health>(NO_HEALTH)
   const [mcp, setMcp] = useState<McpInfo>(NO_MCP)
   const [projection, setProjection] = useState(false)
@@ -159,6 +161,25 @@ export function Chat() {
       removeEventListener("touchstart", onTouchStart); removeEventListener("touchmove", onTouchMove); removeEventListener("keydown", onKey)
     }
   }, [])
+  // The address and the open conversation agree. A link to a conversation opens it (one that does not exist shows a new chat); what the
+  // page does (a first prompt adds a conversation, New chat, a choice in the list) puts its id in the address. The address is
+  // replaced, not added to, so switching is not a trail of history entries.
+  const active = chat.index.active
+  useEffect(() => {
+    if (id === undefined || id === chat.index.active) return
+    if (!chat.open(id) && !chat.index.items.some((i) => i.id === id)) chat.newSession()
+  }, [id])
+  useEffect(() => {
+    const want = chat.index.active ? href("chat", chat.index.active) : href("chat")
+    if (location.hash !== want) location.replace(want)
+  }, [active, id])
+  useEffect(() => { pinned.current = true; setAway(false) }, [active])                   // another conversation opens at its end
+  useEffect(() => {
+    if (!drawer) return
+    const key = (e: globalThis.KeyboardEvent) => { if (e.key === "Escape") setDrawer(false) }
+    addEventListener("keydown", key)
+    return () => removeEventListener("keydown", key)
+  }, [drawer])
   const toLatest = () => { pinned.current = true; setAway(false); scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" }) }
 
   const send = () => {
@@ -198,8 +219,8 @@ export function Chat() {
 
   const newChat = () => {
     if (busy) { toast("warn", t("Still writing"), t("Stop the answer first.")); return }
-    const undo = chat.clear()
-    if (undo) toast("info", t("New chat"), t("The last one was cleared."), 6000, { label: t("Undo"), run: undo })
+    chat.newSession()                                         // the one that was open stays in Recents
+    input.current?.focus()
   }
   const download = () => {
     if (!chat.messages.length) { toast("info", t("Nothing to save yet")); return }
@@ -211,7 +232,20 @@ export function Chat() {
   }
 
   return (
-    <section className="flex min-h-[calc(100dvh-9rem)] flex-col" onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragging(false)}>
+    <div className="md:flex md:gap-6">
+    <div className="max-md:hidden"><Sidebar /></div>
+    {drawer && (
+      <div className="fixed inset-0 z-40 md:hidden">
+        <button type="button" aria-label={t("Close")} onClick={() => setDrawer(false)} className="absolute inset-0 bg-black/40" />
+        <div className="absolute inset-y-0 left-0 w-[min(86vw,320px)] overflow-y-auto bg-surface p-3 shadow-xl"><Sidebar drawer onClose={() => setDrawer(false)} /></div>
+      </div>
+    )}
+    <section className="flex min-h-[calc(100dvh-9rem)] min-w-0 flex-1 flex-col" onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragging(false)}>
+      <div className="mb-2 md:hidden">
+        <button type="button" onClick={() => setDrawer(true)} className="flex h-8 items-center gap-1.5 rounded-sm px-2 text-[13px] text-ink-2 transition-colors hover:bg-hover hover:text-ink">
+          <HugeiconsIcon icon={Menu01Icon} size={16} strokeWidth={1.6} aria-hidden />{t("Recents")}
+        </button>
+      </div>
       <div ref={list} className="flex-1 space-y-6 pb-6" aria-live="off">
         <Collapse open={chat.messages.length === 0} instant className="-mb-6">
           <div className="mx-auto mt-[11vh] flex max-w-[44ch] flex-col items-center text-center">
@@ -271,5 +305,6 @@ export function Chat() {
 
       <SettingsSheet open={sheet} onClose={closeSheet} efforts={choices} mcp={mcp} projectionLoaded={projection} />
     </section>
+    </div>
   )
 }
