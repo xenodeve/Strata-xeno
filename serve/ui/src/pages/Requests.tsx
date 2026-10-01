@@ -100,6 +100,7 @@ export function Requests() {
       </p>
       {error && <p className="mt-4 text-bad">{error}</p>}
       <KeepPrompts />
+      <p className="mt-2 text-[13px] text-ink-2">Have an engine timeline (<code>STRATA_TIMELINE</code>)? <a href={href("requests", "trace")}>Open it in the viewer</a>.</p>
       <div className="mt-4">
         <RequestList rows={rows} empty={loading ? "Loading…" : "No request yet."} />
       </div>

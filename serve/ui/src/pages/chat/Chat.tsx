@@ -161,7 +161,7 @@ export function Chat() {
       <form
         onSubmit={onSubmit}
         className={cn(
-          "sticky bottom-3 relative rounded-lg border bg-surface p-2 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors duration-150",
+          "sticky bottom-3 rounded-lg border bg-surface p-2 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors duration-150",
           dragging ? "border-accent" : "border-line focus-within:border-fill-2",
         )}
       >

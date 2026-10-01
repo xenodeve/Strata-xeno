@@ -2,6 +2,7 @@ import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
   Activity01Icon, ComputerIcon, DashboardSquare01Icon, CpuIcon, InformationCircleIcon, Message01Icon, Moon02Icon, Sun03Icon, Task01Icon,
 } from "@hugeicons/core-free-icons"
+import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { cn } from "./lib/cn"
 import { href, PAGES, useRoute, type Page } from "./lib/router"
 import { useTheme, type Theme } from "./lib/theme"
@@ -22,9 +23,29 @@ const THEME_ICON: Record<Theme, IconSvgElement> = { system: ComputerIcon, light:
 export function App() {
   const route = useRoute()
   const { theme, cycle } = useTheme()
+  const [scrolled, setScrolled] = useState(false)
+  // A new page opens at its top. (Layout effect: it runs before the chat's own effect, which takes the page to the end of the chat.)
+  const first = useRef(true)
+  useLayoutEffect(() => {
+    if (first.current) { first.current = false; return }
+    scrollTo({ top: 0, behavior: "instant" as ScrollBehavior })
+  }, [route.page])
+  useEffect(() => {
+    const on = () => setScrolled(scrollY > 4)
+    on()
+    addEventListener("scroll", on, { passive: true })
+    return () => removeEventListener("scroll", on)
+  }, [])
   return (
-    <div className="mx-auto flex min-h-dvh max-w-5xl flex-col px-4 sm:px-6">
-      <header className="flex items-center gap-3 py-4">
+    <div className="flex min-h-dvh flex-col">
+      {/* Stays at the top while the page scrolls under it: a hairline appears only once something is under it. */}
+      <header
+        className={cn(
+          "sticky top-0 z-20 border-b backdrop-blur-md transition-[border-color,background-color] duration-300",
+          scrolled ? "border-line bg-[color-mix(in_srgb,var(--bg)_82%,transparent)]" : "border-transparent bg-bg",
+        )}
+      >
+      <div className="mx-auto flex max-w-5xl items-center gap-3 px-4 py-3 sm:px-6">
         <span className="text-[15px] font-semibold tracking-tight">Strata</span>
         <nav aria-label="Pages" className="-mx-1 flex min-w-0 flex-1 gap-0.5 overflow-x-auto px-1">
           {PAGES.map((p) => (
@@ -52,9 +73,10 @@ export function App() {
         >
           <HugeiconsIcon icon={THEME_ICON[theme]} size={16} strokeWidth={1.6} aria-hidden />
         </button>
+      </div>
       </header>
       <ToastHost />
-      <main key={route.page} className="page-in flex-1 pb-12 pt-4">
+      <main key={route.page} className="page-in mx-auto w-full max-w-5xl flex-1 px-4 pb-12 pt-4 sm:px-6">
         <PageView route={route} />
       </main>
     </div>
