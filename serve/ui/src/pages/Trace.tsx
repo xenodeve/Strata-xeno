@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent, type PointerEvent as RPointerEvent } from "react"
 import { Row, Rows, Section } from "../components/bits"
-import { Loading, StatusLabel } from "../components/orb"
+import { Empty, Loading, StatusLabel } from "../components/orb"
 import { fmt } from "../lib/format"
 import { href } from "../lib/router"
 import { closeTrace, parseTrace, spansIn, topNames, type Trace } from "../lib/trace"
@@ -168,7 +168,7 @@ export function TracePage() {
       {error && <p className="mt-3 text-bad">{error}</p>}
 
       {!trace ? (
-        busy ? <Loading design="working">Reading the file…</Loading> : <p className="mt-8 text-ink-2">Drop a timeline file here, or open one.</p>
+        busy ? <Loading design="working">Reading the file…</Loading> : <p className="mt-8"><Empty>Drop a timeline file here, or open one.</Empty></p>
       ) : (
         <>
           <div ref={box} className="relative mt-4 overflow-hidden rounded-md border border-line">

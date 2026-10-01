@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Chart } from "../components/Chart"
-import { Loading } from "../components/orb"
+import { Empty, Loading } from "../components/orb"
 import { Disclosure } from "../components/motion"
 import { Facts, NOT_MEASURED, Row, Rows, Section, ms, pct, val, when } from "../components/bits"
 import { clientName, fmt } from "../lib/format"
@@ -42,7 +42,7 @@ function prefillCell(r: RequestRow): ReactNode {
 }
 
 export function RequestList({ rows, empty }: { rows: RequestRow[]; empty: ReactNode }) {
-  if (!rows.length) return typeof empty === "string" ? <p className="text-ink-2">{empty}</p> : <>{empty}</>
+  if (!rows.length) return typeof empty === "string" ? <p><Empty>{empty}</Empty></p> : <>{empty}</>
   return (
     <ul className="m-0 list-none p-0">
       {rows.map((r) => (

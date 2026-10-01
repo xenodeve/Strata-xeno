@@ -8,7 +8,7 @@ type Size = 64 | 32 | 20
 
 /** An orb in a fixed slot. When the design changes the old one fades out while the new one fades in (250 ms), so a state
  *  change reads as one orb changing its mind, not two orbs swapped. */
-export function Orb({ design, size = 20, moving = true, label }: { design: OrbDesign; size?: Size; moving?: boolean; label?: string }) {
+export function Orb({ design, size = 20, moving = true, label, color }: { design: OrbDesign; size?: Size; moving?: boolean; label?: string; color?: string }) {
   const [shown, setShown] = useState(design)
   const [leaving, setLeaving] = useState<OrbDesign | null>(null)
   const was = useRef(design)
@@ -22,8 +22,8 @@ export function Orb({ design, size = 20, moving = true, label }: { design: OrbDe
   }, [design])
   return (
     <span className="orb-slot" style={{ width: size, height: size }}>
-      {leaving && <span className="orb-layer orb-out" aria-hidden><ThinkingOrb state={leaving} size={size} paused={!moving} /></span>}
-      <span key={shown} className="orb-layer orb-in"><ThinkingOrb state={shown} size={size} paused={!moving} aria-label={label} /></span>
+      {leaving && <span className="orb-layer orb-out" aria-hidden><ThinkingOrb state={leaving} size={size} paused={!moving} color={color} /></span>}
+      <span key={shown} className="orb-layer orb-in"><ThinkingOrb state={shown} size={size} paused={!moving} aria-label={label} color={color} /></span>
     </span>
   )
 }
@@ -43,3 +43,11 @@ export function Loading({ children = "Connecting…", error, design = "connectin
   if (error) return <p className="text-ink-2">{error}</p>
   return <p className="py-6 text-ink-2" role="status"><StatusLabel design={design}>{children}</StatusLabel></p>
 }
+
+/** A line for "there is nothing here": a resting orb (a still ring) and the words. */
+export function Empty({ children, className = "" }: { children: ReactNode; className?: string }) {
+  return <span className={`inline-flex items-center gap-2 text-ink-2 ${className}`}><Orb design="breathing" size={20} moving={false} />{children}</span>
+}
+
+/** A token's colour as the orb's tint wants it (#rgb / rgb()): read from the page, so it follows the theme. */
+export const tint = (token: string) => (typeof document === "undefined" ? undefined : getComputedStyle(document.documentElement).getPropertyValue(token).trim() || undefined)

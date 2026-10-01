@@ -104,16 +104,10 @@
 .code-block pre { margin: 0; padding: 0.8em; overflow-x: auto; font: 12.5px/1.55 var(--font-mono); letter-spacing: 0; tab-size: 2; }
 .tool-pre { margin: 0; max-height: 16rem; overflow: auto; border-radius: var(--r-1); background: var(--hover); padding: 0.6em 0.75em; font: 12px/1.5 var(--font-mono); letter-spacing: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .streaming .prose-chat > :last-child::after { content: ""; display: inline-block; width: 0.5em; height: 1em; margin-left: 2px; vertical-align: text-bottom; background: var(--ink-3); border-radius: 2px; animation: blink 1s steps(2, start) infinite; }
-.pulse-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: breathe 1.4s var(--ease) infinite; }
-.thinking-label { animation: breathe-text 1.8s ease-in-out infinite; }
 @keyframes blink { to { visibility: hidden; } }
-@keyframes breathe { 0%, 100% { opacity: 0.25; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1); } }
-@keyframes breathe-text { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } }
 .toast-in { animation: toast-in 240ms var(--ease) both; }
-@media (prefers-reduced-motion: reduce) { .streaming .prose-chat > :last-child::after { animation: none; } .pulse-dot, .thinking-label { animation: none; } }
-.pulse-dot-soft { animation: breathe 1.4s var(--ease) infinite; }
-@media (prefers-reduced-motion: reduce) { .pulse-dot-soft { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .streaming .prose-chat > :last-child::after { animation: none; } }
 /* uPlot: its own stylesheet sets a white-ish cursor; tint it from the tokens */
 .uplot { font-family: var(--font-sans); } .u-cursor-x, .u-cursor-y { border-color: var(--fill-2) !important; }
 

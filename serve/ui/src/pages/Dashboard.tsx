@@ -1,4 +1,4 @@
-import { Loading } from "../components/orb"
+import { Loading, Orb } from "../components/orb"
 import { useEffect, useState, type ReactNode } from "react"
 import { Chart } from "../components/Chart"
 import { Facts, NOT_MEASURED, Row, Rows, ms, pct, val } from "../components/bits"
@@ -123,7 +123,7 @@ export function Dashboard() {
             {gpus.length === 0 ? <p className="text-ink-2">No GPU is reporting.</p> : gpus.map((g) => (
               <div key={g.index} className="row-wash py-2">
                 <div className="flex items-baseline justify-between gap-3 text-[13px]">
-                  <a href={href("hardware", "gpu", String(g.index))} className="min-w-0 truncate no-underline hover:underline">{(g.name || `GPU ${g.index}`).replace("NVIDIA GeForce ", "")}<span className="text-ink-3"> {archOf(arch, g.name)}</span></a>
+                  <a href={href("hardware", "gpu", String(g.index))} className="flex min-w-0 items-center gap-2 truncate no-underline hover:underline"><Orb design={(g.util ?? 0) >= 10 ? "working" : "breathing"} size={20} moving={(g.util ?? 0) >= 10} label={(g.util ?? 0) >= 10 ? "Working" : "Idle"} />{(g.name || `GPU ${g.index}`).replace("NVIDIA GeForce ", "")}<span className="text-ink-3"> {archOf(arch, g.name)}</span></a>
                   <span className="num shrink-0 text-ink-2">{g.util != null ? `${g.util}%` : "–"} · {g.temp != null ? `${g.temp}°C` : "–"}</span>
                 </div>
                 <div className="mt-1.5"><Bar used={g.mem_used} total={g.mem_total} label={`GPU ${g.index} memory`} /></div>

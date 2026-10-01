@@ -1,5 +1,4 @@
 import type { ReactNode } from "react"
-import { cn } from "../lib/cn"
 
 export const NOT_MEASURED = <span className="text-ink-3">not measured</span>
 
@@ -31,12 +30,6 @@ export function Row({ k, v, hint }: { k: ReactNode; v: ReactNode; hint?: ReactNo
       <dd className="m-0 text-right [overflow-wrap:anywhere]">{v}</dd>
     </div>
   )
-}
-
-const DOT = { ok: "bg-ok", busy: "bg-accent", idle: "bg-ink-3", bad: "bg-bad" } as const
-/** A status is a small glyph beside a label, never a banner. */
-export function Dot({ tone, pulse }: { tone: keyof typeof DOT; pulse?: boolean }) {
-  return <span aria-hidden className={cn("inline-block size-2 shrink-0 rounded-full", DOT[tone], pulse && "pulse-dot-soft")} />
 }
 
 export const ms = (n: number) => (n >= 10000 ? `${(n / 1000).toFixed(1)} s` : n >= 1000 ? `${(n / 1000).toFixed(2)} s` : `${n.toFixed(n < 10 ? 1 : 0)} ms`)
