@@ -9,7 +9,7 @@ export interface OrbLook { design: OrbDesign; moving: boolean; speed?: number; f
 
 /** Idle is not a still picture: the searching globe keeps turning, slowly, so the orb is seen and reads as alive and calm. */
 const IDLE_SPEED = 0.5
-const IDLE_FPS = 15                                  // a slow turn needs few frames: an always-open page should not cost a core
+const GPU_IDLE_FPS = 30                              // the small card orbs idle at half the display rate, to spare the page; the server's orbs are never capped
 
 /** The server. An answer being written flows, at the pace of its tokens; a prompt being read is taken in (listening); a request
  *  waiting its turn or a server that does not answer is reaching out; an unloaded model is dormant; idle is the searching
@@ -26,7 +26,7 @@ export function serverDesign(
   if (live.state === "reading") return { design: "listening", moving: true, speed: 1 }
   if (live.state === "unloaded") return { design: "shaping", moving: false, speed: 1 }
   if ((live.queued ?? 0) > 0) return { design: "connecting", moving: true, speed: 1 }
-  return { design: "searching", moving: true, speed: IDLE_SPEED, fps: IDLE_FPS }
+  return { design: "searching", moving: true, speed: IDLE_SPEED }
 }
 
 /** A GPU: idle (the searching globe, slowly), at work, working hard (parallel strands), or held back by a limit (struggling). */
@@ -35,7 +35,7 @@ export function gpuDesign(g: { util: number | null | undefined; throttle?: strin
   const u = g.util ?? 0
   if (u >= 60) return { design: "weaving", moving: true }
   if (u >= 5) return { design: "working", moving: true }
-  return { design: "searching", moving: true, speed: IDLE_SPEED, fps: IDLE_FPS }
+  return { design: "searching", moving: true, speed: IDLE_SPEED, fps: GPU_IDLE_FPS }
 }
 
 /** A tool call is a connection; one that looks things up is a search. */
