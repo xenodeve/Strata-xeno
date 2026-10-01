@@ -85,11 +85,12 @@ function Answer({ m }: { m: Message }) {
 
 // The agent's thinking: a lattice that runs the pattern of what it is doing, beside a line that shimmers while it thinks
 // and settles into "Thought for 2.4s"; it opens to the reasoning text.
-/** The mark beside the thought: while the agent works, the orb of what it is doing (thinking is Solving; a tool call or the next step
+/** The mark beside the thought: the lattice of dots (with the orbs, or the loaders alone); with the orbs only, or the avatars, the orb of what it is doing (thinking is Solving; a tool call or the next step
  *  after one takes its own form); when it is done the orb gives way to the lattice's tick, or its cross when the reply failed. */
 function ThoughtGlyph({ working, status, design }: { working: boolean; status: LatticeStatus; design: OrbDesign }) {
-  const mixed = useAvatar() === "mixed"            // "orbs with loading": the lattice by the thinking, as it was, the orbs elsewhere
-  if (mixed) return <Lattice status={status} pattern={latticePattern(design)} />
+  const kind = useAvatar()
+  // the lattice of dots (LatticeLoader) marks the thinking, as it did, whether the rest are orbs or loaders
+  if (kind === "mixed" || kind === "loading") return <Lattice status={status} pattern={latticePattern(design)} />
   return (
     <span className="relative inline-block size-5">
       <span className={cn("absolute inset-0 transition-opacity duration-300", working ? "opacity-100" : "opacity-0")} aria-hidden><Orb design={design} size={20} moving={working} /></span>

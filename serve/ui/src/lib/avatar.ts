@@ -19,7 +19,7 @@ export const randomBot = (r: number): BotType => BOT_TYPES[Math.min(BOT_TYPES.le
 export type BotState = "default" | "working" | "sleeping"
 
 const saved = store.get<string>("avatar", "")
-let kind: AvatarKind = saved === "bots" || saved === "loading" || saved === "mixed" ? saved : "orbs"
+let kind: AvatarKind = saved === "bots" || saved === "loading" || saved === "orbs" ? saved : "mixed"       // until chosen: orbs, with the lattice of dots by the thinking
 const listeners = new Set<() => void>()
 export const getAvatar = () => kind
 export function setAvatar(k: AvatarKind) {

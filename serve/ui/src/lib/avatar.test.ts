@@ -19,12 +19,13 @@ describe("bot for an orb design", () => {
 })
 
 describe("the choice", () => {
-  test("orbs unless bots were chosen, and the choice is kept", () => {
-    expect(getAvatar()).toBe("orbs")
+  test("it starts as orbs with the loading style by the thinking (the lattice, as the app had it), and a choice is kept", () => {
+    expect(getAvatar()).toBe("mixed")
     setAvatar("bots")
     expect(getAvatar()).toBe("bots")
     setAvatar("orbs")
     expect(getAvatar()).toBe("orbs")
+    setAvatar("mixed")
   })
 })
 
@@ -36,8 +37,8 @@ describe("the four choices", () => {
     expect(nextAvatar("bots")).toBe("orbs")
   })
   test("each is kept as a choice", () => {
-    for (const k of ["mixed", "loading", "bots"] as const) { setAvatar(k); expect(getAvatar()).toBe(k) }
-    setAvatar("orbs")
+    for (const k of ["orbs", "loading", "bots"] as const) { setAvatar(k); expect(getAvatar()).toBe(k) }
+    setAvatar("mixed")
   })
 })
 

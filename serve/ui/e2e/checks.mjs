@@ -178,6 +178,7 @@ export const checks = [
     name: "reason: the thinking is a bounded window that follows the end while it is written and can always be closed",
     async run({ browser, long, t, errors }) {
       const pg = await open(browser, errors, { width: 900, height: 700 })
+      await pg.addInitScript(() => { try { localStorage.setItem("strata.avatar", JSON.stringify("orbs")) } catch { /* private window */ } })      // orbs only: the thinking is marked by an orb
       await pg.goto(long.base + "/#/chat")
       await pg.waitForSelector("textarea")
       await pg.fill("textarea", "think about it at length")
@@ -267,10 +268,7 @@ export const checks = [
       const before = scripts.length
       const btn = pg.locator("button[aria-label^='Status avatars']")
       const painted = () => pg.evaluate(() => [...document.querySelectorAll(".orb-slot canvas")].map((c) => { try { const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i]) n++; return n } catch { return -1 } }))
-      t.ok("to begin with: the orbs, drawn, no avatar loaded", (await btn.getAttribute("aria-label")).includes("Orbs") && (await painted()).some((n) => n > 0) && true)
-      await btn.click()
-      await pg.waitForTimeout(800)
-      t.ok("the next choice is orbs with the loading style: orbs still drawn, nothing more loaded", (await btn.getAttribute("aria-label")).includes("Orbs + Loading") && (await painted()).some((n) => n > 0) && scripts.length === before)
+      t.ok("to begin with: orbs with the loading style, the orbs drawn, no avatar loaded", (await btn.getAttribute("aria-label")).includes("Orbs + Loading") && (await painted()).some((n) => n > 0))
       await btn.click()
       await pg.waitForTimeout(800)
       const marks = () => pg.evaluate(() => ({ lat: document.querySelectorAll(".orb-slot .lat").length, matrix: document.querySelectorAll(".orb-slot .t-matrix").length, canvas: document.querySelectorAll(".orb-slot canvas").length }))
@@ -300,17 +298,16 @@ export const checks = [
       t.ok("the choice is remembered after a reload", (await btn.getAttribute("aria-label")).includes("Avatar") && (await painted()).every((n) => n > 0))
       await btn.click()
       await pg.waitForTimeout(800)
-      t.ok("and it comes round to the orbs again", (await btn.getAttribute("aria-label")).includes("Orbs") && (await painted()).some((n) => n > 0))
+      t.ok("and it comes round to the orbs again", (await btn.getAttribute("aria-label")).includes("Orbs. Change") && (await painted()).some((n) => n > 0))
       await pg.context().close()
     },
   },
   {
     // "orbs with loading": by the thinking the loader of dots (as before), not an orb
-    name: "mixed: with orbs and loading, the thinking is marked by the lattice, not an orb",
+    name: "mixed: by default the thinking is marked by the lattice of dots, not an orb",
     async run({ browser, long, t, errors }) {
       const pg = await open(browser, errors, { width: 900, height: 700 })
-      await pg.addInitScript(() => { try { localStorage.setItem("strata.avatar", JSON.stringify("mixed")) } catch { /* private window */ } })
-      await pg.goto(long.base + "/#/chat")
+      await pg.goto(long.base + "/#/chat")       // nothing chosen: orbs with loading is how it starts
       await pg.waitForSelector("textarea")
       await pg.fill("textarea", "think about it")
       await pg.keyboard.press("Enter")
