@@ -152,7 +152,7 @@ export function Chat() {
           <div className="mx-auto mt-[11vh] flex max-w-[44ch] flex-col items-center text-center">
             <StatusOrb live={live} stale={stale} size={64} scale={2.5} override={typing ? { design: "listening", label: "Listening" } : ambient ? { design: ambient, label: orbLabel(ambient) } : undefined} />
             <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>What can I help with?</h1>
-            <p className="lede mt-3">{health.model} runs on this PC. Nothing leaves it.</p>
+            <p className="lede mt-3">{metrics?.model_info?.name ? [metrics.model_info.name, metrics.model_info.variant].filter(Boolean).join(" · ") : health.model} runs on this PC. Nothing leaves it.</p>
           </div>
         )}
         {chat.messages.map((m, i) => (

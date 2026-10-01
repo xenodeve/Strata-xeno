@@ -7,6 +7,7 @@ import { fmt, gb } from "../lib/format"
 import { href } from "../lib/router"
 import { useMetrics, type Live as LiveT } from "../lib/metrics"
 import { RequestList } from "./Requests"
+import { modelLine } from "../components/ModelBlock"
 
 function headline(l: LiveT): { tone: "ok" | "busy" | "idle"; text: string } {
   switch (l.state) {
@@ -35,7 +36,7 @@ export function Live() {
         <div className="min-w-0">
           <h1 className="page-title"><Swap k={m.live.state}>{h.text}</Swap></h1>
           <p className="page-sub !mt-1">
-            {stale ? "The server is not answering. Showing the last numbers it gave." : l.queued ? `${l.queued} waiting in the queue` : (m.engine.model as string)}
+            {stale ? "The server is not answering. Showing the last numbers it gave." : l.queued ? `${l.queued} waiting in the queue` : modelLine(m)}
           </p>
         </div>
       </header>
