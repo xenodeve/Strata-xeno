@@ -57,6 +57,7 @@ from serve import cjk_guard, forced_opening, gguf_info, think_budget  # noqa: E4
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
+from serve import mcp_admin  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -849,6 +850,8 @@ class Service:
         self.started_at = time.time()
         self.status_lock = threading.Lock()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
+        self.config_path = None                          # the run config (--config) and the --mcp-config file: where serve/mcp_admin.py
+        self.mcp_config_path = None                      # reads and writes the servers the web app sets up
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
@@ -2060,6 +2063,11 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
+            if path == "/mcp/config":
+                # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)
+                if self._authorized():
+                    self._json(200, mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
+                return
             if path == "":
                 body = (ROOT / "serve" / "web" / "index.html").read_bytes()
                 self.send_response(200)
@@ -2131,6 +2139,24 @@ def make_handler(svc: Service):
             if path == "/settings":
                 self._settings()
                 return
+            if path == "/mcp/config":                        # set up the MCP servers: a write that decides which programs Strata starts (#79)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
+                if not self._own_page("MCP servers can be changed"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                if not svc.config_path:
+                    return self._json(409, {"error": {"message": "this server was started without a run config file (--config), so there is nowhere to save the servers"}})
+                if not 0 < n <= 1_000_000:
+                    return self._json(413, {"error": {"message": "send a body of up to 1 MB"}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
+                code, out = mcp_admin.apply(svc, body)
+                return self._json(code, out if code != 200 else mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
             if path == "/metrics/keep":                      # keep the full prompt of the next N requests (0: off)
                 raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 if not self._own_page("prompts can be kept"):      # xeno #71: a "simple" cross-site POST must not switch this on
@@ -2725,6 +2751,7 @@ def main() -> int:
         svc.model_info = gguf_info.model_info(files)        # reads headers only (~0.1 s); a model with no GGUF gives None
     threading.Thread(target=_model_info, daemon=True).start()
     svc.ui = ui_choice(cfg)                                            # which web app "/" serves (xeno UI)
+    svc.config_path, svc.mcp_config_path = a.config, a.mcp_config      # where the web app saves and reads the MCP servers (#79)
     svc.allowed_hosts = {str(h).strip().lower().rstrip(".") for h in (cfg.get("allowed_hosts") or []) if str(h).strip()}   # xeno #71
     svc.gpu_indices = monitor_gpus(cfg)               # every card the engine can see (issue #112; UI S0: no "gpu" key)
     svc.gpu_index = (svc.gpu_indices or [0])[0]         # the Monitor reads the card the engine runs on (issue #51)
