@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type DragEvent, type FormEvent, type KeyboardEvent } from "react"
+import { useCallback, useEffect, useRef, useState, type DragEvent, type FormEvent, type KeyboardEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
-import { ArrowUp02Icon, AttachmentIcon, Cancel01Icon, Download01Icon, PlusSignIcon, Settings02Icon, StopIcon } from "@hugeicons/core-free-icons"
+import { ArrowDown01Icon, ArrowUp02Icon, AttachmentIcon, Cancel01Icon, Download01Icon, PlusSignIcon, Settings02Icon, StopIcon } from "@hugeicons/core-free-icons"
 import { apiHeaders, getHealth, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
 import { chat, exportMarkdown, useChatVersion, type Attachment } from "../../lib/chat"
 import { readFiles } from "../../lib/files"
@@ -35,7 +35,8 @@ export function Chat() {
   const [files, setFiles] = useState<Attachment[]>([])
   const [sheet, setSheet] = useState(false)
   const [dragging, setDragging] = useState(false)
-  const scroller = useRef<HTMLDivElement>(null)
+  const list = useRef<HTMLDivElement>(null)
+  const [away, setAway] = useState(false)                      // the reader scrolled up: the answer no longer drags the page down
   const input = useRef<HTMLTextAreaElement>(null)
   const pinned = useRef(true)                                   // follow the answer while the reader is at the bottom
   const busy = chat.busy
@@ -68,16 +69,41 @@ export function Chat() {
     return () => { cancelled = true }
   }, [])
 
-  useLayoutEffect(() => {
-    const s = scroller.current
-    if (s && pinned.current) s.scrollTop = s.scrollHeight
-  })
+  // The page (the window) scrolls, so that is what follows the answer. The list's size changes for many reasons - text
+  // streaming in, the thinking opening, a tool block - so it is watched, not the renders. The reader's own scroll up
+  // (wheel, touch, keys) lets go; reaching the bottom again takes hold again.
+  useEffect(() => {
+    const bottom = () => document.documentElement.scrollHeight - (scrollY + innerHeight)
+    const follow = () => { if (pinned.current) scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" as ScrollBehavior }) }
+    const release = () => { pinned.current = false; setAway(true) }
+    const onScroll = () => { if (bottom() < 40) { pinned.current = true; setAway(false) } }
+    const onWheel = (e: WheelEvent) => { if (e.deltaY < 0) release() }
+    let touchY = 0
+    const onTouchStart = (e: TouchEvent) => { touchY = e.touches[0].clientY }
+    const onTouchMove = (e: TouchEvent) => { if (e.touches[0].clientY > touchY + 6) release() }        // a finger moving down scrolls up
+    const onKey = (e: globalThis.KeyboardEvent) => { if (["ArrowUp", "PageUp", "Home"].includes(e.key) && !(e.target as HTMLElement)?.closest("textarea")) release() }
+    const ro = new ResizeObserver(follow)
+    if (list.current) ro.observe(list.current)
+    addEventListener("scroll", onScroll, { passive: true })
+    addEventListener("wheel", onWheel, { passive: true })
+    addEventListener("touchstart", onTouchStart, { passive: true })
+    addEventListener("touchmove", onTouchMove, { passive: true })
+    addEventListener("keydown", onKey)
+    follow()                                                      // opening a chat that already has messages: the end of it
+    return () => {
+      ro.disconnect()
+      removeEventListener("scroll", onScroll); removeEventListener("wheel", onWheel)
+      removeEventListener("touchstart", onTouchStart); removeEventListener("touchmove", onTouchMove); removeEventListener("keydown", onKey)
+    }
+  }, [])
+  const toLatest = () => { pinned.current = true; setAway(false); scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" }) }
 
   const send = () => {
     if (busy || (!text.trim() && !files.length)) return
     const t = text, f = files
     setText(""); setFiles([])
     pinned.current = true
+    setAway(false)
     void chat.send(t, f, { health, mcp, projectionLoaded: projection })
   }
   const onSubmit = (e: FormEvent) => { e.preventDefault(); send() }
@@ -120,12 +146,7 @@ export function Chat() {
         <IconButton icon={Settings02Icon} label="Sampling" onClick={() => setSheet(true)} />
       </div>
 
-      <div
-        ref={scroller}
-        onScroll={(e) => { const s = e.currentTarget; pinned.current = s.scrollHeight - s.scrollTop - s.clientHeight < 120 }}
-        className="flex-1 space-y-6 overflow-y-auto pb-6"
-        aria-live="off"
-      >
+      <div ref={list} className="flex-1 space-y-6 pb-6" aria-live="off">
         {chat.messages.length === 0 && (
           <div className="mx-auto mt-[12vh] max-w-[40ch] text-center">
             <h1 className="text-xl font-semibold">What can I help with?</h1>
@@ -140,10 +161,20 @@ export function Chat() {
       <form
         onSubmit={onSubmit}
         className={cn(
-          "sticky bottom-3 rounded-lg border bg-surface p-2 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors duration-150",
+          "sticky bottom-3 relative rounded-lg border bg-surface p-2 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors duration-150",
           dragging ? "border-accent" : "border-line focus-within:border-fill-2",
         )}
       >
+        {away && busy && (
+          <button
+            type="button"
+            onClick={toLatest}
+            aria-label="Jump to the latest"
+            className="msg-in absolute -top-11 left-1/2 flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-line bg-surface px-3 text-[13px] shadow-[0_4px_16px_rgb(0_0_0/0.10)] transition-colors hover:bg-hover"
+          >
+            <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden />Latest
+          </button>
+        )}
         {files.length > 0 && (
           <div className="mb-1.5 flex flex-wrap gap-1.5 px-1">
             {files.map((f, i) => (
