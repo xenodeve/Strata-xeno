@@ -129,6 +129,30 @@ export const checks = [
     },
   },
   {
+    // a prompt that is only a file has no text, so it has no (empty) bubble; it can still be rewritten
+    name: "file: a prompt of only a file shows the file and no empty bubble",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors)
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea")
+      await pg.setInputFiles("input[type=file]", { name: "notes.md", mimeType: "text/markdown", buffer: Buffer.from("# notes") })
+      await pg.waitForTimeout(500)
+      await pg.keyboard.press("Enter")
+      await finished(pg)
+      await pg.waitForTimeout(500)
+      t.ok("the file is shown", (await pg.locator(".msg-in.group", { hasText: "notes.md" }).count()) === 1)
+      t.ok("there is no empty bubble under it", (await pg.locator(".msg-in.group .fit-box").count()) === 0)
+      await pg.locator(".msg-in.group").first().hover()
+      await pg.click("button[aria-label='Edit this prompt']")
+      await pg.waitForTimeout(400)
+      t.ok("Edit still opens a box to add words", (await pg.locator("textarea[aria-label='Edit the prompt']").count()) === 1)
+      await pg.keyboard.press("Escape")
+      await pg.waitForTimeout(500)
+      t.ok("and closing it leaves no empty bubble", (await pg.locator(".msg-in.group .fit-box").count()) === 0)
+      await pg.context().close()
+    },
+  },
+  {
     // the idle orbs are alive: a still picture would mean the animation stopped
     name: "orbs: every orb on the Dashboard redraws",
     async run({ browser, fast, t, errors }) {

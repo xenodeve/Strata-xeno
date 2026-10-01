@@ -152,11 +152,13 @@ export function MessageView({ m, streaming, show, prefill, actions }: { m: Messa
               : <span key={i} className="inline-flex items-center gap-1 rounded-sm bg-fill px-2 py-1 text-[12px]">{im.name || t("image")}</span>)}
           </div>
         )}
-        <Fit className="flex w-full justify-end">
-          {editing && actions
-            ? <PromptEditor text={m.text} last={actions.last} onCancel={() => setEditing(false)} onSend={(t) => { setEditing(false); actions.onEdit(t) }} />
-            : <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] [overflow-wrap:anywhere]">{m.text}</div>}
-        </Fit>
+        {(m.text || editing) && (        // a prompt of only files has no words, so no empty bubble
+          <Fit className="flex w-full justify-end">
+            {editing && actions
+              ? <PromptEditor text={m.text} last={actions.last} onCancel={() => setEditing(false)} onSend={(t) => { setEditing(false); actions.onEdit(t) }} />
+              : <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] [overflow-wrap:anywhere]">{m.text}</div>}
+          </Fit>
+        )}
         <div className="num flex items-center gap-1 px-1 text-[12px] text-ink-3">
           <span>{t("You · {time}", { time: timeStr(m.time) })}</span>
           {actions?.canAct && !editing && (
