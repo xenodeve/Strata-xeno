@@ -6147,7 +6147,7 @@ int main(int argc, char** argv) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
-                    trace_commit(drive, T, T - 1, 0);   // #85: prompt windows commit every position
+                    trace_commit(drive, T, T - 1, strata::core::routing_trace::kPhasePrompt);   // #85: prompt windows commit every position
                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
                     q += T;
                 }
@@ -6429,7 +6429,7 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-                trace_commit(drive, T, a, 1);   // #85
+                trace_commit(drive, T, a, strata::core::routing_trace::kPhaseDecode);   // #85
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -7637,7 +7637,7 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-            trace_commit(drive, T, a, 1);   // #85
+            trace_commit(drive, T, a, strata::core::routing_trace::kPhaseDecode);   // #85
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();

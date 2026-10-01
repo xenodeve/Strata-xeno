@@ -1,4 +1,4 @@
-"""#85: a --dump-routing trace with tag records (negative layer: format, window commit, request, owned set, phase)
+"""#85/#86: a --dump-routing trace with tag records (negative layer: format, window commit, request, owned set, boot set)
 must rank exactly as the same trace without them.  make_profile.py reads only 0 <= layer < N_LAYER and advances by
 each record's own k, so the tags are skipped; this pins that, byte layout as include/strata/core/routing_trace.hpp
 writes it (int32 layer, int32 k, k int32, k float32)."""
@@ -19,7 +19,7 @@ def rec(layer, ids, weights=None):
 
 
 ROUTES = [rec(0, [1, 2, 3]), rec(1, [4, 5, 6]), rec(47, [511, 0, 7], [0.5, 0.3, 0.2]), rec(0, [1, 9, 3])]
-TAGS = [rec(-2, [1]), rec(-3, [42]), rec(-4, [0 * 512 + 1, 47 * 512 + 511]), rec(-5, [1]), rec(-1, [0, 4, 2])]
+TAGS = [rec(-2, [2]), rec(-3, [42]), rec(-4, [0 * 512 + 1, 47 * 512 + 511]), rec(-6, [3, 512 + 9]), rec(-1, [0, 4, 2, 1])]
 
 
 class MakeProfileSkipsTags(unittest.TestCase):

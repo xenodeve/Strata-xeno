@@ -6,9 +6,11 @@
 // by the record's own k (tools/make_profile.py does) skips every tag without knowing it.
 //
 // Order inside a verify window: for each layer, positions 0..n-1 (layer-major), then one commit tag.  Position 0 is
-// the committed input token, positions 1..n_accepted the accepted drafts, the rest were rejected.  Only windows write
-// route records: the batched prompt path writes none, so phase 0 means "prompt tokens read through windows" (serve
-// prompt parts of at most --short-read fresh tokens).
+// the committed input token, positions 1..n_accepted the accepted drafts, the rest were rejected.  The batched prompt
+// path writes no route records, so phase 0 means "prompt tokens read through windows" (serve prompt parts of at most
+// --short-read fresh tokens).  The per-token loop (a non-native pack, --prefill-until, --spec 0) writes route records
+// with NO commit tag after them, and a window that fails or is cancelled leaves its records uncommitted too: a reader
+// must not fold such records into the next window (tests/xeno/perf/n0sim.py refuses the position count mismatch).
 //
 // The owned and boot tags are a snapshot taken when the file opens.  Adaptive swaps change both later and are not
 // traced: record with --adapt-swaps 0 when a replay must match the run.
@@ -24,6 +26,13 @@ namespace strata::core::routing_trace {
 /// 2: the commit tag carries the phase (version 1 had a separate phase tag, -5, now unused).
 inline constexpr int32_t kFormatVersion = 2;
 
+/// The commit tag's phase value.
+inline constexpr int32_t kPhasePrompt = 0;   ///< prompt tokens read through verify windows
+inline constexpr int32_t kPhaseDecode = 1;
+
+/// A record of at most this many ids is assembled on the stack and written in one fwrite.
+inline constexpr int32_t kOneWriteMax = 64;
+
 enum Tag : int32_t {
     kTagCommit = -1,    ///< [window_id, n_positions, n_accepted, phase (0 prompt, 1 decode)], after a window's routes
     kTagFormat = -2,    ///< [version], the first record of a file
@@ -35,8 +44,8 @@ enum Tag : int32_t {
 /// One route record, in one write.  `weights` may be null: the record then carries zeros (the fused verify dispatch
 /// does not surface the router weights; readers take zeros as unit weights).
 inline void write_route(std::FILE* f, int32_t layer, int32_t k, const int32_t* ids, const float* weights) {
-    if (k <= 64) {
-        uint32_t buf[2 + 128] = {};
+    if (k <= kOneWriteMax) {
+        uint32_t buf[2 + 2 * kOneWriteMax] = {};
         buf[0] = (uint32_t) layer;
         buf[1] = (uint32_t) k;
         std::memcpy(buf + 2, ids, (size_t) k * sizeof(int32_t));
@@ -50,8 +59,9 @@ inline void write_route(std::FILE* f, int32_t layer, int32_t k, const int32_t* i
     if (weights != nullptr) {
         std::fwrite(weights, sizeof(float), (size_t) k, f);
     } else {
-        static const float zeros[64] = {};
-        for (int32_t left = k; left > 0; left -= 64) std::fwrite(zeros, sizeof(float), (size_t) (left < 64 ? left : 64), f);
+        static const float zeros[kOneWriteMax] = {};
+        for (int32_t left = k; left > 0; left -= kOneWriteMax)
+            std::fwrite(zeros, sizeof(float), (size_t) (left < kOneWriteMax ? left : kOneWriteMax), f);
     }
 }
 
