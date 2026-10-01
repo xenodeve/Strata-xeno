@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react"
 import { ThinkingOrb } from "../vendor/thinking-orbs/orb"
-import type { OrbDesign } from "../lib/orbs"
+import { SLOW, type OrbDesign } from "../lib/orbs"
 
 // thinking-orbs by Jakub Antalik (Libraries.dev, MIT), vendored in src/vendor/thinking-orbs. The orb pauses itself offscreen and
 // in a hidden tab, and is a still frame under reduced motion. These three components only decide where and how it is shown.
@@ -45,9 +45,9 @@ export function Loading({ children = "Connecting…", error, design = "connectin
   return <p className="py-6 text-ink-2" role="status"><StatusLabel design={design}>{children}</StatusLabel></p>
 }
 
-/** A line for "there is nothing here": a resting orb (a still ring) and the words. */
+/** A line for "there is nothing here": a slowly breathing orb and the words. */
 export function Empty({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return <span className={`inline-flex items-center gap-2 text-ink-2 ${className}`}><Orb design="breathing" size={20} moving={false} />{children}</span>
+  return <span className={`inline-flex items-center gap-2 text-ink-2 ${className}`}><Orb design="breathing" size={20} speed={SLOW.speed} fps={SLOW.fps} />{children}</span>
 }
 
 /** A token's colour as the orb's tint wants it (#rgb / rgb()): read from the page, so it follows the theme. */

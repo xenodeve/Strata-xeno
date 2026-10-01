@@ -9,7 +9,8 @@ export interface OrbLook { design: OrbDesign; moving: boolean; speed?: number; f
 
 /** Idle is not a still picture: the searching globe keeps turning, slowly, so the orb is seen and reads as alive and calm. */
 const IDLE_SPEED = 0.5
-const GPU_IDLE_FPS = 30                              // the small card orbs idle at half the display rate, to spare the page; the server's orbs are never capped
+const GPU_IDLE_FPS = 30                              // the small orbs that idle (a GPU card, a dormant model, an empty list) draw at half the display rate, to spare the page; the server's idle orb is never capped
+export const SLOW = { speed: IDLE_SPEED, fps: GPU_IDLE_FPS }
 
 /** The server. An answer being written flows, at the pace of its tokens; a prompt being read is taken in (listening); a request
  *  waiting its turn or a server that does not answer is reaching out; an unloaded model is dormant; idle is the searching
@@ -24,7 +25,7 @@ export function serverDesign(
     return { design: "composing", moving: true, speed: t == null ? 1 : Math.max(0.7, Math.min(1.5, 0.7 + (t / 150) * 0.4)) }
   }
   if (live.state === "reading") return { design: "listening", moving: true, speed: 1 }
-  if (live.state === "unloaded") return { design: "shaping", moving: false, speed: 1 }
+  if (live.state === "unloaded") return { design: "shaping", moving: true, speed: IDLE_SPEED, fps: GPU_IDLE_FPS }
   if ((live.queued ?? 0) > 0) return { design: "connecting", moving: true, speed: 1 }
   return { design: "searching", moving: true, speed: IDLE_SPEED }
 }

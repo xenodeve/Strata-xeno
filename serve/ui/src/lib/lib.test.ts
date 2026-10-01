@@ -155,11 +155,11 @@ describe("client name", () => {
 
 describe("which orb says what", () => {
   const live = (o: Partial<{ state: "reading" | "generating" | "idle" | "unloaded"; queued: number; tok_s: number | null }> = {}) => ({ state: "idle" as const, queued: 0, tok_s: null, ...o })
-  test("the server: each state has its own form; idle shows the searching orb, slowly; only an unloaded model rests", () => {
+  test("the server: each state has its own form; idle shows the searching orb, slowly; an unloaded model is dormant (shaping, slowly); no orb is a frozen picture", () => {
     expect(serverDesign(live({ state: "reading" }))).toMatchObject({ design: "listening", moving: true })        // the prompt is taken in
     expect(serverDesign(live({ state: "generating", tok_s: 120 }))).toMatchObject({ design: "composing", moving: true })
     expect(serverDesign(live())).toEqual({ design: "searching", moving: true, speed: 0.5 })      // every display frame: the one orb people look at stays smooth
-    expect(serverDesign(live({ state: "unloaded" }))).toMatchObject({ design: "shaping", moving: false })
+    expect(serverDesign(live({ state: "unloaded" }))).toEqual({ design: "shaping", moving: true, speed: 0.5, fps: 30 })        // dormant, but never a frozen picture
     expect(serverDesign(live({ queued: 2 }))).toMatchObject({ design: "connecting", moving: true })
     expect(serverDesign(live(), true)).toMatchObject({ design: "connecting", moving: true })        // not answering: still trying
   })
