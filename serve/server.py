@@ -1855,7 +1855,46 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
+        def _ui_prefix(self) -> bool:
+            """xeno UI S1: /classic/... is the classic web app under a prefix (its relative URLs then land on the
+            same routes), /next/... the new one (serve/ui/dist). True when this call answered."""
+            p = self.path.split("?")[0]
+            for name in ("classic", "next"):
+                if p == "/" + name:                          # relative, so a path-prefixed proxy still works
+                    self.send_response(301)
+                    self.send_header("Location", name + "/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return True
+            if p.startswith("/classic/"):
+                self.path = self.path[len("/classic"):]
+                return False
+            if not p.startswith("/next/"):
+                return False
+            types = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+                     ".woff2": "font/woff2", ".svg": "image/svg+xml", ".png": "image/png", ".webp": "image/webp"}
+            rel = p[len("/next/"):]
+            f, ctype, cache = None, "text/html; charset=utf-8", "no-cache"
+            if rel == "":
+                f = ROOT / "serve" / "ui" / "dist" / "index.html"
+            elif rel.startswith("assets/") and "/" not in rel[7:] and "\\" not in rel and os.path.splitext(rel)[1] in types:
+                f, ctype, cache = ROOT / "serve" / "ui" / "dist" / "assets" / rel[7:], types[os.path.splitext(rel)[1]], \
+                    "public, max-age=31536000, immutable"       # hashed names never change
+            if f is None or not f.is_file():
+                self._json(404, {"error": {"message": "not found"}})
+                return True
+            body = f.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", cache)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+
         def do_GET(self):
+            if self._ui_prefix():
+                return
             path = self.path.split("?")[0].rstrip("/")
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
@@ -1982,6 +2021,8 @@ def make_handler(svc: Service):
                 self._do_post()
 
         def _do_post(self):
+            if self.path.startswith("/classic/"):             # the classic app under its prefix (xeno UI S1)
+                self.path = self.path[len("/classic"):]
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
