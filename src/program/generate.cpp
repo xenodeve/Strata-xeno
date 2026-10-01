@@ -707,7 +707,22 @@ struct Drive {
     /// blob), which is why the layer index comes from there rather than from a counter of our own.
     std::FILE* routing = nullptr;
     int32_t trace_windows = 0;   ///< #85: verify windows committed to the routing trace so far (the commit tag's id)
+    int32_t trace_requests = 0;  ///< #86: served requests seen by the routing trace (the request tag's id)
+    int32_t trace_phase = -1;    ///< #86: the phase the last phase tag named (-1: none written yet)
 };
+
+/// #86: a phase tag (0 prefill, 1 decode) before a verify window's route records, only when the phase changes.
+void trace_phase(Drive& d, int phase) {
+    if (d.routing == nullptr || d.trace_phase == phase) return;
+    d.trace_phase = phase;
+    strata::core::routing_trace::write_phase(d.routing, (int32_t) phase);
+}
+
+/// #86: a request tag as a served request starts.
+void trace_request(Drive& d) {
+    if (d.routing == nullptr) return;
+    strata::core::routing_trace::write_request(d.routing, d.trace_requests++);
+}
 
 /// #85: the routing trace's commit tag for a verify window of `n_positions` with `n_accepted` drafts accepted.
 void trace_commit(Drive& d, int n_positions, int n_accepted) {
@@ -4065,6 +4080,16 @@ int main(int argc, char** argv) {
             return 1;
         }
         strata::core::routing_trace::write_format(routing);   // #85: the first record names the format
+        {   // #86: the GPU-owned set and the host tier after the boot fill (adaptive swaps change both later)
+            std::vector<int32_t> owned, boot;
+            for (int32_t i = 0; i < (int32_t) (g.n_layers * g.n_expert); ++i) {
+                const int64_t l = i / g.n_expert, e = i % g.n_expert;
+                if (arena_src.owned_by_gpu(l, e)) owned.push_back(i);
+                else if (o.ram_cache_gib > 0.0 && arena_src.resident(l, e)) boot.push_back(i);
+            }
+            strata::core::routing_trace::write_owned(routing, owned);
+            if (o.ram_cache_gib > 0.0) strata::core::routing_trace::write_boot(routing, boot);
+        }
         drive.routing = routing;
     }
     strata::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
@@ -5694,6 +5719,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
             }
+            trace_request(drive);   // #86
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
@@ -6121,6 +6147,7 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
+                    trace_phase(drive, 0);   // #86: the prompt read through verify windows
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -6396,6 +6423,7 @@ int main(int argc, char** argv) {
                 }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
+                trace_phase(drive, 1);   // #86
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return serve_fatal();
@@ -7596,6 +7624,7 @@ int main(int argc, char** argv) {
             apply_pending(false);
             ms_apply += std::chrono::duration<double, std::milli>(Clock::now() - tap).count();
             if (strata::timeline::enabled()) strata::timeline::complete("adapt apply", tap, Clock::now());
+            trace_phase(drive, 1);   // #86
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;

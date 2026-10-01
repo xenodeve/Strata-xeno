@@ -506,6 +506,11 @@ public:
     /// `order` (layer * n_expert + expert, best first); the rest stay on NVMe. 0 = no limit.
     void set_capacity(uint64_t bytes, const std::vector<int32_t>& order);
     bool resident(int64_t layer, int64_t expert) const override;
+    /// #86: a GPU tier owns this expert (exclusive placement: no host copy).  The routing trace's owned tag.
+    bool owned_by_gpu(int64_t layer, int64_t expert) const {
+        const size_t i = (size_t) (layer * n_expert_ + expert);
+        return i < exclusive_.size() && exclusive_[i];
+    }
     const uint8_t* materialize(int64_t layer, int64_t expert, int64_t avoid_layer, std::string& err) override;
     bool read_into(int64_t layer, int64_t expert, uint8_t* dst, std::string& err) override;
     /// #34: a faster copy of some experts (the lendable tail's contiguous file): read_into tries it first; it returns

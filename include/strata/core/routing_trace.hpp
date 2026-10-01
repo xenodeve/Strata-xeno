@@ -24,6 +24,7 @@ enum Tag : int32_t {
     kTagRequest = -3,   ///< [request_id], a served request starts
     kTagOwned = -4,     ///< flattened layer * n_expert + expert ids the GPU tiers own at boot
     kTagPhase = -5,     ///< [0 = prefill, 1 = decode], the phase of the route records that follow
+    kTagBoot = -6,      ///< flattened ids resident in the host tier after the boot fill (capacity mode)
 };
 
 /// One route record.  `weights` may be null: the record then carries zeros (the fused verify dispatch does not
@@ -50,6 +51,15 @@ inline void write_format(std::FILE* f) { write_tag(f, kTagFormat, &kFormatVersio
 inline void write_commit(std::FILE* f, int32_t window_id, int32_t n_positions, int32_t n_accepted) {
     const int32_t v[3] = {window_id, n_positions, n_accepted};
     write_tag(f, kTagCommit, v, 3);
+}
+
+inline void write_request(std::FILE* f, int32_t request_id) { write_tag(f, kTagRequest, &request_id, 1); }
+inline void write_phase(std::FILE* f, int32_t phase) { write_tag(f, kTagPhase, &phase, 1); }
+inline void write_owned(std::FILE* f, const std::vector<int32_t>& flat_ids) {
+    write_tag(f, kTagOwned, flat_ids.data(), (int32_t) flat_ids.size());
+}
+inline void write_boot(std::FILE* f, const std::vector<int32_t>& flat_ids) {
+    write_tag(f, kTagBoot, flat_ids.data(), (int32_t) flat_ids.size());
 }
 
 struct Record {

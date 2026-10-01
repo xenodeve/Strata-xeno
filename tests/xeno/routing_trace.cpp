@@ -116,6 +116,37 @@ int main() {
         CHECK(!rt::read_all(path, r));
     }
 
+    // 6. #86: request, phase, GPU-owned and boot-resident tags round-trip; an empty id list is still a record
+    {
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        rt::write_owned(f, std::vector<int32_t>{3, 512 * 47 + 511});
+        rt::write_boot(f, std::vector<int32_t>{});
+        rt::write_request(f, 12);
+        rt::write_phase(f, 0);
+        std::fclose(f);
+        std::vector<rt::Record> r;
+        CHECK(rt::read_all(path, r));
+        CHECK(r.size() == 4);
+        if (r.size() == 4) {
+            CHECK(r[0].layer == rt::kTagOwned && r[0].ids == std::vector<int32_t>({3, 512 * 47 + 511}));
+            CHECK(r[1].layer == rt::kTagBoot && r[1].ids.empty());
+            CHECK(r[2].layer == rt::kTagRequest && r[2].ids == std::vector<int32_t>({12}));
+            CHECK(r[3].layer == rt::kTagPhase && r[3].ids == std::vector<int32_t>({0}));
+        }
+    }
+
+    // 7. a long id list (more than the writer's 64-float padding block) keeps its zero padding exact
+    {
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        std::vector<int32_t> many(1000);
+        for (int32_t i = 0; i < 1000; ++i) many[(size_t) i] = i;
+        rt::write_owned(f, many);
+        std::fclose(f);
+        std::vector<rt::Record> r;
+        CHECK(rt::read_all(path, r));
+        CHECK(r.size() == 1 && r[0].ids == many && r[0].weights == std::vector<float>(1000, 0.0f));
+    }
+
     std::remove(path.c_str());
     if (g_fail == 0) std::printf("xeno_routing_trace: PASS\n");
     return g_fail == 0 ? 0 : 1;
