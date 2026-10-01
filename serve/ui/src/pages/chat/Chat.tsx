@@ -1,32 +1,22 @@
-import { useCallback, useEffect, useRef, useState, type DragEvent, type FormEvent, type KeyboardEvent } from "react"
+import { useCallback, useEffect, useRef, useState, type DragEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
-import { ArrowDown01Icon, ArrowUp02Icon, AttachmentIcon, Cancel01Icon, Download01Icon, PlusSignIcon, Settings02Icon, StopIcon } from "@hugeicons/core-free-icons"
+import { ArrowDown01Icon } from "@hugeicons/core-free-icons"
 import { apiHeaders, getHealth, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
-import { chat, exportMarkdown, useChatVersion, type Attachment } from "../../lib/chat"
+import { chat, exportMarkdown, useChatVersion, type Attachment, type Settings } from "../../lib/chat"
 import { readFiles } from "../../lib/files"
-import { cn } from "../../lib/cn"
 import { toast } from "../../components/toast"
 import { StatusOrb } from "../../components/live"
+import { PromptBar } from "../../components/PromptBar"
 import { useMetrics } from "../../lib/metrics"
 import { MessageView } from "./Messages"
 import { SettingsSheet } from "./SettingsSheet"
 
 const NO_MCP: McpInfo = { servers: [], tools: 0 }
 
-function IconButton({ icon, label, onClick, disabled }: { icon: typeof PlusSignIcon; label: string; onClick: () => void; disabled?: boolean }) {
-  return (
-    <button
-      type="button"
-      aria-label={label}
-      title={label}
-      disabled={disabled}
-      onClick={onClick}
-      className="flex size-8 items-center justify-center rounded-sm text-ink-2 transition-colors duration-150 hover:bg-hover hover:text-ink disabled:pointer-events-none disabled:opacity-40"
-    >
-      <HugeiconsIcon icon={icon} size={17} strokeWidth={1.6} aria-hidden />
-    </button>
-  )
-}
+// The thinking levels the chat offers, as the server's reasoning_effort names them.
+const EFFORTS: { label: string; value: Settings["thinking"] }[] = [
+  { label: "Off", value: "none" }, { label: "Low", value: "low" }, { label: "Medium", value: "medium" }, { label: "High", value: "high" },
+]
 
 export function Chat() {
   useChatVersion()
@@ -109,10 +99,6 @@ export function Chat() {
     setAway(false)
     void chat.send(t, f, { health, mcp, projectionLoaded: projection })
   }
-  const onSubmit = (e: FormEvent) => { e.preventDefault(); send() }
-  const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send() }   // not while a Thai/CJK IME is composing
-  }
   const add = async (list: Iterable<File>) => { const a = await readFiles(list, health); if (a.length) setFiles((x) => [...x, ...a]) }
   const onDrop = (e: DragEvent) => {
     setDragging(false)
@@ -143,12 +129,6 @@ export function Chat() {
 
   return (
     <section className="flex min-h-[calc(100dvh-9rem)] flex-col" onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragging(false)}>
-      <div className="mb-2 flex items-center justify-end gap-0.5">
-        <IconButton icon={PlusSignIcon} label="New chat" onClick={newChat} />
-        <IconButton icon={Download01Icon} label="Save the chat as Markdown" onClick={download} />
-        <IconButton icon={Settings02Icon} label="Sampling" onClick={() => setSheet(true)} />
-      </div>
-
       <div ref={list} className="flex-1 space-y-6 pb-6" aria-live="off">
         {chat.messages.length === 0 && (
           <div className="mx-auto mt-[11vh] flex max-w-[44ch] flex-col items-center text-center">
@@ -162,68 +142,42 @@ export function Chat() {
         ))}
       </div>
 
-      <form
-        onSubmit={onSubmit}
-        className={cn(
-          "sticky bottom-3 rounded-[20px] border bg-surface p-2.5 shadow-[0_8px_32px_rgb(0_0_0/0.07)] transition-[border-color,box-shadow] duration-300 ease-[var(--ease)]",
-          dragging ? "border-accent" : "border-line focus-within:border-[color-mix(in_srgb,var(--accent)_38%,transparent)] focus-within:shadow-[0_0_0_4px_color-mix(in_srgb,var(--accent)_9%,transparent),0_8px_32px_rgb(0_0_0/0.07)]",
-        )}
-      >
-        {away && busy && (
-          <button
-            type="button"
-            onClick={toLatest}
-            aria-label="Jump to the latest"
-            className="msg-in absolute -top-11 left-1/2 flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-line bg-surface px-3 text-[13px] shadow-[0_4px_16px_rgb(0_0_0/0.10)] transition-colors hover:bg-hover"
-          >
-            <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden />Latest
-          </button>
-        )}
-        {files.length > 0 && (
-          <div className="mb-1.5 flex flex-wrap gap-1.5 px-1">
-            {files.map((f, i) => (
-              <span key={i} className="inline-flex items-center gap-1 rounded-sm bg-fill py-0.5 pl-2 pr-0.5 text-[12px]">
-                <HugeiconsIcon icon={AttachmentIcon} size={12} aria-hidden />{f.name}
-                <button type="button" aria-label={`Remove ${f.name}`} onClick={() => setFiles((x) => x.filter((_, j) => j !== i))} className="flex size-5 items-center justify-center rounded-sm hover:bg-hover">
-                  <HugeiconsIcon icon={Cancel01Icon} size={12} aria-hidden />
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
-        <textarea
-          ref={input}
+      <div className="sticky bottom-3 z-10">
+        <PromptBar
           value={text}
-          rows={1}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={onKey}
-          onPaste={(e) => {
-            const imgs = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith("image/"))
+          onChange={setText}
+          inputRef={input}
+          attachments={files}
+          onRemoveAttachment={(i) => setFiles((x) => x.filter((_, j) => j !== i))}
+          onFiles={(f) => void add(f)}
+          onPasteFiles={(e) => {
+            const imgs = Array.from(e.clipboardData?.files || []).filter((f) => f.type.startsWith("image/"))
             if (health.images && imgs.length) { e.preventDefault(); void add(imgs) }
           }}
-          placeholder="Message"
-          aria-label="Message"
-          className="block max-h-[40dvh] min-h-10 w-full resize-none bg-transparent px-2.5 py-2 text-[15px] tracking-[-0.011em] outline-none placeholder:text-ink-3 [field-sizing:content]"
-        />
-        <div className="flex items-center justify-between">
-          <label className="flex size-8 cursor-pointer items-center justify-center rounded-sm text-ink-2 transition-colors hover:bg-hover hover:text-ink" title={health.images ? "Attach a text file or a picture (or drop it here)" : "Attach a text file (or drop it here)"}>
-            <HugeiconsIcon icon={AttachmentIcon} size={17} strokeWidth={1.6} aria-hidden />
-            <input type="file" multiple hidden aria-label="Attach files" onChange={(e) => { void add(Array.from(e.target.files || [])); e.target.value = "" }} />
-          </label>
-          <div className="flex items-center gap-2">
-            {!busy && <span className="hidden text-[12px] text-ink-3 sm:inline">Shift+Enter: new line</span>}
-            {busy ? (
-              <button type="button" onClick={() => chat.stop()} aria-label="Stop" className="flex h-8 items-center gap-1.5 rounded-full bg-fill px-3 text-[13px] font-medium transition-colors hover:bg-fill-2">
-                <HugeiconsIcon icon={StopIcon} size={14} aria-hidden />Stop
-              </button>
-            ) : (
-              <button type="submit" aria-label="Send" disabled={!text.trim() && !files.length} className="group flex size-9 items-center justify-center rounded-full bg-ink text-surface transition-[opacity,transform] duration-200 ease-[var(--ease)] hover:scale-105 active:scale-90 disabled:scale-100 disabled:opacity-25">
-                <HugeiconsIcon icon={ArrowUp02Icon} size={17} strokeWidth={2} aria-hidden className="transition-transform duration-200 ease-[var(--ease)] group-hover:-translate-y-px" />
-              </button>
-            )}
-          </div>
-        </div>
-      </form>
+          busy={!!busy}
+          onSend={send}
+          onStop={() => chat.stop()}
+          onNewChat={newChat}
+          onSave={download}
+          onSampling={() => setSheet(true)}
+          efforts={EFFORTS.map((e) => e.label)}
+          effort={Math.max(0, EFFORTS.findIndex((e) => e.value === chat.settings.thinking))}
+          onEffort={(i) => chat.setSettings({ ...chat.settings, thinking: EFFORTS[i].value })}
+          attachTitle={health.images ? "Text files and pictures" : "Text files"}
+          dragging={dragging}
+        >
+          {away && busy && (
+            <button
+              type="button"
+              onClick={toLatest}
+              aria-label="Jump to the latest"
+              className="msg-in absolute -top-11 left-1/2 z-[2] flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-line bg-surface px-3 text-[13px] shadow-[0_4px_16px_rgb(0_0_0/0.10)] transition-colors hover:bg-hover"
+            >
+              <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden />Latest
+            </button>
+          )}
+        </PromptBar>
+      </div>
 
       <SettingsSheet open={sheet} onClose={closeSheet} mcp={mcp} projectionLoaded={projection} />
     </section>

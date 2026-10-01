@@ -16,6 +16,10 @@ SF Pro / SF Thai are named first in the font stack and used only where the OS ha
 - `design-ship-gate` check 1 (at most two font families): three ship (Inter, Anuphan for Thai, JetBrains Mono for code). Decided in the UI handoff (Q11), so the gate's number gives way; mono is used only for code and measurements.
 - Checks 2 (Open Graph), 4 and 6 (hero) are for static landing pages and do not apply to this app.
 
+## React Bits (MIT + Commons Clause: used inside this app only, never redistributed as components)
+
+- `PromptBar` (the chat's composer, `src/components/PromptBar.tsx` + `src/prompt-bar.css`): adapted. Our tokens replace the fixed colours, the arrow-to-stop morph is a small rAF tween instead of the `motion` package, the sparks at the top thinking level run only while the field is focused, nothing is being written and the tab is visible, the menu holds this app's own actions (attach, new chat, save as Markdown), the effort slider is `reasoning_effort`, and the focus-then-open order is fixed (the original closed a menu it had just opened when the field was not focused). Pasted by the developer on 2026-10-01.
+
 ## Reference only, own implementation (no code copied)
 
 Paid or unclear-licence work that informed the design. Recorded here as the handoff requires; add each one the
