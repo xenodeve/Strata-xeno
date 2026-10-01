@@ -78,7 +78,7 @@ export function replyDesign(m: {
   return m.reasoning ? "solving" : "breathing"
 }
 
-export type LatticePattern = "orbit" | "ripple" | "snake" | "spiral"
+export type LatticePattern = "orbit" | "ripple" | "snake" | "spiral" | "arrow" | "dots"
 
 /** The lattice that sits beside a thought (components/thought.tsx) runs the pattern of what the agent is doing: thinking
  *  circles, a lookup ripples outward, a call to a tool snakes through, planning the next step spirals in. */

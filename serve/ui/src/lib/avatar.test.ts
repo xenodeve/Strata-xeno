@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { botFor, BOT_TYPES, getAvatar, getBotChoice, nextAvatar, plainLook, randomBot, setAvatar, setBotChoice } from "./avatar"
+import { botFor, BOT_TYPES, getAvatar, getBotChoice, loaderFor, nextAvatar, randomBot, setAvatar, setBotChoice } from "./avatar"
 import { ORB_DESIGNS } from "./orbs"
 
 // The avatar choice: orbs (the nine forms) or bots (Libraries.dev bot-avatars), the same states told by a shape and a mood.
@@ -28,24 +28,32 @@ describe("the choice", () => {
   })
 })
 
-describe("the three choices", () => {
-  test("they go round: orbs, a plain loading mark, bots", () => {
-    expect(nextAvatar("orbs")).toBe("loading")
+describe("the four choices", () => {
+  test("they go round: orbs, orbs with loading, loading only, avatars", () => {
+    expect(nextAvatar("orbs")).toBe("mixed")
+    expect(nextAvatar("mixed")).toBe("loading")
     expect(nextAvatar("loading")).toBe("bots")
     expect(nextAvatar("bots")).toBe("orbs")
   })
-  test("the plain loading mark is kept as a choice too", () => {
-    setAvatar("loading")
-    expect(getAvatar()).toBe("loading")
+  test("each is kept as a choice", () => {
+    for (const k of ["mixed", "loading", "bots"] as const) { setAvatar(k); expect(getAvatar()).toBe(k) }
     setAvatar("orbs")
   })
-  test("the plain mark turns at work, breathes at rest or while waiting, and stands still when paused", () => {
-    expect(plainLook("composing", { moving: true })).toBe("spin")
-    expect(plainLook("connecting", { moving: true })).toBe("spin")
-    expect(plainLook("searching", { moving: true, rest: true })).toBe("pulse")     // an idle server
-    expect(plainLook("breathing", { moving: true })).toBe("pulse")                 // waiting
-    expect(plainLook("shaping", { moving: true, rest: true })).toBe("still")       // an unloaded model
-    expect(plainLook("composing", { moving: false })).toBe("still")
+})
+
+describe("the loading style (the lattice and the matrix of dots)", () => {
+  test("each of the nine forms has a loader of its own, so the pattern still says what is happening", () => {
+    const seen = ORB_DESIGNS.map((d) => JSON.stringify(loaderFor(d)))
+    expect(new Set(seen).size).toBe(9)
+  })
+  test("both families are used, and every pattern is one the loaders have", () => {
+    const all = ORB_DESIGNS.map(loaderFor)
+    expect(all.some((l) => l.family === "lattice")).toBe(true)
+    expect(all.some((l) => l.family === "matrix")).toBe(true)
+    for (const l of all) {
+      if (l.family === "lattice") expect(["arrow", "dots", "ripple", "spiral", "orbit", "snake"]).toContain(l.pattern)
+      else expect(["scan", "twinkle", "orbit", "pulse"]).toContain(l.variant)
+    }
   })
 })
 

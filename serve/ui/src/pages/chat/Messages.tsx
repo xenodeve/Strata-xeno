@@ -5,7 +5,8 @@ import { chat, metaText, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
 import { Collapse, Fit } from "../../components/motion"
 import { Orb, StatusLabel } from "../../components/orb"
-import { phaseKind, replyDesign, toolDesign, type OrbDesign } from "../../lib/orbs"
+import { latticePattern, phaseKind, replyDesign, toolDesign, type OrbDesign } from "../../lib/orbs"
+import { useAvatar } from "../../lib/avatar"
 import { Lattice, Thought, type LatticeStatus } from "../../components/thought"
 import { cn } from "../../lib/cn"
 import { fmt, timeStr } from "../../lib/format"
@@ -87,6 +88,8 @@ function Answer({ m }: { m: Message }) {
 /** The mark beside the thought: while the agent works, the orb of what it is doing (thinking is Solving; a tool call or the next step
  *  after one takes its own form); when it is done the orb gives way to the lattice's tick, or its cross when the reply failed. */
 function ThoughtGlyph({ working, status, design }: { working: boolean; status: LatticeStatus; design: OrbDesign }) {
+  const mixed = useAvatar() === "mixed"            // "orbs with loading": the lattice by the thinking, as it was, the orbs elsewhere
+  if (mixed) return <Lattice status={status} pattern={latticePattern(design)} />
   return (
     <span className="relative inline-block size-5">
       <span className={cn("absolute inset-0 transition-opacity duration-300", working ? "opacity-100" : "opacity-0")} aria-hidden><Orb design={design} size={20} moving={working} /></span>

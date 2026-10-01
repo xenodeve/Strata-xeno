@@ -17,18 +17,20 @@ const PATTERNS: Record<LatticePattern, { cells: number[]; loop: number; scale: n
   ripple: { cells: [2, 1, 2, 1, 0, 1, 2, 1, 2], loop: 4.8, scale: 1.5 },
   snake: { cells: [0, 1, 2, 5, 4, 3, 6, 7, 8], loop: 9, scale: 1, lit: 35 },
   spiral: { cells: [0, 1, 2, 7, 8, 3, 6, 5, 4], loop: 9, scale: 1.2, lit: 35 },
+  arrow: { cells: [1, 2, 3, 0, 1, 2, 1, 2, 3], loop: 7.2, scale: 1 },
+  dots: { cells: [0, 1, 2, 0, 1, 2, 0, 1, 2], loop: 3, scale: 2.4 },
 }
 const MARKS = { done: [2, 3, 5, 7], error: [0, 2, 4, 6, 8] }     // the cells that make a tick, and a cross
 const STEP = 90                                                   // ms between one cell and the next
 
 export type LatticeStatus = "working" | "done" | "error"
 
-export function Lattice({ status, pattern = "orbit" }: { status: LatticeStatus; pattern?: LatticePattern }) {
+export function Lattice({ status, pattern = "orbit", cell, gap, paused = false }: { status: LatticeStatus; pattern?: LatticePattern; cell?: number; gap?: number; paused?: boolean }) {
   const p = PATTERNS[pattern]
   const d = STEP * p.scale
   const marks = MARKS[status === "error" ? "error" : "done"]
   return (
-    <span className="lat" data-status={status} style={{ "--lat-cycle": `${Math.round(p.loop * d)}ms` } as React.CSSProperties} aria-hidden>
+    <span className="lat" data-status={status} data-paused={paused ? "" : undefined} style={{ "--lat-cycle": `${Math.round(p.loop * d)}ms`, ...(cell ? { "--lat-cell": `${cell}px` } : null), ...(gap ? { "--lat-gap": `${gap}px` } : null) } as React.CSSProperties} aria-hidden>
       <span className="lat-layer lat-run">
         {p.cells.map((u, i) => (
           <span key={i} className="lat-cell" data-hole={u < 0 ? "" : undefined} data-lit={p.lit} style={u < 0 ? undefined : { animationDelay: `${Math.round(u * d)}ms` }} />

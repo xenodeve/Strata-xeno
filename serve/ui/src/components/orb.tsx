@@ -1,7 +1,8 @@
 import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react"
 import { ThinkingOrb } from "../vendor/thinking-orbs/orb"
 import { SLOW, type OrbDesign } from "../lib/orbs"
-import { botFor, plainLook, randomBot, useAvatar, useBotChoice, type BotType } from "../lib/avatar"
+import { botFor, randomBot, useAvatar, useBotChoice, type BotType } from "../lib/avatar"
+import { LoaderMark } from "./loader"
 import { t } from "../lib/i18n"
 
 // thinking-orbs by Jakub Antalik (Libraries.dev, MIT), vendored in src/vendor/thinking-orbs. The orb pauses itself offscreen and
@@ -28,10 +29,7 @@ function Face({ design, size, moving, label, color, speed, fps, scale, rest, dra
   const avatar = useAvatar()
   const pick = useBotChoice()
   const hidden = label ? { "aria-label": label } : { "aria-hidden": true, role: "presentation" }
-  if (avatar === "loading") {                                  // a plain ring: turns at work, breathes at rest
-    const px = size * scale
-    return <span {...hidden} className="t-ring" data-look={plainLook(design, { moving, rest })} style={{ width: px, height: px, borderWidth: Math.max(2, Math.round(px / 14)), ...(color ? { ["--ring" as string]: color } : null) }} />
-  }
+  if (avatar === "loading") return <LoaderMark design={design} px={size * scale} moving={moving} color={color} />       // the loading style alone: no orb
   if (avatar === "bots") {
     const bot = botFor(design, { moving, rest }, pick, drawn)
     const px = size * scale

@@ -76,9 +76,9 @@ export function About() {
 
       <section>
         <h2 className="text-[15px] font-semibold">{t("Status avatars")}</h2>
-        <p className="mt-1 text-[13px] text-ink-2">{t("What stands for a status: a dotted orb, a plain ring that turns, or a small avatar with a shape and a mood of its own.")}</p>
+        <p className="mt-1 text-[13px] text-ink-2">{t("What stands for a status: a dotted orb; orbs with a loader of dots beside the thinking; loaders of dots alone, a pattern for each status; or a small avatar with a shape and a mood of its own.")}</p>
         <div className="mt-2">
-          <Segmented label={t("Status avatars")} value={avatar} onChange={(v) => setAvatar(v as AvatarKind)} options={[{ value: "orbs", label: t("Orbs") }, { value: "loading", label: t("Loading") }, { value: "bots", label: t("Avatar") }]} />
+          <Segmented label={t("Status avatars")} value={avatar} onChange={(v) => setAvatar(v as AvatarKind)} options={[{ value: "orbs", label: t("Orbs") }, { value: "mixed", label: t("Orbs + Loading") }, { value: "loading", label: t("Loading only") }, { value: "bots", label: t("Avatar") }]} />
         </div>
         {avatar === "bots" && (
           <div className="mt-3">

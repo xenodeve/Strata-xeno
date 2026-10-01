@@ -53,7 +53,7 @@ export const part: Record<string, string> = {
   "Clover": "โคลเวอร์", "Flower": "ดอกไม้", "Triangle": "สามเหลี่ยม", "Square": "สี่เหลี่ยม", "Blob": "ก้อนเจลลี่", "Ghost": "ผี",
   "Circle": "วงกลม", "Drop": "หยดน้ำ", "Star": "ดาว", "Droid": "ดรอยด์", "Mech": "เมก", "Alien": "เอเลี่ยน",
   "Hexagon": "หกเหลี่ยม", "Cat": "แมว", "Cloud": "เมฆ", "Pill": "แคปซูล", "Pebble": "ก้อนกรวด", "Puddle": "แอ่งน้ำ",
-  "What stands for a status: a dotted orb, a plain ring that turns, or a small avatar with a shape and a mood of its own.": "สิ่งที่ใช้แทนสถานะ: orb ที่เป็นจุด วงแหวนธรรมดาที่หมุน หรืออวาตาร์ตัวเล็กที่มีรูปร่างและอารมณ์ของตัวเอง",
+  "What stands for a status: a dotted orb; orbs with a loader of dots beside the thinking; loaders of dots alone, a pattern for each status; or a small avatar with a shape and a mood of its own.": "สิ่งที่ใช้แทนสถานะ: orb ที่เป็นจุด; orb พร้อมตัวโหลดจุดข้างการคิด; ตัวโหลดจุดอย่างเดียว ลวดลายต่างกันตามสถานะ; หรืออวาตาร์ตัวเล็กที่มีรูปร่างและอารมณ์ของตัวเอง",
   "Writing at {n} tok/s": "กำลังเขียน {n} tok/s",
   "Thinking at {n} tok/s": "กำลังคิด {n} tok/s",
   "Answering at {n} tok/s": "กำลังตอบกลับ {n} tok/s",

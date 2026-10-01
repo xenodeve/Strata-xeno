@@ -44,3 +44,4 @@
   .thought-text { filter: none; }
   .thought[data-working] .thought-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; color: inherit; }
 }
+.lat[data-paused] .lat-run .lat-cell { animation-play-state: paused; }

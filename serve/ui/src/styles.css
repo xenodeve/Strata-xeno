@@ -236,10 +236,12 @@ html:lang(th) .t-reason-text { line-height: 1.8; }
 .t-reel-sep { display: inline-block; }
 @media (prefers-reduced-motion: reduce) { .t-reel-strip { transition: none !important; filter: none !important; } }
 
-/* The plain loading mark (an option instead of the orbs and the bots): a ring that turns at work and breathes at rest. */
-.t-ring { display: block; box-sizing: border-box; border-style: solid; border-radius: 50%; border-color: color-mix(in srgb, var(--ring, var(--ink)) 16%, transparent); border-top-color: var(--ring, var(--ink-2)); }
-.t-ring[data-look="spin"] { animation: t-ring-spin 800ms linear infinite; }
-.t-ring[data-look="pulse"] { animation: t-ring-pulse 2.4s ease-in-out infinite; }
-@keyframes t-ring-spin { to { transform: rotate(360deg); } }
-@keyframes t-ring-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
-@media (prefers-reduced-motion: reduce) { .t-ring { animation: none !important; } }
+/* "Matrix dot loader" (transitions.dev): 16 dots, one colour pulse, a delay table per variant. The tokens use our ink so it follows the theme;
+   the dot and the gap are variables so it can be shown at any size. */
+:root { --matrix-cycle: 1200ms; --matrix-base: color-mix(in srgb, var(--ink) 14%, var(--bg)); --matrix-active: var(--ink-2); --matrix-ease: ease-in-out; }
+.t-matrix { display: grid; grid-template-columns: repeat(4, var(--matrix-dot, 2px)); grid-auto-rows: var(--matrix-dot, 2px); gap: var(--matrix-gap, 2px); }
+.t-matrix i { display: block; border-radius: 22%; background: var(--matrix-base); animation: t-matrix-pulse var(--matrix-cycle) var(--matrix-ease) infinite; animation-delay: calc(var(--d, 0) * 1ms); }
+.t-matrix i.is-gap { visibility: hidden; animation: none; }
+.t-matrix[data-paused] i { animation-play-state: paused; }
+@keyframes t-matrix-pulse { 0%, 45%, 100% { background-color: var(--matrix-base); } 15% { background-color: var(--matrix-active); } }
+@media (prefers-reduced-motion: reduce) { .t-matrix i { animation: none !important; } }

@@ -267,11 +267,16 @@ export const checks = [
       const before = scripts.length
       const btn = pg.locator("button[aria-label^='Status avatars']")
       const painted = () => pg.evaluate(() => [...document.querySelectorAll(".orb-slot canvas")].map((c) => { try { const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i]) n++; return n } catch { return -1 } }))
-      t.ok("to begin with: the orbs, drawn, no avatar loaded", (await btn.getAttribute("aria-label")).includes("Orbs") && (await painted()).some((n) => n > 0) && (await pg.locator(".t-ring").count()) === 0)
+      t.ok("to begin with: the orbs, drawn, no avatar loaded", (await btn.getAttribute("aria-label")).includes("Orbs") && (await painted()).some((n) => n > 0) && true)
       await btn.click()
       await pg.waitForTimeout(800)
-      t.ok("the next choice is a plain loading ring, with no canvas and nothing more loaded", (await btn.getAttribute("aria-label")).includes("Loading") && (await pg.locator(".t-ring").count()) >= 2 && (await pg.locator(".orb-slot canvas").count()) === 0 && scripts.length === before, `${await pg.locator(".t-ring").count()} rings`)
-      t.ok("a ring turns while something is at work and breathes at rest", await pg.evaluate(() => [...document.querySelectorAll(".t-ring")].every((r) => ["spin", "pulse", "still"].includes(r.getAttribute("data-look")))))
+      t.ok("the next choice is orbs with the loading style: orbs still drawn, nothing more loaded", (await btn.getAttribute("aria-label")).includes("Orbs + Loading") && (await painted()).some((n) => n > 0) && scripts.length === before)
+      await btn.click()
+      await pg.waitForTimeout(800)
+      const marks = () => pg.evaluate(() => ({ lat: document.querySelectorAll(".orb-slot .lat").length, matrix: document.querySelectorAll(".orb-slot .t-matrix").length, canvas: document.querySelectorAll(".orb-slot canvas").length }))
+      const m = await marks()
+      t.ok("then the loading style alone: loaders of dots in place of the orbs, no canvas, nothing more loaded", (await btn.getAttribute("aria-label")).includes("Loading only") && m.lat + m.matrix >= 2 && m.canvas === 0 && scripts.length === before, JSON.stringify(m))
+      t.ok("both loader families are used", (await pg.evaluate(() => document.querySelectorAll(".orb-slot .lat, .orb-slot .t-matrix").length)) >= 2)
       await btn.click()
       await pg.waitForTimeout(2500)
       t.ok("then avatars: they are loaded now (one more script)", (await btn.getAttribute("aria-label")).includes("Avatar") && scripts.length > before, `${before} -> ${scripts.length}`)
@@ -296,6 +301,24 @@ export const checks = [
       await btn.click()
       await pg.waitForTimeout(800)
       t.ok("and it comes round to the orbs again", (await btn.getAttribute("aria-label")).includes("Orbs") && (await painted()).some((n) => n > 0))
+      await pg.context().close()
+    },
+  },
+  {
+    // "orbs with loading": by the thinking the loader of dots (as before), not an orb
+    name: "mixed: with orbs and loading, the thinking is marked by the lattice, not an orb",
+    async run({ browser, long, t, errors }) {
+      const pg = await open(browser, errors, { width: 900, height: 700 })
+      await pg.addInitScript(() => { try { localStorage.setItem("strata.avatar", JSON.stringify("mixed")) } catch { /* private window */ } })
+      await pg.goto(long.base + "/#/chat")
+      await pg.waitForSelector("textarea")
+      await pg.fill("textarea", "think about it")
+      await pg.keyboard.press("Enter")
+      await pg.waitForSelector(".thought-glyph .lat", { timeout: 20000 })
+      const g = await pg.evaluate(() => ({ lat: document.querySelector(".thought-glyph .lat")?.getAttribute("data-status"), canvas: document.querySelectorAll(".thought-glyph canvas").length }))
+      t.ok("while it thinks: the lattice runs and there is no orb in the mark", g.lat === "working" && g.canvas === 0, JSON.stringify(g))
+      await pg.waitForFunction(() => document.querySelector(".thought:not([data-working]) .lat[data-status='done']"), null, { timeout: 40000 })
+      t.ok("when it is done: its tick", true)
       await pg.context().close()
     },
   },

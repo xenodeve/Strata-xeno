@@ -1,11 +1,12 @@
-// What stands for a status in the app: the orbs (nine forms, one per kind of thing happening), a plain loading mark (a ring that
-// turns), or the bots of Libraries.dev (bot-avatars, MIT, vendored): the same states told by a shape and a mood. The choice is kept in the browser, and the bots are loaded
+// What stands for a status in the app: the orbs (nine forms, one per kind of thing happening); the orbs with the loading style
+// beside the thinking (as the app had it); the loading style alone (the lattice of dots and the matrix of dots, a pattern for each of
+// the nine); or the bots of Libraries.dev (bot-avatars, MIT, vendored): the same states told by a shape and a mood. The choice is kept in the browser, and the bots are loaded
 // only when chosen.
 import { useSyncExternalStore } from "react"
 import { store } from "./store"
 import type { OrbDesign } from "./orbs"
 
-export type AvatarKind = "orbs" | "loading" | "bots"
+export type AvatarKind = "orbs" | "mixed" | "loading" | "bots"
 /** The eighteen shapes bot-avatars has. */
 export const BOT_TYPES = ["clover", "flower", "triangle", "square", "blob", "ghost", "circle", "drop", "star", "droid", "mech", "alien", "hexagon", "cat", "cloud", "pill", "pebble", "puddle"] as const
 export type BotType = (typeof BOT_TYPES)[number]
@@ -18,7 +19,7 @@ export const randomBot = (r: number): BotType => BOT_TYPES[Math.min(BOT_TYPES.le
 export type BotState = "default" | "working" | "sleeping"
 
 const saved = store.get<string>("avatar", "")
-let kind: AvatarKind = saved === "bots" || saved === "loading" ? saved : "orbs"
+let kind: AvatarKind = saved === "bots" || saved === "loading" || saved === "mixed" ? saved : "orbs"
 const listeners = new Set<() => void>()
 export const getAvatar = () => kind
 export function setAvatar(k: AvatarKind) {
@@ -26,8 +27,8 @@ export function setAvatar(k: AvatarKind) {
   store.set("avatar", k)
   listeners.forEach((f) => f())
 }
-/** The next choice in the round: orbs, a plain loading mark, bots. */
-export const nextAvatar = (k: AvatarKind): AvatarKind => (k === "orbs" ? "loading" : k === "loading" ? "bots" : "orbs")
+/** The next choice in the round: orbs, orbs with loading, loading only, bots. */
+export const nextAvatar = (k: AvatarKind): AvatarKind => (k === "orbs" ? "mixed" : k === "mixed" ? "loading" : k === "loading" ? "bots" : "orbs")
 
 let choice: BotChoice = (() => { const v = store.get<string>("avatar.type", ""); return v === "random" || (BOT_TYPES as readonly string[]).includes(v) ? (v as BotChoice) : "auto" })()
 const choiceListeners = new Set<() => void>()
@@ -59,10 +60,17 @@ export function botFor(design: OrbDesign, look: { moving: boolean; rest?: boolea
   return { type, state: design === "breathing" ? "default" : "working" }
 }
 
-/** How the plain loading mark behaves for a design: a ring that turns while something is at work, one that breathes while it waits or
- *  an idle server rests, and a still one when paused or dormant. (It does not tell the forms apart: the words beside it do.) */
-export function plainLook(design: OrbDesign, look: { moving: boolean; rest?: boolean }): "spin" | "pulse" | "still" {
-  if (!look.moving) return "still"
-  if (look.rest) return design === "shaping" ? "still" : "pulse"
-  return design === "breathing" ? "pulse" : "spin"
+export type Loader =
+  | { family: "lattice"; pattern: "arrow" | "dots" | "ripple" | "spiral" | "orbit" | "snake" }
+  | { family: "matrix"; variant: "scan" | "twinkle" | "orbit" | "pulse" }
+
+const LOADERS: Record<OrbDesign, Loader> = {
+  working: { family: "matrix", variant: "scan" }, searching: { family: "lattice", pattern: "ripple" },
+  solving: { family: "matrix", variant: "twinkle" }, listening: { family: "lattice", pattern: "dots" },
+  connecting: { family: "lattice", pattern: "snake" }, weaving: { family: "lattice", pattern: "spiral" },
+  composing: { family: "lattice", pattern: "arrow" }, breathing: { family: "matrix", variant: "pulse" },
+  shaping: { family: "lattice", pattern: "orbit" },
 }
+
+/** The loader for an orb design in the loading style: a pattern of its own for each of the nine forms (the lattice or the matrix of dots). */
+export const loaderFor = (design: OrbDesign): Loader => LOADERS[design]
