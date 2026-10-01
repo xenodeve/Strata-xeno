@@ -56,6 +56,8 @@ export interface ThinkingOrbProps extends Omit<CanvasHTMLAttributes<HTMLCanvasEl
     speed?: number;
     /** Freeze the animation on the current frame. @default false */
     paused?: boolean;
+    /** xeno patch, not in the upstream library: draw at most this many frames a second (the default is every display frame). */
+    fps?: number;
     /**
      * Optional ink tint — any `#rgb`, `#rrggbb` or `rgb()` color. The orb's
      * depth-shading ramp is preserved on the tint (fading toward black on

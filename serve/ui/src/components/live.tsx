@@ -5,7 +5,7 @@ import type { Live } from "../lib/metrics"
 
 const reduce = () => typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches
 
-/** The server's state as a dotted orb: still while idle, breathing while a prompt is read, flowing while it writes.
+/** The server's state as a dotted orb: the searching globe turning slowly while idle, listening while a prompt is read, flowing while it writes.
  *  (vendor/thinking-orbs, MIT: it pauses itself offscreen and in a hidden tab, and is a still frame under reduced motion.) */
 export function StatusOrb({ live, stale = false, size = 64, override }: {
   live: Pick<Live, "state" | "queued" | "tok_s">; stale?: boolean; size?: 64 | 32 | 20; override?: { design: OrbDesign; label: string }
@@ -15,7 +15,7 @@ export function StatusOrb({ live, stale = false, size = 64, override }: {
     : live.state === "unloaded" ? "Model unloaded" : (live.queued ?? 0) > 0 ? "Waiting in the queue" : "Idle"
   return override
     ? <Orb design={override.design} size={size} moving label={override.label} />
-    : <Orb design={look.design} size={size} moving={look.moving} speed={look.speed} label={label} />
+    : <Orb design={look.design} size={size} moving={look.moving} speed={look.speed} fps={look.fps} label={label} />
 }
 
 /** A figure that glides to its new value (cubic ease-out, 500 ms) instead of jumping. Only moves when the value changes. */

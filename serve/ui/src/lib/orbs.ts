@@ -1,14 +1,19 @@
 // Which orb design says what a thing is doing. The nine designs of thinking-orbs (Libraries.dev, MIT) each have a meaning;
 // this maps the app's own states onto them, so the form of an orb tells the state before a word is read.
-//   working: general work · searching: a scan or a lookup · solving: reasoning, or struggling · listening: taking input
+//   working: general work · searching: a scan or a lookup, and the idle look of the server and a GPU · solving: reasoning, or struggling · listening: taking input
 //   connecting: a call, a queue, reaching out · weaving: a multi-step plan, heavy parallel work · composing: writing
 //   breathing: at rest, waiting · shaping: dormant, a different mode
 export type OrbDesign = "working" | "searching" | "solving" | "listening" | "connecting" | "weaving" | "composing" | "breathing" | "shaping"
 
-export interface OrbLook { design: OrbDesign; moving: boolean; speed?: number }
+export interface OrbLook { design: OrbDesign; moving: boolean; speed?: number; fps?: number }
 
-/** The server. An answer being written flows, at the pace of its tokens; a prompt being read scans; a request waiting its
- *  turn or a server that does not answer is reaching out; an unloaded model is dormant; idle rests as a still ring. */
+/** Idle is not a still picture: the searching globe keeps turning, slowly, so the orb is seen and reads as alive and calm. */
+const IDLE_SPEED = 0.5
+const IDLE_FPS = 15                                  // a slow turn needs few frames: an always-open page should not cost a core
+
+/** The server. An answer being written flows, at the pace of its tokens; a prompt being read is taken in (listening); a request
+ *  waiting its turn or a server that does not answer is reaching out; an unloaded model is dormant; idle is the searching
+ *  globe, slowly. */
 export function serverDesign(
   live: { state: "reading" | "generating" | "idle" | "unloaded"; queued?: number; tok_s?: number | null },
   stale = false,
@@ -18,19 +23,19 @@ export function serverDesign(
     const t = live.tok_s
     return { design: "composing", moving: true, speed: t == null ? 1 : Math.max(0.7, Math.min(1.5, 0.7 + (t / 150) * 0.4)) }
   }
-  if (live.state === "reading") return { design: "searching", moving: true, speed: 1 }
+  if (live.state === "reading") return { design: "listening", moving: true, speed: 1 }
   if (live.state === "unloaded") return { design: "shaping", moving: false, speed: 1 }
   if ((live.queued ?? 0) > 0) return { design: "connecting", moving: true, speed: 1 }
-  return { design: "breathing", moving: false, speed: 1 }
+  return { design: "searching", moving: true, speed: IDLE_SPEED, fps: IDLE_FPS }
 }
 
-/** A GPU: at rest, at work, working hard (parallel strands), or held back by a limit (struggling). */
+/** A GPU: idle (the searching globe, slowly), at work, working hard (parallel strands), or held back by a limit (struggling). */
 export function gpuDesign(g: { util: number | null | undefined; throttle?: string[] | null }): OrbLook {
   if (g.throttle && g.throttle.length) return { design: "solving", moving: true }
   const u = g.util ?? 0
   if (u >= 60) return { design: "weaving", moving: true }
   if (u >= 5) return { design: "working", moving: true }
-  return { design: "breathing", moving: false }
+  return { design: "searching", moving: true, speed: IDLE_SPEED, fps: IDLE_FPS }
 }
 
 /** A tool call is a connection; one that looks things up is a search. */

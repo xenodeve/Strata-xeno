@@ -652,6 +652,7 @@ function ThinkingOrb({
   theme = "auto",
   speed = 1,
   paused = false,
+  fps,
   color,
   dots = 1,
   dotSize = 1,
@@ -698,8 +699,13 @@ function ThinkingOrb({
     }
     let raf2 = 0;
     let running = false;
-    const loop = () => {
-      frame(performance.now() / 1e3 * effSpeed);
+    const gap = fps > 0 ? 1e3 / fps - 2 : 0;      // xeno: an `fps` cap (not in the upstream library); frames are skipped, the loop still ticks
+    let last = 0;
+    const loop = (now) => {
+      if (!gap || now - last >= gap) {
+        last = now;
+        frame(performance.now() / 1e3 * effSpeed);
+      }
       if (running) raf2 = requestAnimationFrame(loop);
     };
     const start = () => {
@@ -730,7 +736,7 @@ function ThinkingOrb({
       io == null ? void 0 : io.disconnect();
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [state, size, dark, speed, paused, reduced, color, dots, dotSize, optsKey, customFrame]);
+  }, [state, size, dark, speed, paused, fps, reduced, color, dots, dotSize, optsKey, customFrame]);
   return /* @__PURE__ */ jsx(
     "canvas",
     {

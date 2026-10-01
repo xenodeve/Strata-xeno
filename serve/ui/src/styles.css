@@ -151,8 +151,10 @@
 .orb-slot { position: relative; display: inline-block; flex: none; vertical-align: middle; }
 .orb-layer { position: absolute; inset: 0; display: block; }
 .orb-layer canvas { display: block; }
-.orb-in { animation: orb-fade 250ms var(--ease) both; }
-.orb-out { animation: orb-fade 250ms var(--ease) reverse both; pointer-events: none; }
+.orb-in { animation: orb-in 450ms var(--ease) both; }
+.orb-out { animation: orb-out 450ms var(--ease) both; pointer-events: none; }
+@keyframes orb-in { from { opacity: 0; transform: scale(0.82); filter: blur(3px); } to { opacity: 1; transform: none; filter: blur(0); } }
+@keyframes orb-out { from { opacity: 1; transform: none; filter: blur(0); } to { opacity: 0; transform: scale(1.16); filter: blur(3px); } }
 .fade-swap { animation: orb-fade 250ms var(--ease) both; }      /* a line whose words are replaced (the live speed becomes the mean) */
 @keyframes orb-fade { from { opacity: 0; } to { opacity: 1; } }
 .t-shimmer {
