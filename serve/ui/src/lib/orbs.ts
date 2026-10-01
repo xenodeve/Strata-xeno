@@ -1,11 +1,35 @@
-// Which orb design says what the app is doing: the "map your agent's state to a design" recipe of haplollc/ThinkingOrbs
-// (a SwiftUI port of Jakub Antalik's thinking-orbs, MIT), applied to this app's own states.
+// Which orb design says what a thing is doing. The nine designs of thinking-orbs (Libraries.dev, MIT) each have a meaning;
+// this maps the app's own states onto them, so the form of an orb tells the state before a word is read.
+//   working: general work · searching: a scan or a lookup · solving: reasoning, or struggling · listening: taking input
+//   connecting: a call, a queue, reaching out · weaving: a multi-step plan, heavy parallel work · composing: writing
+//   breathing: at rest, waiting · shaping: dormant, a different mode
 export type OrbDesign = "working" | "searching" | "solving" | "listening" | "connecting" | "weaving" | "composing" | "breathing" | "shaping"
 
-/** The server's state: a prompt being read breathes, an answer being written flows; idle or unloaded rests (a still ring). */
-export function serverDesign(state: "reading" | "generating" | "idle" | "unloaded"): { design: OrbDesign; moving: boolean } {
-  if (state === "generating") return { design: "composing", moving: true }
-  if (state === "reading") return { design: "breathing", moving: true }
+export interface OrbLook { design: OrbDesign; moving: boolean; speed?: number }
+
+/** The server. An answer being written flows, at the pace of its tokens; a prompt being read scans; a request waiting its
+ *  turn or a server that does not answer is reaching out; an unloaded model is dormant; idle rests as a still ring. */
+export function serverDesign(
+  live: { state: "reading" | "generating" | "idle" | "unloaded"; queued?: number; tok_s?: number | null },
+  stale = false,
+): OrbLook & { speed: number } {
+  if (stale) return { design: "connecting", moving: true, speed: 1 }
+  if (live.state === "generating") {
+    const t = live.tok_s
+    return { design: "composing", moving: true, speed: t == null ? 1 : Math.max(0.7, Math.min(1.5, 0.7 + (t / 150) * 0.4)) }
+  }
+  if (live.state === "reading") return { design: "searching", moving: true, speed: 1 }
+  if (live.state === "unloaded") return { design: "shaping", moving: false, speed: 1 }
+  if ((live.queued ?? 0) > 0) return { design: "connecting", moving: true, speed: 1 }
+  return { design: "breathing", moving: false, speed: 1 }
+}
+
+/** A GPU: at rest, at work, working hard (parallel strands), or held back by a limit (struggling). */
+export function gpuDesign(g: { util: number | null | undefined; throttle?: string[] | null }): OrbLook {
+  if (g.throttle && g.throttle.length) return { design: "solving", moving: true }
+  const u = g.util ?? 0
+  if (u >= 60) return { design: "weaving", moving: true }
+  if (u >= 5) return { design: "working", moving: true }
   return { design: "breathing", moving: false }
 }
 
@@ -15,13 +39,15 @@ export function toolDesign(name: string): OrbDesign {
 }
 
 /** What an assistant message is doing right now, as an orb; null once it is done. Waiting for the model, thinking, a tool
- *  running, writing: the five phases of the recipe (idle is the resting ring of serverDesign). */
+ *  running, planning the next step after a tool, writing. */
 export function replyDesign(m: {
   streaming: boolean; reasoning?: string; text: string; tools?: { name: string; state: string }[]
 }): OrbDesign | null {
   if (!m.streaming) return null
-  const running = (m.tools || []).filter((t) => t.state === "running" || t.state === "writing")
+  const tools = m.tools || []
+  const running = tools.filter((t) => t.state === "running" || t.state === "writing")
   if (running.length) return toolDesign(running[running.length - 1].name)
   if (m.text) return "composing"
+  if (tools.some((t) => t.state === "done" || t.state === "error")) return "weaving"      // a tool has answered: the agent plans the next step
   return m.reasoning ? "solving" : "breathing"
 }

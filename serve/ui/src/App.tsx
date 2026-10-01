@@ -70,10 +70,10 @@ function Nav({ page }: { page: Page }) {
 }
 
 function Brand() {
-  const { data } = useMetrics()
+  const { data, stale } = useMetrics()
   return (
     <a href={href("dashboard")} className="flex items-center gap-2 no-underline" aria-label="Strata, the dashboard">
-      <StatusOrb state={data?.live.state ?? "idle"} size={20} />
+      <StatusOrb live={data?.live ?? { state: "idle", queued: 0, tok_s: null }} stale={stale} size={20} />
       <span className="text-[15px] font-semibold tracking-[-0.02em] max-[430px]:sr-only">Strata</span>
     </a>
   )

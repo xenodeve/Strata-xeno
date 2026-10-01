@@ -5,7 +5,7 @@ import { chat, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
 import { Collapse } from "../../components/motion"
 import { Orb, StatusLabel } from "../../components/orb"
-import { toolDesign } from "../../lib/orbs"
+import { replyDesign, toolDesign } from "../../lib/orbs"
 import { cn } from "../../lib/cn"
 import { fmt, timeStr } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
@@ -126,6 +126,7 @@ export function MessageView({ m, streaming, show }: { m: Message; streaming: boo
     )
   }
   const waiting = streaming && !m.text && !m.tools?.length
+  const phase = replyDesign({ streaming, reasoning: m.reasoning, text: m.text, tools: m.tools })
   return (
     <div ref={ref} className="msg-in max-w-[min(100%,65ch)] text-[15px] tracking-[-0.011em] lg:max-w-[72ch]">
       {m.reasoning && <Thinking m={m} streaming={streaming} show={show} />}
@@ -137,8 +138,8 @@ export function MessageView({ m, streaming, show }: { m: Message; streaming: boo
         <div className={cn(streaming && "streaming")}><Answer m={m} /></div>
       )}
       <div className="mt-1 flex min-h-6 items-center gap-2 text-[12px] text-ink-3">
-        {streaming && m.text && !m.tools?.some((t) => t.state === "running" || t.state === "writing")
-          ? <StatusLabel design="composing" className="text-[13px] text-ink-2">Writing…</StatusLabel>
+        {phase === "composing" ? <StatusLabel design="composing" className="text-[13px] text-ink-2">Writing…</StatusLabel>
+          : phase === "weaving" ? <StatusLabel design="weaving" className="text-[13px] text-ink-2">Planning the next step…</StatusLabel>
           : <span className="num">{m.meta || (streaming ? "" : m.stopped ? "Stopped" : "")}</span>}
         {!streaming && !!m.text && (
           <button

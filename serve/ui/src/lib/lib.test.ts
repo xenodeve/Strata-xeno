@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { rootOf } from "./api"
-import { replyDesign, serverDesign, toolDesign } from "./orbs"
+import { gpuDesign, replyDesign, serverDesign, toolDesign } from "./orbs"
 import { clientName } from "./format"
 import { promptSplit } from "./metrics"
 import { apiMessages, type Message } from "./chat"
@@ -154,11 +154,27 @@ describe("client name", () => {
 })
 
 describe("which orb says what", () => {
-  test("the server: a prompt being read breathes, an answer being written flows, otherwise it rests as a ring", () => {
-    expect(serverDesign("reading")).toEqual({ design: "breathing", moving: true })
-    expect(serverDesign("generating")).toEqual({ design: "composing", moving: true })
-    expect(serverDesign("idle")).toEqual({ design: "breathing", moving: false })
-    expect(serverDesign("unloaded")).toEqual({ design: "breathing", moving: false })
+  const live = (o: Partial<{ state: "reading" | "generating" | "idle" | "unloaded"; queued: number; tok_s: number | null }> = {}) => ({ state: "idle" as const, queued: 0, tok_s: null, ...o })
+  test("the server: each state has its own form, and only an idle or unloaded one rests", () => {
+    expect(serverDesign(live({ state: "reading" }))).toMatchObject({ design: "searching", moving: true })
+    expect(serverDesign(live({ state: "generating", tok_s: 120 }))).toMatchObject({ design: "composing", moving: true })
+    expect(serverDesign(live())).toMatchObject({ design: "breathing", moving: false })
+    expect(serverDesign(live({ state: "unloaded" }))).toMatchObject({ design: "shaping", moving: false })
+    expect(serverDesign(live({ queued: 2 }))).toMatchObject({ design: "connecting", moving: true })
+    expect(serverDesign(live(), true)).toMatchObject({ design: "connecting", moving: true })        // not answering: still trying
+  })
+  test("the writing orb runs at the pace of the writing, within limits", () => {
+    expect(serverDesign(live({ state: "generating", tok_s: 0 })).speed).toBeCloseTo(0.7, 5)
+    expect(serverDesign(live({ state: "generating", tok_s: 150 })).speed).toBeCloseTo(1.1, 5)
+    expect(serverDesign(live({ state: "generating", tok_s: 9000 })).speed).toBeCloseTo(1.5, 5)
+    expect(serverDesign(live({ state: "generating", tok_s: null })).speed).toBe(1)
+  })
+  test("a GPU: rests, works, works hard, or struggles when it is held back", () => {
+    expect(gpuDesign({ util: 1, throttle: [] })).toEqual({ design: "breathing", moving: false })
+    expect(gpuDesign({ util: 12, throttle: [] })).toEqual({ design: "working", moving: true })
+    expect(gpuDesign({ util: 85, throttle: [] })).toEqual({ design: "weaving", moving: true })
+    expect(gpuDesign({ util: 30, throttle: ["power cap"] })).toEqual({ design: "solving", moving: true })
+    expect(gpuDesign({ util: null, throttle: null })).toEqual({ design: "breathing", moving: false })
   })
   test("a tool call: connecting, or searching when the tool looks things up", () => {
     expect(toolDesign("fs__read_file")).toBe("connecting")
@@ -166,11 +182,13 @@ describe("which orb says what", () => {
     expect(toolDesign("github__find_issues")).toBe("searching")
     expect(toolDesign("")).toBe("connecting")
   })
-  test("a reply: waiting, thinking, a tool running, writing, and nothing once it is done", () => {
+  test("a reply: waiting, thinking, a tool running, planning the next step after a tool, writing, nothing once done", () => {
     expect(replyDesign({ streaming: true, reasoning: "", text: "", tools: [] })).toBe("breathing")
     expect(replyDesign({ streaming: true, reasoning: "hm", text: "", tools: [] })).toBe("solving")
     expect(replyDesign({ streaming: true, reasoning: "hm", text: "", tools: [{ name: "x__search", state: "running" }] })).toBe("searching")
     expect(replyDesign({ streaming: true, reasoning: "hm", text: "", tools: [{ name: "x__read", state: "writing" }] })).toBe("connecting")
+    expect(replyDesign({ streaming: true, reasoning: "hm", text: "", tools: [{ name: "x__read", state: "done" }] })).toBe("weaving")
+    expect(replyDesign({ streaming: true, reasoning: "", text: "", tools: [{ name: "x__read", state: "done" }] })).toBe("weaving")
     expect(replyDesign({ streaming: true, reasoning: "hm", text: "Hel", tools: [] })).toBe("composing")
     expect(replyDesign({ streaming: true, reasoning: "", text: "Hi", tools: [{ name: "x__read", state: "done" }] })).toBe("composing")
     expect(replyDesign({ streaming: false, reasoning: "", text: "Hi", tools: [] })).toBeNull()

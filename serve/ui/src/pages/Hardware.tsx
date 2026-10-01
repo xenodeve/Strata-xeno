@@ -1,4 +1,5 @@
 import { Empty, Loading, Orb } from "../components/orb"
+import { gpuDesign } from "../lib/orbs"
 import { useEffect, useRef, type ReactNode } from "react"
 import { Chart } from "../components/Chart"
 import { NOT_MEASURED, Row, Rows, Section, val } from "../components/bits"
@@ -22,6 +23,13 @@ export const rates = (m: Metrics): DiskRate[] | null => ((m.hardware as { disks?
 export const link = (gen?: number | null, w?: number | null, wmax?: number | null, genMax?: number | null) =>
   gen == null || w == null ? NOT_MEASURED
     : <span className="num">Gen {gen} ×{w}{(wmax != null && wmax !== w) || (genMax != null && genMax !== gen) ? <span className="text-ink-2"> of Gen {genMax ?? gen} ×{wmax ?? w}</span> : ""}</span>
+
+/** A card's orb says what the card is doing: at rest, at work, working hard, or held back by a limit. */
+export function GpuOrb({ g }: { g: Card }) {
+  const look = gpuDesign(g)
+  const held = !!g.throttle?.length
+  return <Orb design={look.design} size={20} moving={look.moving} label={held ? "Held back" : look.design === "weaving" ? "Working hard" : look.moving ? "Working" : "Idle"} />
+}
 
 export function Bar({ used, total, label }: { used?: number | null; total?: number | null; label: string }) {
   const f = used != null && total ? Math.min(1, used / total) : 0
@@ -64,7 +72,7 @@ export function Hardware() {
 
       <Section title="GPUs">
         {cards(m).length === 0 ? <p><Empty>No GPU is reporting.</Empty></p> : cards(m).map((g) => (
-          <Device key={g.index} lead={<Orb design={(g.util ?? 0) >= 10 ? "working" : "breathing"} size={20} moving={(g.util ?? 0) >= 10} label={(g.util ?? 0) >= 10 ? "Working" : "Idle"} />} title={g.name || `GPU ${g.index}`} to={href("hardware", "gpu", String(g.index))}
+          <Device key={g.index} lead={<GpuOrb g={g} />} title={g.name || `GPU ${g.index}`} to={href("hardware", "gpu", String(g.index))}
             sub={<>{archOf(arch, g.name) ?? "architecture unknown"}{g.throttle && g.throttle.length > 0 && <span className="text-ink"> · held back by {g.throttle.join(", ")}</span>}</>}>
             <Bar used={g.mem_used} total={g.mem_total} label={`GPU ${g.index} memory`} />
             <div className="num mt-1.5 flex flex-wrap justify-between gap-x-4 text-[13px] text-ink-2">

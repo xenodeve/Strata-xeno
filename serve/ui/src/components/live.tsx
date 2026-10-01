@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { serverDesign } from "../lib/orbs"
+import { serverDesign, type OrbDesign } from "../lib/orbs"
 import { Orb } from "./orb"
 import type { Live } from "../lib/metrics"
 
@@ -7,16 +7,15 @@ const reduce = () => typeof matchMedia !== "undefined" && matchMedia("(prefers-r
 
 /** The server's state as a dotted orb: still while idle, breathing while a prompt is read, flowing while it writes.
  *  (vendor/thinking-orbs, MIT: it pauses itself offscreen and in a hidden tab, and is a still frame under reduced motion.) */
-export function StatusOrb({ state, size = 64 }: { state: Live["state"]; size?: 64 | 32 | 20 }) {
-  const { design, moving } = serverDesign(state)
-  return (
-    <Orb
-      design={design}
-      size={size}
-      moving={moving}
-      label={state === "reading" ? "Reading the prompt" : state === "generating" ? "Writing" : state === "unloaded" ? "Model unloaded" : "Idle"}
-    />
-  )
+export function StatusOrb({ live, stale = false, size = 64, override }: {
+  live: Pick<Live, "state" | "queued" | "tok_s">; stale?: boolean; size?: 64 | 32 | 20; override?: { design: OrbDesign; label: string }
+}) {
+  const look = serverDesign(live, stale)
+  const label = stale ? "Not answering" : live.state === "reading" ? "Reading the prompt" : live.state === "generating" ? "Writing"
+    : live.state === "unloaded" ? "Model unloaded" : (live.queued ?? 0) > 0 ? "Waiting in the queue" : "Idle"
+  return override
+    ? <Orb design={override.design} size={size} moving label={override.label} />
+    : <Orb design={look.design} size={size} moving={look.moving} speed={look.speed} label={label} />
 }
 
 /** A figure that glides to its new value (cubic ease-out, 500 ms) instead of jumping. Only moves when the value changes. */

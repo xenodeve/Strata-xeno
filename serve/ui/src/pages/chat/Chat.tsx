@@ -32,7 +32,8 @@ export function Chat() {
   const input = useRef<HTMLTextAreaElement>(null)
   const pinned = useRef(true)                                   // follow the answer while the reader is at the bottom
   const busy = chat.busy
-  const live = useMetrics().data?.live.state ?? "idle"
+  const { data: metrics, stale } = useMetrics()
+  const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
   const closeSheet = useCallback(() => setSheet(false), [])
 
   useEffect(() => {
@@ -132,7 +133,7 @@ export function Chat() {
       <div ref={list} className="flex-1 space-y-6 pb-6" aria-live="off">
         {chat.messages.length === 0 && (
           <div className="mx-auto mt-[11vh] flex max-w-[44ch] flex-col items-center text-center">
-            <StatusOrb state={live} size={64} />
+            <StatusOrb live={live} stale={stale} size={64} override={text.trim() ? { design: "listening", label: "Listening" } : undefined} />
             <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>What can I help with?</h1>
             <p className="lede mt-3">{health.model} runs on this PC. Nothing leaves it.</p>
           </div>

@@ -31,7 +31,7 @@ export function Live() {
   return (
     <div>
       <header className="page-head flex items-center gap-4">
-        <StatusOrb state={l.state} size={32} />
+        <StatusOrb live={l} stale={stale} size={32} />
         <div className="min-w-0">
           <h1 className="page-title"><Swap k={m.live.state}>{h.text}</Swap></h1>
           <p className="page-sub !mt-1">
