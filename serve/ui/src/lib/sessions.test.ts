@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
-  addProject, groupRecents, loadIndex, moveSession, newSession, openSession, removeProject, removeSession, renameProject, renameSession, saveActive, titleOf,
+  addProject, loadIndex, moveSession, newSession, openSession, removeProject, removeSession, renameProject, renameSession, saveActive, titleOf,
   type Backing, type SessionIndex,
 } from "./sessions"
 
@@ -23,7 +23,6 @@ function memory(limit = Infinity) {
 }
 const u = (text: string, extra: object = {}) => ({ role: "user", text, time: 1, ...extra })
 const a = (text: string) => ({ role: "assistant", text, time: 2 })
-const DAY = 86_400_000
 
 describe("title", () => {
   test("the first prompt, on one line, cut to about 40 characters", () => {
@@ -201,22 +200,5 @@ describe("projects", () => {
     expect(idx.projects).toEqual([])
     expect(idx.items).toHaveLength(1)
     expect(idx.items[0].project).toBeUndefined()
-  })
-})
-
-describe("grouping Recents by day", () => {
-  test("today, yesterday and earlier, newest first, empty groups left out", () => {
-    const now = new Date(2026, 9, 2, 15, 0).getTime()
-    const items = [
-      { id: "old", title: "old", time: now - 9 * DAY },
-      { id: "today2", title: "t2", time: now - 3_600_000 },
-      { id: "yest", title: "y", time: new Date(2026, 9, 1, 23, 0).getTime() },
-      { id: "today1", title: "t1", time: now - 60_000 },
-    ]
-    const g = groupRecents(items, now)
-    expect(g.map((x) => x.key)).toEqual(["today", "yesterday", "earlier"])
-    expect(g[0].items.map((i) => i.id)).toEqual(["today1", "today2"])
-    expect(groupRecents([], now)).toEqual([])
-    expect(groupRecents([items[0]], now).map((x) => x.key)).toEqual(["earlier"])
   })
 })

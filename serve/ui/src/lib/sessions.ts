@@ -146,19 +146,3 @@ export function renameProject(index: SessionIndex, id: string, name: string): Se
 export function removeProject(index: SessionIndex, id: string): SessionIndex {
   return { ...index, projects: index.projects.filter((p) => p.id !== id), items: index.items.map((i) => { if (i.project !== id) return i; const { project: _was, ...rest } = i; return rest }) }
 }
-
-export type RecentsGroup = { key: "today" | "yesterday" | "earlier"; items: SessionMeta[] }
-
-/** Conversations by the day of their last message (local time), newest first; groups with nothing in them are left out. */
-export function groupRecents(items: SessionMeta[], now: number): RecentsGroup[] {
-  const d = new Date(now)
-  const today = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
-  const yesterday = new Date(d.getFullYear(), d.getMonth(), d.getDate() - 1).getTime()
-  const sorted = [...items].sort((a, b) => b.time - a.time)
-  const groups: RecentsGroup[] = [
-    { key: "today", items: sorted.filter((i) => i.time >= today) },
-    { key: "yesterday", items: sorted.filter((i) => i.time >= yesterday && i.time < today) },
-    { key: "earlier", items: sorted.filter((i) => i.time < yesterday) },
-  ]
-  return groups.filter((g) => g.items.length)
-}

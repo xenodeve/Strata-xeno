@@ -259,3 +259,6 @@ html:lang(th) .t-reason-text { line-height: 1.8; }
 .handover-out { position: absolute; inset: 0 auto 0 0; display: flex; align-items: center; white-space: nowrap; pointer-events: none; opacity: 0; filter: blur(3px); transform: translateY(-4px); transition: opacity 300ms var(--ease), filter 300ms var(--ease), transform 300ms var(--ease); }
 .handover-out[data-show] { opacity: 1; filter: none; transform: none; animation: sharpen 280ms var(--ease) backwards; }
 @media (prefers-reduced-motion: reduce) { .handover-in, .handover-out { transition: none; filter: none; transform: none; } .handover-out[data-show] { animation: none; } }
+
+.side-in { animation: orb-fade 260ms var(--ease) backwards; }
+@media (prefers-reduced-motion: reduce) { .side-in { animation: none; } }

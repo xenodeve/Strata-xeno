@@ -13,7 +13,7 @@ import { useMetrics } from "../../lib/metrics"
 import { href } from "../../lib/router"
 import { effortChoices, settleEffort } from "../../lib/effort"
 import { noteSend } from "../../lib/sendfx"
-import { Collapse } from "../../components/motion"
+import { Collapse, useMounted } from "../../components/motion"
 import { nextDesign, type OrbDesign } from "../../lib/orbs"
 import { msg, t } from "../../lib/i18n"
 import { MessageView } from "./Messages"
@@ -64,6 +64,13 @@ function useAmbientOrb(on: boolean, every = 5000): OrbDesign | null {
 export function Chat({ id }: { id?: string }) {
   useChatVersion()
   const [drawer, setDrawer] = useState(false)                  // the list as a drawer on a phone
+  const drawerMounted = useMounted(drawer, 320)                // it slides out and is taken away when it is gone
+  const [drawerShown, setDrawerShown] = useState(false)
+  useEffect(() => {
+    if (!drawer) { setDrawerShown(false); return }
+    const id = requestAnimationFrame(() => requestAnimationFrame(() => setDrawerShown(true)))
+    return () => cancelAnimationFrame(id)
+  }, [drawer])
   const [health, setHealth] = useState<Health>(NO_HEALTH)
   const [mcp, setMcp] = useState<McpInfo>(NO_MCP)
   const [projection, setProjection] = useState(false)
@@ -234,10 +241,10 @@ export function Chat({ id }: { id?: string }) {
   return (
     <div className="md:flex md:gap-6">
     <div className="max-md:hidden"><Sidebar /></div>
-    {drawer && (
+    {drawerMounted && (
       <div className="fixed inset-0 z-40 md:hidden">
-        <button type="button" aria-label={t("Close")} onClick={() => setDrawer(false)} className="absolute inset-0 bg-black/40" />
-        <div className="absolute inset-y-0 left-0 w-[min(86vw,320px)] overflow-y-auto bg-surface p-3 shadow-xl"><Sidebar drawer onClose={() => setDrawer(false)} /></div>
+        <button type="button" aria-label={t("Close")} onClick={() => setDrawer(false)} className={cn("absolute inset-0 bg-black/40 transition-opacity duration-300", drawerShown ? "opacity-100" : "opacity-0")} />
+        <div className={cn("absolute inset-y-0 left-0 w-[min(86vw,320px)] overflow-y-auto bg-surface p-3 shadow-xl transition-transform duration-300 ease-[var(--ease)]", drawerShown ? "translate-x-0" : "-translate-x-full")}><Sidebar drawer onClose={() => setDrawer(false)} /></div>
       </div>
     )}
     <section className="flex min-h-[calc(100dvh-9rem)] min-w-0 flex-1 flex-col" onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragging(false)}>
