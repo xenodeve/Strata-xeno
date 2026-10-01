@@ -602,11 +602,13 @@ void usage() {
                  "  --secondary-profile-timing  Opt-in CUDA event timing for secondary transfer/compute.\n"
                      "  --secondary-stage-only  Stage/verify weights, but compute all experts as before.\n"
                      "  --exclusive-primary-experts  Phase 4 static primary ownership; decommit host copies.\n"
-                     "                               Needs a profile, an expert cache, spec >= 2, --pcie-frac 0.\n"
+                     "                               Needs a profile, an expert cache, spec >= 2, --pcie-frac 0,\n"
+                     "                               the CPU pool and no --mmap-experts.\n"
                      "                               On by default for all-Q2_0 native packs; pass it for i-quant packs.\n"
                      "  --ram-cache-gib G    #11 capacity mode: only G GiB of the host-owned experts stay in RAM, the\n"
                      "                       rest are read from the pack or GGUF on a miss (NVMe tier).  Needs\n"
-                     "                       placement-first, i.e. --exclusive-primary-experts or the 4070 tier.\n"
+                     "                       placement-first: it asks for --exclusive-primary-experts itself, and\n"
+                     "                       stops with an error when neither that nor the 4070 tier can be had.\n"
                      "  --no-tail-file       keep host copies of the prompt path's lendable cache slots (default with\n"
                      "                       exclusive primary experts: none; a tail-<key>.bin next to the pack,\n"
                      "                       ~3.5 GB at 8K chunks, refills them after a prompt; #34)\n"
@@ -2250,18 +2252,20 @@ int main(int argc, char** argv) {
         return 2;
     }
     {
-        // #11: requested explicitly, any native pack the GPU and CPU kernels compute (an i-quant pack's NVMe tier
-        // needs placement-first); the automatic default stays Q2_0-only, where pool-hit parity is bit-exact
-        const bool rest = o.spec >= 2 && !o.mmap_experts && !o.cache_cpu_only && !o.no_pool && o.pcie_frac == 0.0 &&
-                          !o.expert_profile.empty() && o.expert_cache != 0;
-        const bool eligible = rest && strata::core::exclusive_primary_formats_ok(pack_formats, o.exclusive_mode == 1);
+        // #11: requested (the flag, or --ram-cache-gib), any native pack the GPU and CPU kernels compute (an i-quant
+        // pack's NVMe tier needs placement-first); the automatic default stays Q2_0-only, where pool-hit parity is
+        // bit-exact
+        const bool runtime_ok = o.spec >= 2 && !o.mmap_experts && !o.cache_cpu_only && !o.no_pool &&
+                                o.pcie_frac == 0.0 && !o.expert_profile.empty() && o.expert_cache != 0;
+        const bool requested = strata::core::exclusive_requested(o.exclusive_mode, o.ram_cache_gib);
+        const bool eligible = runtime_ok && strata::core::exclusive_primary_formats_ok(pack_formats, requested);
         if (o.exclusive_mode == 1 && !eligible) {
             std::fprintf(stderr, "strata generate: --exclusive-primary-experts requires a native pack in formats the "
                                  "GPU and CPU kernels compute, spec >=2, a profile, an expert cache, --pcie-frac 0 "
                                  "and an enabled CPU pool; it excludes mmap/forced-CPU modes\n");
             return 2;
         }
-        o.exclusive_primary_experts = o.exclusive_mode == 1 || (o.exclusive_mode < 0 && eligible);
+        o.exclusive_primary_experts = o.exclusive_mode != 0 && eligible;
     }
     // Placement-first cold start (#4): when a GPU tier owns experts exclusively, the arena is reserved but not
     // committed or read; GPU tiers fill straight from the pack, and only the host-owned experts are committed and
@@ -2270,6 +2274,12 @@ int main(int argc, char** argv) {
                             (o.exclusive_secondary_mode < 0 && o.secondary_expert_mib > 0 && !o.mmap_experts &&
                              !(o.serve && o.adapt_secondary > 0));
     const bool place_first = !o.mmap_experts && (o.exclusive_primary_experts || o.exclusive_secondary);
+    if (o.ram_cache_gib > 0.0 && !place_first) {   // #11: never a silently ignored capacity flag
+        std::fprintf(stderr, "strata generate: --ram-cache-gib needs placement-first (exclusive primary experts: a "
+                             "native pack, spec >=2, a profile, an expert cache, --pcie-frac 0 and the CPU pool, "
+                             "no mmap; or the 4070 tier); without it every host expert would stay in RAM\n");
+        return 2;
+    }
     // #35 D6: with the peer tier and STRATA_PREFILL_EXPERT_SPLIT, big chunks run their routed experts on the 4070:
     // the prompt path's one-card MoE buffers are sized for the short chunks only, so it borrows fewer cache slots
     const bool split_env = [] {
@@ -2294,9 +2304,7 @@ int main(int argc, char** argv) {
     if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 && !(o.exclusive_secondary && o.serve) ? 8 : 0;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
-    else if (std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
-                         strata::kernels::cpu::expert_layout().fmt.end(),
-                         [](const auto& f) { return f.gu_type == 42 && f.d_type == 42; }))
+    else if (pack_formats.all_q2)
         std::fprintf(stderr, "strata generate: native Q2_0 expert rows use %s\n",
                      strata::kernels::cpu::cpu_avx512_ok() ? "AVX-512" :
                      strata::kernels::cpu::cpu_avxvnni_ok() ? "AVX-VNNI" : "AVX2");
