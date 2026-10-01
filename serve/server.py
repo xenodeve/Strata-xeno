@@ -57,7 +57,7 @@ from serve import cjk_guard, forced_opening, gguf_info, think_budget  # noqa: E4
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
-from serve import mcp_admin  # noqa: E402
+from serve import harness, mcp_admin  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -852,6 +852,7 @@ class Service:
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.config_path = None                          # the run config (--config) and the --mcp-config file: where serve/mcp_admin.py
         self.mcp_config_path = None                      # reads and writes the servers the web app sets up
+        self.importer = None                             # serve/harness.py's Importer: the other coding apps' skills and MCP servers (#94)
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
@@ -2068,6 +2069,11 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
                 return
+            if path == "/import":
+                # the skills and the MCP servers of the other coding apps on this PC, with what may be changed (#94)
+                if self._authorized():
+                    self._json(200, harness.view(svc, self.client_address[0], self.headers.get("Host", ""), rescan="rescan=1" in self.path))
+                return
             if path == "":
                 body = (ROOT / "serve" / "web" / "index.html").read_bytes()
                 self.send_response(200)
@@ -2157,6 +2163,24 @@ def make_handler(svc: Service):
                     return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
                 code, out = mcp_admin.apply(svc, body)
                 return self._json(code, out if code != 200 else mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
+            if path == "/import":                            # the skill switches, importing one MCP server, a rescan: a write like /mcp/config (#94)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
+                if not self._own_page("the import can be changed"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                if not svc.config_path:
+                    return self._json(409, {"error": {"message": harness.NO_FILE}})
+                if not 0 < n <= 1_000_000:
+                    return self._json(413, {"error": {"message": "send a body of up to 1 MB"}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
+                code, out = harness.apply(svc, body)
+                return self._json(code, out if code != 200 else harness.view(svc, self.client_address[0], self.headers.get("Host", "")))
             if path == "/metrics/keep":                      # keep the full prompt of the next N requests (0: off)
                 raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 if not self._own_page("prompts can be kept"):      # xeno #71: a "simple" cross-site POST must not switch this on
@@ -2694,7 +2718,9 @@ def main() -> int:
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
-    hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
+    importer = harness.Importer()                        # the skills (and the MCP servers, to import by a click) of the other coding apps on this PC (#94)
+    importer.rescan(cfg)
+    hub = hub_from_config(cfg, a.mcp_config, builtins=importer.builtins())     # before the minutes of loading: a bad entry stops here
     placeholder = None
     if a.engine == "strata":
         if not cfg:
@@ -2766,11 +2792,17 @@ def main() -> int:
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
+    svc.importer = importer
+    skills_in_use = len(importer.skills._skills)
+    if skills_in_use:
+        print(f"[strata] {skills_in_use} skill{'s' * (skills_in_use != 1)} imported from your other coding apps for the web app's chat "
+              "(switch them off in Settings > Import)", flush=True)
     if hub is not None:
         import atexit
         svc.mcp = hub
-        print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
-              f"chat: {', '.join(hub.servers)}", flush=True)
+        own = [n for n in hub.servers if n != "skills"]
+        if own:
+            print(f"[strata] starting {len(own)} MCP server{'s' * (len(own) != 1)} for the web app's chat: {', '.join(own)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
     if placeholder is not None:

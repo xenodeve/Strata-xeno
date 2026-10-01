@@ -490,9 +490,11 @@ def _clean(name: str) -> str:
 class McpHub:
     """Every configured server, and the merged, namespaced tool list the model sees."""
 
-    def __init__(self, servers: dict[str, dict], settings: dict | None = None):
+    def __init__(self, servers: dict[str, dict], settings: dict | None = None, builtins: dict | None = None):
+        """`builtins`: servers that run inside Strata (serve/skills.py) and look like an McpServer to the hub: name, kind, status, tools, call."""
         self.settings = {**DEFAULTS, **(settings or {})}
         self.servers = {name: McpServer(name, cfg, self.settings) for name, cfg in servers.items()}
+        self.servers.update(builtins or {})
         self.threads: list[threading.Thread] = []
         self._routes: dict[str, tuple[McpServer, str]] = {}
 
@@ -577,6 +579,8 @@ class McpHub:
         routes = self.routes()
         servers = []
         for s in self.servers.values():
+            if getattr(s, "kind", "") == "builtin" and not s.tools:         # a built-in with nothing to offer (no skills in use) is not listed
+                continue
             names = {tool: n for n, (srv, tool) in routes.items() if srv is s}
             servers.append({"name": s.name, "transport": s.kind, "status": s.status, "error": s.error,
                             "info": s.info,
@@ -641,7 +645,7 @@ def settings_from(cfg: dict) -> dict:
     return out
 
 
-def hub_from_config(cfg: dict, mcp_config_path: str | None = None) -> McpHub | None:
+def hub_from_config(cfg: dict, mcp_config_path: str | None = None, builtins: dict | None = None) -> McpHub | None:
     """The run config's `"mcp_servers"` (or `"mcpServers"`) plus the servers in the --mcp-config file (Claude
     Desktop's format: {"mcpServers": {...}}); a name in both takes the file's entry.  None when there are none."""
     servers = {}
@@ -657,9 +661,9 @@ def hub_from_config(cfg: dict, mcp_config_path: str | None = None) -> McpHub | N
         if block is None:
             raise SystemExit(f"[strata] --mcp-config {mcp_config_path}: expected {{\"mcpServers\": {{...}}}}")
         servers.update(servers_from(block, f"--mcp-config {mcp_config_path}"))
-    if not servers:
+    if not servers and not builtins:
         return None
-    return McpHub(servers, settings_from(cfg))
+    return McpHub(servers, settings_from(cfg), builtins)
 
 
 if __name__ == "__main__":                               # python -m serve.mcp config.json: list what a config offers

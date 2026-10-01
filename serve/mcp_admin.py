@@ -192,6 +192,18 @@ def write_config(path, servers: dict, settings: dict) -> None:
     cfg[key] = servers
     if settings:
         cfg["mcp"] = {**(cfg["mcp"] if isinstance(cfg.get("mcp"), dict) else {}), **settings}
+    _save(path, cfg)
+
+
+def update_config(path, mutate) -> None:
+    """Read the run config, let `mutate(cfg)` change it, and write it back the same careful way (other keys kept, one-time backup, atomic)."""
+    path = Path(path)
+    cfg = _read_json(path)
+    mutate(cfg)
+    _save(path, cfg)
+
+
+def _save(path: Path, cfg: dict) -> None:
     text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"       # a value that is not JSON fails here, before any file moves
     bak = Path(str(path) + ".bak-mcp")
     if not bak.exists():
@@ -276,7 +288,8 @@ def reload_hub(svc) -> None:
     do not make a hub (the servers were checked before they were written, so this is a file edited by hand)."""
     cfg = _read_json(svc.config_path) if svc.config_path else {}
     try:
-        hub = hub_from_config(cfg, svc.mcp_config_path)
+        importer = getattr(svc, "importer", None)                  # the skills of the other apps (serve/harness.py) are a built-in server
+        hub = hub_from_config(cfg, svc.mcp_config_path, builtins=importer.builtins() if importer else None)
     except SystemExit as e:                                  # hub_from_config stops the process at start-up; here it must not
         raise ValueError(str(e)) from None
     old, svc.mcp = svc.mcp, hub
