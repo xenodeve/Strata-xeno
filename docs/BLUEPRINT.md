@@ -18,6 +18,7 @@ names another. Changes that are on other branches and not yet in the baseline ar
 | 2026-09-30 | `5c51574` on `xeno/exp-upstream-0.1.26-dyn` (upstream 0.1.26 + our dynamic experts + the #48 fix; the engine the D2x server runs on :8091) | extracted from `docs/reports/2026-09-30-fork-delta-and-blueprint.md` §5 (`534ffd3`) | two adversarial verifiers and a fix pass (that report's §9) |
 | 2026-09-30 | the merge of `xeno/claude-merge-0.1.20` (`f0f5d7a`) into `xeno/exp-upstream-0.1.26-dyn` (#49 S7 prerequisite) | the line now carries every row of "Not yet in the baseline"; the rows stay listed until a build of this merge re-checks their `file:line` | not built yet; `pytest serve` 102 passed |
 | 2026-10-01 | unchanged (the 0.1.30 merge `eb2ec1f` is not served yet) | the merge's row under "Not yet in the baseline"; its record is `docs/reports/2026-10-01-merge-upstream-0.1.30.md` | serve ABBA 20/20 identical outputs, `check_cache_slots` PASS (#56) |
+| 2026-10-01 | unchanged (branch `xeno/ui-next-app-s0-s7`, not served yet) | the next web app, request history, per-card telemetry, the GGUF model info, the STATS line (UI S0-S7); rows in the file table and in the protocol section; record: `docs/reports/2026-10-01-ui-next-app.md` | serve tests and `bun test`; **the rebuilt engine has not run** |
 
 **Labels.** `UPSTREAM` means byte-identical to upstream `4c68013`. `XENO` means a file new in our delta. `MIXED` means
 an upstream file we modified. "Static reading" marks a statement from the code that no run has confirmed.
