@@ -1,16 +1,16 @@
 import { useEffect, useState } from "react"
-import { apiHeaders, getHealth, getMcp, NO_HEALTH, root, url, type Health, type McpInfo } from "../lib/api"
+import { apiHeaders, getHealth, NO_HEALTH, root, url, type Health } from "../lib/api"
 import { parseArch } from "../lib/arch"
 import { fmt } from "../lib/format"
-import { msg, t } from "../lib/i18n"
+import { t } from "../lib/i18n"
 import { store } from "../lib/store"
 import { ModelFacts } from "../components/ModelBlock"
 import { SLOT, Sentence } from "../components/bits"
 import type { ModelInfo } from "../lib/metrics"
-import { StatusLabel } from "../components/orb"
 import { toast } from "../components/toast"
 import { inputCls } from "../components/ui"
 import { StatusMarkSettings } from "../components/StatusMarks"
+import { McpSettings } from "../components/McpSettings"
 
 interface Engine { engine?: string; version?: string; context?: number; kv?: string; spec?: number; mtp_max?: number; cpu_isa?: string; gpu_arch?: string }
 
@@ -23,18 +23,14 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
   )
 }
 
-const MCP_STATE: Record<string, string> = { ready: msg("Connected"), starting: msg("Starting"), failed: msg("Failed"), stopped: msg("Stopped"), idle: msg("Waiting") }
-
 export function About() {
   const [health, setHealth] = useState<Health>(NO_HEALTH)
   const [engine, setEngine] = useState<Engine>({})
   const [model, setModel] = useState<ModelInfo | null>(null)
-  const [mcp, setMcp] = useState<McpInfo>({ servers: [], tools: 0 })
   const [key, setKey] = useState(() => store.get("apikey", ""))
 
   useEffect(() => {
     void getHealth().then(setHealth).catch(() => {})
-    void getMcp().then((m) => m && setMcp(m))
     void fetch(url("metrics"), { headers: apiHeaders() })
       .then((r) => (r.ok ? r.json() : null))
       .then((m: { engine?: Engine; model_info?: ModelInfo | null } | null) => { if (m?.engine) setEngine(m.engine); setModel(m?.model_info ?? null) })
@@ -86,26 +82,7 @@ export function About() {
         />
       </section>
 
-      {mcp.servers.length > 0 && (
-        <section>
-          <h2 className="text-[15px] font-semibold">{t("MCP servers")}</h2>
-          <p className="mt-1 text-[13px] text-ink-2">{t("{n} tools; the model calls them when it decides to.", { n: fmt(mcp.tools) })}</p>
-          <ul className="mt-2 m-0 list-none p-0">
-            {mcp.servers.map((s) => (
-              <li key={s.name} className="border-b border-line py-2 last:border-0">
-                <div className="flex items-baseline justify-between gap-4">
-                  <span className="font-medium">{s.name}</span>
-                  {s.status === "starting"
-                    ? <StatusLabel design="connecting" className="text-ink-2">{t(MCP_STATE[s.status])}</StatusLabel>
-                    : <span className={s.status === "failed" ? "text-bad" : "text-ink-2"}>{MCP_STATE[s.status] ? t(MCP_STATE[s.status]) : s.status}</span>}
-                </div>
-                <div className="text-[12px] text-ink-2">{s.transport} · {t("{n} tools", { n: fmt(s.tools.length) })}</div>
-                {s.error && <div className="mt-1 text-[12px] text-bad [overflow-wrap:anywhere]">{s.error}</div>}
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
+      <McpSettings />
 
       <section>
         <h2 className="text-[15px] font-semibold">{t("The classic app")}</h2>

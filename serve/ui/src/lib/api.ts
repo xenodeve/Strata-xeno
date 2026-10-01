@@ -1,5 +1,6 @@
 import { store } from "./store"
 import { t } from "./i18n"
+import type { McpConfigView } from "./mcpconfig"
 
 export const apiHeaders = (json = false): Record<string, string> => {
   const h: Record<string, string> = {}
@@ -34,6 +35,22 @@ export async function getMcp(): Promise<McpInfo | null> {
     const r = await fetch(url("mcp"), { headers: apiHeaders() })
     return r.ok ? ((await r.json()) as McpInfo) : null
   } catch { return null }
+}
+
+export async function getMcpConfig(): Promise<McpConfigView | null> {
+  try {
+    const r = await fetch(url("mcp/config"), { headers: apiHeaders() })
+    return r.ok ? ((await r.json()) as McpConfigView) : null
+  } catch { return null }
+}
+
+/** Save the MCP servers (and limits); the answer is the new state, or why not (the server names the field it refused). */
+export async function saveMcpConfig(body: unknown): Promise<{ view: McpConfigView } | { error: string }> {
+  try {
+    const r = await fetch(url("mcp/config"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body) })
+    if (r.ok) return { view: (await r.json()) as McpConfigView }
+    return { error: await errorMessage(r) }
+  } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
 }
 
 export async function errorMessage(r: Response): Promise<string> {

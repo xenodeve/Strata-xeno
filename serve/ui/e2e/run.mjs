@@ -6,7 +6,8 @@
 // Python is `python` unless STRATA_E2E_PYTHON says otherwise.
 import { chromium } from "playwright-core"
 import { spawn } from "node:child_process"
-import { existsSync } from "node:fs"
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs"
+import os from "node:os"
 import { fileURLToPath } from "node:url"
 import path from "node:path"
 import { checks } from "./checks.mjs"
@@ -40,6 +41,12 @@ const browser = await chromium.launch({ executablePath: chromePath() })
 // fast: a short think and a quick read of the prompt; long: a long answer that streams for a while
 const fast = await startMock({ STRATA_MOCK_THINK_MS: "2", STRATA_MOCK_PREFILL_TPS: "20000" }, 18771)
 const long = await startMock({ STRATA_MOCK_LONG: "1", STRATA_MOCK_THINK_MS: "6", STRATA_MOCK_PREFILL_TPS: "20000" }, 18772)
+// admin: a mock with a run config file that lists one real MCP server (serve/mcp_fake_server.py), for setting servers up from the page
+const FAKE_MCP = path.join(ROOT, "serve", "mcp_fake_server.py")
+const SECRET = "s3cret-e2e-value"
+const adminConfig = path.join(mkdtempSync(path.join(os.tmpdir(), "strata-e2e-")), "strata-e2e.json")
+writeFileSync(adminConfig, JSON.stringify({ model: "m", mcp_servers: { fake: { command: PY, args: [FAKE_MCP], env: { TOKEN: SECRET } } } }, null, 2))
+const admin = { ...(await startMock({ STRATA_MOCK_THINK_MS: "2", STRATA_MOCK_PREFILL_TPS: "20000", STRATA_MOCK_MCP_CONFIG: adminConfig }, 18773)), config: adminConfig, py: PY, fakeMcp: FAKE_MCP, secret: SECRET }
 let failed = 0
 try {
   // one request in the history, so the request page has something to open
@@ -50,14 +57,14 @@ try {
     const results = []
     const t = { ok: (name, pass, detail = "") => results.push({ name, pass: !!pass, detail }) }
     const t0 = Date.now()
-    try { await c.run({ browser, fast, long, t, errors }) } catch (e) { results.push({ name: "the check ran to its end", pass: false, detail: String(e).split("\n")[0] }) }
+    try { await c.run({ browser, fast, long, admin, t, errors }) } catch (e) { results.push({ name: "the check ran to its end", pass: false, detail: String(e).split("\n")[0] }) }
     if (errors.length) results.push({ name: "no console error or page error", pass: false, detail: errors.slice(0, 3).join(" | ") })
     for (const r of results) { console.log(`${r.pass ? "PASS" : "FAIL"} ${c.name.split(":")[0]}: ${r.name}${r.detail ? "  " + r.detail : ""}`); if (!r.pass) failed++ }
     console.log(`     (${c.name.split(":")[0]}: ${((Date.now() - t0) / 1000).toFixed(1)} s)`)
   }
 } finally {
   await browser.close()
-  fast.stop(); long.stop()
+  fast.stop(); long.stop(); admin.stop()
 }
 console.log(failed ? `\n${failed} check(s) failed` : "\nall browser checks passed")
 process.exit(failed ? 1 : 0)

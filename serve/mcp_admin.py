@@ -223,26 +223,28 @@ def _kind(entry) -> str:
 def read_view(config_path: str | None, mcp_config_path: str | None) -> dict:
     """{"servers": [...]} - every configured server without its state: from the run config (editable) and from the
     --mcp-config file (shown, not edited; it wins a name, as the hub has it)."""
-    by: dict[str, dict] = {}
+    config, other = {}, {}
     if config_path:
         try:
-            for name, e in _servers_in(_read_json(config_path)).items():
-                by[str(name)] = {"name": str(name), "kind": _kind(e), **(public_entry(e) if isinstance(e, dict) else {}),
-                                 "disabled": isinstance(e, dict) and e.get("disabled") is True, "source": "config",
-                                 "editable": True, "shadowed": False}
+            config = _servers_in(_read_json(config_path))
         except (OSError, ValueError):
             pass
     if mcp_config_path:
         try:
             data = _read_json(mcp_config_path)
             block = data.get("mcpServers", data.get("mcp_servers"))
-            for name, e in (block if isinstance(block, dict) else {}).items():
-                by[str(name)] = {"name": str(name), "kind": _kind(e), **(public_entry(e) if isinstance(e, dict) else {}),
-                                 "disabled": isinstance(e, dict) and e.get("disabled") is True, "source": "file",
-                                 "editable": False, "shadowed": str(name) in by, "file": os.path.basename(mcp_config_path)}
+            other = block if isinstance(block, dict) else {}
         except (OSError, ValueError):
             pass
-    return {"servers": list(by.values())}
+
+    def row(name, e, **extra):
+        return {"name": str(name), "kind": _kind(e), **(public_entry(e) if isinstance(e, dict) else {}),
+                "disabled": isinstance(e, dict) and e.get("disabled") is True, **extra}
+    # a name in both: the file's entry is the one that runs (as the hub has it); the run config's stays listed so a save keeps it
+    servers = [row(n, e, source="config", editable=True, overridden=str(n) in other) for n, e in config.items()]
+    servers += [row(n, e, source="file", editable=False, shadowed=str(n) in config, file=os.path.basename(mcp_config_path or ""))
+                for n, e in other.items()]
+    return {"servers": servers}
 
 
 def view(svc, client_ip: str, host: str) -> dict:

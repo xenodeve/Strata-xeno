@@ -249,6 +249,9 @@ class FromTheMcpConfigFile(unittest.TestCase):
             self.assertFalse(by["theirs"]["editable"])
             self.assertEqual(by["mine"]["source"], "file")                    # the file wins a name, as the hub does
             self.assertTrue(by["mine"]["shadowed"])
+            mine = [s for s in view["servers"] if s["name"] == "mine"]
+            self.assertEqual(sorted(s["source"] for s in mine), ["config", "file"])   # the run config's entry stays listed: a save keeps it
+            self.assertTrue(next(s for s in mine if s["source"] == "config")["overridden"])
 
 
 if __name__ == "__main__":

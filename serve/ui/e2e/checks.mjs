@@ -483,4 +483,116 @@ export const checks = [
       await pg.context().close()
     },
   },
+  {
+    // MCP servers are set up from About, against a real run config file and a real (fixture) MCP server: add, edit (a secret is
+    // kept), turn off, delete, paste a Claude Desktop block, the limits; the secret never reaches the page
+    name: "mcpset: MCP servers are set up from About",
+    async run({ browser, admin, t, errors }) {
+      const fs = await import("node:fs")
+      const disk = () => JSON.parse(fs.readFileSync(admin.config, "utf8"))
+      const pg = await open(browser, errors)
+      await pg.goto(admin.base + "/#/about")
+      const row = (n) => pg.locator(`li[data-server='${n}']`)
+      const connected = (n) => pg.waitForFunction((x) => document.querySelector(`li[data-server='${x}']`)?.innerText.includes("Connected"), n, { timeout: 40000 })
+      await row("fake").waitFor({ timeout: 15000 })
+      await connected("fake")
+      const first = await row("fake").innerText()
+      t.ok("the server of the run config is listed as connected, with its tools", first.includes("6 tools") && first.includes("echo"), first.split(String.fromCharCode(10)).join(" | "))
+      const raw = await pg.evaluate(async () => (await fetch("mcp/config")).text())
+      t.ok("the secret is neither in what the server sends nor on the page", !raw.includes(admin.secret) && !(await pg.content()).includes(admin.secret))
+
+      await pg.getByRole("button", { name: "Add a server", exact: true }).click()
+      const form = pg.locator("form[aria-label='Add a server']")
+      await form.waitFor()
+      await form.locator("input[aria-label='Name']").fill("a b")
+      await form.locator("input[aria-label='Program']").fill(admin.py)
+      await form.getByRole("button", { name: "Save", exact: true }).click()
+      await pg.waitForTimeout(400)
+      t.ok("a name with a space is refused beside the field, and nothing is written", (await form.innerText()).includes("no spaces") && !("a b" in disk().mcp_servers))
+      await form.locator("input[aria-label='Name']").fill("second")
+      await form.locator("textarea[aria-label='Arguments']").fill(admin.fakeMcp)
+      await form.getByRole("button", { name: "Save", exact: true }).click()
+      await row("second").waitFor({ timeout: 15000 })
+      await connected("second")
+      t.ok("a new server is written to the run config, starts without a restart and lists its tools", JSON.stringify(disk().mcp_servers.second.args) === JSON.stringify([admin.fakeMcp]) && (await row("second").innerText()).includes("6 tools"))
+
+      await pg.click("button[aria-label='Edit fake']")
+      const edit = pg.locator("form[aria-label='Edit']")
+      await edit.waitFor()
+      t.ok("editing shows the secret as a mask, and the name cannot change", (await edit.locator("textarea[aria-label='Environment']").inputValue()) === "TOKEN=********" && (await edit.locator("input[aria-label='Name']").isDisabled()))
+      await edit.locator("input[aria-label='Folder']").fill(".")
+      await edit.getByRole("button", { name: "Save", exact: true }).click()
+      await pg.waitForFunction(() => !document.querySelector("form[aria-label='Edit']"), null, { timeout: 15000 })
+      await connected("fake")
+      t.ok("saving an edit keeps the stored secret and starts the server again", disk().mcp_servers.fake.env.TOKEN === admin.secret && disk().mcp_servers.fake.cwd === ".")
+
+      await pg.click("button[aria-label='Turn off second']")
+      await pg.waitForFunction(() => document.querySelector("li[data-server='second']")?.innerText.includes("Disabled"), null, { timeout: 15000 })
+      t.ok("turning one off keeps it in the file, disabled", disk().mcp_servers.second.disabled === true)
+      await pg.click("button[aria-label='Delete second']")
+      t.ok("Delete asks once more before it deletes", (await pg.locator("button[aria-label='Delete second']").innerText()).includes("Sure"))
+      await pg.click("button[aria-label='Delete second']")
+      await row("second").waitFor({ state: "detached", timeout: 15000 })
+      t.ok("and then it is gone from the file", !("second" in disk().mcp_servers))
+
+      await pg.getByRole("button", { name: "Paste from Claude Desktop", exact: true }).click()
+      const box = pg.locator("textarea[aria-label='The block to paste']")
+      await box.waitFor()
+      await box.fill("{ nope")
+      await pg.getByRole("button", { name: "Add", exact: true }).click()
+      await pg.waitForTimeout(300)
+      t.ok("a block that is not JSON says so", (await pg.locator("[role=alert]").first().innerText()).includes("not valid JSON"))
+      await box.fill(JSON.stringify({ mcpServers: { pasted: { command: admin.py, args: [admin.fakeMcp] } } }))
+      await pg.getByRole("button", { name: "Add", exact: true }).click()
+      await row("pasted").waitFor({ timeout: 15000 })
+      t.ok("a Claude Desktop block adds its servers", disk().mcp_servers.pasted.command === admin.py)
+
+      const rounds = pg.locator("input[aria-label='Tool rounds in one answer']")
+      await rounds.fill("99")
+      await pg.getByRole("button", { name: "Save the limits" }).click()
+      await pg.waitForTimeout(600)
+      t.ok("a limit out of range is refused with its name and nothing is written", (await pg.locator("[role=alert]").first().innerText()).includes("max_rounds") && !(disk().mcp && disk().mcp.max_rounds))
+      for (let i = errors.length - 1; i >= 0; i--) if (/status of 400/.test(errors[i])) errors.splice(i, 1)      // the browser logs the refusal it was just asked to provoke
+      await rounds.fill("3")
+      await pg.getByRole("button", { name: "Save the limits" }).click()
+      await pg.waitForFunction(() => !document.querySelector("[role=alert]"), null, { timeout: 15000 })
+      await pg.waitForTimeout(300)
+      t.ok("a limit in range is saved", disk().mcp.max_rounds === 3)
+      t.ok("the other keys of the run config are still there, and the original is kept", disk().model === "m" && fs.existsSync(admin.config + ".bak-mcp"))
+      await pg.context().close()
+
+      const ph = await open(browser, errors, { width: 390, height: 800 })
+      await ph.goto(admin.base + "/#/about")
+      await ph.getByRole("button", { name: "Add a server", exact: true }).click()
+      await ph.waitForTimeout(900)
+      t.ok("on a phone the open form fits the screen", (await ph.evaluate(() => document.documentElement.scrollWidth - innerWidth)) <= 1)
+      await ph.context().close()
+
+      const th = await open(browser, errors, { lang: "th" })
+      await th.goto(admin.base + "/#/about")
+      await th.getByRole("button", { name: "เพิ่มเซิร์ฟเวอร์", exact: true }).waitFor({ timeout: 15000 })
+      await th.waitForFunction(() => document.querySelector("li[data-server='fake']")?.innerText.includes("เชื่อมต่อแล้ว"), null, { timeout: 40000 })
+      t.ok("in Thai the button and the state are Thai", true)
+      await th.context().close()
+    },
+  },
+  {
+    // where the servers cannot be changed (not this PC and no key, or no run config file) the section is a list that says why
+    name: "mcpro: where MCP servers cannot be changed the section is read-only and says why",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors)
+      await pg.goto(fast.base + "/#/about")
+      await pg.waitForTimeout(1500)
+      t.ok("with no run config file it says there is nowhere to save, and offers no Add", (await pg.locator("[role=note]").innerText()).includes("without a run config file") && (await pg.getByRole("button", { name: "Add a server", exact: true }).count()) === 0)
+      await pg.context().close()
+      const other = await open(browser, errors)
+      const server = { name: "files", kind: "program", command: "npx", args: ["-y", "x"], disabled: false, source: "config", editable: true, status: "ready", error: null, tools: [{ tool: "read" }], info: {} }
+      await other.route("**/mcp/config", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ servers: [server], editable: false, reason: "x", settings: { timeout_s: 60, max_result_chars: 20000, max_rounds: 8 }, config_file: "run.json", tools: 1 }) }))
+      await other.goto(fast.base + "/#/about")
+      await other.waitForSelector("li[data-server='files']")
+      t.ok("from another address it lists the server and says only this PC or an API key may change it", (await other.locator("[role=note]").innerText()).includes("only from this PC"))
+      t.ok("and has no Edit, Turn off, Delete, Add or Save", (await other.locator("li[data-server='files'] button").count()) === 0 && (await other.getByRole("button", { name: "Add a server", exact: true }).count()) === 0 && (await other.getByRole("button", { name: "Save the limits" }).count()) === 0 && (await other.locator("input[aria-label='Tool rounds in one answer']").isDisabled()))
+      await other.context().close()
+    },
+  },
 ]
