@@ -56,6 +56,6 @@ export async function saveMcpConfig(body: unknown): Promise<{ view: McpConfigVie
 export async function errorMessage(r: Response): Promise<string> {
   let msg = `HTTP ${r.status}`
   try { msg = ((await r.json()) as { error?: { message?: string } }).error?.message || msg } catch { /* not json */ }
-  if (r.status === 401) msg = t("This server needs an API key: add it under About > Settings.")
+  if (r.status === 401) msg = t("This server needs an API key: add it under Settings.")
   return msg
 }

@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
-  Activity01Icon, BotIcon, ComputerIcon, Globe02Icon, Loading01Icon, Loading03Icon, CpuIcon, DashboardSquare01Icon, InformationCircleIcon, Message01Icon, Moon02Icon, Sun03Icon, Task01Icon,
+  Activity01Icon, BotIcon, ComputerIcon, Globe02Icon, Loading01Icon, Loading03Icon, CpuIcon, DashboardSquare01Icon, InformationCircleIcon, Message01Icon, Moon02Icon, Settings02Icon, Sun03Icon, Task01Icon,
 } from "@hugeicons/core-free-icons"
 import { cn } from "./lib/cn"
 import { MetricsProvider, useMetrics } from "./lib/metrics"
@@ -22,6 +22,7 @@ const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
   live: { label: msg("Live"), icon: Activity01Icon },
   requests: { label: msg("Requests"), icon: Task01Icon },
   hardware: { label: msg("Hardware"), icon: CpuIcon },
+  settings: { label: msg("Settings"), icon: Settings02Icon },
   about: { label: msg("About"), icon: InformationCircleIcon },
 }
 
@@ -31,7 +32,7 @@ const THEME_NAME: Record<Theme, string> = { system: msg("System"), light: msg("L
 const AVATAR_ICON: Record<AvatarKind, IconSvgElement> = { orbs: Globe02Icon, mixed: Loading01Icon, loading: Loading03Icon, bots: BotIcon }
 const AVATAR_NAME: Record<AvatarKind, string> = { orbs: msg("Orbs"), mixed: msg("Orbs + Loading"), loading: msg("Loading only"), bots: msg("Avatar") }
 
-/** The status marks: a button that shows which way is in use and opens the list (the same one is in About), a way per row with a look
+/** The status marks: a button that shows which way is in use and opens the list (the same one is in Settings), a way per row with a look
  *  at three of its marks and a line on what it is. Closes on Escape, on a click elsewhere, and when the page changes. */
 export function AvatarMenu() {
   const avatar = useAvatar()

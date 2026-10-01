@@ -45,9 +45,18 @@ export function metaText(m: Message): string {
 }
 export interface Settings {
   thinking: string; temperature: number; top_p: number; top_k: number
-  max: string; seed: string; show: boolean; esp: boolean; mcp: boolean; prefill: boolean
+  max: string; seed: string; show: boolean; esp: boolean; mcp: boolean; mcpOff: string[]; prefill: boolean
 }
-export const DEFAULTS: Settings = { thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, prefill: true }
+/** What a request says about MCP: nothing when the tools are off (or no server that is not switched off has any), else `strata_mcp`
+ *  and, when the + menu's list switched some servers off for this chat, their names. */
+export function mcpRequest(s: Settings, mcp: McpInfo): { strata_mcp?: true; strata_mcp_off?: string[] } {
+  if (s.mcp === false) return {}
+  const off = (Array.isArray(s.mcpOff) ? s.mcpOff : []).filter((n) => typeof n === "string" && mcp.servers.some((x) => x.name === n))
+  const usable = mcp.servers.length ? mcp.servers.filter((x) => !off.includes(x.name) && x.tools.length > 0).length : mcp.tools      // the list may not have arrived: the count says
+  if (usable === 0 || (!mcp.servers.length && mcp.tools === 0)) return {}
+  return off.length ? { strata_mcp: true, strata_mcp_off: off } : { strata_mcp: true }
+}
+export const DEFAULTS: Settings = { thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, mcpOff: [], prefill: true }
 
 // a file's text in the message, fenced with more backticks than it contains itself
 const fileBlock = (f: { name: string; text: string }) => {
@@ -242,7 +251,7 @@ export class ChatController {
     if (s.seed) body.seed = +s.seed
     if (s.max) body.max_tokens = +s.max
     if (ctx.projectionLoaded) body.experimental_speed_projection = !!s.esp
-    if (s.mcp !== false && ctx.mcp.tools > 0) body.strata_mcp = true      // this server may run MCP tools for it
+    Object.assign(body, mcpRequest(s, ctx.mcp))                            // this server may run MCP tools for it (the ones not switched off)
 
     let firstAt: number | null = null
     let thinkStart: number | null = null

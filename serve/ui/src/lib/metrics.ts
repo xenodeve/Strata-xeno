@@ -68,7 +68,7 @@ function usePoll(): MetricsState {
       let busy = false
       try {
         const r = await fetch(url("metrics"), { headers: apiHeaders() })
-        if (!r.ok) throw new Error(r.status === 401 ? t("This server needs an API key (About).") : `HTTP ${r.status}`)
+        if (!r.ok) throw new Error(r.status === 401 ? t("This server needs an API key (Settings).") : `HTTP ${r.status}`)
         const data = (await r.json()) as Metrics
         fails.current = 0
         busy = data.live.state === "reading" || data.live.state === "generating"
@@ -96,7 +96,7 @@ export interface RequestDetail {
 
 export async function getRequestPage(page: number, size: number): Promise<RequestPage> {
   const r = await fetch(url(`metrics/requests?page=${page}&size=${size}`), { headers: apiHeaders() })
-  if (!r.ok) throw new Error(r.status === 401 ? t("This server needs an API key (About).") : `HTTP ${r.status}`)
+  if (!r.ok) throw new Error(r.status === 401 ? t("This server needs an API key (Settings).") : `HTTP ${r.status}`)
   return (await r.json()) as RequestPage
 }
 
@@ -115,7 +115,7 @@ export async function getKeepLeft(): Promise<number> {
 
 export async function setKeep(n: number): Promise<number> {
   const r = await fetch(url("metrics/keep"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify({ next: n }) })
-  if (!r.ok) throw new Error(r.status === 401 ? t("This server needs an API key (About).") : `HTTP ${r.status}`)
+  if (!r.ok) throw new Error(r.status === 401 ? t("This server needs an API key (Settings).") : `HTTP ${r.status}`)
   return ((await r.json()) as { keep_prompts_left: number }).keep_prompts_left
 }
 

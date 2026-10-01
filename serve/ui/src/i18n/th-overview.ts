@@ -22,8 +22,8 @@ export const part: Record<string, string> = {
   "Shaping": "กำลังก่อรูป",
 
   // errors from the client
-  "This server needs an API key (About).": "เซิร์ฟเวอร์นี้ต้องใช้คีย์ API (ดูที่ เกี่ยวกับ)",
-  "This server needs an API key: add it under About > Settings.": "เซิร์ฟเวอร์นี้ต้องใช้คีย์ API: เพิ่มได้ที่ เกี่ยวกับ > การตั้งค่า",
+  "This server needs an API key (Settings).": "เซิร์ฟเวอร์นี้ต้องใช้คีย์ API (ดูที่ ตั้งค่า)",
+  "This server needs an API key: add it under Settings.": "เซิร์ฟเวอร์นี้ต้องใช้คีย์ API: เพิ่มได้ที่ ตั้งค่า",
 
   // model facts
   "{list} +{n} more": "{list} +อีก {n}",

@@ -493,14 +493,14 @@ Or keep them in their own file and start the server with `--mcp-config path\to\c
 with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change to
 these files.
 
-**Or set them up in the web app** (new app, **About > MCP servers**; needs the server started with `--config`): the list
+**Or set them up in the web app** (new app, **Settings > MCP servers**; needs the server started with `--config`): the list
 shows each server's state and tools, and you can add, edit, turn off and delete one, paste a block from Claude Desktop,
 and set the three limits. A change is written to the run config (its other keys are kept; the original is copied once
 to `<config>.bak-mcp`) and the servers start again at once - no restart. Servers from `--mcp-config` are listed but
 only edited in that file. The values of `env` and `headers` are never sent to the browser: they show as `********`, and
 leaving that in keeps the stored value. Because this decides which programs Strata starts, it works **only from this
 PC itself** (open the page as `localhost` or `127.0.0.1`) **or when the server has an API key** and it is entered under
-About > API key; from any other address the section is a read-only list.
+Settings > API key; from any other address the section is a read-only list.
 
 - **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
   stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
@@ -516,7 +516,8 @@ About > API key; from any other address the section is a read-only list.
   (default 20,000 characters) are cut, with a note, before the model reads them. Stop stops a running tool too.
 - Only the chat page uses them. API clients (omp, Claude Code, OpenAI and Anthropic SDKs) see the API exactly as
   before and keep their own tools; a request to `/v1/chat/completions` opts in with `"strata_mcp": true` (it then
-  gets `strata_mcp` tool events in the stream).
+  gets `strata_mcp` tool events in the stream), and `"strata_mcp_off": ["name", ...]` leaves servers out of that request (the
+  chat page sends it for the servers switched off in its **+ > MCP tools** list, which shows each server with its tools).
 
 **Security.** MCP tools run on your PC with your user's rights, and **the model decides when to call them** - also
 because of what it reads (a web page or a file can contain instructions). Give a filesystem server only the folders

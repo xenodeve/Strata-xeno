@@ -121,7 +121,6 @@ export const part: Record<string, string> = {
   "Waiting for the model…": "กำลังรอโมเดล…",
   "Answering…": "กำลังตอบกลับ…",
   "MCP tools": "เครื่องมือ MCP",
-  "No server is set up. Add them in the run config.": "ยังไม่ได้ตั้ง server ไว้ เพิ่มได้ใน run config",
   "Planning the next step…": "กำลังวางแผนขั้นตอนต่อไป…",
   "Copy the answer": "คัดลอกคำตอบ",
   "Copy": "คัดลอก",
@@ -155,4 +154,10 @@ export const part: Record<string, string> = {
   "Every client gets these as its defaults.": "ทุก client จะได้ค่านี้เป็นค่าเริ่มต้น",
   "Reset": "รีเซ็ต",
   "Apply": "ใช้",
+  "No server is set up. Add them in Settings.": "ยังไม่ได้ตั้งเซิร์ฟเวอร์ เพิ่มได้ในหน้า “ตั้งค่า”",
+  "{on} of {n} servers on · {tools} tools": "เปิด {on} จาก {n} เซิร์ฟเวอร์ · {tools} เครื่องมือ",
+  "All MCP tools": "เครื่องมือ MCP ทั้งหมด",
+  "Use {name}": "ใช้ {name}",
+  "Tools of {name}": "เครื่องมือของ {name}",
+  "Set up servers": "ตั้งค่าเซิร์ฟเวอร์",
 }

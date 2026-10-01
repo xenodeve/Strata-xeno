@@ -22,7 +22,7 @@ export const checks = [
     async run({ browser, fast, t, errors }) {
       const rows = await (await fetch(fast.base + "/metrics/requests?page=1&size=1")).json()
       const id = rows.items?.[0]?.id
-      const pages = ["#/chat", "#/dashboard", "#/live", "#/requests", id ? `#/requests/${id}` : null, "#/hardware", "#/about", "#/requests/trace"].filter(Boolean)
+      const pages = ["#/chat", "#/dashboard", "#/live", "#/requests", id ? `#/requests/${id}` : null, "#/hardware", "#/settings", "#/about", "#/requests/trace"].filter(Boolean)
       for (const lang of ["en", "th"]) for (const width of [1280, 390]) {
         const pg = await open(browser, errors, { lang, width, height: 800 })
         for (const hash of pages) {
@@ -257,7 +257,7 @@ export const checks = [
     },
   },
   {
-    // the status marks: one list to read and choose from (a menu from the header, the same list in About)
+    // the status marks: one list to read and choose from (a menu from the header, the same list in Settings)
     name: "avatar: the status marks are chosen from a list that shows each way, and it is remembered",
     async run({ browser, fast, t, errors }) {
       const pg = await open(browser, errors)
@@ -309,16 +309,16 @@ export const checks = [
       await pg.reload()
       await pg.waitForTimeout(2500)
       t.ok("the choice is remembered after a reload", (await btn.getAttribute("aria-label")).includes("Avatar"))
-      await pg.goto(fast.base + "/#/about")
+      await pg.goto(fast.base + "/#/settings")
       await pg.waitForTimeout(2000)
       const aboutRadios = pg.locator("main [role=radiogroup][aria-label='Status marks'] [role=radio]")
-      t.ok("About has the same list", (await aboutRadios.count()) === 4 && (await aboutRadios.nth(3).getAttribute("aria-checked")) === "true")
+      t.ok("Settings has the same list", (await aboutRadios.count()) === 4 && (await aboutRadios.nth(3).getAttribute("aria-checked")) === "true")
       const section = () => pg.evaluate(() => Math.round(document.querySelector("main [role=radiogroup][aria-label='Status marks']").closest("section").getBoundingClientRect().height))
       const s0 = await section()
       await aboutRadios.nth(0).click()
       const shrink = []
       for (let i = 0; i < 14; i++) { await pg.waitForTimeout(45); shrink.push(await section()) }
-      t.ok("in About, leaving Avatar shrinks the section smoothly through in-between heights", new Set(shrink).size >= 5 && shrink[shrink.length - 1] < s0 - 100, `${s0} -> ${shrink.join(" ")}`)
+      t.ok("in Settings, leaving Avatar shrinks the section smoothly through in-between heights", new Set(shrink).size >= 5 && shrink[shrink.length - 1] < s0 - 100, `${s0} -> ${shrink.join(" ")}`)
       await pg.waitForTimeout(500)
       await aboutRadios.nth(3).click()
       const stretch = []
@@ -364,12 +364,17 @@ export const checks = [
     },
   },
   {
-    // MCP in the + menu: a row to see whether the tools are on, how many there are, and to switch them
-    name: "mcp: the + menu has an MCP row that shows the tools and switches them",
+    // the + menu's MCP row opens the list of servers: each with its tools and its own switch; what is switched off is named in the request
+    name: "mcp: the MCP row opens a list of servers with their tools, and each one can be switched off",
     async run({ browser, fast, t, errors }) {
       const pg = await open(browser, errors)
       const bodies = []
-      await pg.route("**/mcp", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ servers: [{ name: "fs", transport: "stdio", status: "ready", tools: [{ name: "read" }, { name: "list" }, { name: "search" }] }], tools: 3 }) }))
+      const servers = [
+        { name: "fs", transport: "stdio", status: "ready", tools: [{ tool: "read", description: "Read a file" }, { tool: "list" }, { tool: "search" }] },
+        { name: "web", transport: "http", status: "ready", tools: [{ tool: "fetch" }, { tool: "screenshot" }] },
+        { name: "down", transport: "stdio", status: "failed", error: "could not start", tools: [] },
+      ]
+      await pg.route("**/mcp", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ servers, tools: 5 }) }))
       await pg.route("**/v1/chat/completions", async (r) => { try { bodies.push(JSON.parse(r.request().postData() || "{}")) } catch { /* not json */ } await r.continue() })
       await pg.goto(fast.base + "/#/chat")
       await pg.waitForSelector("textarea")
@@ -377,24 +382,61 @@ export const checks = [
       await pg.click("button[aria-label='Photos, files, new chat, save']")
       await pg.waitForTimeout(600)
       const row = pg.locator(".t-morph-menu [role=option]", { hasText: "MCP tools" })
-      t.ok("the menu has an MCP row, with how many tools and servers", (await row.count()) === 1 && (await row.innerText()).includes("3 tools from 1 server"), (await row.innerText()).split(String.fromCharCode(10)).join(" | "))
-      t.ok("it says the tools are on", (await row.getAttribute("aria-checked")) === "true" && (await row.innerText()).toLowerCase().includes("on"))
-      const h = await pg.evaluate(() => Math.round(document.querySelector(".t-morph").getBoundingClientRect().height))
-      t.ok("the panel is tall enough for four rows", h >= 160, `${h}px`)
+      const rowText = () => row.innerText().then((x) => x.split(String.fromCharCode(10)).join(" | "))
+      t.ok("the row says how many servers are on and how many tools", (await row.count()) === 1 && (await rowText()).includes("2 of 3 servers on · 5 tools"), await rowText())
+      t.ok("it is an ordinary row now, not a switch", (await row.getAttribute("aria-checked")) !== null && (await row.isDisabled()) === false)
       await row.click()
-      await pg.waitForTimeout(400)
-      t.ok("clicking switches it off and keeps the menu open", (await row.getAttribute("aria-checked")) === "false" && (await pg.locator(".t-morph[data-open='true']").count()) === 1 && (await pg.evaluate(() => JSON.parse(localStorage.getItem("strata.sampling")).mcp)) === false)
+      await pg.waitForTimeout(500)
+      const panel = pg.locator("[role=dialog][aria-label='MCP tools']")
+      t.ok("clicking it opens the list and closes the menu", (await panel.count()) === 1 && (await pg.locator(".t-morph[data-open='true']").count()) === 0)
+      const fs = panel.locator("li[data-server='fs']")
+      t.ok("each server shows its state and its tools by name", (await fs.innerText()).includes("Connected") && (await fs.locator(".prompt-bar__mcp-tools li").allInnerTexts()).join(",") === "read,list,search" && (await panel.locator("li[data-server='web'] .prompt-bar__mcp-tools li").allInnerTexts()).join(",") === "fetch,screenshot")
+      t.ok("a tool's description is its tooltip", (await fs.locator("li[title='Read a file']").count()) === 1)
+      t.ok("a server that failed says why, has no tools, and cannot be switched", (await panel.locator("li[data-server='down']").innerText()).includes("could not start") && (await panel.locator("li[data-server='down'] [role=switch]").isDisabled()))
+      const sw = (n) => panel.locator(`[role=switch][aria-label='Use ${n}']`)
+      t.ok("both working servers are on", (await sw("fs").getAttribute("aria-checked")) === "true" && (await sw("web").getAttribute("aria-checked")) === "true")
+      await sw("web").click()
+      await pg.waitForTimeout(300)
+      t.ok("switching web off is kept, and the others stay on", (await sw("web").getAttribute("aria-checked")) === "false" && (await sw("fs").getAttribute("aria-checked")) === "true" && JSON.stringify(await pg.evaluate(() => JSON.parse(localStorage.getItem("strata.sampling")).mcpOff)) === '["web"]')
+      t.ok("and its tools are dimmed", (await panel.locator("li[data-server='web']").getAttribute("data-off")) !== null && (await panel.locator("li[data-server='fs']").getAttribute("data-off")) === null)
       await pg.keyboard.press("Escape")
+      await pg.waitForTimeout(300)
+      t.ok("Escape closes the list", (await panel.count()) === 0)
       await pg.fill("textarea", "hi")
       await pg.keyboard.press("Enter")
       await pg.waitForFunction(() => document.querySelector(".prose-chat, .thought"), null, { timeout: 30000 })
-      t.ok("and the request no longer asks for tools", bodies[0] && bodies[0].strata_mcp !== true, JSON.stringify(bodies[0]?.strata_mcp))
+      t.ok("the request asks for MCP and names the server that is off", bodies[0]?.strata_mcp === true && JSON.stringify(bodies[0]?.strata_mcp_off) === '["web"]', JSON.stringify([bodies[0]?.strata_mcp, bodies[0]?.strata_mcp_off]))
+      await finished(pg)
+
+      await pg.click("button[aria-label='Photos, files, new chat, save']")
+      await pg.waitForTimeout(500)
+      t.ok("the row now says one of the two is on", (await rowText()).includes("1 of 3 servers on"), await rowText())
+      await row.click()
+      await pg.waitForTimeout(400)
+      await sw("fs").click()
+      await pg.waitForTimeout(300)
+      await pg.keyboard.press("Escape")
+      await pg.fill("textarea", "again")
+      await pg.keyboard.press("Enter")
+      await finished(pg)
+      t.ok("with every server off the request does not ask for MCP", bodies[1] && bodies[1].strata_mcp !== true && bodies[1].strata_mcp_off === undefined, JSON.stringify([bodies[1]?.strata_mcp, bodies[1]?.strata_mcp_off]))
+
+      await pg.click("button[aria-label='Photos, files, new chat, save']")
+      await pg.waitForTimeout(500)
+      await row.click()
+      await pg.waitForTimeout(400)
+      await panel.locator("[role=switch][aria-label='All MCP tools']").click()
+      await pg.waitForTimeout(300)
+      t.ok("the master switch turns the tools off and the servers can no longer be switched", (await panel.locator("[role=switch][aria-label='All MCP tools']").getAttribute("aria-checked")) === "false" && (await sw("fs").isDisabled()) && (await pg.evaluate(() => JSON.parse(localStorage.getItem("strata.sampling")).mcp)) === false)
+      await pg.click("body", { position: { x: 5, y: 300 } })
+      await pg.waitForTimeout(300)
+      t.ok("a click elsewhere closes it", (await panel.count()) === 0)
       await pg.context().close()
     },
   },
   {
-    // with no MCP server the row is there and says so
-    name: "mcpnone: with no MCP server the row says none is set up",
+    // with no MCP server the row is there, opens, and says where to add them
+    name: "mcpnone: with no MCP server the list says so and points to Settings",
     async run({ browser, fast, t, errors }) {
       const pg = await open(browser, errors)
       await pg.goto(fast.base + "/#/chat")
@@ -403,7 +445,14 @@ export const checks = [
       await pg.click("button[aria-label='Photos, files, new chat, save']")
       await pg.waitForTimeout(600)
       const row = pg.locator(".t-morph-menu [role=option]", { hasText: "MCP tools" })
-      t.ok("the row is there, not usable, and says why", (await row.count()) === 1 && (await row.isDisabled()) && (await row.innerText()).includes("No server is set up"))
+      t.ok("the row is there and says no server is set up", (await row.count()) === 1 && (await row.innerText()).includes("No server is set up"))
+      await row.click()
+      await pg.waitForTimeout(400)
+      const panel = pg.locator("[role=dialog][aria-label='MCP tools']")
+      t.ok("it opens a list that says so, with no switch", (await panel.innerText()).includes("No server is set up") && (await panel.locator("[role=switch]").count()) === 0)
+      await panel.getByRole("link", { name: "Set up servers" }).click()
+      await pg.waitForTimeout(800)
+      t.ok("and the link goes to Settings", pg.url().endsWith("#/settings") && (await panel.count()) === 0)
       await pg.context().close()
     },
   },
@@ -484,14 +533,14 @@ export const checks = [
     },
   },
   {
-    // MCP servers are set up from About, against a real run config file and a real (fixture) MCP server: add, edit (a secret is
+    // MCP servers are set up from Settings, against a real run config file and a real (fixture) MCP server: add, edit (a secret is
     // kept), turn off, delete, paste a Claude Desktop block, the limits; the secret never reaches the page
-    name: "mcpset: MCP servers are set up from About",
+    name: "mcpset: MCP servers are set up from Settings",
     async run({ browser, admin, t, errors }) {
       const fs = await import("node:fs")
       const disk = () => JSON.parse(fs.readFileSync(admin.config, "utf8"))
       const pg = await open(browser, errors)
-      await pg.goto(admin.base + "/#/about")
+      await pg.goto(admin.base + "/#/settings")
       const row = (n) => pg.locator(`li[data-server='${n}']`)
       const connected = (n) => pg.waitForFunction((x) => document.querySelector(`li[data-server='${x}']`)?.innerText.includes("Connected"), n, { timeout: 40000 })
       await row("fake").waitFor({ timeout: 15000 })
@@ -562,14 +611,14 @@ export const checks = [
       await pg.context().close()
 
       const ph = await open(browser, errors, { width: 390, height: 800 })
-      await ph.goto(admin.base + "/#/about")
+      await ph.goto(admin.base + "/#/settings")
       await ph.getByRole("button", { name: "Add a server", exact: true }).click()
       await ph.waitForTimeout(900)
       t.ok("on a phone the open form fits the screen", (await ph.evaluate(() => document.documentElement.scrollWidth - innerWidth)) <= 1)
       await ph.context().close()
 
       const th = await open(browser, errors, { lang: "th" })
-      await th.goto(admin.base + "/#/about")
+      await th.goto(admin.base + "/#/settings")
       await th.getByRole("button", { name: "เพิ่มเซิร์ฟเวอร์", exact: true }).waitFor({ timeout: 15000 })
       await th.waitForFunction(() => document.querySelector("li[data-server='fake']")?.innerText.includes("เชื่อมต่อแล้ว"), null, { timeout: 40000 })
       t.ok("in Thai the button and the state are Thai", true)
@@ -581,14 +630,14 @@ export const checks = [
     name: "mcpro: where MCP servers cannot be changed the section is read-only and says why",
     async run({ browser, fast, t, errors }) {
       const pg = await open(browser, errors)
-      await pg.goto(fast.base + "/#/about")
+      await pg.goto(fast.base + "/#/settings")
       await pg.waitForTimeout(1500)
       t.ok("with no run config file it says there is nowhere to save, and offers no Add", (await pg.locator("[role=note]").innerText()).includes("without a run config file") && (await pg.getByRole("button", { name: "Add a server", exact: true }).count()) === 0)
       await pg.context().close()
       const other = await open(browser, errors)
       const server = { name: "files", kind: "address", disabled: false, source: "config", editable: true, status: "ready", error: null, tools: [{ tool: "read" }], info: {} }
       await other.route("**/mcp/config", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ servers: [server], editable: false, reason: "x", settings: { timeout_s: 60, max_result_chars: 20000, max_rounds: 8 }, config_file: "run.json", tools: 1 }) }))
-      await other.goto(fast.base + "/#/about")
+      await other.goto(fast.base + "/#/settings")
       await other.waitForSelector("li[data-server='files']")
       t.ok("from another address it lists the server and says only this PC or an API key may change it", (await other.locator("[role=note]").innerText()).includes("only from this PC") && (await other.locator("li[data-server='files']").innerText()).includes("Address"))
       t.ok("and has no Edit, Turn off, Delete, Add or Save", (await other.locator("li[data-server='files'] button").count()) === 0 && (await other.getByRole("button", { name: "Add a server", exact: true }).count()) === 0 && (await other.getByRole("button", { name: "Save the limits" }).count()) === 0 && (await other.locator("input[aria-label='Tool rounds in one answer']").isDisabled()))
@@ -620,6 +669,29 @@ export const checks = [
         t.ok(`${kind}: every mark is centered in its slot (${off.length} marks)`, off.length >= 2 && off.every((o) => Math.abs(o.dx) <= 1 && Math.abs(o.dy) <= 1), JSON.stringify(off))
         await ctx.close()
       }
+    },
+  },
+  {
+    // Settings is a page of its own: the status marks, the API key and the MCP servers are there, and About keeps only what it tells
+    name: "settings: the settings are a page of their own, apart from About",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors)
+      await pg.goto(fast.base + "/#/settings")
+      await pg.waitForTimeout(1500)
+      const heads = (page) => page.locator("main h2").allInnerTexts()
+      const h = await heads(pg)
+      t.ok("Settings has the status marks, the API key and the MCP servers", ["Status marks", "API key", "MCP servers"].every((x) => h.includes(x)), h.join(", "))
+      t.ok("its title is Settings and the navigation marks it", (await pg.locator("main h1").innerText()) === "Settings" && (await pg.locator("nav a[aria-current='page']").getAttribute("aria-label")) === "Settings")
+      await pg.goto(fast.base + "/#/about")
+      await pg.waitForTimeout(1500)
+      const a = await heads(pg)
+      t.ok("About keeps the model and the server, and none of the settings", a.includes("The model") && a.includes("This server") && !["Status marks", "API key", "MCP servers"].some((x) => a.includes(x)), a.join(", "))
+      await pg.context().close()
+      const th = await open(browser, errors, { lang: "th" })
+      await th.goto(fast.base + "/#/settings")
+      await th.waitForTimeout(1500)
+      t.ok("in Thai the page is ตั้งค่า", (await th.locator("main h1").innerText()) === "ตั้งค่า")
+      await th.context().close()
     },
   },
 ]

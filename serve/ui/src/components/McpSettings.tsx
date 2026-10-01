@@ -9,7 +9,7 @@ import { StatusLabel } from "./orb"
 import { toast } from "./toast"
 import { Button, Field, Segmented, inputCls } from "./ui"
 
-// Setting up MCP servers (issue #79): the list with each one's state and tools, add / edit / disable / delete, a box for a
+// Setting up MCP servers (issue #79; on the Settings page): the list with each one's state and tools, add / edit / disable / delete, a box for a
 // block pasted from Claude Desktop, and the limits. Each change is saved at once (the server restarts its servers from the
 // file; no restart of Strata). Without the right to change them (not this PC, no API key) it is a list and says so.
 const STATE: Record<string, string> = {

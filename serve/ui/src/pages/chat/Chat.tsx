@@ -9,6 +9,7 @@ import { toast } from "../../components/toast"
 import { StatusOrb } from "../../components/live"
 import { PromptBar } from "../../components/PromptBar"
 import { useMetrics } from "../../lib/metrics"
+import { href } from "../../lib/router"
 import { effortChoices, settleEffort } from "../../lib/effort"
 import { noteSend } from "../../lib/sendfx"
 import { Collapse } from "../../components/motion"
@@ -243,7 +244,11 @@ export function Chat() {
           onStop={() => chat.stop()}
           onNewChat={newChat}
           onSave={download}
-          mcp={{ servers: mcp.servers.length, tools: mcp.tools, on: chat.settings.mcp !== false, onToggle: () => chat.setSettings({ ...chat.settings, mcp: chat.settings.mcp === false }) }}
+          mcp={{
+            servers: mcp.servers, tools: mcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings"),
+            onToggleAll: () => chat.setSettings({ ...chat.settings, mcp: chat.settings.mcp === false }),
+            onToggleServer: (name) => { const off = Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : []; chat.setSettings({ ...chat.settings, mcpOff: off.includes(name) ? off.filter((n) => n !== name) : [...off, name] }) },
+          }}
           onSampling={() => setSheet(true)}
           efforts={choices.map((c) => t(c.label))}
           effort={Math.max(0, choices.findIndex((c) => c.value === chat.settings.thinking))}

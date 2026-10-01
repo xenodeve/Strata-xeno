@@ -2313,7 +2313,9 @@ def make_handler(svc: Service):
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
                 svc.mcp.wait(10)                                  # servers still starting (only right after start)
-                extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
+                off = req.get("strata_mcp_off")                   # servers the page's list switched off for this chat; anything but a list of names is ignored
+                skip = {x for x in off if isinstance(x, str)} if isinstance(off, list) and all(isinstance(x, str) for x in off) else set()
+                extra = svc.mcp.template_tools(exclude=own, skip_servers=skip)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)

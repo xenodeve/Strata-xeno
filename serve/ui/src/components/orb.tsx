@@ -9,13 +9,13 @@ import { t } from "../lib/i18n"
 // in a hidden tab, and is a still frame under reduced motion. These three components only decide where and how it is shown.
 type Size = 64 | 32 | 20
 
-// The bots (Libraries.dev bot-avatars, MIT, src/vendor/bot-avatars) stand in for the orbs when chosen (About, or the header). They are
+// The bots (Libraries.dev bot-avatars, MIT, src/vendor/bot-avatars) stand in for the orbs when chosen (Settings, or the header). They are
 // loaded only then: with the orbs nobody downloads them.
 const BotAvatar = lazy(() => import("../vendor/bot-avatars/index.es.js").then((m) => ({ default: m.BotAvatar })))
 
 interface FaceProps { design: OrbDesign; size: Size; moving: boolean; label?: string; color?: string; speed: number; fps?: number; scale: number; rest?: boolean; drawn: BotType; as?: AvatarKind }
 
-/** One avatar, as a tile in the picker (About): still looking around, not following the pointer. */
+/** One avatar, as a tile in the picker (Settings): still looking around, not following the pointer. */
 export function BotTile({ type, size = 44 }: { type: BotType; size?: number }) {
   return (
     <Suspense fallback={<span style={{ display: "block", width: size, height: size }} />}>

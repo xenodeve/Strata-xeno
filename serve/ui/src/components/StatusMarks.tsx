@@ -10,7 +10,7 @@ import type { OrbDesign } from "../lib/orbs"
 
 // The choice of what stands for a status, as one list you can read: each way shows three of its marks (thinking, answering, an idle
 // server) beside its name and one line on what it is, so nothing has to be guessed or clicked to find out. Used in a menu from the
-// header and in About.
+// header and in Settings.
 const OPTIONS: { kind: AvatarKind; name: string; text: string }[] = [
   { kind: "orbs", name: msg("Orbs"), text: msg("A dotted ball that takes a form for each status.") },
   { kind: "mixed", name: msg("Orbs + Loading"), text: msg("Orbs, with a lattice of dots beside the thinking. How it starts.") },

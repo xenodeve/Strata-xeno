@@ -6,6 +6,8 @@ export const part: Record<string, string> = {
   "Requests": "คำขอ",
   "Hardware": "ฮาร์ดแวร์",
   "About": "เกี่ยวกับ",
+  "Settings": "ตั้งค่า",
+  "How the app looks and what it connects to. The tools the model may use are set here too.": "หน้าตาของแอปและสิ่งที่เชื่อมต่อ รวมถึงเครื่องมือที่โมเดลใช้ได้ ตั้งได้ที่นี่",
   "Pages": "หน้า",
   "Strata, the dashboard": "Strata ไปที่ภาพรวม",
   "System": "ตามระบบ",

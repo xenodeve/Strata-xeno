@@ -3,7 +3,8 @@ import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
   Attachment01Icon, Cancel01Icon, Download01Icon, File02Icon, HelpCircleIcon, PlusSignIcon, Settings02Icon, SparklesIcon, MessageAdd01Icon, PlugSocketIcon,
 } from "@hugeicons/core-free-icons"
-import { t, tn } from "../lib/i18n"
+import { msg, t } from "../lib/i18n"
+import type { McpServer } from "../lib/api"
 
 // The composer: the field, and one bar of tools under it. Adapted from React Bits' PromptBar (MIT + Commons Clause: used
 // inside this app only, see REFERENCES.md). Changes: our tokens instead of fixed colours; the arrow-to-stop morph is a
@@ -56,6 +57,12 @@ function SendGlyph({ busy }: { busy: boolean }) {
   )
 }
 
+const MCP_STATE: Record<string, string> = { ready: msg("Connected"), starting: msg("Starting"), failed: msg("Failed"), stopped: msg("Stopped"), idle: msg("Waiting") }
+
+function McpSwitch({ on, label, onClick, disabled }: { on: boolean; label: string; onClick: () => void; disabled?: boolean }) {
+  return <button type="button" role="switch" aria-checked={on} aria-label={label} disabled={disabled} className="prompt-bar__sw" onMouseDown={(e) => e.preventDefault()} onClick={onClick}><span aria-hidden /></button>
+}
+
 interface Row { key: string; name: string; description: string; icon: IconSvgElement; disabled?: boolean; state?: string; checked?: boolean }
 
 export interface PromptBarProps {
@@ -72,7 +79,7 @@ export interface PromptBarProps {
   onNewChat: () => void
   onSave: () => void
   onSampling: () => void
-  mcp: { servers: number; tools: number; on: boolean; onToggle: () => void }      // the MCP tools: shown in the + menu, switched there
+  mcp: { servers: McpServer[]; tools: number; on: boolean; off: string[]; onToggleAll: () => void; onToggleServer: (name: string) => void; setupHref: string }      // the MCP tools: a row in the + menu that opens the list of servers, each with its tools and its own switch
   efforts: string[]
   effort: number
   onEffort: (i: number) => void
@@ -89,20 +96,22 @@ export function PromptBar(p: PromptBarProps) {
   const rows = useRef<(HTMLButtonElement | null)[]>([])
   const lastOpen = useRef<string | null>(null)
   const typing = useRef({ energy: 0, strokes: 0 })
-  const [menu, setMenu] = useState<"plus" | "effort" | null>(null)
+  const [menu, setMenu] = useState<"plus" | "effort" | "mcp" | null>(null)
   const [active, setActive] = useState(0)
   const [focused, setFocused] = useState(false)
   const [visible, setVisible] = useState(() => typeof document === "undefined" || !document.hidden)
   const [pressed, setPressed] = useState(false)
 
+  const usable = (x: McpServer) => x.tools.length > 0 && (x.status === "ready" || x.status === "stopped")       // a server that is up and offers tools can be switched
+  const mcpOn = p.mcp.on ? p.mcp.servers.filter((x) => usable(x) && !p.mcp.off.includes(x.name)).length : 0
   const list: Row[] = [
     { key: "attach", name: t("Photos & files"), description: p.attachTitle, icon: Attachment01Icon },
     { key: "new", name: t("New chat"), description: t("Clears this chat, with undo"), icon: MessageAdd01Icon, disabled: p.busy },
     { key: "save", name: t("Save as Markdown"), description: t("Download the conversation"), icon: Download01Icon },
     {
-      key: "mcp", name: t("MCP tools"), icon: PlugSocketIcon, disabled: p.mcp.servers === 0, checked: p.mcp.on && p.mcp.servers > 0,
-      description: p.mcp.servers === 0 ? t("No server is set up. Add them in the run config.") : p.mcp.tools ? tn(p.mcp.servers, "{tools} tools from {n} server.", "{tools} tools from {n} servers.", { tools: p.mcp.tools }) : t("No server is connected yet."),
-      state: p.mcp.servers === 0 ? undefined : p.mcp.on ? t("on") : t("off"),
+      key: "mcp", name: t("MCP tools"), icon: PlugSocketIcon, checked: mcpOn > 0,
+      description: p.mcp.servers.length === 0 ? t("No server is set up. Add them in Settings.") : p.mcp.tools ? t("{on} of {n} servers on · {tools} tools", { on: mcpOn, n: p.mcp.servers.length, tools: p.mcp.tools }) : t("No server is connected yet."),
+      state: p.mcp.servers.length === 0 ? undefined : mcpOn === 0 ? t("off") : mcpOn === p.mcp.servers.length ? t("on") : `${mcpOn}/${p.mcp.servers.length}`,
     },
   ]
   const cursor = Math.min(active, list.length - 1)
@@ -115,7 +124,7 @@ export function PromptBar(p: PromptBarProps) {
   const closeMenu = useCallback(() => setMenu(null), [])
   const focusInput = () => p.inputRef.current?.focus({ preventScroll: true })
   // Focus first, then set the menu: giving the field focus closes menus (its onFocus), so the order matters when the field did not have it.
-  const toggle = (kind: "plus" | "effort") => { const next = menu === kind ? null : kind; setActive(0); focusInput(); setMenu(next) }
+  const toggle = (kind: "plus" | "effort" | "mcp") => { const next = menu === kind ? null : kind; setActive(0); focusInput(); setMenu(next) }
 
   useEffect(() => {
     const on = () => setVisible(!document.hidden)
@@ -210,7 +219,7 @@ export function PromptBar(p: PromptBarProps) {
   }, [p.inputRef, p.onPasteFiles])
 
   const runRow = (key: string) => {
-    if (key === "mcp") { p.mcp.onToggle(); return }          // a switch: it stays open to show the change
+    if (key === "mcp") { setMenu("mcp"); return }             // opens the list of servers, each with its tools and its own switch
     closeMenu()
     if (key === "attach") file.current?.click()
     else if (key === "new") p.onNewChat()
@@ -244,6 +253,42 @@ export function PromptBar(p: PromptBarProps) {
   return (
     <div ref={root} className="prompt-bar" data-busy={p.busy ? "" : undefined}>
       {p.children}
+      {menu === "mcp" && (
+        <div className="prompt-bar__menu" role="dialog" aria-label={t("MCP tools")} data-kind="mcp">
+          <div className="prompt-bar__mcp-head">
+            <span className="prompt-bar__mcp-title">{t("MCP tools")}</span>
+            <span className="prompt-bar__mcp-count">{p.mcp.servers.length ? t("{n} tools", { n: p.mcp.tools }) : ""}</span>
+            {p.mcp.servers.length > 0 && <McpSwitch on={p.mcp.on} label={t("All MCP tools")} onClick={p.mcp.onToggleAll} />}
+          </div>
+          {p.mcp.servers.length === 0 ? (
+            <p className="prompt-bar__mcp-empty">{t("No server is set up. Add them in Settings.")}</p>
+          ) : (
+            <ul className="prompt-bar__mcp-list" aria-label={t("MCP servers")}>
+              {p.mcp.servers.map((x) => {
+                const can = usable(x)
+                const on = p.mcp.on && can && !p.mcp.off.includes(x.name)
+                return (
+                  <li key={x.name} className="prompt-bar__mcp-item" data-server={x.name} data-off={on ? undefined : ""}>
+                    <div className="prompt-bar__mcp-line">
+                      <span className="prompt-bar__mcp-name">{x.name}</span>
+                      <span className="prompt-bar__mcp-state" data-bad={x.status === "failed" ? "" : undefined}>{MCP_STATE[x.status] ? t(MCP_STATE[x.status]) : x.status}</span>
+                      <McpSwitch on={on} disabled={!can || !p.mcp.on} label={t("Use {name}", { name: x.name })} onClick={() => p.mcp.onToggleServer(x.name)} />
+                    </div>
+                    {x.error && <div className="prompt-bar__mcp-error">{x.error}</div>}
+                    {x.tools.length > 0 && (
+                      <ul className="prompt-bar__mcp-tools" aria-label={t("Tools of {name}", { name: x.name })}>
+                        {x.tools.map((tl) => <li key={tl.tool} title={tl.description || undefined}>{tl.tool}</li>)}
+                      </ul>
+                    )}
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+          <a className="prompt-bar__mcp-setup" href={p.mcp.setupHref} onClick={closeMenu}>{t("Set up servers")}</a>
+        </div>
+      )}
+
       {menu === "effort" && (
         <div className="prompt-bar__menu" role="dialog" aria-label={t("Thinking effort")} data-kind="effort">
           {menu === "effort" ? (

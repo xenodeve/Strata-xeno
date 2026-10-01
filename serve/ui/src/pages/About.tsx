@@ -3,14 +3,9 @@ import { apiHeaders, getHealth, NO_HEALTH, root, url, type Health } from "../lib
 import { parseArch } from "../lib/arch"
 import { fmt } from "../lib/format"
 import { t } from "../lib/i18n"
-import { store } from "../lib/store"
 import { ModelFacts } from "../components/ModelBlock"
 import { SLOT, Sentence } from "../components/bits"
 import type { ModelInfo } from "../lib/metrics"
-import { toast } from "../components/toast"
-import { inputCls } from "../components/ui"
-import { StatusMarkSettings } from "../components/StatusMarks"
-import { McpSettings } from "../components/McpSettings"
 
 interface Engine { engine?: string; version?: string; context?: number; kv?: string; spec?: number; mtp_max?: number; cpu_isa?: string; gpu_arch?: string }
 
@@ -27,7 +22,6 @@ export function About() {
   const [health, setHealth] = useState<Health>(NO_HEALTH)
   const [engine, setEngine] = useState<Engine>({})
   const [model, setModel] = useState<ModelInfo | null>(null)
-  const [key, setKey] = useState(() => store.get("apikey", ""))
 
   useEffect(() => {
     void getHealth().then(setHealth).catch(() => {})
@@ -60,29 +54,6 @@ export function About() {
           {engine.gpu_arch && <Row k={t("GPU architecture")} v={parseArch(engine.gpu_arch).map((a) => `${a.sm} ${a.name.replace("NVIDIA GeForce ", "")}`).join(", ")} />}
         </dl>
       </section>
-
-      <section>
-        <h2 className="text-[15px] font-semibold">{t("Status marks")}</h2>
-        <p className="mt-1 mb-3 text-[13px] text-ink-2">{t("What shows that something is happening: thinking, answering, reading. Pick one; the same list opens from the button at the top.")}</p>
-        <StatusMarkSettings />
-      </section>
-
-      <section>
-        <h2 className="text-[15px] font-semibold">{t("API key")}</h2>
-        <p className="mt-1 text-[13px] text-ink-2">{t("Only needed when the server was started with one. Kept in this browser.")}</p>
-        <input
-          className={`${inputCls} mt-2`}
-          type="password"
-          autoComplete="off"
-          value={key}
-          placeholder={t("No key")}
-          aria-label={t("API key")}
-          onChange={(e) => setKey(e.target.value)}
-          onBlur={() => { store.set("apikey", key.trim()); toast("success", t("API key saved"), t("Kept in this browser only.")) }}
-        />
-      </section>
-
-      <McpSettings />
 
       <section>
         <h2 className="text-[15px] font-semibold">{t("The classic app")}</h2>

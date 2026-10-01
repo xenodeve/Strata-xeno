@@ -528,12 +528,12 @@ class McpHub:
         self._routes = out
         return out
 
-    def template_tools(self, exclude=()) -> list[dict]:
+    def template_tools(self, exclude=(), skip_servers=()) -> list[dict]:
         """The tools in the chat template's form ({name, description, parameters}); `exclude`: names the request
-        brought itself (those win)."""
+        brought itself (those win); `skip_servers`: servers the page switched off for this chat."""
         out = []
         for name, (s, tool) in self.routes().items():
-            if name in exclude:
+            if name in exclude or s.name in skip_servers:
                 continue
             t = next(x for x in s.tools if x["name"] == tool)
             schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}

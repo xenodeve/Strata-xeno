@@ -4,6 +4,8 @@ import { beforeAll, describe, expect, test } from "bun:test"
 // request carrying the tool rounds back. fetch is replaced by a stream cut at awkward places, as a network does.
 let ChatController: typeof import("./chat").ChatController
 let metaText: typeof import("./chat").metaText
+let mcpRequest: typeof import("./chat").mcpRequest
+let DEFAULTS: typeof import("./chat").DEFAULTS
 
 beforeAll(async () => {
   const g = globalThis as Record<string, unknown>
@@ -11,7 +13,7 @@ beforeAll(async () => {
   g.requestAnimationFrame = (f: () => void) => setTimeout(f, 0)
   g.cancelAnimationFrame = clearTimeout
   g.location = { pathname: "/next/", search: "" }
-  ;({ ChatController, metaText } = await import("./chat"))
+  ;({ ChatController, metaText, mcpRequest, DEFAULTS } = await import("./chat"))
 })
 
 const enc = new TextEncoder()
@@ -246,5 +248,32 @@ describe("chat stream", () => {
     c2.messages = [{ role: "user", text: "q", time: 1 }, { role: "assistant", text: "a", time: 2 }]
     expect(await c2.edit(0, "  ", ctx)).toBe(false)
     expect(c2.messages).toHaveLength(2)
+  })
+})
+
+describe("which MCP servers a request uses", () => {
+  const sv = (name: string, tools: number, status = "ready") => ({ name, transport: "stdio", status, tools: Array.from({ length: tools }, (_, i) => ({ tool: `t${i}` })) })
+  const mcp = { servers: [sv("files", 3), sv("web", 2), sv("down", 0, "failed")], tools: 5 }
+  test("all on: strata_mcp and no list", () => {
+    expect(mcpRequest(DEFAULTS, mcp)).toEqual({ strata_mcp: true })
+  })
+  test("one switched off: it is named, the others still run", () => {
+    expect(mcpRequest({ ...DEFAULTS, mcpOff: ["web"] }, mcp)).toEqual({ strata_mcp: true, strata_mcp_off: ["web"] })
+  })
+  test("every server that has tools switched off: the request does not ask for MCP at all", () => {
+    expect(mcpRequest({ ...DEFAULTS, mcpOff: ["files", "web"] }, mcp)).toEqual({})
+  })
+  test("the master switch off: nothing, whatever the list says", () => {
+    expect(mcpRequest({ ...DEFAULTS, mcp: false }, mcp)).toEqual({})
+  })
+  test("a name that is no longer a server is not sent, and a saved value that is not a list is ignored", () => {
+    expect(mcpRequest({ ...DEFAULTS, mcpOff: ["gone", "web"] }, mcp)).toEqual({ strata_mcp: true, strata_mcp_off: ["web"] })
+    expect(mcpRequest({ ...DEFAULTS, mcpOff: "web" as unknown as string[] }, mcp)).toEqual({ strata_mcp: true })
+  })
+  test("no server has tools: nothing", () => {
+    expect(mcpRequest(DEFAULTS, { servers: [sv("down", 0, "failed")], tools: 0 })).toEqual({})
+  })
+  test("a list that has not arrived yet (servers empty, tools counted) still asks, as before", () => {
+    expect(mcpRequest(DEFAULTS, { servers: [], tools: 2 })).toEqual({ strata_mcp: true })
   })
 })

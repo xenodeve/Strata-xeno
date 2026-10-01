@@ -1,4 +1,5 @@
 import { About } from "./About"
+import { Settings } from "./Settings"
 import { Dashboard } from "./Dashboard"
 import { GpuPage, Hardware, SsdPage } from "./Hardware"
 import { Live } from "./Live"
@@ -21,6 +22,8 @@ export function PageView({ route }: { route: Route }) {
       const [kind, n] = route.params
       return kind === "gpu" && n ? <GpuPage n={n} /> : kind === "ssd" && n ? <SsdPage n={n} /> : <Hardware />
     }
+    case "settings":
+      return <Settings />
     case "about":
       return <About />
   }
