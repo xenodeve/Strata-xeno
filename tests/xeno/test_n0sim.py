@@ -47,7 +47,7 @@ def trace(*chunks, version=2):
 
 def sim(path, cap_bytes, boot=(), owned=(), policy="baseline", **params):
     t = n0sim.load(path, n_expert=NE)
-    return n0sim.simulate(t, sizes=[SIZE] * 2, cap_bytes=cap_bytes, boot_order=list(boot), owned=set(owned),
+    return n0sim.simulate(t, sizes=[SIZE] * 3, cap_bytes=cap_bytes, boot_order=list(boot), owned=set(owned),
                           n_expert=NE, policy=policy, **params)
 
 
@@ -208,3 +208,97 @@ def test_loads_per_emitted_token_counts_committed_positions():
     assert s.loads == 5
     assert s.loads_per_token == pytest.approx(5 / 4)
     assert s.loads_per_round == pytest.approx(5 / 2)
+
+
+# ------------------------------------------------------------------ #89 window policies
+
+
+def _recent_vs_frequent():
+    # cap 2 experts.  w0-w3: layer 0 routes 1 (a frequent expert, score ~4.6).  w4: layer 0 routes 2 (a recent one).
+    # w5: layer 1 routes 6 -> one eviction among layer 0's two.  The baseline drops the RECENT expert 2 (lower
+    # score); a recent-tokens window of k=1 protects 2 (the last committed token at layer 0 routed it) and drops 1.
+    ws = [window(i, {0: [[1]]}, 0) for i in range(4)] + [window(4, {0: [[2]]}, 0), window(5, {1: [[6]]}, 0)]
+    return trace(*ws)
+
+
+def test_baseline_drops_the_recent_expert_in_the_recent_vs_frequent_case():
+    assert sim(_recent_vs_frequent(), 200).evicted == [(0, 2)]
+
+
+def test_window_k_never_evicts_an_expert_inside_its_window_while_the_cache_fits_it():
+    assert sim(_recent_vs_frequent(), 200, policy="window", k=1).evicted == [(0, 1)]
+    assert sim(_recent_vs_frequent(), 200, policy="window_lfu", k=1).evicted == [(0, 1)]
+
+
+def test_window_k_has_no_miss_after_warm_up_on_a_full_overlap_trace():
+    ws = [window(i, {0: [[1, 2]], 1: [[3]]}, 0) for i in range(6)]
+    s = sim(trace(*ws), 300, policy="window", k=2)
+    assert s.loads == 3      # the first window's three cold loads, nothing after
+
+
+def _pseudo_random_trace(seed=7, n=40):
+    import random
+    r = random.Random(seed)
+    ws = []
+    for i in range(n):
+        n_pos = r.randint(1, 4)
+        routes = {layer: [[r.randrange(NE) for _ in range(2)] for _ in range(n_pos)] for layer in (0, 1)}
+        ws.append(window(i, routes, r.randint(0, n_pos - 1)))
+    return trace(*ws)
+
+
+def test_window_lfu_with_an_empty_window_is_exactly_the_baseline():
+    p = _pseudo_random_trace()
+    a, b = sim(p, 500), sim(p, 500, policy="window_lfu", k=0)
+    assert (a.loads, a.hits, a.evicted) == (b.loads, b.hits, b.evicted)
+
+
+def test_wtinylfu_keeps_a_frequent_expert_against_a_stream_of_one_offs():
+    # (0,1) is used every window; every window also routes a new one-off expert, at layer 1 or 2 by turns (with one
+    # other layer, the runtime's rule - never evict the layer being loaded - would leave (0,1) as the only victim).
+    ws = [window(i, {0: [[1]], 1 + i % 2: [[i]]}, 0) for i in range(8)]
+    s = sim(trace(*ws), 200, policy="wtinylfu", window_frac=0.5)
+    assert (0, 1) not in s.evicted
+    assert s.loads == 1 + 8   # (0,1) once, then every one-off
+
+
+# ------------------------------------------------------------------ #90 speculation-aware admission, prompt seed
+
+
+def test_spec_aware_equals_the_baseline_when_every_draft_is_accepted():
+    import random
+    r = random.Random(3)
+    ws = []
+    for i in range(30):
+        n_pos = r.randint(1, 4)
+        routes = {layer: [[r.randrange(NE) for _ in range(2)] for _ in range(n_pos)] for layer in (0, 1)}
+        ws.append(window(i, routes, n_pos - 1))
+    p = trace(*ws)
+    a, b = sim(p, 400), sim(p, 400, policy="spec")
+    assert (a.loads, a.hits, a.evicted) == (b.loads, b.hits, b.evicted)
+
+
+def test_spec_aware_evicts_a_rejected_only_expert_before_a_committed_one():
+    # cap 2.  w0: committed position routes layer-0 expert 1; the rejected draft routes layer-0 expert 2.
+    # w1: layer 1 routes 6 -> one eviction.  Both have the same baseline score, so the baseline drops the lower index
+    # (0,1) - the committed one; speculation-aware admission put (0,2) on probation and drops it first.
+    p = trace(window(0, {0: [[1], [2]]}, 0), window(1, {1: [[6]]}, 0))
+    assert sim(p, 200).evicted == [(0, 1)]
+    assert sim(p, 200, policy="spec").evicted == [(0, 2)]
+
+
+def test_prompt_tail_seed_loads_the_last_prompt_routes_before_decode():
+    # request 0: a prompt window (phase 0) routes 3; the first decode window routes 3.  Seeded, the decode window hits.
+    p = trace(rec(-3, [0]) + window(0, {0: [[3]]}, 0, phase=0) + window(1, {0: [[3]]}, 0, phase=1))
+    plain = sim(p, 300, phases=(1,))
+    seeded = sim(p, 300, phases=(1,), seed_k=4)
+    assert plain.loads == 1 and seeded.loads == 0
+    assert seeded.seed_loads == 1
+
+
+def test_hit_rate_after_a_request_start_counts_the_first_decode_windows_of_each_request():
+    # request 0: two decode windows, the first misses (load), the second hits
+    p = trace(rec(-3, [0]) + window(0, {0: [[3]]}, 0) + window(1, {0: [[3]]}, 0))
+    s = sim(p, 300, start_windows=2)
+    assert s.start_hits == 1 and s.start_loads == 1
+    assert s.start_hit_rate == pytest.approx(0.5)

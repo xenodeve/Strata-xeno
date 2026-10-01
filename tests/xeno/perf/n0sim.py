@@ -147,19 +147,241 @@ class Baseline:
                 h[:] = [(self.raw[k], i, v, k) for _, i, v, k in h]
                 heapq.heapify(h)
 
-    def victim(self, resident, avoid_layer):
+    def on_evict(self, key):
+        pass   # lazy: the heap entry goes stale and is dropped when it reaches the top
+
+    def victim(self, resident, avoid_layer, skip=frozenset()):
+        """The lowest-scoring resident key outside `avoid_layer` and `skip` (ties: lowest flat index); if `skip` leaves
+        nothing, the lowest one ignoring it."""
         best = None
         for layer, h in self.heaps.items():
             if layer == avoid_layer:
                 continue
-            while h and (h[0][3] not in resident or self.ver.get(h[0][3]) != h[0][2]):
-                heapq.heappop(h)
+            held = []
+            while h:
+                top = h[0]
+                if top[3] not in resident or self.ver.get(top[3]) != top[2]:
+                    heapq.heappop(h)
+                elif top[3] in skip:
+                    held.append(heapq.heappop(h))
+                else:
+                    break
             if h and (best is None or h[0][:2] < best[:2]):
                 best = h[0]
+            for e in held:
+                heapq.heappush(h, e)
+        if best is None and skip:
+            return self.victim(resident, avoid_layer)
         return best[3] if best else None
 
 
-POLICIES = {"baseline": Baseline}
+class _RecentWindow:
+    """#89: the union, per layer, of the experts the last k committed tokens routed (Apple's sliding window, with
+    experts in place of neurons).  Updated at each window's end, so a window never protects its own positions."""
+
+    def __init__(self, k):
+        from collections import deque
+        self.k = k
+        self.hist: dict = {}
+        self.deque = deque
+
+    def update(self, w):
+        if self.k <= 0:
+            return
+        for layer in w.routes:
+            h = self.hist.setdefault(layer, self.deque(maxlen=self.k))
+            for ids in w.committed(layer):
+                h.append({e for e in ids if e >= 0})
+
+    def protected(self):
+        return {(layer, e) for layer, h in self.hist.items() for s in h for e in s}
+
+
+class WindowLFU(Baseline):
+    """#89: a protected recent-tokens window, the runtime's decayed LFU for everything else.  k = 0 is the baseline."""
+
+    name = "window_lfu"
+
+    def __init__(self, n_expert, k=4, decay=0.97):
+        super().__init__(n_expert, decay)
+        self.win = _RecentWindow(k)
+
+    def on_window_end(self, w):
+        super().on_window_end(w)
+        self.win.update(w)
+
+    def victim(self, resident, avoid_layer, skip=frozenset()):
+        return super().victim(resident, avoid_layer, self.win.protected())
+
+
+class WindowLRU(Baseline):
+    """#89: window-k alone - protect the recent-tokens window, evict the least recently used of the rest."""
+
+    name = "window"
+
+    def __init__(self, n_expert, k=4, decay=0.97):
+        super().__init__(n_expert, decay)
+        from collections import OrderedDict
+        self.win = _RecentWindow(k)
+        self.lru = OrderedDict()
+
+    def _touch(self, key):
+        self.lru[key] = None
+        self.lru.move_to_end(key)
+
+    def on_boot(self, key):
+        self._touch(key)
+
+    def on_load(self, key, w, layer):
+        self._touch(key)
+
+    def on_access(self, key, w, layer):
+        self._touch(key)
+
+    def on_evict(self, key):
+        self.lru.pop(key, None)
+
+    def on_window_end(self, w):
+        self.win.update(w)
+
+    def victim(self, resident, avoid_layer, skip=frozenset()):
+        prot = self.win.protected()
+        fallback = None
+        for key in self.lru:
+            if key[0] == avoid_layer:
+                continue
+            if key not in prot:
+                return key
+            if fallback is None:
+                fallback = key
+        return fallback
+
+
+class WTinyLFU(Baseline):
+    """#89 reference design: a small LRU window segment (`window_frac` of the cache) in front of an LRU main segment;
+    when the window overflows, its oldest entry enters the main segment if there is room, or if it is used more often
+    (decayed count) than the main segment's oldest entry, which is then evicted - otherwise the candidate is evicted."""
+
+    name = "wtinylfu"
+
+    def __init__(self, n_expert, window_frac=0.01, decay=0.97):
+        super().__init__(n_expert, decay)
+        from collections import OrderedDict
+        self.frac = window_frac
+        self.window, self.main = OrderedDict(), OrderedDict()
+        self.wbytes = self.mbytes = 0
+        self.sizes, self.wcap, self.mcap = None, 0, 0
+
+    def bind(self, sizes, cap_bytes):
+        self.sizes = sizes
+        self.wcap = int(cap_bytes * self.frac)
+        self.mcap = cap_bytes - self.wcap
+
+    def _freq(self, key):
+        return self.raw.get(key, 0.0)
+
+    def _put(self, seg, key):
+        if key in self.window:
+            self.window.move_to_end(key)
+        elif key in self.main:
+            self.main.move_to_end(key)
+        elif seg == "w":
+            self.window[key] = None
+            self.wbytes += self.sizes[key[0]]
+        else:
+            self.main[key] = None
+            self.mbytes += self.sizes[key[0]]
+
+    def on_boot(self, key):
+        self.raw[key] = 1.0 / self.scale
+        self._put("m", key)
+
+    def on_load(self, key, w, layer):
+        self.raw[key] = self.raw.get(key, 0.0) + 1.0 / self.scale
+        self._put("w", key)
+
+    def on_access(self, key, w, layer):
+        self.raw[key] = self.raw.get(key, 0.0) + 1.0 / self.scale
+        self._put("w", key)
+
+    def on_evict(self, key):
+        if self.window.pop(key, 0) is None:
+            self.wbytes -= self.sizes[key[0]]
+        elif self.main.pop(key, 0) is None:
+            self.mbytes -= self.sizes[key[0]]
+
+    def on_window_end(self, w):
+        self.scale *= self.decay
+        if self.scale < 1e-150:
+            self.raw = {k: v * self.scale for k, v in self.raw.items()}
+            self.scale = 1.0
+
+    @staticmethod
+    def _oldest(seg, avoid_layer):
+        return next((k for k in seg if k[0] != avoid_layer), None)
+
+    def _promote(self, key):
+        del self.window[key]
+        self.wbytes -= self.sizes[key[0]]
+        self.main[key] = None
+        self.mbytes += self.sizes[key[0]]
+
+    def victim(self, resident, avoid_layer, skip=frozenset()):
+        while True:
+            cand = self._oldest(self.window, avoid_layer)
+            if cand is not None and self.wbytes > self.wcap:
+                if self.mbytes + self.sizes[cand[0]] <= self.mcap:
+                    self._promote(cand)
+                    continue
+                v = self._oldest(self.main, avoid_layer)
+                if v is None or self._freq(cand) > self._freq(v):
+                    self._promote(cand)
+                    if v is not None:
+                        return v
+                    continue
+                return cand
+            v = self._oldest(self.main, avoid_layer)
+            return v if v is not None else cand
+
+
+class SpecAware(Baseline):
+    """#90: only committed positions raise scores.  An expert loaded for a rejected draft position alone goes on
+    probation - no score, first to evict - and leaves probation when a committed position uses it."""
+
+    name = "spec"
+
+    def __init__(self, n_expert, decay=0.97):
+        super().__init__(n_expert, decay)
+        self.probation: set = set()
+        self._cw = (None, None, frozenset())
+
+    def _committed(self, w, layer):
+        if self._cw[0] is not w or self._cw[1] != layer:
+            self._cw = (w, layer, frozenset(e for ids in w.committed(layer) for e in ids))
+        return self._cw[2]
+
+    def on_load(self, key, w, layer):
+        if key[1] in self._committed(w, layer):
+            self.add(key)
+        else:
+            self.probation.add(key)
+
+    def on_access(self, key, w, layer):
+        if key[1] in self._committed(w, layer):
+            self.add(key)
+            self.probation.discard(key)
+
+    def on_evict(self, key):
+        self.probation.discard(key)
+
+    def victim(self, resident, avoid_layer, skip=frozenset()):
+        cands = [k for k in self.probation if k in resident and k[0] != avoid_layer]
+        if cands:
+            return min(cands, key=lambda k: k[0] * self.ne + k[1])
+        return super().victim(resident, avoid_layer)
+
+
+POLICIES = {p.name: p for p in (Baseline, WindowLFU, WindowLRU, WTinyLFU, SpecAware)}
 
 
 # ------------------------------------------------------------------ the replay
@@ -173,7 +395,15 @@ class Stats:
         self.evicted: list = []
         self.loads = self.load_bytes = self.hits = self.gpu = self.over_cap = 0
         self.rejected_only_loads = 0
+        self.seed_loads = self.seed_bytes = 0
+        self.start_hits = self.start_loads = 0
         self.emitted = self.rounds = 0
+
+    @property
+    def start_hit_rate(self):
+        """#90: host hits / (hits + loads) over the first decode windows of each request."""
+        n = self.start_hits + self.start_loads
+        return self.start_hits / n if n else 0.0
 
     def score(self, key):
         return self.policy.score(key)
@@ -196,12 +426,31 @@ class Stats:
         return self.rejected_only_loads / self.loads if self.loads else 0.0
 
 
-def simulate(trace, sizes, cap_bytes, boot_order, owned, n_expert, policy="baseline", phases=None, **params):
+def simulate(trace, sizes, cap_bytes, boot_order, owned, n_expert, policy="baseline", phases=None, seed_k=None,
+             start_windows=8, **params):
     """Replay `trace` and return a Stats.  `sizes[layer]` = bytes of one expert; `boot_order` = flat ids or
-    (layer, expert) keys in the runtime's host-tier order; `owned` = GPU-owned keys; `params` go to the policy."""
+    (layer, expert) keys in the runtime's host-tier order; `owned` = GPU-owned keys; `params` go to the policy.
+    `phases`: replay only these phases (windows of other phases still feed the seed).  `seed_k` (#90): before a
+    request's first decode window, load the experts its last `seed_k` prompt-window positions routed.
+    `start_windows`: the first decode windows of each request counted into start_hits / start_loads."""
     pol = POLICIES[policy](n_expert, **params)
+    if hasattr(pol, "bind"):
+        pol.bind(sizes, cap_bytes)
     s = Stats(pol)
     resident, used = s.resident, 0
+
+    def make_room(b, avoid_layer):
+        nonlocal used
+        while cap_bytes and used + b > cap_bytes:
+            v = pol.victim(resident, avoid_layer)
+            if v is None:
+                break
+            resident.discard(v)
+            used -= sizes[v[0]]
+            pol.on_evict(v)
+            s.evicted.append(v)
+        if used + b > cap_bytes:
+            s.over_cap += 1
     for x in boot_order:
         key = x if isinstance(x, tuple) else key_of(x, n_expert)
         if key in owned or key in resident:
@@ -213,9 +462,35 @@ def simulate(trace, sizes, cap_bytes, boot_order, owned, n_expert, policy="basel
         resident.add(key)
         pol.on_boot(key)
     s.boot_resident = set(resident)
+    request, prompt_tail, decode_seen = object(), {}, 0
     for w in trace.windows:
+        if w.request != request:              # a new request: its prompt tail and its start counters begin again
+            request, prompt_tail, decode_seen = w.request, {}, 0
+        if w.phase == 0:
+            for layer in w.routes:
+                tail = prompt_tail.setdefault(layer, [])
+                tail.extend(w.committed(layer))
+                if seed_k is not None:
+                    del tail[:-seed_k]
         if phases is not None and w.phase not in phases:
             continue
+        if w.phase != 0 and decode_seen == 0 and seed_k and prompt_tail:
+            for layer in sorted(prompt_tail):     # #90: the prompt-tail seed, before the first decode window
+                for e in dict.fromkeys(e for ids in prompt_tail[layer] for e in ids if e >= 0):
+                    key = (layer, e)
+                    if key in owned or key in resident:
+                        continue
+                    b = sizes[layer]
+                    make_room(b, None)
+                    resident.add(key)
+                    used += b
+                    s.seed_loads += 1
+                    s.seed_bytes += b
+                    pol.on_boot(key)
+        counting = w.phase != 0 and decode_seen < start_windows
+        if w.phase != 0:
+            decode_seen += 1
+        hits0, loads0 = s.hits, s.loads
         for layer in sorted(w.routes):
             distinct = dict.fromkeys(e for ids in w.routes[layer] for e in ids if e >= 0)
             host = []
@@ -233,15 +508,7 @@ def simulate(trace, sizes, cap_bytes, boot_order, owned, n_expert, policy="basel
                 if key[1] not in committed:
                     s.rejected_only_loads += 1   # #88: loaded (and admitted) for a rejected draft only
                 b = sizes[layer]
-                while cap_bytes and used + b > cap_bytes:
-                    v = pol.victim(resident, layer)
-                    if v is None:
-                        break
-                    resident.discard(v)
-                    used -= sizes[v[0]]
-                    s.evicted.append(v)
-                if used + b > cap_bytes:
-                    s.over_cap += 1
+                make_room(b, layer)
                 resident.add(key)
                 used += b
                 s.loads += 1
@@ -249,6 +516,9 @@ def simulate(trace, sizes, cap_bytes, boot_order, owned, n_expert, policy="basel
                 pol.on_load(key, w, layer)
             for key in host:
                 pol.on_access(key, w, layer)
+        if counting:
+            s.start_hits += s.hits - hits0
+            s.start_loads += s.loads - loads0
         pol.on_window_end(w)
         s.emitted += w.n_acc + 1
         s.rounds += 1
