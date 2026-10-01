@@ -189,11 +189,11 @@ html:lang(th) .prompt-bar { line-height: 24px; }
    (data-still); the stream is a real window onto text that grows (native scrolling, fades only where there is more) and not the
    looping ticker of the demo. Reduced motion stays off, as the snippets require. ---- */
 :root {
-  --digit-dur: 500ms; --digit-distance: 8px; --digit-stagger: 70ms; --digit-blur: 2px;
+  --digit-dur: 320ms; --digit-distance: 6px; --digit-stagger: 38ms; --digit-blur: 2px;
   --digit-ease: cubic-bezier(0.34, 1.45, 0.64, 1); --digit-dir-x: 0; --digit-dir-y: 1;
   --morph-open-dur: 350ms; --morph-close-dur: 250ms; --morph-ease: cubic-bezier(0.34, 1.25, 0.64, 1); --morph-close-ease: cubic-bezier(0.22, 1, 0.36, 1);
   --morph-r-closed: 9px; --morph-r-open: 14px; --morph-fade-dur: 200ms; --morph-slide: 40px; --morph-rotate: 45deg; --morph-scale: 0.97; --morph-blur: 2px;   /* radii for our 30 px button and rows; the rest as shipped */
-  --reel-dur: 650ms; --reel-cell: 1.35em; --reel-spin-blur: 3px; --reel-stagger: 45ms; --reel-ease: cubic-bezier(0.16, 1, 0.3, 1);   /* shorter and in em for a figure in a line of text */
+  --reel-dur: 450ms; --reel-cell: 1.35em; --reel-spin-blur: 3px; --reel-stagger: 45ms; --reel-ease: cubic-bezier(0.16, 1, 0.3, 1);   /* shorter and in em for a figure in a line of text */
   --reason-hold: 840ms; --reason-step: 500ms; --reason-fade: 28px; --reason-ease: cubic-bezier(0.22, 1, 0.36, 1);
 }
 @keyframes t-digit-pop-in {

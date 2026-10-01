@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { popRuns, reelMove, staggerOf } from "./pop"
+import { pace, popRuns, reelMove, staggerOf } from "./pop"
 
 // Numbers in a line of text pop in when they change (transitions.dev "Number pop-in"): the text is cut into plain runs and number
 // runs, and the last two characters of a number come in a step behind the others.
@@ -41,5 +41,26 @@ describe("reel move", () => {
   test("a digit that did not change does not move", () => {
     expect(reelMove(5, 5, true)).toBe(0)
     expect(reelMove(5, 5, false)).toBe(0)
+  })
+})
+
+// A figure that changes often must stay readable: the faster it changes, the shorter its move, and past a point it does not move at all.
+describe("pace", () => {
+  test("a figure that was still for a good while moves as it was made to", () => {
+    expect(pace(null, 320)).toEqual({ animate: true, dur: 320 })
+    expect(pace(2000, 320)).toEqual({ animate: true, dur: 320 })
+    expect(pace(2000, 450)).toEqual({ animate: true, dur: 450 })
+  })
+  test("one that changes every half second moves in a short part of that time", () => {
+    expect(pace(500, 320)).toEqual({ animate: true, dur: 200 })
+    expect(pace(500, 450)).toEqual({ animate: true, dur: 200 })
+  })
+  test("the move gets shorter the faster it changes, but not below what the eye can follow", () => {
+    expect(pace(300, 320).dur).toBe(120)
+    expect(pace(150, 320)).toEqual({ animate: true, dur: 90 })
+  })
+  test("one that changes faster than that does not move: the digits just show", () => {
+    expect(pace(149, 320)).toEqual({ animate: false, dur: 0 })
+    expect(pace(40, 450)).toEqual({ animate: false, dur: 0 })
   })
 })

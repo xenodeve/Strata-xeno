@@ -164,12 +164,17 @@ export const checks = [
       const popping = () => pg.evaluate(() => [...document.querySelectorAll(".t-digit:not([data-still])")].filter((e) => getComputedStyle(e).animationName === "t-digit-pop-in").length)
       t.ok("at rest no figure is popping", (await popping()) === 0)
       await pg.evaluate(() => { fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "m", max_tokens: 800, messages: [{ role: "user", content: "go" }] }) }) })
-      let most = 0, digits = 0, reels = 0, moving = 0
-      for (let i = 0; i < 60; i++) { await pg.waitForTimeout(100); most = Math.max(most, await popping()); digits = Math.max(digits, await pg.locator(".t-digit").count()); reels = Math.max(reels, await pg.locator(".t-reel-col").count()); moving = Math.max(moving, await pg.locator(".t-reel-strip[data-moving]").count()) }
+      let most = 0, digits = 0, reels = 0, moving = 0, popMs = 0, reelMs = 0
+      const lengths = () => pg.evaluate(() => ({
+        pop: Math.max(0, ...[...document.querySelectorAll(".t-digit:not([data-still])")].filter((e) => getComputedStyle(e).animationName === "t-digit-pop-in").map((e) => parseFloat(getComputedStyle(e).animationDuration) * 1000)),
+        reel: Math.max(0, ...[...document.querySelectorAll(".t-reel-strip[data-moving]")].map((e) => parseFloat(getComputedStyle(e).transitionDuration) * 1000)),
+      }))
+      for (let i = 0; i < 60; i++) { await pg.waitForTimeout(100); const l = await lengths(); popMs = Math.max(popMs, l.pop); reelMs = Math.max(reelMs, l.reel); most = Math.max(most, await popping()); digits = Math.max(digits, await pg.locator(".t-digit").count()); reels = Math.max(reels, await pg.locator(".t-reel-col").count()); moving = Math.max(moving, await pg.locator(".t-reel-strip[data-moving]").count()) }
       t.ok("a speed that goes up and down is made of reels", reels > 0, `${reels} reels`)
       t.ok("and a reel turns when its digit changes", moving > 0, `${moving} moving at once`)
       t.ok("a request makes figures out of digits", digits > 0, `${digits} digit elements`)
       t.ok("and the digits that change pop in", most > 0, `at most ${most} at once`)
+      t.ok("a figure that changes about twice a second moves for a short part of that time (pop at most 330 ms, reel at most 460 ms), so it can be read", popMs <= 330 && reelMs <= 460 && (popMs > 0 || reelMs > 0), `pop ${Math.round(popMs)} ms, reel ${Math.round(reelMs)} ms`)
       await pg.context().close()
     },
   },

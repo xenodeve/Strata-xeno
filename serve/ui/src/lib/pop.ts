@@ -23,3 +23,22 @@ export const staggerOf = (fromEnd: number): number => (fromEnd === 0 ? 2 : fromE
 export function reelMove(from: number, to: number, up: boolean): number {
   return up ? (to - from + 10) % 10 : -((from - to + 10) % 10) || 0       // (|| 0: not minus zero)
 }
+
+/** How long a figure that changes should take to move, by how long it had been still before this change (`sinceMs`; null: never changed).
+ *  A figure that changes often has to stay readable: it moves for a part of the time between its changes, never shorter than 90 ms
+ *  (the eye cannot follow less), and when it changes faster than 150 ms it does not move at all - the digits just show. `base` is its
+ *  full length, for a figure that changes rarely. */
+export function pace(sinceMs: number | null, base: number): { animate: boolean; dur: number } {
+  if (sinceMs === null) return { animate: true, dur: base }
+  if (sinceMs < 150) return { animate: false, dur: 0 }
+  return { animate: true, dur: Math.round(Math.min(base, Math.max(90, sinceMs * 0.4))) }
+}
+export const POP_MS = 320       // a number's pop-in at full length
+export const REEL_MS = 450      // a reel's turn at full length
+
+/** The pace of a text that changes: kept per component, it is worked out when the text becomes another one. */
+export function trackPace(prev: { text: string; at: number; pace: { animate: boolean; dur: number } } | null, text: string, now: number, base: number) {
+  if (prev === null) return { text, at: now, pace: { animate: true, dur: base } }
+  if (prev.text === text) return prev
+  return { text, at: now, pace: pace(now - prev.at, base) }
+}
