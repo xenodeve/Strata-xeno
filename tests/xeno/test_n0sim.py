@@ -336,3 +336,31 @@ def test_window_lfu_falls_back_to_the_lowest_score_when_the_window_protects_ever
     p = trace(window(0, {0: [[1, 2]]}, 0), window(1, {1: [[6]]}, 0))
     s = sim(p, 200, policy="window_lfu", k=4)
     assert s.evicted == [(0, 1)] and s.over_cap == 0
+
+
+# ------------------------------------------------------------------ draft-weighted scoring (follow-up to #90)
+
+
+def test_per_position_scores_every_position_that_routes_the_expert():
+    # one window: layer 0 routes expert 1 at all 3 positions; boot score 1 -> 1 + 3 = 4, then x0.97
+    p = trace(window(0, {0: [[1], [1], [1]]}, 2))
+    assert sim(p, 100, boot=[1], policy="per_position").score((0, 1)) == pytest.approx(4 * 0.97)
+
+
+def test_per_position_counts_a_load_once_plus_its_positions():
+    p = trace(window(0, {0: [[3], [3]]}, 1))
+    assert sim(p, 100, policy="per_position").score((0, 3)) == pytest.approx((1 + 2) * 0.97)
+
+
+def test_draft_bonus_adds_the_bonus_when_a_rejected_position_routes_the_expert():
+    # expert 2 is routed by the rejected draft only: +1 (access) +2 (bonus); expert 1 by the committed position: +1
+    p = trace(window(0, {0: [[1], [2]]}, 0))
+    s = sim(p, 300, boot=[1, 2], policy="draft_bonus", bonus=2.0)
+    assert s.score((0, 1)) == pytest.approx((1 + 1) * 0.97)
+    assert s.score((0, 2)) == pytest.approx((1 + 1 + 2) * 0.97)
+
+
+def test_draft_bonus_of_zero_is_exactly_the_baseline():
+    p = _pseudo_random_trace(seed=11)
+    a, b = sim(p, 500), sim(p, 500, policy="draft_bonus", bonus=0.0)
+    assert (a.loads, a.hits, a.evicted) == (b.loads, b.hits, b.evicted)

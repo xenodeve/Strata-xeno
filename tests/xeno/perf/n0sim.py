@@ -392,7 +392,56 @@ class SpecAware(Baseline):
         return super().victim(resident, avoid_layer)
 
 
-POLICIES = {p.name: p for p in (Baseline, WindowLFU, WindowLRU, WTinyLFU, SpecAware)}
+class _PositionCounts:
+    """Per (window, layer): how many positions route each expert, and which experts a rejected position routes."""
+
+    def __init__(self):
+        self._w = self._layer = None
+        self.count, self.rejected = {}, frozenset()
+
+    def of(self, w, layer):
+        if self._w is not w or self._layer != layer:
+            self._w, self._layer, self.count = w, layer, {}
+            for ids in w.routes[layer]:
+                for e in set(ids):
+                    self.count[e] = self.count.get(e, 0) + 1
+            self.rejected = frozenset(e for ids in w.rejected(layer) for e in ids)
+        return self
+
+
+class PerPosition(Baseline):
+    """Follow-up to #90: rejected drafts' experts are reused soon, so weight them up instead of down - an access scores
+    one per position that routes the expert in the window-layer, not one per distinct expert."""
+
+    name = "per_position"
+
+    def __init__(self, n_expert, decay=0.97):
+        super().__init__(n_expert, decay)
+        self.pc = _PositionCounts()
+
+    def on_access(self, key, w, layer):
+        n = self.pc.of(w, layer).count.get(key[1], 1)
+        self.raw[key] = self.raw.get(key, 0.0) + n / self.scale
+        self._push(key)
+
+
+class DraftBonus(Baseline):
+    """Follow-up to #90: the baseline's +1 per access, plus `bonus` when a rejected draft position routes the expert."""
+
+    name = "draft_bonus"
+
+    def __init__(self, n_expert, bonus=1.0, decay=0.97):
+        super().__init__(n_expert, decay)
+        self.bonus = bonus
+        self.pc = _PositionCounts()
+
+    def on_access(self, key, w, layer):
+        extra = self.bonus if key[1] in self.pc.of(w, layer).rejected else 0.0
+        self.raw[key] = self.raw.get(key, 0.0) + (1.0 + extra) / self.scale
+        self._push(key)
+
+
+POLICIES = {p.name: p for p in (Baseline, WindowLFU, WindowLRU, WTinyLFU, SpecAware, PerPosition, DraftBonus)}
 
 
 # ------------------------------------------------------------------ the replay
