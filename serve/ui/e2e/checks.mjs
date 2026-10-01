@@ -224,7 +224,7 @@ export const checks = [
       for (let i = 0; i < 9; i++) { await pg.waitForTimeout(40); grow.push(await box()) }
       t.ok("it grows into the menu through in-between sizes", new Set(grow.map((g) => g.h)).size > 3 && grow[grow.length - 1].h > b0.h + 80 && grow[grow.length - 1].w > b0.w + 150, grow.map((g) => `${g.w}x${g.h}`).join(" "))
       await pg.waitForTimeout(400)
-      t.ok("the three actions are there to use", (await pg.locator(".t-morph-menu [role=option]").count()) === 3 && (await pg.locator(".t-morph-menu [role=option]").first().isVisible()))
+      t.ok("the four actions are there to use", (await pg.locator(".t-morph-menu [role=option]").count()) === 4 && (await pg.locator(".t-morph-menu [role=option]").first().isVisible()))
       await pg.keyboard.press("Escape")
       const shrink = []
       for (let i = 0; i < 9; i++) { await pg.waitForTimeout(40); shrink.push(await box()) }
@@ -360,6 +360,50 @@ export const checks = [
       t.ok("while it thinks: the lattice runs and there is no orb in the mark", g.lat === "working" && g.canvas === 0, JSON.stringify(g))
       await pg.waitForFunction(() => document.querySelector(".thought:not([data-working]) .lat[data-status='done']"), null, { timeout: 40000 })
       t.ok("when it is done: its tick", true)
+      await pg.context().close()
+    },
+  },
+  {
+    // MCP in the + menu: a row to see whether the tools are on, how many there are, and to switch them
+    name: "mcp: the + menu has an MCP row that shows the tools and switches them",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors)
+      const bodies = []
+      await pg.route("**/mcp", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ servers: [{ name: "fs", transport: "stdio", status: "ready", tools: [{ name: "read" }, { name: "list" }, { name: "search" }] }], tools: 3 }) }))
+      await pg.route("**/v1/chat/completions", async (r) => { try { bodies.push(JSON.parse(r.request().postData() || "{}")) } catch { /* not json */ } await r.continue() })
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea")
+      await pg.waitForTimeout(1500)
+      await pg.click("button[aria-label='Photos, files, new chat, save']")
+      await pg.waitForTimeout(600)
+      const row = pg.locator(".t-morph-menu [role=option]", { hasText: "MCP tools" })
+      t.ok("the menu has an MCP row, with how many tools and servers", (await row.count()) === 1 && (await row.innerText()).includes("3 tools from 1 server"), (await row.innerText()).split(String.fromCharCode(10)).join(" | "))
+      t.ok("it says the tools are on", (await row.getAttribute("aria-checked")) === "true" && (await row.innerText()).toLowerCase().includes("on"))
+      const h = await pg.evaluate(() => Math.round(document.querySelector(".t-morph").getBoundingClientRect().height))
+      t.ok("the panel is tall enough for four rows", h >= 160, `${h}px`)
+      await row.click()
+      await pg.waitForTimeout(400)
+      t.ok("clicking switches it off and keeps the menu open", (await row.getAttribute("aria-checked")) === "false" && (await pg.locator(".t-morph[data-open='true']").count()) === 1 && (await pg.evaluate(() => JSON.parse(localStorage.getItem("strata.sampling")).mcp)) === false)
+      await pg.keyboard.press("Escape")
+      await pg.fill("textarea", "hi")
+      await pg.keyboard.press("Enter")
+      await pg.waitForFunction(() => document.querySelector(".prose-chat, .thought"), null, { timeout: 30000 })
+      t.ok("and the request no longer asks for tools", bodies[0] && bodies[0].strata_mcp !== true, JSON.stringify(bodies[0]?.strata_mcp))
+      await pg.context().close()
+    },
+  },
+  {
+    // with no MCP server the row is there and says so
+    name: "mcpnone: with no MCP server the row says none is set up",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors)
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea")
+      await pg.waitForTimeout(1200)
+      await pg.click("button[aria-label='Photos, files, new chat, save']")
+      await pg.waitForTimeout(600)
+      const row = pg.locator(".t-morph-menu [role=option]", { hasText: "MCP tools" })
+      t.ok("the row is there, not usable, and says why", (await row.count()) === 1 && (await row.isDisabled()) && (await row.innerText()).includes("No server is set up"))
       await pg.context().close()
     },
   },

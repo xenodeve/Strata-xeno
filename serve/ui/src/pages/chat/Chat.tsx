@@ -243,6 +243,7 @@ export function Chat() {
           onStop={() => chat.stop()}
           onNewChat={newChat}
           onSave={download}
+          mcp={{ servers: mcp.servers.length, tools: mcp.tools, on: chat.settings.mcp !== false, onToggle: () => chat.setSettings({ ...chat.settings, mcp: chat.settings.mcp === false }) }}
           onSampling={() => setSheet(true)}
           efforts={choices.map((c) => t(c.label))}
           effort={Math.max(0, choices.findIndex((c) => c.value === chat.settings.thinking))}

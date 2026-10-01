@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as RKeyEvent, type PointerEvent as RPointerEvent, type ReactNode, type RefObject } from "react"
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
-  Attachment01Icon, Cancel01Icon, Download01Icon, File02Icon, HelpCircleIcon, PlusSignIcon, Settings02Icon, SparklesIcon, MessageAdd01Icon,
+  Attachment01Icon, Cancel01Icon, Download01Icon, File02Icon, HelpCircleIcon, PlusSignIcon, Settings02Icon, SparklesIcon, MessageAdd01Icon, PlugSocketIcon,
 } from "@hugeicons/core-free-icons"
-import { t } from "../lib/i18n"
+import { t, tn } from "../lib/i18n"
 
 // The composer: the field, and one bar of tools under it. Adapted from React Bits' PromptBar (MIT + Commons Clause: used
 // inside this app only, see REFERENCES.md). Changes: our tokens instead of fixed colours; the arrow-to-stop morph is a
@@ -56,7 +56,7 @@ function SendGlyph({ busy }: { busy: boolean }) {
   )
 }
 
-interface Row { key: string; name: string; description: string; icon: IconSvgElement; disabled?: boolean }
+interface Row { key: string; name: string; description: string; icon: IconSvgElement; disabled?: boolean; state?: string; checked?: boolean }
 
 export interface PromptBarProps {
   value: string
@@ -72,6 +72,7 @@ export interface PromptBarProps {
   onNewChat: () => void
   onSave: () => void
   onSampling: () => void
+  mcp: { servers: number; tools: number; on: boolean; onToggle: () => void }      // the MCP tools: shown in the + menu, switched there
   efforts: string[]
   effort: number
   onEffort: (i: number) => void
@@ -98,6 +99,11 @@ export function PromptBar(p: PromptBarProps) {
     { key: "attach", name: t("Photos & files"), description: p.attachTitle, icon: Attachment01Icon },
     { key: "new", name: t("New chat"), description: t("Clears this chat, with undo"), icon: MessageAdd01Icon, disabled: p.busy },
     { key: "save", name: t("Save as Markdown"), description: t("Download the conversation"), icon: Download01Icon },
+    {
+      key: "mcp", name: t("MCP tools"), icon: PlugSocketIcon, disabled: p.mcp.servers === 0, checked: p.mcp.on && p.mcp.servers > 0,
+      description: p.mcp.servers === 0 ? t("No server is set up. Add them in the run config.") : p.mcp.tools ? tn(p.mcp.servers, "{tools} tools from {n} server.", "{tools} tools from {n} servers.", { tools: p.mcp.tools }) : t("No server is connected yet."),
+      state: p.mcp.servers === 0 ? undefined : p.mcp.on ? t("on") : t("off"),
+    },
   ]
   const cursor = Math.min(active, list.length - 1)
   const canSend = p.value.trim().length > 0 || p.attachments.length > 0
@@ -204,6 +210,7 @@ export function PromptBar(p: PromptBarProps) {
   }, [p.inputRef, p.onPasteFiles])
 
   const runRow = (key: string) => {
+    if (key === "mcp") { p.mcp.onToggle(); return }          // a switch: it stays open to show the change
     closeMenu()
     if (key === "attach") file.current?.click()
     else if (key === "new") p.onNewChat()
@@ -323,7 +330,7 @@ export function PromptBar(p: PromptBarProps) {
         <div className="prompt-bar__bar">
           {/* the button is the menu: it grows into the panel and closes back into the button (transitions.dev "Plus to menu morph") */}
           <span className="prompt-bar__anchor">
-            <div className="t-morph prompt-bar__morph" data-open={menu === "plus" ? "true" : "false"}>
+            <div className="t-morph prompt-bar__morph" data-open={menu === "plus" ? "true" : "false"} style={{ "--pb-rows": list.length } as React.CSSProperties}>
               <div className="t-morph-menu" role="listbox" aria-label={t("Actions")} inert={menu !== "plus"}>
                   <span ref={glow} className="prompt-bar__glow" aria-hidden />
                   {list.map((row, i) => (
@@ -333,6 +340,7 @@ export function PromptBar(p: PromptBarProps) {
                       type="button"
                       role="option"
                       aria-selected={i === cursor}
+                  aria-checked={row.checked}
                       disabled={row.disabled}
                       className="prompt-bar__row"
                       onMouseDown={(e) => e.preventDefault()}
@@ -342,6 +350,7 @@ export function PromptBar(p: PromptBarProps) {
                       <span className="prompt-bar__row-icon"><HugeiconsIcon icon={row.icon} size={15} strokeWidth={1.8} /></span>
                       <span className="prompt-bar__row-name">{row.name}</span>
                       <span className="prompt-bar__row-desc">{row.description}</span>
+                  {row.state && <span className="prompt-bar__row-state" data-on={row.checked ? "" : undefined}>{row.state}</span>}
                     </button>
                   ))}
               </div>

@@ -135,7 +135,7 @@
     box-shadow var(--morph-close-dur) var(--morph-close-ease);
 }
 .t-morph[data-open="true"] {
-  width: min(320px, calc(100vw - 48px)); height: 128px; border-radius: var(--morph-r-open); background: var(--pb-menu);
+  width: min(320px, calc(100vw - 48px)); height: calc(var(--pb-rows, 3) * 40px + 8px); border-radius: var(--morph-r-open); background: var(--pb-menu);
   box-shadow: 0 0 0 1px var(--line), 0 14px 40px -12px rgb(0 0 0 / 0.28), 0 1px 2px rgb(0 0 0 / 0.06);
   transition:
     width var(--morph-open-dur) var(--morph-ease), height var(--morph-open-dur) var(--morph-ease),
@@ -156,3 +156,5 @@
 }
 .t-morph[data-open="true"] .t-morph-menu { opacity: 1; transform: translateX(0) scale(1); filter: blur(0); pointer-events: auto; }
 @media (prefers-reduced-motion: reduce) { .t-morph, .t-morph-plus, .t-morph-plus svg, .t-morph-menu { transition: none !important; } }
+.prompt-bar__row-state { flex: none; padding: 1px 7px; border-radius: 999px; background: var(--pb-hover); color: var(--pb-muted); font-size: 11px; line-height: 16px; }
+.prompt-bar__row-state[data-on] { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }

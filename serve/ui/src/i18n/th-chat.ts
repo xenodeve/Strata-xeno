@@ -120,6 +120,8 @@ export const part: Record<string, string> = {
   "Undo: take the prompt back": "ย้อนกลับ: เอา prompt กลับมา",
   "Waiting for the model…": "กำลังรอโมเดล…",
   "Answering…": "กำลังตอบกลับ…",
+  "MCP tools": "เครื่องมือ MCP",
+  "No server is set up. Add them in the run config.": "ยังไม่ได้ตั้ง server ไว้ เพิ่มได้ใน run config",
   "Planning the next step…": "กำลังวางแผนขั้นตอนต่อไป…",
   "Copy the answer": "คัดลอกคำตอบ",
   "Copy": "คัดลอก",
