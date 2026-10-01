@@ -237,8 +237,8 @@ export function PromptBar(p: PromptBarProps) {
   return (
     <div ref={root} className="prompt-bar" data-busy={p.busy ? "" : undefined}>
       {p.children}
-      {menu && (
-        <div className="prompt-bar__menu" role={menu === "effort" ? "dialog" : "listbox"} aria-label={menu === "effort" ? t("Thinking effort") : t("Actions")} data-kind={menu}>
+      {menu === "effort" && (
+        <div className="prompt-bar__menu" role="dialog" aria-label={t("Thinking effort")} data-kind="effort">
           {menu === "effort" ? (
             <>
               <div className="prompt-bar__effort-head">
@@ -273,29 +273,7 @@ export function PromptBar(p: PromptBarProps) {
                 <span className="prompt-bar__effort-thumb" />
               </div>
             </>
-          ) : (
-            <>
-              <span ref={glow} className="prompt-bar__glow" aria-hidden />
-              {list.map((row, i) => (
-                <button
-                  key={row.key}
-                  ref={(el) => { rows.current[i] = el }}
-                  type="button"
-                  role="option"
-                  aria-selected={i === cursor}
-                  disabled={row.disabled}
-                  className="prompt-bar__row"
-                  onMouseDown={(e) => e.preventDefault()}
-                  onPointerEnter={() => setActive(i)}
-                  onClick={() => runRow(row.key)}
-                >
-                  <span className="prompt-bar__row-icon"><HugeiconsIcon icon={row.icon} size={15} strokeWidth={1.8} /></span>
-                  <span className="prompt-bar__row-name">{row.name}</span>
-                  <span className="prompt-bar__row-desc">{row.description}</span>
-                </button>
-              ))}
-            </>
-          )}
+          ) : null}
         </div>
       )}
 
@@ -343,17 +321,42 @@ export function PromptBar(p: PromptBarProps) {
         />
 
         <div className="prompt-bar__bar">
-          <button
-            type="button"
-            className="prompt-bar__tool"
-            aria-label={t("Photos, files, new chat, save")}
-            aria-expanded={menu === "plus"}
-            data-on={menu === "plus" ? "" : undefined}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => toggle("plus")}
-          >
-            <HugeiconsIcon icon={PlusSignIcon} size={16} strokeWidth={2} />
-          </button>
+          {/* the button is the menu: it grows into the panel and closes back into the button (transitions.dev "Plus to menu morph") */}
+          <span className="prompt-bar__anchor">
+            <div className="t-morph prompt-bar__morph" data-open={menu === "plus" ? "true" : "false"}>
+              <div className="t-morph-menu" role="listbox" aria-label={t("Actions")} inert={menu !== "plus"}>
+                  <span ref={glow} className="prompt-bar__glow" aria-hidden />
+                  {list.map((row, i) => (
+                    <button
+                      key={row.key}
+                      ref={(el) => { rows.current[i] = el }}
+                      type="button"
+                      role="option"
+                      aria-selected={i === cursor}
+                      disabled={row.disabled}
+                      className="prompt-bar__row"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onPointerEnter={() => setActive(i)}
+                      onClick={() => runRow(row.key)}
+                    >
+                      <span className="prompt-bar__row-icon"><HugeiconsIcon icon={row.icon} size={15} strokeWidth={1.8} /></span>
+                      <span className="prompt-bar__row-name">{row.name}</span>
+                      <span className="prompt-bar__row-desc">{row.description}</span>
+                    </button>
+                  ))}
+              </div>
+              <button
+                type="button"
+                className="t-morph-plus prompt-bar__tool"
+                aria-label={t("Photos, files, new chat, save")}
+                aria-expanded={menu === "plus"}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => toggle("plus")}
+              >
+                <HugeiconsIcon icon={PlusSignIcon} size={16} strokeWidth={2} />
+              </button>
+            </div>
+          </span>
           <input ref={file} type="file" multiple hidden aria-label={t("Attach files")} onChange={(e) => { p.onFiles(Array.from(e.target.files || [])); e.target.value = "" }} />
           <button
             type="button"

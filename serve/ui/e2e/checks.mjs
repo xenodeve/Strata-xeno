@@ -129,6 +129,126 @@ export const checks = [
     },
   },
   {
+    // sending: the prompt rises out of the composer to its place, and the empty chat's heading closes up instead of vanishing
+    name: "send: the sent prompt glides out of the composer and the empty-chat heading closes up",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors)
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea")
+      await pg.waitForTimeout(800)
+      const hero = () => pg.evaluate(() => { const e = document.querySelector("h1.display"); const g = e && e.closest(".collapse-grid"); return g ? Math.round(g.getBoundingClientRect().height) : -1 })
+      const bubble = () => pg.evaluate(() => { const b = document.querySelector(".msg-in.group"); if (!b) return null; const c = getComputedStyle(b); return { tf: c.transform, op: +c.opacity, top: Math.round(b.getBoundingClientRect().top) } })
+      const h0 = await hero()
+      await pg.fill("textarea", "a question that is sent")
+      await pg.keyboard.press("Enter")
+      const rows = []
+      for (let i = 0; i < 12; i++) { rows.push({ b: await bubble(), h: await hero() }); await pg.waitForTimeout(40) }
+      const seen = rows.map((r) => r.b).filter(Boolean)
+      t.ok("the prompt appears and starts away from its place (a transform)", seen.length > 0 && seen[0].tf !== "none", seen[0] ? seen[0].tf : "none")
+      t.ok("it fades in on the way", seen.some((s) => s.op < 1))
+      t.ok("and settles with no transform", seen[seen.length - 1].tf === "none" && seen[seen.length - 1].op === 1)
+      const hs = rows.map((r) => r.h).filter((h) => h >= 0)
+      t.ok("the heading closes up through in-between heights", h0 > 0 && hs.length >= 2 && Math.min(...hs) < h0 && new Set(hs).size >= 3, [h0, ...hs].join(" "))
+      await pg.waitForTimeout(600)
+      t.ok("and is gone", (await hero()) === -1)
+      await pg.context().close()
+    },
+  },
+  {
+    // numbers that change pop in (transitions.dev "Number pop-in"), and the ones that were there from the start do not
+    name: "pop: a number that changes pops in, and a page does not start with every figure popping",
+    async run({ browser, long, t, errors }) {
+      const pg = await open(browser, errors)
+      await pg.goto(long.base + "/#/live")
+      await pg.waitForTimeout(2200)
+      const popping = () => pg.evaluate(() => [...document.querySelectorAll(".t-digit:not([data-still])")].filter((e) => getComputedStyle(e).animationName === "t-digit-pop-in").length)
+      t.ok("at rest no figure is popping", (await popping()) === 0)
+      await pg.evaluate(() => { fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "m", max_tokens: 800, messages: [{ role: "user", content: "go" }] }) }) })
+      let most = 0, digits = 0, reels = 0, moving = 0
+      for (let i = 0; i < 60; i++) { await pg.waitForTimeout(100); most = Math.max(most, await popping()); digits = Math.max(digits, await pg.locator(".t-digit").count()); reels = Math.max(reels, await pg.locator(".t-reel-col").count()); moving = Math.max(moving, await pg.locator(".t-reel-strip[data-moving]").count()) }
+      t.ok("a speed that goes up and down is made of reels", reels > 0, `${reels} reels`)
+      t.ok("and a reel turns when its digit changes", moving > 0, `${moving} moving at once`)
+      t.ok("a request makes figures out of digits", digits > 0, `${digits} digit elements`)
+      t.ok("and the digits that change pop in", most > 0, `at most ${most} at once`)
+      await pg.context().close()
+    },
+  },
+  {
+    // the thinking is a window of a fixed height: a long thought cannot push the heading that closes it out of reach
+    name: "reason: the thinking is a bounded window that follows the end while it is written and can always be closed",
+    async run({ browser, long, t, errors }) {
+      const pg = await open(browser, errors, { width: 900, height: 700 })
+      await pg.goto(long.base + "/#/chat")
+      await pg.waitForSelector("textarea")
+      await pg.fill("textarea", "think about it at length")
+      await pg.keyboard.press("Enter")
+      await pg.waitForSelector(".t-reason-viewport", { timeout: 20000 })
+      await pg.waitForFunction(() => { const v = document.querySelector(".t-reason-viewport"); return v && v.scrollHeight > v.clientHeight + 60 }, null, { timeout: 20000 })
+      await pg.waitForTimeout(1500)
+      const info = () => pg.evaluate(() => { const v = document.querySelector(".t-reason-viewport"); const h = document.querySelector(".thought-head").getBoundingClientRect(); return { h: Math.round(v.getBoundingClientRect().height), more: v.scrollHeight - v.clientHeight, fromEnd: Math.round(v.scrollHeight - v.clientHeight - v.scrollTop), above: v.hasAttribute("data-above"), below: v.hasAttribute("data-below"), headTop: Math.round(h.top), vh: innerHeight } })
+      const a = await info()
+      t.ok("the window has a fixed height though the thought is longer", a.h <= 180 && a.more > 60, `window ${a.h}px, ${a.more}px more`)
+      t.ok("while it is written the window stays at the end", a.fromEnd <= 40, `${a.fromEnd}px from the end`)
+      t.ok("the edge fades say there is more above", a.above)
+      t.ok("the heading that closes it is on screen", a.headTop >= 0 && a.headTop < a.vh - 40, `y ${a.headTop}`)
+      await pg.click(".thought-head")
+      await pg.waitForTimeout(600)
+      t.ok("and it closes", (await pg.locator(".thought-head").getAttribute("aria-expanded")) === "false" && (await pg.locator(".t-reason-viewport").count()) === 0)
+      await pg.click(".thought-head")
+      await pg.waitForTimeout(600)
+      t.ok("and opens again, still at the end while it is written", (await pg.locator(".t-reason-viewport").count()) === 1 && (await info()).fromEnd <= 60)
+      await pg.context().close()
+    },
+  },
+  {
+    // the + button becomes the menu it opens (transitions.dev "Plus to menu morph") and the menu closes back into it
+    name: "plus: the + button morphs into its menu and back",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors)
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea")
+      await pg.waitForTimeout(600)
+      const box = () => pg.evaluate(() => { const m = document.querySelector(".t-morph"); if (!m) return null; const r = m.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height), br: parseFloat(getComputedStyle(m).borderTopLeftRadius) } })
+      const b0 = await box()
+      t.ok("the button is a small box", !!b0 && b0.w <= 40 && b0.h <= 40, JSON.stringify(b0))
+      await pg.click("button[aria-label='Photos, files, new chat, save']")
+      const grow = []
+      for (let i = 0; i < 9; i++) { await pg.waitForTimeout(40); grow.push(await box()) }
+      t.ok("it grows into the menu through in-between sizes", new Set(grow.map((g) => g.h)).size > 3 && grow[grow.length - 1].h > b0.h + 80 && grow[grow.length - 1].w > b0.w + 150, grow.map((g) => `${g.w}x${g.h}`).join(" "))
+      await pg.waitForTimeout(400)
+      t.ok("the three actions are there to use", (await pg.locator(".t-morph-menu [role=option]").count()) === 3 && (await pg.locator(".t-morph-menu [role=option]").first().isVisible()))
+      await pg.keyboard.press("Escape")
+      const shrink = []
+      for (let i = 0; i < 9; i++) { await pg.waitForTimeout(40); shrink.push(await box()) }
+      t.ok("Escape closes it back into the button through in-between sizes", new Set(shrink.map((g) => g.h)).size > 3 && shrink[shrink.length - 1].h < 60, shrink.map((g) => `${g.w}x${g.h}`).join(" "))
+      await pg.waitForTimeout(400)
+      const b1 = await box()
+      t.ok("and it is the small button again", b1.w <= 40 && b1.h <= 40)
+      await pg.click("button[aria-label='Photos, files, new chat, save']")
+      await pg.waitForTimeout(500)
+      await pg.locator(".t-morph-menu [role=option]").nth(2).click({ trial: true })
+      t.ok("a row can be clicked while it is open", true)
+      await pg.context().close()
+    },
+  },
+  {
+    // what the server is doing is named: reading, thinking, answering are different statuses (thinking is not "writing")
+    name: "status: reading the prompt, thinking and answering are named apart",
+    async run({ browser, long, t, errors }) {
+      const pg = await open(browser, errors)
+      await pg.goto(long.base + "/#/live")
+      await pg.waitForTimeout(1800)
+      await pg.evaluate(() => { fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "m", max_tokens: 2000, messages: [{ role: "user", content: "go" }] }) }) })
+      const seen = new Set()
+      for (let i = 0; i < 90; i++) { await pg.waitForTimeout(150); const h = await pg.evaluate(() => document.querySelector(".page-title")?.textContent || ""); seen.add(h.replace(/[0-9,]+/g, "N")) }
+      const all = [...seen].join(" | ")
+      t.ok("while the thought is written the status says Thinking, not Writing", [...seen].some((h) => /^Thinking · N tokens/.test(h)), all)
+      t.ok("then it says Answering", [...seen].some((h) => /^Answering · N tokens/.test(h)), all)
+      t.ok("and it never calls thinking or the answer Writing", ![...seen].some((h) => /^Writing · /.test(h)), all)
+      await pg.context().close()
+    },
+  },
+  {
     // a prompt that is only a file has no text, so it has no (empty) bubble; it can still be rewritten
     name: "file: a prompt of only a file shows the file and no empty bubble",
     async run({ browser, fast, t, errors }) {

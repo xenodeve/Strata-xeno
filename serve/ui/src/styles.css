@@ -181,3 +181,57 @@ html:lang(th) .prompt-bar { line-height: 24px; }
 .fit-box { transition: height 300ms var(--ease); }
 .ghost .msg-in { animation: none; }       /* a message that is leaving must not play its entrance */
 @media (prefers-reduced-motion: reduce) { .fit-box { transition: none; } }
+
+/* ---- transitions.dev (Jakub Antalik): "Number pop-in", "Reasoning stream" and (in prompt-bar.css) "Plus to menu morph", pulled with its CLI on the developer's instruction;
+   the snippets are namespaced .t-* with their tokens as variables. Changes: a digit that was already there is not animated
+   (data-still); the stream is a real window onto text that grows (native scrolling, fades only where there is more) and not the
+   looping ticker of the demo. Reduced motion stays off, as the snippets require. ---- */
+:root {
+  --digit-dur: 500ms; --digit-distance: 8px; --digit-stagger: 70ms; --digit-blur: 2px;
+  --digit-ease: cubic-bezier(0.34, 1.45, 0.64, 1); --digit-dir-x: 0; --digit-dir-y: 1;
+  --morph-open-dur: 350ms; --morph-close-dur: 250ms; --morph-ease: cubic-bezier(0.34, 1.25, 0.64, 1); --morph-close-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --morph-r-closed: 9px; --morph-r-open: 14px; --morph-fade-dur: 200ms; --morph-slide: 40px; --morph-rotate: 45deg; --morph-scale: 0.97; --morph-blur: 2px;   /* radii for our 30 px button and rows; the rest as shipped */
+  --reel-dur: 650ms; --reel-cell: 1.35em; --reel-spin-blur: 3px; --reel-stagger: 45ms; --reel-ease: cubic-bezier(0.16, 1, 0.3, 1);   /* shorter and in em for a figure in a line of text */
+  --reason-hold: 840ms; --reason-step: 500ms; --reason-fade: 28px; --reason-ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes t-digit-pop-in {
+  0% { transform: translate(calc(var(--digit-distance) * var(--digit-dir-x)), calc(var(--digit-distance) * var(--digit-dir-y))); opacity: 0; filter: blur(var(--digit-blur)); }
+  100% { transform: translate(0, 0); opacity: 1; filter: blur(0); }
+}
+.t-digit-group { display: inline-flex; align-items: baseline; }
+.t-digit { display: inline-block; will-change: transform, opacity, filter; }
+.t-digit-group.is-animating .t-digit { animation: t-digit-pop-in var(--digit-dur) var(--digit-ease) both; }
+.t-digit-group.is-animating .t-digit[data-stagger="1"] { animation-delay: var(--digit-stagger); }
+.t-digit-group.is-animating .t-digit[data-stagger="2"] { animation-delay: calc(var(--digit-stagger) * 2); }
+.t-digit-group .t-digit[data-still] { animation: none; }
+@media (prefers-reduced-motion: reduce) { .t-digit-group .t-digit { animation: none !important; } }
+
+@property --reason-fade-top { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --reason-fade-bottom { syntax: "<length>"; inherits: false; initial-value: 0px; }
+.t-reason-viewport {
+  max-height: var(--reason-height, 10.5rem); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin;
+  --reason-fade-top: 0px; --reason-fade-bottom: 0px;
+  transition: --reason-fade-top 240ms var(--reason-ease), --reason-fade-bottom 240ms var(--reason-ease);
+  -webkit-mask-image: linear-gradient(transparent 0, black var(--reason-fade-top), black calc(100% - var(--reason-fade-bottom)), transparent 100%);
+  mask-image: linear-gradient(transparent 0, black var(--reason-fade-top), black calc(100% - var(--reason-fade-bottom)), transparent 100%);
+}
+.t-reason-viewport[data-above] { --reason-fade-top: var(--reason-fade); }          /* more above */
+.t-reason-viewport[data-below] { --reason-fade-bottom: var(--reason-fade); }       /* more below */
+html:lang(th) .t-reason-text { line-height: 1.8; }
+@media (prefers-reduced-motion: reduce) { .t-reason-viewport { transition: none; } }
+
+/* "Spinning counter" (transitions.dev): a reel per digit; the strip is one text node of fifty lines moved by --pos cells. */
+.t-reel { display: inline-flex; align-items: center; height: var(--reel-cell); vertical-align: 0.07em; font-variant-numeric: tabular-nums; }
+.t-reel-col {
+  position: relative; display: inline-block; width: 1ch; height: var(--reel-cell); overflow: hidden; text-align: center;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 22%, #000 78%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0%, #000 22%, #000 78%, transparent 100%);
+}
+.t-reel-strip {
+  display: block; white-space: pre; line-height: var(--reel-cell); will-change: transform;
+  transform: translateY(calc(var(--reel-cell) * var(--pos, 0) * -1));
+  transition: transform var(--reel-dur) var(--reel-ease);
+}
+.t-reel-strip[data-moving] { filter: url(#t-reel-blur); }
+.t-reel-sep { display: inline-block; }
+@media (prefers-reduced-motion: reduce) { .t-reel-strip { transition: none !important; filter: none !important; } }

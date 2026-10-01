@@ -14,17 +14,35 @@ const IDLE_SPEED = 0.5
 const GPU_IDLE_FPS = 30                              // the small orbs that idle (a GPU card, a dormant model, an empty list) draw at half the display rate, to spare the page; the server's idle orb is never capped
 export const SLOW = { speed: IDLE_SPEED, fps: GPU_IDLE_FPS }
 
+/** What the server says it is doing while a request runs (`live.phase`: "reading the prompt", "thinking", "answering", "writing a
+ *  tool call: <name>", "tool call complete"), as a kind and, for a tool call, the tool. Anything else (or nothing) is "other". */
+export type Phase = { kind: "reading" | "thinking" | "answering" | "toolDone" | "other" } | { kind: "tool"; tool: string }
+export function phaseKind(phase: string | null | undefined): Phase {
+  const p = (phase || "").trim()
+  if (p === "reading the prompt") return { kind: "reading" }
+  if (p === "thinking") return { kind: "thinking" }
+  if (p === "answering") return { kind: "answering" }
+  if (p === "tool call complete") return { kind: "toolDone" }
+  if (p.startsWith("writing a tool call:")) return { kind: "tool", tool: p.slice("writing a tool call:".length).trim() }
+  return { kind: "other" }
+}
+
 /** The server. An answer being written flows, at the pace of its tokens; a prompt being read is taken in (listening); a request
  *  waiting its turn or a server that does not answer is reaching out; an unloaded model is dormant; idle is the searching
  *  globe, slowly. */
 export function serverDesign(
-  live: { state: "reading" | "generating" | "idle" | "unloaded"; queued?: number; tok_s?: number | null },
+  live: { state: "reading" | "generating" | "idle" | "unloaded"; queued?: number; tok_s?: number | null; phase?: string | null },
   stale = false,
 ): OrbLook & { speed: number } {
   if (stale) return { design: "connecting", moving: true, speed: 1 }
   if (live.state === "generating") {
     const t = live.tok_s
-    return { design: "composing", moving: true, speed: t == null ? 1 : Math.max(0.7, Math.min(1.5, 0.7 + (t / 150) * 0.4)) }
+    const speed = t == null ? 1 : Math.max(0.7, Math.min(1.5, 0.7 + (t / 150) * 0.4))
+    const ph = phaseKind(live.phase)
+    if (ph.kind === "thinking") return { design: "solving", moving: true, speed }              // thinking is not writing
+    if (ph.kind === "tool") return { design: toolDesign(ph.tool), moving: true, speed: 1 }
+    if (ph.kind === "toolDone") return { design: "weaving", moving: true, speed: 1 }
+    return { design: "composing", moving: true, speed }
   }
   if (live.state === "reading") return { design: "listening", moving: true, speed: 1 }
   if (live.state === "unloaded") return { design: "shaping", moving: true, speed: IDLE_SPEED, fps: GPU_IDLE_FPS }

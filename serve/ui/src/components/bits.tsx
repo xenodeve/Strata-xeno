@@ -1,5 +1,7 @@
 import type { ReactNode } from "react"
 import { t } from "../lib/i18n"
+import { Pop } from "./pop"
+import { Spin } from "./spin"
 
 // A module-level element is built once, so the words are looked up when it renders, not when it is made.
 function NotMeasured() { return <span className="text-ink-3">{t("not measured")}</span> }
@@ -12,9 +14,10 @@ export function Sentence({ text, node }: { text: string; node: ReactNode }) {
   return <>{a}{node}{b}</>
 }
 
-/** A figure, or "not measured": a tile with no instrument behind it never shows a guess. */
-export function val(v: number | null | undefined, fmt: (n: number) => string, unit = ""): ReactNode {
-  return v == null || Number.isNaN(v) ? NOT_MEASURED : <span className="num">{fmt(v)}{unit && <span className="text-ink-2"> {unit}</span>}</span>
+/** A figure, or "not measured": a tile with no instrument behind it never shows a guess. `kind`: a figure that goes up and down ("gauge",
+ *  the default) turns reels when it changes; one that only grows ("count") pops in. */
+export function val(v: number | null | undefined, fmt: (n: number) => string, unit = "", kind: "count" | "gauge" = "gauge"): ReactNode {
+  return v == null || Number.isNaN(v) ? NOT_MEASURED : <span className="num">{kind === "gauge" ? <Spin text={fmt(v)} /> : <Pop text={fmt(v)} />}{unit && <span className="text-ink-2"> {unit}</span>}</span>
 }
 
 export function Section({ title, children, aside }: { title: string; children: ReactNode; aside?: ReactNode }) {

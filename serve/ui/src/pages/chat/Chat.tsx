@@ -10,6 +10,8 @@ import { StatusOrb } from "../../components/live"
 import { PromptBar } from "../../components/PromptBar"
 import { useMetrics } from "../../lib/metrics"
 import { effortChoices, settleEffort } from "../../lib/effort"
+import { noteSend } from "../../lib/sendfx"
+import { Collapse } from "../../components/motion"
 import { nextDesign, type OrbDesign } from "../../lib/orbs"
 import { msg, t } from "../../lib/i18n"
 import { MessageView } from "./Messages"
@@ -161,6 +163,7 @@ export function Chat() {
   const send = () => {
     if (busy || (!text.trim() && !files.length)) return
     const t = text, f = files
+    noteSend(input.current?.getBoundingClientRect())          // where the prompt rises from
     setText(""); setFiles([])
     pinned.current = true
     setAway(false)
@@ -209,13 +212,13 @@ export function Chat() {
   return (
     <section className="flex min-h-[calc(100dvh-9rem)] flex-col" onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragging(false)}>
       <div ref={list} className="flex-1 space-y-6 pb-6" aria-live="off">
-        {chat.messages.length === 0 && (
+        <Collapse open={chat.messages.length === 0} instant className="-mb-6">
           <div className="mx-auto mt-[11vh] flex max-w-[44ch] flex-col items-center text-center">
             <StatusOrb live={live} stale={stale} size={64} scale={2.5} override={typing ? { design: "listening", label: t(ORB_NAMES.listening) } : ambient ? { design: ambient, label: t(ORB_NAMES[ambient]) } : undefined} />
             <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>{t("What can I help with?")}</h1>
             <p className="lede mt-3">{t("{name} runs on this PC. Nothing leaves it.", { name: metrics?.model_info?.name ? [metrics.model_info.name, metrics.model_info.variant].filter(Boolean).join(" · ") : health.model })}</p>
           </div>
-        )}
+        </Collapse>
         {chat.messages.map((m, i) => (
           <MessageView key={i} m={m} streaming={busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill}
             actions={m.role === "user" ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt } : undefined} />

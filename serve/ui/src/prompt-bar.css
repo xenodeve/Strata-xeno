@@ -12,7 +12,6 @@
   box-shadow: 0 14px 40px -12px rgb(0 0 0 / 0.28), 0 1px 2px rgb(0 0 0 / 0.06);
   transform-origin: bottom center; animation: pb-pop 180ms var(--ease) both;
 }
-.prompt-bar__menu[data-kind="plus"] { right: auto; width: min(340px, 100%); transform-origin: bottom left; }
 @keyframes pb-pop { from { opacity: 0; transform: translateY(4px) scale(0.98); } }
 .prompt-bar__glow {
   position: absolute; right: 4px; left: 4px; border-radius: 9px; background: var(--pb-hover); opacity: 0; pointer-events: none;
@@ -120,3 +119,40 @@
   .prompt-bar__effort-fill, .prompt-bar__effort-thumb { transition: background-color 300ms; }
   .prompt-bar__tool:active, .prompt-bar__send[data-pressed] { transform: none; }
 }
+
+/* The + button is the menu (transitions.dev "Plus to menu morph", pulled with its CLI on the developer's instruction; tokens in
+   styles.css). Closed: a 30 px button. Open: the box grows up and to the right out of the button's corner, its radius relaxes,
+   the + turns into a x and slides away while the actions slide in. Open and close have their own eases; open is the bouncy one.
+   Changes from the snippet: anchored at the bottom left (the button sits at the left of the bar), a border drawn with a shadow so
+   the 30 px closed box is not eaten by it, our tokens, and a size that fits three rows. */
+.prompt-bar__anchor { position: relative; flex: none; width: 30px; height: 30px; }
+.t-morph {
+  position: absolute; bottom: 0; left: 0; z-index: 4; width: 30px; height: 30px; overflow: hidden; border-radius: var(--morph-r-closed);
+  background: transparent; box-shadow: 0 0 0 1px transparent, 0 0 0 0 transparent;
+  transition:
+    width var(--morph-close-dur) var(--morph-close-ease), height var(--morph-close-dur) var(--morph-close-ease),
+    border-radius var(--morph-close-dur) var(--morph-close-ease), background-color var(--morph-close-dur) var(--morph-close-ease),
+    box-shadow var(--morph-close-dur) var(--morph-close-ease);
+}
+.t-morph[data-open="true"] {
+  width: min(320px, calc(100vw - 48px)); height: 128px; border-radius: var(--morph-r-open); background: var(--pb-menu);
+  box-shadow: 0 0 0 1px var(--line), 0 14px 40px -12px rgb(0 0 0 / 0.28), 0 1px 2px rgb(0 0 0 / 0.06);
+  transition:
+    width var(--morph-open-dur) var(--morph-ease), height var(--morph-open-dur) var(--morph-ease),
+    border-radius var(--morph-open-dur) var(--morph-ease), background-color var(--morph-open-dur) var(--morph-ease),
+    box-shadow var(--morph-open-dur) var(--morph-ease);
+}
+.t-morph-plus {
+  position: absolute; bottom: 0; left: 0; display: grid; place-items: center;
+  transition: opacity var(--morph-fade-dur) var(--morph-close-ease), transform var(--morph-open-dur) var(--morph-close-ease), filter var(--morph-fade-dur) var(--morph-close-ease), background-color 150ms, color 150ms;
+}
+.t-morph-plus svg { transition: transform var(--morph-open-dur) var(--morph-close-ease); }
+.t-morph[data-open="true"] .t-morph-plus { opacity: 0; transform: translateX(calc(-1 * var(--morph-slide))); filter: blur(var(--morph-blur)); pointer-events: none; }
+.t-morph[data-open="true"] .t-morph-plus svg { transform: scale(var(--morph-scale)) rotate(var(--morph-rotate)); }
+.t-morph-menu {
+  position: absolute; inset: 0; padding: 4px; opacity: 0; pointer-events: none; filter: blur(var(--morph-blur));
+  transform: translateX(var(--morph-slide)) scale(var(--morph-scale)); transform-origin: bottom left;
+  transition: opacity var(--morph-fade-dur) var(--morph-close-ease), transform var(--morph-open-dur) var(--morph-close-ease), filter var(--morph-fade-dur) var(--morph-close-ease);
+}
+.t-morph[data-open="true"] .t-morph-menu { opacity: 1; transform: translateX(0) scale(1); filter: blur(0); pointer-events: auto; }
+@media (prefers-reduced-motion: reduce) { .t-morph, .t-morph-plus, .t-morph-plus svg, .t-morph-menu { transition: none !important; } }

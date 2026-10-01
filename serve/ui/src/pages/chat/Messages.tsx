@@ -1,4 +1,4 @@
-import { useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
+import { useLayoutEffect, useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, Copy01Icon, AttachmentIcon, PencilEdit01Icon, Undo02Icon } from "@hugeicons/core-free-icons"
 import { chat, metaText, type Message, type ToolCall } from "../../lib/chat"
@@ -11,6 +11,10 @@ import { cn } from "../../lib/cn"
 import { fmt, timeStr } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
 import { prefillText } from "../../lib/prefill"
+import { takeSend } from "../../lib/sendfx"
+import { ReasonStream } from "../../components/reason"
+import { Pop } from "../../components/pop"
+import { Spin } from "../../components/spin"
 import { msg, t } from "../../lib/i18n"
 
 const TOOL_STATE: Record<ToolCall["state"], string> = { writing: msg("Writing"), running: msg("Running"), done: msg("Done"), error: msg("Error"), skipped: msg("Not run") }
@@ -94,7 +98,7 @@ function Thinking({ m, streaming, show, phase }: { m: Message; streaming: boolea
         onToggle={() => setTouched(!open)}
         elapsed={thinkingNow ? null : m.thinkSecs}
       >
-        <div className="mt-1 max-h-72 overflow-y-auto whitespace-pre-wrap border-l border-line pl-3 text-[13px] font-normal leading-relaxed text-ink-2 [overflow-wrap:anywhere]">{m.reasoning}</div>
+        <ReasonStream text={m.reasoning || ""} live={thinkingNow} />
       </Thought>
     </div>
   )
@@ -132,10 +136,22 @@ function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: bo
 
 export function MessageView({ m, streaming, show, prefill, actions }: { m: Message; streaming: boolean; show: boolean; prefill: boolean; actions?: PromptActions }) {
   const ref = useRef<HTMLDivElement>(null)
+  const mine = useRef<HTMLDivElement>(null)
   const [editing, setEditing] = useState(false)
+  // The prompt that was just sent rises out of the composer (which it left a moment ago) to its place, fading in on the way. Its
+  // own entrance is replaced by this; a message that was not just sent (a reload, a rewrite) keeps the plain one.
+  useLayoutEffect(() => {
+    const el = mine.current
+    const from = m.role === "user" && el ? takeSend(m.time) : null
+    if (!el || !from || matchMedia("(prefers-reduced-motion: reduce)").matches) return
+    const rise = Math.max(24, Math.min(260, from.top - el.getBoundingClientRect().top))
+    el.style.animation = "none"
+    el.animate([{ transform: `translateY(${rise}px) scale(0.97)`, opacity: 0 }, { opacity: 1, offset: 0.35 }, { transform: "none", opacity: 1 }],
+      { duration: 460, easing: "cubic-bezier(0.23, 1, 0.32, 1)" })
+  }, [])
   if (m.role === "user") {
     return (
-      <div className="msg-in group flex flex-col items-end gap-1">
+      <div ref={mine} className="msg-in group flex flex-col items-end gap-1">
         {!!m.files?.length && (
           <div className="flex flex-wrap justify-end gap-1.5">
             {m.files.map((f, i) => (
@@ -169,7 +185,7 @@ export function MessageView({ m, streaming, show, prefill, actions }: { m: Messa
           )}
         </div>
         {prefill && m.prefill && prefillText(m.prefill) && (
-          <div key={m.prefill.state} className="num fade-swap px-1 text-[12px] text-ink-3" role={m.prefill.state === "reading" ? "status" : undefined}>{prefillText(m.prefill)}</div>
+          <div key={m.prefill.state} className="num fade-swap px-1 text-[12px] text-ink-3" role={m.prefill.state === "reading" ? "status" : undefined}>{m.prefill.state === "reading" ? <Spin text={prefillText(m.prefill)!} /> : <Pop text={prefillText(m.prefill)!} />}</div>
         )}
       </div>
     )
@@ -187,7 +203,7 @@ export function MessageView({ m, streaming, show, prefill, actions }: { m: Messa
         <div className={cn(streaming && "streaming")}><Answer m={m} /></div>
       )}
       <div className="mt-1 flex min-h-6 items-center gap-2 text-[12px] text-ink-3">
-        {phase === "composing" ? <StatusLabel design="composing" className="text-[13px] text-ink-2">{t("Writing…")}</StatusLabel>
+        {phase === "composing" ? <StatusLabel design="composing" className="text-[13px] text-ink-2">{t("Answering…")}</StatusLabel>
           : phase === "weaving" ? <StatusLabel design="weaving" className="text-[13px] text-ink-2">{t("Planning the next step…")}</StatusLabel>
           : <span className="num">{metaText(m) || (streaming ? "" : m.stopped ? t("Stopped") : "")}</span>}
         {!streaming && !!m.text && (

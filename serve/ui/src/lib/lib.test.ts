@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { rootOf } from "./api"
-import { gpuDesign, latticePattern, nextDesign, ORB_DESIGNS, replyDesign, serverDesign, toolDesign } from "./orbs"
+import { gpuDesign, latticePattern, nextDesign, ORB_DESIGNS, phaseKind, replyDesign, serverDesign, toolDesign } from "./orbs"
 import { clientName } from "./format"
 import { promptSplit } from "./metrics"
 import { apiMessages, type Message } from "./chat"
@@ -154,7 +154,7 @@ describe("client name", () => {
 })
 
 describe("which orb says what", () => {
-  const live = (o: Partial<{ state: "reading" | "generating" | "idle" | "unloaded"; queued: number; tok_s: number | null }> = {}) => ({ state: "idle" as const, queued: 0, tok_s: null, ...o })
+  const live = (o: Partial<{ state: "reading" | "generating" | "idle" | "unloaded"; queued: number; tok_s: number | null; phase: string | null }> = {}) => ({ state: "idle" as const, queued: 0, tok_s: null, ...o })
   test("the server: each state has its own form; idle shows the searching orb, slowly; an unloaded model is dormant (shaping, slowly); no orb is a frozen picture", () => {
     expect(serverDesign(live({ state: "reading" }))).toMatchObject({ design: "listening", moving: true })        // the prompt is taken in
     expect(serverDesign(live({ state: "generating", tok_s: 120 }))).toMatchObject({ design: "composing", moving: true })
@@ -162,6 +162,23 @@ describe("which orb says what", () => {
     expect(serverDesign(live({ state: "unloaded" }))).toEqual({ design: "shaping", moving: true, speed: 0.5, fps: 30 })        // dormant, but never a frozen picture
     expect(serverDesign(live({ queued: 2 }))).toMatchObject({ design: "connecting", moving: true })
     expect(serverDesign(live(), true)).toMatchObject({ design: "connecting", moving: true })        // not answering: still trying
+  })
+  test("the server's phase names what it is doing, so thinking is not 'writing'", () => {
+    expect(phaseKind("reading the prompt")).toEqual({ kind: "reading" })
+    expect(phaseKind("thinking")).toEqual({ kind: "thinking" })
+    expect(phaseKind("answering")).toEqual({ kind: "answering" })
+    expect(phaseKind("writing a tool call: fs__read_file")).toEqual({ kind: "tool", tool: "fs__read_file" })
+    expect(phaseKind("tool call complete")).toEqual({ kind: "toolDone" })
+    expect(phaseKind(null)).toEqual({ kind: "other" })
+    expect(phaseKind("something new")).toEqual({ kind: "other" })
+  })
+  test("while the server generates, the orb takes the form of the phase", () => {
+    expect(serverDesign(live({ state: "generating", phase: "thinking", tok_s: 120 }))).toMatchObject({ design: "solving", moving: true })
+    expect(serverDesign(live({ state: "generating", phase: "answering", tok_s: 120 }))).toMatchObject({ design: "composing", moving: true })
+    expect(serverDesign(live({ state: "generating", phase: "writing a tool call: web_search" }))).toMatchObject({ design: "searching" })
+    expect(serverDesign(live({ state: "generating", phase: "writing a tool call: fs__read" }))).toMatchObject({ design: "connecting" })
+    expect(serverDesign(live({ state: "generating", phase: "tool call complete" }))).toMatchObject({ design: "weaving" })
+    expect(serverDesign(live({ state: "generating", phase: null }))).toMatchObject({ design: "composing" })        // a server that does not say
   })
   test("the writing orb runs at the pace of the writing, within limits", () => {
     expect(serverDesign(live({ state: "generating", tok_s: 0 })).speed).toBeCloseTo(0.7, 5)

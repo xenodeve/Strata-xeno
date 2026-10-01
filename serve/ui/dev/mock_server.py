@@ -29,7 +29,7 @@ THINKING = ("The user asks something open, so first I should work out what they 
 ANSWER = (THINKING + "</think>\n\nสวัสดีครับ **bold** and `code`\n\n- one\n- two\n\n```py\nprint(1)\n```\n\n"
           "| a | b |\n|---|---|\n| 1 | 2 |\n")
 if os.environ.get("STRATA_MOCK_LONG"):          # an answer longer than a screen, streamed slowly: for the chat's follow-the-answer scroll
-    ANSWER = THINKING + "</think>\n\n" + "\n\n".join(f"Paragraph {i}: " + "word " * 40 for i in range(1, 15))
+    ANSWER = "\n\n".join([THINKING] * 2) + "</think>\n\n" + "\n\n".join(f"Paragraph {i}: " + "word " * 40 for i in range(1, 12))
 THINK_BYTES = len(ANSWER.split("</think>")[0].encode())
 THINK_MS = float(os.environ.get("STRATA_MOCK_THINK_MS", "30"))   # per token while it thinks (about 12 s of thinking by default): the thinking line stays on screen long enough to look at
 PREFILL_TPS = float(os.environ.get("STRATA_MOCK_PREFILL_TPS", "300"))   # the prompt is read at this speed (the byte tokenizer: one token per byte, so paste a few thousand characters to see it)

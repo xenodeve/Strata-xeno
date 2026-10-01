@@ -11,6 +11,7 @@ import { msg, setLang, t, useLang } from "./lib/i18n"
 import { PageView } from "./pages"
 import { StatusOrb } from "./components/live"
 import { ToastHost } from "./components/toast"
+import { ReelFilter } from "./components/spin"
 
 const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
   chat: { label: msg("Chat"), icon: Message01Icon },
@@ -142,6 +143,7 @@ function Shell() {
         </div>
       </header>
       <ToastHost />
+      <ReelFilter />
       <main key={route.page} className="page-in mx-auto w-full max-w-5xl flex-1 px-4 pb-16 pt-6 sm:px-6">
         <PageView route={route} />
       </main>

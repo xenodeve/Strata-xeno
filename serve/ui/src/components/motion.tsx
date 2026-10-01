@@ -19,9 +19,10 @@ function useMounted(open: boolean) {
   return open || mounted
 }
 
-export function Collapse({ open, children, className }: { open: boolean; children: ReactNode; className?: string }) {
+/** `instant`: when it is open at the start it is simply there (no opening), and it still closes by closing up. */
+export function Collapse({ open, children, className, instant = false }: { open: boolean; children: ReactNode; className?: string; instant?: boolean }) {
   const mounted = useMounted(open)
-  const [shown, setShown] = useState(false)          // one frame after mounting, so the opening has a "from" to animate from
+  const [shown, setShown] = useState(instant && open)          // one frame after mounting, so the opening has a "from" to animate from
   useEffect(() => {
     if (!open) { setShown(false); return }
     const id = requestAnimationFrame(() => setShown(true))

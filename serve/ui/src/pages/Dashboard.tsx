@@ -10,6 +10,7 @@ import { archOf, parseArch } from "../lib/arch"
 import { fmt, gb, kfmt } from "../lib/format"
 import { msg, t } from "../lib/i18n"
 import { promptSplit, useMetrics, type Live } from "../lib/metrics"
+import { phaseKind } from "../lib/orbs"
 import { href } from "../lib/router"
 import { Bar, GpuOrb, cards, disksOf, link, modelDisk } from "./Hardware"
 import { RequestList } from "./Requests"
@@ -24,7 +25,14 @@ function Headline({ l }: { l: Live }): ReactNode {
     case "reading": return l.prompt_total
       ? <Sentence text={t("Reading {n} of {total} tokens", { n: SLOT, total: fmt(l.prompt_total) })} node={<Num value={l.prompt_read} />} />
       : <>{t("Reading the prompt")}</>
-    case "generating": return l.tok_s ? <Sentence text={t("Writing at {n} tok/s", { n: SLOT })} node={<Num value={l.tok_s} digits={0} />} /> : <>{t("Writing")}</>
+    case "generating": {
+      const p = phaseKind(l.phase)
+      if (p.kind === "tool") return <>{t("Writing a tool call: {name}", { name: p.tool })}</>
+      if (p.kind === "toolDone") return <>{t("Tool call written")}</>
+      if (!l.tok_s) return <>{p.kind === "thinking" ? t("Model is thinking") : p.kind === "answering" ? t("Model is answering") : t("Writing")}</>
+      const text = p.kind === "thinking" ? t("Thinking at {n} tok/s", { n: SLOT }) : p.kind === "answering" ? t("Answering at {n} tok/s", { n: SLOT }) : t("Writing at {n} tok/s", { n: SLOT })
+      return <Sentence text={text} node={<Num value={l.tok_s} digits={0} kind="gauge" />} />
+    }
     case "unloaded": return <>{t("Model unloaded")}</>
     default: return <>{t("Ready")}</>
   }

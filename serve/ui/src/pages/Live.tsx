@@ -1,6 +1,7 @@
 import { Loading } from "../components/orb"
 import { Chart } from "../components/Chart"
 import { Swap } from "../components/motion"
+import { Pop } from "../components/pop"
 import { StatusOrb } from "../components/live"
 import { Row, Rows, Section, val } from "../components/bits"
 import { fmt, gb } from "../lib/format"
@@ -9,11 +10,17 @@ import { href } from "../lib/router"
 import { useMetrics, type Live as LiveT } from "../lib/metrics"
 import { RequestList } from "./Requests"
 import { modelLine } from "../components/ModelBlock"
+import { phaseKind } from "../lib/orbs"
 
 function headline(l: LiveT): { tone: "ok" | "busy" | "idle"; text: string } {
   switch (l.state) {
     case "reading": return { tone: "busy", text: l.prompt_total ? t("Reading the prompt · {read} of {total} tokens", { read: fmt(l.prompt_read), total: fmt(l.prompt_total) }) : t("Reading the prompt") }
-    case "generating": return { tone: "busy", text: t("Writing · {n} tokens", { n: fmt(l.generated) }) }
+    case "generating": {
+      const p = phaseKind(l.phase), n = fmt(l.generated)
+      return { tone: "busy", text: p.kind === "thinking" ? t("Thinking · {n} tokens", { n }) : p.kind === "answering" ? t("Answering · {n} tokens", { n })
+        : p.kind === "tool" ? t("Writing a tool call: {name} · {n} tokens", { name: p.tool, n }) : p.kind === "toolDone" ? t("Tool call written · {n} tokens", { n })
+        : t("Writing · {n} tokens", { n }) }
+    }
     case "unloaded": return { tone: "idle", text: t("Model unloaded") }
     default: return { tone: "idle", text: t("Idle") }
   }
@@ -35,7 +42,7 @@ export function Live() {
       <header className="page-head flex items-center gap-4">
         <StatusOrb live={l} stale={stale} size={32} />
         <div className="min-w-0">
-          <h1 className="page-title"><Swap k={m.live.state}>{h.text}</Swap></h1>
+          <h1 className="page-title"><Swap k={m.live.state}><Pop text={h.text} /></Swap></h1>
           <p className="page-sub !mt-1">
             {stale ? t("The server is not answering. Showing the last numbers it gave.") : l.queued ? t("{n} waiting in the queue", { n: l.queued }) : modelLine(m)}
           </p>
@@ -47,7 +54,7 @@ export function Live() {
           <Row k="Decode" hint={t("now")} v={running ? val(l.tok_s, (n) => n.toFixed(1), "tok/s") : IDLE} />
           <Row k="Decode" hint={t("mean of this request")} v={running ? val(l.tok_s_mean, (n) => n.toFixed(1), "tok/s") : IDLE} />
           <Row k="Prefill" hint={t("mean of this request")} v={running ? val(l.prefill_tok_s_mean, (n) => n.toFixed(0), "tok/s") : IDLE} />
-          <Row k={t("Elapsed")} v={running ? val(l.elapsed_s, (n) => n.toFixed(1), "s") : IDLE} />
+          <Row k={t("Elapsed")} v={running ? val(l.elapsed_s, (n) => n.toFixed(1), "s", "count") : IDLE} />
         </Rows>
         <div className="mt-3">
           <div className="mb-1 text-[12px] text-ink-2">{t("Decode, last minute")}</div>

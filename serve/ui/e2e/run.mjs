@@ -39,7 +39,7 @@ const only = process.argv[2]
 const browser = await chromium.launch({ executablePath: chromePath() })
 // fast: a short think and a quick read of the prompt; long: a long answer that streams for a while
 const fast = await startMock({ STRATA_MOCK_THINK_MS: "2", STRATA_MOCK_PREFILL_TPS: "20000" }, 18771)
-const long = await startMock({ STRATA_MOCK_LONG: "1", STRATA_MOCK_THINK_MS: "2", STRATA_MOCK_PREFILL_TPS: "20000" }, 18772)
+const long = await startMock({ STRATA_MOCK_LONG: "1", STRATA_MOCK_THINK_MS: "6", STRATA_MOCK_PREFILL_TPS: "20000" }, 18772)
 let failed = 0
 try {
   // one request in the history, so the request page has something to open
