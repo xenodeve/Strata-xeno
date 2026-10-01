@@ -8,7 +8,9 @@ import { MetricsProvider, useMetrics } from "./lib/metrics"
 import { href, PAGES, useRoute, type Page } from "./lib/router"
 import { useTheme, type Theme } from "./lib/theme"
 import { msg, setLang, t, useLang } from "./lib/i18n"
-import { nextAvatar, setAvatar, useAvatar, type AvatarKind } from "./lib/avatar"
+import { useAvatar, type AvatarKind } from "./lib/avatar"
+import { StatusMarkSettings } from "./components/StatusMarks"
+import { GlidePanel } from "./components/motion"
 import { PageView } from "./pages"
 import { StatusOrb } from "./components/live"
 import { ToastHost } from "./components/toast"
@@ -29,20 +31,42 @@ const THEME_NAME: Record<Theme, string> = { system: msg("System"), light: msg("L
 const AVATAR_ICON: Record<AvatarKind, IconSvgElement> = { orbs: Globe02Icon, mixed: Loading01Icon, loading: Loading03Icon, bots: BotIcon }
 const AVATAR_NAME: Record<AvatarKind, string> = { orbs: msg("Orbs"), mixed: msg("Orbs + Loading"), loading: msg("Loading only"), bots: msg("Avatar") }
 
-/** Orbs, orbs with the loading style, the loading style alone, or avatars for the status marks (the choice is also in About): a button that shows which is in use and goes to the next. */
-export function AvatarSwitch() {
+/** The status marks: a button that shows which way is in use and opens the list (the same one is in About), a way per row with a look
+ *  at three of its marks and a line on what it is. Closes on Escape, on a click elsewhere, and when the page changes. */
+export function AvatarMenu() {
   const avatar = useAvatar()
+  const [open, setOpen] = useState(false)
+  const root = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const down = (e: PointerEvent) => { if (!root.current?.contains(e.target as Node)) setOpen(false) }
+    const key = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false) }
+    document.addEventListener("pointerdown", down)
+    document.addEventListener("keydown", key)
+    return () => { document.removeEventListener("pointerdown", down); document.removeEventListener("keydown", key) }
+  }, [open])
   const name = t(AVATAR_NAME[avatar])
   return (
-    <button
-      type="button"
-      onClick={() => setAvatar(nextAvatar(avatar))}
-      title={t("Status avatars: {name}. Change", { name })}
-      aria-label={t("Status avatars: {name}. Change", { name })}
-      className="flex size-8 shrink-0 items-center justify-center rounded-sm text-ink-2 transition-[color,background-color,transform] duration-200 hover:bg-hover hover:text-ink active:scale-90"
-    >
-      <HugeiconsIcon icon={AVATAR_ICON[avatar]} size={16} strokeWidth={1.6} aria-hidden />
-    </button>
+    <div ref={root} className="shrink-0 sm:relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        title={t("Status marks: {name}", { name })}
+        aria-label={t("Status marks: {name}", { name })}
+        className={cn("flex h-8 items-center gap-1.5 rounded-sm px-2 text-[12px] text-ink-2 transition-[color,background-color,transform] duration-200 hover:bg-hover hover:text-ink active:scale-95", open && "bg-hover text-ink")}
+      >
+        <HugeiconsIcon icon={AVATAR_ICON[avatar]} size={16} strokeWidth={1.6} aria-hidden />
+        <span className="max-sm:sr-only">{t("Marks")}</span>
+      </button>
+      {open && (
+        <GlidePanel role="dialog" aria-label={t("Status marks")} cap={() => Math.min(innerHeight * 0.78, 640)} inner="p-3" className="toast-in absolute inset-x-3 top-full z-30 mt-1 max-h-[min(78vh,640px)] rounded-lg border border-line bg-surface shadow-[0_14px_40px_-12px_rgb(0_0_0/0.28)] sm:inset-x-auto sm:right-0 sm:mt-2 sm:w-[400px]">
+          <p className="mb-2 px-1 text-[12px] text-ink-2">{t("What shows that something is happening: thinking, answering, reading.")}</p>
+          <StatusMarkSettings />
+        </GlidePanel>
+      )}
+    </div>
   )
 }
 
@@ -160,7 +184,7 @@ function Shell() {
           >
             <HugeiconsIcon icon={THEME_ICON[theme]} size={16} strokeWidth={1.6} aria-hidden />
           </button>
-          <AvatarSwitch />
+          <AvatarMenu />
           <LangSwitch />
         </div>
       </header>

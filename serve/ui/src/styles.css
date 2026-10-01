@@ -113,6 +113,8 @@
 
 /* Motion: one ease, durations 160-420 ms, opacity / transform / blur / grid-rows only. */
 .collapse-grid { display: grid; grid-template-rows: 0fr; opacity: 0; transition: grid-template-rows 320ms var(--ease), opacity 240ms var(--ease); }
+.collapse-soft { transition: grid-template-rows 520ms cubic-bezier(0.4, 0, 0.2, 1), opacity 360ms ease; }       /* a section that is a good part of a panel or a page: an even stretch and shrink */
+.glide-panel { transition: height 520ms cubic-bezier(0.4, 0, 0.2, 1); }
 .collapse-grid.is-open { grid-template-rows: 1fr; opacity: 1; }
 @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 @keyframes row-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
@@ -124,7 +126,7 @@
 .msg-in { animation: rise 300ms var(--ease) backwards; }
 .swap-in { animation: sharpen 280ms var(--ease) backwards; }
 @media (prefers-reduced-motion: reduce) {
-  .collapse-grid { transition: none; } .stagger > *, main > * > *, .row-in, .msg-in, .swap-in { animation: none; }
+  .collapse-grid, .collapse-soft, .glide-panel { transition: none; } .stagger > *, main > * > *, .row-in, .msg-in, .swap-in { animation: none; }
 }
 
 /* Type: one display size for the moment that matters, a quiet lede under it. Tracking tightens with size; Thai is never tracked. */

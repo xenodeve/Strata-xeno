@@ -257,8 +257,8 @@ export const checks = [
     },
   },
   {
-    // the status marks can be orbs, a plain loading ring, or avatars (bots): the bots are loaded only when chosen; the choice is remembered
-    name: "avatar: the status marks can be orbs, a plain loading ring or avatars, and it is remembered",
+    // the status marks: one list to read and choose from (a menu from the header, the same list in About)
+    name: "avatar: the status marks are chosen from a list that shows each way, and it is remembered",
     async run({ browser, fast, t, errors }) {
       const pg = await open(browser, errors)
       const scripts = []
@@ -266,39 +266,83 @@ export const checks = [
       await pg.goto(fast.base + "/#/dashboard")
       await pg.waitForTimeout(2000)
       const before = scripts.length
-      const btn = pg.locator("button[aria-label^='Status avatars']")
+      const btn = pg.locator("button[aria-label^='Status marks']")
+      const menu = pg.locator("[role=dialog][aria-label='Status marks']")
+      const radios = menu.locator("[role=radio]")
+      const checked = () => pg.evaluate(() => [...document.querySelectorAll("[role=dialog] [role=radio]")].map((r) => r.getAttribute("aria-checked") === "true").indexOf(true))
       const painted = () => pg.evaluate(() => [...document.querySelectorAll(".orb-slot canvas")].map((c) => { try { const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i]) n++; return n } catch { return -1 } }))
-      t.ok("to begin with: orbs with the loading style, the orbs drawn, no avatar loaded", (await btn.getAttribute("aria-label")).includes("Orbs + Loading") && (await painted()).some((n) => n > 0))
+      t.ok("the button names the way in use and opens a list", (await btn.getAttribute("aria-label")).includes("Orbs + Loading") && (await menu.count()) === 0)
       await btn.click()
-      await pg.waitForTimeout(800)
-      const marks = () => pg.evaluate(() => ({ lat: document.querySelectorAll(".orb-slot .lat").length, matrix: document.querySelectorAll(".orb-slot .t-matrix").length, canvas: document.querySelectorAll(".orb-slot canvas").length }))
-      const m = await marks()
-      t.ok("then the loading style alone: loaders of dots in place of the orbs, no canvas, nothing more loaded", (await btn.getAttribute("aria-label")).includes("Loading only") && m.lat + m.matrix >= 2 && m.canvas === 0 && scripts.length === before, JSON.stringify(m))
-      t.ok("both loader families are used", (await pg.evaluate(() => document.querySelectorAll(".orb-slot .lat, .orb-slot .t-matrix").length)) >= 2)
+      await pg.waitForTimeout(500)
+      t.ok("four ways are listed, each with its name and a line on what it is", (await radios.count()) === 4 && (await menu.innerText()).includes("A dotted ball") && (await menu.innerText()).includes("Loaders of dots"))
+      t.ok("the one in use is marked, and it says which is the default", (await checked()) === 1 && (await menu.innerText()).includes("Default"))
+      t.ok("each way shows three of its marks, and the avatars are not loaded for it yet", (await radios.nth(0).locator("canvas").count()) === 3 && (await radios.nth(2).locator(".lat, .t-matrix").count()) === 3 && scripts.length === before)
+      await radios.nth(1).focus()
+      await pg.keyboard.press("ArrowDown")
+      await pg.waitForTimeout(700)
+      const m = await pg.evaluate(() => ({ lat: document.querySelectorAll(".orb-slot .lat").length, matrix: document.querySelectorAll(".orb-slot .t-matrix").length, canvas: document.querySelectorAll(".orb-slot canvas").length }))
+      t.ok("the arrow keys move through them: Loading only puts loaders of dots in place of the orbs", (await checked()) === 2 && m.lat + m.matrix >= 2 && scripts.length === before, JSON.stringify(m))
+      const panel = () => pg.evaluate(() => { const b = document.querySelector("[role=dialog][aria-label='Status marks']").getBoundingClientRect(); return { w: Math.round(b.width), h: Math.round(b.height) } })
+      const p0 = await panel()
+      await pg.keyboard.press("ArrowDown")
+      const grow = []
+      for (let i = 0; i < 12; i++) { await pg.waitForTimeout(45); grow.push(await panel()) }
+      await pg.waitForTimeout(2200)
+      t.ok("choosing Avatar stretches the list open through in-between heights", new Set(grow.map((g) => g.h)).size >= 4 && grow[grow.length - 1].h > p0.h + 100, grow.map((g) => g.h).join(" "))
+      t.ok("and it does not widen: the scrollbar's room is kept, so nothing jumps sideways", grow.every((g) => Math.abs(g.w - p0.w) <= 1) && Math.abs((await panel()).w - p0.w) <= 1, `${p0.w} -> ${grow.map((g) => g.w).join(" ")}`)
+      t.ok("Avatar loads the avatars (one more script) and shows which avatar to use", (await checked()) === 3 && scripts.length > before && (await menu.locator("[role=group][aria-label='Which avatar'] button").count()) === 20, `${before} -> ${scripts.length}`)
+      await menu.locator("button[aria-label='Cat']").click()
+      await pg.waitForTimeout(500)
+      t.ok("choosing Cat is kept", (await pg.evaluate(() => localStorage.getItem("strata.avatar.type"))) === '"cat"' && (await menu.locator("button[aria-label='Cat']").getAttribute("aria-pressed")) === "true")
+      await menu.getByRole("button", { name: "Random", exact: true }).click()
+      await pg.waitForTimeout(500)
+      t.ok("and so is Random", (await pg.evaluate(() => localStorage.getItem("strata.avatar.type"))) === '"random"')
+      t.ok("an avatar is drawn in each place", (await painted()).filter((n) => n > 0).length >= 2)
+      await pg.keyboard.press("Escape")
+      await pg.waitForTimeout(300)
+      t.ok("Escape closes the list", (await menu.count()) === 0)
       await btn.click()
-      await pg.waitForTimeout(2500)
-      t.ok("then avatars: they are loaded now (one more script)", (await btn.getAttribute("aria-label")).includes("Avatar") && scripts.length > before, `${before} -> ${scripts.length}`)
-      const p1 = await painted()
-      t.ok("and an avatar is drawn in each place", p1.length >= 2 && p1.every((n) => n > 0), p1.join(" "))
-      await pg.goto(fast.base + "/#/about")
-      await pg.waitForTimeout(2500)
-      const tiles = pg.locator("[role=group][aria-label='Which avatar'] button")
-      t.ok("About lists the choices: by status, random and eighteen avatars, each drawn", (await tiles.count()) === 20 && (await pg.locator("[role=group][aria-label='Which avatar'] canvas").count()) === 18)
-      await pg.locator("button[aria-label='Cat']").click()
-      await pg.waitForTimeout(500)
-      t.ok("choosing Cat is kept and shown as chosen", (await pg.evaluate(() => localStorage.getItem("strata.avatar.type"))) === '"cat"' && (await pg.locator("button[aria-label='Cat']").getAttribute("aria-pressed")) === "true")
-      await pg.getByRole("button", { name: "Random", exact: true }).click()
-      await pg.waitForTimeout(500)
-      t.ok("Random is a choice too, kept and shown as chosen", (await pg.evaluate(() => localStorage.getItem("strata.avatar.type"))) === '"random"' && (await pg.getByRole("button", { name: "Random", exact: true }).getAttribute("aria-pressed")) === "true")
-      await pg.goto(fast.base + "/#/dashboard")
-      await pg.waitForTimeout(2000)
-      t.ok("and the avatars are drawn with a random one each", (await painted()).every((n) => n > 0))
+      await pg.waitForTimeout(400)
+      await pg.mouse.click(300, 650)
+      await pg.waitForTimeout(300)
+      t.ok("so does a click elsewhere", (await menu.count()) === 0)
       await pg.reload()
       await pg.waitForTimeout(2500)
-      t.ok("the choice is remembered after a reload", (await btn.getAttribute("aria-label")).includes("Avatar") && (await painted()).every((n) => n > 0))
-      await btn.click()
+      t.ok("the choice is remembered after a reload", (await btn.getAttribute("aria-label")).includes("Avatar"))
+      await pg.goto(fast.base + "/#/about")
+      await pg.waitForTimeout(2000)
+      const aboutRadios = pg.locator("main [role=radiogroup][aria-label='Status marks'] [role=radio]")
+      t.ok("About has the same list", (await aboutRadios.count()) === 4 && (await aboutRadios.nth(3).getAttribute("aria-checked")) === "true")
+      const section = () => pg.evaluate(() => Math.round(document.querySelector("main [role=radiogroup][aria-label='Status marks']").closest("section").getBoundingClientRect().height))
+      const s0 = await section()
+      await aboutRadios.nth(0).click()
+      const shrink = []
+      for (let i = 0; i < 14; i++) { await pg.waitForTimeout(45); shrink.push(await section()) }
+      t.ok("in About, leaving Avatar shrinks the section smoothly through in-between heights", new Set(shrink).size >= 5 && shrink[shrink.length - 1] < s0 - 100, `${s0} -> ${shrink.join(" ")}`)
+      await pg.waitForTimeout(500)
+      await aboutRadios.nth(3).click()
+      const stretch = []
+      for (let i = 0; i < 14; i++) { await pg.waitForTimeout(45); stretch.push(await section()) }
+      t.ok("and choosing Avatar stretches it open smoothly", new Set(stretch).size >= 5 && stretch[stretch.length - 1] > stretch[0] + 60, stretch.join(" "))
+      await pg.waitForTimeout(700)
+      await aboutRadios.nth(0).click()
       await pg.waitForTimeout(800)
-      t.ok("and it comes round to the orbs again", (await btn.getAttribute("aria-label")).includes("Orbs. Change") && (await painted()).some((n) => n > 0))
+      const label = await btn.getAttribute("aria-label")
+      t.ok("and choosing Orbs there changes the page at once", label.endsWith("Orbs") && (await painted()).some((n) => n > 0), label)
+      await pg.context().close()
+    },
+  },
+  {
+    // on a phone the list stays on the screen
+    name: "marks: on a phone the list of status marks fits the screen",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors, { width: 390, height: 780 })
+      await pg.goto(fast.base + "/#/dashboard")
+      await pg.waitForTimeout(1800)
+      await pg.click("button[aria-label^='Status marks']")
+      await pg.waitForTimeout(600)
+      const r = await pg.evaluate(() => { const b = document.querySelector("[role=dialog][aria-label='Status marks']").getBoundingClientRect(); return { l: Math.round(b.left), r: Math.round(b.right), w: innerWidth, over: document.documentElement.scrollWidth - innerWidth } })
+      t.ok("the list is inside the screen, on both sides", r.l >= 0 && r.r <= r.w && r.over <= 1, JSON.stringify(r))
       await pg.context().close()
     },
   },

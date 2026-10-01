@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react"
 import { ThinkingOrb } from "../vendor/thinking-orbs/orb"
 import { SLOW, type OrbDesign } from "../lib/orbs"
-import { botFor, randomBot, useAvatar, useBotChoice, type BotType } from "../lib/avatar"
+import { botFor, randomBot, useAvatar, useBotChoice, type AvatarKind, type BotType } from "../lib/avatar"
 import { LoaderMark } from "./loader"
 import { t } from "../lib/i18n"
 
@@ -13,7 +13,7 @@ type Size = 64 | 32 | 20
 // loaded only then: with the orbs nobody downloads them.
 const BotAvatar = lazy(() => import("../vendor/bot-avatars/index.es.js").then((m) => ({ default: m.BotAvatar })))
 
-interface FaceProps { design: OrbDesign; size: Size; moving: boolean; label?: string; color?: string; speed: number; fps?: number; scale: number; rest?: boolean; drawn: BotType }
+interface FaceProps { design: OrbDesign; size: Size; moving: boolean; label?: string; color?: string; speed: number; fps?: number; scale: number; rest?: boolean; drawn: BotType; as?: AvatarKind }
 
 /** One avatar, as a tile in the picker (About): still looking around, not following the pointer. */
 export function BotTile({ type, size = 44 }: { type: BotType; size?: number }) {
@@ -25,8 +25,9 @@ export function BotTile({ type, size = 44 }: { type: BotType; size?: number }) {
 }
 
 /** What shows for one design: its orb, or its bot (a shape of its own, working / looking around / sleeping by what it stands for). */
-function Face({ design, size, moving, label, color, speed, fps, scale, rest, drawn }: FaceProps) {
-  const avatar = useAvatar()
+function Face({ design, size, moving, label, color, speed, fps, scale, rest, drawn, as }: FaceProps) {
+  const chosen = useAvatar()
+  const avatar = as ?? chosen                                   // `as`: show this way whatever is chosen (the preview in the settings)
   const pick = useBotChoice()
   const hidden = label ? { "aria-label": label } : { "aria-hidden": true, role: "presentation" }
   if (avatar === "loading") return <LoaderMark design={design} px={size * scale} moving={moving} color={color} />       // the loading style alone: no orb
@@ -45,7 +46,7 @@ function Face({ design, size, moving, label, color, speed, fps, scale, rest, dra
 /** An orb in a fixed slot. When the design changes the old form dissolves (it swells a little and blurs away) while the new
  *  one resolves out of a blur (it settles from a little smaller), 450 ms, so a state change reads as one orb changing form,
  *  not two orbs swapped. */
-export function Orb({ design, size = 20, moving = true, label, color, speed = 1, fps, scale = 1, rest }: { design: OrbDesign; size?: Size; moving?: boolean; label?: string; color?: string; speed?: number; fps?: number; scale?: number; rest?: boolean }) {
+export function Orb({ design, size = 20, moving = true, label, color, speed = 1, fps, scale = 1, rest, as }: { design: OrbDesign; size?: Size; moving?: boolean; label?: string; color?: string; speed?: number; fps?: number; scale?: number; rest?: boolean; as?: AvatarKind }) {
   const [shown, setShown] = useState(design)
   const drawn = useRef<BotType | null>(null)
   drawn.current ??= randomBot(Math.random())          // this place's avatar when "random" is chosen: it stays until the page is opened again
@@ -61,8 +62,8 @@ export function Orb({ design, size = 20, moving = true, label, color, speed = 1,
   }, [design])
   return (
     <span className="orb-slot" style={{ width: size * scale, height: size * scale }}>
-      {leaving && <span className="orb-layer orb-out" aria-hidden><Face design={leaving} size={size} moving={moving} color={color} speed={speed} fps={fps} scale={scale} rest={rest} drawn={drawn.current} /></span>}
-      <span key={shown} className="orb-layer orb-in"><Face design={shown} size={size} moving={moving} label={label} color={color} speed={speed} fps={fps} scale={scale} rest={rest} drawn={drawn.current} /></span>
+      {leaving && <span className="orb-layer orb-out" aria-hidden><Face design={leaving} size={size} moving={moving} color={color} speed={speed} fps={fps} scale={scale} rest={rest} drawn={drawn.current} as={as} /></span>}
+      <span key={shown} className="orb-layer orb-in"><Face design={shown} size={size} moving={moving} label={label} color={color} speed={speed} fps={fps} scale={scale} rest={rest} drawn={drawn.current} as={as} /></span>
     </span>
   )
 }

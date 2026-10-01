@@ -6,22 +6,24 @@ import { cn } from "../lib/cn"
 // Motion for things that open, close, appear and disappear. Height is animated through grid rows (0fr <-> 1fr), so it
 // is exact for any content and needs no measuring; opacity rides along. One ease and one duration scale, everywhere.
 const MS = 320
+export const SOFT_MS = 520
 
 /** Mounted while open and for the length of the closing animation: a body that is expensive to build (a 20,000
  *  character tool result) exists only while it is visible. */
-function useMounted(open: boolean) {
+function useMounted(open: boolean, ms: number) {
   const [mounted, setMounted] = useState(open)
   useEffect(() => {
     if (open) { setMounted(true); return }
-    const t = setTimeout(() => setMounted(false), MS)
+    const t = setTimeout(() => setMounted(false), ms)
     return () => clearTimeout(t)
   }, [open])
   return open || mounted
 }
 
-/** `instant`: when it is open at the start it is simply there (no opening), and it still closes by closing up. */
-export function Collapse({ open, children, className, instant = false }: { open: boolean; children: ReactNode; className?: string; instant?: boolean }) {
-  const mounted = useMounted(open)
+/** `instant`: when it is open at the start it is simply there (no opening), and it still closes by closing up. `soft`: a slower, even
+ *  stretch and shrink (for a section that is a good part of a page or a panel). */
+export function Collapse({ open, children, className, instant = false, soft = false }: { open: boolean; children: ReactNode; className?: string; instant?: boolean; soft?: boolean }) {
+  const mounted = useMounted(open, soft ? SOFT_MS + 40 : MS)
   const [shown, setShown] = useState(instant && open)          // one frame after mounting, so the opening has a "from" to animate from
   useEffect(() => {
     if (!open) { setShown(false); return }
@@ -30,7 +32,7 @@ export function Collapse({ open, children, className, instant = false }: { open:
   }, [open])
   if (!mounted) return null
   return (
-    <div className={cn("collapse-grid", shown && open && "is-open", className)}>
+    <div className={cn("collapse-grid", soft && "collapse-soft", shown && open && "is-open", className)}>
       <div className="min-h-0 overflow-hidden" inert={!open}>{children}</div>
     </div>
   )
@@ -83,6 +85,30 @@ export function Fit({ children, className }: { children: ReactNode; className?: 
   return (
     <div className="fit-box -m-1 w-[calc(100%+0.5rem)] overflow-hidden p-1" style={h == null ? undefined : { height: h + 8 }}>
       <div ref={inner} className={className}>{children}</div>
+    </div>
+  )
+}
+
+/** A scrolling panel whose height glides to the height of what is in it, up to a cap (then it scrolls): a section that opens inside it
+ *  stretches it open, instead of the panel jumping to its largest size at once. The scrollbar's room is kept, so nothing shifts sideways
+ *  when the scrollbar appears. The padding goes on `inner`: the height is measured inside it. */
+export function GlidePanel({ children, className, inner = "", cap, ...rest }: { children: ReactNode; className?: string; inner?: string; cap: () => number } & React.HTMLAttributes<HTMLDivElement>) {
+  const body = useRef<HTMLDivElement>(null)
+  const [h, setH] = useState<number | null>(null)
+  useLayoutEffect(() => {
+    const el = body.current
+    if (!el) return
+    const measure = () => setH(Math.min(el.offsetHeight, cap()))
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    addEventListener("resize", measure)
+    return () => { ro.disconnect(); removeEventListener("resize", measure) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  return (
+    <div {...rest} className={cn("glide-panel overflow-y-auto [scrollbar-gutter:stable]", className)} style={h == null ? undefined : { height: h }}>
+      <div ref={body} className={inner}>{children}</div>
     </div>
   )
 }
