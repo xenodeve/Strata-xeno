@@ -81,6 +81,7 @@ upstream file we modified (45 files). Source: `git diff --name-status 4c68013 5c
 | `src/core/expert_source.cpp` + `.hpp` | expert sources; `expert_pool_dispatch_multi`; placement-first reads; exclusive release/recommit; NVMe tier | MIXED +562/−5 |
 | `src/core/pinned.cu` + `.hpp` | host arena: VirtualAlloc, large pages, cudaHostRegister; `reserve_only`, `decommit_interior`, `commit_interior` | MIXED |
 | `src/core/secondary_{arena,runner,vram}.cpp`, `secondary_{budget,profile}.hpp` | 4070 tier | XENO |
+| `include/strata/core/placement_formats.hpp` | which placements a pack's per-layer formats allow: the 4070 tier and the automatic exclusive default need all-Q2_0; an explicit `--exclusive-primary-experts` (and with it `--ram-cache-gib`) any format the native kernels compute (#11) | XENO |
 | `src/core/expert_cache.cpp` | GPU0 expert cache | UPSTREAM |
 | `src/core/remote_experts.cpp` | upstream helper-GPU caches | MIXED (merge-only, 1 line) |
 | `src/core/device.cu`, `device_main.cpp` | `strata-device`; our 4070 VRAM probe | MIXED |
@@ -287,7 +288,7 @@ defaults verified at `generate.cpp:181`, `:237`, `:239`, `:251`, `:258`, `:312`)
 | MMQ `nsm = 1` on every device | `moe_mmq.cu:153-154` | `STRATA_MMQ_STREAM_K` set to any value |
 | CPU-order Q2_0 GPU path and the `exp(double)` CPU SwiGLU (changes CPU-only output too) | `pool.cpp:419`; `verify.cpp:654`, `:694` | **no opt-out** |
 | LAZY module loading instead of forced EAGER | `generate.cpp:1413-1418` | `CUDA_MODULE_LOADING=EAGER` in the environment |
-| exclusive primary when eligible (`exclusive_mode = -1`); eligible by default for any Q2_0 native pack with a profile and a cache, since `pcie_frac` now defaults to 0 | `:251`, `:1931-1941` | `--no-exclusive-primary-experts` |
+| exclusive primary when eligible (`exclusive_mode = -1`); eligible by default for any Q2_0 native pack with a profile and a cache, since `pcie_frac` now defaults to 0; on an i-quant native pack only when requested (#11, `placement_formats.hpp`) | `:251`, `:1931-1941` | `--no-exclusive-primary-experts` |
 | placement-first whenever a tier is exclusive | `:1948` | follows the above |
 | tail file | `:312` | `--no-tail-file` |
 | `--pool-priority` 2 (HIGHEST) | `:237` | `--pool-priority 0` |

@@ -21,6 +21,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/placement_formats.hpp"
 #include "strata/core/secondary_arena.hpp"
 #include "strata/core/secondary_profile.hpp"
 #include "strata/core/secondary_runner.hpp"
@@ -32,6 +33,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -600,7 +602,11 @@ void usage() {
                  "  --secondary-profile-timing  Opt-in CUDA event timing for secondary transfer/compute.\n"
                      "  --secondary-stage-only  Stage/verify weights, but compute all experts as before.\n"
                      "  --exclusive-primary-experts  Phase 4 static primary ownership; decommit host copies.\n"
-                     "                               Needs profile, --no-prefill-borrow, --adapt-swaps 0.\n"
+                     "                               Needs a profile, an expert cache, spec >= 2, --pcie-frac 0.\n"
+                     "                               On by default for all-Q2_0 native packs; pass it for i-quant packs.\n"
+                     "  --ram-cache-gib G    #11 capacity mode: only G GiB of the host-owned experts stay in RAM, the\n"
+                     "                       rest are read from the pack or GGUF on a miss (NVMe tier).  Needs\n"
+                     "                       placement-first, i.e. --exclusive-primary-experts or the 4070 tier.\n"
                      "  --no-tail-file       keep host copies of the prompt path's lendable cache slots (default with\n"
                      "                       exclusive primary experts: none; a tail-<key>.bin next to the pack,\n"
                      "                       ~3.5 GB at 8K chunks, refills them after a prompt; #34)\n"
@@ -2233,10 +2239,9 @@ int main(int argc, char** argv) {
     // at 3.24 tok/s with it and 61.92 tok/s with --pcie-frac 0, prefill unchanged (292.9 vs 294.7 tok/s;
     // strata-claude-servepcie, #27). So the default is 0; --pcie-frac still turns the path on.
     if (o.pcie_frac < 0.0) o.pcie_frac = 0.0;
-    const bool secondary_q2 = native_pack &&
-        std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
-                    strata::kernels::cpu::expert_layout().fmt.end(),
-                    [](const auto& f) { return f.gu_type == 42 && f.d_type == 42; });
+    const auto pack_formats = strata::core::placement_formats(native_pack, strata::kernels::cpu::expert_layout().fmt,
+                                                              strata::kernels::iq_supported);
+    const bool secondary_q2 = pack_formats.all_q2;
     if (o.secondary_expert_mib > 0 &&
         (!native_pack || (!o.secondary_stage_only && !o.cache_cpu_only &&
                           (!secondary_q2 || o.pcie_frac != 0.0 || o.no_pool || o.spec < 2)))) {
@@ -2245,11 +2250,14 @@ int main(int argc, char** argv) {
         return 2;
     }
     {
-        const bool eligible = secondary_q2 && o.spec >= 2 && !o.mmap_experts && !o.cache_cpu_only && !o.no_pool &&
-                              o.pcie_frac == 0.0 && !o.expert_profile.empty() && o.expert_cache != 0;
+        // #11: requested explicitly, any native pack the GPU and CPU kernels compute (an i-quant pack's NVMe tier
+        // needs placement-first); the automatic default stays Q2_0-only, where pool-hit parity is bit-exact
+        const bool rest = o.spec >= 2 && !o.mmap_experts && !o.cache_cpu_only && !o.no_pool && o.pcie_frac == 0.0 &&
+                          !o.expert_profile.empty() && o.expert_cache != 0;
+        const bool eligible = rest && strata::core::exclusive_primary_formats_ok(pack_formats, o.exclusive_mode == 1);
         if (o.exclusive_mode == 1 && !eligible) {
-            std::fprintf(stderr, "strata generate: --exclusive-primary-experts requires native Q2_0, spec >=2, "
-                                 "a profile, an expert cache, --pcie-frac 0 "
+            std::fprintf(stderr, "strata generate: --exclusive-primary-experts requires a native pack in formats the "
+                                 "GPU and CPU kernels compute, spec >=2, a profile, an expert cache, --pcie-frac 0 "
                                  "and an enabled CPU pool; it excludes mmap/forced-CPU modes\n");
             return 2;
         }
