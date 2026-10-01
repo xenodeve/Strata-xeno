@@ -220,7 +220,7 @@ export function Chat() {
           </div>
         </Collapse>
         {chat.messages.map((m, i) => (
-          <MessageView key={i} m={m} streaming={busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill}
+          <MessageView key={i} m={m} streaming={busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined}
             actions={m.role === "user" ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt } : undefined} />
         ))}
         {leaving.length > 0 && <Leaving messages={leaving} onGone={() => setLeaving([])} />}

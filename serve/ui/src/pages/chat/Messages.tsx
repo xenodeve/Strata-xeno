@@ -5,7 +5,7 @@ import { chat, metaText, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
 import { Collapse, Fit } from "../../components/motion"
 import { Orb, StatusLabel } from "../../components/orb"
-import { latticePattern, replyDesign, toolDesign, type OrbDesign } from "../../lib/orbs"
+import { phaseKind, replyDesign, toolDesign, type OrbDesign } from "../../lib/orbs"
 import { Lattice, Thought, type LatticeStatus } from "../../components/thought"
 import { cn } from "../../lib/cn"
 import { fmt, timeStr } from "../../lib/format"
@@ -84,6 +84,17 @@ function Answer({ m }: { m: Message }) {
 
 // The agent's thinking: a lattice that runs the pattern of what it is doing, beside a line that shimmers while it thinks
 // and settles into "Thought for 2.4s"; it opens to the reasoning text.
+/** The mark beside the thought: while the agent works, the orb of what it is doing (thinking is Solving; a tool call or the next step
+ *  after one takes its own form); when it is done the orb gives way to the lattice's tick, or its cross when the reply failed. */
+function ThoughtGlyph({ working, status, design }: { working: boolean; status: LatticeStatus; design: OrbDesign }) {
+  return (
+    <span className="relative inline-block size-5">
+      <span className={cn("absolute inset-0 transition-opacity duration-300", working ? "opacity-100" : "opacity-0")} aria-hidden><Orb design={design} size={20} moving={working} /></span>
+      <span className={cn("absolute inset-0 grid place-items-center transition-opacity duration-300", working ? "opacity-0" : "opacity-100")}><Lattice status={status} pattern="orbit" /></span>
+    </span>
+  )
+}
+
 function Thinking({ m, streaming, show, phase }: { m: Message; streaming: boolean; show: boolean; phase: OrbDesign | null }) {
   const [touched, setTouched] = useState<boolean | null>(null)       // the user's own choice, once made
   const thinkingNow = streaming && !m.text
@@ -93,7 +104,7 @@ function Thinking({ m, streaming, show, phase }: { m: Message; streaming: boolea
     <div className="mb-2">
       <Thought
         working={thinkingNow}
-        glyph={<Lattice status={status} pattern={latticePattern(phase)} />}
+        glyph={<ThoughtGlyph working={thinkingNow} status={status} design={phase ?? "solving"} />}
         open={open}
         onToggle={() => setTouched(!open)}
         elapsed={thinkingNow ? null : m.thinkSecs}
@@ -134,7 +145,7 @@ function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: bo
   )
 }
 
-export function MessageView({ m, streaming, show, prefill, actions }: { m: Message; streaming: boolean; show: boolean; prefill: boolean; actions?: PromptActions }) {
+export function MessageView({ m, streaming, show, prefill, actions, serverPhase }: { m: Message; streaming: boolean; show: boolean; prefill: boolean; actions?: PromptActions; serverPhase?: string | null }) {
   const ref = useRef<HTMLDivElement>(null)
   const mine = useRef<HTMLDivElement>(null)
   const [editing, setEditing] = useState(false)
@@ -198,7 +209,9 @@ export function MessageView({ m, streaming, show, prefill, actions }: { m: Messa
       {m.error ? (
         <div className="rounded-md border border-line px-3 py-2 text-[13px] text-bad [overflow-wrap:anywhere]">{m.error}</div>
       ) : waiting ? (
-        m.reasoning ? null : <StatusLabel design="breathing" className="text-[13px] text-ink-2">{t("Waiting for the model…")}</StatusLabel>
+        m.reasoning ? null : phaseKind(serverPhase).kind === "reading"
+          ? <StatusLabel design="listening" className="text-[13px] text-ink-2">{t("Reading the prompt…")}</StatusLabel>
+          : <StatusLabel design="breathing" className="text-[13px] text-ink-2">{t("Waiting for the model…")}</StatusLabel>
       ) : (
         <div className={cn(streaming && "streaming")}><Answer m={m} /></div>
       )}
