@@ -955,4 +955,75 @@ export const checks = [
       t.ok("the two themes use different colours", got.light.builtin !== got.dark.builtin && got.light.bg !== got.dark.bg)
     },
   },
+  {
+    // taking the first prompt back would leave the conversation empty, so it asks before deleting it; and a conversation is in the
+    // list from the moment its first prompt is sent
+    name: "undoall: taking back the first prompt asks before it deletes the conversation, which is in the list from the first send",
+    async run({ browser, fast, long, t, errors }) {
+      const pg = await open(browser, errors)
+      const side = pg.locator("aside[aria-label='Conversations']")
+      const dialog = pg.locator("[role=alertdialog]")
+      const undo = async () => { await pg.locator(".msg-in.group").last().hover(); await pg.click("button[aria-label='Take this prompt back']") }
+      await pg.goto(fast.base + "/#/chat")
+      await pg.evaluate(() => localStorage.clear())
+      await pg.reload()
+      await pg.waitForSelector("textarea")
+      await send(pg, "only prompt")
+      await undo()
+      await pg.waitForTimeout(400)
+      t.ok("taking back the only prompt asks first, and says what happens", (await dialog.count()) === 1 && (await dialog.innerText()).includes("Delete this conversation?") && (await pg.locator(".msg-in.group").count()) === 1)
+      t.ok("nothing has been taken back yet", (await side.locator("[data-topic]", { hasText: "only prompt" }).count()) === 1 && (await pg.inputValue("textarea")) === "")
+      t.ok("the safe answer has the focus", (await pg.evaluate(() => document.activeElement?.textContent)) === "Cancel")
+      await pg.keyboard.press("Escape")
+      await pg.waitForTimeout(400)
+      t.ok("Escape leaves everything as it was", (await dialog.count()) === 0 && (await pg.locator(".msg-in.group").count()) === 1 && (await side.locator("[data-topic]", { hasText: "only prompt" }).count()) === 1)
+      await undo()
+      await pg.waitForTimeout(300)
+      await dialog.getByRole("button", { name: "Cancel", exact: true }).click()
+      await pg.waitForTimeout(400)
+      t.ok("Cancel does too", (await dialog.count()) === 0 && (await pg.locator(".msg-in.group").count()) === 1)
+      await undo()
+      await pg.waitForTimeout(300)
+      await dialog.getByRole("button", { name: "Delete conversation", exact: true }).click()
+      await pg.waitForTimeout(800)
+      t.ok("Delete takes the prompt back to the composer and the conversation leaves the list", (await dialog.count()) === 0 && (await pg.inputValue("textarea")) === "only prompt" && (await side.locator("[data-topic]").count()) === 0 && pg.url().endsWith("#/chat"), pg.url())
+
+      await send(pg, "first of two")
+      await send(pg, "second of two")
+      await undo()
+      await pg.waitForFunction(() => document.querySelectorAll(".msg-in.group").length === 1 && !document.querySelector(".ghost"), null, { timeout: 8000 }).catch(() => {})      // it closes up over about 400 ms
+      await pg.waitForTimeout(300)
+      t.ok("with an earlier prompt there is nothing to ask: the last one is simply taken back", (await dialog.count()) === 0 && (await pg.locator(".msg-in.group").count()) === 1 && (await side.locator("[data-topic]", { hasText: "first of two" }).count()) === 1)
+      await pg.context().close()
+
+      const slow = await open(browser, errors)
+      await slow.goto(long.base + "/#/chat")
+      await slow.evaluate(() => localStorage.clear())
+      await slow.reload()
+      await slow.waitForSelector("textarea")
+      await slow.fill("textarea", "listed at once")
+      await slow.keyboard.press("Enter")
+      await slow.waitForSelector("button[aria-label='Stop']")
+      await slow.waitForTimeout(400)
+      const listed = await slow.locator("aside[aria-label='Conversations'] [data-topic]", { hasText: "listed at once" }).count()
+      t.ok("a conversation is in the list while its first answer is still being written", listed === 1 && /#\/chat\/.+/.test(slow.url()) && (await slow.locator("button[aria-label='Stop']").count()) === 1, slow.url())
+      await slow.click("button[aria-label='Stop']")
+      await slow.context().close()
+
+      const th = await open(browser, errors, { lang: "th" })
+      await th.goto(fast.base + "/#/chat")
+      await th.evaluate(() => localStorage.clear())
+      await th.reload()
+      await th.waitForSelector("textarea")
+      await th.fill("textarea", "คำถามเดียว")
+      await th.keyboard.press("Enter")
+      await th.waitForFunction(() => !document.querySelector("button[aria-label='หยุด']") && document.querySelector(".prose-chat"), null, { timeout: 60000 })
+      await th.waitForTimeout(500)
+      await th.locator(".msg-in.group").last().hover()
+      await th.click("button[aria-label='เอา prompt นี้กลับมา']")
+      await th.waitForTimeout(400)
+      t.ok("in Thai the question is Thai", (await th.locator("[role=alertdialog]").innerText()).includes("ลบการสนทนานี้ไหม"))
+      await th.context().close()
+    },
+  },
 ]

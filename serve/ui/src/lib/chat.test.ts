@@ -375,3 +375,86 @@ describe("conversations", () => {
     expect(said[0]).toContain("storage is full")
   })
 })
+
+describe("a conversation appears when its prompt is sent, and taking back the first prompt is announced", () => {
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    return data
+  }
+  const answer = (text: string) => sse(delta({ content: text }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]\n\n")
+
+  test("it is in the list as soon as the prompt is sent, not when the answer ends; the answer that is still being written is not stored", async () => {
+    const data = keep()
+    let release!: () => void
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(new ReadableStream<Uint8Array>({
+      start(ctl) { release = () => { ctl.enqueue(enc.encode(answer("ok"))); ctl.close() } },
+    }), { status: 200 })
+    const c = new ChatController()
+    const p = c.send("hello there", [], ctx)
+    expect(c.busy).not.toBeNull()                                   // the answer has not come
+    expect(c.index.items).toHaveLength(1)
+    expect(c.index.items[0].title).toBe("hello there")
+    expect(c.index.active).toBe(c.index.items[0].id)
+    expect((JSON.parse(data.get("strata.chat")!) as { role: string }[]).map((m) => m.role)).toEqual(["user"])
+    expect(JSON.parse(data.get("strata.chats")!).items).toHaveLength(1)
+    release()
+    await p
+    expect((JSON.parse(data.get("strata.chat")!) as { role: string }[]).map((m) => m.role)).toEqual(["user", "assistant"])
+    expect(c.index.items).toHaveLength(1)
+  })
+
+  test("a rewrite of the first prompt keeps one conversation", async () => {
+    keep()
+    mockFetch([answer("a"), answer("b")], [])
+    const c = new ChatController()
+    await c.send("first", [], ctx)
+    await c.edit(0, "first, reworded", ctx)
+    expect(c.index.items).toHaveLength(1)
+    expect(c.index.items[0].title).toBe("first, reworded")
+  })
+
+  test("rewriting the first prompt keeps the conversation: its name by hand, its project and its place", async () => {
+    keep()
+    mockFetch([answer("a"), answer("b")], [])
+    const c = new ChatController()
+    await c.send("first", [], ctx)
+    const id = c.index.active!
+    c.rename(id, "Kept")
+    const project = c.addProject("Work")!
+    c.move(id, project)
+    await c.edit(0, "first, reworded", ctx)
+    expect(c.index.items).toHaveLength(1)
+    expect(c.index.items[0]).toMatchObject({ id, title: "Kept", project })
+    expect(c.index.active).toBe(id)
+  })
+
+  test("taking back the only prompt would empty the conversation, and the controller says so first", async () => {
+    keep()
+    mockFetch([answer("a"), answer("b")], [])
+    const c = new ChatController()
+    expect(c.undoWouldEmpty()).toBe(false)                          // nothing to take back
+    await c.send("one", [], ctx)
+    expect(c.undoWouldEmpty()).toBe(true)
+    await c.send("two", [], ctx)
+    expect(c.undoWouldEmpty()).toBe(false)                          // there is an earlier prompt
+    c.undoLast()
+    expect(c.undoWouldEmpty()).toBe(true)
+    const back = c.undoLast()!
+    expect(back.text).toBe("one")
+    expect(c.index.items).toEqual([])                                // the conversation is gone, as the question said it would be
+    expect(c.index.active).toBeNull()
+  })
+
+  test("while an answer is being written there is nothing to ask about", async () => {
+    keep()
+    mockFetch([answer("a")], [])
+    const c = new ChatController()
+    await c.send("one", [], ctx)
+    c.busy = { abort: new AbortController(), msg: c.messages[1] }
+    expect(c.undoWouldEmpty()).toBe(false)
+    c.busy = null
+  })
+})

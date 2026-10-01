@@ -9,6 +9,7 @@ import { toast } from "../../components/toast"
 import { StatusOrb } from "../../components/live"
 import { PromptBar } from "../../components/PromptBar"
 import { Sidebar } from "../../components/Sidebar"
+import { ConfirmDialog } from "../../components/ConfirmDialog"
 import { useMetrics } from "../../lib/metrics"
 import { href } from "../../lib/router"
 import { effortChoices, settleEffort } from "../../lib/effort"
@@ -201,7 +202,13 @@ export function Chat({ id }: { id?: string }) {
   const ctx = () => ({ health, mcp, projectionLoaded: projection })
   const editPrompt = (i: number, t: string) => { pinned.current = true; setAway(false); void chat.edit(i, t, ctx()) }
   const [leaving, setLeaving] = useState<Message[]>([])        // what an undo took away: it closes up (height and fade) before it is gone
+  const [asking, setAsking] = useState(false)               // taking back the first prompt deletes the conversation: asked first
   const undoPrompt = () => {
+    if (chat.undoWouldEmpty()) { setAsking(true); return }
+    takeBack()
+  }
+  const cancelAsk = useCallback(() => setAsking(false), [])
+  const takeBack = () => {
     const back = chat.undoLast()
     if (!back) return
     setLeaving(back.removed)
@@ -310,6 +317,14 @@ export function Chat({ id }: { id?: string }) {
         </PromptBar>
       </div>
 
+      <ConfirmDialog
+        open={asking}
+        title={t("Delete this conversation?")}
+        text={t("Taking back the first prompt leaves nothing in this conversation, so it is deleted from Recents. The prompt goes back to the composer.")}
+        confirmLabel={t("Delete conversation")}
+        onCancel={cancelAsk}
+        onConfirm={() => { setAsking(false); takeBack() }}
+      />
       <SettingsSheet open={sheet} onClose={closeSheet} efforts={choices} mcp={mcp} projectionLoaded={projection} />
     </section>
     </div>

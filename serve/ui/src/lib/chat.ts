@@ -169,7 +169,8 @@ export class ChatController {
   private fullNoted = false
   /** The open conversation as it is stored: attachments are kept by name only. */
   private stored(): StoredMessage[] {
-    return this.messages.map((m) => ({ ...m, images: (m.images || []).map((i) => ({ name: i.name })), files: (m.files || []).map((f) => ({ name: f.name })) }))
+    return this.messages.filter((m) => m !== this.busy?.msg)               // the answer that is still being written is not stored half-empty
+      .map((m) => ({ ...m, images: (m.images || []).map((i) => ({ name: i.name })), files: (m.files || []).map((f) => ({ name: f.name })) }))
   }
   /** The browser refused a write: said once, until a write works again. */
   private storageFull() {
@@ -252,6 +253,14 @@ export class ChatController {
     if (lost) this.onError(t("Attachments not restored"), tn(lost, "{n} attachment was not kept: only the names of attachments are stored, so a file or an image is gone after the page is reloaded.", "{n} attachments were not kept: only the names of attachments are stored, so a file or an image is gone after the page is reloaded."))
   }
 
+  /** Whether taking the last prompt back would leave the conversation empty (it is the first prompt), which deletes the conversation: the page
+   *  asks first. Never while an answer is being written (nothing can be taken back then). */
+  undoWouldEmpty(): boolean {
+    if (this.busy) return false
+    const at = this.messages.map((m) => m.role).lastIndexOf("user")
+    return at === 0
+  }
+
   /** Takes the last prompt back, with its answer: both leave the chat and the prompt (with the attachments that are still
    *  held) is returned to be put in the composer. Not while an answer is being written. */
   undoLast(): { text: string; attachments: Attachment[]; removed: Message[] } | null {
@@ -277,7 +286,7 @@ export class ChatController {
     const { kept, lost } = attachmentsOf(m)
     if (!text.trim() && !kept.length) return false
     this.messages = this.messages.slice(0, index)
-    this.save(); this.notify()
+    this.notify()                                             // not saved here: send() saves, and an empty save would delete the conversation (its name, its project) and make it again
     this.lostNote(lost)
     await this.send(text, kept, ctx)
     return true
@@ -298,6 +307,7 @@ export class ChatController {
     this.messages.push(m)
     const abort = new AbortController()
     this.busy = { abort, msg: m }
+    this.save()                                               // the conversation is in the list now, not when its answer ends
     this.notify()
 
     const s = this.settings

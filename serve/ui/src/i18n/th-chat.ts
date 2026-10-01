@@ -179,4 +179,7 @@ export const part: Record<string, string> = {
   "Starts a new chat; this one stays in Recents": "เริ่มแชทใหม่ แชทนี้ยังอยู่ใน “ล่าสุด”",
   "This browser's storage is full": "ที่เก็บของเบราว์เซอร์นี้เต็มแล้ว",
   "The conversation may not be kept. Delete some from Recents to make room.": "การสนทนานี้อาจไม่ถูกเก็บไว้ ลบบางอันใน “ล่าสุด” เพื่อเพิ่มที่",
+  "Delete this conversation?": "ลบการสนทนานี้ไหม?",
+  "Taking back the first prompt leaves nothing in this conversation, so it is deleted from Recents. The prompt goes back to the composer.": "การเอา prompt แรกกลับมาทำให้การสนทนานี้ว่างเปล่า จึงจะถูกลบออกจาก “ล่าสุด” ส่วน prompt จะกลับไปอยู่ในช่องพิมพ์",
+  "Delete conversation": "ลบการสนทนา",
 }
