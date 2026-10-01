@@ -26,6 +26,7 @@ import contextlib
 import base64
 import hashlib
 import hmac
+import ipaddress
 import codecs
 import heapq
 import itertools
@@ -831,6 +832,7 @@ class Service:
         self.fifo = RequestGate()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.allowed_hosts: set = set()                # names besides this PC's own that may be used as Host when there is no key (config "allowed_hosts")
         self.status = {"busy": False, "queued": 0, "loops_stopped": 0}  # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
@@ -1925,6 +1927,21 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
+        def _host_ok(self) -> bool:
+            """With no API key, only this PC's own names as Host (see host_allowed); with one, the key is the gate."""
+            if svc.api_key or host_allowed(self.headers.get("Host", ""), svc.allowed_hosts):
+                return True
+            self._json(421, {"error": {"message": "this name does not reach this server: use the PC's address, or list the name in the run config's allowed_hosts"}})
+            return False
+
+        def _foreign_origin(self) -> bool:
+            """A browser sends Origin on a cross-site POST; one that is not this server's own page is refused (403)."""
+            origin = self.headers.get("Origin")
+            if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
+                self._json(403, {"error": {"message": "only from Strata's own page"}})
+                return True
+            return False
+
         def _ui_prefix(self) -> bool:
             """xeno UI S1: /classic/... is the classic web app under a prefix (its relative URLs then land on the
             same routes), /next/... the new one (serve/ui/dist). True when this call answered."""
@@ -1964,12 +1981,18 @@ def make_handler(svc: Service):
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", cache)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if f.suffix == ".html":                          # the app is never shown inside another page (clickjacking the buttons)
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
             return True
 
         def do_GET(self):
+            if not self._host_ok():
+                return
             if self._ui_prefix():
                 return
             path = self.path.split("?")[0].rstrip("/")
@@ -2098,6 +2121,8 @@ def make_handler(svc: Service):
                 self._do_post()
 
         def _do_post(self):
+            if not self._host_ok():
+                return
             if self.path.startswith("/classic/"):             # the classic app under its prefix (xeno UI S1)
                 self.path = self.path[len("/classic"):]
             if not self._authorized():
@@ -2107,8 +2132,11 @@ def make_handler(svc: Service):
                 self._settings()
                 return
             if path == "/metrics/keep":                      # keep the full prompt of the next N requests (0: off)
+                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if not self._own_page("prompts can be kept"):      # xeno #71: a "simple" cross-site POST must not switch this on
+                    return
                 try:
-                    n = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}").get("next")
+                    n = json.loads(raw or b"{}").get("next")
                 except ValueError:
                     n = None
                 if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 50:
@@ -2116,6 +2144,8 @@ def make_handler(svc: Service):
                 with svc.keep_lock:
                     svc.keep_prompts = n
                 return self._json(200, {"keep_prompts_left": n})
+            if path in ("/unload", "/load") and self._foreign_origin():
+                return
             if path == "/unload":                            # give the GPU back now (between requests)
                 r = svc.unload()
                 self._json(409 if r == "busy" else 200, {"status": r})
@@ -2429,6 +2459,27 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
+def host_allowed(host: str, allowed=()) -> bool:
+    """Whether the Host a request names is this PC (xeno #71). A web page on another site whose name has been re-pointed at
+    this PC (DNS rebinding) is then same-origin with the server, and its requests carry that site's name as Host. An IP
+    address cannot be re-pointed, `localhost` and a name with no dot (a machine on the LAN) cannot be a public site, `.local`
+    is mDNS; any other name has to be in the run config's `allowed_hosts`. No Host at all is no browser."""
+    h = (host or "").strip().lower()
+    if not h:
+        return True
+    if h.startswith("["):
+        name = h[1:h.find("]")] if "]" in h else h
+    else:
+        name = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+    name = name.rstrip(".")
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    return name == "localhost" or name.endswith(".localhost") or "." not in name or name.endswith(".local") or name in allowed
+
+
 def ui_choice(cfg: dict) -> str:
     """Which web app `/` serves: the new one, unless the run config says `"ui": "classic"` (the classic app is at /classic/ either way)."""
     return "classic" if (cfg or {}).get("ui") == "classic" else "next"
@@ -2674,6 +2725,7 @@ def main() -> int:
         svc.model_info = gguf_info.model_info(files)        # reads headers only (~0.1 s); a model with no GGUF gives None
     threading.Thread(target=_model_info, daemon=True).start()
     svc.ui = ui_choice(cfg)                                            # which web app "/" serves (xeno UI)
+    svc.allowed_hosts = {str(h).strip().lower().rstrip(".") for h in (cfg.get("allowed_hosts") or []) if str(h).strip()}   # xeno #71
     svc.gpu_indices = monitor_gpus(cfg)               # every card the engine can see (issue #112; UI S0: no "gpu" key)
     svc.gpu_index = (svc.gpu_indices or [0])[0]         # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time

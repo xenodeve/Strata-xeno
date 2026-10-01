@@ -2351,5 +2351,76 @@ class EffortLevelsTests(unittest.TestCase):
             clean_shared_defaults({"reasoning_effort": "extreme"})
 
 
+class WebSecurity(unittest.TestCase):
+    """Security review of the new web app (#71). With no API key a web page on another site must not reach the monitor: not by
+    DNS rebinding (the page's own name resolves to this PC, so the browser sends that name as Host), and not by a "simple"
+    cross-site POST that needs no preflight."""
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        self.svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def call(self, path, method="GET", headers=None, body=None):
+        req = urllib.request.Request(self.base + path, method=method, data=body, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+
+    def test_a_host_that_is_not_this_pc_is_refused_when_there_is_no_key(self):
+        for host in ("attacker.com", "attacker.com:8091", "evil.example.org"):
+            for path in ("/metrics", "/metrics/requests", "/", "/next/"):
+                with self.subTest(host=host, path=path):
+                    self.assertEqual(self.call(path, headers={"Host": host})[0], 421)
+        status, _, _ = self.call("/settings", "POST", {"Host": "attacker.com", "Content-Type": "application/json", "Origin": "http://attacker.com"}, b"{}")
+        self.assertEqual(status, 421)
+
+    def test_this_pc_by_any_of_its_own_names_is_served(self):
+        for host in ("127.0.0.1:8091", "localhost:8091", "[::1]:8091", "192.168.1.20", "my-pc", "my-pc.local:8091", "foo.localhost"):
+            with self.subTest(host=host):
+                self.assertEqual(self.call("/metrics", headers={"Host": host})[0], 200)
+
+    def test_a_name_can_be_allowed_in_the_config(self):
+        self.svc.allowed_hosts = {"strata.example.com"}
+        self.assertEqual(self.call("/metrics", headers={"Host": "strata.example.com"})[0], 200)
+        self.assertEqual(self.call("/metrics", headers={"Host": "attacker.com"})[0], 421)
+
+    def test_with_a_key_the_key_decides_not_the_host(self):
+        self.svc.api_key = "secret"
+        self.assertEqual(self.call("/metrics", headers={"Host": "proxy.example.com"})[0], 401)           # not 421: the key is the gate
+        self.assertEqual(self.call("/metrics", headers={"Host": "proxy.example.com", "Authorization": "Bearer secret"})[0], 200)
+
+    def test_keep_needs_json_and_the_own_page(self):
+        plain = self.call("/metrics/keep", "POST", {"Content-Type": "text/plain"}, b'{"next": 50}')      # a "simple" cross-site request
+        self.assertEqual(plain[0], 415)
+        foreign = self.call("/metrics/keep", "POST", {"Content-Type": "application/json", "Origin": "http://evil.example"}, b'{"next": 50}')
+        self.assertEqual(foreign[0], 403)
+        self.assertEqual(self.svc.keep_prompts, 0)
+        own = self.call("/metrics/keep", "POST", {"Content-Type": "application/json", "Origin": self.base}, b'{"next": 3}')
+        self.assertEqual(own[0], 200)
+        self.assertEqual(self.svc.keep_prompts, 3)
+
+    def test_load_and_unload_refuse_a_foreign_origin(self):
+        for path in ("/load", "/unload"):
+            with self.subTest(path=path):
+                self.assertEqual(self.call(path, "POST", {"Origin": "http://evil.example"}, b"")[0], 403)
+
+    def test_the_app_cannot_be_framed(self):
+        for path in ("/", "/next/"):
+            with self.subTest(path=path):
+                status, headers, _ = self.call(path)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["X-Frame-Options"], "DENY")
+                self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+                self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+
+
 if __name__ == "__main__":
     unittest.main()

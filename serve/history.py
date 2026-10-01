@@ -116,9 +116,18 @@ class HistoryStore:
         name = f"requests-{time.strftime('%Y-%m', time.localtime(t))}.jsonl"
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         with self.lock:
-            self.dir.mkdir(parents=True, exist_ok=True)
-            with open(self.dir / name, "a", encoding="utf-8") as f:
+            self._private_dir(self.dir)
+            fd = os.open(self.dir / name, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)       # xeno #71: owner only (a no-op on Windows)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
                 f.write(line)
+
+    @staticmethod
+    def _private_dir(d: Path) -> None:
+        """The history holds the start of every prompt (and a whole one on request): the folder is the owner's alone where the
+        OS has modes (on Windows it lives under the user's own profile)."""
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name != "nt":
+            os.chmod(d, 0o700)
 
     def _files_newest_first(self):
         return sorted(self.dir.glob("requests-*.jsonl"), reverse=True) if self.dir.is_dir() else []
@@ -200,9 +209,10 @@ class HistoryStore:
             return
         blob = gzip.compress(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         with self.lock:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            self._private_dir(path.parent)
             tmp = path.with_suffix(".tmp")
-            tmp.write_bytes(blob)
+            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                f.write(blob)
             os.replace(tmp, path)
             self._prune()
 

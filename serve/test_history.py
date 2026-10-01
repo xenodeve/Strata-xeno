@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import sys
 import tempfile
 import time
@@ -256,6 +257,25 @@ class DecodeWindows(unittest.TestCase):
         self.assertEqual((s["windows"], s["tok_s_min"], s["tok_s_max"], s["tok_s_mean"]), (0, None, None, 10.0))
         self.assertIsNone(window_rates([0.0]))
         self.assertIsNone(window_rates([]))
+
+
+class Permissions(unittest.TestCase):
+    """xeno #71: the history holds the start of every prompt, so on an OS with modes it is the owner's alone."""
+
+    @unittest.skipIf(os.name == "nt", "modes only mean something off Windows (not run on the developer's PC)")
+    def test_the_folder_and_its_files_are_owner_only(self):
+        old = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                store = HistoryStore(Path(d) / "h")
+                store.append(rec(1))
+                store.write_detail("r0001", {"prompt": ["x"]})
+                for p in (store.dir, store.dir / "detail"):
+                    self.assertEqual(os.stat(p).st_mode & 0o077, 0, str(p))
+                for p in list(store.dir.glob("*.jsonl")) + list((store.dir / "detail").glob("*.gz")):
+                    self.assertEqual(os.stat(p).st_mode & 0o077, 0, str(p))
+        finally:
+            os.umask(old)
 
 
 if __name__ == "__main__":
