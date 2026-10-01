@@ -55,6 +55,7 @@ from serve.loop_guard import LoopGuard
 from serve import cjk_guard, forced_opening, think_budget  # noqa: E402  (xeno #49 S4, S7 follow-up, S3)
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
+from serve.history import HistoryStore, request_meta, summary_record  # noqa: E402  (xeno UI S3)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -805,6 +806,7 @@ class Service:
         self.status = {"busy": False, "queued": 0, "loops_stopped": 0}  # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
+        self.hstore = HistoryStore(Path(tempfile.gettempdir()) / "strata-history-off", enabled=False)  # main() turns it on
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0}
@@ -1407,7 +1409,9 @@ class Service:
                     started = self.status.get("started", time.time())
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
-                    self.history.append({
+                    meta = (sampling or {}).get("_meta") or request_meta("", [], None, None)
+                    rec = summary_record({
+                        **meta,
                         "projection": (sampling or {}).get("experimental_speed_projection") is not False
                         if loaded else None,
                         "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
@@ -1418,6 +1422,11 @@ class Service:
                         if n and last.get("generated") and last.get("decode_ms") else None,
                         "cjk_chars": cjk_guard.count_han(self.tok.decode(raw_ids)) if raw_ids else 0,   # #49 S4
                         "hit_rate": hit_rate})
+                    self.history.append(rec)
+                    try:
+                        self.hstore.append(rec)         # on disk, kept (a full disk must not fail the request)
+                    except OSError as e:
+                        print(f"[strata] history not saved: {e}", flush=True)
                     t = self.totals
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
@@ -1881,6 +1890,23 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path == "/metrics/requests" or path.startswith("/metrics/requests/"):
+                if self._authorized():                     # the history on disk (xeno UI S3): a page, or one request
+                    q = parse_qs(urlsplit(self.path).query)
+                    if path == "/metrics/requests":
+                        try:
+                            page, size = int(q.get("page", ["0"])[0]), int(q.get("size", ["50"])[0])
+                        except ValueError:
+                            return self._json(400, {"error": {"message": "page and size are numbers"}})
+                        return self._json(200, svc.hstore.page(page, size))
+                    rid = path[len("/metrics/requests/"):]
+                    summary = svc.hstore.summary(rid)
+                    if summary is None:
+                        return self._json(404, {"error": {"message": "no such request"}})
+                    detail = svc.hstore.detail(rid)
+                    return self._json(200, {"summary": summary, "detail": detail,
+                                            "detail_state": "kept" if detail is not None else "deleted"})
+                return
             if path == "/metrics":
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
@@ -2108,6 +2134,7 @@ def make_handler(svc: Service):
                 tools = (tools or []) + extra or None
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
+            req = {**req, "_meta": request_meta("openai", messages, tools, self.headers.get("User-Agent"))}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -2142,6 +2169,7 @@ def make_handler(svc: Service):
             think_budget.side_effort(req, kw)                         # xeno #49 S3: before the template renders
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
+            req = {**req, "_meta": request_meta("anthropic", messages, tools, self.headers.get("User-Agent"))}
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
             if budget and thinking:
                 req = {**req, "_think_budget": budget}
@@ -2505,7 +2533,11 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
-    svc.gpu_indices = monitor_gpus(cfg)                 # every card the engine can see (issue #112; UI S0: no "gpu" key)
+    hist = cfg.get("history") if isinstance(cfg.get("history"), dict) else {}      # {"enabled", "dir", "detail_cap_gb"}
+    from serve.history import default_dir
+    svc.hstore = HistoryStore(hist.get("dir") or default_dir(), enabled=hist.get("enabled", True) is not False,
+                              detail_cap_bytes=int(float(hist.get("detail_cap_gb", 2)) * 2**30))
+    svc.gpu_indices = monitor_gpus(cfg)                # every card the engine can see (issue #112; UI S0: no "gpu" key)
     svc.gpu_index = (svc.gpu_indices or [0])[0]         # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"

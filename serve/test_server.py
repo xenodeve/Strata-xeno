@@ -398,6 +398,69 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
 
 
+class RequestHistory(unittest.TestCase):
+    """xeno UI S3: each request carries an id and its dialect, lands on disk, and is read back over /metrics/requests."""
+
+    def setUp(self):
+        from serve.history import HistoryStore
+        self.tmp = tempfile.TemporaryDirectory()
+        tok = ByteTokenizer()
+        self.svc = Service(RecordingEngine(tok, "</think>\n\nhello", max_context=CTX), tok,
+                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.hstore = HistoryStore(self.tmp.name)
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.tmp.cleanup()
+
+    def call(self, path, body, headers=None):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+
+    def get(self, path, headers=None):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(self.base + path, headers=headers or {}), timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_both_dialects_are_recorded_with_id_client_and_preview(self):
+        msgs = [{"role": "user", "content": "hello there"}]
+        self.call("/v1/chat/completions", {"model": "m", "messages": msgs, "max_tokens": 5},
+                  {"User-Agent": "open-webui/0.6"})
+        self.call("/v1/messages", {"model": "m", "messages": msgs, "max_tokens": 5}, {"User-Agent": "claude-cli/2.1"})
+        code, page = self.get("/metrics/requests")
+        self.assertEqual(code, 200)
+        self.assertEqual(page["total"], 2)
+        newest, oldest = page["items"]
+        self.assertEqual((oldest["dialect"], newest["dialect"]), ("openai", "anthropic"))
+        self.assertEqual((oldest["client"], newest["client"]), ("open-webui/0.6", "claude-cli/2.1"))
+        self.assertEqual(newest["preview"], "hello there")
+        self.assertNotEqual(oldest["id"], newest["id"])
+        self.assertEqual(self.svc.metrics()["requests"][0]["id"], newest["id"])       # same row in /metrics
+
+    def test_one_request_by_id_and_a_deleted_detail(self):
+        self.call("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5})
+        rid = self.get("/metrics/requests")[1]["items"][0]["id"]
+        code, one = self.get(f"/metrics/requests/{rid}")
+        self.assertEqual((code, one["summary"]["id"], one["detail_state"], one["detail"]), (200, rid, "deleted", None))
+        self.svc.hstore.write_detail(rid, {"rounds": [1]})
+        self.assertEqual(self.get(f"/metrics/requests/{rid}")[1]["detail"], {"rounds": [1]})
+        self.assertEqual(self.get("/metrics/requests/nope")[0], 404)
+        self.assertEqual(self.get("/metrics/requests/..%2F..%2Fx")[0], 404)
+        self.assertEqual(self.get("/metrics/requests?page=x")[0], 400)
+
+    def test_the_history_needs_the_key_when_one_is_set(self):
+        self.svc.api_key = "secret"
+        self.assertEqual(self.get("/metrics/requests")[0], 401)
+        self.assertEqual(self.get("/metrics/requests", {"Authorization": "Bearer secret"})[0], 200)
+
+
 class MonitorGpus(unittest.TestCase):
     """The Monitor lists every card the engine can see, not only the config's \"gpu\" (xeno UI S0): the D2x config has
     no \"gpu\" key and the launcher sets CUDA_VISIBLE_DEVICES=1,0, so the old code watched NVML card 0 alone."""

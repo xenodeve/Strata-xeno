@@ -94,6 +94,7 @@ upstream file we modified (45 files). Source: `git diff --name-status 4c68013 5c
 | `serve/server.py` (1,903) | HTTP, engine client, OpenAI/Anthropic/MCP | MIXED |
 | `serve/frontend.py` | messages, tool-call parser; billing strip; document blocks | MIXED |
 | `serve/loop_guard.py`, `serve/pdf_blocks.py`, `serve/timeline.py` | loop guard; PDFs; server timeline lanes | XENO |
+| `serve/history.py` | request history on disk: `requests-YYYY-MM.jsonl` summaries (kept), `detail/<id>.json.gz` (2 GB cap, oldest first); run-config key `"history"` `{enabled, dir, detail_cap_gb}`; `GET /metrics/requests[/<id>]` | XENO |
 | `CMakeLists.txt` | our `strata_timeline`, `strata_secondary`, `strata_secondary_compute`, `STRATA_BUILD_XENO_TESTS` | MIXED (+179/−9) |
 | `tests/xeno/**` (88 files) | parity tests, Python tests, `perf/` tools | XENO |
 
