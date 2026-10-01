@@ -1,0 +1,208 @@
+import { useEffect, useState, type ReactNode } from "react"
+import { Chart } from "../components/Chart"
+import { NOT_MEASURED, Row, Rows, Section, ms, pct, val, when } from "../components/bits"
+import { fmt } from "../lib/format"
+import { getRequest, getRequestPage, type RequestDetail, type RequestRow } from "../lib/metrics"
+import { href } from "../lib/router"
+
+/** A figure with its spread on hover or focus: the first depth of detail. */
+function Tip({ children, tip }: { children: ReactNode; tip: ReactNode }) {
+  return (
+    <span className="group relative inline-block outline-none" tabIndex={0}>
+      <span className="cursor-help decoration-dotted decoration-ink-3 underline-offset-4 group-hover:underline group-focus:underline">{children}</span>
+      <span role="tooltip" className="pointer-events-none absolute bottom-full right-0 z-20 mb-1.5 w-max max-w-64 origin-bottom-right scale-[0.98] rounded-md border border-line bg-surface px-2.5 py-1.5 text-left text-[12px] leading-snug opacity-0 shadow-[0_6px_24px_rgb(0_0_0/0.10)] transition-[opacity,transform] duration-150 group-hover:scale-100 group-hover:opacity-100 group-focus:scale-100 group-focus:opacity-100">
+        {tip}
+      </span>
+    </span>
+  )
+}
+
+const r1 = (n: number) => n.toFixed(1)
+
+function decodeCell(r: RequestRow): ReactNode {
+  const d = r.decode
+  const mean = d?.tok_s_mean ?? r.decode_tok_s
+  if (mean == null) return NOT_MEASURED
+  const tip = d && d.windows > 0
+    ? <>min <b className="num">{r1(d.tok_s_min!)}</b> · max <b className="num">{r1(d.tok_s_max!)}</b> · mean <b className="num">{r1(mean)}</b> tok/s<br /><span className="text-ink-2">over {d.windows} windows of 16 tokens</span></>
+    : <>mean <b className="num">{r1(mean)}</b> tok/s<br /><span className="text-ink-2">fewer than 16 tokens: no window to compare</span></>
+  return <Tip tip={tip}><span className="num">{r1(mean)}</span><span className="text-ink-2"> tok/s</span></Tip>
+}
+
+function prefillCell(r: RequestRow): ReactNode {
+  const p = r.prefill
+  if (!p) return r.prefill_tok_s != null ? <span className="num">{r.prefill_tok_s.toFixed(0)}<span className="text-ink-2"> tok/s</span></span> : NOT_MEASURED
+  const tip = p.chunks === 1
+    ? <>1 chunk · <b className="num">{p.tok_s_mean!.toFixed(0)}</b> tok/s</>
+    : <>{p.chunks} chunks: min <b className="num">{p.tok_s_min!.toFixed(0)}</b> · max <b className="num">{p.tok_s_max!.toFixed(0)}</b> · mean <b className="num">{p.tok_s_mean!.toFixed(0)}</b> tok/s</>
+  return <Tip tip={tip}><span className="num">{p.tok_s_mean!.toFixed(0)}</span><span className="text-ink-2"> tok/s</span></Tip>
+}
+
+export function RequestList({ rows, empty }: { rows: RequestRow[]; empty: string }) {
+  if (!rows.length) return <p className="text-ink-2">{empty}</p>
+  return (
+    <ul className="m-0 list-none p-0">
+      {rows.map((r) => (
+        <li key={r.id} className="border-b border-line last:border-0">
+          <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1 py-2.5">
+            <a href={href("requests", r.id)} className="min-w-0 flex-1 basis-56 no-underline">
+              <div className="truncate">{r.preview || <span className="text-ink-3">(no text)</span>}</div>
+              <div className="mt-0.5 truncate text-[12px] text-ink-2">
+                <span className="num">{when(r.time)}</span> · {r.dialect === "anthropic" ? "Anthropic" : r.dialect === "openai" ? "OpenAI" : "unknown API"}
+                {r.client && ` · ${r.client}`}{r.tools.length > 0 && ` · ${r.tools.length} tools`}
+                {r.finish !== "stop" && r.finish !== "length" && ` · ${r.finish}`}
+              </div>
+            </a>
+            <div className="flex shrink-0 items-baseline gap-5 text-[13px]">
+              <span className="num text-ink-2">{fmt(r.prompt_tokens)} → {fmt(r.output_tokens)}</span>
+              <span title="Prefill">{prefillCell(r)}</span>
+              <span title="Decode">{decodeCell(r)}</span>
+            </div>
+          </div>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+export function Requests() {
+  const [rows, setRows] = useState<RequestRow[]>([])
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(0)
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const SIZE = 50
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    getRequestPage(page, SIZE)
+      .then((p) => { if (!cancelled) { setRows((x) => (page === 0 ? p.items : [...x, ...p.items])); setTotal(p.total); setError(null) } })
+      .catch((e: Error) => !cancelled && setError(e.message))
+      .finally(() => !cancelled && setLoading(false))
+    return () => { cancelled = true }
+  }, [page])
+
+  return (
+    <div>
+      <h1 className="text-xl font-semibold">Requests</h1>
+      <p className="mt-1 text-[13px] text-ink-2">
+        {total ? `${fmt(total)} kept on this PC.` : "Every finished request is kept here."} Hover a speed for its spread.
+      </p>
+      {error && <p className="mt-4 text-bad">{error}</p>}
+      <div className="mt-4">
+        <RequestList rows={rows} empty={loading ? "Loading…" : "No request yet."} />
+      </div>
+      {rows.length < total && (
+        <button type="button" disabled={loading} onClick={() => setPage((p) => p + 1)} className="mt-4 h-8 rounded-sm bg-fill px-3 text-[13px] font-medium transition-colors hover:bg-fill-2 disabled:opacity-40">
+          Show more
+        </button>
+      )}
+    </div>
+  )
+}
+
+const TIERS: [string, string][] = [
+  ["tier_primary", "Primary GPU's VRAM"], ["tier_secondary", "Secondary GPU's VRAM"],
+  ["tier_pcie", "RAM, copied over PCIe to a GPU"], ["tier_cpu", "RAM, computed on the CPU"],
+]
+
+const STAGES: [string, string, string?][] = [
+  ["ms_gpu_wait", "Waiting for the GPU to ring a layer"], ["ms_pool", "Inside the CPU pool (per layer)"],
+  ["ms_plan", "Plan", "of the pool time"], ["ms_actq", "Quantize activations", "of the pool time"],
+  ["ms_jobs", "Dispatch jobs", "of the pool time"], ["ms_cpu", "CPU expert compute", "of the pool time"],
+  ["ms_stage", "Staging the window"], ["ms_commit", "Commit and emit"], ["ms_draft", "MTP draft"],
+]
+
+export function RequestDetailPage({ id }: { id: string }) {
+  const [d, setD] = useState<RequestDetail | null | undefined>(undefined)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => { getRequest(id).then(setD).catch((e: Error) => setError(e.message)) }, [id])
+
+  if (error) return <p className="text-bad">{error}</p>
+  if (d === undefined) return <p className="text-ink-2">Loading…</p>
+  if (d === null) return <div><p>This request is not in the history.</p><p><a href={href("requests")}>Back to Requests</a></p></div>
+
+  const r = d.summary
+  const det = d.detail
+  const stats = det?.stats ?? r.stats
+  const tierTotal = stats ? TIERS.reduce((a, [k]) => a + (stats[k] ?? 0), 0) : 0
+
+  return (
+    <div>
+      <p className="mb-3 text-[13px]"><a href={href("requests")}>← Requests</a></p>
+      <h1 className="text-xl font-semibold [overflow-wrap:anywhere]">{r.preview || "(no text)"}</h1>
+      <p className="mt-1 text-[13px] text-ink-2"><span className="num">{when(r.time)}</span> · {r.dialect}{r.client && ` · ${r.client}`}</p>
+
+      <Section title="Overview">
+        <Rows>
+          <Row k="Prompt" v={<span className="num">{fmt(r.prompt_tokens)} tokens{r.reused ? `, ${fmt(r.reused)} already cached` : ""}</span>} />
+          <Row k="Answer" v={<span className="num">{fmt(r.output_tokens)} tokens</span>} />
+          <Row k="Took" v={val(r.duration_s, (n) => n.toFixed(1), "s")} />
+          <Row k="Ended" v={r.finish} />
+          {r.tools.length > 0 && <Row k="Tools offered" v={<span className="text-ink-2">{r.tools.join(", ")}</span>} />}
+          <Row k="Expert cache hit rate" v={val(r.hit_rate, (n) => pct(n, 1))} />
+        </Rows>
+      </Section>
+
+      <Section title="Prefill" aside="per chunk">
+        {r.prefill ? (
+          <>
+            <Rows>
+              <Row k="Chunks" v={r.prefill.chunks === 1 ? "1 chunk" : <span className="num">{r.prefill.chunks}</span>} />
+              {r.prefill.chunks > 1 && <Row k="Slowest chunk" v={val(r.prefill.tok_s_min, (n) => n.toFixed(0), "tok/s")} />}
+              {r.prefill.chunks > 1 && <Row k="Fastest chunk" v={val(r.prefill.tok_s_max, (n) => n.toFixed(0), "tok/s")} />}
+              <Row k="Mean" hint="all tokens over all time" v={val(r.prefill.tok_s_mean, (n) => n.toFixed(0), "tok/s")} />
+            </Rows>
+            {det?.prefill_chunks && det.prefill_chunks.length > 1 && (
+              <div className="mt-3">
+                <div className="mb-1 text-[12px] text-ink-2">Speed of each chunk, tok/s</div>
+                <Chart series={[{ label: "tok/s", values: det.prefill_chunks.map(([t, m]) => (m > 0 ? t / (m / 1000) : null)) }]} height={90} />
+              </div>
+            )}
+          </>
+        ) : <p className="text-ink-2">{r.prompt_tokens && r.reused === r.prompt_tokens ? "Nothing to read: the whole prompt was cached." : <>Not measured.</>}</p>}
+      </Section>
+
+      <Section title="Decode" aside="over a sliding 16-token window">
+        {r.decode ? (
+          <>
+            <Rows>
+              <Row k="Mean" v={val(r.decode.tok_s_mean, r1, "tok/s")} />
+              {r.decode.windows > 0 && <Row k="Slowest window" v={val(r.decode.tok_s_min, r1, "tok/s")} />}
+              {r.decode.windows > 0 && <Row k="Fastest window" v={val(r.decode.tok_s_max, r1, "tok/s")} />}
+            </Rows>
+            {det?.decode_series && det.decode_series.length > 1 && (
+              <div className="mt-3">
+                <div className="mb-1 text-[12px] text-ink-2">Trend over the answer, tok/s</div>
+                <Chart series={[{ label: "tok/s", values: det.decode_series }]} area height={110} />
+              </div>
+            )}
+          </>
+        ) : <p className="text-ink-2">No tokens were written.</p>}
+        {d.detail_state === "deleted" && <p className="mt-3 text-[13px] text-ink-2">Detail deleted: the history keeps 2 GB of detail and this one was the oldest. The summary stays.</p>}
+      </Section>
+
+      <Section title="Where the decode time went" aside={stats ? undefined : "needs the engine's STATS line"}>
+        {!stats ? <p className="text-ink-2">Not measured: this engine does not report its per-request counters yet.</p> : (
+          <>
+            <div className="text-[12px] text-ink-2">Routed expert entries by where they ran</div>
+            <Rows>
+              {TIERS.map(([k, label]) => (
+                <Row key={k} k={label} v={<span className="num">{fmt(stats[k] ?? 0)}{tierTotal > 0 && <span className="text-ink-2"> · {pct((stats[k] ?? 0) / tierTotal, 0)}</span>}</span>} />
+              ))}
+              <Row k="Loaded from the SSD into RAM" v={<span className="num">{fmt(stats.nvme_loads ?? 0)}{(stats.nvme_loads ?? 0) > 0 && <span className="text-ink-2"> · {ms(stats.nvme_ms ?? 0)}</span>}</span>} />
+            </Rows>
+            <div className="mt-4 text-[12px] text-ink-2">Host time per stage{r.decode_ms ? ` of ${ms(r.decode_ms)}` : ""}</div>
+            <Rows>
+              {STAGES.map(([k, label, hint]) => stats[k] != null && (
+                <Row key={k} k={label} hint={hint} v={<span className="num">{ms(stats[k])}{r.decode_ms ? <span className="text-ink-2"> · {pct(stats[k] / r.decode_ms, 0)}</span> : null}</span>} />
+              ))}
+            </Rows>
+            <p className="mt-3 text-[12px] text-ink-3">Counted by the engine over {fmt(stats.windows ?? 0)} verify windows. Stages overlap, so they do not add up to the total.</p>
+          </>
+        )}
+      </Section>
+    </div>
+  )
+}

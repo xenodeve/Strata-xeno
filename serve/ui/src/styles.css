@@ -112,3 +112,7 @@
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } }
 .toast-in { animation: toast-in 240ms var(--ease) both; }
 @media (prefers-reduced-motion: reduce) { .streaming .prose-chat > :last-child::after { animation: none; } .pulse-dot, .thinking-label { animation: none; } }
+.pulse-dot-soft { animation: breathe 1.4s var(--ease) infinite; }
+@media (prefers-reduced-motion: reduce) { .pulse-dot-soft { animation: none; } }
+/* uPlot: its own stylesheet sets a white-ish cursor; tint it from the tokens */
+.uplot { font-family: var(--font-sans); } .u-cursor-x, .u-cursor-y { border-color: var(--fill-2) !important; }
