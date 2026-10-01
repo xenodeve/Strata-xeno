@@ -22,7 +22,7 @@ export function StatusOrb({ live, stale = false, size = 64, scale = 1, override 
     : live.state === "unloaded" ? t("Model unloaded") : (live.queued ?? 0) > 0 ? t("Waiting in the queue") : t("Idle")
   return override
     ? <Orb design={override.design} size={size} scale={scale} moving label={override.label} />
-    : <Orb design={look.design} size={size} scale={scale} moving={look.moving} speed={look.speed} fps={look.fps} label={label} />
+    : <Orb design={look.design} size={size} scale={scale} moving={look.moving} speed={look.speed} fps={look.fps} rest={look.rest} label={label} />
 }
 
 /** A figure that animates when its value changes: "count" (one that only grows, a token count) pops in, only the digits that changed

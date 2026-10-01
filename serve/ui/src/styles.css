@@ -235,3 +235,11 @@ html:lang(th) .t-reason-text { line-height: 1.8; }
 .t-reel-strip[data-moving] { filter: url(#t-reel-blur); }
 .t-reel-sep { display: inline-block; }
 @media (prefers-reduced-motion: reduce) { .t-reel-strip { transition: none !important; filter: none !important; } }
+
+/* The plain loading mark (an option instead of the orbs and the bots): a ring that turns at work and breathes at rest. */
+.t-ring { display: block; box-sizing: border-box; border-style: solid; border-radius: 50%; border-color: color-mix(in srgb, var(--ring, var(--ink)) 16%, transparent); border-top-color: var(--ring, var(--ink-2)); }
+.t-ring[data-look="spin"] { animation: t-ring-spin 800ms linear infinite; }
+.t-ring[data-look="pulse"] { animation: t-ring-pulse 2.4s ease-in-out infinite; }
+@keyframes t-ring-spin { to { transform: rotate(360deg); } }
+@keyframes t-ring-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .t-ring { animation: none !important; } }

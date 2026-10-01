@@ -9,7 +9,9 @@ import { SLOT, Sentence } from "../components/bits"
 import type { ModelInfo } from "../lib/metrics"
 import { StatusLabel } from "../components/orb"
 import { toast } from "../components/toast"
-import { inputCls } from "../components/ui"
+import { inputCls, Segmented } from "../components/ui"
+import { BOT_TYPES, setAvatar, setBotChoice, useAvatar, useBotChoice, type AvatarKind } from "../lib/avatar"
+import { BotTile } from "../components/orb"
 
 interface Engine { engine?: string; version?: string; context?: number; kv?: string; spec?: number; mtp_max?: number; cpu_isa?: string; gpu_arch?: string }
 
@@ -24,7 +26,15 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 
 const MCP_STATE: Record<string, string> = { ready: msg("Connected"), starting: msg("Starting"), failed: msg("Failed"), stopped: msg("Stopped"), idle: msg("Waiting") }
 
+const BOT_NAME: Record<(typeof BOT_TYPES)[number], string> = {
+  clover: msg("Clover"), flower: msg("Flower"), triangle: msg("Triangle"), square: msg("Square"), blob: msg("Blob"), ghost: msg("Ghost"),
+  circle: msg("Circle"), drop: msg("Drop"), star: msg("Star"), droid: msg("Droid"), mech: msg("Mech"), alien: msg("Alien"),
+  hexagon: msg("Hexagon"), cat: msg("Cat"), cloud: msg("Cloud"), pill: msg("Pill"), pebble: msg("Pebble"), puddle: msg("Puddle"),
+}
+
 export function About() {
+  const avatar = useAvatar()
+  const pick = useBotChoice()
   const [health, setHealth] = useState<Health>(NO_HEALTH)
   const [engine, setEngine] = useState<Engine>({})
   const [model, setModel] = useState<ModelInfo | null>(null)
@@ -62,6 +72,28 @@ export function About() {
           {engine.cpu_isa && <Row k={t("CPU kernels")} v={engine.cpu_isa} />}
           {engine.gpu_arch && <Row k={t("GPU architecture")} v={parseArch(engine.gpu_arch).map((a) => `${a.sm} ${a.name.replace("NVIDIA GeForce ", "")}`).join(", ")} />}
         </dl>
+      </section>
+
+      <section>
+        <h2 className="text-[15px] font-semibold">{t("Status avatars")}</h2>
+        <p className="mt-1 text-[13px] text-ink-2">{t("What stands for a status: a dotted orb, a plain ring that turns, or a small avatar with a shape and a mood of its own.")}</p>
+        <div className="mt-2">
+          <Segmented label={t("Status avatars")} value={avatar} onChange={(v) => setAvatar(v as AvatarKind)} options={[{ value: "orbs", label: t("Orbs") }, { value: "loading", label: t("Loading") }, { value: "bots", label: t("Avatar") }]} />
+        </div>
+        {avatar === "bots" && (
+          <div className="mt-3">
+            <p className="text-[13px] text-ink-2">{t("Which avatar: one for every status, a shape for each status, or a random one for each place.")}</p>
+            <div className="mt-2 flex flex-wrap gap-2" role="group" aria-label={t("Which avatar")}>
+              <button type="button" aria-pressed={pick === "auto"} onClick={() => setBotChoice("auto")} className={`flex h-[60px] min-w-[84px] items-center justify-center rounded-md border px-3 text-[12px] transition-colors ${pick === "auto" ? "border-ink bg-fill text-ink" : "border-line text-ink-2 hover:bg-hover"}`}>{t("By status")}</button>
+              <button type="button" aria-pressed={pick === "random"} onClick={() => setBotChoice("random")} className={`flex h-[60px] min-w-[84px] items-center justify-center rounded-md border px-3 text-[12px] transition-colors ${pick === "random" ? "border-ink bg-fill text-ink" : "border-line text-ink-2 hover:bg-hover"}`}>{t("Random")}</button>
+              {BOT_TYPES.map((b) => (
+                <button key={b} type="button" aria-pressed={pick === b} aria-label={t(BOT_NAME[b])} title={t(BOT_NAME[b])} onClick={() => setBotChoice(b)} className={`grid size-[60px] place-items-center rounded-md border transition-colors ${pick === b ? "border-ink bg-fill" : "border-line hover:bg-hover"}`}>
+                  <BotTile type={b} />
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </section>
 
       <section>

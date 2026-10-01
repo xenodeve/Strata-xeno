@@ -7,7 +7,7 @@ import { msg, t } from "./i18n"
 
 export type OrbDesign ="working" | "searching" | "solving" | "listening" | "connecting" | "weaving" | "composing" | "breathing" | "shaping"
 
-export interface OrbLook { design: OrbDesign; moving: boolean; speed?: number; fps?: number }
+export interface OrbLook { design: OrbDesign; moving: boolean; speed?: number; fps?: number; rest?: boolean }       // rest: idle or dormant (the bots look around or sleep)
 
 /** Idle is not a still picture: the searching globe keeps turning, slowly, so the orb is seen and reads as alive and calm. */
 const IDLE_SPEED = 0.5
@@ -45,9 +45,9 @@ export function serverDesign(
     return { design: "composing", moving: true, speed }
   }
   if (live.state === "reading") return { design: "listening", moving: true, speed: 1 }
-  if (live.state === "unloaded") return { design: "shaping", moving: true, speed: IDLE_SPEED, fps: GPU_IDLE_FPS }
+  if (live.state === "unloaded") return { design: "shaping", moving: true, speed: IDLE_SPEED, fps: GPU_IDLE_FPS, rest: true }
   if ((live.queued ?? 0) > 0) return { design: "connecting", moving: true, speed: 1 }
-  return { design: "searching", moving: true, speed: IDLE_SPEED }
+  return { design: "searching", moving: true, speed: IDLE_SPEED, rest: true }
 }
 
 /** A GPU: idle (the searching globe, slowly), at work, working hard (parallel strands), or held back by a limit (struggling). */
@@ -56,7 +56,7 @@ export function gpuDesign(g: { util: number | null | undefined; throttle?: strin
   const u = g.util ?? 0
   if (u >= 60) return { design: "weaving", moving: true }
   if (u >= 5) return { design: "working", moving: true }
-  return { design: "searching", moving: true, speed: IDLE_SPEED, fps: GPU_IDLE_FPS }
+  return { design: "searching", moving: true, speed: IDLE_SPEED, fps: GPU_IDLE_FPS, rest: true }
 }
 
 /** A tool call is a connection; one that looks things up is a search. */

@@ -1,13 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
-  Activity01Icon, ComputerIcon, CpuIcon, DashboardSquare01Icon, InformationCircleIcon, Message01Icon, Moon02Icon, Sun03Icon, Task01Icon,
+  Activity01Icon, BotIcon, ComputerIcon, Globe02Icon, Loading03Icon, CpuIcon, DashboardSquare01Icon, InformationCircleIcon, Message01Icon, Moon02Icon, Sun03Icon, Task01Icon,
 } from "@hugeicons/core-free-icons"
 import { cn } from "./lib/cn"
 import { MetricsProvider, useMetrics } from "./lib/metrics"
 import { href, PAGES, useRoute, type Page } from "./lib/router"
 import { useTheme, type Theme } from "./lib/theme"
 import { msg, setLang, t, useLang } from "./lib/i18n"
+import { nextAvatar, setAvatar, useAvatar, type AvatarKind } from "./lib/avatar"
 import { PageView } from "./pages"
 import { StatusOrb } from "./components/live"
 import { ToastHost } from "./components/toast"
@@ -24,6 +25,26 @@ const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
 
 const THEME_ICON: Record<Theme, IconSvgElement> = { system: ComputerIcon, light: Sun03Icon, dark: Moon02Icon }
 const THEME_NAME: Record<Theme, string> = { system: msg("System"), light: msg("Light"), dark: msg("Dark") }
+
+const AVATAR_ICON: Record<AvatarKind, IconSvgElement> = { orbs: Globe02Icon, loading: Loading03Icon, bots: BotIcon }
+const AVATAR_NAME: Record<AvatarKind, string> = { orbs: msg("Orbs"), loading: msg("Loading"), bots: msg("Avatar") }
+
+/** Orbs, a plain loading mark or avatars for the status marks (the choice is also in About): a button that shows which is in use and goes to the next. */
+export function AvatarSwitch() {
+  const avatar = useAvatar()
+  const name = t(AVATAR_NAME[avatar])
+  return (
+    <button
+      type="button"
+      onClick={() => setAvatar(nextAvatar(avatar))}
+      title={t("Status avatars: {name}. Change", { name })}
+      aria-label={t("Status avatars: {name}. Change", { name })}
+      className="flex size-8 shrink-0 items-center justify-center rounded-sm text-ink-2 transition-[color,background-color,transform] duration-200 hover:bg-hover hover:text-ink active:scale-90"
+    >
+      <HugeiconsIcon icon={AVATAR_ICON[avatar]} size={16} strokeWidth={1.6} aria-hidden />
+    </button>
+  )
+}
 
 /** The language switch: both names are shown, each in its own language, and the one in use is the strong one. */
 export function LangSwitch() {
@@ -139,6 +160,7 @@ function Shell() {
           >
             <HugeiconsIcon icon={THEME_ICON[theme]} size={16} strokeWidth={1.6} aria-hidden />
           </button>
+          <AvatarSwitch />
           <LangSwitch />
         </div>
       </header>

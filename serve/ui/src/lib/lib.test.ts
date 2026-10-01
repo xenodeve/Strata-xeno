@@ -158,8 +158,8 @@ describe("which orb says what", () => {
   test("the server: each state has its own form; idle shows the searching orb, slowly; an unloaded model is dormant (shaping, slowly); no orb is a frozen picture", () => {
     expect(serverDesign(live({ state: "reading" }))).toMatchObject({ design: "listening", moving: true })        // the prompt is taken in
     expect(serverDesign(live({ state: "generating", tok_s: 120 }))).toMatchObject({ design: "composing", moving: true })
-    expect(serverDesign(live())).toEqual({ design: "searching", moving: true, speed: 0.5 })      // every display frame: the one orb people look at stays smooth
-    expect(serverDesign(live({ state: "unloaded" }))).toEqual({ design: "shaping", moving: true, speed: 0.5, fps: 30 })        // dormant, but never a frozen picture
+    expect(serverDesign(live())).toEqual({ design: "searching", moving: true, speed: 0.5, rest: true })      // every display frame: the one orb people look at stays smooth
+    expect(serverDesign(live({ state: "unloaded" }))).toEqual({ design: "shaping", moving: true, speed: 0.5, fps: 30, rest: true })        // dormant, but never a frozen picture
     expect(serverDesign(live({ queued: 2 }))).toMatchObject({ design: "connecting", moving: true })
     expect(serverDesign(live(), true)).toMatchObject({ design: "connecting", moving: true })        // not answering: still trying
   })
@@ -187,11 +187,11 @@ describe("which orb says what", () => {
     expect(serverDesign(live({ state: "generating", tok_s: null })).speed).toBe(1)
   })
   test("a GPU: rests, works, works hard, or struggles when it is held back", () => {
-    expect(gpuDesign({ util: 1, throttle: [] })).toEqual({ design: "searching", moving: true, speed: 0.5, fps: 30 })
+    expect(gpuDesign({ util: 1, throttle: [] })).toEqual({ design: "searching", moving: true, speed: 0.5, fps: 30, rest: true })
     expect(gpuDesign({ util: 12, throttle: [] })).toEqual({ design: "working", moving: true })
     expect(gpuDesign({ util: 85, throttle: [] })).toEqual({ design: "weaving", moving: true })
     expect(gpuDesign({ util: 30, throttle: ["power cap"] })).toEqual({ design: "solving", moving: true })
-    expect(gpuDesign({ util: null, throttle: null })).toEqual({ design: "searching", moving: true, speed: 0.5, fps: 30 })
+    expect(gpuDesign({ util: null, throttle: null })).toEqual({ design: "searching", moving: true, speed: 0.5, fps: 30, rest: true })
   })
   test("a tool call: connecting, or searching when the tool looks things up", () => {
     expect(toolDesign("fs__read_file")).toBe("connecting")

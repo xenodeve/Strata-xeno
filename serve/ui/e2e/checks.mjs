@@ -256,6 +256,50 @@ export const checks = [
     },
   },
   {
+    // the status marks can be orbs, a plain loading ring, or avatars (bots): the bots are loaded only when chosen; the choice is remembered
+    name: "avatar: the status marks can be orbs, a plain loading ring or avatars, and it is remembered",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors)
+      const scripts = []
+      pg.on("request", (r) => { if (/\.js(\?|$)/.test(r.url())) scripts.push(r.url()) })
+      await pg.goto(fast.base + "/#/dashboard")
+      await pg.waitForTimeout(2000)
+      const before = scripts.length
+      const btn = pg.locator("button[aria-label^='Status avatars']")
+      const painted = () => pg.evaluate(() => [...document.querySelectorAll(".orb-slot canvas")].map((c) => { try { const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i]) n++; return n } catch { return -1 } }))
+      t.ok("to begin with: the orbs, drawn, no avatar loaded", (await btn.getAttribute("aria-label")).includes("Orbs") && (await painted()).some((n) => n > 0) && (await pg.locator(".t-ring").count()) === 0)
+      await btn.click()
+      await pg.waitForTimeout(800)
+      t.ok("the next choice is a plain loading ring, with no canvas and nothing more loaded", (await btn.getAttribute("aria-label")).includes("Loading") && (await pg.locator(".t-ring").count()) >= 2 && (await pg.locator(".orb-slot canvas").count()) === 0 && scripts.length === before, `${await pg.locator(".t-ring").count()} rings`)
+      t.ok("a ring turns while something is at work and breathes at rest", await pg.evaluate(() => [...document.querySelectorAll(".t-ring")].every((r) => ["spin", "pulse", "still"].includes(r.getAttribute("data-look")))))
+      await btn.click()
+      await pg.waitForTimeout(2500)
+      t.ok("then avatars: they are loaded now (one more script)", (await btn.getAttribute("aria-label")).includes("Avatar") && scripts.length > before, `${before} -> ${scripts.length}`)
+      const p1 = await painted()
+      t.ok("and an avatar is drawn in each place", p1.length >= 2 && p1.every((n) => n > 0), p1.join(" "))
+      await pg.goto(fast.base + "/#/about")
+      await pg.waitForTimeout(2500)
+      const tiles = pg.locator("[role=group][aria-label='Which avatar'] button")
+      t.ok("About lists the choices: by status, random and eighteen avatars, each drawn", (await tiles.count()) === 20 && (await pg.locator("[role=group][aria-label='Which avatar'] canvas").count()) === 18)
+      await pg.locator("button[aria-label='Cat']").click()
+      await pg.waitForTimeout(500)
+      t.ok("choosing Cat is kept and shown as chosen", (await pg.evaluate(() => localStorage.getItem("strata.avatar.type"))) === '"cat"' && (await pg.locator("button[aria-label='Cat']").getAttribute("aria-pressed")) === "true")
+      await pg.getByRole("button", { name: "Random", exact: true }).click()
+      await pg.waitForTimeout(500)
+      t.ok("Random is a choice too, kept and shown as chosen", (await pg.evaluate(() => localStorage.getItem("strata.avatar.type"))) === '"random"' && (await pg.getByRole("button", { name: "Random", exact: true }).getAttribute("aria-pressed")) === "true")
+      await pg.goto(fast.base + "/#/dashboard")
+      await pg.waitForTimeout(2000)
+      t.ok("and the avatars are drawn with a random one each", (await painted()).every((n) => n > 0))
+      await pg.reload()
+      await pg.waitForTimeout(2500)
+      t.ok("the choice is remembered after a reload", (await btn.getAttribute("aria-label")).includes("Avatar") && (await painted()).every((n) => n > 0))
+      await btn.click()
+      await pg.waitForTimeout(800)
+      t.ok("and it comes round to the orbs again", (await btn.getAttribute("aria-label")).includes("Orbs") && (await painted()).some((n) => n > 0))
+      await pg.context().close()
+    },
+  },
+  {
     // a prompt that is only a file has no text, so it has no (empty) bubble; it can still be rewritten
     name: "file: a prompt of only a file shows the file and no empty bubble",
     async run({ browser, fast, t, errors }) {

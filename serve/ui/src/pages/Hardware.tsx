@@ -29,7 +29,7 @@ export const link = (gen?: number | null, w?: number | null, wmax?: number | nul
 export function GpuOrb({ g }: { g: Card }) {
   const look = gpuDesign(g)
   const held = !!g.throttle?.length
-  return <Orb design={look.design} size={20} moving={look.moving} speed={look.speed} fps={look.fps} label={held ? t("Held back") : look.design === "weaving" ? t("Working hard") : look.design === "searching" ? t("Idle") : t("Working")} />
+  return <Orb design={look.design} size={20} moving={look.moving} speed={look.speed} fps={look.fps} rest={look.rest} label={held ? t("Held back") : look.design === "weaving" ? t("Working hard") : look.design === "searching" ? t("Idle") : t("Working")} />
 }
 
 export function Bar({ used, total, label }: { used?: number | null; total?: number | null; label: string }) {
