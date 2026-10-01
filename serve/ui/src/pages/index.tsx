@@ -1,4 +1,5 @@
 import { About } from "./About"
+import { Dashboard } from "./Dashboard"
 import { GpuPage, Hardware, SsdPage } from "./Hardware"
 import { Live } from "./Live"
 import { Requests, RequestDetailPage } from "./Requests"
@@ -9,6 +10,8 @@ export function PageView({ route }: { route: Route }) {
   switch (route.page) {
     case "chat":
       return <Chat />
+    case "dashboard":
+      return <Dashboard />
     case "live":
       return <Live />
     case "requests":

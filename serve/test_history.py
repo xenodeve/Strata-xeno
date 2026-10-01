@@ -110,6 +110,21 @@ class Details(unittest.TestCase):
         self.assertIsNone(h.detail("..\\..\\evil"))
 
 
+class KeepPrompt(unittest.TestCase):
+    """Q8: the full prompt is kept only on request ("keep for replay"), and a picture is a note, not megabytes."""
+
+    def test_images_become_a_note_and_the_rest_is_kept(self):
+        from serve.history import prompt_for_keep
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "look"},
+                                             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 5000}}]},
+                {"role": "assistant", "content": "ok"}]
+        kept = prompt_for_keep(msgs)
+        self.assertEqual(kept[1], {"role": "assistant", "content": "ok"})
+        self.assertEqual(kept[0]["content"][0], {"type": "text", "text": "look"})
+        self.assertEqual(kept[0]["content"][1], {"type": "image_url", "image_url": {"url": "[image omitted]"}})
+        self.assertEqual(msgs[0]["content"][1]["image_url"]["url"][:5], "data:")      # the request itself is untouched
+
+
 class Meta(unittest.TestCase):
     def test_meta_keeps_numbers_names_and_200_chars_not_the_prompt(self):
         from serve.history import request_meta

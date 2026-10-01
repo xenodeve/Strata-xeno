@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react"
 
 // Hash routing with relative paths only: the app works behind a path-prefixed reverse proxy.
-export const PAGES = ["chat", "live", "requests", "hardware", "about"] as const
+export const PAGES = ["chat", "dashboard", "live", "requests", "hardware", "about"] as const
 export type Page = (typeof PAGES)[number]
 
 export interface Route { page: Page; params: string[] }

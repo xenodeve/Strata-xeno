@@ -3,7 +3,7 @@ import { Chart } from "../components/Chart"
 import { NOT_MEASURED, Row, Rows, Section, ms, pct, val, when } from "../components/bits"
 import { fmt } from "../lib/format"
 import { attribute, overlapOpportunityMs } from "../lib/stall"
-import { getRequest, getRequestPage, type RequestDetail, type RequestRow } from "../lib/metrics"
+import { getKeepLeft, getRequest, getRequestPage, setKeep, type RequestDetail, type RequestRow } from "../lib/metrics"
 import { href } from "../lib/router"
 
 /** A figure with its spread on hover or focus: the first depth of detail. */
@@ -91,6 +91,7 @@ export function Requests() {
         {total ? `${fmt(total)} kept on this PC.` : "Every finished request is kept here."} Hover a speed for its spread.
       </p>
       {error && <p className="mt-4 text-bad">{error}</p>}
+      <KeepPrompts />
       <div className="mt-4">
         <RequestList rows={rows} empty={loading ? "Loading…" : "No request yet."} />
       </div>
@@ -141,6 +142,7 @@ export function RequestDetailPage({ id }: { id: string }) {
           <Row k="Answer" v={<span className="num">{fmt(r.output_tokens)} tokens</span>} />
           <Row k="Took" v={val(r.duration_s, (n) => n.toFixed(1), "s")} />
           <Row k="Ended" v={r.finish} />
+          {det?.prompt && <Row k="Prompt" hint="kept for replay" v={<span className="num">{det.prompt.length} messages</span>} />}
           {r.tools.length > 0 && <Row k="Tools offered" v={<span className="text-ink-2">{r.tools.join(", ")}</span>} />}
           <Row k="Expert cache hit rate" v={val(r.hit_rate, (n) => pct(n, 1))} />
         </Rows>
@@ -236,6 +238,27 @@ function Stall({ stats, decodeMs }: { stats: Record<string, number>; decodeMs: n
         <Row k="Overlap opportunity" hint="upper bound: SSD time only" v={opp == null ? NOT_MEASURED : <span className="num">{ms(opp)}</span>} />
         <Row k="PCIe copy waits" hint="not in the bound" v={NOT_MEASURED} />
       </Rows>
+    </div>
+  )
+}
+
+/** Q8: only the numbers, the first 200 characters, the tool names and the client are kept. The whole prompt is kept
+ *  only when asked for, for the next few requests, and goes to that request's detail file. */
+function KeepPrompts() {
+  const [left, setLeft] = useState<number | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  useEffect(() => { getKeepLeft().then(setLeft).catch(() => {}) }, [])
+  const set = (n: number) => setKeep(n).then(setLeft).then(() => setErr(null)).catch((e: Error) => setErr(e.message))
+  return (
+    <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-[13px] text-ink-2">
+      <span>
+        {left ? <>The full prompt of the next <b className="num text-ink">{left}</b> request{left > 1 ? "s" : ""} is being kept, for replay.</> : "Prompts are kept as 200 characters. Keep the whole prompt of the next:"}
+      </span>
+      {[1, 5, 10].map((n) => (
+        <button key={n} type="button" onClick={() => void set(n)} className="h-7 rounded-sm bg-fill px-2.5 font-medium text-ink transition-colors hover:bg-fill-2">{n}</button>
+      ))}
+      {left ? <button type="button" onClick={() => void set(0)} className="h-7 rounded-sm px-2.5 transition-colors hover:bg-hover">Stop keeping</button> : null}
+      {err && <span className="text-bad">{err}</span>}
     </div>
   )
 }

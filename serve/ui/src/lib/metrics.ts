@@ -36,6 +36,7 @@ export interface Metrics {
   hardware_static: { gpu_name?: string | null; gpu_count?: number; cpu_name?: string | null; cores?: number | null; threads?: number | null; psutil?: boolean }
   history: Record<string, (number | null)[]>
   time: number
+  keep_prompts_left?: number
 }
 
 export type MetricsState = { data: Metrics | null; error: string | null; stale: boolean }
@@ -74,7 +75,7 @@ export function useMetrics(): MetricsState {
 export interface RequestPage { items: RequestRow[]; total: number; page: number; size: number }
 export interface RequestDetail {
   summary: RequestRow
-  detail: { prefill_chunks?: [number, number][]; decode_series?: number[]; stats?: Record<string, number> | null } | null
+  detail: { prefill_chunks?: [number, number][]; decode_series?: number[]; stats?: Record<string, number> | null; prompt?: unknown[] } | null
   detail_state: "kept" | "deleted"
 }
 
@@ -89,4 +90,16 @@ export async function getRequest(id: string): Promise<RequestDetail | null> {
   if (r.status === 404) return null
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
   return (await r.json()) as RequestDetail
+}
+
+export async function getKeepLeft(): Promise<number> {
+  const r = await fetch(url("metrics"), { headers: apiHeaders() })
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return ((await r.json()) as { keep_prompts_left?: number }).keep_prompts_left ?? 0
+}
+
+export async function setKeep(n: number): Promise<number> {
+  const r = await fetch(url("metrics/keep"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify({ next: n }) })
+  if (!r.ok) throw new Error(r.status === 401 ? "This server needs an API key (About)." : `HTTP ${r.status}`)
+  return ((await r.json()) as { keep_prompts_left: number }).keep_prompts_left
 }

@@ -1,6 +1,6 @@
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
-  Activity01Icon, ComputerIcon, CpuIcon, InformationCircleIcon, Message01Icon, Moon02Icon, Sun03Icon, Task01Icon,
+  Activity01Icon, ComputerIcon, DashboardSquare01Icon, CpuIcon, InformationCircleIcon, Message01Icon, Moon02Icon, Sun03Icon, Task01Icon,
 } from "@hugeicons/core-free-icons"
 import { cn } from "./lib/cn"
 import { href, PAGES, useRoute, type Page } from "./lib/router"
@@ -10,6 +10,7 @@ import { ToastHost } from "./components/toast"
 
 const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
   chat: { label: "Chat", icon: Message01Icon },
+  dashboard: { label: "Dashboard", icon: DashboardSquare01Icon },
   live: { label: "Live", icon: Activity01Icon },
   requests: { label: "Requests", icon: Task01Icon },
   hardware: { label: "Hardware", icon: CpuIcon },

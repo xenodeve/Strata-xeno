@@ -55,7 +55,7 @@ from serve.loop_guard import LoopGuard
 from serve import cjk_guard, forced_opening, think_budget  # noqa: E402  (xeno #49 S4, S7 follow-up, S3)
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
-from serve.history import HistoryStore, chunk_stats, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
+from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -834,6 +834,8 @@ class Service:
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         self.hstore = HistoryStore(Path(tempfile.gettempdir()) / "strata-history-off", enabled=False)  # main() turns it on
+        self.keep_prompts = 0                           # POST /metrics/keep: the next N requests keep their full prompt (Q8)
+        self.keep_lock = threading.Lock()
         self.ui = "classic"                             # which web app "/" serves; config "ui": "next" for the new one
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
@@ -1051,6 +1053,16 @@ class Service:
                     req["output_config"] = {"effort": effort}
         return req
 
+    def meta_for(self, dialect, messages, tools, user_agent) -> dict:
+        """The request's history meta; while "keep the next N prompts" is on it also carries the full prompt (`_prompt`,
+        which run() moves to the detail file and never into the summary row)."""
+        meta = request_meta(dialect, messages, tools, user_agent)
+        with self.keep_lock:
+            if self.keep_prompts > 0:
+                self.keep_prompts -= 1
+                meta["_prompt"] = prompt_for_keep(messages)
+        return meta
+
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
@@ -1124,7 +1136,7 @@ class Service:
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+                tel["static"], "history": tel["history"], "time": now, "keep_prompts_left": self.keep_prompts}
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -1450,11 +1462,13 @@ class Service:
                         if calls > 1:
                             meta["id"] = f"{shared['id']}-{calls}"
                     meta.pop("calls", None)
+                    prompt = meta.pop("_prompt", None)                  # Q8: only when asked for; the detail file, never the row
                     chunks = chunk_stats(last.get("prefill_points") or [], last.get("reused") or 0)
                     decode = window_rates(tok_times)
                     rec = summary_record({
                         **meta,
                         "decode": {k: v for k, v in decode.items() if k != "series"} if decode else None,
+                        "prompt_kept": prompt is not None,
                         "prefill": {k: v for k, v in chunks.items() if k != "items"} if chunks else None,
                         "projection": (sampling or {}).get("experimental_speed_projection") is not False
                         if loaded else None,
@@ -1471,7 +1485,8 @@ class Service:
                         self.hstore.append(rec)         # on disk, kept (a full disk must not fail the request)
                         self.hstore.write_detail(rec["id"], {"prefill_chunks": chunks["items"] if chunks else [],
                                                              "decode_series": decode["series"] if decode else [],
-                                                             "stats": last.get("stats")})
+                                                             "stats": last.get("stats"),
+                                                             **({"prompt": prompt} if prompt is not None else {})})
                     except OSError as e:
                         print(f"[strata] history not saved: {e}", flush=True)
                     t = self.totals
@@ -2083,6 +2098,16 @@ def make_handler(svc: Service):
             if path == "/settings":
                 self._settings()
                 return
+            if path == "/metrics/keep":                      # keep the full prompt of the next N requests (0: off)
+                try:
+                    n = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}").get("next")
+                except ValueError:
+                    n = None
+                if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 50:
+                    return self._json(400, {"error": {"type": "invalid_request_error", "message": "next is a number from 0 to 50"}})
+                with svc.keep_lock:
+                    svc.keep_prompts = n
+                return self._json(200, {"keep_prompts_left": n})
             if path == "/unload":                            # give the GPU back now (between requests)
                 r = svc.unload()
                 self._json(409 if r == "busy" else 200, {"status": r})
@@ -2229,7 +2254,7 @@ def make_handler(svc: Service):
                 tools = (tools or []) + extra or None
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
-            req = {**req, "_meta": request_meta("openai", messages, tools, self.headers.get("User-Agent"))}
+            req = {**req, "_meta": svc.meta_for("openai", messages, tools, self.headers.get("User-Agent"))}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -2264,7 +2289,7 @@ def make_handler(svc: Service):
             think_budget.side_effort(req, kw)                         # xeno #49 S3: before the template renders
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
-            req = {**req, "_meta": request_meta("anthropic", messages, tools, self.headers.get("User-Agent"))}
+            req = {**req, "_meta": svc.meta_for("anthropic", messages, tools, self.headers.get("User-Agent"))}
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
             if budget and thinking:
                 req = {**req, "_think_budget": budget}

@@ -13,16 +13,16 @@ type Card = Gpu & {
   pcie_rx_mb?: number; pcie_tx_mb?: number; sm_clock?: number; mem_clock?: number; throttle?: string[] | null
 }
 
-const cards = (m: Metrics): Card[] => (m.hardware.gpus as Card[] | undefined) ?? []
-const disksOf = (m: Metrics): Disk[] => ((m.hardware_static as { storage?: { disks?: Disk[] } }).storage?.disks) ?? []
-const modelDisk = (m: Metrics): number | null => ((m.hardware_static as { storage?: { model_disk?: number | null } }).storage?.model_disk) ?? null
-const rates = (m: Metrics): DiskRate[] | null => ((m.hardware as { disks?: DiskRate[] | null }).disks) ?? null
+export const cards = (m: Metrics): Card[] => (m.hardware.gpus as Card[] | undefined) ?? []
+export const disksOf = (m: Metrics): Disk[] => ((m.hardware_static as { storage?: { disks?: Disk[] } }).storage?.disks) ?? []
+export const modelDisk = (m: Metrics): number | null => ((m.hardware_static as { storage?: { model_disk?: number | null } }).storage?.model_disk) ?? null
+export const rates = (m: Metrics): DiskRate[] | null => ((m.hardware as { disks?: DiskRate[] | null }).disks) ?? null
 
-const link = (gen?: number | null, w?: number | null, wmax?: number | null, genMax?: number | null) =>
+export const link = (gen?: number | null, w?: number | null, wmax?: number | null, genMax?: number | null) =>
   gen == null || w == null ? NOT_MEASURED
     : <span className="num">Gen {gen} ×{w}{(wmax != null && wmax !== w) || (genMax != null && genMax !== gen) ? <span className="text-ink-2"> of Gen {genMax ?? gen} ×{wmax ?? w}</span> : ""}</span>
 
-function Bar({ used, total, label }: { used?: number | null; total?: number | null; label: string }) {
+export function Bar({ used, total, label }: { used?: number | null; total?: number | null; label: string }) {
   const f = used != null && total ? Math.min(1, used / total) : 0
   return (
     <div role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(f * 100)} className="h-1 w-full overflow-hidden rounded-full bg-fill">

@@ -45,6 +45,19 @@ def request_meta(dialect: str, messages, tools, user_agent) -> dict:
             "client": str(user_agent or "")[:120], "tools": names, "preview": preview}
 
 
+def prompt_for_keep(messages) -> list:
+    """The prompt as kept for replay (Q8, opt-in): the messages in full, but a picture is a note, not its base64."""
+    out = []
+    for m in messages or []:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list):
+            c = [{**p, "image_url": {"url": "[image omitted]"}} if isinstance(p, dict) and p.get("type") == "image_url" else p
+                 for p in c]
+            m = {**m, "content": c}
+        out.append(m)
+    return out
+
+
 def summary_record(rec: dict) -> dict:
     """A request's summary line: the server's record plus the prefill speed over the tokens actually read."""
     read = (rec.get("prompt_tokens") or 0) - (rec.get("reused") or 0)

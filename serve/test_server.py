@@ -475,6 +475,42 @@ class RequestHistory(unittest.TestCase):
         self.assertIn("decode_series", one["detail"])
         self.assertEqual(set(row["decode"]), {"windows", "tok_s_min", "tok_s_max", "tok_s_mean"})   # no series in the row
 
+    def post_keep(self, body, headers=None):
+        req = urllib.request.Request(self.base + "/metrics/keep", data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_the_full_prompt_is_kept_only_for_the_next_n_requests_asked_for(self):
+        chat = {"model": "m", "max_tokens": 3, "messages": [{"role": "user", "content": "the secret question " + "x" * 300}]}
+        self.call("/v1/chat/completions", chat)                                   # not asked for: not kept
+        self.assertEqual(self.post_keep({"next": 2}), (200, {"keep_prompts_left": 2}))
+        self.call("/v1/chat/completions", chat)
+        self.call("/v1/messages", chat)
+        self.call("/v1/chat/completions", chat)                                   # the third is past N
+        items = self.get("/metrics/requests")[1]["items"]
+        kept = [bool(r.get("prompt_kept")) for r in items]
+        self.assertEqual(kept, [False, True, True, False])                        # newest first
+        for r in items:
+            self.assertNotIn("prompt", r)                                         # never in the summary row
+        d = self.get(f"/metrics/requests/{items[1]['id']}")[1]["detail"]
+        self.assertEqual(d["prompt"][0]["content"][:19], "the secret question")
+        self.assertEqual(len(d["prompt"][0]["content"]), len(chat["messages"][0]["content"]))      # in full, not 200 chars
+        self.assertNotIn("prompt", self.get(f"/metrics/requests/{items[0]['id']}")[1]["detail"])
+        self.assertEqual(self.svc.keep_prompts, 0)
+
+    def test_keep_needs_a_sane_number_and_the_key(self):
+        self.assertEqual(self.post_keep({"next": -1})[0], 400)
+        self.assertEqual(self.post_keep({"next": 1000})[0], 400)
+        self.assertEqual(self.post_keep({"next": "x"})[0], 400)
+        self.assertEqual(self.post_keep({"next": 0}), (200, {"keep_prompts_left": 0}))   # 0 turns it off
+        self.svc.api_key = "secret"
+        self.assertEqual(self.post_keep({"next": 1})[0], 401)
+        self.assertEqual(self.post_keep({"next": 1}, {"Authorization": "Bearer secret"})[0], 200)
+
     def test_every_engine_call_of_one_request_has_its_own_history_row(self):
         # an MCP request calls Service.run once per tool round with the same request: one id, one row per round
         from serve.history import request_meta
