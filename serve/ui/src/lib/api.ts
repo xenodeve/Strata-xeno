@@ -10,7 +10,8 @@ export const apiHeaders = (json = false): Record<string, string> => {
 
 // The server's root, from where this page is served: "/", "/p/" behind a path-prefixed reverse proxy, and the same
 // with "next/" taken off while the app lives at /next/. Never an absolute path baked into the build.
-export const root = () => location.pathname.replace(/next\/$/, "").replace(/[^/]*$/, "")
+export const rootOf = (pathname: string) => pathname.replace(/next\/$/, "").replace(/[^/]*$/, "").replace(/^\/+/, "/")   // never "//host/": that is another origin
+export const root = () => rootOf(location.pathname)
 export const url = (path: string) => root() + path
 
 export interface Health { model: string; images: boolean; max_context: number }

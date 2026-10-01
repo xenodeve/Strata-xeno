@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { rootOf } from "./api"
 import { apiMessages, type Message } from "./chat"
 import { archOf, parseArch } from "./arch"
 import { markdown } from "./markdown"
@@ -106,5 +107,18 @@ describe("stall attribution", () => {
     expect(overlapOpportunityMs(stats)).toBe(83)
     expect(overlapOpportunityMs({})).toBeNull()
     expect(overlapOpportunityMs(null)).toBeNull()
+  })
+})
+
+describe("api root", () => {
+  test("from where the page is served, relative to any proxy prefix", () => {
+    expect(rootOf("/")).toBe("/")
+    expect(rootOf("/next/")).toBe("/")
+    expect(rootOf("/p/next/")).toBe("/p/")
+    expect(rootOf("/p/index.html")).toBe("/p/")
+  })
+  test("a path that starts with // can never point at another origin", () => {
+    expect(rootOf("//evil.test/next/")).toBe("/evil.test/")
+    expect(rootOf("///x/")).toBe("/x/")
   })
 })
