@@ -19,6 +19,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/routing_trace.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/placement_formats.hpp"
@@ -539,7 +540,10 @@ void usage() {
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
                  "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
-                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
+                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8),\n"
+                 "                       plus tag records with a negative layer: the format version first and\n"
+                 "                       a commit tag (window, positions, accepted) after each verify window\n"
+                 "                       (#85; include/strata/core/routing_trace.hpp)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
@@ -702,7 +706,14 @@ struct Drive {
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
     /// blob), which is why the layer index comes from there rather than from a counter of our own.
     std::FILE* routing = nullptr;
+    int32_t trace_windows = 0;   ///< #85: verify windows committed to the routing trace so far (the commit tag's id)
 };
+
+/// #85: the routing trace's commit tag for a verify window of `n_positions` with `n_accepted` drafts accepted.
+void trace_commit(Drive& d, int n_positions, int n_accepted) {
+    if (d.routing == nullptr) return;
+    strata::core::routing_trace::write_commit(d.routing, d.trace_windows++, (int32_t) n_positions, (int32_t) n_accepted);
+}
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
                 float* out) {
@@ -726,10 +737,7 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
             std::fprintf(stderr, "strata generate: the routing trace saw layer %d, outside 0..47\n", layer_idx);
             return;
         }
-        const int32_t rec[2] = {layer_idx, (int32_t) k};
-        std::fwrite(rec, sizeof rec, 1, t->routing);
-        std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing);
-        std::fwrite(weights, sizeof(float), (size_t) k, t->routing);
+        strata::core::routing_trace::write_route(t->routing, layer_idx, (int32_t) k, ids, weights);
     }
 }
 
@@ -1114,11 +1122,7 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     // signal that matters; a one-shot --dump-routing run records true weights if a weighted ranking is wanted.
     if (t->routing != nullptr && layer >= 0 && layer < 48) {
         for (int64_t tok = 0; tok < n_tok; ++tok) {
-            const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
-            std::fwrite(rec, sizeof rec, 1, t->routing);
-            std::fwrite(ids + tok * k, sizeof(int32_t), (size_t) k, t->routing);
-            static const float one[64] = {};   // k <= 64 in a verify window; zeros read as unit weights
-            std::fwrite(one, sizeof(float), (size_t) k, t->routing);
+            strata::core::routing_trace::write_route(t->routing, (int32_t) layer, (int32_t) k, ids + tok * k, nullptr);
         }
     }
 }
@@ -4060,6 +4064,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_routing.c_str());
             return 1;
         }
+        strata::core::routing_trace::write_format(routing);   // #85: the first record names the format
         drive.routing = routing;
     }
     strata::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
@@ -6120,6 +6125,7 @@ int main(int argc, char** argv) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
+                    trace_commit(drive, T, T - 1);   // #85: prompt windows commit every position
                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
                     q += T;
                 }
@@ -6401,6 +6407,7 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                trace_commit(drive, T, a);   // #85
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -7608,6 +7615,7 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            trace_commit(drive, T, a);   // #85
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
