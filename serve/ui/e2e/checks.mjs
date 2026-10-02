@@ -1029,6 +1029,8 @@ export const checks = [
 
       await folderIn.fill(work)
       t.ok("typing again takes the reason away", (await dlg.locator("[role=alert]").count()) === 0)
+      await dlg.locator("h2").click()                                             // the field is left: what is offered while typing closes up first, so the list of folders opens on its own
+      await pg.waitForTimeout(800)
       const opening = heights()
       await dlg.getByRole("button", { name: "Browse", exact: true }).click()
       const hs1 = await opening
@@ -1302,6 +1304,7 @@ export const checks = [
       await box.press("Enter")
       await pg.waitForTimeout(250)
       t.ok("while the model writes the summary the chat says so, and the composer is empty", (await pg.getByText("Compacting the conversation…").count()) >= 1 && (await box.inputValue()) === "")
+      t.ok("and it is shown with the orb that is made for compacting, an SVG that packs and springs back", (await pg.locator("[data-compacting-status] svg").count()) >= 1)
       t.ok("and nothing else can be sent meanwhile (Stop is offered)", (await pg.locator("button[aria-label='Stop']").count()) === 1)
       await pg.waitForTimeout(1200)
       const last = bodies.at(-1)
@@ -1496,6 +1499,97 @@ export const checks = [
       t.ok("Escape closes the sheet", (await sheet.count()) === 0)
       await ph.context().close()
       fs.rmSync(base, { recursive: true, force: true })
+    },
+  },
+  {
+    // The memory and instruction files the chat reads (issue #99): the project's own are always on; what other apps wrote down is off until switched on, from the panel or from
+    // Settings > Import > Memory. A fake home folder is read (the importer mock), never the real one.
+    name: "memory: the notes the chat reads are listed for the project, switched on from the panel and from Settings, and /memory, /init and /clear work",
+    async run({ browser, importer, t, errors }) {
+      const fs = await import("node:fs")
+      const os = await import("node:os")
+      const path = await import("node:path")
+      const NL = String.fromCharCode(10)
+      const proj = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "strata-mem-")))
+      fs.writeFileSync(path.join(proj, "CLAUDE.md"), "Project: use tabs." + NL)
+      const slug = proj.replace(/[^A-Za-z0-9]/g, "-")
+      const files = [
+        [path.join(importer.home, ".claude", "CLAUDE.md"), "Global: I like haiku." + NL],
+        [path.join(importer.home, ".claude", "projects", slug, "memory", "MEMORY.md"), "- [style](style.md) the user likes short answers" + NL],
+        [path.join(importer.home, ".claude", "projects", slug, "memory", "style.md"), "Short answers please." + NL],
+      ]
+      for (const [f, text] of files) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, text) }
+      const saved = () => JSON.parse(fs.readFileSync(importer.config, "utf8"))
+
+      const pg = await open(browser, errors, { width: 1400, height: 900 })
+      const bodies = []
+      await pg.route("**/v1/chat/completions", (r) => { bodies.push(JSON.parse(r.request().postData() || "{}")); return r.fulfill({ status: 200, contentType: "text/event-stream", body: `data: ${JSON.stringify({ choices: [{ delta: { content: "ok" } }] })}${NL}${NL}data: [DONE]${NL}${NL}` }) })
+      await pg.addInitScript((p) => { if (!localStorage.getItem("strata.chats")) localStorage.setItem("strata.chats", JSON.stringify({ active: null, items: [], projects: [{ id: "p1", name: "Notes", folders: [p] }] })) }, proj)
+      await pg.goto(importer.base + "/#/chat")
+      await pg.waitForSelector("aside[aria-label='Conversations']")
+      await pg.waitForTimeout(800)
+      const side = pg.locator("aside[aria-label='Conversations']")
+      const dock = pg.locator("aside[aria-label='Session panel']")
+      const box = pg.locator("textarea[aria-label='Message']")
+      await side.getByRole("button", { name: "New chat in project Notes" }).click()
+      await pg.waitForTimeout(400)
+
+      // /memory opens the panel on the notes
+      await box.fill("/memory")
+      await box.press("Enter")
+      await pg.waitForTimeout(900)
+      t.ok("/memory opens the panel on the Memory tab and sends nothing", (await dock.getAttribute("data-panel")) === "open" && (await dock.locator("[data-tab='memory'][aria-selected='true']").count()) === 1 && bodies.length === 0 && (await box.inputValue()) === "")
+      const tab = dock.locator("[data-memory-tab]")
+      await tab.waitFor({ timeout: 8000 })
+      t.ok("the project's own file is listed and always on", (await tab.locator("[data-memory-source='project:0']").innerText()).includes("always on") && (await tab.locator("[data-memory-source='project:0'] [role=switch]").count()) === 0)
+      t.ok("what other apps wrote down is listed and off", (await tab.locator("[data-memory-source='claude:instructions']").getAttribute("data-on")) === null && (await tab.locator("[data-memory-source='claude:memory']").getAttribute("data-on")) === null)
+      await tab.locator("[data-memory-file='CLAUDE.md'] button").click()
+      await pg.waitForTimeout(700)
+      t.ok("a file opens to its text", (await tab.locator("[data-memory-text]").first().innerText()).includes("Project: use tabs."))
+      await tab.getByRole("button", { name: "Ask the model to change it" }).click()
+      t.ok("and the model can be asked to change it: the composer has the start of the request", (await box.inputValue()).includes("CLAUDE.md"))
+      await box.fill("")
+      await tab.locator("[data-memory-source='claude:instructions'] [role=switch]").click()
+      await pg.waitForTimeout(900)
+      t.ok("switching another app's instructions on is saved in the run config", JSON.stringify(saved().import.memory.on) === '["claude:instructions"]' && (await tab.locator("[data-memory-source='claude:instructions']").getAttribute("data-on")) !== null, JSON.stringify(saved().import))
+      await tab.locator("[data-memory-source='claude:memory'] [role=switch]").click()
+      await pg.waitForTimeout(900)
+      t.ok("and the memory of the project too", JSON.stringify(saved().import.memory.on.sort()) === '["claude:instructions","claude:memory"]')
+      await tab.locator("[data-memory-source='claude:memory'] [data-memory-file$='MEMORY.md'] button").click()
+      await pg.waitForTimeout(700)
+      t.ok("its index opens to its text", (await tab.locator("[data-memory-source='claude:memory'] [data-memory-text]").first().innerText()).includes("short answers"))
+
+      // Settings
+      await pg.goto(importer.base + "/#/settings/import-memory")
+      await pg.waitForSelector("[data-memory-source]")
+      await pg.waitForTimeout(500)
+      const row = (id) => pg.locator(`[data-memory-source='${id}']`)
+      t.ok("Settings > Import > Memory lists the same, with their switches as saved", (await row("claude:instructions").locator("[role=switch]").getAttribute("aria-checked")) === "true" && (await row("claude:memory").locator("[role=switch]").getAttribute("aria-checked")) === "true")
+      await row("claude:instructions").locator("[role=switch]").click()
+      await pg.waitForTimeout(800)
+      t.ok("a switch is turned off from there and saved", JSON.stringify(saved().import.memory.on) === '["claude:memory"]')
+      await row("claude:memory").locator("[role=switch]").click()
+      await pg.waitForTimeout(800)
+      t.ok("and all are off again", JSON.stringify(saved().import.memory.on) === "[]")
+
+      // /init and /clear
+      await pg.goto(importer.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(800)
+      await side.getByRole("button", { name: "New chat in project Notes" }).click()
+      await pg.waitForTimeout(300)
+      await box.fill("/init")
+      await box.press("Enter")
+      await pg.waitForTimeout(1200)
+      t.ok("/init sends the prompt that has the model write the project's CLAUDE.md", bodies.length === 1 && String(bodies[0].messages.at(-1).content).includes("CLAUDE.md") && String(bodies[0].messages.at(-1).content).includes("improve it"))
+      await box.fill("/clear")
+      await box.press("Enter")
+      await pg.waitForTimeout(600)
+      t.ok("/clear starts a new chat, and the one before stays in Recents", (await pg.locator(".msg-in").count()) === 0 && (await side.locator("[data-topic]").count()) >= 1)
+      await pg.context().close()
+      for (const [f] of files) fs.rmSync(f, { force: true })
+      fs.rmSync(path.join(importer.home, ".claude", "projects", slug), { recursive: true, force: true })
+      fs.rmSync(proj, { recursive: true, force: true })
     },
   },
   {
@@ -1980,7 +2074,7 @@ export const checks = [
       await plain.waitForTimeout(700)
       await plain.locator("textarea[aria-label='Message']").fill("/")
       await plain.waitForTimeout(250)
-      t.ok("with no skills at all a / lists only Strata's own commands, /compact and /context", JSON.stringify(await plain.locator("[role=listbox][aria-label='Skills'] [role=option]").evaluateAll((os) => os.map((o) => o.dataset.skill))) === '["compact","context"]')
+      t.ok("with no skills at all a / lists only Strata's own commands, /clear, /compact, /context, /init and /memory", JSON.stringify(await plain.locator("[role=listbox][aria-label='Skills'] [role=option]").evaluateAll((os) => os.map((o) => o.dataset.skill))) === '["clear","compact","context","init","memory"]')
     },
   },
   {

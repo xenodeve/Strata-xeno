@@ -19,6 +19,7 @@ import { nextDesign, type OrbDesign } from "../../lib/orbs"
 import { builtinCommands, commandsOf, type Command } from "../../lib/slash"
 import { compactCommand } from "../../lib/compact"
 import { contextView, isContextCommand } from "../../lib/context"
+import { INIT_PROMPT, isInitCommand, isMemoryCommand } from "../../lib/memory"
 import { forgetRules, NO_AGENT, rulesOf, type AgentInfo, type AgentMode } from "../../lib/agent"
 import { store } from "../../lib/store"
 import { SkillsContext } from "../../components/SkillTip"
@@ -218,6 +219,8 @@ export function Chat({ id }: { id?: string }) {
   const send = () => {
     if (busy || (!text.trim() && !files.length)) return
     if (!files.length && isContextCommand(text)) { setText(""); setCtxOpen((n) => n + 1); return }                // "/context": the panel with the context window opens
+    if (!files.length && isMemoryCommand(text)) { setText(""); keepPanel({ open: true, tab: "memory" }); return }                      // "/memory": the panel opens on the notes
+    if (!files.length && /^\s*\/clear\s*$/i.test(text)) { setText(""); newChat(); return }                                              // "/clear": a new chat, this one stays in Recents
     const asked = files.length ? null : compactCommand(text)           // "/compact" (and what to focus on) is not a message: the conversation is summarised
     if (asked) {
       setText("")
@@ -226,7 +229,7 @@ export function Chat({ id }: { id?: string }) {
       else void chat.compact(ctx(), asked.focus)
       return
     }
-    const typed = text, f = files
+    const typed = !files.length && isInitCommand(text) ? INIT_PROMPT : text, f = files                                    // "/init": the prompt that has the model write the project's CLAUDE.md
     noteSend(input.current?.getBoundingClientRect())          // where the prompt rises from
     setText(""); setFiles([])
     pinned.current = true
@@ -381,7 +384,7 @@ export function Chat({ id }: { id?: string }) {
     <PanelDock
       open={panel.open} tab={panel.tab} onTab={(tab: PanelTab) => keepPanel({ ...panel, tab })} onClose={() => keepPanel({ ...panel, open: false })}
       data={{
-        folders: chat.folders(), allowed: agentInfo.allowed, busy: !!busy, messages: chat.messages, commands,
+        folders: chat.folders(), allowed: agentInfo.allowed, busy: !!busy, messages: chat.messages, commands, onAsk: (text) => { setText(text); input.current?.focus() },
         context: contextView(chat.messages, chat.contextReported(), health.max_context, chat.settings.autoCompact !== false), canCompact: chat.canCompact(), onCompact: () => { void chat.compact(ctx()) },
       }}
     />

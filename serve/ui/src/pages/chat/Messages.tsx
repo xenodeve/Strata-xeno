@@ -17,6 +17,7 @@ import { ReasonStream } from "../../components/reason"
 import { Pop } from "../../components/pop"
 import { Spin } from "../../components/spin"
 import { SkillText } from "../../components/SkillTip"
+import { CompactingStatus } from "../../components/CompactingStatus"
 import { skillCall, type SkillCall } from "../../lib/panel"
 import { AgentCall, TodoList } from "./AgentCall"
 import { msg, t } from "../../lib/i18n"
@@ -160,7 +161,7 @@ function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: bo
 
 /** The line the conversation is summarised under: the model is writing the summary that will take the place of the earlier messages. */
 export function CompactingLine() {
-  return <div className="msg-in" role="status"><StatusLabel design="weaving" className="text-[13px] text-ink-2">{t("Compacting the conversation…")}</StatusLabel></div>
+  return <div className="msg-in"><CompactingStatus className="text-[13px] text-ink-2" /></div>
 }
 
 /** Where the earlier messages were summarised: a line across the chat that says so, and opens to the summary the model reads in their place. */
@@ -253,7 +254,7 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
       {m.error ? (
         <div className="rounded-md border border-line px-3 py-2 text-[13px] text-bad [overflow-wrap:anywhere]">{m.error}</div>
       ) : waiting ? (
-        compacting ? <StatusLabel design="weaving" className="text-[13px] text-ink-2">{t("Compacting the conversation…")}</StatusLabel>
+        compacting ? <CompactingStatus className="text-[13px] text-ink-2" />
         : m.reasoning ? null : phaseKind(serverPhase).kind === "reading"
           ? <StatusLabel design="listening" className="text-[13px] text-ink-2">{t("Reading the prompt…")}</StatusLabel>
           : <StatusLabel design="breathing" className="text-[13px] text-ink-2">{t("Waiting for the model…")}</StatusLabel>

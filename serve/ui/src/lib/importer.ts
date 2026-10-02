@@ -18,12 +18,14 @@ export interface Candidate {
   disabled_in_source: boolean; already_as: string | null
   command?: string; args?: string[]; cwd?: string; url?: string; env?: Record<string, string>; headers?: Record<string, string>      // only for a caller who may change the settings
 }
+export interface MemorySourceInfo { id: string; app: string; label: string; kind: "project" | "instructions" | "memory"; shown: string[]; bytes: number | null; on: boolean }
 export interface ImportView {
   available: boolean
   editable?: boolean; reason?: string; config_file?: string | null
   harnesses?: HarnessInfo[]
   skills?: { settings: SkillSettings; used: number; total: number; items: SkillItem[] }
   mcp?: { harnesses: { id: string; label: string; servers: Candidate[] }[] }
+  memory?: { settings: { on: string[] }; sources: MemorySourceInfo[] }         // the notes of other apps the chat may read: all off until switched on (serve/memory.py)
 }
 
 export const harnessOn = (s: SkillSettings, harness: string) => !s.harness_off.includes(harness)

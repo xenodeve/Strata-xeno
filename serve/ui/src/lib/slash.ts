@@ -14,6 +14,9 @@ export interface Command {
 export const builtinCommands = (): Command[] => [
   { name: "compact", description: t("Summarise the conversation so far to free up context. Add after it what the summary should focus on."), from: "Strata", plugin: null, builtin: true },
   { name: "context", description: t("Show how much of the context window the conversation uses, and what it is made of."), from: "Strata", plugin: null, builtin: true },
+  { name: "memory", description: t("Show the notes and instruction files the chat reads for this project."), from: "Strata", plugin: null, builtin: true },
+  { name: "init", description: t("Have the model look at the project and write a CLAUDE.md for it."), from: "Strata", plugin: null, builtin: true },
+  { name: "clear", description: t("Start a new chat. This one stays in Recents."), from: "Strata", plugin: null, builtin: true },
 ]
 
 /** The query when the caret is in a slash command at the very start of the message (`/pd|`), else null: a path, a URL, a `/` further in

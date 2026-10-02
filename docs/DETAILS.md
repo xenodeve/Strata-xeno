@@ -538,7 +538,7 @@ tasks, current work, next step), with no tools, and the summary takes the place 
 the model reads it as the earlier part of the conversation. A conversation that has used 95 % of the context (what the last answer reported: its prompt after every tool
 round, and its own tokens; else a guess from the text) is compacted by itself before the next prompt is sent (the prompt and its answer stay out of the summary); the
 switch is in the sampling settings ("Compact the conversation by itself", on by default). When the conversation does not fit with the request, the oldest prompts are
-left out of the summary and the model is asked again. Nothing is kept of the messages that were summarised. Not done: compacting in the middle of one answer's tool
+left out of the summary and the model is asked again. While it is being summarised the status is the "compacting" orb of thinkingorbs.com (the dots pack tight and spring back; `@yogesharc/thinking-orbs`, MIT). Nothing is kept of the messages that were summarised. Not done: compacting in the middle of one answer's tool
 rounds (the server's tool loop runs them without the page).
 
 **The context window in view.** The prompt bar has a chip with the share of the window that is used (a small ring and a number, amber from 60 %, red at the point where it is
@@ -556,6 +556,7 @@ and is saved in its own place when it ends; coming back to it shows what has bee
 Stop ends the open chat's answer only. Nothing of this survives closing the page: an answer still being written then is lost, as before.
 
 **Memory and instruction files.** The chat reads the project's own instruction files (`CLAUDE.md`, `CLAUDE.local.md`, `.claude/CLAUDE.md`, `AGENTS.md` when there is no `CLAUDE.md`, `.claude/rules/*.md`) of every folder of the project, following `@file` lines inside the folder a few levels deep, and hands them to the model after the rules and under them; a file in a sub-folder is handed over, once per chat, when the model reads or changes a file there. What other apps wrote down is **off until switched on** (in the import settings, or the Memory tab): each app's user instruction file (Claude Code `~/.claude/CLAUDE.md`, Codex, the shared agents folder, Gemini CLI) and the memory Claude Code keeps for a project (`~/.claude/projects/<folder>/memory/`). Each file is cut at 20,000 characters and all together at 60,000. None of it changes what the model may do: the permission rules decide that.
+The panel's Memory tab lists the sources for the open chat's folders (each file opens to its text, a button puts "Please update <file>: " in the composer, and the other apps' sources have their switches); Settings > Import > Memory has the same switches. `/memory` opens the tab, `/init` sends the prompt that has the model look at the project and write its `CLAUDE.md` (improving one that is there), `/clear` starts a new chat.
 
 **The right panel.** A button at the top right of the Chat opens a panel beside the conversation (a sheet over it on a screen narrower than 1280 px; open state and tab are kept in
 the browser). Tabs: **Git** - for each folder of the project (a tab each), the branch (or "detached at ..."), commits ahead and behind its upstream, the changed files in groups

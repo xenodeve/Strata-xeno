@@ -64,7 +64,6 @@ export const part: Record<string, string> = {
   "Photos, files, new chat, save": "รูปภาพ ไฟล์ แชทใหม่ บันทึก",
   "Attach files": "แนบไฟล์",
   "Sampling": "การสุ่ม (sampling)",
-  "Shift+Enter: new line": "Shift+Enter: ขึ้นบรรทัดใหม่",
   "Stop": "หยุด",
   "Send": "ส่ง",
 

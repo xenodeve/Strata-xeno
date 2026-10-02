@@ -67,8 +67,6 @@
 
 .prompt-bar__bar { display: flex; align-items: center; gap: 4px; }
 .prompt-bar__spacer { flex: 1 1 auto; }
-.prompt-bar__hint { margin-right: 6px; color: var(--ink-3); font-size: 12px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-@media (max-width: 560px) { .prompt-bar__hint { display: none; } }
 .prompt-bar__tool, .prompt-bar__pick, .prompt-bar__send {
   flex: none; border: 0; font: inherit; cursor: pointer; outline: none; user-select: none; -webkit-tap-highlight-color: transparent; touch-action: manipulation;
 }

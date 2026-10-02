@@ -6,6 +6,9 @@ import type { Command } from "../lib/slash"
 import type { ContextView } from "../lib/context"
 import { baseName, getGit, getGitDiff, parseDiff, STATUS_WORD, type DiffLine, type GitFile, type GitInfo, type GitResult } from "../lib/git"
 import { planOf, skillsUsed, type PanelTab } from "../lib/panel"
+import { getMemory, getMemoryFile, saveMemorySwitches, sizeText, withSwitch, type MemoryList, type MemorySource } from "../lib/memory"
+import { toast } from "./toast"
+import { MiniSwitch } from "./ui"
 import { cn } from "../lib/cn"
 import { t } from "../lib/i18n"
 import { ContextPanel } from "./ContextPanel"
@@ -25,7 +28,7 @@ const TAB_META: Record<PanelTab, { icon: IconSvgElement; label: () => string }> 
   memory: { icon: BookOpenTextIcon, label: () => t("Memory") },
   context: { icon: Layers01Icon, label: () => t("Context") },
 }
-export const SHOWN_TABS: PanelTab[] = ["git", "plan", "skills", "context"]
+export const SHOWN_TABS: PanelTab[] = ["git", "plan", "skills", "memory", "context"]
 
 export interface PanelData {
   folders: string[]                  // the project's folders (or the default one): one Git view each
@@ -33,6 +36,7 @@ export interface PanelData {
   busy: boolean                      // an answer is being written: the Git view refreshes when it ends
   messages: Message[]
   commands: Command[]
+  onAsk: (text: string) => void      // puts text in the composer (to ask the model to change a memory file)
   context: ContextView
   canCompact: boolean
   onCompact: () => void
@@ -270,6 +274,81 @@ function SkillsTab({ messages, commands }: { messages: Message[]; commands: Comm
   )
 }
 
+// ------------------------------------------------------------------------------------------------ memory
+/** One file of a source: its name, and its text when opened (read from the server when asked). */
+function MemoryFile({ folders, source, n, onAsk }: { folders: string[]; source: MemorySource; n: number; onAsk: (text: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const [got, setGot] = useState<{ name: string; text: string; cut: boolean } | "loading" | "error" | null>(null)
+  const name = source.shown[n]
+  const toggle = () => {
+    const next = !open
+    setOpen(next)
+    if (next && got === null) {
+      setGot("loading")
+      void getMemoryFile(folders, source.id, n).then((r) => setGot(r ?? "error"))
+    }
+  }
+  return (
+    <li data-memory-file={name}>
+      <button type="button" aria-expanded={open} onClick={toggle} className="flex w-full items-center gap-2 rounded-sm px-1.5 py-1 text-left text-[12.5px] transition-colors hover:bg-hover">
+        <span className="min-w-0 flex-1 truncate font-mono" title={name}>{name}</span>
+        <HugeiconsIcon icon={ArrowDown01Icon} size={12} aria-hidden className={cn("shrink-0 text-ink-3 transition-transform duration-200", open && "rotate-180")} />
+      </button>
+      <Collapse open={open}>
+        <div className="px-1.5 pb-2 pt-0.5">
+          {got === "loading" || got === null ? <p className="text-[12px] text-ink-3">{t("Reading the file…")}</p>
+            : got === "error" ? <p className="text-[12px] text-bad">{t("The file could not be read.")}</p>
+            : <>
+              <div className="max-h-64 overflow-y-auto rounded-sm border border-line px-2.5 py-2 text-[12.5px]" data-memory-text><Prose text={got.text} /></div>
+              {got.cut && <p className="mt-1 text-[12px] text-ink-3">{t("The file is long: only the start is shown here.")}</p>}
+              <button type="button" onClick={() => onAsk(t("Please update {file}: ", { file: name }))} className="mt-1.5 rounded-sm px-1.5 py-1 text-[12px] text-ink-2 transition-colors hover:bg-hover hover:text-ink">{t("Ask the model to change it")}</button>
+            </>}
+        </div>
+      </Collapse>
+    </li>
+  )
+}
+
+function MemoryTab({ folders, allowed, onAsk }: { folders: string[]; allowed: boolean; onAsk: (text: string) => void }) {
+  const [list, setList] = useState<MemoryList | null | "loading">("loading")
+  const key = folders.join("|")
+  const load = useCallback(() => { void getMemory(folders).then(setList) }, [key])       // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (allowed) load() }, [allowed, load])
+  if (!allowed) return <p className="text-[13px] text-ink-2">{t("Notes are read from this PC's files, so they are shown only on the PC that runs Strata (or with the API key).")}</p>
+  if (list === "loading") return <Loading>{t("Looking for notes…")}</Loading>
+  if (!list) return <p className="text-[13px] text-ink-2">{t("The server could not be asked for the notes.")}</p>
+  const others = list.sources.filter((s) => s.kind !== "project")
+  const flip = async (s: MemorySource, value: boolean) => {
+    const on = withSwitch(others.filter((x) => x.on).map((x) => x.id), s.id, value)
+    setList({ ...list, sources: list.sources.map((x) => (x.id === s.id ? { ...x, on: value } : x)) })
+    const err = await saveMemorySwitches(on)
+    if (err) toast("error", t("The switch was not saved"), err)
+    load()
+  }
+  const inUse = list.sources.filter((s) => s.on)
+  return (
+    <div className="space-y-3" data-memory-tab>
+      <p className="text-[12.5px] text-ink-2">{inUse.length ? t("The chat is handed these notes after its rules. They never change what it may do.") : t("No notes are in use for this chat: no instruction file was found in the project's folders.")}</p>
+      {list.sources.map((s) => (
+        <section key={s.id} data-memory-source={s.id} data-on={s.on ? "" : undefined} className="rounded-md border border-line">
+          <div className="flex items-center gap-2 px-2.5 py-2">
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[13px] font-medium">{s.kind === "project" ? t("The project's own: {name}", { name: s.label }) : `${s.label} · ${s.kind === "memory" ? t("what it remembers about this project") : t("its instructions for you")}`}</div>
+              <div className="num text-[11.5px] text-ink-3">{sizeText(s.bytes)}{s.kind === "project" ? ` · ${t("always on")}` : ""}</div>
+            </div>
+            {s.kind !== "project" && <MiniSwitch on={s.on} label={t("Read {name}", { name: `${s.label}: ${s.kind === "memory" ? t("memory") : t("instructions")}` })} onClick={() => void flip(s, !s.on)} />}
+          </div>
+          <ul className={cn("border-t border-line px-1 py-1", !s.on && "opacity-60")}>
+            {s.shown.map((_, n) => <MemoryFile key={s.id + n} folders={folders} source={s} n={n} onAsk={onAsk} />)}
+          </ul>
+        </section>
+      ))}
+      {list.sources.length === 0 && <p className="text-[12.5px] text-ink-3">{t("Type /init and the model will look at the project and write a CLAUDE.md for it.")}</p>}
+      {others.length === 0 && list.sources.length > 0 && <p className="text-[12px] text-ink-3">{t("Notes your other coding apps keep would be listed here, off until you switch them on.")}</p>}
+    </div>
+  )
+}
+
 // ------------------------------------------------------------------------------------------------ the panel
 const WIDE = "(min-width: 1280px)"
 const WIDTH = 340
@@ -338,6 +417,7 @@ export function PanelBody({ tab, onTab, onClose, data }: { tab: PanelTab; onTab:
         {shown === "git" && <GitTab folders={data.folders} allowed={data.allowed} busy={data.busy} />}
         {shown === "plan" && <PlanTab messages={data.messages} />}
         {shown === "skills" && <SkillsTab messages={data.messages} commands={data.commands} />}
+        {shown === "memory" && <MemoryTab folders={data.folders} allowed={data.allowed} onAsk={data.onAsk} />}
         {shown === "context" && <ContextPanel view={data.context} canCompact={data.canCompact} onCompact={data.onCompact} />}
       </GlidePanel>
     </div>

@@ -4,6 +4,7 @@ import { ArrowDown01Icon, ArrowRight01Icon } from "@hugeicons/core-free-icons"
 import { getImport, postImport } from "../lib/api"
 import { fmt } from "../lib/format"
 import { harnessOn, filterItems, itemOn, setHarness, setItem, setMaster, skillSummary, type Candidate, type ImportView, type SkillSettings } from "../lib/importer"
+import { sizeText, withSwitch } from "../lib/memory"
 import { msg, t } from "../lib/i18n"
 import { cn } from "../lib/cn"
 import { Collapse } from "./motion"
@@ -57,16 +58,45 @@ function Note({ view }: { view: ImportView }) {
   )
 }
 
-export function ImportSettings({ part }: { part: "skills" | "mcp" }) {
+export function ImportSettings({ part }: { part: "skills" | "mcp" | "memory" }) {
   const { view, setView, busy, notice, send, rescan } = useImport()
   const [filter, setFilter] = useState("")
   const [open, setOpen] = useState<string[]>([])               // the apps whose skills are shown
 
   if (!view) return null
-  if (!view.available) return <section><h2 className="text-[15px] font-semibold">{part === "skills" ? t("Skills from other apps") : t("MCP servers from other apps")}</h2><p className="mt-1 text-[13px] text-ink-2">{t("Importing from other apps is not available on this server.")}</p></section>
+  if (!view.available) return <section><h2 className="text-[15px] font-semibold">{part === "skills" ? t("Skills from other apps") : part === "memory" ? t("Memory from other apps") : t("MCP servers from other apps")}</h2><p className="mt-1 text-[13px] text-ink-2">{t("Importing from other apps is not available on this server.")}</p></section>
   const can = !!view.editable
   const labels = Object.fromEntries((view.harnesses ?? []).map((h) => [h.id, h.label]))
   const rescanButton = <Button disabled={busy} onClick={() => void rescan()}>{busy ? t("Rescanning…") : t("Rescan")}</Button>
+
+  if (part === "memory") {
+    const mem = view.memory ?? { settings: { on: [] }, sources: [] }
+    const flip = async (id: string, value: boolean) => {
+      const next = { on: withSwitch(mem.settings.on, id, value) }
+      setView({ ...view, memory: { settings: next, sources: mem.sources.map((x) => (x.id === id ? { ...x, on: value } : x)) } })      // at once; the server's answer replaces it, or it is put back
+      if (!(await send({ memory: next }))) setView(view)
+    }
+    return (
+      <section>
+        <h2 className="text-[15px] font-semibold">{t("Memory from other apps")}</h2>
+        <p className="mt-1 text-[13px] text-ink-2">{t("Your other coding apps keep notes about how you like to work, and about your projects. The chat can read them, as those apps do. They are your own words, but written for another app, so each is off until you switch it on. They never change what the chat may do: asking you first still applies.")}</p>
+        <Note view={view} />
+        {mem.sources.length === 0 && <p className="py-3 text-[13px] text-ink-2">{t("No notes were found in your other coding apps.")}</p>}
+        {mem.sources.map((x) => (
+          <div key={x.id} data-memory-source={x.id} className="flex items-start gap-3 border-t border-line py-2.5">
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-baseline gap-x-2"><span className="text-[13px] font-medium">{x.label}</span><span className="text-[12px] text-ink-2">{x.kind === "memory" ? t("what it remembers about each project") : t("its instructions for you")}</span></div>
+              <div className="font-mono text-[12px] text-ink-3 [overflow-wrap:anywhere]">{x.shown.join(", ")}</div>
+              {x.bytes != null && <div className="num text-[12px] text-ink-3">{sizeText(x.bytes)}</div>}
+            </div>
+            <MiniSwitch on={x.on} disabled={!can || busy} label={t("Read {name}", { name: `${x.label}: ${x.kind === "memory" ? t("memory") : t("instructions")}` })} onClick={() => void flip(x.id, !x.on)} />
+          </div>
+        ))}
+        <div className="flex justify-end pt-2">{rescanButton}</div>
+        {notice && <p role="alert" className="mt-2 text-[12px] text-bad [overflow-wrap:anywhere]">{notice}</p>}
+      </section>
+    )
+  }
 
   if (part === "skills") {
     const sk = view.skills!

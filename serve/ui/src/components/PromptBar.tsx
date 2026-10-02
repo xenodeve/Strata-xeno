@@ -601,7 +601,6 @@ export function PromptBar(p: PromptBarProps) {
               <span className="num">{p.context.view.pct}%</span>
             </button>
           )}
-          {!p.busy && <span className="prompt-bar__hint">{t("Shift+Enter: new line")}</span>}
           <button
             type="button"
             className="prompt-bar__send"
