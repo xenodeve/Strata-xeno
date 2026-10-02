@@ -62,8 +62,16 @@ function stretch(el: HTMLElement, from: number, to: number, done: () => void): v
 export function watchGrowth(root: HTMLElement): () => void {
   const last = new WeakMap<Element, number>()
   const busy = new WeakSet<Element>()
-  const all = () => [...root.querySelectorAll<HTMLElement>("*")]
-  const snapshot = () => { for (const el of all()) last.set(el, el.getBoundingClientRect().height) }
+  // The size of a part is its layout height (offsetHeight), not what is drawn: a menu that is still popping in is drawn a little smaller than it is,
+  // and that is not a change in the content.
+  const all = () => [...root.querySelectorAll<HTMLElement>("*")].filter((el) => el instanceof HTMLElement)
+  const heightOf = (el: HTMLElement) => el.offsetHeight
+  // "before" must be what the part measured just before the change, whenever that was: a size that changed by itself since (a font that arrived, a
+  // line that wrapped differently) is not part of this change. So every size change is noted as it happens, and a change in the content is
+  // compared with the last size noted.
+  const sizes = new ResizeObserver((entries) => { for (const e of entries) if (e.target instanceof HTMLElement) last.set(e.target, heightOf(e.target)) })
+  const watch = () => { for (const el of all()) sizes.observe(el) }
+  const snapshot = () => { for (const el of all()) last.set(el, heightOf(el)); watch() }
   snapshot()
   const settle = () => {
     if (reduced() || movingBySelf(root)) { snapshot(); return }
@@ -72,7 +80,7 @@ export function watchGrowth(root: HTMLElement): () => void {
       if (busy.has(el)) continue
       const d = getComputedStyle(el).display
       if (d === "inline" || d === "contents" || d === "none") continue            // an inline box has no height of its own to stretch
-      seen.push({ node: el, was: last.get(el), now: el.getBoundingClientRect().height })
+      seen.push({ node: el, was: last.get(el), now: heightOf(el) })
     }
     const go = chooseStretching(seen, (a, b) => a !== b && a.contains(b))
     for (const s of go) {
@@ -80,8 +88,9 @@ export function watchGrowth(root: HTMLElement): () => void {
       stretch(s.node, s.was ?? 0, s.now, () => { busy.delete(s.node); snapshot() })
     }
     for (const s of seen) if (!go.some((g) => g.node === s.node)) last.set(s.node, s.now)
+    watch()                                                                          // the parts that came with this change are noted from now on
   }
   const mo = new MutationObserver(settle)
   mo.observe(root, { childList: true, characterData: true, subtree: true })       // not attributes: the stretch itself writes styles
-  return () => mo.disconnect()
+  return () => { mo.disconnect(); sizes.disconnect() }
 }

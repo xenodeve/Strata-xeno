@@ -14,7 +14,19 @@ const MODE_TEXT: Record<AgentMode, string> = {
 }
 export const modeLabel = (m: AgentMode) => t(MODE_LABEL[m])
 
+/** The three modes and what the one in use means. On the prompt bar it is the chip's menu (the mode is what a chat needs to see and change often);
+ *  in Settings it is part of the coding tools' settings. */
+export function ModePicker({ mode, onMode }: { mode: AgentMode; onMode: (m: AgentMode) => void }) {
+  return (
+    <div data-agent-mode-picker>
+      <Segmented label={t("Mode")} value={mode} onChange={onMode} options={(["ask", "plan", "auto"] as AgentMode[]).map((m) => ({ value: m, label: modeLabel(m) }))} />
+      <p className="mt-1.5 text-[12px] text-ink-2" data-agent-mode-text>{t(MODE_TEXT[mode])}</p>
+    </div>
+  )
+}
+
 export interface AgentControlsProps {
+  withMode?: boolean                    // the mode picker is part of these controls (Settings); not in the prompt bar's panel, where the mode has its own chip
   info: AgentInfo
   on: boolean
   mode: AgentMode
@@ -43,9 +55,8 @@ export function AgentControls(p: AgentControlsProps) {
         <MiniSwitch on={p.on} label={t("Coding tools")} onClick={p.onToggle} />
       </div>
       <div className={p.on ? "" : "pointer-events-none opacity-50"} aria-disabled={!p.on}>
-        <Segmented label={t("Mode")} value={p.mode} onChange={p.onMode} options={(["ask", "plan", "auto"] as AgentMode[]).map((m) => ({ value: m, label: modeLabel(m) }))} />
-        <p className="mt-1.5 text-[12px] text-ink-2" data-agent-mode-text>{t(MODE_TEXT[p.mode])}</p>
-        <label className="mt-3 block">
+        {p.withMode !== false && <ModePicker mode={p.mode} onMode={p.onMode} />}
+        <label className={p.withMode !== false ? "mt-3 block" : "block"}>
           <span className="text-[13px]">{t("Folder")}</span>
           <span className="mt-1.5 flex items-center gap-2">
             <input

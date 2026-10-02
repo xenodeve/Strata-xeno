@@ -236,6 +236,8 @@ export const part: Record<string, string> = {
   "The coding tools are switched off on this server (\"agent\": false in the run config).": "server นี้ปิดเครื่องมือเขียนโค้ดไว้ (\"agent\": false ใน run config)",
   "The coding tools work only from the PC that runs Strata (or with the API key), because they change files and run commands there.": "เครื่องมือเขียนโค้ดใช้ได้เฉพาะจากเครื่องที่รัน Strata (หรือด้วย API key) เพราะมันแก้ไฟล์และรันคำสั่งบนเครื่องนั้น",
   "Coding tools": "เครื่องมือเขียนโค้ด",
+  "Coding mode": "โหมดการทำงาน",
+  "Temperature, top-p, seed and more": "อุณหภูมิ top-p seed และอื่นๆ",
   "Read, search and change files, and run commands, like Claude Code.": "อ่าน ค้นหา และแก้ไฟล์ รวมถึงรันคำสั่ง แบบเดียวกับ Claude Code",
   "Mode": "โหมด",
   "Folder the tools work in": "โฟลเดอร์ที่เครื่องมือทำงาน",

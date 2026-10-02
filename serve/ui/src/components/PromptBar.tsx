@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as RKeyEvent, type PointerEvent as RPointerEvent, type ReactNode, type RefObject } from "react"
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
-  Attachment01Icon, Cancel01Icon, Download01Icon, File02Icon, HelpCircleIcon, PlusSignIcon, Settings02Icon, SparklesIcon, MessageAdd01Icon, PlugSocketIcon, ComputerTerminal01Icon,
+  Attachment01Icon, Cancel01Icon, Download01Icon, File02Icon, HelpCircleIcon, PlusSignIcon, Settings02Icon, SparklesIcon, MessageAdd01Icon, PlugSocketIcon, ComputerTerminal01Icon, Shield01Icon,
 } from "@hugeicons/core-free-icons"
 import { msg, t } from "../lib/i18n"
 import type { McpServer } from "../lib/api"
 import { markOf, matchCommands, pickCommand, slashQuery, type Command } from "../lib/slash"
 import { SkillCard } from "./SkillTip"
 import { MiniSwitch } from "./ui"
-import { AgentControls, modeLabel, type AgentControlsProps } from "./AgentControls"
+import { AgentControls, ModePicker, modeLabel, type AgentControlsProps } from "./AgentControls"
 import { GlidePanel } from "./motion"
 
 // The composer: the field, and one bar of tools under it. Adapted from React Bits' PromptBar (MIT + Commons Clause: used
@@ -99,7 +99,7 @@ export function PromptBar(p: PromptBarProps) {
   const rows = useRef<(HTMLButtonElement | null)[]>([])
   const lastOpen = useRef<string | null>(null)
   const typing = useRef({ energy: 0, strokes: 0 })
-  const [menu, setMenu] = useState<"plus" | "effort" | "mcp" | "agent" | null>(null)
+  const [menu, setMenu] = useState<"plus" | "effort" | "mcp" | "agent" | "mode" | null>(null)
   const [active, setActive] = useState(0)
   const [focused, setFocused] = useState(false)
   const [visible, setVisible] = useState(() => typeof document === "undefined" || !document.hidden)
@@ -126,8 +126,9 @@ export function PromptBar(p: PromptBarProps) {
     {
       key: "agent", name: t("Coding tools"), icon: ComputerTerminal01Icon, checked: usableAgent && p.agent.on,
       description: !p.agent.info.available ? t("Not on this server") : !p.agent.info.allowed ? t("Only from the PC that runs Strata") : p.agent.folder ? p.agent.folder : t("No folder yet. Set one to work in."),
-      state: usableAgent ? (p.agent.on ? modeLabel(p.agent.mode) : t("off")) : undefined,
+      state: usableAgent ? (p.agent.on ? t("on") : t("off")) : undefined,
     },
+    { key: "sampling", name: t("Sampling"), description: t("Temperature, top-p, seed and more"), icon: Settings02Icon },
   ]
   const cursor = Math.min(active, list.length - 1)
   const canSend = p.value.trim().length > 0 || p.attachments.length > 0
@@ -159,7 +160,7 @@ export function PromptBar(p: PromptBarProps) {
   const closeMenu = useCallback(() => setMenu(null), [])
   const focusInput = () => p.inputRef.current?.focus({ preventScroll: true })
   // Focus first, then set the menu: giving the field focus closes menus (its onFocus), so the order matters when the field did not have it.
-  const toggle = (kind: "plus" | "effort" | "mcp") => { const next = menu === kind ? null : kind; setActive(0); focusInput(); setMenu(next) }
+  const toggle = (kind: "plus" | "effort" | "mcp" | "mode") => { const next = menu === kind ? null : kind; setActive(0); focusInput(); setMenu(next) }
 
   useEffect(() => {
     const on = () => setVisible(!document.hidden)
@@ -260,6 +261,7 @@ export function PromptBar(p: PromptBarProps) {
     if (key === "attach") file.current?.click()
     else if (key === "new") p.onNewChat()
     else if (key === "save") p.onSave()
+    else if (key === "sampling") p.onSampling()
   }
 
   const setEffort = (i: number) => { const n = Math.max(0, Math.min(p.efforts.length - 1, i)); if (n !== p.effort) p.onEffort(n) }
@@ -322,10 +324,18 @@ export function PromptBar(p: PromptBarProps) {
         </div>
       )}
 
+      {menu === "mode" && (
+        <div className="prompt-bar__menu" role="dialog" aria-label={t("Coding mode")} data-kind="mode" onKeyDown={(e) => { if (e.key === "Escape") { e.preventDefault(); closeMenu(); focusInput() } }}>
+          <GlidePanel cap={() => Math.min(innerHeight * 0.6, 420)} inner="px-4 pb-4 pt-3.5">
+            <ModePicker mode={p.agent.mode} onMode={p.agent.onMode} />
+          </GlidePanel>
+        </div>
+      )}
+
       {menu === "agent" && (
         <div className="prompt-bar__menu" role="dialog" aria-label={t("Coding tools")} data-kind="agent">
           <GlidePanel cap={() => Math.min(innerHeight * 0.7, 520)} inner="px-4 pb-4 pt-3.5">      {/* it stretches where its content grows (the description of a mode, a row that comes), not as a whole */}
-            <AgentControls {...p.agent} />
+            <AgentControls {...p.agent} withMode={false} />
           </GlidePanel>
         </div>
       )}
@@ -503,6 +513,21 @@ export function PromptBar(p: PromptBarProps) {
             </div>
           </span>
           <input ref={file} type="file" multiple hidden aria-label={t("Attach files")} onChange={(e) => { p.onFiles(Array.from(e.target.files || [])); e.target.value = "" }} />
+          {usableAgent && p.agent.on && (
+            <button
+              type="button"
+              className="prompt-bar__pick"
+              aria-label={t("Coding mode")}
+              aria-expanded={menu === "mode"}
+              data-on={menu === "mode" ? "" : undefined}
+              data-agent-mode={p.agent.mode}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => toggle("mode")}
+            >
+              <HugeiconsIcon icon={Shield01Icon} size={13} strokeWidth={2} />
+              <span>{modeLabel(p.agent.mode)}</span>
+            </button>
+          )}
           <button
             type="button"
             className="prompt-bar__pick"
@@ -515,9 +540,6 @@ export function PromptBar(p: PromptBarProps) {
           >
             <HugeiconsIcon icon={SparklesIcon} size={13} strokeWidth={2} />
             <span>{level}</span>
-          </button>
-          <button type="button" className="prompt-bar__tool" aria-label={t("Sampling")} title={t("Sampling")} onMouseDown={(e) => e.preventDefault()} onClick={() => { closeMenu(); p.onSampling() }}>
-            <HugeiconsIcon icon={Settings02Icon} size={15} strokeWidth={2} />
           </button>
           <span className="prompt-bar__spacer" />
           {!p.busy && <span className="prompt-bar__hint">{t("Shift+Enter: new line")}</span>}
