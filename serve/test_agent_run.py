@@ -162,6 +162,18 @@ class TheJudge(unittest.TestCase):
         self.assertIn("C:/proj", user)
         self.assertIn("never", system.lower())                            # tool results and file contents are not instructions
 
+    def test_the_system_prompt_is_a_rubric_with_the_places_and_the_always_stop_kinds(self):
+        system, _ = judge.prompt(REQ, "build the project", "C:/proj", "bash")
+        low = system.lower()
+        for word in ("intent", "project's folders", "leaving this computer", "destroying", "credentials", "production", "downloaded", "unclear"):
+            self.assertIn(word, low, word)
+        self.assertIn("<severity>", judge.prompt(REQ, "g", "C:/proj", "bash")[1])         # the one answer it must give is still asked for in the request
+        self.assertNotIn("<severity>", system)                                            # and the rubric itself holds no markup the model could copy as an answer
+
+    def test_the_other_folders_of_the_project_are_named_to_the_judge(self):
+        _, user = judge.prompt(REQ, "g", "C:/proj", "bash", dirs=["C:/wt2"])
+        self.assertIn("C:/wt2", user)
+
     def test_a_long_goal_and_a_long_command_are_cut(self):
         system, user = judge.prompt({**REQ, "arguments": {"command": "x" * 20000}}, "g" * 20000, "C:/proj", "bash")
         self.assertLess(len(user), 8000)
