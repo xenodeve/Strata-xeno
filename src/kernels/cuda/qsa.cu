@@ -184,10 +184,18 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
             ss = __dadd_rn(ss, __dmul_rn(v, v));
         }
         const double inv = __ddiv_rn(1.0, __dsqrt_rn(ss / (double) idx_dim + (double) eps));
-        dead[d] = (float) (p * inv * (double) w_k_norm[d]);
-        // rope at position 0 is the identity here (cos = 1, sin = 0 exactly), so no rotation is applied and
-        // the parity test asserts the value is bit-exact - which is what makes skipping it legitimate.
-        pooled[d] = dead[d];
+        float y = (float) (p * inv * (double) w_k_norm[d]);
+        // The spare rotates at position 0 - ALWAYS row 0 of the table, whatever `pos_base` is, as the native
+        // indexer's spare does.  At angle 0 the sine is exactly 0 in every scaling (sin(0) * mscale), so the
+        // pair rotation reduces to `v * cos_tab[pair]` with no partner element to read (and no barrier).
+        // Unscaled, row 0 is exactly (1, 0) and `v * 1.0f` is `v` bit for bit - today's value, which the
+        // parity test holds bit-exact.  Under YaRN row 0 is (mscale, 0): the rotated dims carry the magnitude
+        // correction exactly like every other pooled row and like the native kernel's spare (the unrotated
+        // dims pass through, as in the rotation of the completed blocks below).  Skipping the rotation here,
+        // as this kernel once did, left `dead` and `pooled[0]` the only unscaled keys of a scaled cache.
+        if (d < n_rot) y *= cos_tab[d % (n_rot / 2)];
+        dead[d] = y;
+        pooled[d] = y;
     }
 
     if (slot != r - 1) return;
@@ -656,7 +664,11 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
     // then index past it at token 500.  The kernel reads the real count from `step`, so a larger allocation is
     // exactly what it wants.  The opt-in therefore happens once, for the capacity.
     const size_t smem = (size_t) (max_ids + 32) * sizeof(float);
-    static size_t s_configured = 0;
+    // per DEVICE: the opt-in is a device setting (a layer split runs this on two cards)
+    static size_t s_configured_dev[64] = {};
+    int cur_dev = 0;
+    cudaGetDevice(&cur_dev);
+    size_t& s_configured = s_configured_dev[(cur_dev >= 0 && cur_dev < 64) ? cur_dev : 0];
     if (smem > s_configured) {
         int dev = 0, max_shared = 0;
         cudaGetDevice(&dev);

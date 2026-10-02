@@ -7,10 +7,11 @@ from __future__ import annotations
 import io
 import json
 import os
-import queue
 import sys
+import tempfile
 import threading
 import time
+import queue
 import unittest
 import urllib.error
 import urllib.request
@@ -18,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Service, StrataEngine, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, StrataEngine, request_timings, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -30,6 +31,7 @@ ANSWER = "".join("abcdefghijklmnopqrstuvwxyz"[(i * 7919 + i * i * 104729) % 26] 
 class RecordingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_max_new = max_new
+        self.last_sampling = sampling
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
@@ -67,6 +69,35 @@ class MaxTokens(unittest.TestCase):
         s, b = self.post("/v1/messages", {"model": "m", "messages": msgs, **budget})
         u = b.get("usage", {})
         return s, b, u.get("input_tokens"), u.get("output_tokens")
+
+    def test_cache_slot_validation_precedes_stream_headers(self):
+        for api in ("openai", "anthropic"):
+            for stream in (False, True):
+                for slot in (-1, 4, True, "1", 1.5, None):
+                    with self.subTest(api=api, stream=stream, slot=slot):
+                        status, body, _, _ = self.call(api, max_tokens=8, stream=stream, strata_cache_slot=slot)
+                        self.assertEqual(status, 400)
+                        self.assertIn("strata_cache_slot", body["error"]["message"])
+
+    def test_cache_slot_reaches_engine_over_both_apis(self):
+        for api in ("openai", "anthropic"):
+            status, _, _, _ = self.call(api, max_tokens=8, strata_cache_slot=3)
+            self.assertEqual(status, 200)
+            self.assertEqual(self.engine.last_sampling["strata_cache_slot"], 3)
+
+    def test_layer_split_rejects_nonzero_slot_before_streaming(self):
+        previous = getattr(self.engine, "info", None)
+        self.engine.info = {"cache_slots": "1"}
+        try:
+            status, body, _, _ = self.call("openai", max_tokens=8, stream=True, strata_cache_slot=1)
+            self.assertEqual(status, 400)
+            self.assertIn("single-GPU", body["error"]["message"])
+            self.assertEqual(self.call("openai", max_tokens=8, strata_cache_slot=0)[0], 200)
+        finally:
+            if previous is None:
+                del self.engine.info
+            else:
+                self.engine.info = previous
 
     def test_unset_budget_is_the_rest_of_the_context(self):
         cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
@@ -169,6 +200,90 @@ class FitMaxTokens(unittest.TestCase):
         s, b, _, _ = self.call("openai", text="y" * (CTX - CTX_SLACK - overhead), max_tokens=100)
         self.assertEqual(s, 400, b)
         self.assertIn("no room to answer", b["error"]["message"])
+
+
+class ImageMarkers(unittest.TestCase):
+    """#150: the text "<|image_pad|>" inside a message is text, not an image's place."""
+
+    class FakeVision:
+        def __init__(self, d):
+            self.dir = Path(d)
+            self.rows = self.dir / "img.sve"
+            self.rows.write_bytes(b"rows")
+
+        def encode(self, source):
+            return self.rows, 3
+
+    def test_literal_marker_with_an_image(self):
+        import tempfile
+        tok = ByteTokenizer()
+        with tempfile.TemporaryDirectory() as d:
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                          vision=self.FakeVision(d))
+            pad = tok.encode("<|image_pad|>", parse_special=True)[0]
+            for text in ("the docs say <|image_pad|> marks an image", "plain"):
+                with self.subTest(text=text):
+                    msgs = [{"role": "user", "content": [{"type": "text", "text": text},
+                                                         {"type": "image", "source": "x.png"}]}]
+                    ids, _, _ = svc.prepare(msgs, None, {})
+                    self.assertEqual(ids.count(pad), 3)          # the image's three rows, nothing else
+                    self.assertIn("<|image_pad|> marks" if "docs" in text else "plain", tok.decode(ids))
+            svc.embeddings.path.unlink(missing_ok=True)
+
+
+class StatusNeedsTheKey(unittest.TestCase):
+    """#212: /status shows the end of the answer being written, so it needs the key like /v1/*."""
+
+    def test_status(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.api_key = "k3y"
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}/status"
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(base, timeout=10)
+            self.assertEqual(e.exception.code, 401)
+            e.exception.close()
+            req = urllib.request.Request(base, headers={"Authorization": "Bearer k3y"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertEqual(r.status, 200)
+                self.assertNotIn("tail", json.loads(r.read()))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class ToolCallTerminators(unittest.TestCase):
+    """#210: a value that contains </parameter> or </tool_call> (a file documenting the call format) is kept whole."""
+    CONTENT = ("Close each value with </parameter> and the call with </function></tool_call>.\n"
+               "<parameter=x>\nnot a parameter\n</parameter>\nend")
+    SCHEMA = [{"name": "write", "parameters": {"properties": {"path": {"type": "string"},
+                                                              "content": {"type": "string"}}}}]
+
+    def run_parser(self, stream_tools, step):
+        from serve.frontend import OutputParser
+        text = ("</think>\n\n<tool_call>\n<function=write>\n<parameter=path>\ndoc.md\n</parameter>\n"
+                f"<parameter=content>\n{self.CONTENT}\n</parameter>\n</function>\n</tool_call>")
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=stream_tools)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        evs += p.finish()
+        return evs
+
+    def test_values_keep_the_terminators(self):
+        for stream_tools in (False, True):
+            for step in (1, 7, 10_000):
+                with self.subTest(stream_tools=stream_tools, step=step):
+                    evs = self.run_parser(stream_tools, step)
+                    calls = [e.call for e in evs if e.kind == "tool_call"]
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0].arguments, {"path": "doc.md", "content": self.CONTENT})
+                    self.assertFalse([e for e in evs if e.kind == "content" and e.text.strip()])
+                    if stream_tools:
+                        streamed = "".join(e.text for e in evs if e.kind == "tool_args")
+                        self.assertEqual(json.loads(streamed), {"path": "doc.md", "content": self.CONTENT})
 
 
 class ClientShapes(unittest.TestCase):
@@ -374,6 +489,132 @@ class EngineDeath(unittest.TestCase):
             httpd.server_close()
 
 
+class LiveRate(unittest.TestCase):
+    """The Monitor's Speed readout: live.tok_s is a rate, and a request that never got a DONE keeps no counters.
+
+    It used to be `generated / (now - first_token)` - the mean since the first token, whose first sample is
+    1/elapsed.  Against a paced engine that reads five-digit numbers for the first instant of every answer and
+    undershoots for the first second after that.  It is now the rate over the last RATE_WINDOW_S, with the mean
+    still available as `live.tok_s_mean` for anyone who wants it."""
+
+    PACE_S = 0.02                    # 50 tokens/s: a 30-token answer takes about 0.6 s
+    TOKENS = 30
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = MockEngine(self.tok, "x" * self.TOKENS, max_context=CTX, delay_s=self.PACE_S)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def metrics(self):
+        with urllib.request.urlopen(self.base + "/metrics", timeout=10) as r:
+            return json.loads(r.read())
+
+    def test_prefill_rate_excludes_cached_tokens(self):
+        import io
+        import queue
+        from types import SimpleNamespace
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)   # alive() asks it (#208)
+        engine.lines = queue.Queue()
+        engine.can_stop = False
+        engine.max_context = 262144
+        engine.prefill_tok_s_mean = 9999.0
+        engine.lines.put("PP 10000 12000 2000 1000.0")  # 8000 cached, 2000 newly read in two seconds
+        engine.lines.put("DONE 1 12000 4000 10 stop 0 0 8000")
+        gen = engine.generate([1], 1, {}, threading.Event())
+        self.assertIsNone(next(gen))
+        self.assertEqual(engine.progress, (10000, 12000))
+        self.assertEqual(engine.prefill_tok_s_mean, 1000.0)
+        self.svc.engine = engine
+        self.svc.status.update(busy=True, first_token=None)
+        self.assertEqual(self.metrics()["live"]["prefill_tok_s_mean"], 1000.0)
+        self.assertNotIn("prefill_tok_s", self.metrics()["live"])
+        self.assertEqual(self.svc._prefill_tok_s_mean(), 1000.0)
+        self.svc.status.update(first_token=time.time(), generated=1)
+        self.assertEqual(self.svc._prefill_tok_s_mean(), 0.0)
+        self.assertEqual(list(gen), [])
+        timings = request_timings(12000, 1, engine.last)
+        self.assertEqual(timings["prompt_per_second"], 1000.0)
+        engine.lines.put("PP 8000 12000")
+        engine.lines.put("DONE 0 12000 0 0 stop 0 0 12000")
+        gen = engine.generate([1], 1, {}, threading.Event())
+        next(gen)
+        self.assertIsNone(engine.prefill_tok_s_mean)
+        list(gen)
+        self.svc.status["busy"] = False
+        self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
+
+    def test_the_live_number_is_a_rate(self):
+        live_samples, stop = [], threading.Event()
+
+        def poll():                                   # what the Monitor polls, at 10 ms
+            while not stop.is_set():
+                live = self.metrics()["live"]
+                if live["state"] == "generating" and live["tok_s"] is not None:
+                    live_samples.append((live["generated"], live["tok_s"], live["tok_s_mean"]))
+                time.sleep(0.01)
+
+        body = json.dumps({"model": "m", "max_tokens": self.TOKENS, "temperature": 0,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        watcher = threading.Thread(target=poll, daemon=True)
+        watcher.start()
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(urllib.request.Request(self.base + "/v1/chat/completions", data=body,
+                                                               headers={"Content-Type": "application/json"}),
+                                        timeout=30) as r:
+                usage = json.loads(r.read())["usage"]
+        finally:
+            stop.set()
+            watcher.join(2)
+        true_rate = usage["completion_tokens"] / (time.time() - t0)
+        self.assertGreaterEqual(len(live_samples), 3, "too few live readings to judge the readout")
+        self.assertLess(max(s for _g, s, _m in live_samples), 4 * true_rate,
+                        f"live.tok_s peaked at {max(s for _g, s, _m in live_samples):.1f} tok/s "
+                        f"for a {true_rate:.1f} tok/s engine")
+        self.assertEqual(self.metrics()["live"]["state"], "idle")
+        self.assertIsNone(self.metrics()["live"]["tok_s"])
+
+    def test_a_request_without_a_done_keeps_no_engine_counters(self):
+        """An engine that dies mid-answer: the previous request's `last` must not become this row's decode rate."""
+        class HalfDead(MockEngine):
+            last = {"generated": 99, "prompt_tokens": 9, "prompt_ms": 10.0, "decode_ms": 100.0, "finish": "stop"}
+
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+                    if i == 3:
+                        raise EngineDied("the engine stopped unexpectedly (exit code -9)")
+                    yield t
+
+        tok = ByteTokenizer()
+        svc = Service(HalfDead(tok, "x" * self.TOKENS, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            body = json.dumps({"model": "m", "max_tokens": self.TOKENS, "stream": True,
+                               "messages": [{"role": "user", "content": "hi"}]}).encode()
+            with urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", data=body,
+                                                               headers={"Content-Type": "application/json"}),
+                                        timeout=30) as r:
+                text = r.read().decode()
+            self.assertIn('"error"', text)
+            row = svc.metrics()["requests"][0]
+            self.assertEqual(row["finish"], "error")
+            self.assertEqual(row["output_tokens"], 3)
+            self.assertIsNone(row["decode_tok_s"], "the previous request's counters were recorded as this one's")
+            self.assertIsNone(row["engine_generated"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 class SharedSettings(unittest.TestCase):
     """The web app's "Use for other apps too": POST /settings makes its Chat settings every client's defaults."""
 
@@ -495,7 +736,7 @@ class WebApp(unittest.TestCase):
         code, ctype, body = self.get("/")
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
-        self.assertIn(b"/web/app.js", body)
+        self.assertIn(b"\"web/app.js\"", body)   # relative since #82 (works behind a path-prefixed proxy)
         for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/tokens.css", "text/css"),
                            ("/web/components.css", "text/css"), ("/web/sprite.svg", "image/svg+xml")):
             with self.subTest(path=path):
@@ -522,6 +763,86 @@ class WebApp(unittest.TestCase):
         self.assertEqual(m["live"]["state"], "idle")
         self.assertEqual(m["requests"][0]["output_tokens"], 5)
 
+    def test_model_discovery_and_props(self):
+        svc = self.svc
+        previous = svc.engine.max_context, svc.vision, svc.sampling_defaults, svc.shared
+        try:
+            svc.engine.max_context = 262144
+            svc.sampling_defaults = {"temperature": 1.0, "repetition_penalty": 1.1}
+            svc.shared = {"temperature": 0.7, "max_tokens": 4096}
+            for vision in (None, object()):
+                svc.vision = vision
+                for path in ("/models", "/v1/models"):
+                    code, _, body = self.get(path)
+                    self.assertEqual(code, 200)
+                    models = json.loads(body)["data"]
+                    self.assertEqual(len(models), 1)
+                    model = models[0]
+                    self.assertEqual(model["id"], svc.model)
+                    self.assertEqual(model["status"]["value"], "loaded")
+                    self.assertEqual(model["meta"]["n_ctx"], 262144)
+                    self.assertEqual(model["architecture"]["input_modalities"],
+                                     ["text", "image"] if vision else ["text"])
+                code, _, body = self.get("/props?model=" + svc.model + "&autoload=false")
+                self.assertEqual(code, 200)
+                props = json.loads(body)
+                self.assertEqual(props["default_generation_settings"]["n_ctx"], 262144)
+                self.assertEqual(props["default_generation_settings"]["params"],
+                                 {"temperature": 0.7, "repeat_penalty": 1.1, "n_predict": 4096})
+                self.assertEqual(props["chat_template"], (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))
+                self.assertEqual(props["modalities"]["vision"], vision is not None)
+                self.assertEqual(props["total_slots"], 1)
+                self.assertFalse(props["models_autoload"])
+            svc.shared = {}
+            props = json.loads(self.get("/props")[2])
+            self.assertEqual(props["default_generation_settings"]["params"]["n_predict"], -1)
+            self.assertEqual(self.get("/props?model=not-loaded&autoload=true")[0], 404)
+        finally:
+            svc.engine.max_context, svc.vision, svc.sampling_defaults, svc.shared = previous
+
+    def test_discovery_needs_the_api_key(self):
+        self.svc.api_key = "secret"
+        try:
+            for path in ("/models", "/v1/models", "/props", "/slots"):
+                self.assertEqual(self.get(path)[0], 401)
+                self.assertEqual(self.get(path, {"Authorization": "Bearer secret"})[0], 200)
+        finally:
+            self.svc.api_key = ""
+
+    def test_build_model_path_and_slot_status(self):
+        engine = self.svc.engine
+        engine.model_path = "models/example.gguf"
+        engine.info = {"version": "0.1.21"}
+        try:
+            props = json.loads(self.get("/props")[2])
+            self.assertEqual(props["model_path"], engine.model_path)
+            self.assertEqual(props["build_info"], "Strata 0.1.21")
+            for busy in (True, False):
+                with self.svc.status_lock:
+                    self.svc.status["busy"] = busy
+                code, _, body = self.get("/slots")
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(body), [{"id": 0, "n_ctx": CTX, "is_processing": busy}])
+        finally:
+            with self.svc.status_lock:
+                self.svc.status["busy"] = False
+            del engine.model_path, engine.info
+        props = json.loads(self.get("/props")[2])
+        self.assertNotIn("build_info", props)
+        self.assertNotIn("model_path", props)
+
+    def test_discovery_does_not_restart_a_dead_engine(self):
+        self.svc.engine.alive = lambda: False
+        try:
+            for path in ("/models", "/v1/models"):
+                code, _, body = self.get(path)
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(body)["data"], [])
+            self.assertEqual(self.get("/props")[0], 503)
+            self.assertEqual(json.loads(self.get("/slots")[2]), [])
+        finally:
+            del self.svc.engine.alive
+
     def test_metrics_need_the_key_when_one_is_set(self):
         self.svc.api_key = "secret"
         try:
@@ -530,6 +851,121 @@ class WebApp(unittest.TestCase):
             self.assertEqual(self.get("/")[0], 200)                  # the page itself asks for the key
         finally:
             self.svc.api_key = ""
+
+
+class ClockedEngine(MockEngine):
+    """The mock engine with StrataEngine's clock: `last` as the engine's DONE line gives it, the conversation cache
+    holding the first REUSED tokens of every prompt."""
+    REUSED = 5
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        n = 0
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                n += 1
+                yield t
+        finally:          # as StrataEngine reads its DONE line: also when the server closes the request at a stop token
+            self.last = {"generated": n, "prompt_tokens": len(ids), "prompt_ms": 40.0, "decode_ms": 20.0 * n,
+                         "finish": "stop", "reused": min(self.REUSED, len(ids)), "hits": 9, "lookups": 10}
+
+
+class UsageAndStatus(unittest.TestCase):
+    """What clients read besides the text: the part of the prompt the conversation cache held (OpenAI's
+    prompt_tokens_details.cached_tokens, Anthropic's cache_read_input_tokens), llama.cpp's timings, GET /v1/status."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = ClockedEngine(tok, "</think>\n\nok", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def request(self, path, body=None):
+        req = urllib.request.Request(self.base + path, data=None if body is None else json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read()
+
+    def chat(self, path, stream=False):
+        body = {"model": "x", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}], "stream": stream}
+        status, raw = self.request(path, body)
+        self.assertEqual(status, 200)
+        if not stream:
+            return json.loads(raw)
+        return [json.loads(line[6:]) for line in raw.decode().splitlines()
+                if line.startswith("data: {")]
+
+    def test_openai(self):
+        b = self.chat("/v1/chat/completions")
+        u, t = b["usage"], b["timings"]
+        self.assertEqual(u["prompt_tokens_details"]["cached_tokens"], ClockedEngine.REUSED)
+        self.assertEqual(t["cache_n"], ClockedEngine.REUSED)
+        self.assertEqual(t["prompt_n"] + t["cache_n"], u["prompt_tokens"])
+        self.assertEqual(t["predicted_n"], u["completion_tokens"])
+        self.assertAlmostEqual(t["prompt_per_second"], t["prompt_n"] / 0.040, delta=0.1)
+        self.assertAlmostEqual(t["predicted_per_second"], 50.0, delta=0.1)            # 20 ms a token
+
+    def test_openai_stream(self):
+        last = self.chat("/v1/chat/completions", stream=True)[-1]
+        self.assertEqual(last["usage"]["prompt_tokens_details"]["cached_tokens"], ClockedEngine.REUSED)
+        self.assertEqual(last["timings"]["cache_n"], ClockedEngine.REUSED)
+
+    def test_anthropic(self):
+        u = self.chat("/v1/messages")["usage"]
+        self.assertEqual(u["cache_read_input_tokens"], ClockedEngine.REUSED)
+        self.assertEqual(u["input_tokens"] + u["cache_read_input_tokens"], len(self.engine.last_prompt))
+        self.assertGreater(u["output_tokens"], 0)
+
+    def test_v1_status(self):
+        self.chat("/v1/chat/completions")
+        status, raw = self.request("/v1/status")
+        self.assertEqual(status, 200)
+        s = json.loads(raw)
+        self.assertEqual(s["model"], self.svc.model)
+        self.assertEqual(s["context"]["max_positions"], CTX)
+        self.assertEqual(s["concurrency"]["serving"], 1)
+        self.assertFalse(s["vision"]["available"])
+        self.assertEqual(s["activity"]["in_flight"], 0)
+        self.assertGreaterEqual(s["activity"]["requests"], 1)
+        self.assertEqual(s["last_timings"]["cache_n"], ClockedEngine.REUSED)
+        self.assertIn("at", s["last_timings"])
+
+    def test_no_clock(self):
+        """An engine without a clock (MockEngine): no timings, nothing cached."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            data = json.dumps({"model": "x", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}).encode()
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions", data=data,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                b = json.loads(r.read())
+            self.assertNotIn("timings", b)
+            self.assertEqual(b["usage"]["prompt_tokens_details"]["cached_tokens"], 0)
+            self.assertIsNone(svc.v1_status()["last_timings"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class TimingsDrafts(unittest.TestCase):
+    """`timings` carries the speculative draft counts (PR #83's fields) only when the engine reported them."""
+
+    def test_draft_fields(self):
+        base = {"prompt_ms": 100.0, "decode_ms": 200.0, "generated": 20, "reused": 4}
+        t = request_timings(24, 20, dict(base, drafts_offered=15, drafts_accepted=11))
+        self.assertEqual((t["draft_n"], t["draft_n_accepted"]), (15, 11))
+        self.assertEqual((t["prompt_n"], t["cache_n"]), (20, 4))
+        self.assertNotIn("draft_n", request_timings(24, 20, base))
+        self.assertIsNone(request_timings(24, 20, {}))
 
 
 class ToolResultContent(unittest.TestCase):
@@ -951,6 +1387,16 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(text, "no")
         self.assertIn("Reasoning effort is set to low", tok.decode(eng.prompts[0]))
 
+    def test_a_main_turn_resent_without_streaming_thinks_freely(self):
+        """Live (2026-09-30): after a failed stream Claude Code sent its main turn again without streaming (102,165
+        tokens, 33 tools), and it was taken for a side request: its thinking was closed at 1,024 tokens. The side
+        requests (the classifier, titles) carry no tools; a request with tools is a main turn."""
+        tool = {"name": "Read", "description": "read a file", "input_schema": {"type": "object", "properties": {}}}
+        tok, eng, thinking, text = self.run_request([THINK[:3000] + "</think>\n\nok"], {"tools": [tool]})
+        self.assertEqual(thinking.strip(), THINK[:3000])
+        self.assertEqual(len(eng.prompts), 1)
+        self.assertNotIn("Reasoning effort is set to low", tok.decode(eng.prompts[0]))
+
     def test_side_budget_zero_leaves_side_requests_alone(self):
         from unittest import mock
         with mock.patch.dict(os.environ, {"STRATA_SIDE_BUDGET": "0"}):
@@ -1146,6 +1592,26 @@ class SamplingPresets(unittest.TestCase):
             self.defaults({"preset": "creative"})
 
 
+class LogEncoding(unittest.TestCase):
+    """2026-09-30, live (xeno): with STRATA_DEBUG=1 the raw-output line went to a redirected stdout in cp1252; a Thai
+    answer raised UnicodeEncodeError - a ValueError - inside the request, the SSE loop sent an `error` event instead of
+    message_stop, and Claude Code showed "Server error mid-response" on 3 of 3 Thai tool-call turns."""
+
+    def test_a_log_line_the_console_cannot_encode_never_fails_the_request(self):
+        import contextlib
+        from unittest import mock
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nคำตอบภาษาไทย", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ids, thinking, max_new = svc.prepare([{"role": "user", "content": "hi"}], None, {}, 64)
+        cp1252 = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")        # as a redirected stdout on Windows
+        with mock.patch.dict(os.environ, {"STRATA_DEBUG": "1"}), contextlib.redirect_stdout(cp1252):
+            out = list(svc.run(ids, thinking, None, max_new, {}, threading.Event()))
+        self.assertEqual(out[-1][0], "done")
+        cp1252.flush()
+        self.assertIn(b"[strata] raw:", cp1252.buffer.getvalue())
+
+
 class CjkGuard(unittest.TestCase):
     """#49 S4 (xeno; the EXL3 server's #77): Han tokens are banned for a request whose prompt has no Han character
     and does not name Chinese - 4.0bpw dropped Han characters into Thai sentences by sampling drift."""
@@ -1188,6 +1654,15 @@ class CjkGuard(unittest.TestCase):
         self.assertIn("ban=1", StrataEngine.sampling_keys({"_ban": True}).split())
         self.assertFalse([k for k in StrataEngine.sampling_keys({}).split() if k.startswith("ban=")])
 
+    def test_an_image_request_carries_the_ban(self):
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.proc, eng.lines, eng.QUIET_S = ExitedProc(None), queue.Queue(), 0.01
+        eng.lines.put("DONE 0 1 0 0 stop\n")
+        list(eng.generate([1, 2], 5, {"_ban": True}, threading.Event(), embeddings="req.sve"))
+        head = eng.proc.stdin.getvalue().split(" 1,2")[0]
+        self.assertTrue(head.startswith("GENI 5"), head)
+        self.assertIn("ban=1", head.split())
+
     def test_the_server_bans_per_request(self):
         class Recorder(MockEngine):
             def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -1216,6 +1691,386 @@ class CjkGuard(unittest.TestCase):
         self.assertEqual(eng.bans, [False, True, False, True])
         self.assertEqual([r["cjk_chars"] for r in svc.metrics()["requests"]], [2, 2, 2, 2])
 
+
+class CacheSlotProtocol(unittest.TestCase):
+    def test_slot_selection_and_validation(self):
+        self.assertIn("cache_slot=0", StrataEngine.sampling_keys({}))
+        for slot in range(4):
+            self.assertIn(f"cache_slot={slot}", StrataEngine.sampling_keys({"strata_cache_slot":slot}))
+        for slot in [-1,4,True,"1",1.5]:
+            with self.assertRaises(ValueError):
+                StrataEngine.sampling_keys({"strata_cache_slot":slot})
+
+
+class AutoCacheSlot(unittest.TestCase):
+    """#49 S7 (xeno, on upstream PR #175's slots): Claude Code cannot send strata_cache_slot, and its side requests
+    (the auto-mode classifier, titles) have their own prompt, so each one wiped the main session's cache - a 52.6K
+    re-read (55 s) in real use (#50). The server picks a slot per prompt family (the prompt's first tokens), keeps a
+    family on its slot, and reuses the least recently used slot when there are more families than slots."""
+
+    class SlotEngine(MockEngine):
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            self.slots = getattr(self, "slots", []) + [sampling.get("strata_cache_slot", 0)]
+            self.samplings = getattr(self, "samplings", []) + [dict(sampling)]
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+    def serve_with(self, slots):
+        tok = ByteTokenizer()
+        eng = self.SlotEngine(tok, "</think>\n\nok", max_context=16384)
+        if slots is not None:
+            eng.info = {"cache_slots": slots}
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+
+        def post(system, extra=None):
+            body = {"model": "m", "max_tokens": 8, "stream": True, "system": system,
+                    "messages": [{"role": "user", "content": "hi"}], **(extra or {})}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/messages",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
+        return eng, post
+
+    MAIN, SIDE = "You are the main agent. " * 40, "You are a classifier. " * 40
+
+    def test_families_keep_their_own_slot(self):
+        eng, post = self.serve_with(4)
+        for system in (self.MAIN, self.SIDE, self.MAIN, self.SIDE, self.MAIN):
+            post(system)
+        self.assertEqual(eng.slots[0], eng.slots[2])
+        self.assertEqual(eng.slots[0], eng.slots[4])
+        self.assertEqual(eng.slots[1], eng.slots[3])
+        self.assertNotEqual(eng.slots[0], eng.slots[1])
+
+    def test_the_least_recently_used_family_gives_up_its_slot(self):
+        eng, post = self.serve_with(2)
+        post("family A " * 80)
+        post("family B " * 80)
+        post("family A " * 80)          # A is now the more recent
+        post("family C " * 80)          # takes B's slot, not A's
+        self.assertEqual(eng.slots[3], eng.slots[1])
+        self.assertNotEqual(eng.slots[3], eng.slots[0])
+
+    def test_an_explicit_slot_wins(self):
+        eng, post = self.serve_with(4)
+        post(self.MAIN, {"strata_cache_slot": 3})
+        self.assertEqual(eng.slots, [3])
+
+    def test_a_family_reports_where_its_prompt_leaves_the_last_one(self):
+        """#49 S7 follow-up: the classifier's stage 2 reused only the 28,408-token root of its stage 1, though both
+        render the same transcript. Where the two prompts part is the evidence for where a checkpoint would help."""
+        from serve.server import CacheSlots
+        slots = CacheSlots(4)
+        head = list(range(600))
+        slots.pick(head + [1, 2, 3])
+        self.assertEqual(slots.shared(head + [1, 9, 9, 9]), 601)
+        self.assertIsNone(slots.shared([7] * 600))      # a family never seen: nothing to compare with
+
+    def test_the_engine_checkpoints_where_the_family_last_parted(self):
+        """Live (2026-09-30, engine-s7.log): a classifier prompt of 39,994 tokens shared 36,158 with the one before
+        it but reused only its 28,408-token root - its transcript grows inside one message, and the engine keeps
+        checkpoints at turn starts only. The server names the shared length (GEN key ckpt_at) so the engine keeps a
+        checkpoint there, which the family's next prompt shares too."""
+        from serve.server import StrataEngine
+        eng, post = self.serve_with(4)
+        post(self.SIDE)
+        self.assertNotIn("_ckpt_at", eng.samplings[0])                # nothing to compare with yet
+        post(self.SIDE + " and more")
+        shared = eng.samplings[1]["_ckpt_at"]
+        self.assertGreater(shared, len(self.SIDE))
+        self.assertIn(f" ckpt_at={shared}", StrataEngine.sampling_keys(eng.samplings[1]))
+        self.assertNotIn("ckpt_at", StrataEngine.sampling_keys(eng.samplings[0]))
+
+    def test_no_automatic_slot_without_engine_slots(self):
+        for slots in (None, 1):
+            eng, post = self.serve_with(slots)
+            post(self.MAIN)
+            post(self.SIDE)
+            self.assertEqual(eng.slots, [0, 0], slots)
+
+
+class ClassifierStageOne(unittest.TestCase):
+    """#49 S7 follow-up (xeno, decided by the developer 2026-09-30): Claude Code's auto-mode classifier asks its fast
+    stage for a reply that MUST begin with <block>, reads it with `<block>(yes|no)`, and gives it 64 tokens without
+    thinking. Qwen answered in prose ("Evaluating the final action: ..."), was cut at 64 tokens, and the stage was
+    sent again 4 times with the same greedy answer before the slow stage ran - every round, in real use.
+    A: the server writes the required opening for the model. B: an identical greedy request is answered again from
+    the last answer instead of being generated again."""
+
+    MUST = "Err on the side of blocking. Your ENTIRE response MUST begin with <block>. Do NOT output anything else."
+
+    class Counting(MockEngine):
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            self.calls = getattr(self, "calls", 0) + 1
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+    def serve_with(self, script):
+        tok = ByteTokenizer()
+        eng = self.Counting(tok, script, max_context=16384)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+
+        def post(last, system="You judge actions.", extra=None):
+            body = {"model": "m", "max_tokens": 64, "stream": False, "system": system,
+                    "thinking": {"type": "disabled"},        # as the classifier sends it (thinking=False in the log)
+                    "messages": [{"role": "user", "content": last}], **(extra or {})}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/messages",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        return tok, eng, post
+
+    @staticmethod
+    def text(body):
+        return "".join(b.get("text", "") for b in body["content"] if b["type"] == "text")
+
+    def test_A_the_required_opening_is_written_for_the_model(self):
+        tok, eng, post = self.serve_with("no</block>")
+        body = post("<transcript>ls</transcript>\n" + self.MUST)
+        self.assertEqual(self.text(body), "<block>no</block>")
+        self.assertEqual(eng.last_prompt[-len("<block>"):], tok.encode("<block>"))   # the model continues it
+
+    def test_A_no_opening_without_the_rule_in_the_last_message(self):
+        tok, eng, post = self.serve_with("fine")
+        self.assertEqual(self.text(post("<transcript>ls</transcript>")), "fine")
+        self.assertEqual(self.text(post("<transcript>ls</transcript>", system=self.MUST,      # stage 2: it thinks
+                                        extra={"max_tokens": 8192})), "fine")               # before its <block>
+
+    # the fast stage's own last lines in real use (logged with the developer's approval, 2026-09-30)
+    STAGE1 = ("</transcript>\n\nStage 1 does NOT apply user intent or ALLOW exceptions — stage 2 will handle "
+              "those.\nRespond with <severity>N</severity> ONLY. Grade HARM ONLY — do NOT reduce for user "
+              "intent. No other text.\n")
+
+    def test_A_the_real_fast_stage_gets_its_severity_opening(self):
+        """Live (2026-09-30): the real fast stage asks for "<severity>N</severity> ONLY" (not <block>); Qwen wrote
+        "The agent's most recent action is ..." instead."""
+        tok, eng, post = self.serve_with("12</severity>")
+        self.assertEqual(self.text(post("<transcript>\n{\"Bash\":\"ls\"}\n" + self.STAGE1)), "<severity>12</severity>")
+
+    def test_A_a_format_only_in_the_system_prompt_is_not_forced(self):
+        tok, eng, post = self.serve_with("fine")
+        self.assertEqual(self.text(post("<transcript>ls</transcript>", system=self.STAGE1)), "fine")
+
+    def test_B_an_identical_greedy_request_is_answered_again(self):
+        tok, eng, post = self.serve_with("Evaluating the final action")
+        first = post("<transcript>ls</transcript>\n" + self.MUST)
+        again = post("<transcript>ls</transcript>\n" + self.MUST)
+        self.assertEqual(eng.calls, 1)
+        self.assertEqual(again["content"], first["content"])
+        self.assertNotEqual(again["id"], first["id"])
+
+    def test_B_sampled_different_or_ordinary_requests_are_generated(self):
+        tok, eng, post = self.serve_with("x")
+        post("<transcript>ls</transcript>\n" + self.MUST, extra={"temperature": 0.7})
+        post("<transcript>ls</transcript>\n" + self.MUST, extra={"temperature": 0.7})
+        post("<transcript>ls -la</transcript>\n" + self.MUST)
+        post("<transcript>ls</transcript>\n" + self.MUST)
+        post("the same benchmark prompt")                # a repeated prompt is timed, never replayed
+        post("the same benchmark prompt")
+        self.assertEqual(eng.calls, 6)
+
+
+class LoadingAnswers529(unittest.TestCase):
+    """Live (2026-09-30): the server bound its port only after the model loaded (1-2 minutes), so every restart
+    refused Claude Code's connections; it took them for a network fault and backed off until "will retry in 29m".
+    EXL3 (C:\\AI a04b381) answers 529 overloaded_error while loading, which Claude Code retries soon. So does this."""
+
+    def test_a_request_while_loading_is_529_overloaded_and_the_real_server_takes_the_port_after(self):
+        from serve.server import loading_server
+        placeholder = loading_server("127.0.0.1", 0)
+        port = placeholder.server_address[1]
+        body = json.dumps({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/messages", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(req, timeout=10)
+        with caught.exception as e:
+            self.assertEqual(e.code, 529)
+            self.assertEqual(json.loads(e.read())["error"]["type"], "overloaded_error")
+        with self.assertRaises(urllib.error.HTTPError) as health:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10)
+        with health.exception as e:
+            self.assertEqual(e.code, 503)
+        placeholder.shutdown()
+        placeholder.server_close()
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=port)                   # the same port, at once
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            self.assertEqual(r.status, 200)
+
+class UnloadableEngine(MockEngine):
+    """A mock engine that can be stopped and started again like StrataEngine (alive / unload / restart)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.running, self.unloaded, self.starts = True, False, 0
+
+    def alive(self):
+        return self.running
+
+    def unload(self):
+        self.running, self.unloaded = False, True
+
+    def restart(self):
+        self.running, self.unloaded = True, False
+        self.starts += 1
+
+
+class SharingTheGpu(unittest.TestCase):
+    """Idle unload, POST /unload and /load, the free-VRAM guard and the before_load hook (all off by default)."""
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        self.engine = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def req(self, path, body=None):
+        r = urllib.request.Request(self.base + path, data=None if body is None else json.dumps(body).encode(),
+                                   headers={"Content-Type": "application/json"}, method="GET" if body is None else "POST")
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def chat(self):
+        return self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+
+    def test_unload_then_the_next_request_loads(self):
+        self.assertEqual(self.req("/unload", {}), (200, {"status": "unloaded"}))
+        self.assertFalse(self.engine.alive())
+        self.assertEqual(self.req("/health")[1]["loaded"], False)
+        self.assertEqual(self.req("/v1/models")[1]["data"][0]["status"]["value"], "unloaded")
+        self.assertEqual(self.req("/unload", {}), (200, {"status": "not loaded"}))
+        s, b = self.chat()
+        self.assertEqual(s, 200)
+        self.assertEqual(b["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(self.engine.starts, 1)
+        self.assertEqual(self.req("/health")[1]["loaded"], True)
+
+    def test_load_endpoint(self):
+        self.svc.unload()
+        self.assertEqual(self.req("/load", {}), (200, {"status": "loaded"}))
+        self.assertTrue(self.engine.alive())
+        self.assertEqual(self.req("/load", {}), (200, {"status": "loaded"}))
+        self.assertEqual(self.engine.starts, 1)
+
+    def test_unload_refused_while_a_request_runs(self):
+        with self.svc.fifo:
+            self.assertEqual(self.svc.unload(), "busy")
+        self.assertTrue(self.engine.alive())
+
+    def test_idle_unload(self):
+        self.svc.idle_unload_s = 1
+        self.svc.last_request_at = time.time()
+        self.assertEqual(self.svc.unload(idle_for=1), "busy")       # a request just now: not idle yet
+        self.svc.start_idle_unload()
+        deadline = time.time() + 10
+        while self.engine.alive() and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(self.engine.alive())
+        self.assertEqual(self.chat()[0], 200)
+
+    def test_min_free_vram_refuses_to_load(self):
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000
+        self.svc.unload()
+        t0 = time.time()
+        s, b = self.chat()
+        self.assertEqual(s, 503)
+        self.assertIn("in use by another program", b["error"]["message"])
+        self.assertFalse(self.engine.alive())
+        self.assertGreater(time.time() - t0, 10)                    # waited for memory being given back first
+        self.svc.free_vram_mib = lambda: 9000
+        self.assertEqual(self.chat()[0], 200)
+
+    def test_min_free_vram_unreadable_loads(self):
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: None                       # no NVML: never refuse
+        self.svc.unload()
+        self.assertEqual(self.chat()[0], 200)
+
+    def test_before_load_runs_first(self):
+        mark = Path(tempfile.mkdtemp()) / "ran"
+        self.svc.before_load = [sys.executable, "-c", f"open({str(mark)!r}, 'w').close()"]
+        self.svc.unload()
+        self.assertFalse(mark.exists())
+        self.assertEqual(self.chat()[0], 200)
+        self.assertTrue(mark.exists())
+
+    def test_vision_encoder_unloads_and_starts_first(self):
+        order = []
+
+        class FakeVision:
+            running = True
+
+            def alive(self):
+                return self.running
+
+            def unload(self):
+                self.running = False
+
+            def restart(self):
+                order.append("vision")
+                self.running = True
+
+        engine_restart = self.engine.restart
+        self.engine.restart = lambda: (order.append("engine"), engine_restart())
+        self.svc.vision = FakeVision()
+        self.assertEqual(self.svc.unload(), "unloaded")
+        self.assertFalse(self.svc.vision.alive())
+        self.assertEqual(self.chat()[0], 200)
+        self.assertEqual(order, ["vision", "engine"])             # the encoder first, as at a start
+        self.assertTrue(self.svc.vision.alive())
+
+    def test_off_by_default(self):
+        self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
+        self.assertEqual(self.req("/health")[1]["loaded"], True)
+
+class HealthTellsACrashFromAnUnload(unittest.TestCase):
+    """#56 review (xeno): after the 0.1.30 merge /health answered 200 for a crashed engine - its test for an unload
+    (`not loaded()`) is also true after a crash.  A crash is 503 `engine_exited`; an unload on purpose (#208) is 200."""
+
+    def health(self, crashed: bool):
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        eng.proc = ExitedProc()                         # the process has ended either way
+        if crashed:
+            eng.running = False
+        else:
+            eng.unload()
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_address[1]}/health", timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_a_crashed_engine_is_503(self):
+        status, body = self.health(crashed=True)
+        self.assertEqual((status, body["status"]), (503, "engine_exited"))
+
+    def test_an_unloaded_engine_is_ok(self):
+        status, body = self.health(crashed=False)
+        self.assertEqual((status, body["status"], body["loaded"]), (200, "ok", False))
 
 if __name__ == "__main__":
     unittest.main()

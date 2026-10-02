@@ -34,7 +34,9 @@ def side_budget():
 
 
 def is_side(req: dict) -> bool:
-    return not req.get("stream") and side_budget() > 0
+    """A side request (the auto-mode classifier, titles): not streamed and without tools.  Claude Code resends a
+    main turn without streaming after a failed stream - with its tools, so that one is not a side request."""
+    return not req.get("stream") and not req.get("tools") and side_budget() > 0
 
 
 def side_effort(req: dict, kwargs: dict) -> None:

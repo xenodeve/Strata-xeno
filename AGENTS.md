@@ -188,6 +188,28 @@ as the change, not at the end of the work:
 
 The full procedure is the file's own "Keeping this file current" section.
 
+## Write a merge report for every upstream merge
+
+A merge of upstream moves the whole engine at once, and the next session has to be able to tell which lines are the
+fork's, which are upstream's and why each conflict went the way it did (the developer, 2026-10-01). So **once a merge
+is finished and verified**, write `docs/reports/<date>-merge-upstream-<version>.md`, in English, as the merge's
+blueprint and checkpoint:
+
+- **What moved:** the base (fork branch + commit) and the upstream tag merged, the commit count, the files changed on
+  both sides, the merge commit and the engine exe sha256.
+- **Upstream's changes that matter here,** and the ones deliberately not taken or left off, with the reason.
+- **Every conflict, file by file:** which side was kept, what was ported from the other side, and why. A fork feature
+  that was dropped, replaced or re-homed gets its own line (with the upstream code that replaced it).
+- **Semantic hazards checked beyond the conflict markers:** silent type conversions, duplicated or lost features, code
+  moved by upstream, serve-loop exits, format strings. Say how each was checked.
+- **Bugs the merge introduced and how they were found and fixed,** with the evidence (the log line, the repro).
+- **Verification:** each gate with its numbers and data files (build, tests, parity, greedy output hashes against the
+  pre-merge line, same-session A/B), and what was not run.
+- **What is left:** refused combinations, opt-in features not measured, follow-up issues.
+
+Link the report from the merge's tracking issue and from `docs/BLUEPRINT.md`'s revision log, and commit it on the merge
+branch. A merge without this report is not finished.
+
 ## Other standing rules
 
 - **The correctness gate is greedy raw-token parity against a same-session

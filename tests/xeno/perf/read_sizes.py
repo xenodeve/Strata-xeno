@@ -3,7 +3,7 @@
 Usage:
     python tests/xeno/perf/read_sizes.py D:\\Github\\Strata\\strata-xeno.log [more logs...]
 
-The engine prints one line per prompt part (root / history / new turn / reread), always:
+The engine prints one line per prompt part (root / shared / history / new turn / reread), always:
     strata serve: prompt part new turn: 1199 tokens [12800, 13999) of 14000 (batched) in 1500.0 ms
 Split + wave only runs chunks of 2,048 tokens or more, so the share of prefill time spent in such parts bounds what
 the dual-GPU prompt path can save in daily use.
@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import sys
 
-LINE = re.compile(r"strata serve: prompt part (root|history|new turn|reread): (\d+) tokens \[(\d+), (\d+)\) of (\d+) "
+LINE = re.compile(r"strata serve: prompt part (root|shared|history|new turn|reread): (\d+) tokens \[(\d+), (\d+)\) of (\d+) "
                   r"\((batched|windows)\) in ([\d.]+) ms")
 BINS = [("< 2K", 0, 2048), ("2-4K", 2048, 4096), ("4-8K", 4096, 8192), ("> 8K", 8192, 1 << 62)]
 SPLIT_MIN = 2048   # STREAM_ALL_MIN: the smallest chunk that runs split

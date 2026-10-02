@@ -70,12 +70,6 @@ __global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restr
         xn16[row * N + d] = bf(v);
     }
 }
-__global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restrict__ lo16, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float x = lo[i] / (float) HC;
-    lo16[i] = bf(x / (1.0f + __expf(-x)));
-}
 // F-1: the row scale only (and the BF16 image); gr_mix_r_kernel recomputes r * rs * w itself, in the same order,
 // so the FP32 copy of the normalized rows (T x 10240 floats) is neither written nor read
 __global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
@@ -138,6 +132,12 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
 #pragma unroll
     for (int d = threadIdx.x; d < N; d += 256, ++k) xn16[row * N + d] = bf(v[k] * rs * w[c * N + d]);
 }
+__global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restrict__ lo16, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float x = lo[i] / (float) HC;
+    lo16[i] = bf(x / (1.0f + __expf(-x)));
+}
 __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
                               uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -193,6 +193,38 @@ __global__ void gdn_conv_kernel(float* __restrict__ hist, const float* __restric
         v0 = v1; v1 = v2; v2 = x;
     }
     hist[c * 3] = v0; hist[c * 3 + 1] = v1; hist[c * 3 + 2] = v2;
+}
+// C-3: the same 4-tap causal conv, tiled over tokens: thread (c, tile) reads its tile's 3 predecessors from the
+// chunk (or the history before it) instead of carrying them - the conv reads inputs, not its own outputs, so the
+// tiles are independent. The same expression per element (so the same bits); the history is written afterwards.
+constexpr int CONV_TILE = 64;
+__global__ void gdn_conv_tiled_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
+                                      const float* __restrict__ w, float* __restrict__ h, int64_t T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int64_t t0 = (int64_t) blockIdx.y * CONV_TILE;
+    if (t0 >= T) return;
+    const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
+    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
+    float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    for (int64_t t = t0; t < t1; ++t) {
+        const float x = qkv[t * C + c];
+        const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+        h[t * C + c] = s / (1.0f + __expf(-s));
+        v0 = v1; v1 = v2; v2 = x;
+    }
+}
+// the history after the chunk: its last three inputs (the older history where the chunk is shorter than 3)
+__global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float v[3];
+    for (int k = 0; k < 3; ++k) {
+        const int64_t t = T - 3 + k;
+        v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
+    }
+    hist[c * 3] = v[0]; hist[c * 3 + 1] = v[1]; hist[c * 3 + 2] = v[2];
 }
 __global__ void gdn_l2_kernel(float* __restrict__ h, float eps) {
     // block (t, head) over the 32 q/k heads, 128 threads
@@ -261,6 +293,126 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
     }
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+}
+
+// D-2: the recurrence with the value columns split over 4 blocks per head (4x the blocks of the kernel above, a
+// quarter of its threads per __syncthreads), and the output norm - the only step that couples the head's columns -
+// in its own kernel. Per column the same arithmetic in the same order (the 4 row-group partial sums added as
+// red[0] + red[1] + red[2] + red[3]; the norm's warp sums over the same 32-column warps): the same bits.
+constexpr int CB = 32, NCB = S / CB;
+__global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                                const float* __restrict__ gate,
+                                                                const float* __restrict__ beta,
+                                                                float* __restrict__ oc_out, int64_t T) {
+    __shared__ float sk[S], sq[S], red[RG][CB];
+    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
+    const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
+    const int qh = head % HK;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+    for (int64_t t = 0; t < T; ++t) {
+        const float* ht = h + t * C;
+        __syncthreads();
+        if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
+        __syncthreads();
+        const float g = __expf(gate[t * HV + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red[rg][c] = kv;
+        __syncthreads();
+        const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
+        const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * beta[t * HV + head];
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[rg * RPG + r], o);
+        }
+        __syncthreads();
+        red[rg][c] = o;
+        __syncthreads();
+        if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+}
+// gdn_rec_cols_kernel with the next token's inputs (q/k rows, v, gate, beta) loaded into registers while this token
+// computes (software pipelining).  The same arithmetic in the same order: the same bits, and the same CB-column split.
+// STRATA_GDN_PIPELINE=0: gdn_rec_cols_kernel.
+__global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                                      const float* __restrict__ gate,
+                                                                      const float* __restrict__ beta,
+                                                                      float* __restrict__ oc_out, int64_t T) {
+    constexpr int NT = CB * RG, LPT = S / NT;   // threads, q/k rows loaded per thread
+    __shared__ float sk[S], sq[S], red[RG][CB];
+    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
+    const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
+    const int qh = head % HK;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+    float nq[LPT], nk[LPT], nv = 0.0f, ng = 0.0f, nb = 0.0f;
+    auto fetch = [&](int64_t t) {
+        const float* ht = h + t * C;
+#pragma unroll
+        for (int u = 0; u < LPT; ++u) { nq[u] = ht[qh * S + tid + u * NT]; nk[u] = ht[HK * S + qh * S + tid + u * NT]; }
+        nv = ht[2 * HK * S + head * S + col];
+        ng = gate[t * HV + head];
+        nb = beta[t * HV + head];
+    };
+    if (T > 0) fetch(0);
+    for (int64_t t = 0; t < T; ++t) {
+        float cq[LPT], ck[LPT];
+#pragma unroll
+        for (int u = 0; u < LPT; ++u) { cq[u] = nq[u]; ck[u] = nk[u]; }
+        const float cv = nv, cg = ng, cbt = nb;
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < LPT; ++u) { sq[tid + u * NT] = cq[u]; sk[tid + u * NT] = ck[u]; }
+        __syncthreads();
+        if (t + 1 < T) fetch(t + 1);
+        const float g = __expf(cg);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red[rg][c] = kv;
+        __syncthreads();
+        const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
+        const float delta = (cv - g * kv_col) * cbt;
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[rg * RPG + r], o);
+        }
+        __syncthreads();
+        red[rg][c] = o;
+        __syncthreads();
+        if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+}
+__global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
+                                                         float eps, float* __restrict__ y, uint16_t* __restrict__ y16) {
+    __shared__ float wsum[4];
+    const int64_t t = blockIdx.x;
+    const int head = blockIdx.y, col = threadIdx.x;
+    const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
+    const float oc = y[at];
+    float sp = warp_sum(oc * oc);
+    if ((col & 31) == 0) wsum[col >> 5] = sp;
+    __syncthreads();
+    const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+    const float v = oc * rsqrtf(ss / (float) S + eps) * gamma[col] * sigm(z[t * HV * S + head * S + col]);
+    y[at] = v;
+    y16[at] = hf(v);
 }
 
 // ---------------------------------------------------------------- MoE
@@ -381,13 +533,17 @@ __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__
     for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) r[c] = s * r[c] * w[c];
 }
 __global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
-                            float theta_scale, const int32_t* __restrict__ mtab) {
+                            float theta_scale, float freq_scale, float corr_low, float corr_high,
+                            float ext_factor, float mscale, const int32_t* __restrict__ mtab) {
     const int64_t row = blockIdx.x;             // t * heads + h
     const int pair = threadIdx.x;               // 0..31
     const int64_t t = row / heads, h = row % heads;
     float* p = x + t * ld + h * dim;
-    const float theta = (float) strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair) * powf(theta_scale, (float) pair);
-    const float c = cosf(theta), s = sinf(theta);
+    const float theta_extrap =
+        (float) strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair) * powf(theta_scale, (float) pair);
+    float c, s;
+    strata::kernels::rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale,
+                                       pair, c, s);
     const float a = p[pair], b = p[pair + 32];
     p[pair] = a * c - b * s;
     p[pair + 32] = a * s + b * c;
@@ -495,10 +651,6 @@ void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t
     gr_norm_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, xn, xn16);
     check("gr_norm");
 }
-void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream) {
-    gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, T * LR);
-    check("gr_silu");
-}
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream) {
     gr_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, rs, xn16);
     check("gr_norm_rs");
@@ -514,6 +666,10 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
     gr_write_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
                                                                                       rs, xn16);
     check("gr_write_norm_rs");
+}
+void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream) {
+    gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, T * LR);
+    check("gr_silu");
 }
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h) {
@@ -533,13 +689,30 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
     check("gdn_gates");
 }
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream) {
-    gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+    static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
+    if (serial || T <= CONV_TILE) {
+        gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+    } else {
+        gdn_conv_tiled_kernel<<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
+                                (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+        gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T);
+    }
     gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
     check("gdn_conv");
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
-    gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
+    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
+    if (serial || T <= 0) {
+        gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
+    } else {
+        static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
+        if (pipe)   // the software-pipelined loads (same bits)
+            gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        else
+            gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16);
+    }
     check("gdn_recurrence");
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
@@ -616,9 +789,19 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
     rms_rows_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, w, cols, ld, eps);
     check("rms_rows");
 }
-void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, float freq_base, void* stream) {
-    const float theta_scale = powf(freq_base, -2.0f / 64.0f);
-    rope_kernel<<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(x, heads, dim, ld, pos0, theta_scale, strata::kernels::mrope_table());
+void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
+          const strata::kernels::RopeScaling& scaling, void* stream) {
+    // The engine validates the resolved config at startup with the same rule (generate.cpp), so this only
+    // fires for a caller that bypassed it; the prompt path has no error return here, so it stops the process.
+    if (const char* why = strata::kernels::rope_scaling_invalid(scaling)) {
+        std::fprintf(stderr, "prefill rope: invalid rope scaling: %s\n", why);
+        std::exit(1);
+    }
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / 64.0f);
+    const strata::kernels::RopeKernelArgs k = scaling.kernel_args(64);   // none: the identity constants
+    rope_kernel<<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(
+        x, heads, dim, ld, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
+        strata::kernels::mrope_table());
     check("rope");
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {

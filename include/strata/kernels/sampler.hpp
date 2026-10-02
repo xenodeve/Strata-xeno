@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace strata::kernels {
 
@@ -25,6 +27,11 @@ struct SamplerParams {
     uint64_t seed = 0;           // drives Philox, which is counter-based on (seed, token index)
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
+    // xeno #49 S4: banned ids, a DEVICE bitmap (bit v of word v/32 set = id v is never picked, greedy or sampled),
+    // built by `ban_words` for `ban_vocab` ids.  nullptr (the default) launches the kernels without the ban code at
+    // all, so output with no ban is the same machine code as before.
+    const uint32_t* ban = nullptr;
+    int ban_vocab = 0;
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
@@ -42,6 +49,24 @@ struct SamplerParams {
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
+// ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp, STRATA_SPEC_COUPLED=1).  Device pointers
+// throughout; every per-request / per-round value comes from device memory, so the calls can be captured.
+//
+// The scratch `coupled_draft_sample` needs for `nv` logits (0: too wide for the split merge, coupled cannot run).
+size_t coupled_draft_scratch_bytes(int nv);
+// A round's inputs: `*params` <- `*mapped_params`, ring[cap - h, cap) <- mapped_hist[cap - h, cap) with h =
+// coupled_hist_len(penalty_last_n, cap).  `mapped_*` are mapped host memory.
+void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapped_hist, SamplerParams* params,
+                         int32_t* ring, int cap, void* stream);
+// Draft j of the chain from ONE row of `nv` logits (modified in place: the penalties): the target's chain with
+// `*params`, the penalty window ring[cap + j - h, cap + j), Philox counter coupled_draft_counter(step_rec[0]).
+// `sub_to_id` / `id_to_sub` map the draft head's subset to token ids and back (null: the whole vocabulary,
+// `id_vocab` ids).  Writes the token id to *out_id, its probability under the final distribution to *out_prob, and
+// the id to ring[cap + j].
+void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
+                          const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
+                          void* scratch, int32_t* out_id, float* out_prob, void* stream);
+
 // The penalty-history rows of a verify window, on the host: row t of `out` (T rows of `h` slots) is the last `h`
 // tokens of `tail[0..n_tail)` followed by `window[0..t]`, most recent LAST, -1 in the unused front slots.
 // `tail` is what the state consumed before the window, `window[0]` the fed-back token and `window[1..]` the
@@ -58,6 +83,21 @@ inline void penalty_rows(const int32_t* tail, int64_t n_tail, const int32_t* win
             row[h - take + j] = i < n_tail ? tail[i] : window[i - n_tail];
         }
     }
+}
+
+// xeno #49 S4: the ban bitmap of `ids` for an `n_vocab` vocabulary: (n_vocab + 31) / 32 words, bit v set for each
+// listed id (duplicates allowed).  false and a reason in `err` for an id outside [0, n_vocab).
+inline bool ban_words(const std::vector<int64_t>& ids, int64_t n_vocab, std::vector<uint32_t>& words,
+                      std::string& err) {
+    words.assign((size_t) ((n_vocab + 31) / 32), 0u);
+    for (const int64_t v : ids) {
+        if (v < 0 || v >= n_vocab) {
+            err = "token id " + std::to_string(v) + " is outside the vocabulary (0.." + std::to_string(n_vocab - 1) + ")";
+            return false;
+        }
+        words[(size_t) (v >> 5)] |= 1u << (v & 31);
+    }
+    return true;
 }
 
 }  // namespace strata::kernels
