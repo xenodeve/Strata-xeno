@@ -129,6 +129,13 @@ public:
         for (int i = 0; i < n; ++i) if (!materialize(layer, experts[i], layer, err)) return false;
         return true;
     }
+    /// #95: materialize_batch in two halves, so the caller can run its resident experts while the reads are in flight.
+    /// A source with a real split (ArenaExpertSource): between them the batch's experts are not resident and the host
+    /// tier is held; end publishes them.  This default does the whole batch in begin, and end has nothing to do.
+    virtual bool materialize_begin(int64_t layer, const int32_t* experts, int n, std::string& err) {
+        return materialize_batch(layer, experts, n, err);
+    }
+    virtual bool materialize_end(std::string& err) { (void) err; return true; }
     /// #11: the expert's bytes into `dst` straight from the pack, admitting nothing (the prompt path).
     virtual bool read_into(int64_t layer, int64_t expert, uint8_t* dst, std::string& err) {
         (void) layer; (void) expert; (void) dst; err = "this expert source cannot read the pack"; return false;
@@ -502,6 +509,8 @@ public:
     /// The same, each expert to its own destination.
     bool read_experts_to(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts, std::string& err);
     bool materialize_batch(int64_t layer, const int32_t* experts, int n, std::string& err) override;
+    bool materialize_begin(int64_t layer, const int32_t* experts, int n, std::string& err) override;
+    bool materialize_end(std::string& err) override;
     /// #11 N1 capacity mode: before load_rest, keep at most `bytes` of host-owned experts, the first ones of
     /// `order` (layer * n_expert + expert, best first); the rest stay on NVMe. 0 = no limit.
     void set_capacity(uint64_t bytes, const std::vector<int32_t>& order);
@@ -522,6 +531,7 @@ public:
     void decay_scores(float f = 0.97f);
     uint64_t host_cache_bytes() const { return cache_used_; }
     int64_t nvme_loads() const { return nvme_loads_; }
+    /// The time the caller waited on NVMe-tier loads (#95: a pool run overlapped between begin and end not counted).
     double nvme_ms() const { return nvme_ms_; }
     /// #62: a directory holding byte-identical copies of the expert source files (a GGUF shard, experts.bin) on
     /// another drive; repeatable.  read_experts_to sends each expert, all its ranges, to the copy with the fewest
@@ -611,6 +621,20 @@ private:
         uint64_t lat_next = 0, lat_n = 0;
     };
     std::vector<DFile> dfiles_;
+    /// #95: a submitted read batch (submit_reads), collected later (collect_reads); read_experts_to is both at once
+    struct PendingReads {
+        struct Req { int file; uint64_t skip, len; uint8_t* to; };
+        std::vector<Req> reqs;
+        size_t slot_bytes = 0;
+        double t0 = 0;
+    };
+    PendingReads pend_;
+    bool submit_reads(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts, std::string& err);
+    bool collect_reads(std::string& err);
+    std::unique_lock<std::mutex> mat_lock_;   ///< #95: host_mu_, held from materialize_begin to materialize_end
+    std::vector<int32_t> mat_es_;
+    int64_t mat_layer_ = -1;
+    double mat_ms_ = 0;                        ///< the begin half's time (eviction, commit, submit)
     std::vector<std::string> mirror_dirs_;                 ///< #62: add_mirror's directories
     /// #62: per source file, its verified copies (resolved on first use)
     std::vector<std::pair<std::string, std::vector<std::string>>> copies_;

@@ -1164,6 +1164,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     else
         for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
     const auto c2 = std::chrono::steady_clock::now();
+    // #95: with the overlap on (default; STRATA_NVME_OVERLAP=0 is the A/B arm), the layer's misses are submitted here and
+    // collected only after the pool has run the resident experts; the missed experts' jobs run in a second pool run.
+    static const bool nvme_overlap = [] {
+        const char* v = std::getenv("STRATA_NVME_OVERLAP");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    auto fail_nvme = [&](const std::string& ne) {
+        d.failed = true;
+        d.nvme_fail = "an NVMe-tier expert could not be read: " + ne;   // #62: e.g. a wrong mirror
+        d.fail = d.nvme_fail.c_str();
+        d.fail_layer = d.layers;
+    };
+    bool nvme_pending = false;
     {   // #11 NVMe tier: this layer's host misses are read together (overlapped), one wait for the layer
         int32_t miss[128];
         int nm = 0;
@@ -1176,16 +1189,55 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         if (nm > 0) {
             std::string ne;
-            if (!d.src->materialize_batch(d.layers, miss, nm, ne)) {
-                d.failed = true;
-                d.nvme_fail = "an NVMe-tier expert could not be read: " + ne;   // #62: e.g. a wrong mirror
-                d.fail = d.nvme_fail.c_str();
-                d.fail_layer = d.layers;
+            if (!d.src->materialize_begin(d.layers, miss, nm, ne) || !(nvme_overlap || d.src->materialize_end(ne))) {
+                fail_nvme(ne);
                 return;
             }
+            nvme_pending = nvme_overlap;
         }
     }
+    // #95: a failure below returns with the batch in flight; ending it on the way out releases host_mu_ (else the next
+    // hold()/materialize() waits forever and the failure becomes a hang).  A no-op once the batch has ended.
+    struct EndBatch {
+        ExpertSource* src;
+        ~EndBatch() { std::string e; src->materialize_end(e); }
+    } end_batch{d.src};
     int njobs = 0;
+    // routed entry i onto its expert's job, made at the expert's first entry; false: the dispatch failed
+    auto add_entry = [&](int64_t i) -> bool {
+        const int64_t t = i / k, e = ids[i];
+        int16_t& jo = d.job_of[(size_t) e];
+        if (jo < 0) {
+            const uint8_t* b = d.src->blob(d.layers, e);
+            if (b == nullptr) { std::string ne; b = d.src->materialize(d.layers, e, d.layers, ne); }   // #11 NVMe tier
+            if (b == nullptr) {
+                d.failed = true;
+                d.fail = "the expert source could not produce a blob";
+                d.fail_layer = d.layers;
+                d.fail_expert = e;
+                ++d.missing;
+                return false;
+            }
+            jo = (int16_t) njobs++;
+            ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
+            nj.blob = b;
+            nj.nt = 0;
+        }
+        ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+        jb.act[jb.nt] = &d.act_multi[(size_t) t];
+        jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+        jb.out[jb.nt] = out + (size_t) i * H;
+        ++jb.nt;
+        ++d.multi_entries;
+        ++d.tier_entries[3];
+        return true;
+    };
+    auto run_jobs = [&](int first, int count) {
+        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data() + first, count);
+        else d.pool->run_split_multi(d.jobs_multi.data() + first, count);
+    };
+    static thread_local std::vector<int32_t> deferred;   // #95: routed entries whose expert is still being read
+    deferred.clear();
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
@@ -1205,37 +1257,37 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 continue;
             }
             ++d.cache_refused;
-            int16_t& jo = d.job_of[(size_t) e];
-            if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
-        if (b == nullptr) { std::string ne; b = d.src->materialize(d.layers, e, d.layers, ne); }   // #11 NVMe tier
-                if (b == nullptr) {
-                    d.failed = true;
-                    d.fail = "the expert source could not produce a blob";
-                    d.fail_layer = d.layers;
-                    d.fail_expert = e;
-                    ++d.missing;
-                    return;
-                }
-                jo = (int16_t) njobs++;
-                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                nj.blob = b;
-                nj.nt = 0;
+            // #95: still in flight (or past the batch's 128): after materialize_end, in the second pass - a
+            // materialize here would wait on the host tier this thread holds.  resident(), not blob(): blob() counts a
+            // use, and add_entry's lookup is the one use
+            if (nvme_pending && d.job_of[(size_t) e] < 0 && !d.src->resident(d.layers, e)) {
+                deferred.push_back((int32_t) i);
+                continue;
             }
-            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-            jb.act[jb.nt] = &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-            jb.out[jb.nt] = row;
-            ++jb.nt;
-            ++d.multi_entries;
-            ++d.tier_entries[3];
+            if (!add_entry(i)) return;
         }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     const auto pool_start = std::chrono::steady_clock::now();
-    if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-    else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    run_jobs(0, njobs);
     const auto pool_end = std::chrono::steady_clock::now();
+    if (nvme_pending) {   // #95: the reads have had the resident run to land; publish them, then run their jobs
+        std::string ne;
+        if (!d.src->materialize_end(ne)) { fail_nvme(ne); return; }
+        const auto p1 = std::chrono::steady_clock::now();
+        const int first = njobs;
+        for (const int32_t i : deferred)
+            if (!add_entry(i)) return;
+        const auto p2 = std::chrono::steady_clock::now();
+        if (njobs > first) run_jobs(first, njobs - first);
+        const auto p3 = std::chrono::steady_clock::now();
+        d.ms_cpu_pool += std::chrono::duration<double, std::milli>(p3 - p2).count();
+        if (timeline::enabled()) {   // own names: decode_paths.py pairs one "cpu pool" per layer
+            timeline::complete("nvme collect", pool_end, p1, d.layers, (int64_t) deferred.size());
+            timeline::complete("cpu pool misses", p2, p3, d.layers, njobs - first);
+        }
+    }
+    const auto cpu_end = std::chrono::steady_clock::now();
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
@@ -1275,7 +1327,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         timeline::complete("dispatch jobs", c2, c3, d.layers, njobs);
         timeline::complete("cpu pool", pool_start, pool_end, d.layers, njobs);
         if (secondary_claims)
-            timeline::complete("4070 finish", pool_end, c4, d.layers, (int64_t) d.secondary_runner->served_entries());
+            timeline::complete("4070 finish", cpu_end, c4, d.layers, (int64_t) d.secondary_runner->served_entries());
     }
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
@@ -1819,6 +1871,11 @@ bool ArenaExpertSource::copies_of(const std::string& source, const std::vector<s
 
 bool ArenaExpertSource::read_experts_to(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts,
                                         std::string& err) {
+    return submit_reads(layers, experts, n, dsts, err) && collect_reads(err);
+}
+
+bool ArenaExpertSource::submit_reads(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts,
+                                     std::string& err) {
     using strata::platform::DirectFile;
     const auto& lay = strata::kernels::cpu::expert_layout();
     constexpr uint64_t A = DirectFile::alignment();
@@ -1841,15 +1898,17 @@ bool ArenaExpertSource::read_experts_to(const int32_t* layers, const int32_t* ex
         dfiles_.push_back(std::move(d));
         return (int) dfiles_.size() - 1;
     };
-    struct Req { int file; uint64_t skip, len; uint8_t* to; };
-    std::vector<Req> reqs;
+    auto& reqs = pend_.reqs;
+    reqs.clear();
     reqs.reserve((size_t) n * 3);
+    pend_.slot_bytes = slot_bytes;
     std::vector<uint64_t> queued;   // #62: bytes queued per dfiles_ index in this batch
     auto queued_of = [&](int i) -> uint64_t& {
         if ((size_t) i >= queued.size()) queued.resize((size_t) i + 1, 0);
         return queued[(size_t) i];
     };
     const double t0 = strata::timeline::now_us();
+    pend_.t0 = t0;
     for (int i = 0; i < n; ++i) {
         uint64_t off[3], len[3], at[3];
         const int nr = expert_ranges(lay, from_gguf_, layers[i], experts[i], off, len, at);
@@ -1877,6 +1936,15 @@ bool ArenaExpertSource::read_experts_to(const int32_t* layers, const int32_t* ex
             queued_of(fi) += a1 - a0;
         }
     }
+    return true;
+}
+
+bool ArenaExpertSource::collect_reads(std::string& err) {
+    using strata::platform::DirectFile;
+    using Req = PendingReads::Req;
+    const auto& reqs = pend_.reqs;
+    const size_t slot_bytes = pend_.slot_bytes;
+    const double t0 = pend_.t0;
     // Collect every completion.  Each file's port reports its own requests; the ports are polled in turn, so each
     // copy's reads are timed when they land rather than after the copy drained before it (#62: a second drive
     // must be able to show that it was faster).  With nothing ready, one port is waited on for 1 ms.
@@ -2119,7 +2187,14 @@ const uint8_t* ArenaExpertSource::materialize(int64_t layer, int64_t expert, int
 }
 
 bool ArenaExpertSource::materialize_batch(int64_t layer, const int32_t* experts, int n, std::string& err) {
-    std::lock_guard<std::mutex> lk(host_mu_);
+    return materialize_begin(layer, experts, n, err) && materialize_end(err);
+}
+
+bool ArenaExpertSource::materialize_begin(int64_t layer, const int32_t* experts, int n, std::string& err) {
+    // one batch at a time, from one thread (the verify window's dispatch): mat_lock_ is that thread's, so reading it
+    // here without host_mu_ is safe; another thread that wants the host tier waits on host_mu_ instead
+    if (mat_lock_.owns_lock()) { err = "materialize_begin: a batch is already in flight"; return false; }
+    std::unique_lock<std::mutex> lk(host_mu_);
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (nvme_.empty() || n <= 0) return true;
     const auto t0 = std::chrono::steady_clock::now();
@@ -2138,18 +2213,38 @@ bool ArenaExpertSource::materialize_batch(int64_t layer, const int32_t* experts,
         dsts.push_back(const_cast<uint8_t*>(base_) + lay.blob_offset(layer, experts[i]));
     }
     if (es.empty()) return true;
-    if (!read_experts_to(ls.data(), es.data(), (int) es.size(), dsts.data(), err)) {
+    if (!submit_reads(ls.data(), es.data(), (int) es.size(), dsts.data(), err)) {
         cache_used_ -= b * es.size();   // nothing published: they stay on NVMe, and the caller fails loudly
         return false;
     }
-    for (int32_t x : es) {
-        const size_t idx = (size_t) (layer * n_expert_ + x);
-        nvme_[idx] = 0;
-        score_[idx] += 1.0f;
-    }
-    nvme_loads_ += (int64_t) es.size();
-    nvme_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    // #95: the reads are in flight; host_mu_ stays held (the bounce buffer, the ports and the tier are this batch's)
+    // until materialize_end publishes them.  The batch's experts are still on NVMe, so blob() refuses them.
+    mat_es_ = std::move(es);
+    mat_layer_ = layer;
+    mat_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    mat_lock_ = std::move(lk);
     return true;
+}
+
+bool ArenaExpertSource::materialize_end(std::string& err) {
+    if (!mat_lock_.owns_lock()) return true;
+    const auto t1 = std::chrono::steady_clock::now();
+    const bool ok = collect_reads(err);
+    if (!ok) {
+        cache_used_ -= strata::kernels::cpu::expert_layout().blob_bytes(mat_layer_) * mat_es_.size();   // nothing published: they stay on NVMe, and the caller fails loudly
+    } else {
+        for (int32_t x : mat_es_) {
+            const size_t idx = (size_t) (mat_layer_ * n_expert_ + x);
+            nvme_[idx] = 0;
+            score_[idx] += 1.0f;
+        }
+        nvme_loads_ += (int64_t) mat_es_.size();
+    }
+    // the exposed time only: the begin half plus the wait here (an overlapped pool run between them is not counted)
+    nvme_ms_ += mat_ms_ + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    mat_es_.clear();
+    mat_lock_.unlock();
+    return ok;
 }
 
 void ArenaExpertSource::trim(int64_t avoid_layer) {

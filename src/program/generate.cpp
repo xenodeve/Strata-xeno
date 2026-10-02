@@ -7733,7 +7733,7 @@ int main(int argc, char** argv) {
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
         if (rounds > 0 && o.ram_cache_gib > 0.0)
-            std::printf("%-24s %lld loads, %.3f per round, %.3f ms/round reading; host tier %.2f GiB\n", "nvme tier",
+            std::printf("%-24s %lld loads, %.3f per round, %.3f ms/round waiting; host tier %.2f GiB\n", "nvme tier",
                         (long long) arena_src.nvme_loads(), (double) arena_src.nvme_loads() / rounds,
                         arena_src.nvme_ms() / rounds, (double) arena_src.host_cache_bytes() / 1073741824.0);
         if (rounds > 0 && !o.expert_mirrors.empty())   // #62: each copy's share
