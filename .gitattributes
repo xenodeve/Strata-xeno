@@ -6,3 +6,6 @@ bench/prompts/** -text
 *.bat text eol=crlf
 *.pdf binary
 tools/hooks/* text eol=lf
+
+# copies of real packs' native_experts.txt, parsed byte for byte by tests/core/expert_layout_test.cpp
+tests/data/native_experts/** -text

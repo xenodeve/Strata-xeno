@@ -73,6 +73,34 @@ const char* compiled_gpu_archs() {
 #endif
 }
 
+int device_count() {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess) {   // HIP without a usable device reports an error, not 0
+        cudaGetLastError();
+        return 0;
+    }
+    return count < 0 ? 0 : count;
+}
+
+bool device_summary(int ordinal, std::string& name, std::string& detail) {
+    cudaDeviceProp p{};
+    if (ordinal < 0 || ordinal >= device_count() || cudaGetDeviceProperties(&p, ordinal) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    char buf[160];
+#if defined(STRATA_USE_HIP)
+    std::snprintf(buf, sizeof(buf), "arch %s, %.1f GiB, wave%d", base_arch(p.gcnArchName).c_str(),
+                  (double) p.totalGlobalMem / (1024.0 * 1024 * 1024), p.warpSize);
+#else
+    std::snprintf(buf, sizeof(buf), "compute capability %d.%d, %.1f GiB", p.major, p.minor,
+                  (double) p.totalGlobalMem / (1024.0 * 1024 * 1024));
+#endif
+    name = p.name;
+    detail = buf;
+    return true;
+}
+
 std::string gpu_arch_problem(int ordinal) {
 #if defined(STRATA_USE_HIP)
     int count = 0;
@@ -89,6 +117,19 @@ std::string gpu_arch_problem(int ordinal) {
 #else
     (void) ordinal;
     return "";
+#endif
+}
+
+std::string device_code_error() {
+#if defined(STRATA_USE_HIP)
+    return "";   // gpu_arch_problem() checks the HIP architectures against STRATA_HIP_ARCHS, before this point
+#else
+    // every .cu of the engine is compiled for the same CMAKE_CUDA_ARCHITECTURES, so this kernel stands for all
+    cudaFuncAttributes a{};
+    const cudaError_t e = cudaFuncGetAttributes(&a, poison_kernel);
+    if (e == cudaSuccess) return {};
+    cudaGetLastError();
+    return cudaGetErrorString(e);
 #endif
 }
 
@@ -131,15 +172,23 @@ DeviceInfo device_info(int ordinal, bool allow_display_sm89) {
     // supported arch is enforced by CMake; RUNNING on an older card is caught here, because a binary can be carried
     // to a machine with an older card and would otherwise silently take whatever path the driver chose.  The HIP
     // backend checks the card against the architectures the binary was compiled for (and wave32).
+    (void) allow_display_sm89;   // (xeno) upstream's floor (sm_75 since 0.1.27) admits the sm_89 display card already
 #if defined(STRATA_USE_HIP)
     d.arch = base_arch(p.gcnArchName);
     if (const std::string why = arch_problem(p, ordinal); !why.empty()) throw CudaError(why, -1);
 #else
-    (void) allow_display_sm89;   // (xeno) upstream's floor (sm_75 since 0.1.27) admits the sm_89 display card already
-    if (d.cc_major * 10 + d.cc_minor < 75) {
+    // #236: the experimental build (-DSTRATA_EXPERIMENTAL_SM60=ON: Pascal sm_60, Volta sm_70) runs on the cards it
+    // was built for - refusing them below 7.5 there made the flag useless; the release engine keeps 7.5
+#if defined(STRATA_EXPERIMENTAL_SM60)
+    constexpr int kMinCc = 60;
+    const char* const kNeed = "6.0 or newer (this is the experimental Pascal / Volta build)";
+#else
+    constexpr int kMinCc = 75;
+    const char* const kNeed = "7.5 or newer (RTX 20 / 30 / 40 / 50 series)";
+#endif
+    if (d.cc_major * 10 + d.cc_minor < kMinCc) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
-                            "." + std::to_string(d.cc_minor) +
-                            "; Strata needs compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series)",
+                            "." + std::to_string(d.cc_minor) + "; Strata needs compute capability " + kNeed,
                         -1);
     }
 #endif

@@ -9,6 +9,9 @@ from serve.server import ByteTokenizer, MockEngine, Service, anthropic_collect, 
 
 class FakeService:
     model = 'qwen3.8-flash-next'
+
+    def model_for(self, req):   # upstream #297 aliases (merge 0.1.34, #100)
+        return self.model
     def __init__(self, events): self.events = events
     def run(self, ids, thinking, tools, max_new, sampling, cancel):
         yield from self.events
