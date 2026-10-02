@@ -150,6 +150,7 @@ function Brand() {
 
 function Shell() {
   const route = useRoute()
+  const wide = route.page === "chat"                       // the chat has a sidebar and a right panel beside the conversation: it gets the width of the window, not the narrow column of the other pages
   const { theme, cycle } = useTheme()
   useLang()                                                       // the whole page below is drawn again when the language changes
   const [scrolled, setScrolled] = useState(false)
@@ -174,7 +175,7 @@ function Shell() {
           scrolled ? "border-line bg-[color-mix(in_srgb,var(--bg)_82%,transparent)]" : "border-transparent bg-bg",
         )}
       >
-        <div className="mx-auto flex max-w-5xl items-center gap-2 px-3 py-3 sm:gap-4 sm:px-6">
+        <div className={cn("mx-auto flex items-center gap-2 px-3 py-3 sm:gap-4 sm:px-6", wide ? "max-w-[1680px]" : "max-w-5xl")}>
           <Brand />
           <Nav page={route.page} />
           <button
@@ -192,7 +193,7 @@ function Shell() {
       </header>
       <ToastHost />
       <ReelFilter />
-      <main key={route.page} className="page-in mx-auto w-full max-w-5xl flex-1 px-4 pb-16 pt-6 sm:px-6">
+      <main key={route.page} className={cn("page-in mx-auto w-full flex-1 px-4 pb-16 pt-6 sm:px-6", wide ? "max-w-[1680px]" : "max-w-5xl")}>
         <PageView route={route} />
       </main>
     </div>

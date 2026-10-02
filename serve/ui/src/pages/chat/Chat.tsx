@@ -315,7 +315,7 @@ export function Chat({ id }: { id?: string }) {
         <div className={cn("absolute inset-y-0 left-0 w-[min(86vw,320px)] overflow-y-auto bg-surface p-3 shadow-xl transition-transform duration-300 ease-[var(--ease)]", drawerShown ? "translate-x-0" : "-translate-x-full")}><Sidebar drawer onClose={() => setDrawer(false)} /></div>
       </div>
     )}
-    <section className="flex min-h-[calc(100dvh-9rem)] min-w-0 flex-1 flex-col" onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragging(false)}>
+    <section className="mx-auto flex min-h-[calc(100dvh-9rem)] w-full min-w-0 max-w-[56rem] flex-1 flex-col" onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragging(false)}>
       <div className="mb-2 flex items-center justify-between">
         <button type="button" onClick={() => setDrawer(true)} className="flex h-8 items-center gap-1.5 rounded-sm px-2 text-[13px] text-ink-2 transition-colors hover:bg-hover hover:text-ink md:hidden">
           <HugeiconsIcon icon={Menu01Icon} size={16} strokeWidth={1.6} aria-hidden />{t("Recents")}
