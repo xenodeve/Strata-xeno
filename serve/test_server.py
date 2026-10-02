@@ -2090,8 +2090,14 @@ class DisplayFloorRecovery(unittest.TestCase):
                           "--adapt-secondary", "0", "--ram-cache-gib", "12"])
         self.assertEqual(without_secondary(["--pack", "p"]), ["--pack", "p"])   # no tier: nothing to drop
 
-    def engine(self, log_text, fail_full=False):
-        """A StrataEngine whose start is recorded instead of spawned; `fail_full`: a start with the tier fails."""
+    # the start-up refusals besides the runner's own check: the arena's open and its fill
+    ARENA_REFUSAL = ("strata generate: secondary arena: display GPU has no space above the free floor and allocation "
+                     "cushion\n")
+    FILL_REFUSAL = "strata generate: secondary fill: secondary fill crossed the display free floor\n"
+
+    def engine(self, log_text, fail_full=False, refusal=None):
+        """A StrataEngine whose start is recorded instead of spawned; `fail_full`: a start with the tier fails, its log
+        ending with `refusal` (the runner's floor check by default)."""
         d = tempfile.mkdtemp()
         log = os.path.join(d, "engine.log")
         Path(log).write_text(log_text, encoding="utf-8")
@@ -2103,7 +2109,7 @@ class DisplayFloorRecovery(unittest.TestCase):
                 starts.append(list(args))
                 if failing[0] and "--secondary-expert-mib" in args and args[args.index("--secondary-expert-mib") + 1] != "0":
                     with open(log, "a", encoding="utf-8") as f:
-                        f.write(DisplayFloorRecovery.BREACH)
+                        f.write(refusal or DisplayFloorRecovery.BREACH)
                     raise RuntimeError("the engine exited before it was ready")
 
         eng = Recorded("strata.exe", self.ARGS, None, log, None)
@@ -2132,6 +2138,20 @@ class DisplayFloorRecovery(unittest.TestCase):
         self.assertEqual(len(starts), 2)
         self.assertEqual(starts[1][starts[1].index("--secondary-expert-mib") + 1], "0")
         self.assertTrue(eng.degraded)
+
+    def test_an_arena_or_fill_floor_refusal_also_falls_back_to_no_tier(self):
+        # incident (2026-10-02 /simplify review): only the runner's message was recognised, so a restore the arena's
+        # floor check refused raised instead, and the engine stayed dead
+        for refusal in (self.ARENA_REFUSAL, self.FILL_REFUSAL):
+            eng, starts = self.engine("strata: access violation\n", fail_full=True, refusal=refusal)
+            eng.restart()
+            self.assertEqual(starts[1][starts[1].index("--secondary-expert-mib") + 1], "0", refusal)
+            self.assertTrue(eng.degraded, refusal)
+
+    def test_the_staging_line_is_not_a_floor_refusal(self):
+        eng, _ = self.engine("strata generate: staged 900 next-ranked secondary experts (6.25 GiB); 4070 SUPER lower "
+                             "free 3.10 GiB (free floor 0.62 GiB); SECONDARY COMPUTE\nstrata: access violation\n")
+        self.assertFalse(eng.floor_breach())
 
     def test_full_restores_the_tier(self):
         eng, starts = self.engine("strata serve: ready\n" + self.BREACH)
@@ -2174,6 +2194,22 @@ class DisplayFloorRecovery(unittest.TestCase):
         svc.display_free_mib = lambda: 5000
         svc.watch_once(upgrade_idle_s=300)
         self.assertEqual(fulls, [])              # idle, but the display still lacks the room
+        svc.display_free_mib = lambda: 9000
+        svc.watch_once(upgrade_idle_s=300)
+        self.assertEqual(fulls, [True])
+
+    def test_the_watch_restores_the_tier_before_any_request(self):
+        # incident (2026-10-02 /simplify review): the watch restarts a dead engine degraded before any request, and
+        # `time.time() - None` then raised every 5 s; idle counts from the server's start instead
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        fulls = []
+        eng.degraded = True
+        eng.restart = lambda full=None: fulls.append(full)
+        eng.secondary_need_mib = lambda: 7040
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertIsNone(svc.last_request_at)
+        svc.started_at = time.time() - 400
         svc.display_free_mib = lambda: 9000
         svc.watch_once(upgrade_idle_s=300)
         self.assertEqual(fulls, [True])

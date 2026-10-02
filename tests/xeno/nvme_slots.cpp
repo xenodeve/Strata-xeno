@@ -67,6 +67,7 @@ int main() {
     if (!make(slots)) { std::fprintf(stderr, "open slots: %s\n", err.c_str()); return 1; }
     expect(fixed->host_slots() == 0, "STRATA_NVME_SLOTS=0: fixed addresses");
     expect(slots->host_slots() == 4, "capacity mode: one committed slot per resident expert after boot");
+    const double boot_commit_ms = slots->nvme_stages().commit_ms;   // the boot's slots are committed pages too
 
     // the same miss sequence on both: residency, bytes and loads agree; every resident expert reads its own bytes
     const int seq[][2] = {{0, 2}, {1, 3}, {2, 0}, {0, 3}, {2, 1}, {1, 2}, {0, 0}, {2, 2}, {1, 0}, {0, 1}, {2, 0}, {1, 1}};
@@ -88,7 +89,7 @@ int main() {
     expect(fixed->nvme_loads() == slots->nvme_loads(), "the same loads");
     expect(slots->host_idle_bytes() <= (2ull << 20), "idle slots stay within the slack");
     expect(slots->host_slots() >= 4, "the slots of the resident experts stay committed");
-    expect(slots->nvme_stages().commit_ms == 0.0, "a slot load commits nothing");
+    expect(slots->nvme_stages().commit_ms == boot_commit_ms, "a slot load reuses an idle slot: nothing committed");
 
     // copy-home: the GPU-owned (2,3) comes back into a slot, then goes out again and frees it
     uint8_t* home = slots->recommit_host_copy(2, 3, err);
@@ -101,6 +102,14 @@ int main() {
         expect(slots->host_cache_bytes() <= 4 * blob, "admit_home trims to the cap");
         expect(slots->release_host_copy(2, 3, err), "release gives the slot back");
         expect(slots->blob(2, 3) == nullptr, "a released expert is GPU-owned again");
+        // a second trip: coming home takes the bytes off the released count, going out adds them again (2026-10-02
+        // /simplify review: the slab path added on release and never took off on recommit)
+        const uint64_t out = slots->released_host_bytes();
+        expect(slots->recommit_host_copy(2, 3, err) != nullptr && slots->released_host_bytes() + blob == out,
+               "a copy coming home takes its bytes off the released count");
+        slots->publish_host_copy(2, 3);
+        expect(slots->release_host_copy(2, 3, err) && slots->released_host_bytes() == out,
+               "going out again adds them back");
     }
 
     // acquire: resident -> held at once; a miss is loaded and held; held experts survive every eviction

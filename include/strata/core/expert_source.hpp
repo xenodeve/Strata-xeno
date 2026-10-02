@@ -529,9 +529,16 @@ public:
     int64_t nvme_loads() const { return nvme_loads_; }
     /// The time the caller waited on NVMe-tier loads (#95: a pool run overlapped between begin and end not counted).
     double nvme_ms() const { return nvme_ms_; }
-    /// Where the NVMe-tier loads' time went, summed over every load (the miss-cost breakdown): evicting (decommit),
-    /// committing the slots, issuing the reads, waiting for completions, copying the bounce buffer into the slots.
-    struct NvmeStages { double evict_ms = 0, commit_ms = 0, submit_ms = 0, wait_ms = 0, copy_ms = 0; };
+    /// Where the NVMe-tier loads' time went, summed over every load (the miss-cost breakdown): evicting, committing
+    /// new pages (a cold slab slot, or the arena's pages), issuing the reads, waiting for completions, copying the
+    /// bounce buffer into the slots.
+    struct NvmeStages {
+        double evict_ms = 0, commit_ms = 0, submit_ms = 0, wait_ms = 0, copy_ms = 0;
+        NvmeStages operator-(const NvmeStages& o) const {
+            return {evict_ms - o.evict_ms, commit_ms - o.commit_ms, submit_ms - o.submit_ms, wait_ms - o.wait_ms,
+                    copy_ms - o.copy_ms};
+        }
+    };
     NvmeStages nvme_stages() const { return stages_; }
     /// #62: a directory holding byte-identical copies of the expert source files (a GGUF shard, experts.bin) on
     /// another drive; repeatable.  read_experts_to sends each expert, all its ranges, to the copy with the fewest
@@ -571,6 +578,7 @@ public:
     /// (0 = the fixed arena addresses: STRATA_NVME_SLOTS=0, a pinned arena or no capacity); host_idle_bytes() = the
     /// committed bytes no expert uses.
     int64_t host_slots() const { return slab_committed_; }
+    bool slab_on() const { return slab_; }   ///< #81: only then does an expert pack read straight into its slot
     uint64_t host_idle_bytes() const { return idle_bytes_; }
     /// A GPU-owned expert that comes home (paired swap copy-home) joins the host tier: account it and trim.
     void admit_home(int64_t layer, int64_t expert);
@@ -680,6 +688,10 @@ private:
     std::vector<uint8_t> ldirty_;
     bool evict_scan_ = false;
     void touch(size_t idx) { if (!ldirty_.empty()) ldirty_[idx / (size_t) n_expert_] = 1; }
+    /// A score raised or a hold taken: only the layer's cached minimum itself can change its layer's answer.
+    void touch_up(size_t idx) {
+        if (!ldirty_.empty() && larg_[idx / (size_t) n_expert_] == (int32_t) idx) ldirty_[idx / (size_t) n_expert_] = 1;
+    }
     // capacity mode's slab (set_capacity): each host-resident expert sits in a slot of its blob size's region
     struct SlabClass {
         uint8_t* base = nullptr;           ///< reserved for every expert of these layers; committed per slot
@@ -696,8 +708,16 @@ private:
     int64_t slab_committed_ = 0;
     void slab_release();
     uint8_t* host_at(size_t idx) const;    ///< the expert's host bytes: its slot, or its fixed arena offset
-    bool take_slot(size_t idx, int64_t avoid_layer, std::string& err);   ///< evicts until a slot is free
+    SlabClass& slab_class(size_t idx) { return classes_[(size_t) class_of_layer_[idx / (size_t) n_expert_]]; }
+    const SlabClass& slab_class(size_t idx) const { return classes_[(size_t) class_of_layer_[idx / (size_t) n_expert_]]; }
+    bool take_slot(size_t idx, std::string& err);   ///< an idle slot of its size, else a newly committed one
     void free_slot(size_t idx);
+    /// Back the expert's host bytes (a slab slot, or the arena's pages); `held` = the bytes it newly holds.
+    bool host_commit(size_t idx, uint64_t& held, std::string& err);
+    /// Give them back (the slot goes idle, or the pages are decommitted); `given` = the bytes it no longer holds.
+    bool host_release(size_t idx, uint64_t& given, std::string& err);
+    /// A batch that publishes nothing: its experts stay on NVMe; their bytes, slots or pages go back.
+    void unwind_batch(int64_t layer, const std::vector<int32_t>& es);
     const uint8_t* materialize_locked(int64_t layer, int64_t expert, int64_t avoid_layer, std::string& err);
 };
 

@@ -3751,6 +3751,11 @@ int main(int argc, char** argv) {
         for (const auto& [l, e] : profile) push(l * (int32_t) g.n_expert + e);
         for (int32_t i = 0; i < (int32_t) (g.n_layers * g.n_expert); ++i) push(i);
         arena_src.set_capacity((uint64_t) (o.ram_cache_gib * 1073741824.0), order);
+        if (!o.expert_pack.empty())   // #81: say which path the pack takes, so an A/B cannot time the wrong one
+            std::fprintf(stderr, "strata generate: expert pack %s: %s\n", o.expert_pack.c_str(),
+                         arena_src.slab_on() ? "one read per expert, straight into its slab slot"
+                                             : "one read per expert, through the bounce buffer (no slab: "
+                                               "STRATA_NVME_SLOTS=0, a pinned arena or not Windows)");
     }
     if (place_first) {
         const uint64_t commit_before = private_commit_bytes();
@@ -7782,9 +7787,7 @@ int main(int argc, char** argv) {
                         (double) arena_src.nvme_loads() / (double) produced.size(),
                         arena_src.nvme_ms() / (double) produced.size(), produced.size(), (long long) rounds);
         if (rounds > 0 && o.ram_cache_gib > 0.0) {   // the miss-cost breakdown of the decode loads
-            auto s = arena_src.nvme_stages();
-            s.evict_ms -= stages0.evict_ms; s.commit_ms -= stages0.commit_ms; s.submit_ms -= stages0.submit_ms;
-            s.wait_ms -= stages0.wait_ms; s.copy_ms -= stages0.copy_ms;
+            const auto s = arena_src.nvme_stages() - stages0;
             std::printf("%-24s evict %.3f  commit %.3f  submit %.3f  wait %.3f  copy %.3f ms/round; slab %lld slots, "
                         "%.0f MiB idle\n", "nvme stages",
                         s.evict_ms / rounds, s.commit_ms / rounds, s.submit_ms / rounds, s.wait_ms / rounds,

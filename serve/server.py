@@ -225,7 +225,9 @@ def without_secondary(args: list[str]) -> list[str]:
     return out
 
 
-FLOOR_BREACH = "display VRAM below configured free floor"   # secondary_runner.cpp's monitor, before _Exit(3)
+# the engine's last words when the 4070 free floor ends it or refuses its start: the runner's monitor and start check
+# (secondary_runner.cpp), the arena's open and fill (secondary_arena.cpp)
+FLOOR_BREACH = ("display VRAM below configured free floor", "above the free floor", "display free floor")
 
 
 class StrataEngine:
@@ -291,16 +293,19 @@ class StrataEngine:
         if self.proc is proc:                           # xeno #49 review: a pump left over from before restart()
             self.ended = True                           # its output closed: it is gone, even before the OS says so
 
-    def death_note(self) -> str:
-        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
-        tail = ""
+    def _log_tail(self) -> str:
+        """The last 4 KiB of the engine's log ("" without one)."""
         try:
             with open(self.log_path, "rb") as f:
                 f.seek(0, 2)
                 f.seek(max(0, f.tell() - 4096))
-                tail = f.read().decode("utf-8", "replace")
+                return f.read().decode("utf-8", "replace")
         except (OSError, TypeError):
-            pass
+            return ""
+
+    def death_note(self) -> str:
+        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
+        tail = self._log_tail()
         for line in reversed(tail.splitlines()):
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
@@ -343,15 +348,9 @@ class StrataEngine:
         self.unloaded = True
 
     def floor_breach(self) -> bool:
-        """#59: the engine's last words (the end of its log) are the 4070 free-floor monitor's terminate."""
-        try:
-            with open(self.log_path, "rb") as f:
-                f.seek(0, 2)
-                f.seek(max(0, f.tell() - 4096))
-                tail = f.read().decode("utf-8", "replace")
-        except (OSError, TypeError):
-            return False
-        return any(FLOOR_BREACH in x for x in [x for x in tail.splitlines() if x.strip()][-5:])
+        """#59: the engine's last words (the end of its log) are a 4070 free-floor terminate or start refusal."""
+        last = [x for x in self._log_tail().splitlines() if x.strip()][-5:]
+        return any(m in x for x in last for m in FLOOR_BREACH)
 
     def secondary_need_mib(self) -> int | None:
         """The 4070 VRAM the configured tier takes plus its floor (what the display must have free to restore it)."""
@@ -891,11 +890,12 @@ class Service:
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
-    def free_vram_mib(self) -> int | None:
-        """Free VRAM on the engine's (first) GPU, from NVML; None when it can't be read (then nothing is refused)."""
+    def free_vram_mib(self, index: int | None = None) -> int | None:
+        """Free VRAM on the engine's (first) GPU, or NVML device `index`; None when it can't be read (then nothing is
+        refused)."""
         try:
             from serve.telemetry import _Nvml
-            nv = _Nvml(int(getattr(self, "gpu_index", 0) or 0))
+            nv = _Nvml(int(getattr(self, "gpu_index", 0) or 0) if index is None else index)
             if not nv.ok():
                 return None
             m = nv.Mem()
@@ -988,17 +988,7 @@ class Service:
         vis = [v for v in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if v.strip()]
         if len(vis) < 2 or not vis[1].strip().isdigit():
             return None
-        try:
-            from serve.telemetry import _Nvml
-            nv = _Nvml(int(vis[1]))
-            if not nv.ok():
-                return None
-            m = nv.Mem()
-            if nv.lib.nvmlDeviceGetMemoryInfo(nv.dev, ctypes.byref(m)) != 0:
-                return None
-            return int(m.free >> 20)
-        except Exception:
-            return None
+        return self.free_vram_mib(int(vis[1]))
 
     def watch_once(self, upgrade_idle_s: float = 300):
         """#59: between requests, start an engine that died by itself again (no request has to pay for it), and give a
@@ -1014,10 +1004,11 @@ class Service:
                     self.ensure_loaded()
                 except (EngineDied, GpuBusy) as e:
                     print(f"[strata] the engine could not be started again yet: {e}", flush=True)
-            elif getattr(eng, "degraded", False) and time.time() - self.last_request_at >= upgrade_idle_s:
+            elif (getattr(eng, "degraded", False) and
+                  time.time() - (self.last_request_at or self.started_at) >= upgrade_idle_s):
                 need = eng.secondary_need_mib() if hasattr(eng, "secondary_need_mib") else None
-                free = self.display_free_mib()
-                if need is not None and free is not None and free >= need:
+                free = self.display_free_mib() if need is not None else None
+                if free is not None and free >= need:
                     print(f"[strata] the display has room again ({free} MiB free): restoring the 4070 tier ...",
                           flush=True)
                     self.restarting = True
