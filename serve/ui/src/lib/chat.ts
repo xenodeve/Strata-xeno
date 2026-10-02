@@ -9,10 +9,11 @@ import { t, tn } from "./i18n"
 import { skillOfMessage } from "./slash"
 import { compactPrompt, continuationText, estimateTokens, MIN_SUMMARY, shouldCompact, summaryOf, summaryRoom } from "./compact"
 import { addRule, agentRequest, NO_AGENT, rulesOf, type AgentInfo } from "./agent"
+import { addPerm, forgetPerms, permsFor, type Effect, type Scope } from "./perms"
 import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, saveBackground, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
 
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
-export interface Ask { id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny" }
+export interface Ask { id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny"; kept?: { scope: "project" | "everywhere"; effect: Effect } }
 export interface Todo { content: string; status: "pending" | "in_progress" | "completed"; activeForm: string }
 export interface ToolCall {
   id: string; name: string; at: number; rat: number
@@ -319,7 +320,7 @@ export class ChatController {
     return this.index.projects.length > before ? id : null
   }
   renameProject(id: string, name: string) { this.index = renameProject(this.index, id, name); this.saveIndex() }
-  removeProject(id: string) { this.index = removeProject(this.index, id); if (this.pendingProject === id) this.pendingProject = null; this.saveIndex() }
+  removeProject(id: string) { this.index = removeProject(this.index, id); if (this.pendingProject === id) this.pendingProject = null; forgetPerms(store, id); this.saveIndex() }
   setSettings(s: Settings) { this.settings = s; store.set("sampling", s); this.notify() }
   setProjectFolders(id: string, folders: string[]) { this.index = setProjectFolders(this.index, id, folders); this.saveIndex() }
   /** The folders the coding tools work in for the open conversation: its project's (the first is the main one), else the default one (Settings); none when there is none. */
@@ -425,14 +426,17 @@ export class ChatController {
 
   /** The user's answer to a card of the coding tools. The call goes on (or is refused) at the server; the card stays until the server says
    *  it took the answer, so a lost one can be given again. "Allow for this chat" also keeps the rule for the next requests of this chat. */
-  async answer(callId: string, decision: "allow" | "allow_chat" | "deny"): Promise<boolean> {
+  async answer(callId: string, decision: "allow" | "allow_chat" | "deny", keep?: { scope: Scope; effect: Effect }): Promise<boolean> {
     const call = this.messages.flatMap((m) => m.tools ?? []).find((c) => c.id === callId && c.ask && !c.ask.answer)
     if (!call?.ask) return false
-    const r = await postPermission(call.ask.id, decision)
+    const sent = keep ? (keep.effect === "allow" ? "allow_chat" : "deny") : decision          // "always allow" is allowed for the rest of this request too; "never" is a no
+    const r = await postPermission(call.ask.id, sent)
     if ("error" in r) { this.onError(t("The answer was not taken"), r.error); return false }
-    call.ask.answer = decision
+    call.ask.answer = sent
     call.state = "running"
-    if (decision === "allow_chat" && call.ask.rule) addRule(store, this.index.active ?? "new", call.ask.rule)
+    if (keep && call.ask.rule) {
+      if (addPerm(store, keep.scope, keep.effect, call.ask.rule)) call.ask.kept = { scope: keep.scope.kind, effect: keep.effect }
+    } else if (decision === "allow_chat" && call.ask.rule) addRule(store, this.index.active ?? "new", call.ask.rule)
     this.notify()
     return true
   }
@@ -528,7 +532,7 @@ export class ChatController {
     if (s.max) body.max_tokens = +s.max
     if (ctx.projectionLoaded) body.experimental_speed_projection = !!s.esp
     Object.assign(body, mcpRequest(s, ctx.mcp))                            // this server may run MCP tools for it (the ones not switched off)
-    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, id === NEW_KEY ? null : id, rulesOf(store, id)))      // the coding tools, when they are on and reachable
+    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, id === NEW_KEY ? null : id, permsFor(store, rulesOf(store, id), this.currentProject())))      // the coding tools, when they are on and reachable
     const lastPrompt = [...conv].reverse().find((x) => x.role === "user")
     const skill = lastPrompt ? skillOfMessage(lastPrompt.text, ctx.skills ?? []) : null
     if (skill) body.strata_skill = skill                                   // "/name": the server loads that skill for this message

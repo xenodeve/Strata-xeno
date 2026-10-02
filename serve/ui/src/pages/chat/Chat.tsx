@@ -220,6 +220,7 @@ export function Chat({ id }: { id?: string }) {
     if (busy || (!text.trim() && !files.length)) return
     if (!files.length && isContextCommand(text)) { setText(""); setCtxOpen((n) => n + 1); return }                // "/context": the panel with the context window opens
     if (!files.length && isMemoryCommand(text)) { setText(""); keepPanel({ open: true, tab: "memory" }); return }                      // "/memory": the panel opens on the notes
+    if (!files.length && /^\s*\/permissions\s*$/i.test(text)) { setText(""); location.hash = href("settings", "permissions"); return }                // "/permissions": the page of the rules
     if (!files.length && /^\s*\/clear\s*$/i.test(text)) { setText(""); newChat(); return }                                              // "/clear": a new chat, this one stays in Recents
     const asked = files.length ? null : compactCommand(text)           // "/compact" (and what to focus on) is not a message: the conversation is summarised
     if (asked) {
@@ -344,7 +345,7 @@ export function Chat({ id }: { id?: string }) {
             onToggle: () => chat.setSettings({ ...chat.settings, agent: chat.settings.agent === false }),
             onMode: (m) => chat.setSettings({ ...chat.settings, agentMode: m }),
             onFolders: (list) => (project ? chat.setProjectFolders(project.id, list) : chat.setSettings({ ...chat.settings, agentFolder: list[0]?.trim() ?? "" })),
-            onForget: () => { forgetRules(store, chatKey); chat.notify() },
+            onForget: () => { forgetRules(store, chatKey); chat.notify() }, permsHref: href("settings", "permissions"),
           }}
           mcp={{
             servers: mcp.servers, tools: mcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings", "mcp-servers"),

@@ -38,6 +38,7 @@ export interface AgentControlsProps {
   onMode: (m: AgentMode) => void
   onFolders: (folders: string[]) => void
   onForget: () => void
+  permsHref?: string                    // the page of the rules that last (Settings > Permissions)
 }
 
 export function AgentControls(p: AgentControlsProps) {
@@ -87,6 +88,7 @@ export function AgentControls(p: AgentControlsProps) {
           </label>
         )}
         <p className="mt-2 text-[12px] text-ink-2">{p.info.shell ? t("Commands run in {shell}, in the folder, and ask you first unless they only read.", { shell: p.info.shell }) : t("No shell was found on this PC, so commands cannot run.")}</p>
+        {p.permsHref && <a className="mt-2 block text-[12px] text-ink-2 underline underline-offset-2 hover:text-ink" data-perms-link href={p.permsHref}>{t("Rules for projects and everywhere")}</a>}
         {p.rules > 0 && (
           <div className="mt-2 flex items-center justify-between gap-3 text-[12px] text-ink-2">
             <span>{t("{n} rules allowed for this chat", { n: p.rules })}</span>

@@ -9,6 +9,8 @@ let DEFAULTS: typeof import("./chat").DEFAULTS
 let store: typeof import("./store").store
 let addRule: typeof import("./agent").addRule
 let rulesOf: typeof import("./agent").rulesOf
+let loadPerms: typeof import("./perms").loadPerms
+let addPerm: typeof import("./perms").addPerm
 type Message = import("./chat").Message
 
 beforeAll(async () => {
@@ -20,6 +22,7 @@ beforeAll(async () => {
   ;({ ChatController, metaText, mcpRequest, DEFAULTS } = await import("./chat"))
   ;({ store } = await import("./store"))
   ;({ addRule, rulesOf } = await import("./agent"))
+  ;({ loadPerms, addPerm } = await import("./perms"))
 })
 
 const enc = new TextEncoder()
@@ -1267,5 +1270,110 @@ describe("chats that answer at the same time", () => {
     expect(c.messages).toHaveLength(1)
     expect(c.messages[0].compact).toBeDefined()
     expect(c.messages[0].text).toContain("1. Primary request: kept")
+  })
+})
+
+// Rules that last (issue #99): an answer kept for a project or for everywhere, and the rules that go with every request.
+describe("rules that last", () => {
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    return data
+  }
+  const finish = [delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]\n\n"]
+  const ON = { available: true, allowed: true, shell: "bash", tools: ["Read", "Bash"] }
+  const asking = (rule: string | null = "Bash(npm test:*)"): Message[] => [{ role: "user", text: "x", time: 1 }, { role: "assistant", text: "", time: 2, tools: [{ id: "c1", name: "Bash", at: 0, rat: 0, state: "asking", server: "agent", ask: { id: "q1", tool: "Bash", why: "w", danger: false, rule } }] }]
+  const posts = () => {
+    const sent: { body: { id: string; decision: string } }[] = []
+    ;(globalThis as Record<string, unknown>).fetch = async (_u: string, init: { body: string }) => { sent.push({ body: JSON.parse(init.body) }); return new Response('{"ok":true}', { status: 200 }) }
+    return sent
+  }
+
+  test("\"always allow in this project\" is allowed for the rest of this request and kept for the project", async () => {
+    keep()
+    const c = new ChatController()
+    const p = c.addProject("Work", ["C:/w"])!
+    c.messages = asking()
+    c.index = { ...c.index, active: "chat9" }
+    const sent = posts()
+    expect(await c.answer("c1", "allow_chat", { scope: { kind: "project", id: p }, effect: "allow" })).toBe(true)
+    expect(sent[0].body).toEqual({ id: "q1", decision: "allow_chat" })
+    expect(c.messages[1].tools![0].ask).toMatchObject({ answer: "allow_chat", kept: { scope: "project", effect: "allow" } })
+    expect(loadPerms(store).projects[p].allow).toEqual(["Bash(npm test:*)"])
+    expect(rulesOf(store, "chat9")).toEqual([])                            // not kept for the chat as well: it is kept for the project
+  })
+
+  test("\"never anywhere\" is a no for now and a deny rule for good", async () => {
+    keep()
+    const c = new ChatController()
+    c.messages = asking()
+    c.index = { ...c.index, active: "chat9" }
+    const sent = posts()
+    await c.answer("c1", "allow", { scope: { kind: "everywhere" }, effect: "deny" })
+    expect(sent[0].body.decision).toBe("deny")
+    expect(loadPerms(store).everywhere.deny).toEqual(["Bash(npm test:*)"])
+    expect(c.messages[1].tools![0].ask?.kept).toEqual({ scope: "everywhere", effect: "deny" })
+  })
+
+  test("a call with no rule (a dangerous command) keeps nothing", async () => {
+    keep()
+    const c = new ChatController()
+    c.messages = asking(null)
+    c.index = { ...c.index, active: "chat9" }
+    posts()
+    await c.answer("c1", "allow", { scope: { kind: "everywhere" }, effect: "allow" })
+    expect(loadPerms(store).everywhere.allow).toEqual([])
+    expect(c.messages[1].tools![0].ask?.kept).toBeUndefined()
+  })
+
+  test("a server that did not take the answer keeps nothing", async () => {
+    keep()
+    const c = new ChatController()
+    c.messages = asking()
+    c.index = { ...c.index, active: "chat9" }
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(JSON.stringify({ error: { message: "no such question" } }), { status: 404 })
+    c.onError = () => {}
+    expect(await c.answer("c1", "allow_chat", { scope: { kind: "everywhere" }, effect: "allow" })).toBe(false)
+    expect(loadPerms(store).everywhere.allow).toEqual([])
+    expect(c.messages[1].tools![0].ask?.answer).toBeUndefined()
+  })
+
+  test("a request carries the chat's, the project's and everywhere's allowed rules and the refused ones", async () => {
+    keep()
+    const c = new ChatController()
+    const p = c.addProject("Work", ["C:/w"])!
+    c.newSession(p)
+    addPerm(store, { kind: "everywhere" }, "allow", "Read")
+    addPerm(store, { kind: "everywhere" }, "deny", "Bash(rm:*)")
+    addPerm(store, { kind: "project", id: p }, "allow", "Edit(src/**)")
+    addPerm(store, { kind: "project", id: p }, "deny", "Bash(curl:*)")
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(...finish)], seen)
+    await c.send("go", [], { ...ctx, agent: ON, folder: c.folders() })
+    expect(seen[0].strata_agent).toMatchObject({ allow: ["Edit(src/**)", "Read"], deny: ["Bash(curl:*)", "Bash(rm:*)"] })
+  })
+
+  test("a chat that is in no project gets only everywhere's rules", async () => {
+    keep()
+    const c = new ChatController()
+    c.addProject("Work", ["C:/w"])
+    addPerm(store, { kind: "everywhere" }, "allow", "Read")
+    addPerm(store, { kind: "project", id: "other" }, "deny", "Bash")
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(...finish)], seen)
+    await c.send("go", [], { ...ctx, agent: ON })
+    expect((seen[0].strata_agent as { allow: string[]; deny?: string[] }).allow).toEqual(["Read"])
+    expect("deny" in (seen[0].strata_agent as object)).toBe(false)
+  })
+
+  test("deleting a project takes its rules with it", () => {
+    keep()
+    const c = new ChatController()
+    const p = c.addProject("Work", ["C:/w"])!
+    addPerm(store, { kind: "project", id: p }, "allow", "Read")
+    c.removeProject(p)
+    expect(loadPerms(store).projects[p]).toBeUndefined()
   })
 })

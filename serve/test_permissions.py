@@ -160,6 +160,17 @@ class OtherFolders(Base):
 
 
 class Rules(Base):
+    def test_no_rule_settles_a_change_in_the_git_folder_or_a_secret(self):
+        (self.proj / ".git").mkdir()
+        hook = str(self.proj / ".git" / "hooks" / "pre-commit")
+        env = str(self.proj / ".env")
+        for allow in (["Write"], ["Edit"], ["Write(.git/**)"], ["Edit(**)"], ["Write(" + hook.replace("\\", "/") + ")"]):
+            self.assertEqual(self.kind("Write", {"file_path": hook, "content": "x"}, allow=allow), "ask", allow)
+            self.assertEqual(self.kind("Edit", {"file_path": hook, "old_string": "a", "new_string": "b"}, allow=allow), "ask", allow)
+        for allow in (["Read"], ["Read(.env)"], ["Write"]):
+            self.assertEqual(self.kind("Read", {"file_path": env}, allow=allow), "ask", allow)
+        self.assertEqual(self.kind("Read", {"file_path": str(self.proj / ".git" / "config")}, allow=["Read"]), "allow")      # reading .git is fine
+
     def test_an_allow_rule_lets_a_path_outside_through(self):
         rule = f"Read({(self.outside).as_posix()}/**)"
         self.assertEqual(self.kind("Read", {"file_path": str(self.outside / "b.txt")}, allow=[rule]), "allow")

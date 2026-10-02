@@ -1593,6 +1593,110 @@ export const checks = [
     },
   },
   {
+    // Rules that last (issue #99): a card that asks can keep the answer for a project or everywhere (More choices); Settings > Permissions lists, adds and removes the rules; the
+    // requests carry them. The server's answers are scripted.
+    name: "perms: an answer can be kept as a rule for good, and the rules are listed, added and removed in Settings",
+    async run({ browser, fast, t, errors }) {
+      const NL = String.fromCharCode(10)
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const ev = (e) => chunk({ choices: [{ delta: {} }], strata_mcp: e })
+      const done = chunk({ choices: [{ delta: { content: "ok" } }] }) + chunk({ choices: [], usage: { completion_tokens: 1 } }) + `data: [DONE]${NL}${NL}`
+      const ask = (id, qid, command, rule) => ev({ event: "start", id, name: "Bash" }) + ev({ event: "call", id, name: "Bash", server: "agent", tool: "Bash", arguments: { command }, round: 1 })
+        + ev({ event: "permission", id: qid, call_id: id, tool: "Bash", arguments: { command }, why: "a command asks every time", danger: false, rule }) + done
+      const info = { available: true, allowed: true, shell: "bash", tools: ["Bash"] }
+      const pg = await open(browser, errors)
+      const sent = [], answers = []
+      const streams = [ask("c1", "q1", "npm test", "Bash(npm test:*)"), ask("c2", "q2", "curl x.example", "Bash(curl:*)"), done]
+      let n = 0
+      await pg.route("**/agent", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(info) }))
+      await pg.route("**/agent/permission", (r) => { answers.push(JSON.parse(r.request().postData() || "{}")); return r.fulfill({ status: 200, contentType: "application/json", body: "{\"ok\":true}" }) })
+      await pg.route("**/v1/chat/completions", (r) => { sent.push(JSON.parse(r.request().postData() || "{}")); return r.fulfill({ status: 200, contentType: "text/event-stream", body: streams[Math.min(n++, streams.length - 1)] }) })
+      await pg.addInitScript(() => { if (!localStorage.getItem("strata.chats")) localStorage.setItem("strata.chats", JSON.stringify({ active: null, items: [], projects: [{ id: "p1", name: "Work", folders: ["/work/app"] }] })) })
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(900)
+      const perms = () => pg.evaluate(() => JSON.parse(localStorage.getItem("strata.agent.perms") || "{}"))
+      const card = pg.locator("[data-agent-ask]").first()
+
+      // a chat in no project: only "everywhere" is offered
+      await pg.fill("textarea[aria-label='Message']", "run the tests")
+      await pg.keyboard.press("Enter")
+      await card.waitFor({ timeout: 8000 })
+      t.ok("a card that asks has More choices", (await card.locator("[data-ask-more]").count()) === 1 && (await card.locator("[data-ask-keep]").count()) === 0)
+      await card.locator("[data-ask-more]").click()
+      await pg.waitForTimeout(300)
+      const keep = (await card.locator("[data-ask-keep] button").allInnerTexts()).join("|")
+      t.ok("in a chat that is in no project the choices are for everywhere only", keep === "Always allow everywhere|Never anywhere", keep)
+      await card.getByRole("button", { name: "Always allow everywhere" }).click()
+      await pg.waitForTimeout(700)
+      t.ok("it is sent as allowed for now, and the rule is kept for good", JSON.stringify(answers.at(-1)) === '{"id":"q1","decision":"allow_chat"}' && JSON.stringify((await perms()).everywhere?.allow) === '["Bash(npm test:*)"]', JSON.stringify(await perms()))
+      t.ok("the card says what was done", (await pg.locator("[data-agent-ask-answer], .border-t").filter({ hasText: "You allowed it everywhere from now on." }).count()) >= 1)
+
+      // a chat in a project: the project's choices too; the next request carries the rule
+      await pg.getByRole("button", { name: "New chat in project Work" }).click()
+      await pg.waitForTimeout(400)
+      await pg.fill("textarea[aria-label='Message']", "fetch it")
+      await pg.keyboard.press("Enter")
+      await pg.waitForSelector("[data-agent-ask]", { timeout: 8000 })
+      t.ok("the request carries what was allowed everywhere", JSON.stringify(sent.at(-1).strata_agent.allow) === '["Bash(npm test:*)"]', JSON.stringify(sent.at(-1).strata_agent))
+      const card2 = pg.locator("[data-agent-ask]").last()
+      await card2.locator("[data-ask-more]").click()
+      await pg.waitForTimeout(300)
+      const keep2 = (await card2.locator("[data-ask-keep] button").allInnerTexts()).join("|")
+      t.ok("in a project the choices are for the project and for everywhere", keep2 === "Always allow in this project|Always allow everywhere|Never in this project|Never anywhere", keep2)
+      await card2.getByRole("button", { name: "Never in this project" }).click()
+      await pg.waitForTimeout(700)
+      t.ok("\"never\" is sent as a no and kept as a deny rule of the project", answers.at(-1).decision === "deny" && JSON.stringify((await perms()).projects?.p1?.deny) === '["Bash(curl:*)"]', JSON.stringify(await perms()))
+      await pg.fill("textarea[aria-label='Message']", "again")
+      await pg.keyboard.press("Enter")
+      await pg.waitForTimeout(900)
+      const last = sent.at(-1).strata_agent
+      t.ok("and the next request refuses it", JSON.stringify(last.deny) === '["Bash(curl:*)"]' && last.allow.includes("Bash(npm test:*)"), JSON.stringify(last))
+
+      // Settings > Permissions
+      await pg.goto(fast.base + "/#/settings/permissions")
+      await pg.waitForSelector("[data-permissions]")
+      await pg.waitForTimeout(500)
+      const rule = (r) => pg.locator(`[data-perm-rule='${r}']`)
+      t.ok("the page lists the rules where they are: everywhere and the project", (await rule("Bash(npm test:*)").getAttribute("data-perm-scope")) === "everywhere" && (await rule("Bash(curl:*)").getAttribute("data-perm-scope")) === "p1" && (await rule("Bash(curl:*)").getAttribute("data-effect")) === "deny")
+      const everywhere = pg.locator("[data-perm-block='everywhere']")
+      const field = everywhere.locator("input")
+      await field.fill("not a rule")
+      await everywhere.getByRole("button", { name: "Add", exact: true }).click()
+      t.ok("something that is not a rule is refused with a reason", (await everywhere.locator("[role=alert]").innerText()).includes("not a rule"))
+      await field.fill("Read(src/**)")
+      await everywhere.getByRole("button", { name: "Add", exact: true }).click()
+      await pg.waitForTimeout(300)
+      t.ok("a rule is added", (await rule("Read(src/**)").count()) === 1 && (await rule("Read(src/**)").getAttribute("data-effect")) === "allow")
+      await everywhere.getByRole("radio", { name: "Never" }).click()
+      await field.fill("Bash(rm:*)")
+      await field.press("Enter")
+      await pg.waitForTimeout(300)
+      t.ok("and a \"never\" too", (await rule("Bash(rm:*)").getAttribute("data-effect")) === "deny")
+      await field.fill("Bash(rm:*)")
+      await field.press("Enter")
+      t.ok("the same rule twice is said to be there already", (await everywhere.locator("[role=alert]").innerText()).includes("there already"))
+      await pg.reload()
+      await pg.waitForSelector("[data-permissions]")
+      t.ok("the rules are kept", (await rule("Read(src/**)").count()) === 1 && (await rule("Bash(rm:*)").count()) === 1)
+      await pg.getByRole("button", { name: "Remove the rule Read(src/**)" }).click()
+      await pg.waitForTimeout(300)
+      t.ok("a rule is removed", (await rule("Read(src/**)").count()) === 0 && !JSON.stringify(await perms()).includes("Read(src"))
+      await pg.getByRole("button", { name: "Remove the rule Bash(curl:*)" }).click()
+      await pg.waitForTimeout(300)
+      t.ok("a project's rule is removed from the project", (await perms()).projects?.p1 === undefined)
+
+      // /permissions
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.fill("textarea[aria-label='Message']", "/permissions")
+      await pg.keyboard.press("Enter")
+      await pg.waitForTimeout(600)
+      t.ok("/permissions opens the page of the rules", pg.url().endsWith("#/settings/permissions") && (await pg.locator("[data-permissions]").count()) === 1)
+      await pg.context().close()
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {
@@ -2074,7 +2178,7 @@ export const checks = [
       await plain.waitForTimeout(700)
       await plain.locator("textarea[aria-label='Message']").fill("/")
       await plain.waitForTimeout(250)
-      t.ok("with no skills at all a / lists only Strata's own commands, /clear, /compact, /context, /init and /memory", JSON.stringify(await plain.locator("[role=listbox][aria-label='Skills'] [role=option]").evaluateAll((os) => os.map((o) => o.dataset.skill))) === '["clear","compact","context","init","memory"]')
+      t.ok("with no skills at all a / lists only Strata's own commands (clear, compact, context, init, memory, permissions)", JSON.stringify(await plain.locator("[role=listbox][aria-label='Skills'] [role=option]").evaluateAll((os) => os.map((o) => o.dataset.skill))) === '["clear","compact","context","init","memory","permissions"]')
     },
   },
   {

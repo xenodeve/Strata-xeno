@@ -3,6 +3,7 @@ import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, CheckmarkCircle02Icon, CircleIcon, Alert02Icon } from "@hugeicons/core-free-icons"
 import { chat, type Todo, type ToolCall } from "../../lib/chat"
 import { diffRows, toolSummary } from "../../lib/agent"
+import type { Effect, Scope } from "../../lib/perms"
 import { Collapse } from "../../components/motion"
 import { Orb } from "../../components/orb"
 import { toolDesign } from "../../lib/orbs"
@@ -45,10 +46,18 @@ const str = (x: unknown) => (typeof x === "string" ? x : "")
 const arg = (call: ToolCall, k: string) => (call.arguments && typeof call.arguments === "object" ? (call.arguments as Record<string, unknown>)[k] : undefined)
 const Out = ({ text }: { text: string }) => <pre className="tool-pre">{text}</pre>
 
+/** What a card says after the user kept the answer as a rule. */
+function keptText(k: { scope: "project" | "everywhere"; effect: "allow" | "deny" }): string {
+  return k.effect === "allow" ? (k.scope === "project" ? t("You allowed it in this project from now on.") : t("You allowed it everywhere from now on.")) : (k.scope === "project" ? t("You refused it in this project from now on.") : t("You refused it everywhere from now on."))
+}
+
 function Question({ call }: { call: ToolCall }) {
   const ask = call.ask!
   const [busy, setBusy] = useState(false)
-  const go = async (d: "allow" | "allow_chat" | "deny") => { setBusy(true); await chat.answer(call.id, d); setBusy(false) }
+  const [more, setMore] = useState(false)
+  const project = chat.currentProject()
+  const go = async (d: "allow" | "allow_chat" | "deny", keep?: { scope: Scope; effect: Effect }) => { setBusy(true); await chat.answer(call.id, d, keep); setBusy(false) }
+  const here: Scope | null = project ? { kind: "project", id: project } : null
   const a = ask.arguments ?? call.arguments
   const get = (k: string) => (a && typeof a === "object" ? str((a as Record<string, unknown>)[k]) : "")
   return (
@@ -70,7 +79,18 @@ function Question({ call }: { call: ToolCall }) {
           <button type="button" disabled={busy} onClick={() => void go("allow_chat")} title={ask.rule} className="rounded-sm border border-line px-3 py-1 text-[13px] transition-colors hover:bg-hover disabled:opacity-40">{t("Allow for this chat")}</button>
         )}
         <button type="button" disabled={busy} onClick={() => void go("deny")} className="rounded-sm border border-line px-3 py-1 text-[13px] transition-colors hover:bg-hover disabled:opacity-40">{t("Deny")}</button>
+        {ask.rule && (
+          <button type="button" aria-expanded={more} data-ask-more onClick={() => setMore(!more)} className="rounded-sm px-2 py-1 text-[12px] text-ink-2 transition-colors hover:bg-hover hover:text-ink">{more ? t("Fewer choices") : t("More choices")}</button>
+        )}
       </div>
+      {ask.rule && more && (
+        <div className="flex flex-wrap items-center gap-2" data-ask-keep>
+          {!ask.danger && here && <button type="button" disabled={busy} onClick={() => void go("allow_chat", { scope: here, effect: "allow" })} className="rounded-sm border border-line px-2.5 py-1 text-[12px] transition-colors hover:bg-hover disabled:opacity-40">{t("Always allow in this project")}</button>}
+          {!ask.danger && <button type="button" disabled={busy} onClick={() => void go("allow_chat", { scope: { kind: "everywhere" }, effect: "allow" })} className="rounded-sm border border-line px-2.5 py-1 text-[12px] transition-colors hover:bg-hover disabled:opacity-40">{t("Always allow everywhere")}</button>}
+          {here && <button type="button" disabled={busy} onClick={() => void go("deny", { scope: here, effect: "deny" })} className="rounded-sm border border-line px-2.5 py-1 text-[12px] transition-colors hover:bg-hover disabled:opacity-40">{t("Never in this project")}</button>}
+          <button type="button" disabled={busy} onClick={() => void go("deny", { scope: { kind: "everywhere" }, effect: "deny" })} className="rounded-sm border border-line px-2.5 py-1 text-[12px] transition-colors hover:bg-hover disabled:opacity-40">{t("Never anywhere")}</button>
+        </div>
+      )}
       {ask.rule && !ask.danger && <div className="font-mono text-[11px] text-ink-3 [overflow-wrap:anywhere]">{ask.rule}</div>}
     </div>
   )
@@ -133,7 +153,7 @@ export function AgentCall({ call }: { call: ToolCall }) {
       </button>
       <Judge call={call} />
       {pending && <Question call={call} />}
-      {call.ask?.answer && <div className="border-t border-line px-3 py-1.5 text-[12px] text-ink-2">{call.ask.answer === "deny" ? t("You did not allow it.") : call.ask.answer === "allow_chat" ? t("You allowed it for this chat.") : t("You allowed it.")}</div>}
+      {call.ask?.answer && <div className="border-t border-line px-3 py-1.5 text-[12px] text-ink-2">{call.ask.kept ? keptText(call.ask.kept) : call.ask.answer === "deny" ? t("You did not allow it.") : call.ask.answer === "allow_chat" ? t("You allowed it for this chat.") : t("You allowed it.")}</div>}
       <Collapse open={open && !pending}>
         <div className="space-y-2 border-t border-line px-3 py-2.5"><Body call={call} /></div>
       </Collapse>

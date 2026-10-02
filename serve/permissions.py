@@ -447,9 +447,11 @@ def decide(tool: str, args: dict, pol: Policy) -> Decision:
     if target is None:
         return ask(why, judge=False)
     secret = is_secret(target)
-    for rule in pol.allow:
+    root_here = root_of(target, pol)
+    in_dot_git = tool in FILE_EDIT and root_here is not None and in_git(target, root_here)
+    for rule in pol.allow:                                         # a rule, however it was written (even an "always" one), never settles a secret or a change in .git: those ask every time
         rt, spec = _rule_parts(rule)
-        if _tool_matches(rt, tool) and not secret and (spec is None or _path_rule_matches(spec, target, pol.cwd)):
+        if _tool_matches(rt, tool) and not secret and not in_dot_git and (spec is None or _path_rule_matches(spec, target, pol.cwd)):
             if plan and tool in FILE_EDIT:
                 break
             return Decision("allow", f"allowed by the rule {rule}", rule=rule)
