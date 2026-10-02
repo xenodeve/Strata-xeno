@@ -5,7 +5,7 @@ import { chat, metaText, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
 import { Collapse, Fit, Handover } from "../../components/motion"
 import { Orb, StatusLabel } from "../../components/orb"
-import { latticePattern, phaseKind, replyDesign, toolDesign, type OrbDesign } from "../../lib/orbs"
+import { afterToolStep, latticePattern, phaseKind, replyDesign, toolDesign, type OrbDesign } from "../../lib/orbs"
 import { useAvatar } from "../../lib/avatar"
 import { Lattice, Thought, type LatticeStatus } from "../../components/thought"
 import { cn } from "../../lib/cn"
@@ -233,7 +233,7 @@ function CompactNotice({ m }: { m: Message }) {
   )
 }
 
-export function MessageView({ m, streaming, compacting = false, show, prefill, actions, serverPhase }: { m: Message; streaming: boolean; compacting?: boolean; show: boolean; prefill: boolean; actions?: PromptActions; serverPhase?: string | null }) {
+export function MessageView({ m, streaming, compacting = false, show, prefill, actions, serverPhase, serverState, liveTokens }: { m: Message; streaming: boolean; compacting?: boolean; show: boolean; prefill: boolean; actions?: PromptActions; serverPhase?: string | null; serverState?: string | null; liveTokens?: { tokens: number; tokS: number | null } | null }) {
   const ref = useRef<HTMLDivElement>(null)
   const mine = useRef<HTMLDivElement>(null)
   const [editing, setEditing] = useState(false)
@@ -313,9 +313,12 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
       )}
       <div className="mt-1 flex min-h-6 items-center gap-2 text-[12px] text-ink-3">
         <Handover live={phase === "composing" ? <StatusLabel design="composing" className="text-[13px] text-ink-2">{t("Answering…")}</StatusLabel>
-          : phase === "weaving" ? <StatusLabel design="weaving" className="text-[13px] text-ink-2">{t("Planning the next step…")}</StatusLabel> : null}>
+          : phase === "weaving" ? (afterToolStep(serverState) === "planning"
+            ? <StatusLabel design="weaving" className="text-[13px] text-ink-2">{t("Planning the next step…")}</StatusLabel>
+            : <StatusLabel design="listening" className="text-[13px] text-ink-2">{t("Reading the tool's result…")}</StatusLabel>) : null}>
           <span className="num">{metaText(m) || (streaming ? "" : m.stopped ? t("Stopped") : "")}</span>
         </Handover>
+        {streaming && !!liveTokens && <span className="num" data-live-tokens role="status" aria-label={t("Tokens written so far")}>{t("{n} tokens", { n: fmt(liveTokens.tokens) })}{liveTokens.tokS ? ` · ${fmt(liveTokens.tokS, 1)} tok/s` : ""}</span>}
         {!streaming && !!m.text && (
           <button
             type="button"

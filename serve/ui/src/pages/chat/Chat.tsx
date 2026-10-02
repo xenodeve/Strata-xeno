@@ -11,6 +11,7 @@ import { PromptBar } from "../../components/PromptBar"
 import { Sidebar } from "../../components/Sidebar"
 import { ConfirmDialog } from "../../components/ConfirmDialog"
 import { useMetrics } from "../../lib/metrics"
+import { LiveTokens, type LiveReading } from "../../lib/livetokens"
 import { href } from "../../lib/router"
 import { effortChoices, settleEffort } from "../../lib/effort"
 import { noteSend } from "../../lib/sendfx"
@@ -111,6 +112,14 @@ export function Chat({ id }: { id?: string }) {
   const busy = chat.busy
   const { data: metrics, stale } = useMetrics()
   const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
+  // the tokens written so far in the answer that is being made, counted live and run on between the server's readings, so that it shows that the agent is still at work
+  useEffect(() => { void chat.resumeRuns() }, [])                // an answer that was being written when the page was refreshed went on in the server: it is read again
+  const counter = useRef(new LiveTokens())
+  const [, tickCount] = useState(0)
+  const working = !!busy
+  useEffect(() => { if (!working) return; const id = setInterval(() => tickCount((n) => n + 1), 250); return () => clearInterval(id) }, [working])
+  counter.current.sample(busy?.msg ?? null, live as LiveReading, performance.now())
+  const counted = counter.current.shown(performance.now())
   const closeSheet = useCallback(() => setSheet(false), [])
   // The thinking levels are the model's: what its template accepts, as the server lists them. A level saved for another model
   // (or "high" where this one calls it "xhigh") is moved onto one this model has.
@@ -334,7 +343,7 @@ export function Chat({ id }: { id?: string }) {
           </div>
         </Collapse>
         {chat.messages.map((m, i) => (
-          <MessageView key={i} m={m} streaming={busy?.msg === m} compacting={chat.compacting && busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined}
+          <MessageView key={i} m={m} streaming={busy?.msg === m} compacting={chat.compacting && busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined} serverState={busy?.msg === m ? live.state : undefined} liveTokens={busy?.msg === m ? counted : null}
             actions={isPrompt(m) ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt, onRewind: () => setRewindAt(Math.max(0, rewindPrompts().findIndex((p) => p.index === i))) } : undefined} />
         ))}
         {chat.compacting && !!busy && !chat.messages.includes(busy.msg) && <CompactingLine />}

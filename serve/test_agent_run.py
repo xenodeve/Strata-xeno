@@ -98,7 +98,7 @@ class AutoMode(unittest.TestCase):
         run, broker = make(mode="auto", side=lambda s, u: "<severity>3</severity>", timeout=0.4)
         self.assertEqual(run.ctx.ask(dict(REQ)), "deny")                 # nobody answered
         kinds = [e["event"] for e in run.drain()]
-        self.assertEqual(kinds, ["judging", "judged", "permission"])
+        self.assertEqual(kinds, ["judging", "judged", "permission", "answered"])        # the user is asked after an unsure verdict, and the answer is told to a page that reads the run again
 
     def test_a_clearly_harmful_verdict_blocks_it_with_the_reason(self):
         run, _ = make(mode="auto", side=lambda s, u: "<severity>5</severity>")

@@ -116,7 +116,9 @@ class AgentRun:
                 if self.cancel.is_set():
                     return "cancelled"
                 if time.monotonic() > end:
+                    self._emit({"event": "question_answered", "id": rid, "answers": None})
                     return {"answers": None}
+            self._emit({"event": "question_answered", "id": rid, "answers": (slot["answer"] or {}).get("answers")})        # a page that reads the run again later learns that it was answered
             return slot["answer"]
         finally:
             self.broker.close(rid)
@@ -135,7 +137,9 @@ class AgentRun:
                 if self.cancel.is_set():
                     return "cancelled"
                 if time.monotonic() > end:
+                    self._emit({"event": "answered", "id": rid, "answer": "deny"})
                     return "deny"
+            self._emit({"event": "answered", "id": rid, "answer": slot["answer"]})              # a page that reads the run again later learns that it was answered
             return slot["answer"]
         finally:
             self.broker.close(rid)

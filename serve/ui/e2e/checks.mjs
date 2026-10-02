@@ -2161,6 +2161,162 @@ export const checks = [
     },
   },
   {
+    // An agent's long run of tools: the thinking of each later round is shown below the tools of the round before it, not only once at the top.
+    name: "rounds: the thinking after the tools is shown below them, in order, and the first stays above",
+    async run({ browser, fast, t, errors }) {
+      const NL = String.fromCharCode(10)
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const think = (s) => chunk({ choices: [{ delta: { reasoning_content: s } }] })
+      const ev = (e) => chunk({ choices: [{ delta: {} }], strata_mcp: e })
+      const call = (id, file) => ev({ event: "start", id, name: "Read" }) + ev({ event: "call", id, name: "Read", server: "agent", tool: "Read", arguments: { file_path: file }, round: 1 }) + ev({ event: "result", id, ok: true, text: "contents of " + file, chars: 20, truncated: false, ms: 5 })
+      const body = think("FIRSTTHOUGHT about the plan.") + call("a1", "one.txt") + think("SECONDTHOUGHT after the first tool.") + call("a2", "two.txt") + think("THIRDTHOUGHT after the second tool.") +
+        chunk({ choices: [{ delta: { content: "FINALANSWER is ready." } }] }) + chunk({ choices: [], usage: { completion_tokens: 1 } }) + `data: [DONE]${NL}${NL}`
+      const info = { available: true, allowed: true, shell: "bash", tools: ["Read"] }
+      const pg = await open(browser, errors, { width: 1300, height: 900 })
+      await pg.route("**/agent", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(info) }))
+      await pg.route("**/v1/chat/completions", (r) => r.fulfill({ status: 200, contentType: "text/event-stream", body }))
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(900)
+      await pg.fill("textarea[aria-label='Message']", "read both")
+      await pg.keyboard.press("Enter")
+      await pg.waitForFunction(() => document.body.innerText.includes("FINALANSWER"), null, { timeout: 15000 })
+      await pg.waitForTimeout(600)
+      const order = await pg.evaluate(() => {
+        const seq = [...document.querySelectorAll("[data-agent-call], [data-round-thought]")].map((e) => (e.hasAttribute("data-agent-call") ? "tool" : "thought"))
+        const last = [...document.querySelectorAll("[data-round-thought]")].pop()
+        const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+        let n, answer = null
+        while ((n = w.nextNode())) if (n.textContent.includes("FINALANSWER")) answer = n
+        const first = document.querySelector("[data-agent-call]")
+        const top = first && first.parentElement ? first.parentElement.innerText : ""
+        return { seq, after: !!(last && answer && (last.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING)), topThought: top.indexOf("Thought") }
+      })
+      t.ok("the tools and the later thoughts alternate in the order they happened, and the answer follows the last one", JSON.stringify(order.seq) === JSON.stringify(["tool", "thought", "tool", "thought"]) && order.after, JSON.stringify(order))
+      t.ok("the first thought is above the first tool", order.topThought >= 0)
+      t.ok("the later thoughts are their own blocks below the tools", (await pg.locator("[data-round-thought]").count()) === 2)
+      t.ok("and they are closed once over, as the first is", (await pg.locator("[data-round-thought]").first().innerText()).includes("Thoughts") && !(await pg.locator("[data-round-thought]").first().innerText()).includes("SECONDTHOUGHT"))
+      await pg.context().close()
+    },
+  },
+  {
+    // A refresh while the agent works (issue #99 follow-up): the answer goes on in the server, no network error, and the page that comes back reads the run again with the same card waiting.
+    name: "refresh: refreshing the page while the agent works leaves the chat usable, with the question still waiting and the answer finishing",
+    async run({ browser, agentDemo, t, errors }) {
+      const fs = await import("node:fs")
+      const os = await import("node:os")
+      const path = await import("node:path")
+      const outside = path.join(os.tmpdir(), "strata-agent-demo.txt")
+      const inside = path.join(agentDemo.dir, "strata-agent-demo.txt")
+      fs.rmSync(outside, { force: true })
+      fs.rmSync(inside, { force: true })
+      const pg = await open(browser, errors)
+      await pg.addInitScript((dir) => { try { if (!localStorage.getItem("strata.sampling")) localStorage.setItem("strata.sampling", JSON.stringify({ agentFolder: dir })) } catch { /* private window */ } }, agentDemo.dir)
+      await pg.goto(agentDemo.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(1200)
+      await pg.fill("textarea[aria-label='Message']", "agent demo please")
+      await pg.keyboard.press("Enter")
+      const card = pg.locator("[data-agent-ask]")
+      await card.first().waitFor({ timeout: 30000 })
+      t.ok("the agent has worked and now waits for a question", (await pg.locator("[data-agent-call='Read']").count()) === 1 && (await card.count()) === 1)
+
+      await pg.reload()
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await card.first().waitFor({ timeout: 30000 })
+      t.ok("after a refresh the question is still there, on the same call", (await card.count()) === 1 && (await card.first().innerText()).includes("strata-agent-demo.txt"))
+      t.ok("and the conversation is whole: the prompt, the steps the agent had taken, no error", (await pg.locator("[data-agent-call='Read']").count()) === 1 && (await pg.locator("[data-agent-call='Glob']").count()) === 1 && !(await pg.locator("body").innerText()).toLowerCase().includes("network error") && (await pg.getByText("agent demo please").count()) >= 1)
+      t.ok("and it is working: the page is answering, with Stop to hand", (await pg.getByRole("button", { name: /Stop/ }).count()) >= 1)
+
+      await card.first().getByRole("button", { name: "Allow", exact: true }).click()
+      await pg.waitForFunction(() => document.body.innerText.includes("Make a file here"), null, { timeout: 30000 })
+      t.ok("answering it goes on as if nothing had happened: the file was written", fs.existsSync(outside))
+      await pg.reload()                                                                  // and once more, with another question waiting
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await card.first().waitFor({ timeout: 30000 })
+      t.ok("a second refresh finds the next question", (await card.first().innerText()).includes("touch strata-agent-demo.txt"))
+      await card.first().getByRole("button", { name: "Allow for this chat" }).click()
+      await pg.waitForFunction(() => document.body.innerText.includes("That was the demo of the coding tools"), null, { timeout: 30000 })
+      t.ok("the answer ends, and the command ran", fs.existsSync(inside))
+      await pg.reload()
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(1500)
+      t.ok("after the end a refresh shows the finished conversation, with nothing running and no error", (await pg.getByText("That was the demo of the coding tools").count()) === 1 && (await pg.getByRole("button", { name: /Stop/ }).count()) === 0 && !(await pg.locator("body").innerText()).toLowerCase().includes("network error"))
+      fs.rmSync(outside, { force: true })
+    },
+  },
+  {
+    // While an agent works the page shows how many tokens it has written, counting live, so that a long run of tools is seen to be going on.
+    name: "live tokens: the count of tokens written so far runs while the agent works, adds up the rounds, and is gone when it ends",
+    async run({ browser, fast, t, errors }) {
+      const NL = String.fromCharCode(10)
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const pg = await open(browser, errors, { width: 1300, height: 900 })
+      let n = 0
+      await pg.route("**/metrics", async (r) => {
+        if (r.request().method() !== "GET" || !r.request().url().endsWith("/metrics")) return r.fallback()
+        const real = await (await r.fetch()).json()
+        n += 1
+        const round2 = n > 6                                                             // later readings: the next round, whose count starts again
+        const live = { ...real.live, state: "generating", generated: round2 ? 40 + (n - 6) * 10 : 100 + n * 20, tok_s: 40, queued: 0, phase: null }
+        return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...real, live }) })
+      })
+      let release
+      const held = new Promise((res) => { release = res })
+      await pg.route("**/v1/chat/completions", async (r) => {
+        await held
+        return r.fulfill({ status: 200, contentType: "text/event-stream", body: chunk({ choices: [{ delta: { content: "done" } }] }) + chunk({ choices: [], usage: { completion_tokens: 3 } }) + `data: [DONE]${NL}${NL}` })
+      })
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(900)
+      await pg.fill("textarea[aria-label='Message']", "work for a while")
+      await pg.keyboard.press("Enter")
+      const counter = pg.locator("[data-live-tokens]")
+      await counter.waitFor({ timeout: 8000 })
+      const first = parseInt((await counter.innerText()).replace(/,/g, ""), 10)
+      t.ok("a count of tokens shows while the agent works, with its speed", first >= 100 && (await counter.innerText()).includes("tokens") && (await counter.innerText()).includes("tok/s"), await counter.innerText())
+      await pg.waitForTimeout(2500)
+      const later = parseInt((await counter.innerText()).replace(/,/g, ""), 10)
+      t.ok("it keeps going up", later > first, `${first} -> ${later}`)
+      await pg.waitForTimeout(4000)
+      const afterRound = parseInt((await counter.innerText()).replace(/,/g, ""), 10)
+      t.ok("when the server's count starts again for a new round, the rounds are added up and it never goes back", afterRound >= later, `${later} -> ${afterRound}`)
+      release()
+      await pg.waitForFunction(() => !document.querySelector("[data-live-tokens]"), null, { timeout: 8000 })
+      t.ok("when the answer ends the live count gives way to the answer's own line", (await counter.count()) === 0)
+      await pg.context().close()
+    },
+  },
+  {
+    // The project menu on the empty chat was cut off by the area it sits in; it is drawn on the page itself now and fits the window, under the button or above it.
+    name: "project menu: the list of projects on a new chat is whole, whatever the window's height",
+    async run({ browser, fast, t, errors }) {
+      for (const height of [900, 500]) {
+        const pg = await open(browser, errors, { width: 700, height })
+        await pg.addInitScript(() => { try { localStorage.setItem("strata.chats", JSON.stringify({ active: null, items: [], projects: [{ id: "p1", name: "Local LLM", folders: ["C:/a"] }, { id: "p2", name: "Strata", folders: ["C:/b", "C:/c"] }, { id: "p3", name: "Third project", folders: [] }, { id: "p4", name: "Fourth", folders: ["C:/d"] }] })) } catch { /* private window */ } })
+        await pg.goto(fast.base + "/#/chat")
+        await pg.waitForSelector("[data-project-picker]")
+        await pg.waitForTimeout(900)
+        await pg.locator("[data-project-picker] button").first().click()
+        await pg.waitForSelector("[data-project-menu]")
+        await pg.waitForTimeout(400)
+        const r = await pg.evaluate(() => {
+          const m = document.querySelector("[data-project-menu]")
+          m.scrollTop = m.scrollHeight                                       // when the window is too short for all of them the menu scrolls: its end can be reached
+          const b = m.getBoundingClientRect()
+          const last = [...m.querySelectorAll("[data-project-option]")].pop().getBoundingClientRect()
+          return { top: b.top, bottom: b.bottom, vh: innerHeight, lastInside: last.bottom <= b.bottom + 1 && last.top >= b.top }
+        })
+        t.ok(`at ${height}px high the menu is inside the window, and every project can be reached`, r.top >= 0 && r.bottom <= r.vh && r.lastInside, JSON.stringify(r))
+        await pg.getByRole("menuitemradio", { name: /Fourth/ }).click()
+        await pg.waitForTimeout(300)
+        t.ok(`and a project can be picked from it (${height}px)`, (await pg.locator("[data-project-picker] button").first().getAttribute("data-in-project")) === "Fourth" && (await pg.locator("[data-project-menu]").count()) === 0)
+        await pg.context().close()
+      }
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {

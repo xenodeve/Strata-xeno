@@ -78,6 +78,12 @@ export function replyDesign(m: {
   return m.reasoning ? "solving" : "breathing"
 }
 
+/** After a tool has answered, what the agent is doing before its next move: reading the tool's result (the server is still reading the prompt that now holds it, or has not begun to) or planning the next step
+ *  (the model is writing, so it is thinking about what to do). The two are told apart by the server's own state. */
+export function afterToolStep(serverState: string | null | undefined): "reading" | "planning" {
+  return serverState === "generating" ? "planning" : "reading"
+}
+
 export type LatticePattern = "orbit" | "ripple" | "snake" | "spiral" | "arrow" | "dots"
 
 /** The lattice that sits beside a thought (components/thought.tsx) runs the pattern of what the agent is doing: thinking

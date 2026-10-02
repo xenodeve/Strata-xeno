@@ -231,4 +231,7 @@ export const part: Record<string, string> = {
   "The helper did not finish": "ตัวช่วยทำไม่เสร็จ",
   "The helper is done": "ตัวช่วยทำเสร็จแล้ว",
   "{n} earlier steps": "ก่อนหน้านี้ {n} ขั้นตอน",
+  "Tokens written so far": "token ที่เขียนไปแล้ว",
+  "Reading the tool's result…": "กำลังอ่านผลของ tool…",
+  "This answer could not be recovered: the server no longer has it (it was restarted, or it ended long ago). Your message is kept; send it again.": "กู้คำตอบนี้กลับมาไม่ได้: เซิร์ฟเวอร์ไม่มีคำตอบนี้แล้ว (อาจถูกเริ่มใหม่หรือจบไปนานแล้ว) ข้อความของคุณยังอยู่ ส่งอีกครั้งได้",
 }

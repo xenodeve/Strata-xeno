@@ -337,7 +337,7 @@ describe("the coding tools in the chat", () => {
     const c = new ChatController()
     c.setSettings({ ...c.settings, agentMode: "plan" })
     await c.send("hi", [], { ...ctx, agent: ON, folder: ["C:/work/app", "C:/work/app-wt2"] })
-    expect(seen[0].strata_agent).toEqual({ cwd: "C:/work/app", dirs: ["C:/work/app-wt2"], mode: "plan", session: c.index.active, allow: [], checkpoint: String(c.messages[0].time) })      // the prompt's time is its checkpoint
+    expect(seen[0].strata_agent).toEqual({ cwd: "C:/work/app", dirs: ["C:/work/app-wt2"], mode: "plan", session: c.index.active, allow: [], checkpoint: String(c.messages[0].time), run: expect.any(String) })      // the prompt's time is its checkpoint; the run id is how the answer is read again after a refresh
   })
 
   test("without the tools (switched off, or the server has none) the request has no strata_agent", async () => {
@@ -1780,3 +1780,226 @@ describe("what a helper did, on the Task call", () => {
     expect(c.messages[1].tools![0].steps).toBeUndefined()
   })
 })
+
+// A refresh while the agent works (issue #99 follow-up): the answer goes on in the server, the cut read is not an error, and the page that comes back reads the run again from its start.
+describe("a refresh while the agent is working", () => {
+  const ON = { available: true, allowed: true, shell: "bash", tools: ["Read"] }
+  const finish = [delta({ content: "all done" }), { choices: [], usage: { completion_tokens: 3 } }, "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10)]
+  const toolCall = [
+    { strata_mcp: { event: "start", id: "c1", name: "Read" } },
+    { strata_mcp: { event: "call", id: "c1", name: "Read", server: "agent", tool: "Read", arguments: { file_path: "a.txt" }, round: 1 } },
+    { strata_mcp: { event: "result", id: "c1", ok: true, text: "contents", chars: 8, truncated: false, ms: 5 } },
+  ]
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+  }
+  const pending = () => store.get<Record<string, { run: string; prompt: string; time: number }>>("runs", {})
+  /** A request whose stream gives its first events and then fails, as a refreshed page's does. */
+  function cutAfterFirst(c: InstanceType<typeof ChatController>, calls: { url: string; body?: string }[]) {
+    let cut!: () => void
+    const held = new Promise<void>((r) => { cut = r })
+    ;(globalThis as Record<string, unknown>).fetch = async (u: string, init?: { body?: string }) => {
+      calls.push({ url: String(u), body: init?.body })
+      return new Response(new ReadableStream({
+        async start(ctl) { ctl.enqueue(enc.encode(sse(delta({ reasoning_content: "thinking first" })))); await held; ctl.error(new TypeError("network error")) },
+      }), { status: 200 })
+    }
+    return () => { ;(c as unknown as { leaving: boolean }).leaving = true; cut() }
+  }
+
+  test("a read cut by leaving the page is not an error, and the run is remembered by its id", async () => {
+    keep()
+    const c = new ChatController()
+    const calls: { url: string; body?: string }[] = []
+    const leave = cutAfterFirst(c, calls)
+    const p = c.send("work on it", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    await new Promise((r) => setTimeout(r, 20))
+    leave()
+    await p
+    expect(JSON.parse(calls[0].body!).strata_agent.run).toMatch(/^[A-Za-z0-9_-]{8,64}$/)
+    expect(c.messages[1].error).toBeUndefined()
+    expect(Object.values(pending())).toHaveLength(1)
+    expect(pending()[c.index.active!].run).toBe(JSON.parse(calls[0].body!).strata_agent.run)
+  })
+
+  test("the page that comes back reads the run again from its start and the conversation is whole", async () => {
+    keep()
+    const c = new ChatController()
+    const calls: { url: string; body?: string }[] = []
+    const leave = cutAfterFirst(c, calls)
+    const p = c.send("work on it", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    await new Promise((r) => setTimeout(r, 20))
+    leave()
+    await p
+    const runId = JSON.parse(calls[0].body!).strata_agent.run
+
+    const back = new ChatController()                                                   // the page after the refresh: it restores what was stored
+    expect(back.messages).toHaveLength(1)                                              // the prompt; the answer that was being written is not stored half-empty
+    const seen: string[] = []
+    ;(globalThis as Record<string, unknown>).fetch = async (u: string) => { seen.push(String(u)); return new Response(sse(delta({ reasoning_content: "thinking first" }), ...toolCall, ...finish), { status: 200 }) }
+    await back.resumeRuns()
+    expect(seen).toEqual([expect.stringContaining(`agent/run?id=${runId}&from=0`)])
+    expect(back.messages).toHaveLength(2)
+    const m = back.messages[1]
+    expect(m.error).toBeUndefined()
+    expect(m.text).toBe("all done")
+    expect(m.reasoning).toBe("thinking first")
+    expect(m.tools![0]).toMatchObject({ name: "Read", state: "done", ok: true })
+    expect(m.stats?.tokS).toBeUndefined()                                                // read again at once: its speed is not what it was written at
+    expect(pending()).toEqual({})
+    expect(back.busy).toBeNull()
+    expect(new ChatController().messages).toHaveLength(2)                                // and it is stored: another refresh finds the answer
+  })
+
+  test("while it is read again the conversation shows the answer being written, and Stop stops it in the server", async () => {
+    keep()
+    const c = new ChatController()
+    const calls: { url: string; body?: string }[] = []
+    const leave = cutAfterFirst(c, calls)
+    const p = c.send("work on it", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    await new Promise((r) => setTimeout(r, 20))
+    leave()
+    await p
+    const runId = JSON.parse(calls[0].body!).strata_agent.run
+
+    const back = new ChatController()
+    const posts: { url: string; body: string }[] = []
+    let release!: () => void
+    const held = new Promise<void>((r) => { release = r })
+    ;(globalThis as Record<string, unknown>).fetch = async (u: string, init?: { body?: string; signal?: AbortSignal }) => {
+      if (String(u).includes("agent/cancel")) { posts.push({ url: String(u), body: init!.body! }); return new Response('{"ok":true}', { status: 200 }) }
+      return new Response(new ReadableStream({
+        async start(ctl) {
+          ctl.enqueue(enc.encode(sse(delta({ content: "part" }))))
+          init?.signal?.addEventListener("abort", () => ctl.error(new DOMException("aborted", "AbortError")))
+          await held
+          ctl.close()
+        },
+      }), { status: 200 })
+    }
+    const done = back.resumeRuns()
+    await new Promise((r) => setTimeout(r, 30))
+    expect(back.busy).not.toBeNull()
+    expect(back.messages[1].text).toBe("part")
+    back.stop()
+    await done
+    expect(posts).toHaveLength(1)
+    expect(posts[0].url).toContain("agent/cancel")
+    expect(JSON.parse(posts[0].body)).toEqual({ id: runId })
+    expect(back.messages[1].stopped).toBe(true)
+    expect(pending()).toEqual({})
+    release()
+  })
+
+  test("a run that the server no longer has is said so, in the conversation, and the message is kept", async () => {
+    keep()
+    const c = new ChatController()
+    const calls: { url: string; body?: string }[] = []
+    const leave = cutAfterFirst(c, calls)
+    const p = c.send("work on it", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    await new Promise((r) => setTimeout(r, 20))
+    leave()
+    await p
+    const back = new ChatController()
+    const errors: string[] = []
+    back.onError = (title) => errors.push(title)
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(JSON.stringify({ error: { message: "there is no such run" } }), { status: 404 })
+    await back.resumeRuns()
+    expect(back.messages[0].text).toBe("work on it")
+    expect(back.messages[1].error).toContain("could not be recovered")
+    expect(errors).toEqual([])                                                           // no pop-up: it is in the conversation
+    expect(pending()).toEqual({})
+  })
+
+  test("a record of a conversation that is gone, or of another prompt, is dropped and nothing is read", async () => {
+    keep()
+    store.set("runs", { nobody: { run: "run-xxxxxxxx", prompt: "1", time: 2 } })
+    let fetched = 0
+    ;(globalThis as Record<string, unknown>).fetch = async () => { fetched++; return new Response("", { status: 200 }) }
+    const c = new ChatController()
+    await c.resumeRuns()
+    expect(fetched).toBe(0)
+    expect(pending()).toEqual({})
+    // a conversation that has moved on
+    const d = new ChatController()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(...finish), { status: 200 })
+    await d.send("first", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    store.set("runs", { [d.index.active!]: { run: "run-yyyyyyyy", prompt: "12345", time: 2 } })
+    fetched = 0
+    ;(globalThis as Record<string, unknown>).fetch = async () => { fetched++; return new Response("", { status: 200 }) }
+    await new ChatController().resumeRuns()
+    expect(fetched).toBe(0)
+    expect(pending()).toEqual({})
+  })
+
+  test("an answer that ends as usual leaves no record, and a request without the coding tools never has one", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("with tools", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    expect(pending()).toEqual({})
+    const bodies: string[] = []
+    ;(globalThis as Record<string, unknown>).fetch = async (_u: string, init?: { body?: string }) => { bodies.push(init!.body!); return new Response(sse(...finish), { status: 200 }) }
+    const d = new ChatController()
+    await d.send("plain", [], ctx)
+    expect(JSON.parse(bodies[0]).strata_agent).toBeUndefined()
+    expect(pending()).toEqual({})
+  })
+
+  test("a real failure of the read (not leaving the page) is still an error", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => { throw new TypeError("network error") }
+    const c = new ChatController()
+    const errors: string[] = []
+    c.onError = (title) => errors.push(title)
+    await c.send("hi", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    expect(c.messages[1].error).toBe("network error")
+    expect(errors).toEqual(["The request failed"])
+    expect(pending()).toEqual({})
+  })
+})
+
+describe("a question that was answered before the page read the run again", () => {
+  const finish = [delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10)]
+  const questions = [{ question: "Which?", header: "Library", multiSelect: false, options: [{ label: "a", description: "x" }, { label: "b", description: "y" }] }]
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+  }
+  test("its card is not left waiting: the permission and the question show as answered", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(
+      { strata_mcp: { event: "start", id: "c1", name: "Bash" } }, { strata_mcp: { event: "call", id: "c1", name: "Bash", server: "agent", tool: "Bash", arguments: { command: "make" }, round: 1 } },
+      { strata_mcp: { event: "permission", id: "p1", call_id: "c1", tool: "Bash", arguments: { command: "make" }, why: "asks", danger: false, rule: null } },
+      { strata_mcp: { event: "answered", id: "p1", call_id: "c1", answer: "allow" } },
+      { strata_mcp: { event: "start", id: "c2", name: "AskUserQuestion" } }, { strata_mcp: { event: "call", id: "c2", name: "AskUserQuestion", server: "agent", tool: "AskUserQuestion", arguments: { questions }, round: 1 } },
+      { strata_mcp: { event: "question", id: "q1", call_id: "c2", questions } },
+      { strata_mcp: { event: "question_answered", id: "q1", call_id: "c2", answers: { "Which?": ["b"] } } },
+      ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("go", [], ctx)
+    const [bash, ask] = c.messages[1].tools!
+    expect(bash.ask?.answer).toBe("allow")
+    expect(bash.state === "asking").toBe(false)
+    expect(ask.question?.answers).toEqual({ "Which?": ["b"] })
+    expect(ask.state === "asking").toBe(false)
+  })
+
+  test("an answer that is not one, or for a card that is not there, is ignored", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(
+      { strata_mcp: { event: "start", id: "c1", name: "Bash" } }, { strata_mcp: { event: "call", id: "c1", name: "Bash", server: "agent", tool: "Bash", arguments: { command: "make" }, round: 1 } },
+      { strata_mcp: { event: "permission", id: "p1", call_id: "c1", tool: "Bash", arguments: {}, why: "asks", danger: false, rule: null } },
+      { strata_mcp: { event: "answered", id: "p1", answer: "maybe" } }, { strata_mcp: { event: "answered", id: "nobody", answer: "allow" } },
+      ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("go", [], ctx)
+    expect(c.messages[1].tools![0].ask?.answer).toBeUndefined()
+  })
+})
+

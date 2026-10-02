@@ -145,6 +145,6 @@ def _forward(parent, e: dict) -> int:
     if ev == "result":
         parent._emit({"event": "step_result", "id": e.get("id"), "ok": bool(e.get("ok")), "chars": e.get("chars"), "text": str(e.get("text") or "")[:300]})
         return 0
-    if ev in ("permission", "judging", "judged", "hook"):
+    if ev in ("permission", "answered", "judging", "judged", "hook"):
         parent._emit({k: v for k, v in e.items() if k != "call_id"})            # on the Task call: where the page shows what the helper asks
     return 0

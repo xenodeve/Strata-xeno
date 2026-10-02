@@ -8,7 +8,7 @@ export const NO_AGENT: AgentInfo = { available: false, allowed: false, shell: nu
 export type AgentMode = "ask" | "plan" | "auto"
 export const MODES: AgentMode[] = ["ask", "plan", "auto"]
 
-export interface AgentRequest { cwd?: string; dirs?: string[]; mode: AgentMode; session: string; allow: string[]; deny?: string[]; checkpoint?: string }
+export interface AgentRequest { cwd?: string; dirs?: string[]; mode: AgentMode; session: string; allow: string[]; deny?: string[]; checkpoint?: string; run?: string }
 
 /** What a request says: `strata_agent` when the coding tools are on (the default), reachable from here and the server has them; else nothing.
  *  An unknown mode is the default one (the server also ignores it). */

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { rootOf } from "./api"
-import { gpuDesign, latticePattern, nextDesign, ORB_DESIGNS, phaseKind, replyDesign, serverDesign, toolDesign } from "./orbs"
+import { afterToolStep, gpuDesign, latticePattern, nextDesign, ORB_DESIGNS, phaseKind, replyDesign, serverDesign, toolDesign } from "./orbs"
 import { clientName } from "./format"
 import { promptSplit } from "./metrics"
 import { apiMessages, type Message } from "./chat"
@@ -230,5 +230,15 @@ describe("which orb says what", () => {
     expect(latticePattern("connecting")).toBe("snake")
     expect(latticePattern("weaving")).toBe("spiral")
     expect(latticePattern(null)).toBe("orbit")
+  })
+})
+
+describe("afterToolStep: what an agent does once a tool has answered", () => {
+  test("it reads the tool's result until the model begins to write, and then it plans the next step", () => {
+    expect(afterToolStep("reading")).toBe("reading")
+    expect(afterToolStep("idle")).toBe("reading")                 // the next request has not begun yet
+    expect(afterToolStep(undefined)).toBe("reading")
+    expect(afterToolStep(null)).toBe("reading")
+    expect(afterToolStep("generating")).toBe("planning")
   })
 })

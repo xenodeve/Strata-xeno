@@ -34,6 +34,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -59,7 +60,7 @@ from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's la
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
 from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
-from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, shell as shell_mod, subagent as subagent_mod, web as web_mod  # noqa: E402
+from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, runs as runs_mod, shell as shell_mod, subagent as subagent_mod, web as web_mod  # noqa: E402
 from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -859,6 +860,7 @@ class Service:
         self.importer = None                             # serve/harness.py's Importer: the other coding apps' skills and MCP servers (#94)
         self.agent = None                                # serve/agent.py's AgentServer: the chat's coding tools (Read, Write, Edit, Bash, ...); None: switched off
         self.broker = agent_run.Broker()                 # the questions the coding tools have asked the page and not had answered yet
+        self.runs = runs_mod.RunStore()                  # the answers that use the coding tools: they go on when the page that asked is refreshed or closed (serve/runs.py)
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
@@ -2218,6 +2220,26 @@ def make_handler(svc: Service):
                     self._json(200, {**subagent_mod.settings(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "helper_tools", ())), "editable": bool(svc.config_path),
                                      "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
                 return
+            if path == "/agent/run":
+                # a run that went on while the page was away (serve/runs.py): its events from number `from` on, as they come; only for who may use the coding tools
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    origin = self.headers.get("Origin")
+                    if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
+                        return self._json(403, {"error": {"message": "a run can be read only from Strata's own page"}})
+                    q = parse_qs(urlsplit(self.path).query)
+                    run = svc.runs.get(q.get("id", [""])[0])
+                    if run is None:
+                        return self._json(404, {"error": {"message": "there is no such run (it ended long ago, or the server was restarted)"}})
+                    try:
+                        start = int(q.get("from", ["0"])[0])
+                    except ValueError:
+                        return self._json(400, {"error": {"message": "from is a number"}})
+                    self._sse()
+                    self._follow(run, start)
+                return
             if path == "/agent/web":
                 # web access (serve/web.py): off by default; only who may use the coding tools sees the settings
                 if self._authorized():
@@ -2408,6 +2430,21 @@ def make_handler(svc: Service):
                 if body.get("apply") is True:
                     return self._json(200, svc.checkpoints.apply(body["session"], body["checkpoint"], body.get("include_changed") is True))
                 return self._json(200, svc.checkpoints.preview(body["session"], body["checkpoint"]))
+            if path == "/agent/cancel":                      # the user's Stop for an answer that runs on its own (serve/runs.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
+                if not self._own_page("A run can be stopped"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict) or not isinstance(body.get("id"), str):
+                    return self._json(400, {"error": {"message": "send {\"id\": the run's id}"}})
+                return self._json(200, {"ok": True, "found": svc.runs.cancel(body["id"])})
             if path == "/agent/question":                    # the page's answer to a question the model asked with AskUserQuestion (serve/agent_run.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 50_000 else b""
@@ -2683,6 +2720,15 @@ def make_handler(svc: Service):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
 
+        def _follow(self, run, start: int = 0):
+            """Send a run's stream from event `start` on, as it grows.  A page that goes away ends only this reading: the run goes on (serve/runs.py)."""
+            try:
+                for ev in run.follow(start):
+                    self.wfile.write(b": keep-alive\n\n" if ev is None else ev)
+                    self.wfile.flush()
+            except OSError:
+                pass
+
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             skill = req.get("strata_skill")                       # the web app's "/name": that skill is loaded here, not left for the model to ask for
@@ -2736,6 +2782,17 @@ def make_handler(svc: Service):
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}, arun) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
+            rid = sa.get("run") if isinstance(sa, dict) else None
+            if arun is not None and req.get("stream") and isinstance(rid, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,64}", rid):
+                def describe(e):
+                    if isinstance(e, EngineDied):
+                        return {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                    return {"error": {"type": "server_error", "message": str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"}}
+                buf = svc.runs.launch(rid, chunks, cancel, describe)             # the answer is written on its own thread: a refresh of the page does not stop it
+                if buf is None:
+                    return self._json(409, {"error": {"message": "there is a run with that id already"}})
+                self._sse()
+                return self._follow(buf, 0)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()

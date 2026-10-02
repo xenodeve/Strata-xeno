@@ -12,7 +12,7 @@ import { addRule, agentRequest, NO_AGENT, rulesOf, type AgentInfo } from "./agen
 import { addPerm, forgetPerms, permsFor, type Effect, type Scope } from "./perms"
 import { forgetCheckpoints } from "./rewind"
 import { noteFrom, type HookNote } from "./hooks"
-import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, saveBackground, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
+import { slotKey, addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, saveBackground, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
 
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
 export interface Ask { id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny"; kept?: { scope: "project" | "everywhere"; effect: Effect } }
@@ -139,7 +139,7 @@ export function apiMessages(messages: Message[]): ApiMessage[] {
 interface ToolEvent {
   event: string; id: string; name: string; server?: string; tool?: string; arguments?: unknown; round?: number
   text?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number; skipped?: boolean; max_rounds?: number
-  state?: string; kind?: string; description?: string; steps?: number
+  state?: string; kind?: string; description?: string; steps?: number; answer?: string; answers?: unknown
   on?: string; hook?: string; command?: string; code?: number | null; blocked?: boolean; timeout?: boolean; error?: string | null
   call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string; questions?: AskedQuestion["questions"]      // the coding tools
 }
@@ -148,6 +148,13 @@ interface ToolEvent {
 function onTool(m: Message, x: ToolEvent) {
   if (x.event === "limit") { m.limit = x.max_rounds; return }
   if (x.event === "todos") { if (Array.isArray(x.todos)) m.todos = x.todos; return }
+  if (x.event === "answered" || x.event === "question_answered") {                           // a question was answered (by this page, or by another one before a refresh): read again, a card is not left waiting
+    for (const c of m.tools || []) {
+      if (x.event === "answered" && c.ask?.id === x.id && !c.ask.answer && (x.answer === "allow" || x.answer === "allow_chat" || x.answer === "deny")) { c.ask.answer = x.answer; if (c.state === "asking") c.state = "running" }
+      if (x.event === "question_answered" && c.question?.id === x.id && c.question.answers === undefined) { c.question.answers = (x.answers as Record<string, string[]> | null | undefined) ?? null; if (c.state === "asking") c.state = "running" }
+    }
+    return
+  }
   if (x.event === "helper" || x.event === "step" || x.event === "step_result") {            // a helper's work, on the Task call it belongs to
     const c = (m.tools || []).find((y) => y.id === x.call_id)
     if (!c) return
@@ -246,7 +253,28 @@ export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: b
 
 /** An answer that is being written (or a conversation that is being summarised) for one conversation. Several can run at once, each for its own conversation: the page shows one,
  *  and the others go on in the background (the server takes their requests one after the other). `messages` is the live list of that conversation. */
-interface Run { abort: AbortController; msg: Message; messages: Message[]; meter: PrefillMeter | null; compacting: boolean }
+interface Run { abort: AbortController; msg: Message; messages: Message[]; meter: PrefillMeter | null; compacting: boolean; runId?: string }
+
+/** An answer that uses the coding tools goes on in the server when the page is refreshed or closed: what is needed to read it again when the page is back (serve/runs.py). */
+export interface PendingRun { run: string; prompt: string; time: number }
+const PENDING_KEY = "runs"
+export const pendingRuns = (): Record<string, PendingRun> => {
+  const raw = store.get<unknown>(PENDING_KEY, {})
+  const out: Record<string, PendingRun> = {}
+  if (!raw || typeof raw !== "object") return out
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const r = v as Partial<PendingRun> | null
+    if (r && typeof r.run === "string" && typeof r.prompt === "string" && typeof r.time === "number") out[k] = { run: r.run, prompt: r.prompt, time: r.time }
+  }
+  return out
+}
+const setPending = (key: string, rec: PendingRun | null) => {
+  const all = pendingRuns()
+  if (rec) all[key] = rec
+  else delete all[key]
+  store.set(PENDING_KEY, all)
+}
+const newRunId = (): string => (globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`).replace(/[^A-Za-z0-9_-]/g, "")
 /** A message typed while the conversation was answering: it waits, and is sent when the answer ends. */
 export interface Queued { id: string; text: string; files: Attachment[]; ctx: SendContext }
 const MAX_QUEUED = 20
@@ -422,7 +450,14 @@ export class ChatController {
   /** The main folder: where commands run. */
   folder(): string | null { return this.folders()[0] ?? null }
 
-  stop() { this.busy?.abort.abort() }
+  stop() {
+    const run = this.runs.get(this.index.active ?? NEW_KEY)
+    if (run?.runId) void fetch(url("agent/cancel"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify({ id: run.runId }) }).catch(() => {})       // the answer goes on in the server when the page goes: Stop says so
+    run?.abort.abort()
+  }
+  /** True once the page is being left (refreshed or closed): a read that is cut then is not a failure, the answer goes on in the server. */
+  private leaving = false
+  constructor() { if (typeof window !== "undefined") window.addEventListener("pagehide", () => { this.leaving = true }) }
 
   // ------------------------------------------------------------------------------------------------ compacting (lib/compact.ts)
   /** How many tokens the conversation uses: what the last answer reported (its prompt after every tool round, and its own tokens), else a guess from the text. */
@@ -663,13 +698,52 @@ export class ChatController {
     const lastPrompt = [...conv].reverse().find((x) => x.role === "user")
     const skill = lastPrompt ? skillOfMessage(lastPrompt.text, ctx.skills ?? []) : null
     if (skill) body.strata_skill = skill                                   // "/name": the server loads that skill for this message
+    if (body.strata_agent && id !== NEW_KEY) {                             // an answer with the coding tools goes on in the server if the page is refreshed: it is read again by this id
+      run.runId = newRunId()
+      ;(body.strata_agent as { run?: string }).run = run.runId
+      setPending(id, { run: run.runId, prompt: String(um.time), time: m.time })
+    }
 
+    await this.stream(id, run, conv, m, um, () => fetch(url("v1/chat/completions"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body), signal: abort.signal }), ctx, false)
+  }
+
+  /** Answers that were being written when the page was refreshed or closed went on in the server: each is read again from its start, so that the conversation looks as it would have and goes on being used. */
+  async resumeRuns(): Promise<void> {
+    const reading: Promise<void>[] = []
+    for (const [key, rec] of Object.entries(pendingRuns())) {
+      if (this.runs.has(key)) continue
+      if (!this.index.items.some((i) => i.id === key)) { setPending(key, null); continue }
+      reading.push(this.resume(key, rec))
+    }
+    await Promise.all(reading)
+  }
+  private async resume(key: string, rec: PendingRun) {
+    const open = key === this.index.active
+    const conv = open ? this.messages : restore(store.get<Message[]>(slotKey(key), []))
+    const um = [...conv].reverse().find((x) => x.role === "user")
+    if (!um || String(um.time) !== rec.prompt || conv[conv.length - 1] !== um) { setPending(key, null); return }       // not the conversation it was (it was changed from another tab, or deleted)
+    const m: Message = { role: "assistant", text: "", reasoning: "", time: rec.time }
+    conv.push(m)
+    const abort = new AbortController()
+    const run: Run = { abort, msg: m, messages: conv, meter: null, compacting: false, runId: rec.run }
+    this.runs.set(key, run)
+    this.notify()
+    await this.stream(key, run, conv, m, um, async () => {
+      const r = await fetch(url(`agent/run?id=${encodeURIComponent(rec.run)}&from=0`), { headers: apiHeaders(), signal: abort.signal })
+      if (r.status === 404) throw new Error(t("This answer could not be recovered: the server no longer has it (it was restarted, or it ended long ago). Your message is kept; send it again."))
+      return r
+    }, null, true)
+  }
+
+  /** Reads an answer's stream into `m` - a request just sent, or a run that went on in the server while the page was away - and settles the conversation when it ends. */
+  private async stream(id: string, run: Run, conv: Message[], m: Message, um: Message, open: () => Promise<Response>, ctx: SendContext | null, resumed: boolean) {
+    const s = this.settings
     let firstAt: number | null = null
     let thinkStart: number | null = null
     let usage: { completion_tokens?: number; prompt_tokens?: number } | null = null
     let timings: { prompt_n?: number; prompt_per_second?: number | null; cache_n?: number } | null = null
     try {
-      const r = await fetch(url("v1/chat/completions"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body), signal: abort.signal })
+      const r = await open()
       if (!r.ok) throw new Error(await errorMessage(r))
       const reader = r.body!.getReader()
       const dec = new TextDecoder()
@@ -713,8 +787,9 @@ export class ChatController {
       }
     } catch (e) {
       const err = e as Error
+      if (this.leaving) return                                  // the page is being left: the answer goes on in the server, and the page reads it again when it is back
       if (err.name === "AbortError") m.stopped = true
-      else { m.error = err.message || String(err); this.onError(t("The request failed"), m.error) }
+      else { m.error = err.message || String(err); if (!resumed) this.onError(t("The request failed"), m.error) }
     }
     if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000
     // The read is over: the engine's own mean replaces the live speed. After a tool round the final timings are the last
@@ -729,9 +804,9 @@ export class ChatController {
     if (n && firstAt) {
       const secs = (performance.now() - firstAt) / 1000
       stats.tokens = n
-      if (secs > 0.25) stats.tokS = n / secs
+      if (secs > 0.25 && !resumed) stats.tokS = n / secs                      // read again from the start, its speed is not what it was written at
       if (m.stopped) stats.stopped = true
-      if (ctx.projectionLoaded) stats.projection = s.esp ? "on" : "off"
+      if (ctx?.projectionLoaded) stats.projection = s.esp ? "on" : "off"
     } else if (m.stopped) {
       stats.stopped = true
     }
@@ -742,6 +817,7 @@ export class ChatController {
     if (m.limit) stats.limit = m.limit
     if (Object.keys(stats).length) m.stats = stats
     this.runs.delete(id)
+    setPending(id, null)
     if (this.frame) { cancelAnimationFrame(this.frame); this.frame = 0 }
     if (this.index.active === id || id === NEW_KEY) this.save()
     else {                                                    // another conversation is open: this one is saved in its own place
