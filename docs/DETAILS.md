@@ -537,6 +537,12 @@ writes there.
   A skill's files are read inside the skill's own folder only (no `..`, no links out, no hidden files or keys, text under 100 KB).
   A skill may tell the model to run a script: Strata has no shell of its own, so that works only if you import and enable a shell
   MCP server (the model decides when to call tools, as with any MCP server).
+- **`/` in the chat picks a skill, like Claude Code's slash commands.** Typing `/` at the very start of the message lists the skills
+  in use (type more to narrow the list; arrow keys and Enter or Tab, or a click, pick one; Escape closes it). A message that starts
+  with `/name` of a skill in use makes the page send `strata_skill: "name"`; the server then loads that skill itself (the same text
+  `use_skill` gives, behind the same folder fence) and puts it in front of that message, so it does not depend on the model asking for
+  it. The message is shown and stored as typed. Only that message gets the skill: a later plain one does not repeat it. A name that
+  is not a skill in use, or one switched off since, is refused with 400 and its name; the request must come from Strata's own page.
 - **MCP servers are listed by app and imported by a click** (Settings > Import > MCP servers): nothing is started until you press
   **Import** on one. Import copies the server (with its environment variables and headers, on the server: they never go to the
   browser) into Strata's own `mcp_servers`; from then on it is an ordinary server of Strata's (Settings > MCP tools > Servers), which

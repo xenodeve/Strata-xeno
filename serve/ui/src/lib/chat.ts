@@ -6,6 +6,7 @@ import { fmt } from "./format"
 import { store } from "./store"
 import { PrefillMeter, type Prefill } from "./prefill"
 import { t, tn } from "./i18n"
+import { skillOfMessage } from "./slash"
 import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, type SessionIndex, type StoredMessage } from "./sessions"
 
 export interface ToolCall {
@@ -147,7 +148,7 @@ function restore(msgs: Message[]): Message[] {
   return msgs.map((m) => (m.prefill?.state === "reading" ? { ...m, prefill: { ...m.prefill, state: "done" as const, rate: null } } : m))
 }
 
-export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean }
+export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[] }      // skills: the names of the skills in use, for "/name"
 
 export class ChatController {
   // a read that was cut off by closing the page is not still reading
@@ -318,6 +319,9 @@ export class ChatController {
     if (s.max) body.max_tokens = +s.max
     if (ctx.projectionLoaded) body.experimental_speed_projection = !!s.esp
     Object.assign(body, mcpRequest(s, ctx.mcp))                            // this server may run MCP tools for it (the ones not switched off)
+    const lastPrompt = [...this.messages].reverse().find((x) => x.role === "user")
+    const skill = lastPrompt ? skillOfMessage(lastPrompt.text, ctx.skills ?? []) : null
+    if (skill) body.strata_skill = skill                                   // "/name": the server loads that skill for this message
 
     let firstAt: number | null = null
     let thinkStart: number | null = null

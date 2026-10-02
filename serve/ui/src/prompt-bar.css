@@ -159,6 +159,28 @@
 .prompt-bar__row-state { flex: none; padding: 1px 7px; border-radius: 999px; background: var(--pb-hover); color: var(--pb-muted); font-size: 11px; line-height: 16px; }
 .prompt-bar__row-state[data-on] { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
 
+/* "/" at the start of the message: the skills in use, in the same panel as the other menus, scrolling inside itself when there are many */
+.prompt-bar__menu[data-kind="slash"] { max-height: min(40vh, 320px); overflow-y: auto; overscroll-behavior: contain; }
+.prompt-bar__skill {
+  display: flex; align-items: baseline; gap: 10px; width: 100%; min-height: 36px; padding: 7px 10px; border: 0; border-radius: 9px;
+  background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; outline: none; -webkit-tap-highlight-color: transparent;
+}
+.prompt-bar__skill[aria-selected="true"] { background: var(--pb-hover); }
+.prompt-bar__skill-name { flex: none; font-size: 13px; font-weight: 500; }
+.prompt-bar__skill-desc { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--pb-muted); font-size: 12px; white-space: nowrap; text-overflow: ellipsis; }
+
+/* the message starts with /name of a skill in use: that word is bold. The text typed stays in the textarea (transparent); a copy of it sits
+   exactly under, with the word marked. The mark is a stroke, not a heavier face, so no letter changes its width and the caret stays true. */
+.prompt-bar__inputwrap { position: relative; }
+.prompt-bar__mirror {
+  position: absolute; inset: 0; max-height: 40dvh; overflow-x: hidden; overflow-y: auto; pointer-events: none; white-space: pre-wrap; overflow-wrap: anywhere;
+  font: inherit; font-size: 15px; line-height: 24px; letter-spacing: -0.011em; color: inherit;
+}
+@media (pointer: coarse) { .prompt-bar__mirror { font-size: 16px; } }
+.prompt-bar__mark { -webkit-text-stroke: 0.55px currentColor; }
+.prompt-bar__inputwrap[data-marked] .prompt-bar__input { color: transparent; caret-color: var(--pb-ink); }
+.prompt-bar__menu[data-kind="tip"] { right: auto; width: max-content; max-width: min(320px, 100%); padding: 8px 12px; pointer-events: none; font-size: 12px; line-height: 1.4; transform-origin: bottom left; }
+
 /* the MCP list: opened from the + menu's MCP row, one block per server with its tools and its own switch */
 .prompt-bar__menu[data-kind="mcp"] { right: auto; width: min(380px, 100%); max-height: min(62vh, 460px); overflow-y: auto; padding: 10px 14px 12px; transform-origin: bottom left; }
 .prompt-bar__mcp-head { display: flex; align-items: center; gap: 8px; font-size: 13px; line-height: 20px; }

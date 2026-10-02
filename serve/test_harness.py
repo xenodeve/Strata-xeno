@@ -683,6 +683,58 @@ class SkillsInTheChat(Fixture):
         self.assertNotIn("pdf-tools", self.engine.prompt_text(0))
         self.assertIn("plugin-skill", self.engine.prompt_text(0))
 
+    # ---- "/name" in the chat: the page sends `strata_skill`, and the server loads that skill itself (the model need not ask for it)
+    def post_raw(self, body):
+        body = {"model": "m", "messages": [{"role": "user", "content": "make a pdf"}], "stream": True, **body}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def test_a_skill_named_by_the_page_is_in_the_prompt_before_the_message(self):
+        self.start("</think>\n\nok")
+        code, _ = self.post_raw({"strata_skill": "pdf-tools"})
+        self.assertEqual(code, 200)
+        prompt = self.engine.prompt_text(0)
+        self.assertIn("# Body\nsteps", prompt)                              # the skill's own text, with no tool call by the model
+        self.assertIn("pdf-tools", prompt)
+        self.assertLess(prompt.index("# Body\nsteps"), prompt.index("make a pdf"))      # in front of what the user asked
+
+    def test_without_a_skill_named_the_prompt_has_no_skill_text(self):
+        self.start("</think>\n\nok")
+        self.post_raw({})
+        self.assertNotIn("# Body", self.engine.prompt_text(0))
+
+    def test_a_skill_that_does_not_exist_or_is_switched_off_is_refused_by_name(self):
+        self.imp.apply({"import": {"skills": {"off": {"claude": ["pdf-tools"]}}}})
+        self.start("</think>\n\nok")
+        for name in ("pdf-tools", "nope"):
+            code, text = self.post_raw({"strata_skill": name})
+            self.assertEqual(code, 400, name)
+            self.assertIn(name, text)
+        self.assertEqual(self.engine.prompts, [])                           # nothing was run
+
+    def test_only_a_text_name_counts_and_a_foreign_page_may_not_ask(self):
+        self.start("</think>\n\nok", "</think>\n\nok", "</think>\n\nok", "</think>\n\nok")
+        for odd in (5, ["pdf-tools"], {"a": 1}, True):
+            code, _ = self.post_raw({"strata_skill": odd})
+            self.assertEqual(code, 200)
+        self.assertNotIn("# Body", self.engine.prompt_text(0))
+        req = urllib.request.Request(self.base + "/v1/chat/completions", method="POST", headers={"Content-Type": "application/json", "Origin": "http://evil.example"},
+                                     data=json.dumps({"model": "m", "messages": [{"role": "user", "content": "x"}], "strata_skill": "pdf-tools"}).encode())
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=30)
+        self.assertEqual(cm.exception.code, 403)
+
+    def test_a_skill_named_by_the_page_and_the_tools_work_together(self):
+        self.start(tool_call("skills__use_skill", name="plugin-skill"), "</think>\n\nok")
+        code, _ = self.post_raw({"strata_skill": "pdf-tools", "strata_mcp": True})
+        self.assertEqual(code, 200)
+        self.assertIn("# Body\nsteps", self.engine.prompt_text(0))
+        self.assertEqual(len(self.engine.prompts), 2)
+
 
 class ImportEndpoints(Fixture):
     def setUp(self):

@@ -5,6 +5,8 @@ import {
 } from "@hugeicons/core-free-icons"
 import { msg, t } from "../lib/i18n"
 import type { McpServer } from "../lib/api"
+import { markOf, matchCommands, pickCommand, slashQuery, type Command } from "../lib/slash"
+import { SkillCard } from "./SkillTip"
 import { MiniSwitch } from "./ui"
 
 // The composer: the field, and one bar of tools under it. Adapted from React Bits' PromptBar (MIT + Commons Clause: used
@@ -76,6 +78,7 @@ export interface PromptBarProps {
   onNewChat: () => void
   onSave: () => void
   onSampling: () => void
+  skills: Command[]                          // the skills in use: "/" at the start of the message lists them, to be picked by name
   mcp: { servers: McpServer[]; tools: number; on: boolean; off: string[]; onToggleAll: () => void; onToggleServer: (name: string) => void; setupHref: string }      // the MCP tools: a row in the + menu that opens the list of servers, each with its tools and its own switch
   efforts: string[]
   effort: number
@@ -98,6 +101,12 @@ export function PromptBar(p: PromptBarProps) {
   const [focused, setFocused] = useState(false)
   const [visible, setVisible] = useState(() => typeof document === "undefined" || !document.hidden)
   const [pressed, setPressed] = useState(false)
+  const [caret, setCaret] = useState(0)
+  const [slashAt, setSlashAt] = useState(0)                      // the mark in the list of skills
+  const [shut, setShut] = useState<string | null>(null)          // the text at which Escape closed the list: it stays closed until the text changes
+  const skillRows = useRef<(HTMLButtonElement | null)[]>([])
+  const mirror = useRef<HTMLDivElement>(null)
+  const [tipAt, setTipAt] = useState<number | null>(null)       // pointing at the marked command: where its card goes (from the left of the bar)
 
   const usable = (x: McpServer) => x.tools.length > 0 && (x.status === "ready" || x.status === "stopped")       // a server that is up and offers tools can be switched
   const mcpOn = p.mcp.on ? p.mcp.servers.filter((x) => usable(x) && !p.mcp.off.includes(x.name)).length : 0
@@ -118,6 +127,26 @@ export function PromptBar(p: PromptBarProps) {
   const maxed = p.efforts.length > 1 && p.effort === p.efforts.length - 1
   const sparking = maxed && focused && !p.busy && visible && !reduced()
 
+  const query = slashQuery(p.value, caret)
+  const found = query !== null && p.skills.length > 0 ? matchCommands(p.skills, query) : []
+  const slashOpen = found.length > 0 && shut !== p.value && menu === null
+  const slashMark = Math.min(slashAt, Math.max(0, found.length - 1))
+  const marked = markOf(p.value, p.skills)                       // the message starts with /name of a skill in use: that word is shown in bold
+  const pointAt = (e: { clientX: number; clientY: number }) => {
+    const m = mirror.current?.querySelector("[data-mark]"), r = root.current?.getBoundingClientRect()
+    const b = m?.getBoundingClientRect()
+    if (!m || !r || !b) { setTipAt(null); return }
+    const on = e.clientX >= b.left && e.clientX <= b.right && e.clientY >= b.top && e.clientY <= b.bottom
+    setTipAt(on ? Math.max(0, b.left - r.left) : null)
+  }
+  useEffect(() => { if (slashOpen) skillRows.current[slashMark]?.scrollIntoView({ block: "nearest" }) }, [slashOpen, slashMark])
+  const pickSkill = (name: string) => {
+    const r = pickCommand(p.value, name)
+    p.onChange(r.text)
+    setCaret(r.caret)
+    setSlashAt(0)
+    requestAnimationFrame(() => { const el = p.inputRef.current; if (el) { el.focus({ preventScroll: true }); el.setSelectionRange(r.caret, r.caret) } })
+  }
   const closeMenu = useCallback(() => setMenu(null), [])
   const focusInput = () => p.inputRef.current?.focus({ preventScroll: true })
   // Focus first, then set the menu: giving the field focus closes menus (its onFocus), so the order matters when the field did not have it.
@@ -239,6 +268,11 @@ export function PromptBar(p: PromptBarProps) {
   }
 
   const onKeyDown = (e: RKeyEvent<HTMLTextAreaElement>) => {
+    if (slashOpen && !e.nativeEvent.isComposing) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); setSlashAt((slashMark + (e.key === "ArrowDown" ? 1 : found.length - 1)) % found.length); return }
+      if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") { e.preventDefault(); pickSkill(found[slashMark].name); return }
+      if (e.key === "Escape") { e.preventDefault(); setShut(p.value); return }
+    }
     if (menu === "plus") {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); setActive((cursor + (e.key === "ArrowDown" ? 1 : list.length - 1)) % list.length); return }
       if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") { e.preventDefault(); if (!list[cursor].disabled) runRow(list[cursor].key); return }
@@ -250,6 +284,34 @@ export function PromptBar(p: PromptBarProps) {
   return (
     <div ref={root} className="prompt-bar" data-busy={p.busy ? "" : undefined}>
       {p.children}
+      {slashOpen && (
+        <div className="prompt-bar__menu" data-kind="slash" role="listbox" aria-label={t("Skills")}>
+          {found.map((c, i) => (
+            <button
+              key={c.name}
+              ref={(el) => { skillRows.current[i] = el }}
+              type="button"
+              role="option"
+              aria-selected={i === slashMark}
+              data-skill={c.name}
+              className="prompt-bar__skill"
+              onMouseDown={(e) => e.preventDefault()}
+              onPointerEnter={() => setSlashAt(i)}
+              onClick={() => pickSkill(c.name)}
+            >
+              <span className="prompt-bar__skill-name">/{c.name}</span>
+              <span className="prompt-bar__skill-desc">{c.description}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {marked && tipAt !== null && !slashOpen && (
+        <div className="prompt-bar__menu" data-kind="tip" role="tooltip" style={{ left: tipAt }}>
+          <SkillCard cmd={marked.cmd} />
+        </div>
+      )}
+
       {menu === "mcp" && (
         <div className="prompt-bar__menu" role="dialog" aria-label={t("MCP tools")} data-kind="mcp">
           <div className="prompt-bar__mcp-head">
@@ -351,6 +413,12 @@ export function PromptBar(p: PromptBarProps) {
           </div>
         )}
 
+        <div className="prompt-bar__inputwrap" data-marked={marked ? "" : undefined}>
+        {marked && (
+          <div ref={mirror} className="prompt-bar__mirror" aria-hidden>
+            {p.value.slice(0, marked.at)}<span className="prompt-bar__mark" data-mark>{p.value.slice(marked.at, marked.end)}</span>{p.value.slice(marked.end)}{"\n"}
+          </div>
+        )}
         <textarea
           ref={p.inputRef}
           className="prompt-bar__input"
@@ -360,14 +428,22 @@ export function PromptBar(p: PromptBarProps) {
           aria-label={t("Message")}
           onChange={(e) => {
             p.onChange(e.target.value)
+            setCaret(e.target.selectionStart ?? e.target.value.length)
+            setSlashAt(0)
+            setShut(null)
             typing.current.energy = Math.min(1.6, typing.current.energy + 0.22)
             typing.current.strokes = Math.min(4, typing.current.strokes + 1)
             closeMenu()
             setActive(0)
           }}
           onFocus={closeMenu}
+          onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
+          onScroll={(e) => { if (mirror.current) mirror.current.scrollTop = e.currentTarget.scrollTop }}
+          onMouseMove={pointAt}
+          onMouseLeave={() => setTipAt(null)}
           onKeyDown={onKeyDown}
         />
+        </div>
 
         <div className="prompt-bar__bar">
           {/* the button is the menu: it grows into the panel and closes back into the button (transitions.dev "Plus to menu morph") */}

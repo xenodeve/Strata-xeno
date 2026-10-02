@@ -211,3 +211,16 @@ class SkillsServer:
                 if len(out) >= MAX_LISTED:
                     return out
         return out
+
+
+def invoked(name: str, text: str) -> str:
+    """What the model is told when the user typed `/name` in the page's chat: the skill's instructions, as the user's own choice."""
+    return (f'The user invoked the skill "{name}" with a slash command in their message. Follow these instructions for their request.\n\n'
+            f"{text}")
+
+
+def put_before_last_user(messages: list, note: str) -> list:
+    """A copy of the request's messages with `note` as a system message in front of the last user message (so the conversation before it
+    keeps its place in the cache); at the end when there is no user message."""
+    at = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], dict) and messages[i].get("role") == "user"), len(messages))
+    return [*messages[:at], {"role": "system", "content": note}, *messages[at:]]

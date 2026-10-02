@@ -278,6 +278,33 @@ describe("which MCP servers a request uses", () => {
   })
 })
 
+// "/name" in the prompt (a skill in use) makes the request ask the server to load that skill.
+describe("a message that starts with a skill's name", () => {
+  const ok = () => sse(delta({ content: "ok" }), "data: [DONE]\n\n")
+  test("names the skill in the request when it is one in use", async () => {
+    const seen: Record<string, unknown>[] = []
+    mockFetch([ok()], seen)
+    await new ChatController().send("/tdd write the tests", [], { ...ctx, skills: ["tdd", "pdf-tools"] })
+    expect(seen[0].strata_skill).toBe("tdd")
+  })
+  test("does not when the name is not a skill in use, or the page has no list of skills", async () => {
+    const seen: Record<string, unknown>[] = []
+    mockFetch([ok(), ok(), ok()], seen)
+    await new ChatController().send("/nope hi", [], { ...ctx, skills: ["tdd"] })
+    await new ChatController().send("/tdd hi", [], ctx)
+    await new ChatController().send("/tdd hi", [], { ...ctx, skills: [] })
+    expect(seen.map((b) => "strata_skill" in b)).toEqual([false, false, false])
+  })
+  test("only the last prompt counts: a later plain one does not ask again", async () => {
+    const seen: Record<string, unknown>[] = []
+    mockFetch([ok(), ok()], seen)
+    const c = new ChatController()
+    await c.send("/tdd write the tests", [], { ...ctx, skills: ["tdd"] })
+    await c.send("and then?", [], { ...ctx, skills: ["tdd"] })
+    expect([seen[0].strata_skill, "strata_skill" in seen[1]]).toEqual(["tdd", false])
+  })
+})
+
 // Many conversations (issue #92) through the controller, over a localStorage that really keeps things.
 describe("conversations", () => {
   function keep(limit = Infinity) {

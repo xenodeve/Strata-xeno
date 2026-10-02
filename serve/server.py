@@ -58,6 +58,7 @@ from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
 from serve import harness, mcp_admin  # noqa: E402
+from serve import skills as skills_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -2328,6 +2329,15 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            skill = req.get("strata_skill")                       # the web app's "/name": that skill is loaded here, not left for the model to ask for
+            if isinstance(skill, str):                            # anything but a name is ignored
+                if not self._own_page("A skill can be used"):
+                    return
+                hub = svc.mcp.servers.get("skills") if svc.mcp is not None else None
+                got = hub.call("use_skill", {"name": skill}) if hub is not None else None
+                if got is None or got.get("isError"):
+                    return self._json(400, {"error": {"message": f"there is no skill named {skill!r} (it may be switched off in Settings > Import)"}})
+                req = {**req, "messages": skills_mod.put_before_last_user(req.get("messages") or [], skills_mod.invoked(skill, got["content"][0]["text"]))}
             messages, tools, kw = openai_to_messages(req)
             req = svc.cjk(req, messages)                                # xeno #49 S4
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest

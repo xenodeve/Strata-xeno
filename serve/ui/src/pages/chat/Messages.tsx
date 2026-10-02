@@ -16,6 +16,7 @@ import { takeSend } from "../../lib/sendfx"
 import { ReasonStream } from "../../components/reason"
 import { Pop } from "../../components/pop"
 import { Spin } from "../../components/spin"
+import { SkillText } from "../../components/SkillTip"
 import { msg, t } from "../../lib/i18n"
 
 const TOOL_STATE: Record<ToolCall["state"], string> = { writing: msg("Writing"), running: msg("Running"), done: msg("Done"), error: msg("Error"), skipped: msg("Not run") }
@@ -187,7 +188,7 @@ export function MessageView({ m, streaming, show, prefill, actions, serverPhase 
           <Fit className="flex w-full justify-end">
             {editing && actions
               ? <PromptEditor text={m.text} last={actions.last} onCancel={() => setEditing(false)} onSend={(t) => { setEditing(false); actions.onEdit(t) }} />
-              : <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] [overflow-wrap:anywhere]">{m.text}</div>}
+              : <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] [overflow-wrap:anywhere]"><SkillText text={m.text} /></div>}
           </Fit>
         )}
         <div className="num flex items-center gap-1 px-1 text-[12px] text-ink-3">

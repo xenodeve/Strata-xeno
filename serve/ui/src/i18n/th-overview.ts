@@ -226,4 +226,6 @@ export const part: Record<string, string> = {
   "It is not a server entry.": "ไม่ใช่รายการ server",
   "Skills": "Skill",
   "Skills of {name}": "Skill ของ {name}",
+  "Skill from {app}": "Skill จาก {app}",
+  "Skill from {app} · plugin {plugin}": "Skill จาก {app} · ปลั๊กอิน {plugin}",
 }
