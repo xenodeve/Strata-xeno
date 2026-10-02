@@ -945,3 +945,83 @@ describe("compacting the conversation", () => {
     expect(again.index.items[0].title).toBe("first prompt")
   })
 })
+
+// A conversation started inside a project (issue #99): it is in the project from its first prompt, and the tools work in the project's folders before that.
+describe("a new chat in a project", () => {
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    return data
+  }
+  const said = (text: string) => sse(delta({ content: text }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]\n\n")
+
+  test("it is in the project from its first prompt, and the project's folders are its folders at once", async () => {
+    keep()
+    const c = new ChatController()
+    const p = c.addProject("Work", ["C:/work/app", "C:/work/app-wt2"])!
+    expect(c.newSession(p)).toBe(true)
+    expect(c.currentProject()).toBe(p)
+    expect(c.folders()).toEqual(["C:/work/app", "C:/work/app-wt2"])              // before any prompt
+    const seen: Record<string, unknown>[] = []
+    mockFetch([said("hi")], seen)
+    await c.send("hello", [], { ...ctx, agent: { available: true, allowed: true, shell: null, tools: [] }, folder: c.folders() })
+    expect(c.index.items[0].project).toBe(p)
+    expect(c.pendingProject).toBeNull()
+    expect(c.currentProject()).toBe(p)
+    expect((seen[0].strata_agent as { cwd: string }).cwd).toBe("C:/work/app")
+  })
+
+  test("a chat that is open is kept in the list, and the new one starts in the project", async () => {
+    keep()
+    const c = new ChatController()
+    const p = c.addProject("Work", ["C:/w"])!
+    mockFetch([said("one")], [])
+    await c.send("first", [], ctx)
+    expect(c.index.items[0].project).toBeUndefined()
+    expect(c.newSession(p)).toBe(true)
+    expect(c.messages).toHaveLength(0)
+    mockFetch([said("two")], [])
+    await c.send("second", [], ctx)
+    expect(c.index.items.map((i) => i.project)).toEqual([p, undefined])
+  })
+
+  test("no project: no project; an unknown one is ignored", () => {
+    keep()
+    const c = new ChatController()
+    c.addProject("Work", ["C:/w"])
+    expect(c.newSession("nope")).toBe(true)
+    expect(c.currentProject()).toBeUndefined()
+    expect(c.newSession()).toBe(true)
+    expect(c.currentProject()).toBeUndefined()
+  })
+
+  test("another new chat without a project takes it back, and so does opening a conversation, and deleting the project", async () => {
+    keep()
+    const c = new ChatController()
+    const p = c.addProject("Work", ["C:/w"])!
+    mockFetch([said("one")], [])
+    await c.send("first", [], ctx)
+    const id = c.index.active!
+    c.newSession(p)
+    expect(c.currentProject()).toBe(p)
+    c.newSession()
+    expect(c.currentProject()).toBeUndefined()
+    c.newSession(p)
+    expect(c.open(id)).toBe(true)
+    expect(c.currentProject()).toBeUndefined()
+    c.newSession(p)
+    c.removeProject(p)
+    expect(c.pendingProject).toBeNull()
+  })
+
+  test("not while an answer is being written", () => {
+    keep()
+    const c = new ChatController()
+    const p = c.addProject("Work", ["C:/w"])!
+    c.busy = { abort: new AbortController(), msg: { role: "assistant", text: "", time: 1 } }
+    expect(c.newSession(p)).toBe(false)
+    c.busy = null
+  })
+})

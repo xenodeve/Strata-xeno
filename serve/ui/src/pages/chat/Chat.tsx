@@ -229,8 +229,7 @@ export function Chat({ id }: { id?: string }) {
     void chat.send(typed, f, { health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folders() })
   }
   const ctx = () => ({ health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folders() })
-  const session = chat.index.items.find((i) => i.id === chat.index.active)
-  const project = chat.index.projects.find((p) => p.id === session?.project)       // the open conversation's project: its folder is where the coding tools work
+  const project = chat.index.projects.find((p) => p.id === chat.currentProject())       // the open conversation's project (or the one a new conversation was started in): its folders are where the coding tools work
   const chatKey = chat.index.active ?? "new"
   const editPrompt = (i: number, t: string) => { pinned.current = true; setAway(false); void chat.edit(i, t, ctx()) }
   const [leaving, setLeaving] = useState<Message[]>([])        // what an undo took away: it closes up (height and fade) before it is gone
@@ -298,6 +297,7 @@ export function Chat({ id }: { id?: string }) {
           <div className="mx-auto mt-[11vh] flex max-w-[44ch] flex-col items-center text-center">
             <StatusOrb live={live} stale={stale} size={64} scale={2.5} override={typing ? { design: "listening", label: t(ORB_NAMES.listening) } : ambient ? { design: ambient, label: t(ORB_NAMES[ambient]) } : undefined} />
             <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>{t("What can I help with?")}</h1>
+            {project && <p className="mt-2 text-[13px] text-ink-2" data-in-project>{t("New chat in the project {name}", { name: project.name })}</p>}
             <p className="lede mt-3">{t("{name} runs on this PC. Nothing leaves it.", { name: metrics?.model_info?.name ? [metrics.model_info.name, metrics.model_info.variant].filter(Boolean).join(" · ") : health.model })}</p>
           </div>
         </Collapse>

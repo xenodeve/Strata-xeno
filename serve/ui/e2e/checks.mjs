@@ -1169,6 +1169,20 @@ export const checks = [
       await panel.getByRole("button", { name: "Add", exact: true }).click()
       await pg.waitForTimeout(400)
       t.ok("and one can be added, and it is kept with the project", (await prows.count()) === 2 && JSON.stringify((await projects())[0].folders) === JSON.stringify([beta, alpha]))
+
+      // a new chat inside the project
+      await pg.keyboard.press("Escape")
+      await pg.waitForTimeout(400)
+      const newIn = side.getByRole("button", { name: "New chat in project Work" })
+      t.ok("a project has a button for a new chat in it", (await newIn.count()) === 1)
+      await newIn.click()
+      await pg.waitForTimeout(500)
+      t.ok("the empty chat says which project it will be in", (await pg.locator("[data-in-project]").innerText()).includes("Work"))
+      await pg.fill("textarea[aria-label='Message']", "inside the project")
+      await pg.keyboard.press("Enter")
+      await pg.waitForTimeout(900)
+      t.ok("its first prompt puts it in the project, in the sidebar", (await side.locator("section[data-projects] [data-section]", { hasText: "Work" }).locator("[data-topic]", { hasText: "inside the project" }).count()) === 1)
+      t.ok("and its tools work in the project's folders from that first request", sent.at(-1)?.strata_agent?.cwd === beta && JSON.stringify(sent.at(-1)?.strata_agent?.dirs) === JSON.stringify([alpha]), JSON.stringify(sent.at(-1)?.strata_agent))
       await pg.context().close()
       fs.rmSync(work, { recursive: true, force: true })
     },

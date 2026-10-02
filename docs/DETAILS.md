@@ -546,6 +546,9 @@ compacted by itself); it opens to how many tokens of how many, a bar and a list 
 messages, what the server added - its instructions, the tools, the memory - and what is free) and "Compact now". `/context` opens the same panel. The figure is what the
 last answer reported, else a guess from the text (the panel says "about"); with no window size from the server there is no chip.
 
+**A new chat inside a project.** Each project in the sidebar has a button for a new conversation in it: the conversation is in the project from its first prompt (and the
+coding tools work in the project's folders from that request); until then the empty chat says which project it will be in.
+
 - **What asks.** Inside the chat's project folder, reading, searching, writing and editing files are free (secrets such as `.env` or keys, and
   writing in `.git`, always ask). Outside the folder, or when the chat has no folder, everything asks. A command asks every time unless it is
   a plain read-only one (`ls`, `git status`, `cat src/a.py`, ...) that names nothing outside the folder; a command that is chained, writes a

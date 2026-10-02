@@ -206,6 +206,7 @@ export class ChatController {
   messages: Message[] = restore(store.get<Message[]>("chat", []))   // the open one
   settings: Settings = { ...DEFAULTS, ...store.get<Partial<Settings>>("sampling", {}) }
   busy: { abort: AbortController; msg: Message } | null = null
+  pendingProject: string | null = null                          // the project a new conversation (one that is not in the list yet) was started in
   compacting = false                                             // the conversation is being summarised (busy is set too: nothing else can be sent or opened meanwhile)
   onError: (title: string, text: string) => void = () => {}
   private meter: PrefillMeter | null = null
@@ -231,23 +232,31 @@ export class ChatController {
     this.onError(t("This browser's storage is full"), t("The conversation may not be kept. Delete some from Recents to make room."))
   }
   save() {
-    const r = saveActive(store, this.index, this.stored(), Date.now())
+    const r = saveActive(store, this.index, this.stored(), Date.now(), this.pendingProject ?? undefined)
     this.index = r.index
+    if (this.index.active !== null) this.pendingProject = null
     if (r.ok) this.fullNoted = false
     else this.storageFull()
   }
   private saveIndex() { if (persistIndex(store, this.index)) this.fullNoted = false; else this.storageFull(); this.notify() }
 
   /** Starts an empty conversation; the one that was open stays in Recents. Not while an answer is being written. */
-  newSession(): boolean {
+  newSession(project?: string): boolean {
     if (this.busy) return false
-    if (!this.messages.length) return true
+    const into = project && this.index.projects.some((p) => p.id === project) ? project : null       // started inside a project: its folders are where the tools work from the first prompt
+    if (!this.messages.length) { this.pendingProject = into; this.notify(); return true }
     const next = newSession(store, this.index, this.stored())
     if (next === this.index) { this.storageFull(); return false }
     this.index = next
     this.messages = []
+    this.pendingProject = into
     this.notify()
     return true
+  }
+  /** The project the open conversation is in, or the one a new conversation was started in. */
+  currentProject(): string | undefined {
+    const mine = this.index.items.find((i) => i.id === this.index.active)
+    return mine ? mine.project : this.pendingProject ?? undefined
   }
   /** Opens a conversation of the list. False when there is none with that id, an answer is being written, or the open one could not be kept. */
   open(id: string): boolean {
@@ -258,6 +267,7 @@ export class ChatController {
     if (!r.ok) { this.storageFull(); return false }
     this.index = r.index
     this.messages = restore(r.messages as Message[])
+    this.pendingProject = null
     this.notify()
     return true
   }
@@ -281,13 +291,12 @@ export class ChatController {
     return this.index.projects.length > before ? id : null
   }
   renameProject(id: string, name: string) { this.index = renameProject(this.index, id, name); this.saveIndex() }
-  removeProject(id: string) { this.index = removeProject(this.index, id); this.saveIndex() }
+  removeProject(id: string) { this.index = removeProject(this.index, id); if (this.pendingProject === id) this.pendingProject = null; this.saveIndex() }
   setSettings(s: Settings) { this.settings = s; store.set("sampling", s); this.notify() }
   setProjectFolders(id: string, folders: string[]) { this.index = setProjectFolders(this.index, id, folders); this.saveIndex() }
   /** The folders the coding tools work in for the open conversation: its project's (the first is the main one), else the default one (Settings); none when there is none. */
   folders(): string[] {
-    const mine = this.index.items.find((i) => i.id === this.index.active)
-    const own = foldersOf(this.index, mine?.project)
+    const own = foldersOf(this.index, this.currentProject())
     return own.length ? own : this.settings.agentFolder?.trim() ? [this.settings.agentFolder.trim()] : []
   }
   /** The main folder: where commands run. */

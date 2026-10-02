@@ -58,8 +58,9 @@ export function Sidebar({ drawer = false, onClose }: { drawer?: boolean; onClose
     if (id !== idx.active && busy) { stillWriting(); return }
     if (chat.open(id)) onClose?.()
   }
-  const fresh = () => {
-    if (!chat.newSession()) { stillWriting(); return }
+  const fresh = (project?: string) => {
+    if (!chat.newSession(project)) { stillWriting(); return }
+    if (project && folded.includes(project)) setFoldedKept(folded.filter((x) => x !== project))
     onClose?.()
     document.querySelector<HTMLTextAreaElement>("textarea[aria-label]")?.focus()
   }
@@ -123,7 +124,12 @@ export function Sidebar({ drawer = false, onClose }: { drawer?: boolean; onClose
     return {
       value: p.id, label: p.name, topics: items.map(topic), empty: t("Empty"),
       custom: isRenaming ? renameField(target, p.name, "") : undefined,
-      trailing: isRenaming ? undefined : (<><span className="num mr-1 shrink-0 text-[11px] text-ink-3">{items.length}</span>{optionsButton({ target, label: t("Options for project {name}", { name: p.name }) })}</>),
+      trailing: isRenaming ? undefined : (<>
+        <button type="button" data-new-in-project aria-label={t("New chat in project {name}", { name: p.name })} title={t("New chat in this project")} onClick={() => fresh(p.id)} className="flex size-6 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 transition-opacity hover:text-ink focus-visible:opacity-100 group-hover:opacity-100 [@media(hover:none)]:opacity-100">
+          <HugeiconsIcon icon={MessageAdd01Icon} size={14} aria-hidden />
+        </button>
+        <span className="num mr-1 shrink-0 text-[11px] text-ink-3">{items.length}</span>{optionsButton({ target, label: t("Options for project {name}", { name: p.name }) })}
+      </>),
     }
   })
   const recentSections: BranchSection[] = [{ value: RECENTS, label: t("Recents"), topics: unfiled.map(topic), empty: idx.items.length === 0 ? t("No conversations yet") : t("Empty") }]
@@ -136,7 +142,7 @@ export function Sidebar({ drawer = false, onClose }: { drawer?: boolean; onClose
   const content = (
     <>
       <div className="flex items-center gap-1">
-        <button type="button" onClick={fresh} className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-sm px-2.5 text-[13px] font-medium transition-colors hover:bg-hover">
+        <button type="button" onClick={() => fresh()} className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-sm px-2.5 text-[13px] font-medium transition-colors hover:bg-hover">
           <HugeiconsIcon icon={MessageAdd01Icon} size={15} strokeWidth={1.8} aria-hidden /><span className="truncate">{t("New chat")}</span>
         </button>
         {!drawer && (

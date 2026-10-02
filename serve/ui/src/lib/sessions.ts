@@ -82,9 +82,9 @@ export function loadIndex(b: Backing, now: number): SessionIndex {
 
 export const persistIndex = (b: Backing, index: SessionIndex) => b.set(INDEX_KEY, index)
 
-/** Saves the open conversation (`messages` as they are to be stored) and updates the index: the first prompt of a new one adds it, an
+/** Saves the open conversation (`messages` as they are to be stored) and updates the index: the first prompt of a new one adds it (in `project`, when it was started in one), an
  *  emptied one is dropped, otherwise its time moves and its title follows the first prompt unless it was named by hand. */
-export function saveActive(b: Backing, index: SessionIndex, messages: StoredMessage[], now: number): { index: SessionIndex; ok: boolean } {
+export function saveActive(b: Backing, index: SessionIndex, messages: StoredMessage[], now: number, project?: string): { index: SessionIndex; ok: boolean } {
   const wrote = b.set(ACTIVE_KEY, messages)
   let next = index
   const open = index.active !== null && index.items.some((i) => i.id === index.active)
@@ -92,7 +92,8 @@ export function saveActive(b: Backing, index: SessionIndex, messages: StoredMess
     if (open) next = { ...index, active: null, items: index.items.filter((i) => i.id !== index.active) }
   } else if (!open) {
     const id = newId()
-    next = { ...index, active: id, items: [{ id, title: titleOf(messages), time: now }, ...index.items] }
+    const inProject = project && index.projects.some((p) => p.id === project) ? { project } : {}        // a conversation that was started in a project
+    next = { ...index, active: id, items: [{ id, title: titleOf(messages), time: now, ...inProject }, ...index.items] }
   } else {
     next = { ...index, items: index.items.map((i) => (i.id === index.active ? { ...i, time: now, title: i.named ? i.title : titleOf(messages) || i.title } : i)) }
   }
