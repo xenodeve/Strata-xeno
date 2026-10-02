@@ -31,6 +31,8 @@ export interface ToolCall {
   question?: AskedQuestion
   ask?: Ask; judge?: { verdict: string; severity: number | null }                // the coding tools: a question for the user, and what auto mode found
   hooks?: HookNote[]                                                                 // what the user's hooks did about this call
+  judging?: boolean                                                                  // auto mode is checking this call now
+  hookRunning?: string | null                                                        // a hook of the user's is running for this call now (its command)
   helper?: { kind: string; description: string; state: "running" | "done" | "failed"; steps: number }      // a Task call: the helper that works on it
   steps?: Step[]                                                                     // and what that helper did, step by step
   server?: string; tool?: string; arguments?: unknown; round?: number
@@ -51,6 +53,7 @@ export interface Message {
   images?: { name: string; url?: string }[]; files?: { name: string; text?: string }[]; tools?: ToolCall[]
   todos?: Todo[]                                                 // the coding tools' list of steps, as the model last sent it
   hooks?: HookNote[]                                             // what the user's prompt and stop hooks did (the ones that belong to no call)
+  hookRunning?: string | null                                    // one of those is running now (its command)
 }
 
 /** The line under an answer ("40 tokens · 38.2 tok/s · 1 tool call"), in the language in use now. An answer stored by an
@@ -168,10 +171,18 @@ function onTool(m: Message, x: ToolEvent) {
     else { const s = c.steps.find((y) => y.id === String(x.id)); if (s) { s.state = x.ok ? "done" : "error"; s.text = typeof x.text === "string" ? x.text : undefined } }
     return
   }
+  if (x.event === "hook_start") {                                                            // a hook of the user's has begun: the status says so from now, not only when it is over
+    const c = x.call_id ? (m.tools || []).find((y) => y.id === x.call_id) : undefined
+    if (c) c.hookRunning = x.command ?? ""
+    else m.hookRunning = x.command ?? ""
+    return
+  }
   if (x.event === "hook") {                                                                  // a hook of the user's ran: on the call it was about, else on the answer
     const note = noteFrom(x as unknown as Record<string, unknown>)
     if (!note) return
     const c = x.call_id ? (m.tools || []).find((y) => y.id === x.call_id) : undefined
+    if (c) c.hookRunning = null
+    else m.hookRunning = null
     const list = c ? (c.hooks = c.hooks || []) : (m.hooks = m.hooks || [])
     if (list.length < 20) list.push(note)
     return
@@ -184,6 +195,8 @@ function onTool(m: Message, x: ToolEvent) {
   if (x.event === "permission" || x.event === "judging" || x.event === "judged") {          // about a call that is already shown: x.call_id is its id
     const c = (m.tools || []).find((y) => y.id === x.call_id)
     if (!c) return
+    if (x.event === "judging") c.judging = true
+    else c.judging = false
     if (x.event === "permission") { c.ask = { id: x.id, tool: String(x.tool ?? c.name), why: x.why ?? "", danger: !!x.danger, rule: x.rule ?? null, arguments: x.arguments }; c.state = "asking" }
     else if (x.event === "judged" && (x.verdict === "allow" || x.verdict === "block" || x.verdict === "ask")) c.judge = { verdict: x.verdict, severity: x.severity ?? null }
     return
@@ -195,7 +208,7 @@ function onTool(m: Message, x: ToolEvent) {
   if (x.event === "call") {
     Object.assign(t, { name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running" })
   } else if (x.event === "result") {
-    Object.assign(t, { result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, state: x.skipped ? "skipped" : x.ok ? "done" : "error" })
+    Object.assign(t, { result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, state: x.skipped ? "skipped" : x.ok ? "done" : "error", judging: false })
   }
 }
 
@@ -811,7 +824,8 @@ export class ChatController {
       stats.stopped = true
     }
     if (usage?.prompt_tokens && !m.error) stats.ctx = usage.prompt_tokens + (usage.completion_tokens ?? 0)       // how much of the context the conversation uses now (after every tool round)
-    for (const tc of m.tools || []) if (tc.state === "writing" || tc.state === "running") { tc.state = "skipped"; tc.ms = null }
+    for (const tc of m.tools || []) { tc.judging = false; tc.hookRunning = null; if (tc.state === "writing" || tc.state === "running") { tc.state = "skipped"; tc.ms = null } }
+    m.hookRunning = null
     const ran = (m.tools || []).filter((tc) => tc.state === "done" || tc.state === "error").length
     if (ran) stats.tools = ran
     if (m.limit) stats.limit = m.limit

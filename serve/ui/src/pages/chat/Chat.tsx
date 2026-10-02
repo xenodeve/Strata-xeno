@@ -12,6 +12,7 @@ import { Sidebar } from "../../components/Sidebar"
 import { ConfirmDialog } from "../../components/ConfirmDialog"
 import { useMetrics } from "../../lib/metrics"
 import { LiveTokens, type LiveReading } from "../../lib/livetokens"
+import { readProgress } from "../../lib/status"
 import { href } from "../../lib/router"
 import { effortChoices, settleEffort } from "../../lib/effort"
 import { noteSend } from "../../lib/sendfx"
@@ -343,7 +344,7 @@ export function Chat({ id }: { id?: string }) {
           </div>
         </Collapse>
         {chat.messages.map((m, i) => (
-          <MessageView key={i} m={m} streaming={busy?.msg === m} compacting={chat.compacting && busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined} serverState={busy?.msg === m ? live.state : undefined} liveTokens={busy?.msg === m ? counted : null}
+          <MessageView key={i} m={m} streaming={busy?.msg === m} compacting={chat.compacting && busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined} serverState={busy?.msg === m ? live.state : undefined} reading={busy?.msg === m && live.state === "reading" ? readProgress((live as { prompt_read?: number | null }).prompt_read, (live as { prompt_total?: number | null }).prompt_total) : null} liveTokens={busy?.msg === m ? counted : null}
             actions={isPrompt(m) ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt, onRewind: () => setRewindAt(Math.max(0, rewindPrompts().findIndex((p) => p.index === i))) } : undefined} />
         ))}
         {chat.compacting && !!busy && !chat.messages.includes(busy.msg) && <CompactingLine />}

@@ -951,7 +951,7 @@ class Service:
         run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
         defined, _problems = hooks_mod.load(conf)
         run.ctx.vision = self.vision is not None and not self._vision_down()          # Read can give an image to the model only when the vision encoder is there
-        runner = hooks_mod.Runner(defined, sh, folder, sid, run._emit, lambda: run.cancel.is_set())
+        runner = hooks_mod.Runner(defined, sh, folder, sid, run._emit, lambda: run.cancel.is_set(), begin=run._emit)
         if runner:
             run.ctx.hooks = run.hooks = runner
             said = runner.prompt(goal)                                   # the user's own prompt hooks: what they print goes to the model with the rules

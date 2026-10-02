@@ -202,6 +202,16 @@ class Running(unittest.TestCase):
         self.assertEqual(self.told[0]["text"], "finished")
         self.assertEqual(self.told[0]["on"], "stop")
 
+    def test_the_runner_tells_when_a_hook_begins_only_if_asked_to(self):
+        begun: list[dict] = []
+        defined, _ = hooks.load(cfg(hook("before_tool", "exit 0")))
+        quiet = hooks.Runner(defined, SH, str(self.proj), "s1", self.told.append, lambda: False)
+        quiet.before("Bash", {})
+        self.assertEqual([e["event"] for e in self.told], ["hook"])                           # no begin callback: nothing more than before
+        loud = hooks.Runner(defined, SH, str(self.proj), "s1", self.told.append, lambda: False, begin=begun.append)
+        loud.before("Bash", {})
+        self.assertEqual([(e["event"], e["on"], e["tool"]) for e in begun], [("hook_start", "before_tool", "Bash")])
+
     def test_a_hook_that_is_off_does_not_run(self):
         (h,), _ = hooks.load(cfg(hook("before_tool", "echo ran >> ran.txt; exit 2")))
         r = self.runner(hook("before_tool", "echo ran >> ran.txt; exit 2"), off=[h.id])
@@ -368,6 +378,20 @@ class Chat(Fixture):
         _, _, events = self.chat()
         self.assertEqual(self.hook_events(events), [])
         self.assertTrue([e for e in events if e["event"] == "result"][0]["ok"])
+
+    @unittest.skipUnless(BASH, "needs bash")
+    def test_the_stream_says_when_a_hook_begins_and_not_only_when_it_is_over(self):
+        self.write(hook("prompt", "echo p"), hook("before_tool", "echo b", matcher="Read"), hook("after_tool", "echo a", matcher="Read"), hook("stop", "echo s"))
+        self.start(tool_call("Read", file_path="a.txt"), DONE)
+        _, _, events = self.chat()
+        names = [(e["event"], e["on"]) for e in events if e["event"] in ("hook_start", "hook")]
+        self.assertEqual(names, [("hook_start", "prompt"), ("hook", "prompt"), ("hook_start", "before_tool"), ("hook", "before_tool"), ("hook_start", "after_tool"), ("hook", "after_tool"), ("hook_start", "stop"), ("hook", "stop")])
+        call = [e for e in events if e["event"] == "call"][0]
+        starts = {e["on"]: e for e in events if e["event"] == "hook_start"}
+        self.assertEqual((starts["before_tool"]["call_id"], starts["after_tool"]["call_id"]), (call["id"], call["id"]))      # tied to the call they are about
+        self.assertIsNone(starts["prompt"]["call_id"])
+        self.assertIsNone(starts["stop"]["call_id"])                                                                    # and the others to the answer
+        self.assertEqual(starts["before_tool"]["command"], "echo b")
 
     def test_without_hooks_nothing_about_them_is_in_the_stream(self):
         self.start(DONE)

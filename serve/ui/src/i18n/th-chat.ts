@@ -234,4 +234,11 @@ export const part: Record<string, string> = {
   "Tokens written so far": "token ที่เขียนไปแล้ว",
   "Reading the tool's result…": "กำลังอ่านผลของ tool…",
   "This answer could not be recovered: the server no longer has it (it was restarted, or it ended long ago). Your message is kept; send it again.": "กู้คำตอบนี้กลับมาไม่ได้: เซิร์ฟเวอร์ไม่มีคำตอบนี้แล้ว (อาจถูกเริ่มใหม่หรือจบไปนานแล้ว) ข้อความของคุณยังอยู่ ส่งอีกครั้งได้",
+  "Waiting for you…": "รอคุณอยู่…",
+  "Running your hook…": "กำลังรัน hook ของคุณ…",
+  "Auto mode is checking the call…": "โหมดอัตโนมัติกำลังตรวจการเรียกนี้…",
+  "Writing the call to {tool}…": "กำลังเขียนการเรียก {tool}…",
+  "Running {tool}…": "กำลังรัน {tool}…",
+  "A helper is working…": "ตัวช่วยกำลังทำงาน…",
+  "{read} of {total} tokens read": "อ่านแล้ว {read} จาก {total} token",
 }

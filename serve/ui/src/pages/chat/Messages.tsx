@@ -5,7 +5,9 @@ import { chat, metaText, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
 import { Collapse, Fit, Handover } from "../../components/motion"
 import { Orb, StatusLabel } from "../../components/orb"
-import { afterToolStep, latticePattern, phaseKind, replyDesign, toolDesign, type OrbDesign } from "../../lib/orbs"
+import { latticePattern, phaseKind, replyDesign, toolDesign, type OrbDesign } from "../../lib/orbs"
+import { createPortal } from "react-dom"
+import { agentStatus } from "../../lib/status"
 import { useAvatar } from "../../lib/avatar"
 import { Lattice, Thought, type LatticeStatus } from "../../components/thought"
 import { cn } from "../../lib/cn"
@@ -156,6 +158,20 @@ function Thinking({ m, text, streaming, show, phase }: { m: Message; text: strin
   )
 }
 
+/** How far the server is in reading what it is reading, as a share beside the words; pointing at it gives the tokens read of the tokens to read. */
+function ReadShare({ p }: { p?: { read: number; total: number; percent: number } | null }) {
+  const [tip, setTip] = useState<{ left: number; top: number } | null>(null)
+  if (!p) return null
+  const show = (e: { currentTarget: HTMLElement }) => { const r = e.currentTarget.getBoundingClientRect(); setTip({ left: Math.min(Math.max(r.left + r.width / 2, 120), window.innerWidth - 120), top: r.top - 8 }) }
+  const words = t("{read} of {total} tokens read", { read: fmt(p.read), total: fmt(p.total) })
+  return (
+    <span className="num cursor-default text-[12px] text-ink-3" data-read-share tabIndex={0} onMouseEnter={show} onFocus={show} onMouseLeave={() => setTip(null)} onBlur={() => setTip(null)} aria-label={words}>
+      {p.percent}%
+      {tip && createPortal(<span role="tooltip" data-read-tip className="skill-tip" style={{ left: tip.left, top: tip.top, transform: "translate(-50%, -100%)" }}>{words}</span>, document.body)}
+    </span>
+  )
+}
+
 // What can be done to a prompt that was sent: rewrite it (it and everything after it are replaced), or, on the last one, take
 // it back (the prompt returns to the composer and its answer goes). Not offered while an answer is being written.
 export interface PromptActions { canAct: boolean; last: boolean; onEdit: (text: string) => void; onUndo: () => void; onRewind?: () => void }
@@ -233,7 +249,7 @@ function CompactNotice({ m }: { m: Message }) {
   )
 }
 
-export function MessageView({ m, streaming, compacting = false, show, prefill, actions, serverPhase, serverState, liveTokens }: { m: Message; streaming: boolean; compacting?: boolean; show: boolean; prefill: boolean; actions?: PromptActions; serverPhase?: string | null; serverState?: string | null; liveTokens?: { tokens: number; tokS: number | null } | null }) {
+export function MessageView({ m, streaming, compacting = false, show, prefill, actions, serverPhase, serverState, reading, liveTokens }: { m: Message; streaming: boolean; compacting?: boolean; show: boolean; prefill: boolean; actions?: PromptActions; serverPhase?: string | null; serverState?: string | null; reading?: { read: number; total: number; percent: number } | null; liveTokens?: { tokens: number; tokS: number | null } | null }) {
   const ref = useRef<HTMLDivElement>(null)
   const mine = useRef<HTMLDivElement>(null)
   const [editing, setEditing] = useState(false)
@@ -293,6 +309,7 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
   }
   const waiting = streaming && !m.text && !m.tools?.length
   const phase = replyDesign({ streaming, reasoning: m.reasoning, text: m.text, tools: m.tools })
+  const status = agentStatus({ streaming, reasoning: m.reasoning, text: m.text, tools: m.tools, serverState, hookRunning: m.hookRunning })        // what is going on now, in words (the thinking has its own live block)
   const first = m.tools?.length && typeof m.tools[0].rat === "number" ? (m.reasoning || "").slice(0, m.tools[0].rat) : m.reasoning || ""        // with tools: only the thinking before the first one is shown above them
   return (
     <div ref={ref} className="msg-in max-w-[min(100%,65ch)] text-[15px] tracking-[-0.011em] lg:max-w-[72ch]">
@@ -301,8 +318,8 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
         <div className="rounded-md border border-line px-3 py-2 text-[13px] text-bad [overflow-wrap:anywhere]">{m.error}</div>
       ) : waiting ? (
         compacting ? <CompactingStatus className="text-[13px] text-ink-2" />
-        : m.reasoning ? null : phaseKind(serverPhase).kind === "reading"
-          ? <StatusLabel design="listening" className="text-[13px] text-ink-2">{t("Reading the prompt…")}</StatusLabel>
+        : m.reasoning ? null : phaseKind(serverPhase).kind === "reading" || serverState === "reading"
+          ? <span className="inline-flex items-center gap-2"><StatusLabel design="listening" className="text-[13px] text-ink-2">{t("Reading the prompt…")}</StatusLabel><ReadShare p={reading} /></span>
           : <StatusLabel design="breathing" className="text-[13px] text-ink-2">{t("Waiting for the model…")}</StatusLabel>
       ) : (
         <>
@@ -312,10 +329,7 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
         </>
       )}
       <div className="mt-1 flex min-h-6 items-center gap-2 text-[12px] text-ink-3">
-        <Handover live={phase === "composing" ? <StatusLabel design="composing" className="text-[13px] text-ink-2">{t("Answering…")}</StatusLabel>
-          : phase === "weaving" ? (afterToolStep(serverState) === "planning"
-            ? <StatusLabel design="weaving" className="text-[13px] text-ink-2">{t("Planning the next step…")}</StatusLabel>
-            : <StatusLabel design="listening" className="text-[13px] text-ink-2">{t("Reading the tool's result…")}</StatusLabel>) : null}>
+        <Handover live={status && status.kind !== "thinking" ? <span data-agent-status={status.kind} className="inline-flex items-center gap-2"><StatusLabel design={status.design} className="text-[13px] text-ink-2">{status.label}</StatusLabel>{status.kind === "reading" && <ReadShare p={reading} />}</span> : null}>
           <span className="num">{metaText(m) || (streaming ? "" : m.stopped ? t("Stopped") : "")}</span>
         </Handover>
         {streaming && !!liveTokens && <span className="num" data-live-tokens role="status" aria-label={t("Tokens written so far")}>{t("{n} tokens", { n: fmt(liveTokens.tokens) })}{liveTokens.tokS ? ` · ${fmt(liveTokens.tokS, 1)} tok/s` : ""}</span>}

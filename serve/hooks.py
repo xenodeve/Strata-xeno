@@ -132,9 +132,10 @@ def _short(command: str, n: int = 120) -> str:
 class Runner:
     """The hooks of one request: which are on, where they run, and how they are told to the page (`emit`)."""
 
-    def __init__(self, hooks: list[Hook], shell, cwd: str | None, session: str, emit: Callable[[dict], None], cancelled: Callable[[], bool] = lambda: False):
+    def __init__(self, hooks: list[Hook], shell, cwd: str | None, session: str, emit: Callable[[dict], None], cancelled: Callable[[], bool] = lambda: False, begin: Callable[[dict], None] | None = None):
         self.hooks = [h for h in hooks if h.on]
         self.shell, self.cwd, self.session, self.emit, self.cancelled = shell, cwd, session, emit, cancelled
+        self.begin = begin                                                # told when a hook starts (the page says "running your hook" from then, not only when it is over)
 
     def __bool__(self) -> bool:
         return bool(self.hooks) and self.shell is not None and bool(self.cwd)
@@ -187,6 +188,14 @@ class Runner:
             return Outcome(None, text, timed_out=True, ms=ms)
         return Outcome(proc.returncode, text, ms=ms)
 
+    def _start(self, hook: Hook, tool: str | None, call: bool = True) -> None:
+        if self.begin is None:
+            return
+        ev = {"event": "hook_start", "hook": hook.id, "on": hook.event, "tool": tool, "command": _short(hook.command)}
+        if not call:
+            ev["call_id"] = None
+        self.begin(ev)
+
     def _tell(self, hook: Hook, o: Outcome, tool: str | None, blocked: bool = False, call: bool = True) -> None:
         ev = {"event": "hook", "hook": hook.id, "on": hook.event, "tool": tool, "command": _short(hook.command), "ok": o.completed and o.code == 0, "code": o.code, "blocked": blocked,
               "timeout": o.timed_out, "error": o.error, "text": o.text[:SHOWN], "ms": o.ms}
@@ -200,6 +209,7 @@ class Runner:
         for h in self._for("before_tool", tool):
             if self.cancelled():
                 return None
+            self._start(h, tool)
             o = self._run(h, {"tool_name": tool, "tool_input": args})
             blocked = o.completed and o.code == BLOCK
             self._tell(h, o, tool, blocked)
@@ -214,6 +224,7 @@ class Runner:
         for h in self._for("after_tool", tool):
             if self.cancelled():
                 break
+            self._start(h, tool)
             o = self._run(h, {"tool_name": tool, "tool_input": args, "tool_response": {"is_error": bool(result.get("isError")), "text": text}})
             self._tell(h, o, tool)
             if o.completed and o.text:
@@ -226,6 +237,7 @@ class Runner:
         for h in self._for("prompt"):
             if self.cancelled():
                 break
+            self._start(h, None, call=False)
             o = self._run(h, {"prompt": text[:MAX_INPUT]})
             self._tell(h, o, None, call=False)
             if o.completed and o.text:
@@ -237,6 +249,7 @@ class Runner:
         for h in self._for("stop"):
             if self.cancelled():
                 break
+            self._start(h, None, call=False)
             self._tell(h, self._run(h, {"last_message": text[:MAX_INPUT]}), None, call=False)
 
 

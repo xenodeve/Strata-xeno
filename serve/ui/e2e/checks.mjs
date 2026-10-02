@@ -2226,6 +2226,7 @@ export const checks = [
       await card.first().waitFor({ timeout: 30000 })
       t.ok("after a refresh the question is still there, on the same call", (await card.count()) === 1 && (await card.first().innerText()).includes("strata-agent-demo.txt"))
       t.ok("and the conversation is whole: the prompt, the steps the agent had taken, no error", (await pg.locator("[data-agent-call='Read']").count()) === 1 && (await pg.locator("[data-agent-call='Glob']").count()) === 1 && !(await pg.locator("body").innerText()).toLowerCase().includes("network error") && (await pg.getByText("agent demo please").count()) >= 1)
+      t.ok("the status line says what it is doing: it waits for the user", (await pg.locator("[data-agent-status='asking']").innerText()).includes("Waiting for you"))
       t.ok("and it is working: the page is answering, with Stop to hand", (await pg.getByRole("button", { name: /Stop/ }).count()) >= 1)
 
       await card.first().getByRole("button", { name: "Allow", exact: true }).click()
@@ -2314,6 +2315,46 @@ export const checks = [
         t.ok(`and a project can be picked from it (${height}px)`, (await pg.locator("[data-project-picker] button").first().getAttribute("data-in-project")) === "Fourth" && (await pg.locator("[data-project-menu]").count()) === 0)
         await pg.context().close()
       }
+    },
+  },
+  {
+    // The status always says what the model is doing now (design principle, AGENTS.md): while it reads, a share beside the words, and the tokens read of the tokens to read when it is pointed at.
+    name: "status: reading shows how far it is in percent, and pointing at it gives the tokens read of the tokens to read",
+    async run({ browser, fast, t, errors }) {
+      const NL = String.fromCharCode(10)
+      const pg = await open(browser, errors, { width: 1300, height: 900 })
+      let state = { state: "reading", prompt_read: 4200, prompt_total: 10000 }
+      await pg.route("**/metrics", async (r) => {
+        if (r.request().method() !== "GET" || !r.request().url().endsWith("/metrics")) return r.fallback()
+        const real = await (await r.fetch()).json()
+        return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...real, live: { ...real.live, ...state, queued: 0, phase: null, generated: null, tok_s: null } }) })
+      })
+      let release
+      const held = new Promise((res) => { release = res })
+      await pg.route("**/v1/chat/completions", async (r) => {
+        await held
+        return r.fulfill({ status: 200, contentType: "text/event-stream", body: `data: ${JSON.stringify({ choices: [{ delta: { content: "done" } }] })}${NL}${NL}data: ${JSON.stringify({ choices: [], usage: { completion_tokens: 1 } })}${NL}${NL}data: [DONE]${NL}${NL}` })
+      })
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(900)
+      await pg.fill("textarea[aria-label='Message']", "read a lot")
+      await pg.keyboard.press("Enter")
+      const share = pg.locator("[data-read-share]")
+      await share.waitFor({ timeout: 8000 })
+      t.ok("while the prompt is read the words are joined by a share", (await pg.locator("body").innerText()).includes("Reading the prompt") && (await share.innerText()).trim() === "42%", await share.innerText())
+      await share.hover()
+      await pg.waitForSelector("[data-read-tip]")
+      t.ok("pointing at it says the tokens read of the tokens to read", (await pg.locator("[data-read-tip]").innerText()) === "4,200 of 10,000 tokens read", await pg.locator("[data-read-tip]").innerText())
+      state = { state: "reading", prompt_read: 7300, prompt_total: 10000 }
+      await pg.waitForFunction(() => document.querySelector("[data-read-share]")?.textContent?.trim() === "73%", null, { timeout: 8000 })
+      t.ok("and the share moves with the reading", true)
+      state = { state: "generating", prompt_read: null, prompt_total: null }
+      await pg.waitForFunction(() => !document.querySelector("[data-read-share]"), null, { timeout: 8000 })
+      t.ok("when the model begins to write there is no share left", (await pg.locator("[data-read-tip]").count()) === 0)
+      release()
+      await pg.waitForFunction(() => document.body.innerText.includes("done"), null, { timeout: 8000 })
+      await pg.context().close()
     },
   },
   {
