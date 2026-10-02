@@ -59,7 +59,7 @@ class Base(unittest.TestCase):
 class TheServer(Base):
     def test_it_offers_the_tools_by_claude_codes_names_and_parameters(self):
         names = {t["name"]: t for t in self.srv.tools}
-        self.assertEqual(set(names), {"Read", "Write", "Edit", "Glob", "Grep", "TodoWrite", "ExitPlanMode", "NotebookEdit"})
+        self.assertEqual(set(names), {"Read", "Write", "Edit", "Glob", "Grep", "TodoWrite", "ExitPlanMode", "NotebookEdit", "AskUserQuestion"})
         props = lambda n: set(names[n]["inputSchema"]["properties"])  # noqa: E731
         self.assertEqual(props("Read"), {"file_path", "offset", "limit"})
         self.assertEqual(props("Write"), {"file_path", "content"})

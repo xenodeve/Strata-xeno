@@ -584,8 +584,8 @@ also says "Used skill: name" where it happened). **Context** - the same panel as
   plan the model sends with `ExitPlanMode`) and *Auto* (like Claude Code's auto mode: a second check by the same model decides what would
   ask - 1-2 runs it, 3 asks you, 4-5 blocks it and says why; it sees what you asked and the call, never tool output; a dangerous command, a
   secret or `.git` is never left to it). There is no mode that turns the questions off.
-- **Safety nets.** A file must be read in the chat before it can be overwritten or edited, and not have changed since; a command runs in a
-  fresh shell in the folder, with a time limit (default 2 minutes, at most 10), is stopped with all it started on a timeout or Stop, and gets
+- **Safety nets.** A file must be read in the chat before it can be overwritten or edited, and not have changed since; a command runs in the
+  chat's folder (a `cd` carries over to its next command while it stays inside the project's folders, variables do not), with a time limit (default 2 minutes, at most 10), is stopped with all it started on a timeout or Stop, and gets
   no `STRATA_*` environment variable. Output over 30,000 characters is cut in the middle.
 - **In the chat.** The + menu has a **Coding tools** row (the same controls are in Settings > Coding tools): a switch (on by default when the server
   has them and this page may use them), the mode (Ask / Plan / Auto) and the folder. A chat in a project works in the project's folder; a chat in no

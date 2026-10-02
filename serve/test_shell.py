@@ -29,7 +29,7 @@ def text(res: dict) -> str:
 @unittest.skipUnless(SHELL and SHELL.kind == "bash", "needs bash (Git Bash on Windows)")
 class Bash(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._tmp.cleanup)
         self.proj = Path(self._tmp.name).resolve() / "proj"
         self.proj.mkdir()
@@ -184,3 +184,97 @@ class Finding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(SHELL and SHELL.kind == "bash", "needs bash (Git Bash on Windows)")
+class WhereTheNextCommandRuns(unittest.TestCase):
+    """A `cd` carries over to the next command of the chat, inside the project's folders; environment variables and shell state do not."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name).resolve()
+        self.proj = self.base / "proj"
+        (self.proj / "sub" / "deep").mkdir(parents=True)
+        self.other = self.base / "other"
+        self.other.mkdir()
+        self.srv = agent.AgentServer()
+        shell.install(self.srv, SHELL)
+        self.addCleanup(self.srv.close)
+
+    def ctx(self, session="s1", dirs=None):
+        return agent.AgentContext(policy=Policy(cwd=str(self.proj), dirs=dirs or []), session=session, ask=lambda r: "allow")
+
+    def run_(self, command, ctx=None, **args):
+        return text(self.srv.call("Bash", {"command": command, **args}, 0, None, ctx or self.ctx()))
+
+    def where(self, ctx=None):
+        out = self.run_("pwd -W 2>/dev/null || pwd -P", ctx)                                  # the directory in this system's own form
+        return os.path.normcase(os.path.realpath(out.split("\n")[0].strip()))
+
+    def test_a_cd_carries_over_to_the_next_command_and_the_model_is_told(self):
+        out = self.run_("cd sub")
+        self.assertIn("Shell cwd is now", out)
+        self.assertTrue(out.rstrip().endswith("sub]"))
+        self.assertEqual(self.where(), os.path.normcase(str(self.proj / "sub")))
+        self.run_("cd deep")
+        self.assertEqual(self.where(), os.path.normcase(str(self.proj / "sub" / "deep")))
+        self.run_("cd ../..")
+        self.assertEqual(self.where(), os.path.normcase(str(self.proj)))
+
+    def test_a_command_that_does_not_move_says_nothing_about_it(self):
+        self.assertNotIn("Shell cwd", self.run_("echo hi"))
+        self.run_("cd sub")
+        self.assertNotIn("Shell cwd", self.run_("ls"))
+
+    def test_environment_variables_and_shell_state_do_not_carry_over(self):
+        self.run_("export STRATA_TEST_VAR=1; cd sub")
+        self.assertEqual(self.run_('echo "[${STRATA_TEST_VAR}]"').split("\n")[0], "[]")
+        self.run_("alias zz=echo")
+        self.assertIn("not found", self.run_("zz hi").lower())
+
+    def test_a_failing_command_and_an_exit_inside_it_still_say_where_it_ended(self):
+        out = self.run_("cd sub && false")
+        self.assertIn("Exit code 1", out)
+        self.assertEqual(self.where(), os.path.normcase(str(self.proj / "sub")))
+        self.run_("cd deep; exit 3")
+        self.assertEqual(self.where(), os.path.normcase(str(self.proj / "sub" / "deep")))
+
+    def test_a_directory_outside_the_project_is_forgotten_with_a_note(self):
+        out = self.run_(f'cd "{self.other.as_posix()}"')
+        self.assertIn("Shell cwd was reset", out)
+        self.assertIn("outside the project's folders", out)
+        self.assertEqual(self.where(), os.path.normcase(str(self.proj)))
+
+    def test_the_other_folders_of_the_project_count(self):
+        ctx = self.ctx(dirs=[str(self.other)])
+        out = self.run_(f'cd "{self.other.as_posix()}"', ctx)
+        self.assertIn("Shell cwd is now", out)
+        self.assertEqual(self.where(ctx), os.path.normcase(str(self.other)))
+
+    def test_a_folder_that_is_gone_means_the_project_folder_again(self):
+        self.run_("cd sub/deep")
+        os.rmdir(self.proj / "sub" / "deep")
+        self.assertEqual(self.where(), os.path.normcase(str(self.proj)))
+
+    def test_each_chat_has_its_own_directory(self):
+        self.run_("cd sub", self.ctx("chat-a"))
+        self.assertEqual(self.where(self.ctx("chat-b")), os.path.normcase(str(self.proj)))
+        self.assertEqual(self.where(self.ctx("chat-a")), os.path.normcase(str(self.proj / "sub")))
+
+    def test_a_background_command_does_not_move_the_chat(self):
+        self.run_("cd sub")
+        self.srv.call("Bash", {"command": "cd deep; sleep 0.2", "run_in_background": True}, 0, None, self.ctx())
+        time.sleep(0.5)
+        self.assertEqual(self.where(), os.path.normcase(str(self.proj / "sub")))
+
+    def test_no_file_of_the_tool_is_left_behind(self):
+        before = {p for p in Path(tempfile.gettempdir()).glob("strata-cwd-*")}
+        self.run_("cd sub")
+        self.run_("echo x")
+        self.assertEqual({p for p in Path(tempfile.gettempdir()).glob("strata-cwd-*")}, before)
+
+    def test_the_description_tells_the_model(self):
+        desc = {t["name"]: t["description"] for t in self.srv.tools}["Bash"]
+        self.assertIn("cd carries over", desc)
+        self.assertNotIn("fresh shell", desc)

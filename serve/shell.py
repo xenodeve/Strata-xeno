@@ -5,8 +5,9 @@ comes back with the exit code, and it is stopped when `timeout` (milliseconds, d
 cancelled - the whole process tree, not only the shell.  `run_in_background` starts it and returns an id; BashOutput reads what is new,
 KillShell stops it.  The permission gate in serve/agent.py has already decided by the time a command gets here.
 
-Each call starts a fresh shell in the project folder (a `cd` does not carry over to the next call).  The server's own settings
-(environment variables that start with STRATA_) are not given to a command.
+A call starts where the last one ended, when that is inside the project's folders (a `cd` carries over, as in Claude Code); a directory outside them is forgotten and the next call
+starts in the project folder again.  Environment variables and shell state do not carry over.  The server's own settings (environment variables that start with STRATA_) are not
+given to a command.
 """
 from __future__ import annotations
 
@@ -14,11 +15,12 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 
-from serve import agent
+from serve import agent, permissions
 
 DEFAULT_TIMEOUT_MS = 120_000
 MAX_TIMEOUT_MS = 600_000
@@ -159,8 +161,8 @@ def install(server: agent.AgentServer, sh: Shell | None) -> None:
     name = describe(sh)
     server.add_tool(
         "Bash",
-        f"Run a command in {name}, in the project folder, and return its output (both streams) and exit code. Every call starts a fresh shell in the project folder "
-        "(cd does not carry over). Prefer Read, Edit, Glob and Grep to cat, sed, find and grep. Default timeout 120 seconds, at most 600 (timeout is in milliseconds); "
+        f"Run a command in {name}, in the project folder, and return its output (both streams) and exit code. A call starts in the directory the last one ended in "
+        "(cd carries over inside the project's folders; environment variables and shell state do not). Prefer Read, Edit, Glob and Grep to cat, sed, find and grep. Default timeout 120 seconds, at most 600 (timeout is in milliseconds); "
         "output over 30,000 characters is cut in the middle. For a long-running command (a server, a watcher) set run_in_background and read it later with BashOutput. "
         "The user is asked before a command runs, unless it is a plain read-only one.",
         {"command": {"type": "string", "description": f"the command, written for {name}"}, "timeout": {"type": "integer", "description": "milliseconds before it is stopped (max 600000)"},
@@ -190,8 +192,15 @@ def _bash(server: agent.AgentServer, sh: Shell, a: dict, ctx: agent.AgentContext
     s = server.session(ctx.session)
     if bg and sum(1 for b in s.shells.values() if b.proc.poll() is None) >= MAX_BACKGROUND:
         return agent._err(f"There are already {MAX_BACKGROUND} background commands running; stop one with KillShell first.")
+    start = _start_dir(s, ctx.policy)
+    mark = None
+    code = command
+    if not bg and sh.kind == "bash":                                  # the shell says where it ended (an EXIT trap, so an `exit` in the command counts too)
+        fd, mark = tempfile.mkstemp(prefix="strata-cwd-")
+        os.close(fd)
+        code = f"trap 'pwd -W > \"{mark.replace(chr(92), '/')}\" 2>/dev/null || pwd -P > \"{mark.replace(chr(92), '/')}\"' EXIT\n{command}"
     try:
-        run = Running(command, sh, cwd)
+        run = Running(code, sh, start)
     except OSError as e:
         return agent._err(f"the shell could not be started: {e.strerror or e}")
     if bg:
@@ -218,6 +227,9 @@ def _bash(server: agent.AgentServer, sh: Shell, a: dict, ctx: agent.AgentContext
         pass
     run.reader.join(timeout=2)
     out = _cap(run.text()).rstrip()
+    moved = _ended(s, ctx.policy, mark, start)
+    if moved:
+        out = (out + "\n\n" if out else "") + moved
     if why == "timeout":
         return agent._err((out + "\n\n" if out else "") + f"Command timed out after {tm / 1000:g} seconds and was stopped.")
     if why == "cancelled":
@@ -226,6 +238,40 @@ def _bash(server: agent.AgentServer, sh: Shell, a: dict, ctx: agent.AgentContext
     if rc:
         return agent._err((out + "\n" if out else "") + f"Exit code {rc}")
     return agent._ok(out or "(no output)")
+
+
+def _start_dir(s, policy: permissions.Policy) -> str:
+    """Where a command starts: where the last one ended, if that is still a folder inside the project's; else the project folder."""
+    d = s.cwd
+    if d and os.path.isdir(d) and permissions.root_of(os.path.realpath(d), policy) is not None:
+        return d
+    s.cwd = None
+    return policy.cwd
+
+
+def _ended(s, policy: permissions.Policy, mark: str | None, start: str) -> str:
+    """Notes where the command ended (read from the file its shell wrote) for the next one; a note for the model when that is not where it started. Always removes the file."""
+    if not mark:
+        return ""
+    try:
+        with open(mark, "rb") as f:
+            text = f.read(4096).decode("utf-8", errors="replace").strip()
+    except OSError:
+        text = ""
+    try:
+        os.remove(mark)
+    except OSError:
+        pass
+    if not text:
+        return ""
+    where = os.path.realpath(text)
+    if not os.path.isdir(where):
+        return ""
+    if permissions.root_of(where, policy) is None:
+        s.cwd = None
+        return f"[Shell cwd was reset to {policy.cwd}: {where} is outside the project's folders]"
+    s.cwd = where
+    return f"[Shell cwd is now {where}]" if os.path.normcase(where) != os.path.normcase(os.path.realpath(start)) else ""
 
 
 def _find(server: agent.AgentServer, bid, ctx: agent.AgentContext, what: str):

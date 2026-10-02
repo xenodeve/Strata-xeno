@@ -69,6 +69,7 @@ class Session:
     def __init__(self):
         self.reads: dict[str, tuple[int, int]] = {}        # real path -> (mtime_ns, size) when it was last read or written here
         self.todos: list[dict] = []
+        self.cwd: str | None = None                         # where the next command runs: the directory the last one ended in, when it is inside the project's folders (serve/shell.py)
         self.loaded: set = set()                            # the instruction files of sub-folders already handed to the model (serve/memory.py nested)
         self.shells: dict = {}                              # background commands of this chat (serve/shell.py)
         self.shell_count = 0
