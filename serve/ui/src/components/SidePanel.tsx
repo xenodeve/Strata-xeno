@@ -351,7 +351,7 @@ function MemoryTab({ folders, allowed, onAsk }: { folders: string[]; allowed: bo
 
 // ------------------------------------------------------------------------------------------------ the panel
 const WIDE = "(min-width: 1280px)"
-const WIDTH = 340
+const WIDTH = 380
 /** Whether the screen is wide enough for the panel to sit beside the chat (else it is a sheet over it). */
 function useWide(): boolean {
   const [wide, setWide] = useState(() => typeof matchMedia !== "undefined" && matchMedia(WIDE).matches)
@@ -383,7 +383,7 @@ export function PanelDock({ open, tab, onTab, onClose, data }: { open: boolean; 
   }, [open, wide, onClose])
   if (wide) {
     return (
-      <aside aria-label={t("Session panel")} aria-hidden={!open} data-panel={open ? "open" : "closed"} className={cn("sticky top-[4.5rem] shrink-0 self-start overflow-hidden transition-[width,margin] duration-300 ease-[var(--ease)]", open ? "ml-6 w-[340px]" : "ml-0 w-0")}>
+      <aside aria-label={t("Session panel")} aria-hidden={!open} data-panel={open ? "open" : "closed"} className={cn("sticky top-[4.5rem] shrink-0 self-start justify-self-end overflow-hidden transition-[width,margin] duration-300 ease-[var(--ease)]", open ? "ml-6 w-[380px] min-[1600px]:ml-0" : "ml-0 w-0")}>
         {listed && <div inert={!open} className={cn("side-in flex max-h-[calc(100dvh-5.5rem)] flex-col transition-opacity duration-200", !open && "pointer-events-none opacity-0")} style={{ width: WIDTH }}><PanelBody tab={tab} onTab={onTab} data={data} /></div>}
       </aside>
     )

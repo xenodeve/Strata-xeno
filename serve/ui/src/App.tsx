@@ -175,7 +175,7 @@ function Shell() {
           scrolled ? "border-line bg-[color-mix(in_srgb,var(--bg)_82%,transparent)]" : "border-transparent bg-bg",
         )}
       >
-        <div className={cn("mx-auto flex items-center gap-2 px-3 py-3 sm:gap-4 sm:px-6", wide ? "max-w-[1680px]" : "max-w-5xl")}>
+        <div className={cn("mx-auto flex items-center gap-2 px-3 py-3 sm:gap-4 sm:px-6", wide ? "max-w-[1800px]" : "max-w-5xl")}>
           <Brand />
           <Nav page={route.page} />
           <button
@@ -193,7 +193,7 @@ function Shell() {
       </header>
       <ToastHost />
       <ReelFilter />
-      <main key={route.page} className={cn("page-in mx-auto w-full flex-1 px-4 pb-16 pt-6 sm:px-6", wide ? "max-w-[1680px]" : "max-w-5xl")}>
+      <main key={route.page} className={cn("page-in mx-auto w-full flex-1 px-4 pb-16 pt-6 sm:px-6", wide ? "max-w-[1800px]" : "max-w-5xl")}>
         <PageView route={route} />
       </main>
     </div>

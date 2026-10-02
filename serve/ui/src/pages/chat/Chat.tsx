@@ -307,7 +307,7 @@ export function Chat({ id }: { id?: string }) {
 
   return (
     <SkillsContext.Provider value={commands}>
-    <div className="md:flex md:gap-6">
+    <div className="md:max-[1599px]:flex md:gap-6 min-[1600px]:grid min-[1600px]:grid-cols-[minmax(380px,1fr)_minmax(0,56rem)_minmax(380px,1fr)]">      {/* with room to spare the conversation sits in the middle of the window and the sidebars open into the space at its sides, so opening or closing one does not move it */}
     <div className="max-md:hidden"><Sidebar /></div>
     {drawerMounted && (
       <div className="fixed inset-0 z-40 md:hidden">
