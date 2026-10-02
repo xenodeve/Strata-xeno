@@ -2107,7 +2107,8 @@ class DisplayFloorRecovery(unittest.TestCase):
             def __init__(self, exe, args, cwd=None, log=None, env=None):
                 self.spawn, self.log_path, self.info = (exe, list(args), cwd, log, env), log, {}
                 starts.append(list(args))
-                if failing[0] and "--secondary-expert-mib" in args and args[args.index("--secondary-expert-mib") + 1] != "0":
+                tiered = "--secondary-expert-mib" in args and args[args.index("--secondary-expert-mib") + 1] != "0"
+                if failing[0] == "all" or (failing[0] and tiered):
                     with open(log, "a", encoding="utf-8") as f:
                         f.write(refusal or DisplayFloorRecovery.BREACH)
                     raise RuntimeError("the engine exited before it was ready")
@@ -2116,6 +2117,7 @@ class DisplayFloorRecovery(unittest.TestCase):
         eng.proc = type("P", (), {"kill": lambda self: None, "poll": lambda self: 3})()
         starts.clear()
         failing[0] = fail_full
+        self.failing = failing
         return eng, starts
 
     def test_a_floor_breach_restarts_without_the_tier(self):
@@ -2152,6 +2154,32 @@ class DisplayFloorRecovery(unittest.TestCase):
         eng, _ = self.engine("strata generate: staged 900 next-ranked secondary experts (6.25 GiB); 4070 SUPER lower "
                              "free 3.10 GiB (free floor 0.62 GiB); SECONDARY COMPUTE\nstrata: access violation\n")
         self.assertFalse(eng.floor_breach())
+
+    def test_a_restore_that_fails_for_another_reason_stays_degraded(self):
+        # incident (2026-10-02 /scrutinize): restart(full=True) killed the degraded engine, the full start failed for a
+        # reason other than the floor, and it raised - the server was left with no engine, and the watch then tried the
+        # full start (a whole model load) again every 5 s instead of serving degraded
+        eng, starts = self.engine("strata serve: ready\n" + self.BREACH, refusal="strata: cudaMalloc failed\n")
+        eng.restart()
+        self.assertTrue(eng.degraded)
+        with open(eng.log_path, "a", encoding="utf-8") as f:   # the degraded engine's own start and serving
+            f.write("strata generate: loaded\n" * 6 + "strata serve: ready\n")
+        self.failing[0] = True
+        eng.restart(full=True)   # its log now ends with that failure, not with the floor
+        self.assertEqual(starts[-1][starts[-1].index("--secondary-expert-mib") + 1], "0")
+        self.assertTrue(eng.degraded)
+
+    def test_a_failed_degraded_start_keeps_the_configured_command(self):
+        # incident (2026-10-02 /scrutinize): __init__ stores the args it is given, so a degraded start that failed left
+        # the no-tier args as the engine's own and full_spawn unset: the tier could never come back
+        eng, starts = self.engine("strata serve: ready\n" + self.BREACH)
+        self.failing[0] = "all"
+        with self.assertRaises(RuntimeError):
+            eng.restart()
+        self.failing[0] = False
+        eng.restart(full=True)
+        self.assertEqual(starts[-1], self.ARGS)
+        self.assertFalse(eng.degraded)
 
     def test_full_restores_the_tier(self):
         eng, starts = self.engine("strata serve: ready\n" + self.BREACH)

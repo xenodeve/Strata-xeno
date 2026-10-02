@@ -365,7 +365,8 @@ class StrataEngine:
     def restart(self, full: bool | None = None):
         """Start the engine again after it died; the new process has its own line queue.  #59: after a 4070
         free-floor terminate (or a start the floor refuses) it comes back without the 4070 tier (`degraded`);
-        `full=True` restores the configured command."""
+        `full=True` restores the configured command; if that start fails, it comes back degraded again rather than
+        leaving no engine."""
         try:
             self.proc.kill()
         except OSError:
@@ -373,6 +374,7 @@ class StrataEngine:
         info = dict(self.info)
         self.ended = False
         base = getattr(self, "full_spawn", self.spawn)
+        self.full_spawn = base                          # __init__ stores the args it starts with: keep the configured ones
         exe, args, cwd, log, env = base
         want_full = (not self.floor_breach()) if full is None else full
         if args == without_secondary(args):
@@ -380,9 +382,11 @@ class StrataEngine:
         try:
             self.__init__(exe, args if want_full else without_secondary(args), cwd, log, env)
         except RuntimeError:
-            if not want_full or not self.floor_breach():
+            if not want_full or (full is not True and not self.floor_breach()):
                 raise
-            print("[strata] the display needs the 4070's VRAM: starting without the 4070 tier", flush=True)
+            print("[strata] " + ("the display needs the 4070's VRAM" if self.floor_breach() else
+                                 "the start with the 4070 tier failed (see the log)") +
+                  ": starting without the 4070 tier", flush=True)
             self.__init__(exe, without_secondary(args), cwd, log, env)
             want_full = False
         self.full_spawn = base
