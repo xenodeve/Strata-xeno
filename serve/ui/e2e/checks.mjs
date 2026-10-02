@@ -2075,6 +2075,61 @@ export const checks = [
     },
   },
   {
+    // Sub-agents (issue #99): off by default, switched on in Settings (kept in the run config); a helper's steps are a nested list on the Task call.
+    name: "helpers: Settings switch them on from off (kept in the run config); a Task shows its helper's steps and how it ended",
+    async run({ browser, importer, fast, t, errors }) {
+      const fs = await import("node:fs")
+      const NL = String.fromCharCode(10)
+      const original = fs.readFileSync(importer.config, "utf8")
+      const saved = () => JSON.parse(fs.readFileSync(importer.config, "utf8"))
+      try {
+        const pg = await open(browser, errors, { width: 1200, height: 900 })
+        await pg.goto(importer.base + "/#/settings/helpers")
+        await pg.waitForSelector("[data-helpers]")
+        await pg.waitForTimeout(700)
+        const sw = pg.getByRole("switch", { name: "Let the model use helpers" })
+        t.ok("it is off by default and the page says why", (await sw.getAttribute("aria-checked")) === "false" && (await pg.locator("[data-helpers]").innerText()).includes("one engine slot"))
+        await sw.click()
+        await pg.waitForFunction(() => document.querySelector("[role=switch][aria-label='Let the model use helpers']")?.getAttribute("aria-checked") === "true")
+        t.ok("switching it on is kept in the run config", saved().agents?.on === true)
+        await pg.reload()
+        await pg.waitForSelector("[data-helpers]")
+        await pg.waitForTimeout(500)
+        t.ok("and is still on after a reload", (await pg.getByRole("switch", { name: "Let the model use helpers" }).getAttribute("aria-checked")) === "true")
+        await pg.context().close()
+      } finally {
+        fs.writeFileSync(importer.config, original)
+      }
+
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const ev = (e) => chunk({ choices: [{ delta: {} }], strata_mcp: e })
+      const stream = ev({ event: "start", id: "t1", name: "Task" }) + ev({ event: "call", id: "t1", name: "Task", server: "agent", tool: "Task", arguments: { description: "find hello", prompt: "find where hello is said and report the file", subagent_type: "explore" }, round: 1 }) +
+        ev({ event: "helper", state: "start", kind: "explore", description: "find hello", call_id: "t1" }) +
+        ev({ event: "step", id: "s1", name: "Grep", arguments: { pattern: "hello" }, call_id: "t1" }) + ev({ event: "step_result", id: "s1", ok: true, chars: 20, text: "a.txt:1:hello", call_id: "t1" }) +
+        ev({ event: "step", id: "s2", name: "Read", arguments: { file_path: "a.txt" }, call_id: "t1" }) + ev({ event: "step_result", id: "s2", ok: false, chars: 5, text: "denied", call_id: "t1" }) +
+        ev({ event: "helper", state: "end", ok: true, steps: 2, call_id: "t1" }) +
+        ev({ event: "result", id: "t1", ok: true, text: "[Report of the helper (explore, 2 steps).]\n\na.txt line 1", chars: 50, truncated: false, ms: 9 }) +
+        chunk({ choices: [{ delta: { content: "ok" } }] }) + chunk({ choices: [], usage: { completion_tokens: 1 } }) + `data: [DONE]${NL}${NL}`
+      const info = { available: true, allowed: true, shell: "bash", tools: ["Task"] }
+      const pg2 = await open(browser, errors, { width: 1200, height: 900 })
+      await pg2.route("**/agent", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(info) }))
+      await pg2.route("**/v1/chat/completions", (r) => r.fulfill({ status: 200, contentType: "text/event-stream", body: stream }))
+      await pg2.goto(fast.base + "/#/chat")
+      await pg2.waitForSelector("textarea[aria-label='Message']")
+      await pg2.waitForTimeout(900)
+      await pg2.fill("textarea[aria-label='Message']", "look for hello")
+      await pg2.keyboard.press("Enter")
+      const call = pg2.locator("[data-agent-call='Task']").first()
+      await call.waitFor({ timeout: 8000 })
+      await pg2.waitForTimeout(600)
+      t.ok("the Task is summed up by its description", (await call.innerText()).includes("find hello"))
+      const steps = call.locator("[data-step]")
+      t.ok("its helper's steps are a list on the call, each with how it went", (await steps.count()) === 2 && (await steps.nth(0).getAttribute("data-step")) === "done" && (await steps.nth(1).getAttribute("data-step")) === "error" && (await steps.nth(0).innerText()).includes("Grep") && (await steps.nth(0).innerText()).includes("hello"))
+      t.ok("and it says the helper is done", (await call.locator("[data-helper]").innerText()).includes("The helper is done"))
+      await pg2.context().close()
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {

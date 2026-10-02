@@ -59,7 +59,7 @@ from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's la
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
 from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
-from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, shell as shell_mod, web as web_mod  # noqa: E402
+from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, shell as shell_mod, subagent as subagent_mod, web as web_mod  # noqa: E402
 from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -940,6 +940,11 @@ class Service:
         run.hidden = set() if web["on"] else set(getattr(self.agent, "web_tools", ()))          # web access is off until the user switches it on: the model is not even offered the tools
         if web["on"]:
             run.ctx.web = web_mod.Web(web)
+        helpers = getattr(self.agent, "helper_tools", ())
+        if subagent_mod.settings(conf)["on"] and helpers:                                         # helpers are off until the user switches them on, for the same reason
+            run.ctx.spawn = lambda kind, prompt, description: subagent_mod.execute(self, run, kind, prompt, description, run_with_mcp)
+        else:
+            run.hidden |= set(helpers)
         tools = [t["name"] for t in self.agent.tools if (t["name"] != "ExitPlanMode" or mode == "plan") and t["name"] not in run.hidden]
         run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
         defined, _problems = hooks_mod.load(conf)
@@ -1686,7 +1691,7 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 # ------------------------------------------------------------------------------------------------ MCP tool loop
 AGENT_ROUNDS = 100      # tool rounds in one answer when the chat has the coding tools
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names, agent_run=None):
+                 mcp_names, agent_run=None, rounds_limit=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -1696,6 +1701,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
     could not reach the model before the client's)."""
     max_rounds = max(int(hub.settings["max_rounds"]), AGENT_ROUNDS) if agent_run is not None else int(hub.settings["max_rounds"])      # coding takes many rounds
+    if rounds_limit is not None:                                  # a helper (serve/subagent.py) stops sooner
+        max_rounds = rounds_limit
     total, rounds, done = 0, 0, None
     messages = list(messages)
     if agent_run is not None:
@@ -1726,6 +1733,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
         if run_them and rounds >= max_rounds:
             yield "mcp", {"event": "limit", "max_rounds": max_rounds}
+            if agent_run is not None:
+                agent_run.limit_hit = True
             run_them = False
         if not run_them:
             for c in calls:                              # announced, never run: close them in the client's view
@@ -2200,6 +2209,15 @@ def make_handler(svc: Service):
                     self._json(200, {**hooks_mod.view(harness._cfg(svc)), "config_file": os.path.basename(svc.config_path) if svc.config_path else None,
                                      "shell": bool(getattr(svc.agent, "shell", None)), "editable": bool(svc.config_path)})
                 return
+            if path == "/agent/helpers":
+                # sub-agents (serve/subagent.py): off by default; only who may use the coding tools sees the setting
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    self._json(200, {**subagent_mod.settings(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "helper_tools", ())), "editable": bool(svc.config_path),
+                                     "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
+                return
             if path == "/agent/web":
                 # web access (serve/web.py): off by default; only who may use the coding tools sees the settings
                 if self._authorized():
@@ -2426,6 +2444,31 @@ def make_handler(svc: Service):
                 if not svc.broker.answer(body["id"], body["decision"]):
                     return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
                 return self._json(200, {"ok": True})
+            if path == "/agent/helpers":                     # sub-agents on or off (serve/subagent.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
+                if not self._own_page("sub-agents can be switched"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                if not svc.config_path:
+                    return self._json(409, {"error": {"message": harness.NO_FILE}})
+                if not 0 < n <= 10_000:
+                    return self._json(413, {"error": {"message": "send a body of up to 10 KB"}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self._json(400, {"error": {"message": "the body is not JSON"}})
+                new, errors = subagent_mod.check_settings(body)
+                if errors:
+                    return self._json(400, {"error": {"message": f"{errors[0]['message']} ({errors[0]['field']})", "fields": errors}})
+                with mcp_admin._lock:
+                    try:
+                        mcp_admin.update_config(svc.config_path, lambda cfg: cfg.__setitem__("agents", new))
+                    except (OSError, ValueError, TypeError) as e:
+                        return self._json(500, {"error": {"message": f"it could not be saved: {e}"}})
+                return self._json(200, {**subagent_mod.settings(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "helper_tools", ())), "editable": True, "config_file": os.path.basename(svc.config_path)})
             if path == "/agent/web":                         # web access on or off, and the search provider (serve/web.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
@@ -2665,6 +2708,8 @@ def make_handler(svc: Service):
                 req = {**req, "messages": agent_prompt.with_system(req.get("messages") or [], arun.prompt)}
             messages, tools, kw = openai_to_messages(req)
             req = svc.cjk(req, messages)                                # xeno #49 S4
+            if arun is not None:
+                arun.kw, arun.sampling = kw, req                      # a helper (serve/subagent.py) runs with the same settings
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = (req.get("strata_mcp") is True or arun is not None) and svc.mcp is not None      # the web app's opt-in (serve/mcp.py), or the coding tools
             own = {t.get("name") for t in tools or []}
@@ -3065,6 +3110,7 @@ def main() -> int:
     if agent_server is not None:
         shell_mod.install(agent_server, shell_mod.find_shell())
         web_mod.install(agent_server)                         # WebFetch and WebSearch: offered to a chat only when the user has switched web access on
+        subagent_mod.install(agent_server)                    # Task: the same, for helpers
     hub = hub_from_config(cfg, a.mcp_config, builtins={**importer.builtins(), **({"agent": agent_server} if agent_server else {})})     # before the minutes of loading: a bad entry stops here
     placeholder = None
     if a.engine == "strata":

@@ -25,8 +25,8 @@ from urllib.parse import urlsplit
 FILE_READ = ("Read", "Glob", "Grep")
 FILE_EDIT = ("Write", "Edit", "NotebookEdit")
 WEB = ("WebFetch", "WebSearch")                                  # they send something off this PC: every call asks, unless the user wrote a rule for it
-KNOWN = FILE_READ + FILE_EDIT + WEB + ("Bash", "TodoWrite", "BashOutput", "KillShell", "ExitPlanMode", "AskUserQuestion")
-FREE = ("TodoWrite", "BashOutput", "KillShell", "AskUserQuestion")      # they only act on what the user already allowed in this chat, or only ask the user something
+KNOWN = FILE_READ + FILE_EDIT + WEB + ("Bash", "TodoWrite", "BashOutput", "KillShell", "ExitPlanMode", "AskUserQuestion", "Task")
+FREE = ("TodoWrite", "BashOutput", "KillShell", "AskUserQuestion", "Task")      # they only act on what the user already allowed in this chat, or only ask the user something
 
 
 @dataclass

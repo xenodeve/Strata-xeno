@@ -77,6 +77,7 @@ export function toolSummary(tool: string, args: unknown): string {
     case "Grep": return cut(str(a.path) ? `${str(a.pattern)} in ${str(a.path)}` : str(a.pattern))
     case "Bash": return cut(str(a.description).trim() || str(a.command).split("\n")[0])
     case "TodoWrite": return Array.isArray(a.todos) ? `${a.todos.length} ${a.todos.length === 1 ? "step" : "steps"}` : ""
+    case "Task": return cut(str(a.description))
     case "WebFetch": return cut(str(a.url))
     case "WebSearch": return cut(str(a.query))
     case "BashOutput": return str(a.bash_id)

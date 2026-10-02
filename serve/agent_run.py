@@ -70,6 +70,8 @@ class AgentRun:
         self.prompt = ""                                       # the rules for the AI (serve/agent_prompt.py), set by the server
         self.hidden: set = set()                               # coding tools that are not offered to the model in this request (web access, until it is switched on)
         self.hooks = None                                      # serve/hooks.py Runner, when the user has hooks
+        self.kw, self.sampling = {}, {}                        # the request's template settings and sampling: a helper (serve/subagent.py) runs with the same
+        self.limit_hit = False                                 # the tool loop stopped at its limit of rounds
         self.ctx = agent.AgentContext(policy=policy, session=session, ask=self.ask, cancel=cancel, emit=self._emit, question=self.question)
 
     def bind(self, cancel: threading.Event) -> None:

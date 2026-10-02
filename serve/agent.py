@@ -66,6 +66,8 @@ class AgentContext:
     hooks: object | None = None                            # serve/hooks.py Runner: the user's own commands before and after a call (none by default)
     vision: bool = False                                   # the server has the vision encoder: Read can give an image to the model
     web: object | None = None                              # serve/web.py Web: set only when the user switched web access on (WebFetch and WebSearch run only with it)
+    spawn: Callable | None = None                          # serve/subagent.py: runs a helper (kind, prompt, description) -> (ok, report); set only when the user switched helpers on
+    in_helper: bool = False                                # this call is a helper's: it cannot start a helper
 
 
 class Session:

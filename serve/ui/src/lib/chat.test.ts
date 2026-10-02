@@ -1720,3 +1720,63 @@ describe("what the user's hooks did, in the chat", () => {
     expect(c.messages[1].hooks).toBeUndefined()
   })
 })
+
+// Sub-agents (issue #99): what a helper did comes in the stream as steps on the Task call it works for.
+describe("what a helper did, on the Task call", () => {
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+  }
+  const finish = [delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10)]
+  const task = [
+    { strata_mcp: { event: "start", id: "t1", name: "Task" } },
+    { strata_mcp: { event: "call", id: "t1", name: "Task", server: "agent", tool: "Task", arguments: { description: "find hello", prompt: "find where hello is said" }, round: 1 } },
+  ]
+
+  test("steps are listed under the Task, each with its result, and the helper's start and end are kept", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(...task,
+      { strata_mcp: { event: "helper", state: "start", kind: "explore", description: "find hello", call_id: "t1" } },
+      { strata_mcp: { event: "step", id: "s1", name: "Grep", arguments: { pattern: "hello" }, call_id: "t1" } },
+      { strata_mcp: { event: "step_result", id: "s1", ok: true, chars: 40, text: "a.txt:1:hello", call_id: "t1" } },
+      { strata_mcp: { event: "step", id: "s2", name: "Read", arguments: { file_path: "../x" }, call_id: "t1" } },
+      { strata_mcp: { event: "step_result", id: "s2", ok: false, chars: 10, text: "denied", call_id: "t1" } },
+      { strata_mcp: { event: "helper", state: "end", ok: true, steps: 2, call_id: "t1" } },
+      { strata_mcp: { event: "result", id: "t1", ok: true, text: "[Report of the helper (explore, 2 steps).]\n\na.txt", chars: 50, truncated: false, ms: 9 } },
+      ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("look", [], ctx)
+    const call = c.messages[1].tools![0]
+    expect(call.steps!.map((s) => [s.name, s.state])).toEqual([["Grep", "done"], ["Read", "error"]])
+    expect(call.steps![0]).toMatchObject({ arguments: { pattern: "hello" }, text: "a.txt:1:hello" })
+    expect(call.helper).toEqual({ kind: "explore", description: "find hello", state: "done", steps: 2 })
+    expect(call.state).toBe("done")
+  })
+
+  test("a helper that did not finish is marked, and a step of no known call or a bad one is left out", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(...task,
+      { strata_mcp: { event: "helper", state: "start", kind: "general", description: "d", call_id: "t1" } },
+      { strata_mcp: { event: "step", id: "s1", name: "Bash", arguments: { command: "ls" }, call_id: "nobody" } },
+      { strata_mcp: { event: "step_result", id: "unknown", ok: true, call_id: "t1" } },
+      { strata_mcp: { event: "helper", state: "end", ok: false, call_id: "t1" } },
+      ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("look", [], ctx)
+    const call = c.messages[1].tools![0]
+    expect(call.helper!.state).toBe("failed")
+    expect(call.steps).toEqual([])
+  })
+
+  test("a call that is not a Task has no helper", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(
+      { strata_mcp: { event: "start", id: "c1", name: "Read" } }, { strata_mcp: { event: "call", id: "c1", name: "Read", server: "agent", tool: "Read", arguments: { file_path: "a" }, round: 1 } }, ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("look", [], ctx)
+    expect(c.messages[1].tools![0].helper).toBeUndefined()
+    expect(c.messages[1].tools![0].steps).toBeUndefined()
+  })
+})

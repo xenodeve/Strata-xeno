@@ -48,6 +48,23 @@ export async function getAgent(): Promise<AgentInfo | null> {
   } catch { return null }
 }
 
+export interface HelpersView { on: boolean; available: boolean; editable: boolean; config_file: string | null }
+
+/** Sub-agents for the coding tools (serve/subagent.py): whether they are on. null when the server cannot be asked (not this PC, no such route). */
+export async function getHelpers(): Promise<HelpersView | null> {
+  try {
+    const r = await fetch(url("agent/helpers"), { headers: apiHeaders() })
+    return r.ok ? ((await r.json()) as HelpersView) : null
+  } catch { return null }
+}
+
+export async function postHelpers(on: boolean): Promise<{ view: HelpersView } | { error: string }> {
+  try {
+    const r = await fetch(url("agent/helpers"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify({ on }) })
+    return r.ok ? { view: (await r.json()) as HelpersView } : { error: await errorMessage(r) }
+  } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
+}
+
 export interface WebView { on: boolean; provider: "searxng" | "brave"; searxng_url: string; brave_key_set: boolean; available: boolean; editable: boolean; config_file: string | null }
 
 /** Web access for the coding tools (serve/web.py): whether it is on, the search provider, whether there is a Brave key (never the key). null when the server cannot be asked (not this PC, no such route). */

@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, CheckmarkCircle02Icon, CircleIcon, Alert02Icon } from "@hugeicons/core-free-icons"
-import { chat, type AskedQuestion, type Todo, type ToolCall } from "../../lib/chat"
+import { chat, type AskedQuestion, type Step, type Todo, type ToolCall } from "../../lib/chat"
 import { diffRows, toolSummary } from "../../lib/agent"
 import type { Effect, Scope } from "../../lib/perms"
 import { Collapse } from "../../components/motion"
@@ -171,6 +171,29 @@ export function HookNotes({ notes, className }: { notes?: HookNote[]; className?
   )
 }
 
+/** What a helper did on a Task, step by step (its calls, with a mark for each); the last few while it works, all of them when it is done. */
+function HelperSteps({ call }: { call: ToolCall }) {
+  const steps = call.steps
+  if (!call.helper && !steps?.length) return null
+  const h = call.helper
+  const shown: Step[] = steps ? (h?.state === "running" ? steps.slice(-6) : steps) : []
+  const hidden = (steps?.length ?? 0) - shown.length
+  return (
+    <div data-helper={h?.state ?? "done"} className="border-t border-line px-3 py-1.5 text-[12px] text-ink-2">
+      {h && <div className="font-medium">{h.state === "running" ? t("A helper is working ({kind})", { kind: h.kind === "general" ? t("general") : t("read only") }) : h.state === "failed" ? t("The helper did not finish") : t("The helper is done")}</div>}
+      {hidden > 0 && <div className="text-ink-3">{t("{n} earlier steps", { n: fmt(hidden) })}</div>}
+      <ul className="m-0 mt-0.5 list-none space-y-0.5 p-0">
+        {shown.map((s) => (
+          <li key={s.id} data-step={s.state} className={cn("flex gap-2", s.state === "error" && "text-bad")}>
+            <span aria-hidden className="w-3 shrink-0 text-ink-3">{s.state === "running" ? "…" : s.state === "done" ? "✓" : "✕"}</span>
+            <span className="min-w-0 truncate font-mono text-[11.5px]"><span className="font-medium">{s.name}</span> {toolSummary(s.name, s.arguments)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 function Body({ call }: { call: ToolCall }) {
   const name = call.tool || call.name
   const result = call.result != null ? <Out text={call.result} /> : null
@@ -192,6 +215,7 @@ function Body({ call }: { call: ToolCall }) {
   }
   if (name === "Write") return <div className="space-y-2"><Out text={str(arg(call, "content")).split("\n").slice(0, 60).join("\n") + (str(arg(call, "content")).split("\n").length > 60 ? "\n…" : "")} />{result}</div>
   if (name === "NotebookEdit") return <div className="space-y-2"><Out text={str(arg(call, "new_source"))} />{result}</div>
+  if (name === "Task") return <div className="space-y-2"><Out text={str(arg(call, "prompt"))} />{result}</div>
   if (name === "ExitPlanMode") return <div className="prose-chat text-[13px]" dangerouslySetInnerHTML={{ __html: markdown(str(arg(call, "plan"))) }} />
   if (name === "TodoWrite") return <TodoList todos={Array.isArray(arg(call, "todos")) ? (arg(call, "todos") as Todo[]) : []} />
   return result ?? <Out text={JSON.stringify(call.arguments ?? {}, null, 2)} />
@@ -220,6 +244,7 @@ export function AgentCall({ call }: { call: ToolCall }) {
         <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("shrink-0 text-ink-3 transition-transform duration-200", open && "rotate-180")} />
       </button>
       <Judge call={call} />
+      <HelperSteps call={call} />
       <HookNotes notes={call.hooks} />
       {call.question && <Ask call={call} />}
       {pending && !waiting && <Question call={call} />}

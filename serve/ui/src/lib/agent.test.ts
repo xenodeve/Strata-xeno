@@ -93,6 +93,7 @@ describe("toolSummary: a call in a few words", () => {
     expect(toolSummary("BashOutput", { bash_id: "bash_1" })).toBe("bash_1")
     expect(toolSummary("KillShell", { shell_id: "bash_2" })).toBe("bash_2")
     expect(toolSummary("WebFetch", { url: "https://example.com/a" })).toBe("https://example.com/a")
+    expect(toolSummary("Task", { description: "find hello", prompt: "long text" })).toBe("find hello")
     expect(toolSummary("WebSearch", { query: "rice recipes" })).toBe("rice recipes")
   })
   test("arguments that are not what they should be give nothing, not a crash", () => {

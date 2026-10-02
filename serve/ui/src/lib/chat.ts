@@ -23,12 +23,16 @@ export interface AskedQuestion {
   questions: { question: string; header: string; multiSelect: boolean; options: { label: string; description: string }[] }[]
   answers?: Record<string, string[]> | null
 }
+/** One call a helper made while it worked on a Task: the nested list on the Task's card. */
+export interface Step { id: string; name: string; arguments?: unknown; state: "running" | "done" | "error"; text?: string }
 export interface ToolCall {
   id: string; name: string; at: number; rat: number
   state: "writing" | "asking" | "running" | "done" | "error" | "skipped"
   question?: AskedQuestion
   ask?: Ask; judge?: { verdict: string; severity: number | null }                // the coding tools: a question for the user, and what auto mode found
   hooks?: HookNote[]                                                                 // what the user's hooks did about this call
+  helper?: { kind: string; description: string; state: "running" | "done" | "failed"; steps: number }      // a Task call: the helper that works on it
+  steps?: Step[]                                                                     // and what that helper did, step by step
   server?: string; tool?: string; arguments?: unknown; round?: number
   result?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number | null; open?: boolean
 }
@@ -135,6 +139,7 @@ export function apiMessages(messages: Message[]): ApiMessage[] {
 interface ToolEvent {
   event: string; id: string; name: string; server?: string; tool?: string; arguments?: unknown; round?: number
   text?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number; skipped?: boolean; max_rounds?: number
+  state?: string; kind?: string; description?: string; steps?: number
   on?: string; hook?: string; command?: string; code?: number | null; blocked?: boolean; timeout?: boolean; error?: string | null
   call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string; questions?: AskedQuestion["questions"]      // the coding tools
 }
@@ -143,6 +148,19 @@ interface ToolEvent {
 function onTool(m: Message, x: ToolEvent) {
   if (x.event === "limit") { m.limit = x.max_rounds; return }
   if (x.event === "todos") { if (Array.isArray(x.todos)) m.todos = x.todos; return }
+  if (x.event === "helper" || x.event === "step" || x.event === "step_result") {            // a helper's work, on the Task call it belongs to
+    const c = (m.tools || []).find((y) => y.id === x.call_id)
+    if (!c) return
+    if (x.event === "helper") {
+      if (x.state === "start") { c.helper = { kind: String(x.kind ?? "explore"), description: String(x.description ?? ""), state: "running", steps: 0 }; c.steps = [] }
+      else if (c.helper) { c.helper.state = x.ok === false ? "failed" : "done"; if (typeof x.steps === "number") c.helper.steps = x.steps }
+      return
+    }
+    c.steps = c.steps || []
+    if (x.event === "step") { if (c.steps.length < 200) c.steps.push({ id: String(x.id), name: String(x.name ?? ""), arguments: x.arguments, state: "running" }) }
+    else { const s = c.steps.find((y) => y.id === String(x.id)); if (s) { s.state = x.ok ? "done" : "error"; s.text = typeof x.text === "string" ? x.text : undefined } }
+    return
+  }
   if (x.event === "hook") {                                                                  // a hook of the user's ran: on the call it was about, else on the answer
     const note = noteFrom(x as unknown as Record<string, unknown>)
     if (!note) return
