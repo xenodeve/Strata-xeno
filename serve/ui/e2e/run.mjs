@@ -56,6 +56,7 @@ skill(".claude/skills", "shared-skill", "in two apps")
 skill(".codex/skills", "codex-only", "only in Codex")
 skill(".codex/skills", "shared-skill", "in two apps")
 skill(".agents/skills", "agents-skill", "in the shared folder")
+for (let i = 0; i < 60; i++) skill(".agents/skills", `bulk-${String(i).padStart(2, "0")}`, `a skill of many, number ${i}`)
 put(".cursor/mcp.json", JSON.stringify({ mcpServers: {
   fake: { command: PY, args: [FAKE_MCP] },
   quiet: { command: "node", args: ["q.js"], disabled: true },

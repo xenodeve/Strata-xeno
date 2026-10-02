@@ -9,11 +9,11 @@ import { cn } from "../lib/cn"
 import { Collapse } from "./motion"
 import { toast } from "./toast"
 import { Button, MiniSwitch, inputCls } from "./ui"
+import { Windowed } from "./Windowed"
 
 // Skills and MCP servers of the other coding apps on this PC (issue #94). Skills are imported automatically and are on until switched off
 // (the whole import, an app, a skill); MCP servers are only listed, by app, and imported by a click: nothing is started until then.
 // The server reads the other apps' files and decides; secrets never come here. Without the right to change things it is a list.
-const SHOWN = 40                                           // skills of an app shown before "Show all"
 const REASON: Record<string, string> = {
   "it speaks SSE only; Strata speaks Streamable HTTP": msg("It speaks SSE only; Strata speaks Streamable HTTP."),
   "no command or address to run": msg("It has no command or address to run."),
@@ -61,7 +61,6 @@ export function ImportSettings({ part }: { part: "skills" | "mcp" }) {
   const { view, setView, busy, notice, send, rescan } = useImport()
   const [filter, setFilter] = useState("")
   const [open, setOpen] = useState<string[]>([])               // the apps whose skills are shown
-  const [all, setAll] = useState<string[]>([])                 // the apps whose whole list is shown
 
   if (!view) return null
   if (!view.available) return <section><h2 className="text-[15px] font-semibold">{part === "skills" ? t("Skills from other apps") : t("MCP servers from other apps")}</h2><p className="mt-1 text-[13px] text-ink-2">{t("Importing from other apps is not available on this server.")}</p></section>
@@ -99,7 +98,6 @@ export function ImportSettings({ part }: { part: "skills" | "mcp" }) {
           const mine = matching.filter((i) => i.harness === h.id)
           if (filter.trim() && mine.length === 0) return null
           const expanded = open.includes(h.id) || !!filter.trim()
-          const showing = all.includes(h.id) || filter.trim() ? mine : mine.slice(0, SHOWN)
           const on = harnessOn(s, h.id)
           return (
             <div key={h.id} data-harness={h.id} className="border-t border-line py-2.5">
@@ -114,8 +112,9 @@ export function ImportSettings({ part }: { part: "skills" | "mcp" }) {
               {h.files.length > 0 && <div className="mt-0.5 pl-5 text-[12px] text-ink-3 [overflow-wrap:anywhere]">{t("Read from {files}", { files: h.files.join(", ") })}</div>}
               {h.errors.map((e) => <div key={e} className="mt-0.5 pl-5 text-[12px] text-bad [overflow-wrap:anywhere]">{e}</div>)}
               <Collapse open={expanded && h.skills > 0}>
+                <Windowed label={t("Skills of {name}", { name: h.label })}>
                 <ul className={cn("m-0 mt-1 list-none p-0 pl-5", (!on || !s.enabled) && "opacity-60")}>
-                  {showing.map((i) => {
+                  {mine.map((i) => {
                     const own = itemOn(s, i.harness, i.name)
                     return (
                       <li key={i.id} data-skill={i.id} className={cn("flex items-start gap-3 py-1.5", !i.used && "opacity-60")}>
@@ -132,9 +131,7 @@ export function ImportSettings({ part }: { part: "skills" | "mcp" }) {
                     )
                   })}
                 </ul>
-                {!(all.includes(h.id) || filter.trim()) && mine.length > SHOWN && (
-                  <div className="pl-5 pt-1"><Button kind="quiet" onClick={() => setAll([...all, h.id])}>{t("Show all {n}", { n: fmt(mine.length) })}</Button></div>
-                )}
+                </Windowed>
               </Collapse>
             </div>
           )

@@ -207,7 +207,6 @@ export const part: Record<string, string> = {
   "no skills": "ไม่มี skill",
   "Read from {files}": "อ่านจาก {files}",
   "Same as {name}": "เหมือนของ {name}",
-  "Show all {n}": "แสดงทั้ง {n}",
   "No skill matches.": "ไม่มี skill ที่ตรง",
   "MCP servers from other apps": "MCP server จากแอปอื่น",
   "Nothing here runs until you import it. Importing copies a server into Strata's own list (MCP tools > Servers), where you can edit it, turn it off or delete it.": "ที่นี่ไม่มีอะไรรันจนกว่าคุณจะนำเข้า การนำเข้าจะคัดลอก server เข้าไปในรายการของ Strata เอง (เครื่องมือ MCP > Servers) ซึ่งคุณแก้ ปิด หรือลบได้",
@@ -226,4 +225,5 @@ export const part: Record<string, string> = {
   "It has no command or address to run.": "ไม่มีคำสั่งหรือที่อยู่ให้รัน",
   "It is not a server entry.": "ไม่ใช่รายการ server",
   "Skills": "Skill",
+  "Skills of {name}": "Skill ของ {name}",
 }
