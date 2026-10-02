@@ -242,6 +242,8 @@ export const part: Record<string, string> = {
   "Mode": "โหมด",
   "Folder the tools work in": "โฟลเดอร์ที่เครื่องมือทำงาน",
   "Browse": "เลือกโฟลเดอร์",
+  "Waiting for your answer": "รอคำตอบจากคุณ",
+  "Answering": "กำลังตอบ",
   "Used skill: {name}": "ใช้ skill: {name}",
   "Read a file of the skill {name}": "อ่านไฟล์ของ skill {name}",
   "Looked for a skill": "ค้นหา skill",

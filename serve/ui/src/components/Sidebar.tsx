@@ -24,7 +24,8 @@ interface Open extends Target { x: number; y: number; moving?: boolean }
 export function Sidebar({ drawer = false, onClose }: { drawer?: boolean; onClose?: () => void }) {
   useChatVersion()
   const idx = chat.index
-  const busy = !!chat.busy
+  const running = chat.runningIds()                                           // the conversations that are being answered (the open one too)
+  const asking = chat.askingIds()                                             // those among them that wait for the user's answer to a question of the coding tools
   const [shut, setShut] = useState(() => store.get<string>("sidebar", "open") === "closed")
   const [folded, setFolded] = useState<string[]>(() => { const f = store.get<unknown>("sidebar.folded", []); return Array.isArray(f) ? f.filter((x): x is string => typeof x === "string") : [] })
   const [menu, setMenu] = useState<Open | null>(null)
@@ -55,7 +56,6 @@ export function Sidebar({ drawer = false, onClose }: { drawer?: boolean; onClose
   const setShutKept = (v: boolean) => { setShut(v); store.set("sidebar", v ? "closed" : "open") }
   const stillWriting = () => toast("warn", t("Still writing"), t("Stop the answer first."))
   const pick = (id: string) => {
-    if (id !== idx.active && busy) { stillWriting(); return }
     if (chat.open(id)) onClose?.()
   }
   const fresh = (project?: string) => {
@@ -109,12 +109,15 @@ export function Sidebar({ drawer = false, onClose }: { drawer?: boolean; onClose
   const topic = (s: SessionMeta): BranchTopic => {
     const target: Target = { kind: "chat", id: s.id }
     const title = s.title || t("Untitled chat")
-    const blocked = busy && s.id !== idx.active
+    const state = asking.includes(s.id) ? "asking" : running.includes(s.id) ? "answering" : null
     const isRenaming = renaming?.kind === "chat" && renaming.id === s.id
     return {
-      value: s.id, label: title, disabled: blocked, title: blocked ? t("Stop the answer first.") : title,
+      value: s.id, label: title, title,
       custom: isRenaming ? renameField(target, s.title, "ml-10 mr-1") : undefined,
-      trailing: isRenaming ? undefined : optionsButton({ target, label: t("Options for {title}", { title }) }),
+      trailing: isRenaming ? undefined : (<>
+        {state && <span data-running={state} role="img" aria-label={state === "asking" ? t("Waiting for your answer") : t("Answering")} title={state === "asking" ? t("Waiting for your answer") : t("Answering")} className="run-dot" />}
+        {optionsButton({ target, label: t("Options for {title}", { title }) })}
+      </>),
     }
   }
   const projectSections: BranchSection[] = idx.projects.map((p) => {

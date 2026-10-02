@@ -565,17 +565,20 @@ describe("conversations", () => {
     expect(again.index.items).toHaveLength(2)
   })
 
-  test("nothing changes while an answer is being written", async () => {
+  test("while an answer is being written the chat cannot be deleted, and a chat that is open is already open", async () => {
     keep()
     mockFetch([answer("a")], [])
     const c = new ChatController()
     await c.send("one", [], ctx)
     const first = c.index.active!
     c.busy = { abort: new AbortController(), msg: c.messages[1] }
-    expect(c.newSession()).toBe(false)
     expect(c.open(first)).toBe(true)                       // the one that is open is already open
     expect(c.remove(first)).toBe(false)
     expect(c.messages).toHaveLength(2)
+    expect(c.newSession()).toBe(true)                      // another can be started: this one goes on answering
+    expect(c.runningIds()).toEqual([first])
+    expect(c.open(first)).toBe(true)
+    expect(c.busy).not.toBeNull()
     c.busy = null
   })
 
@@ -1016,12 +1019,13 @@ describe("a new chat in a project", () => {
     expect(c.pendingProject).toBeNull()
   })
 
-  test("not while an answer is being written", () => {
+  test("an answer that is being written does not stop a new chat in the project", () => {
     keep()
     const c = new ChatController()
     const p = c.addProject("Work", ["C:/w"])!
     c.busy = { abort: new AbortController(), msg: { role: "assistant", text: "", time: 1 } }
-    expect(c.newSession(p)).toBe(false)
+    expect(c.newSession(p)).toBe(true)
+    expect(c.currentProject()).toBe(p)
     c.busy = null
   })
 
@@ -1062,5 +1066,206 @@ describe("a new chat in a project", () => {
     mockFetch([said("one")], [])
     await c.send("first", [], ctx)
     expect(c.index.items[0].project).toBe(p)
+  })
+})
+
+// Chats that answer at the same time (issue #99): another chat can be opened or started while one is answering. The one that was left goes on in the background (the server takes the
+// requests one after the other) and is saved in its own place; coming back to it shows what has been written.
+describe("chats that answer at the same time", () => {
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    return data
+  }
+  const tick = () => new Promise((r) => setTimeout(r, 8))
+  type Call = { body: Record<string, any>; chunk: (text: string) => void; end: () => void; aborted: boolean }
+  /** A server that answers when it is told to: each request is a `Call` that is fed text and then ended. */
+  function gated(): Call[] {
+    const calls: Call[] = []
+    ;(globalThis as Record<string, unknown>).fetch = (_u: string, init: { body: string; signal: AbortSignal }) => {
+      let ctl!: ReadableStreamDefaultController<Uint8Array>
+      const body = new ReadableStream<Uint8Array>({ start(c) { ctl = c } })
+      const call: Call = {
+        body: JSON.parse(init.body), aborted: false,
+        chunk: (text) => ctl.enqueue(enc.encode(sse(delta({ content: text })))),
+        end: () => { ctl.enqueue(enc.encode(sse({ choices: [], usage: { prompt_tokens: 50, completion_tokens: 5 } }, "data: [DONE]\n\n"))); ctl.close() },
+      }
+      init.signal.addEventListener("abort", () => { call.aborted = true; try { ctl.error(Object.assign(new Error("aborted"), { name: "AbortError" })) } catch { /* closed */ } })
+      calls.push(call)
+      return Promise.resolve(new Response(body, { status: 200 }))
+    }
+    return calls
+  }
+
+  test("a new chat can be started and answered while another is answering", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    const a = c.send("question A", [], ctx)
+    await tick()
+    const idA = c.index.active!
+    expect(c.busy).not.toBeNull()
+    expect(c.newSession()).toBe(true)
+    expect(c.busy).toBeNull()                                       // the new chat is not answering
+    expect(c.runningIds()).toEqual([idA])
+    const b = c.send("question B", [], ctx)
+    await tick()
+    expect(calls).toHaveLength(2)                                   // both requests are out; the server takes them one after the other
+    expect(calls[1].body.messages.map((m: { content: string }) => m.content)).toEqual(["question B"])
+    expect(calls[0].body.messages.map((m: { content: string }) => m.content)).toEqual(["question A"])
+    calls[1].chunk("answer B"); calls[1].end()
+    await b
+    expect(c.messages.map((m) => m.text)).toEqual(["question B", "answer B"])
+    expect(c.runningIds()).toEqual([idA])
+    calls[0].chunk("answer A"); calls[0].end()
+    await a
+    expect(c.runningIds()).toEqual([])
+    expect(c.messages.map((m) => m.text)).toEqual(["question B", "answer B"])        // the page still shows the one that is open
+    expect(c.open(idA)).toBe(true)
+    expect(c.messages.map((m) => m.text)).toEqual(["question A", "answer A"])       // and the other has its answer, stored in its own place
+  })
+
+  test("another chat can be opened while one answers, and the live answer is there when coming back", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    calls.length = 0
+    const first = c.send("old one", [], ctx)
+    await tick(); calls[0].chunk("old answer"); calls[0].end(); await first
+    const old = c.index.active!
+    c.newSession()
+    const run = c.send("long one", [], ctx)
+    await tick()
+    const long = c.index.active!
+    calls[1].chunk("part one, ")
+    await tick()
+    expect(c.open(old)).toBe(true)
+    expect(c.messages.map((m) => m.text)).toEqual(["old one", "old answer"])
+    expect(c.busy).toBeNull()
+    calls[1].chunk("part two")
+    await tick()
+    expect(c.open(long)).toBe(true)
+    expect(c.messages.map((m) => m.text)).toEqual(["long one", "part one, part two"])      // what has been written, live
+    expect(c.busy?.msg).toBe(c.messages[1])
+    calls[1].chunk(" and the end"); calls[1].end()
+    await run
+    expect(c.messages[1].text).toBe("part one, part two and the end")
+    expect(c.busy).toBeNull()
+    expect(new ChatController().messages.map((m) => m.text)).toEqual(["long one", "part one, part two and the end"])      // kept, in the open conversation's place
+  })
+
+  test("the answer of a chat that is not open is stored in its place, and it moves up the list", async () => {
+    const data = keep()
+    const calls = gated()
+    const c = new ChatController()
+    const first = c.send("first", [], ctx)
+    await tick()
+    const idFirst = c.index.active!
+    c.newSession()
+    const second = c.send("second", [], ctx)
+    await tick()
+    const idSecond = c.index.active!
+    calls[1].chunk("two"); calls[1].end(); await second
+    expect([...c.index.items].sort((x, y) => y.time - x.time)[0].id).toBe(idSecond)
+    await tick(); await tick()                                      // a later moment than the other finished
+    calls[0].chunk("one, finished later"); calls[0].end(); await first
+    expect(c.index.active).toBe(idSecond)
+    const stored = JSON.parse(data.get("strata.chat." + idFirst)!) as { text: string }[]
+    expect(stored.map((m) => m.text)).toEqual(["first", "one, finished later"])
+    expect([...c.index.items].sort((x, y) => y.time - x.time)[0].id).toBe(idFirst)          // it finished last, so it is the newest (the list is shown by time)
+    expect(c.index.items.find((i) => i.id === idFirst)!.title).toBe("first")
+  })
+
+  test("a chat answers one question at a time, but another chat can ask", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    const a = c.send("in A", [], ctx)
+    await tick()
+    await c.send("again in A", [], ctx)                             // refused: A is answering
+    expect(calls).toHaveLength(1)
+    expect(c.messages).toHaveLength(2)
+    c.newSession()
+    const b = c.send("in B", [], ctx)
+    await tick()
+    expect(calls).toHaveLength(2)
+    calls[0].end(); calls[1].end()
+    await Promise.all([a, b])
+  })
+
+  test("Stop ends the open chat's answer only", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    const a = c.send("A", [], ctx)
+    await tick()
+    c.newSession()
+    const b = c.send("B", [], ctx)
+    await tick()
+    c.stop()
+    await b
+    expect(calls[1].aborted).toBe(true)
+    expect(calls[0].aborted).toBe(false)
+    expect(c.messages[1].stopped).toBe(true)
+    expect(c.runningIds()).toHaveLength(1)
+    calls[0].chunk("fine"); calls[0].end()
+    await a
+  })
+
+  test("a chat that is answering cannot be deleted until it is done", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    const a = c.send("A", [], ctx)
+    await tick()
+    const idA = c.index.active!
+    c.newSession()
+    expect(c.remove(idA)).toBe(false)
+    expect(c.index.items.some((i) => i.id === idA)).toBe(true)
+    calls[0].end()
+    await a
+    expect(c.remove(idA)).toBe(true)
+    expect(c.index.items.some((i) => i.id === idA)).toBe(false)
+  })
+
+  test("a chat that waits for the user's answer to a question is told apart", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    const a = c.send("A", [], ctx)
+    await tick()
+    const idA = c.index.active!
+    c.messages[1].tools = [{ id: "t", name: "Bash", at: 0, rat: 0, state: "asking" }]
+    expect(c.askingIds()).toEqual([idA])
+    c.newSession()
+    expect(c.askingIds()).toEqual([idA])
+    expect(c.runningIds()).toEqual([idA])
+    calls[0].end()
+    await a
+    expect(c.askingIds()).toEqual([])
+  })
+
+  test("a chat that is summarised in the background keeps its summary in place", async () => {
+    keep()
+    const c = new ChatController()
+    const said = (text: string) => sse(delta({ content: text }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]\n\n")
+    mockFetch([said("answer one"), said("answer two")], [])
+    await c.send("first", [], ctx)
+    await c.send("second", [], ctx)
+    const id = c.index.active!
+    const calls = gated()
+    const summary = c.compact(ctx)
+    await tick()
+    expect(c.compacting).toBe(true)
+    c.newSession()
+    expect(c.compacting).toBe(false)                                 // the new chat is not being summarised
+    calls[0].chunk("<summary>1. Primary request: kept</summary>"); calls[0].end()
+    await summary
+    expect(c.open(id)).toBe(true)
+    expect(c.messages).toHaveLength(1)
+    expect(c.messages[0].compact).toBeDefined()
+    expect(c.messages[0].text).toContain("1. Primary request: kept")
   })
 })

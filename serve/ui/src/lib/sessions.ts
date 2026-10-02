@@ -100,6 +100,15 @@ export function saveActive(b: Backing, index: SessionIndex, messages: StoredMess
   return { index: next, ok: persistIndex(b, next) && wrote }
 }
 
+/** Saves a conversation that is not the open one (it is still being answered while another is open): its messages go to its own slot and its place in the list moves up. Nothing
+ *  when it was deleted meanwhile. */
+export function saveBackground(b: Backing, index: SessionIndex, id: string, messages: StoredMessage[], now: number): { index: SessionIndex; ok: boolean } {
+  if (!index.items.some((i) => i.id === id)) return { index, ok: true }
+  const wrote = b.set(slotKey(id), messages)
+  const next = { ...index, items: index.items.map((i) => (i.id === id ? { ...i, time: now, title: i.named ? i.title : titleOf(messages) || i.title } : i)) }
+  return { index: next, ok: persistIndex(b, next) && wrote }
+}
+
 /** Starts an empty conversation; the open one (`current`, its messages) is kept in the list. When it cannot be kept (storage full)
  *  the same index object comes back and nothing changed. */
 export function newSession(b: Backing, index: SessionIndex, current: unknown[]): SessionIndex {

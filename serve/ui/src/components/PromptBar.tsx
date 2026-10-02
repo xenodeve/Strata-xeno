@@ -138,7 +138,7 @@ export function PromptBar(p: PromptBarProps) {
   const usableAgent = p.agent.info.available && p.agent.info.allowed
   const list: Row[] = [
     { key: "attach", name: t("Photos & files"), description: p.attachTitle, icon: Attachment01Icon },
-    { key: "new", name: t("New chat"), description: t("Starts a new chat; this one stays in Recents"), icon: MessageAdd01Icon, disabled: p.busy },
+    { key: "new", name: t("New chat"), description: t("Starts a new chat; this one stays in Recents"), icon: MessageAdd01Icon },
     { key: "save", name: t("Save as Markdown"), description: t("Download the conversation"), icon: Download01Icon },
     {
       key: "mcp", name: t("MCP tools"), icon: PlugSocketIcon, checked: mcpOn > 0,

@@ -123,6 +123,11 @@
 /* the slash command of a skill in a message: bold, and a card that says what skill it is (shown on hover or focus, drawn on the page itself) */
 .skill-tag { font-weight: 600; cursor: default; outline: none; border-radius: 3px; }
 .skill-tag:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* a conversation that is answering in the background (the sidebar): a small pulsing dot, amber when it waits for the user */
+.run-dot { flex: none; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: var(--accent); animation: run-pulse 1.4s ease-in-out infinite; }
+.run-dot[data-running="asking"] { background: #d98a00; }
+@keyframes run-pulse { 0%, 100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.1); } }
+@media (prefers-reduced-motion: reduce) { .run-dot { animation: none; } }
 .skill-tip {
   position: fixed; z-index: 60; width: max-content; max-width: min(300px, calc(100vw - 16px)); padding: 8px 12px; box-sizing: border-box;
   border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); box-shadow: 0 6px 24px rgb(0 0 0 / 0.10);

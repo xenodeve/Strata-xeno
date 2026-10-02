@@ -550,6 +550,11 @@ last answer reported, else a guess from the text (the panel says "about"); with 
 coding tools work in the project's folders from that request); until then the empty chat says which project it will be in. A new chat can also be given a project on its empty page (a menu under the heading, shown when there are projects):
 "No project" or one of them, changed or taken away until the first prompt; after that moving it is the sidebar's.
 
+**Chats that answer at the same time.** Another chat can be opened, or a new one started, while one is answering. The one that was left goes on in the background (the server takes the
+requests one after the other, so the second waits for its turn), is marked in the sidebar by a pulsing dot (amber when it waits for the user's answer to a question of the coding tools),
+and is saved in its own place when it ends; coming back to it shows what has been written so far, with Stop. A chat answers one question at a time, and cannot be deleted while it answers.
+Stop ends the open chat's answer only. Nothing of this survives closing the page: an answer still being written then is lost, as before.
+
 **Memory and instruction files.** The chat reads the project's own instruction files (`CLAUDE.md`, `CLAUDE.local.md`, `.claude/CLAUDE.md`, `AGENTS.md` when there is no `CLAUDE.md`, `.claude/rules/*.md`) of every folder of the project, following `@file` lines inside the folder a few levels deep, and hands them to the model after the rules and under them; a file in a sub-folder is handed over, once per chat, when the model reads or changes a file there. What other apps wrote down is **off until switched on** (in the import settings, or the Memory tab): each app's user instruction file (Claude Code `~/.claude/CLAUDE.md`, Codex, the shared agents folder, Gemini CLI) and the memory Claude Code keeps for a project (`~/.claude/projects/<folder>/memory/`). Each file is cut at 20,000 characters and all together at 60,000. None of it changes what the model may do: the permission rules decide that.
 
 **The right panel.** A button at the top right of the Chat opens a panel beside the conversation (a sheet over it on a screen narrower than 1280 px; open state and tab are kept in

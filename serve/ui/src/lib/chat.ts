@@ -9,7 +9,7 @@ import { t, tn } from "./i18n"
 import { skillOfMessage } from "./slash"
 import { compactPrompt, continuationText, estimateTokens, MIN_SUMMARY, shouldCompact, summaryOf, summaryRoom } from "./compact"
 import { addRule, agentRequest, NO_AGENT, rulesOf, type AgentInfo } from "./agent"
-import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
+import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, saveBackground, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
 
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
 export interface Ask { id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny" }
@@ -200,16 +200,40 @@ function restore(msgs: Message[]): Message[] {
 
 export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | string[] | null }      // skills: the names of the skills in use, for "/name"
 
+/** An answer that is being written (or a conversation that is being summarised) for one conversation. Several can run at once, each for its own conversation: the page shows one,
+ *  and the others go on in the background (the server takes their requests one after the other). `messages` is the live list of that conversation. */
+interface Run { abort: AbortController; msg: Message; messages: Message[]; meter: PrefillMeter | null; compacting: boolean }
+const NEW_KEY = "new"                                         // a conversation that is not in the list yet (only before its first prompt is saved)
+
+/** A conversation as it is stored: attachments are kept by name only, and an answer that is still being written (`skip`) is left out. */
+function storedOf(messages: Message[], skip?: Message): StoredMessage[] {
+  return messages.filter((m) => m !== skip)
+    .map((m) => ({ ...m, images: (m.images || []).map((i) => ({ name: i.name })), files: (m.files || []).map((f) => ({ name: f.name })) }))
+}
+
 export class ChatController {
   // a read that was cut off by closing the page is not still reading
   index: SessionIndex = loadIndex(store, Date.now())             // the conversations, and which is open (lib/sessions.ts)
   messages: Message[] = restore(store.get<Message[]>("chat", []))   // the open one
   settings: Settings = { ...DEFAULTS, ...store.get<Partial<Settings>>("sampling", {}) }
-  busy: { abort: AbortController; msg: Message } | null = null
+  private runs = new Map<string, Run>()                       // the conversations that are being answered, by id
+  /** The open conversation's answer that is being written, or null. (Another conversation may be answering in the background: see `runningIds`.) */
+  get busy(): { abort: AbortController; msg: Message } | null {
+    const r = this.runs.get(this.index.active ?? NEW_KEY)
+    return r ? { abort: r.abort, msg: r.msg } : null
+  }
+  set busy(v: { abort: AbortController; msg: Message } | null) {
+    const key = this.index.active ?? NEW_KEY
+    if (v) this.runs.set(key, { abort: v.abort, msg: v.msg, messages: this.messages, meter: null, compacting: false })
+    else this.runs.delete(key)
+  }
+  /** The open conversation is being summarised. */
+  get compacting(): boolean { return !!this.runs.get(this.index.active ?? NEW_KEY)?.compacting }
+  /** The conversations that are being answered now (the open one too), and those among them that wait for the user's answer to a question of the coding tools. */
+  runningIds(): string[] { return [...this.runs.keys()].filter((k) => k !== NEW_KEY) }
+  askingIds(): string[] { return [...this.runs].filter(([k, r]) => k !== NEW_KEY && (r.msg.tools || []).some((c) => c.state === "asking")).map(([k]) => k) }
   pendingProject: string | null = null                          // the project a new conversation (one that is not in the list yet) was started in
-  compacting = false                                             // the conversation is being summarised (busy is set too: nothing else can be sent or opened meanwhile)
   onError: (title: string, text: string) => void = () => {}
-  private meter: PrefillMeter | null = null
   private version = 0
   private listeners = new Set<() => void>()
   private frame = 0
@@ -220,19 +244,16 @@ export class ChatController {
   private paint() { if (!this.frame) this.frame = requestAnimationFrame(() => { this.frame = 0; this.notify() }) }
 
   private fullNoted = false
-  /** The open conversation as it is stored: attachments are kept by name only. */
-  private stored(): StoredMessage[] {
-    return this.messages.filter((m) => m !== this.busy?.msg)               // the answer that is still being written is not stored half-empty
-      .map((m) => ({ ...m, images: (m.images || []).map((i) => ({ name: i.name })), files: (m.files || []).map((f) => ({ name: f.name })) }))
-  }
+  /** The open conversation as it is stored: the answer that is still being written is not stored half-empty. */
+  private stored(skip: Message | undefined = this.busy?.msg): StoredMessage[] { return storedOf(this.messages, skip) }
   /** The browser refused a write: said once, until a write works again. */
   private storageFull() {
     if (this.fullNoted) return
     this.fullNoted = true
     this.onError(t("This browser's storage is full"), t("The conversation may not be kept. Delete some from Recents to make room."))
   }
-  save() {
-    const r = saveActive(store, this.index, this.stored(), Date.now(), this.pendingProject ?? undefined)
+  save(skip?: Message) {
+    const r = saveActive(store, this.index, this.stored(skip ?? this.busy?.msg), Date.now(), this.pendingProject ?? undefined)
     this.index = r.index
     if (this.index.active !== null) this.pendingProject = null
     if (r.ok) this.fullNoted = false
@@ -240,9 +261,8 @@ export class ChatController {
   }
   private saveIndex() { if (persistIndex(store, this.index)) this.fullNoted = false; else this.storageFull(); this.notify() }
 
-  /** Starts an empty conversation; the one that was open stays in Recents. Not while an answer is being written. */
+  /** Starts an empty conversation; the one that was open stays in Recents (and goes on answering, if it was). */
   newSession(project?: string): boolean {
-    if (this.busy) return false
     const into = project && this.index.projects.some((p) => p.id === project) ? project : null       // started inside a project: its folders are where the tools work from the first prompt
     if (!this.messages.length) { this.pendingProject = into; this.notify(); return true }
     const next = newSession(store, this.index, this.stored())
@@ -266,21 +286,21 @@ export class ChatController {
     const mine = this.index.items.find((i) => i.id === this.index.active)
     return mine ? mine.project : this.pendingProject ?? undefined
   }
-  /** Opens a conversation of the list. False when there is none with that id, an answer is being written, or the open one could not be kept. */
+  /** Opens a conversation of the list; the one that was open stays as it is (and goes on answering, if it was). False when there is none with that id, or the open one could not be kept. */
   open(id: string): boolean {
-    if (id === this.index.active) return true              // already open (also fine while it is being written)
-    if (this.busy) return false
+    if (id === this.index.active) return true              // already open
     const r = openSession(store, this.index, this.stored(), id)
     if (!r) return false
     if (!r.ok) { this.storageFull(); return false }
     this.index = r.index
-    this.messages = restore(r.messages as Message[])
+    const live = this.runs.get(id)                            // one that is being answered shows its live messages, not what was stored when it was left
+    this.messages = live ? live.messages : restore(r.messages as Message[])
     this.pendingProject = null
     this.notify()
     return true
   }
   remove(id: string): boolean {
-    if (this.busy && this.index.active === id) return false
+    if (this.runs.has(id)) return false                       // not while it is being answered
     const r = removeSession(store, this.index, id)
     this.index = r.index
     if (r.clearedActive) this.messages = []
@@ -337,41 +357,52 @@ export class ChatController {
   async compact(ctx: SendContext, focus = ""): Promise<boolean> {
     if (!this.canCompact()) return false
     const abort = new AbortController()
-    this.busy = { abort, msg: { role: "assistant", text: "", time: Date.now() } }
-    const ok = await this.runCompact(ctx, focus, false, 0, abort, this.contextUsed())
-    this.busy = null
+    const key = this.index.active ?? NEW_KEY
+    const run: Run = { abort, msg: { role: "assistant", text: "", time: Date.now() }, messages: this.messages, meter: null, compacting: false }
+    this.runs.set(key, run)
+    const ok = await this.runCompact(key, run, ctx, focus, false, 0, this.contextUsed())
+    this.runs.delete(key)
     this.notify()
     return ok
   }
 
+  /** Saves what a run changed: in the open conversation's place, or in its own slot when another conversation is open. */
+  private persist(key: string, run: Run) {
+    if (this.index.active === key || key === NEW_KEY) { this.save(run.msg); return }
+    const r = saveBackground(store, this.index, key, storedOf(run.messages, run.msg), Date.now())
+    this.index = r.index
+    if (!r.ok) this.storageFull()
+  }
+
   /** Summarises all but the last `tail` messages (the prompt that is being sent, and its answer, stay out of it) and puts the summary in their place. */
-  private async runCompact(ctx: SendContext, focus: string, auto: boolean, tail: number, abort: AbortController, before: number): Promise<boolean> {
-    this.compacting = true
+  private async runCompact(key: string, run: Run, ctx: SendContext, focus: string, auto: boolean, tail: number, before: number): Promise<boolean> {
+    run.compacting = true
     this.notify()
     let ok = false
     try {
-      const head = this.messages.slice(0, this.messages.length - tail)
-      const summary = summaryOf(await this.summarize(ctx, head, focus, abort.signal))
+      const head = run.messages.slice(0, run.messages.length - tail)
+      const summary = summaryOf(await this.summarize(ctx, head, focus, run.abort.signal, before))
       if (!summary) throw new Error(t("The model sent no summary."))
       const note: Message = { role: "user", text: continuationText(summary), time: Date.now(), compact: { before, after: estimateTokens(summary), auto, ...(focus ? { focus } : {}) } }
-      this.messages = [note, ...this.messages.slice(this.messages.length - tail)]
-      this.save()
+      const rest = run.messages.slice(run.messages.length - tail)
+      run.messages.splice(0, run.messages.length, note, ...rest)           // in place: the page may be showing another conversation, and this one's list must stay the same list
+      this.persist(key, run)
       ok = true
     } catch (e) {
       if ((e as Error).name !== "AbortError") this.onError(t("Could not compact the conversation"), (e as Error).message || String(e))
     }
-    this.compacting = false
+    run.compacting = false
     this.notify()
     return ok
   }
 
   /** The model's summary of `head`, as it wrote it. When the conversation does not fit with the request, the oldest part is left out and it is asked again. */
-  private async summarize(ctx: SendContext, head: Message[], focus: string, signal: AbortSignal): Promise<string> {
+  private async summarize(ctx: SendContext, head: Message[], focus: string, signal: AbortSignal, used = 0): Promise<string> {
     const prompt = compactPrompt(focus)
     let from = 0
     for (;;) {
       const history = apiMessages(head.slice(from))
-      const room = summaryRoom(ctx.health.max_context, estimateTokens(history), estimateTokens(prompt))
+      const room = summaryRoom(ctx.health.max_context, from === 0 && used > 0 ? used : estimateTokens(history), estimateTokens(prompt))      // what the server reported is the safe figure for the whole conversation
       const next = this.nextStart(head, from)
       if (room < MIN_SUMMARY && next !== null) { from = next; continue }
       const body: Record<string, unknown> = { model: ctx.health.model, messages: [...history, { role: "user", content: prompt }], stream: true, reasoning_effort: "low", temperature: 0.3, max_tokens: Math.max(64, room) }
@@ -410,9 +441,9 @@ export class ChatController {
    *  was sent (the mean over the last second) while it is read, and the engine's own mean as soon as it is read. The tokens
    *  read and cached come with the final timings, at the end of the answer. */
   samplePrefill(live: { state: string; prompt_read: number | null; prefill_tok_s_mean?: number | null }, ms: number) {
-    const b = this.busy, meter = this.meter
-    if (!b || !meter) return
-    const um = this.messages[this.messages.indexOf(b.msg) - 1]
+    const run = this.runs.get(this.index.active ?? NEW_KEY), meter = run?.meter
+    if (!run || !meter) return
+    const um = run.messages[run.messages.indexOf(run.msg) - 1]
     if (!um || um.role !== "user" || um.prefill?.state !== "reading") return
     if (live.state === "generating") {
       um.prefill = { state: "done", rate: null, mean: live.prefill_tok_s_mean ?? meter.mean(), read: null, cached: null }
@@ -478,25 +509,27 @@ export class ChatController {
     })
     const um = this.messages[this.messages.length - 1]
     um.prefill = { state: "reading", rate: null, mean: null, read: null, cached: null }
-    this.meter = new PrefillMeter()
     const m: Message = { role: "assistant", text: "", reasoning: "", time: Date.now() }
     this.messages.push(m)
     const abort = new AbortController()
-    this.busy = { abort, msg: m }
-    this.save()                                               // the conversation is in the list now, not when its answer ends
+    const conv = this.messages                                // this conversation's list: it stays the same list when the page shows another conversation meanwhile
+    this.save(m)                                              // the conversation is in the list now (it has its id), not when its answer ends
+    const id = this.index.active ?? NEW_KEY
+    const run: Run = { abort, msg: m, messages: conv, meter: new PrefillMeter(), compacting: false }
+    this.runs.set(id, run)
     this.notify()
-    if (compactFirst) await this.runCompact(ctx, "", true, 2, abort, before)       // near the end of the context: the earlier messages become a summary; this prompt and its answer are not part of it
+    if (compactFirst) await this.runCompact(id, run, ctx, "", true, 2, before)       // near the end of the context: the earlier messages become a summary; this prompt and its answer are not part of it
 
     const s = this.settings
-    const body: Record<string, unknown> = { model: ctx.health.model, messages: apiMessages(this.messages), stream: true, reasoning_effort: s.thinking }
+    const body: Record<string, unknown> = { model: ctx.health.model, messages: apiMessages(conv), stream: true, reasoning_effort: s.thinking }
     if (s.temperature > 0) Object.assign(body, { temperature: +s.temperature, top_p: +s.top_p, top_k: +s.top_k })
     else body.temperature = 0
     if (s.seed) body.seed = +s.seed
     if (s.max) body.max_tokens = +s.max
     if (ctx.projectionLoaded) body.experimental_speed_projection = !!s.esp
     Object.assign(body, mcpRequest(s, ctx.mcp))                            // this server may run MCP tools for it (the ones not switched off)
-    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, this.index.active, rulesOf(store, this.index.active ?? "new")))      // the coding tools, when they are on and reachable
-    const lastPrompt = [...this.messages].reverse().find((x) => x.role === "user")
+    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, id === NEW_KEY ? null : id, rulesOf(store, id)))      // the coding tools, when they are on and reachable
+    const lastPrompt = [...conv].reverse().find((x) => x.role === "user")
     const skill = lastPrompt ? skillOfMessage(lastPrompt.text, ctx.skills ?? []) : null
     if (skill) body.strata_skill = skill                                   // "/name": the server loads that skill for this message
 
@@ -555,10 +588,10 @@ export class ChatController {
     if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000
     // The read is over: the engine's own mean replaces the live speed. After a tool round the final timings are the last
     // round's (a different prompt), so then the mean is the one measured while the first prompt was read.
-    const sampled = this.meter?.mean() ?? null
+    const sampled = run.meter?.mean() ?? null
     const own = timings && !(m.tools || []).length ? timings : null
     um.prefill = { state: "done", rate: null, mean: own ? own.prompt_per_second ?? null : sampled, read: own?.prompt_n ?? null, cached: own?.cache_n ?? null }
-    this.meter = null
+    run.meter = null
     const n = usage?.completion_tokens ?? null
     // what the line under the answer says, kept as numbers (metaText words it when it is shown)
     const stats: Stats = {}
@@ -577,9 +610,14 @@ export class ChatController {
     if (ran) stats.tools = ran
     if (m.limit) stats.limit = m.limit
     if (Object.keys(stats).length) m.stats = stats
-    this.busy = null
+    this.runs.delete(id)
     if (this.frame) { cancelAnimationFrame(this.frame); this.frame = 0 }
-    this.save()
+    if (this.index.active === id || id === NEW_KEY) this.save()
+    else {                                                    // another conversation is open: this one is saved in its own place
+      const r = saveBackground(store, this.index, id, storedOf(conv), Date.now())
+      this.index = r.index
+      if (!r.ok) this.storageFull()
+    }
     this.notify()
   }
 }

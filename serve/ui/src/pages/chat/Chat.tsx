@@ -268,8 +268,7 @@ export function Chat({ id }: { id?: string }) {
   }
 
   const newChat = () => {
-    if (busy) { toast("warn", t("Still writing"), t("Stop the answer first.")); return }
-    chat.newSession()                                         // the one that was open stays in Recents
+    chat.newSession()                                         // the one that was open stays in Recents (and goes on answering, if it was)
     input.current?.focus()
   }
   const download = () => {
