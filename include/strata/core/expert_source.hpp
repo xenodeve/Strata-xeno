@@ -651,6 +651,7 @@ private:
     int64_t mat_layer_ = -1;
     double mat_ms_ = 0;                        ///< the begin half's time (eviction, commit, submit)
     std::vector<std::string> mirror_dirs_;                 ///< #62: add_mirror's directories
+    uint64_t mirror_turn_ = 0;                             ///< #82: the batch count, the tie-break's starting copy
     /// #62: per source file, its verified copies (resolved on first use)
     std::vector<std::pair<std::string, std::vector<std::string>>> copies_;
     bool copies_of(const std::string& source, const std::vector<std::string>*& out, std::string& err);

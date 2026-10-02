@@ -1901,6 +1901,7 @@ bool ArenaExpertSource::submit_reads(const int32_t* layers, const int32_t* exper
     auto& reqs = pend_.reqs;
     reqs.clear();
     reqs.reserve((size_t) n * 3);
+    bool used_mirror = false;
     pend_.slot_bytes = slot_bytes;
     std::vector<uint64_t> queued;   // #62: bytes queued per dfiles_ index in this batch
     auto queued_of = [&](int i) -> uint64_t& {
@@ -1915,14 +1916,25 @@ bool ArenaExpertSource::submit_reads(const int32_t* layers, const int32_t* exper
         const std::string source = expert_file(gguf_, path_, from_gguf_, lay, layers[i]);
         int fi = open_file(source);
         if (fi < 0) return false;
-        if (!mirror_dirs_.empty()) {   // #62: the whole expert to the copy with the fewest bytes queued; ties: source
+        if (!mirror_dirs_.empty()) {   // #62: the whole expert to the copy with the fewest bytes queued
             const std::vector<std::string>* cs = nullptr;
             if (!copies_of(source, cs, err)) return false;
+            int cand[8], nc = 0;
+            cand[nc++] = fi;
             for (const std::string& c : *cs) {
                 const int gi = open_file(c);
                 if (gi < 0) return false;
+                if (nc < 8) cand[nc++] = gi;
+            }
+            // #82: ties go to the copy this batch starts at, one further on each batch - a decode layer misses ~0.3
+            // experts, so most batches hold one, and "ties to the source" sent nearly every read to the source
+            const int start = (int) (mirror_turn_ % (uint64_t) nc);
+            fi = cand[start];
+            for (int k = 1; k < nc; ++k) {
+                const int gi = cand[(start + k) % nc];
                 if (queued_of(gi) < queued_of(fi)) fi = gi;
             }
+            used_mirror = true;
         }
         DFile& d = dfiles_[(size_t) fi];
         ++d.st.reads;
@@ -1936,6 +1948,7 @@ bool ArenaExpertSource::submit_reads(const int32_t* layers, const int32_t* exper
             queued_of(fi) += a1 - a0;
         }
     }
+    if (used_mirror) ++mirror_turn_;
     return true;
 }
 
