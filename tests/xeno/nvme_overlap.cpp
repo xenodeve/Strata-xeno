@@ -68,6 +68,11 @@ int main() {
             expect(a->resident(l, e) == b->resident(l, e), "the same resident set as materialize_batch");
     expect(a->host_cache_bytes() == b->host_cache_bytes(), "the same host bytes");
     expect(a->nvme_loads() == b->nvme_loads() && b->nvme_loads() == 2, "two loads each");
+    {   // where a miss's time goes: every stage counted, the read and the copy always nonzero after a load
+        const auto s = b->nvme_stages();
+        expect(s.evict_ms >= 0 && s.commit_ms >= 0 && s.submit_ms >= 0, "the stage times are counted");
+        expect(s.wait_ms + s.copy_ms > 0 && s.copy_ms > 0, "a load waits for and copies its bytes");
+    }
     expect(b->blob(0, 2) && b->blob(0, 2)[blob - 1] == (uint8_t) (mark(0, 2) + blob - 1), "the bytes landed");
 
     // nothing to read: begin and end are no-ops; end without begin too

@@ -5427,10 +5427,9 @@ int main(int argc, char** argv) {
                         const size_t bytes = (size_t) lay.blob_bytes(s.layer);
                         uint8_t* st = ps_stage + i * ps_blob;
                         std::string e;
-                        const uint8_t* src = srcp->blob(s.layer, s.in);
-                        if (src == nullptr) src = srcp->materialize(s.layer, s.in, -1, e);   // #11
-                        // #62 crash: a later newcomer's materialize may evict this one before the copy below
-                        if (src != nullptr) arena_src.hold(s.layer, s.in);
+                        // #62 crash: held from the lookup on, so a later newcomer's materialize cannot evict it (with
+                        // capacity mode's slots it would hand over another expert's bytes) before the copy below
+                        const uint8_t* src = arena_src.acquire(s.layer, s.in, e);   // #11: a miss is read in
                         if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
                             uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
                             if (home == nullptr) {
@@ -7275,14 +7274,14 @@ int main(int argc, char** argv) {
                     uint8_t* st = ss_stage + i * ps_blob;
                     std::string e;
                     uint8_t* home = arena_src.recommit_host_copy(out_layer, x.out % (int32_t) g.n_expert, e);
-                    const uint8_t* src = srcp->blob(in_layer, x.in % (int32_t) g.n_expert);
-                    if (src == nullptr) src = srcp->materialize(in_layer, x.in % (int32_t) g.n_expert, -1, e);
+                    // #62 crash: held from the lookup on (acquire), so a later newcomer's materialize cannot evict this
+                    // one's host copy before the copy below
+                    const uint8_t* src = arena_src.acquire(in_layer, x.in % (int32_t) g.n_expert, e);
                     if (home == nullptr || src == nullptr) {
+                        if (src != nullptr) arena_src.release_hold(in_layer, x.in % (int32_t) g.n_expert);
                         std::fprintf(stderr, "strata generate: paired 4070 swap copy-home: %s\n", e.c_str());
                         return false;
                     }
-                    // #62 crash: a later newcomer's materialize may evict this one's host copy before the copy below
-                    arena_src.hold(in_layer, x.in % (int32_t) g.n_expert);
                     home_jobs.push_back({home, st, (size_t) lay.blob_bytes(out_layer)});
                     in_jobs.push_back({st, src, (size_t) lay.blob_bytes(in_layer)});
                 }
@@ -7411,10 +7410,9 @@ int main(int argc, char** argv) {
                         const size_t bytes = (size_t) lay.blob_bytes(s.layer);
                         uint8_t* st = ps_stage + i * ps_blob;
                         std::string e;
-                        const uint8_t* src = srcp->blob(s.layer, s.in);
-                        if (src == nullptr) src = srcp->materialize(s.layer, s.in, -1, e);   // #11
-                        // #62 crash: a later newcomer's materialize may evict this one before the copy below
-                        if (src != nullptr) arena_src.hold(s.layer, s.in);
+                        // #62 crash: held from the lookup on, so a later newcomer's materialize cannot evict it (with
+                        // capacity mode's slots it would hand over another expert's bytes) before the copy below
+                        const uint8_t* src = arena_src.acquire(s.layer, s.in, e);   // #11: a miss is read in
                         if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
                             uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
                             if (home == nullptr) {
@@ -7568,6 +7566,7 @@ int main(int argc, char** argv) {
         }
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
+        const auto stages0 = arena_src.nvme_stages();   // the miss-cost breakdown counts decode only
         if (o.profile_decode_range && cudaProfilerStart() != cudaSuccess) {
             std::fprintf(stderr, "strata generate: cudaProfilerStart failed\n");
             return 1;
@@ -7739,6 +7738,16 @@ int main(int argc, char** argv) {
             std::printf("%-24s %lld loads, %.3f per round, %.3f ms/round waiting; host tier %.2f GiB\n", "nvme tier",
                         (long long) arena_src.nvme_loads(), (double) arena_src.nvme_loads() / rounds,
                         arena_src.nvme_ms() / rounds, (double) arena_src.host_cache_bytes() / 1073741824.0);
+        if (rounds > 0 && o.ram_cache_gib > 0.0) {   // the miss-cost breakdown of the decode loads
+            auto s = arena_src.nvme_stages();
+            s.evict_ms -= stages0.evict_ms; s.commit_ms -= stages0.commit_ms; s.submit_ms -= stages0.submit_ms;
+            s.wait_ms -= stages0.wait_ms; s.copy_ms -= stages0.copy_ms;
+            std::printf("%-24s evict %.3f  commit %.3f  submit %.3f  wait %.3f  copy %.3f ms/round; slab %lld slots, "
+                        "%.0f MiB idle\n", "nvme stages",
+                        s.evict_ms / rounds, s.commit_ms / rounds, s.submit_ms / rounds, s.wait_ms / rounds,
+                        s.copy_ms / rounds, (long long) arena_src.host_slots(),
+                        (double) arena_src.host_idle_bytes() / 1048576.0);
+        }
         if (rounds > 0 && !o.expert_mirrors.empty())   // #62: each copy's share
             for (const auto& f : arena_src.nvme_file_stats())
                 std::printf("%-24s %lld experts, %.2f GiB, %.3f ms per batch it served, read p50 %.0f p99 %.0f "

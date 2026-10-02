@@ -533,6 +533,10 @@ public:
     int64_t nvme_loads() const { return nvme_loads_; }
     /// The time the caller waited on NVMe-tier loads (#95: a pool run overlapped between begin and end not counted).
     double nvme_ms() const { return nvme_ms_; }
+    /// Where the NVMe-tier loads' time went, summed over every load (the miss-cost breakdown): evicting (decommit),
+    /// committing the slots, issuing the reads, waiting for completions, copying the bounce buffer into the slots.
+    struct NvmeStages { double evict_ms = 0, commit_ms = 0, submit_ms = 0, wait_ms = 0, copy_ms = 0; };
+    NvmeStages nvme_stages() const { return stages_; }
     /// #62: a directory holding byte-identical copies of the expert source files (a GGUF shard, experts.bin) on
     /// another drive; repeatable.  read_experts_to sends each expert, all its ranges, to the copy with the fewest
     /// bytes queued in that batch (ties: the source).  A copy is checked against its source when first used (size,
@@ -552,6 +556,17 @@ public:
     /// swap's stage 2); the eviction skips it until release_hold.  No-op outside capacity mode.
     void hold(int64_t layer, int64_t expert);
     void release_hold(int64_t layer, int64_t expert);
+    /// The expert's bytes, held (release with release_hold): a resident one is held at once, a miss is read in and
+    /// held - one step under the host lock, so no eviction can take it between the lookup and the hold (with slots
+    /// a reused slot would hand over another expert's bytes silently).  Null and `err` when it cannot be produced.
+    const uint8_t* acquire(int64_t layer, int64_t expert, std::string& err);
+    /// Capacity mode's slab: the host tier lives in committed slots, one region per blob size.  A load takes an idle
+    /// slot of its size (no commit, no demand-zero faults); an eviction leaves its slot committed and idle, and only
+    /// idle bytes past the slack (STRATA_NVME_SLACK_MIB, 512) are decommitted.  host_slots() = slots committed now
+    /// (0 = the fixed arena addresses: STRATA_NVME_SLOTS=0, a pinned arena or no capacity); host_idle_bytes() = the
+    /// committed bytes no expert uses.
+    int64_t host_slots() const { return slab_committed_; }
+    uint64_t host_idle_bytes() const { return idle_bytes_; }
     /// A GPU-owned expert that comes home (paired swap copy-home) joins the host tier: account it and trim.
     void admit_home(int64_t layer, int64_t expert);
     bool load_rest(int threads, std::string& err);
@@ -647,7 +662,27 @@ private:
     std::vector<uint8_t> held_;      ///< #62 crash: hold() count per expert; evict_one skips these
     int64_t nvme_loads_ = 0;
     double nvme_ms_ = 0;
+    NvmeStages stages_;
     bool evict_one(int64_t avoid_layer);
+    // capacity mode's slab (set_capacity): each host-resident expert sits in a slot of its blob size's region
+    struct SlabClass {
+        uint8_t* base = nullptr;           ///< reserved for every expert of these layers; committed per slot
+        size_t stride = 0;                 ///< the blob size rounded up to a page
+        int32_t next = 0, cap = 0;         ///< slots ever committed / reserved
+        std::vector<int32_t> idle;         ///< committed, no expert in it
+        std::vector<int32_t> cold;         ///< decommitted again (reused before `next` grows)
+    };
+    bool slab_ = false;
+    std::vector<SlabClass> classes_;
+    std::vector<int16_t> class_of_layer_;
+    std::vector<int32_t> slot_of_;         ///< per expert, -1 = no slot
+    uint64_t idle_bytes_ = 0, slack_bytes_ = 0;
+    int64_t slab_committed_ = 0;
+    void slab_release();
+    uint8_t* host_at(size_t idx) const;    ///< the expert's host bytes: its slot, or its fixed arena offset
+    bool take_slot(size_t idx, int64_t avoid_layer, std::string& err);   ///< evicts until a slot is free
+    void free_slot(size_t idx);
+    const uint8_t* materialize_locked(int64_t layer, int64_t expert, int64_t avoid_layer, std::string& err);
 };
 
 }  // namespace strata::core

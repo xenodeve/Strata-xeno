@@ -1955,7 +1955,10 @@ bool ArenaExpertSource::collect_reads(std::string& err) {
     size_t got = 0;
     auto take = [&](size_t fi, int timeout_ms) -> bool {   // false on a failed read
         strata::platform::Completion c[64];
+        const auto tw = std::chrono::steady_clock::now();
         const int k = ((DirectFile*) dfiles_[fi].file)->wait(c, 64, timeout_ms);
+        const auto tk = std::chrono::steady_clock::now();
+        stages_.wait_ms += std::chrono::duration<double, std::milli>(tk - tw).count();
         const double t = strata::timeline::now_us();
         for (int j = 0; j < k; ++j) {
             if (c[j].tag == DirectFile::WAKE_TAG) continue;
@@ -1968,6 +1971,7 @@ bool ArenaExpertSource::collect_reads(std::string& err) {
             dfiles_[fi].lat_us[dfiles_[fi].lat_next++ % DFile::kLat] = (float) (t - t0);
             dfiles_[fi].lat_n = std::min<uint64_t>(dfiles_[fi].lat_n + 1, DFile::kLat);
         }
+        stages_.copy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tk).count();
         return true;
     };
     while (got < reqs.size()) {
@@ -2012,7 +2016,7 @@ std::vector<ArenaExpertSource::NvmeFileStat> ArenaExpertSource::nvme_file_stats(
 // with its own unbuffered file, copying only the host-owned experts into the arena.
 static LoadStats load_experts_gguf_direct(const std::string& gguf, uint8_t* dst,
                                           const strata::kernels::cpu::ExpertLayout& lay, int threads,
-                                          const uint8_t* skip) {
+                                          const uint8_t* skip, uint8_t* const* dst_of = nullptr) {
     using strata::platform::DirectFile;
     LoadStats st;
     const auto t0 = std::chrono::steady_clock::now();
@@ -2057,8 +2061,10 @@ static LoadStats load_experts_gguf_direct(const std::string& gguf, uint8_t* dst,
                         c.bytes < (off - a0) + n) { bad = true; break; }
                     for (int64_t x = e0; x < e0 + ne; ++x) {
                         if (skip[(size_t) (l * lay.n_expert + x)]) continue;
-                        std::memcpy(dst + lay.blob_offset(l, x) + at[r],
-                                    (uint8_t*) buf + (off - a0) + (uint64_t) (x - e0) * per[r], (size_t) per[r]);
+                        uint8_t* to = dst_of != nullptr ? dst_of[(size_t) (l * lay.n_expert + x)]
+                                                        : dst + lay.blob_offset(l, x);
+                        std::memcpy(to + at[r], (uint8_t*) buf + (off - a0) + (uint64_t) (x - e0) * per[r],
+                                    (size_t) per[r]);
                     }
                 }
             }
@@ -2081,22 +2087,30 @@ bool ArenaExpertSource::load_rest(int threads, std::string& err) {
     uint64_t kept = 0;
     std::vector<uint8_t> skip(exclusive_);
     for (size_t i = 0; i < nvme_.size(); ++i) skip[i] |= nvme_[i];
+    std::vector<uint8_t*> dst_of;
+    if (slab_) dst_of.assign(exclusive_.size(), nullptr);
     for (size_t i = 0; i < exclusive_.size(); ++i) {
         if (skip[i]) continue;
         const int64_t l = (int64_t) i / lay.n_expert, x = (int64_t) i % lay.n_expert;
-        uint64_t c = 0;
-        if (!((PinnedArena*) arena_)->commit_interior(lay.blob_offset(l, x), lay.blob_bytes(l), c, err)) return false;
+        if (slab_) {
+            if (!take_slot(i, -1, err)) return false;
+            dst_of[i] = host_at(i);
+        } else {
+            uint64_t c = 0;
+            if (!((PinnedArena*) arena_)->commit_interior(lay.blob_offset(l, x), lay.blob_bytes(l), c, err)) return false;
+        }
         kept += lay.blob_bytes(l);
     }
     if (from_gguf_) {
-        const LoadStats st = load_experts_gguf_direct(gguf_, const_cast<uint8_t*>(base_), lay, threads, skip.data());
+        const LoadStats st = load_experts_gguf_direct(gguf_, const_cast<uint8_t*>(base_), lay, threads, skip.data(),
+                                                      dst_of.empty() ? nullptr : dst_of.data());
         if (st.seconds < 0) { err = "load_rest: the GGUF read failed"; return false; }
     } else {
         std::string e;
         for (int64_t l = 0; l < lay.n_layers; ++l)
             for (int64_t x = 0; x < lay.n_expert; ++x)
                 if (!skip[(size_t) (l * lay.n_expert + x)] &&
-                    !read_expert(l, x, const_cast<uint8_t*>(base_) + lay.blob_offset(l, x), e)) { err = e; return false; }
+                    !read_expert(l, x, host_at((size_t) (l * lay.n_expert + x)), e)) { err = e; return false; }
     }
     deferred_ = false;
     cache_used_ = kept;
@@ -2108,6 +2122,35 @@ bool ArenaExpertSource::load_rest(int threads, std::string& err) {
 void ArenaExpertSource::set_capacity(uint64_t bytes, const std::vector<int32_t>& order) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     cache_cap_ = bytes;
+    slab_release();
+    // the slab: capacity mode on a deferred (placement-first), unpinned arena (Windows).  STRATA_NVME_SLOTS=0 keeps
+    // the fixed addresses (the A/B arm).  One reserved region per blob size, room for every expert of its layers;
+    // the byte cap still decides residency and eviction, the slab only stores.
+    const char* sv = std::getenv("STRATA_NVME_SLOTS");
+#if defined(_WIN32)
+    if (bytes > 0 && deferred_ && pinned_bytes_ == 0 && !(sv != nullptr && *sv && std::atoi(sv) == 0)) {
+        const char* sk = std::getenv("STRATA_NVME_SLACK_MIB");
+        slack_bytes_ = (uint64_t) (sk != nullptr && *sk ? std::max(0, std::atoi(sk)) : 512) << 20;
+        class_of_layer_.assign((size_t) lay.n_layers, -1);
+        for (int64_t l = 0; l < lay.n_layers; ++l) {
+            const size_t stride = (size_t) ((lay.blob_bytes(l) + 4095) / 4096 * 4096);
+            int16_t c = -1;
+            for (size_t k = 0; k < classes_.size(); ++k) if (classes_[k].stride == stride) c = (int16_t) k;
+            if (c < 0) { classes_.push_back(SlabClass{}); c = (int16_t) (classes_.size() - 1); classes_.back().stride = stride; }
+            class_of_layer_[(size_t) l] = c;
+            classes_[(size_t) c].cap += (int32_t) lay.n_expert;
+        }
+        slab_ = true;
+        for (SlabClass& k : classes_) {
+            k.base = (uint8_t*) VirtualAlloc(nullptr, (size_t) k.cap * k.stride, MEM_RESERVE, PAGE_READWRITE);
+            if (k.base == nullptr) slab_ = false;
+        }
+        if (!slab_) slab_release();
+        else slot_of_.assign(exclusive_.size(), -1);
+    }
+#else
+    (void) sv;
+#endif
     nvme_.assign(exclusive_.size(), 0);
     score_.assign(exclusive_.size(), 0.0f);
     held_.assign(exclusive_.size(), 0);
@@ -2156,9 +2199,13 @@ bool ArenaExpertSource::evict_one(int64_t avoid_layer) {
     }
     if (victim == SIZE_MAX) return false;
     const int64_t l = (int64_t) victim / lay.n_expert, x = (int64_t) victim % lay.n_expert;
-    uint64_t released = 0;
-    std::string e;
-    if (!((PinnedArena*) arena_)->decommit_interior(lay.blob_offset(l, x), lay.blob_bytes(l), released, e)) return false;
+    if (slab_) {
+        free_slot(victim);   // the next load overwrites it: nothing to decommit
+    } else {
+        uint64_t released = 0;
+        std::string e;
+        if (!((PinnedArena*) arena_)->decommit_interior(lay.blob_offset(l, x), lay.blob_bytes(l), released, e)) return false;
+    }
     nvme_[victim] = 1;
     cache_used_ -= lay.blob_bytes(l);
     return true;
@@ -2166,18 +2213,42 @@ bool ArenaExpertSource::evict_one(int64_t avoid_layer) {
 
 const uint8_t* ArenaExpertSource::materialize(int64_t layer, int64_t expert, int64_t avoid_layer, std::string& err) {
     std::lock_guard<std::mutex> lk(host_mu_);
+    return materialize_locked(layer, expert, avoid_layer, err);
+}
+
+const uint8_t* ArenaExpertSource::acquire(int64_t layer, int64_t expert, std::string& err) {
+    std::lock_guard<std::mutex> lk(host_mu_);
+    const size_t i = (size_t) (layer * n_expert_ + expert);
+    if (base_ == nullptr || deferred_ || i >= exclusive_.size() || exclusive_[i]) { err = "acquire: not a host-tier expert"; return nullptr; }
+    const uint8_t* p = materialize_locked(layer, expert, -1, err);
+    if (p != nullptr) {
+        if (i < held_.size() && held_[i] < 255) ++held_[i];
+        if (i < score_.size()) score_[i] += 1.0f;   // a use, as blob() counts one
+    }
+    return p;
+}
+
+const uint8_t* ArenaExpertSource::materialize_locked(int64_t layer, int64_t expert, int64_t avoid_layer,
+                                                     std::string& err) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     const size_t i = (size_t) (layer * n_expert_ + expert);
     if (base_ == nullptr || i >= exclusive_.size() || exclusive_[i]) { err = "materialize: not a host-tier expert"; return nullptr; }
-    uint8_t* at = const_cast<uint8_t*>(base_) + lay.blob_offset(layer, expert);
-    if (nvme_.empty() || !nvme_[i]) return at;
+    if (nvme_.empty() || !nvme_[i]) return host_at(i);
     const auto t0 = std::chrono::steady_clock::now();
     const uint64_t b = lay.blob_bytes(layer);
     while (cache_cap_ != 0 && cache_used_ + b > cache_cap_ && evict_one(avoid_layer)) {}
-    uint64_t c = 0;
-    if (!((PinnedArena*) arena_)->commit_interior(lay.blob_offset(layer, expert), b, c, err)) return nullptr;
+    if (slab_) {
+        if (!take_slot(i, avoid_layer, err)) return nullptr;
+    } else {
+        uint64_t c = 0;
+        if (!((PinnedArena*) arena_)->commit_interior(lay.blob_offset(layer, expert), b, c, err)) return nullptr;
+    }
+    uint8_t* at = host_at(i);
     // the read lands before the tier says so: a failed read leaves the expert on NVMe and returns null
-    if (!read_expert(layer, expert, at, err)) return nullptr;
+    if (!read_expert(layer, expert, at, err)) {
+        if (slab_) free_slot(i);
+        return nullptr;
+    }
     nvme_[i] = 0;
     score_[i] += 1.0f;
     cache_used_ += b;
@@ -2204,17 +2275,34 @@ bool ArenaExpertSource::materialize_begin(int64_t layer, const int32_t* experts,
     for (int i = 0; i < n; ++i) {
         const size_t idx = (size_t) (layer * n_expert_ + experts[i]);
         if (idx >= nvme_.size() || exclusive_[idx] || !nvme_[idx]) continue;
+        const auto te = std::chrono::steady_clock::now();
         while (cache_cap_ != 0 && cache_used_ + b > cache_cap_ && evict_one(layer)) {}
-        uint64_t c = 0;
-        if (!((PinnedArena*) arena_)->commit_interior(lay.blob_offset(layer, experts[i]), b, c, err)) return false;
+        if (slab_) {
+            if (!take_slot(idx, layer, err)) {
+                for (int32_t x : es) free_slot((size_t) (layer * n_expert_ + x));
+                cache_used_ -= b * es.size();
+                return false;
+            }
+            stages_.evict_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te).count();
+        } else {
+            const auto tc = std::chrono::steady_clock::now();
+            uint64_t c = 0;
+            if (!((PinnedArena*) arena_)->commit_interior(lay.blob_offset(layer, experts[i]), b, c, err)) return false;
+            stages_.evict_ms += std::chrono::duration<double, std::milli>(tc - te).count();
+            stages_.commit_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
+        }
         cache_used_ += b;   // accounted now so the next eviction sees it; published below once the bytes landed
         ls.push_back((int32_t) layer);
         es.push_back(experts[i]);
-        dsts.push_back(const_cast<uint8_t*>(base_) + lay.blob_offset(layer, experts[i]));
+        dsts.push_back(host_at(idx));
     }
     if (es.empty()) return true;
-    if (!submit_reads(ls.data(), es.data(), (int) es.size(), dsts.data(), err)) {
+    const auto ts = std::chrono::steady_clock::now();
+    const bool submitted = submit_reads(ls.data(), es.data(), (int) es.size(), dsts.data(), err);
+    stages_.submit_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
+    if (!submitted) {
         cache_used_ -= b * es.size();   // nothing published: they stay on NVMe, and the caller fails loudly
+        if (slab_) for (int32_t x : es) free_slot((size_t) (layer * n_expert_ + x));
         return false;
     }
     // #95: the reads are in flight; host_mu_ stays held (the bounce buffer, the ports and the tier are this batch's)
@@ -2230,8 +2318,9 @@ bool ArenaExpertSource::materialize_end(std::string& err) {
     if (!mat_lock_.owns_lock()) return true;
     const auto t1 = std::chrono::steady_clock::now();
     const bool ok = collect_reads(err);
-    if (!ok) {
-        cache_used_ -= strata::kernels::cpu::expert_layout().blob_bytes(mat_layer_) * mat_es_.size();   // nothing published: they stay on NVMe, and the caller fails loudly
+    if (!ok) {   // nothing published: they stay on NVMe, and the caller fails loudly
+        cache_used_ -= strata::kernels::cpu::expert_layout().blob_bytes(mat_layer_) * mat_es_.size();
+        if (slab_) for (int32_t x : mat_es_) free_slot((size_t) (mat_layer_ * n_expert_ + x));
     } else {
         for (int32_t x : mat_es_) {
             const size_t idx = (size_t) (mat_layer_ * n_expert_ + x);
@@ -2298,6 +2387,7 @@ void ArenaExpertSource::close() {
     if (dscratch_ != nullptr) strata::platform::DirectFile::free_aligned(dscratch_);
     dscratch_ = nullptr;
     dscratch_bytes_ = 0;
+    slab_release();
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
         arena_ = nullptr;
@@ -2322,12 +2412,16 @@ uint8_t* ArenaExpertSource::recommit_host_copy(int64_t layer, int64_t expert, st
         return nullptr;
     }
     const auto& layout = strata::kernels::cpu::expert_layout();
-    uint64_t committed = 0;
-    if (!((PinnedArena*) arena_)->commit_interior(layout.blob_offset(layer, expert), layout.blob_bytes(layer),
-                                                  committed, err)) return nullptr;
-    released_host_bytes_ -= committed < released_host_bytes_ ? committed : released_host_bytes_;
+    if (slab_ && slot_of_[index] < 0) {   // capacity mode: the copy comes home into a slot
+        if (!take_slot(index, -1, err)) return nullptr;
+    } else if (!slab_) {
+        uint64_t committed = 0;
+        if (!((PinnedArena*) arena_)->commit_interior(layout.blob_offset(layer, expert), layout.blob_bytes(layer),
+                                                      committed, err)) return nullptr;
+        released_host_bytes_ -= committed < released_host_bytes_ ? committed : released_host_bytes_;
+    }
     err.clear();
-    return const_cast<uint8_t*>(base_) + layout.blob_offset(layer, expert);   // GPU-owned until publish_host_copy
+    return host_at(index);   // GPU-owned until publish_host_copy
 }
 
 void ArenaExpertSource::publish_host_copy(int64_t layer, int64_t expert) {
@@ -2350,8 +2444,10 @@ bool ArenaExpertSource::release_host_copy(int64_t layer, int64_t expert, std::st
     }
     const auto& layout = strata::kernels::cpu::expert_layout();
     uint64_t decommitted = 0;
-    if (!((PinnedArena*) arena_)->decommit_interior(layout.blob_offset(layer, expert),
-                                                    layout.blob_bytes(layer), decommitted, err)) return false;
+    if (slab_) {
+        if (slot_of_[index] >= 0) { free_slot(index); decommitted = layout.blob_bytes(layer); }
+    } else if (!((PinnedArena*) arena_)->decommit_interior(layout.blob_offset(layer, expert),
+                                                           layout.blob_bytes(layer), decommitted, err)) return false;
     exclusive_[index] = 1; // publish ownership only after the Windows decommit succeeds
     released_host_bytes_ += decommitted;
     err.clear();
@@ -2389,7 +2485,77 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     ++reads_;
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
-    return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
+    return host_at((size_t) idx);
+}
+
+uint8_t* ArenaExpertSource::host_at(size_t idx) const {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (slab_) {
+        if (slot_of_[idx] < 0) return nullptr;
+        const SlabClass& k = classes_[(size_t) class_of_layer_[idx / (size_t) lay.n_expert]];
+        return k.base + (size_t) slot_of_[idx] * k.stride;
+    }
+    return const_cast<uint8_t*>(base_) + lay.blob_offset((int64_t) idx / lay.n_expert, (int64_t) idx % lay.n_expert);
+}
+
+bool ArenaExpertSource::take_slot(size_t idx, int64_t avoid_layer, std::string& err) {
+    (void) avoid_layer;   // the byte cap evicts; a slot is always available (the region holds every expert)
+    if (slot_of_[idx] >= 0) return true;
+    SlabClass& k = classes_[(size_t) class_of_layer_[idx / (size_t) strata::kernels::cpu::expert_layout().n_expert]];
+    if (!k.idle.empty()) {   // the common case: an evicted expert's slot, committed and already faulted in
+        slot_of_[idx] = k.idle.back();
+        k.idle.pop_back();
+        idle_bytes_ -= k.stride;
+        return true;
+    }
+    int32_t s;
+    if (!k.cold.empty()) { s = k.cold.back(); k.cold.pop_back(); }
+    else if (k.next < k.cap) s = k.next++;
+    else { err = "capacity mode: the slab region is full"; return false; }
+#if defined(_WIN32)
+    if (VirtualAlloc(k.base + (size_t) s * k.stride, k.stride, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+        k.cold.push_back(s);
+        err = "capacity mode: a slab slot could not be committed";
+        return false;
+    }
+#endif
+    ++slab_committed_;
+    slot_of_[idx] = s;
+    return true;
+}
+
+void ArenaExpertSource::free_slot(size_t idx) {
+    if (slot_of_[idx] < 0) return;
+    SlabClass& k = classes_[(size_t) class_of_layer_[idx / (size_t) strata::kernels::cpu::expert_layout().n_expert]];
+    k.idle.push_back(slot_of_[idx]);
+    idle_bytes_ += k.stride;
+    slot_of_[idx] = -1;
+    while (idle_bytes_ > slack_bytes_) {   // past the slack: decommit an idle slot of the size holding the most
+        SlabClass* most = nullptr;
+        for (SlabClass& c : classes_)
+            if (!c.idle.empty() && (most == nullptr || c.idle.size() * c.stride > most->idle.size() * most->stride)) most = &c;
+        if (most == nullptr) break;
+        const int32_t s = most->idle.back();
+        most->idle.pop_back();
+#if defined(_WIN32)
+        VirtualFree(most->base + (size_t) s * most->stride, most->stride, MEM_DECOMMIT);
+#endif
+        most->cold.push_back(s);
+        idle_bytes_ -= most->stride;
+        --slab_committed_;
+    }
+}
+
+void ArenaExpertSource::slab_release() {
+#if defined(_WIN32)
+    for (SlabClass& k : classes_) if (k.base != nullptr) VirtualFree(k.base, 0, MEM_RELEASE);
+#endif
+    classes_.clear();
+    class_of_layer_.clear();
+    slot_of_.clear();
+    slab_ = false;
+    idle_bytes_ = 0;
+    slab_committed_ = 0;
 }
 
 }  // namespace strata::core
