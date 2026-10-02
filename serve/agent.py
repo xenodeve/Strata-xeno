@@ -26,7 +26,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
-from serve import memory as memory_mod, permissions
+from serve import media as media_mod, memory as memory_mod, permissions
 
 MAX_DIRS = 20                                   # the project's other folders that one request may name
 MAX_READ_LINES = 2000
@@ -64,6 +64,7 @@ class AgentContext:
     question: Callable[[list], object] = lambda questions: {"answers": None}      # AskUserQuestion: the user's answers, or None when nobody answered
     checkpoint: object | None = None                       # serve/checkpoints.py Scope: the way back for the files the tools change in this prompt
     hooks: object | None = None                            # serve/hooks.py Runner: the user's own commands before and after a call (none by default)
+    vision: bool = False                                   # the server has the vision encoder: Read can give an image to the model
 
 
 class Session:
@@ -132,10 +133,11 @@ def _int(v, name: str, low: int) -> tuple[int | None, str]:
 
 # ------------------------------------------------------------------------------------------------ the server
 SCHEMAS = {
-    "Read": ("Read a text file from the project (or another place, if the user allows it). Returns the lines with their numbers. Give an absolute path, or one "
-             "relative to the project folder. Long files are cut at 2000 lines: use offset and limit to read a window. Read a file before you Write or Edit it.",
+    "Read": ("Read a file from the project (or another place, if the user allows it). A text file comes back as its lines with their numbers; give an absolute path, or one "
+             "relative to the project folder. Long files are cut at 2000 lines: use offset and limit to read a window. Read a file before you Write or Edit it. "
+             "An image (png, jpg, gif, bmp, webp) is shown to you when the server has vision. A PDF is read by pages (give pages, for example \"1-5\"; a PDF of more than 10 pages needs it, at most 20 at a time).",
              {"file_path": {"type": "string", "description": "the file to read"}, "offset": {"type": "integer", "description": "the line to start at (1 is the first)"},
-              "limit": {"type": "integer", "description": "how many lines to read"}}, ["file_path"]),
+              "limit": {"type": "integer", "description": "how many lines to read"}, "pages": {"type": "string", "description": "for a PDF: the pages to read, such as 1-5 or 2,4-6"}}, ["file_path"]),
     "Write": ("Write a whole file (create it, or replace it). To replace an existing file you must have read it first in this chat. To change a part of a file use Edit.",
               {"file_path": {"type": "string"}, "content": {"type": "string", "description": "the complete new content"}}, ["file_path", "content"]),
     "Edit": ("Replace an exact piece of text in a file. old_string must appear once in the file (add surrounding lines to make it unique) unless replace_all is true. "
@@ -322,6 +324,11 @@ class AgentServer:
             return _err(f"File does not exist: {a['file_path']}")
         if os.path.isdir(path):
             return _err(f"{a['file_path']} is a directory, not a file (use Glob to list what is in it)")
+        media = media_mod.kind_of(path)
+        if media == "image":
+            return media_mod.read_image(path, os.path.basename(path), ctx.vision)
+        if media == "pdf":
+            return media_mod.read_pdf(path, os.path.basename(path), a.get("pages"), ctx.vision)
         if _is_binary(path):
             return _err("This tool cannot read binary files.")
         size = os.path.getsize(path)

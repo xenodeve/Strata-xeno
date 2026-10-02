@@ -61,7 +61,7 @@ class TheServer(Base):
         names = {t["name"]: t for t in self.srv.tools}
         self.assertEqual(set(names), {"Read", "Write", "Edit", "Glob", "Grep", "TodoWrite", "ExitPlanMode", "NotebookEdit", "AskUserQuestion"})
         props = lambda n: set(names[n]["inputSchema"]["properties"])  # noqa: E731
-        self.assertEqual(props("Read"), {"file_path", "offset", "limit"})
+        self.assertEqual(props("Read"), {"file_path", "offset", "limit", "pages"})
         self.assertEqual(props("Write"), {"file_path", "content"})
         self.assertEqual(props("Edit"), {"file_path", "old_string", "new_string", "replace_all"})
         self.assertEqual(props("Glob"), {"pattern", "path"})

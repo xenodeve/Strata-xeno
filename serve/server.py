@@ -938,6 +938,7 @@ class Service:
             defined, _problems = hooks_mod.load(harness._cfg(self))
         except Exception:  # noqa: BLE001 - a config that cannot be read means no hooks
             defined = []
+        run.ctx.vision = self.vision is not None and not self._vision_down()          # Read can give an image to the model only when the vision encoder is there
         runner = hooks_mod.Runner(defined, sh, folder, sid, run._emit, lambda: run.cancel.is_set())
         if runner:
             run.ctx.hooks = run.hooks = runner
@@ -1766,7 +1767,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             r = box["r"]
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            results.append(r["text"])
+            results.append([{"type": "text", "text": r["text"]}, *({"type": "image", "source": u} for u in r["images"])] if r.get("images") else r["text"])      # an image goes to the model as an image
             yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}

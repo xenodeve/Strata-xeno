@@ -562,6 +562,12 @@ class McpHub:
                 else:
                     res = server.call(tool, arguments if isinstance(arguments, dict) else {},
                                       float(self.settings["timeout_s"]), cancel)
+                if getattr(server, "wants_context", False):               # the coding tools may give the model an image (Read): it goes with the result, not as text
+                    for b in res.get("content") or []:
+                        if isinstance(b, dict) and b.get("type") == "image" and isinstance(b.get("data"), str) and isinstance(b.get("mimeType"), str):
+                            out.setdefault("images", []).append(f"data:{b['mimeType']};base64,{b['data']}")
+                    if out.get("images"):
+                        res = {**res, "content": [b for b in res.get("content") or [] if not (isinstance(b, dict) and b.get("type") == "image")]}
                 text, ok = result_text(res), not res.get("isError")
                 if not ok:
                     text = "error: " + (text or "the tool reported an error")
