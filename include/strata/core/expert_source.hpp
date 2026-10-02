@@ -296,6 +296,7 @@ struct ExpertDispatch {
     /// tier, [2] GPU PCIe read, [3] CPU pool.  Their sum is every routed (token, expert) entry of those windows.
     int64_t tier_entries[4] = {0, 0, 0, 0};
     std::string secondary_fail; ///< owns dynamic device-1 error text while `fail` points to it
+    std::string nvme_fail;      ///< #62: the NVMe reader's error text while `fail` points to it
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
@@ -517,6 +518,25 @@ public:
     uint64_t host_cache_bytes() const { return cache_used_; }
     int64_t nvme_loads() const { return nvme_loads_; }
     double nvme_ms() const { return nvme_ms_; }
+    /// #62: a directory holding byte-identical copies of the expert source files (a GGUF shard, experts.bin) on
+    /// another drive; repeatable.  read_experts_to sends each expert, all its ranges, to the copy with the fewest
+    /// bytes queued in that batch (ties: the source).  A copy is checked against its source when first used (size,
+    /// then the first, last and sampled pages); a mismatch fails the read.  A directory without the file is ignored.
+    void add_mirror(const std::string& dir) { mirror_dirs_.push_back(dir); }
+    struct NvmeFileStat {
+        std::string path;
+        int64_t reads = 0;    ///< experts read from this copy
+        uint64_t bytes = 0;   ///< aligned bytes requested
+        double ms = 0;        ///< per batch: submit to this copy's last completion, summed
+        int64_t batches = 0;
+        double p50_us = 0, p99_us = 0, max_us = 0;   ///< per read: submit to completion (last 65,536)
+    };
+    /// One entry per file read_experts_to has opened, the source first.
+    std::vector<NvmeFileStat> nvme_file_stats() const;
+    /// #62 crash: keep a host expert resident while a caller holds its pointer across materialize calls (a paired
+    /// swap's stage 2); the eviction skips it until release_hold.  No-op outside capacity mode.
+    void hold(int64_t layer, int64_t expert);
+    void release_hold(int64_t layer, int64_t expert);
     /// A GPU-owned expert that comes home (paired swap copy-home) joins the host tier: account it and trim.
     void admit_home(int64_t layer, int64_t expert);
     bool load_rest(int threads, std::string& err);
@@ -576,12 +596,26 @@ private:
     std::string rf_name_;
     void* dscratch_ = nullptr;  ///< read_experts' aligned bounce buffer
     size_t dscratch_bytes_ = 0;
-    std::vector<std::pair<std::string, void*>> dfiles_;   ///< read_experts' open DirectFiles, by name
+    /// read_experts' open DirectFiles, by name, with #62's per-copy stats and its last read latencies
+    struct DFile {
+        static constexpr size_t kLat = 65536;
+        std::string name;
+        void* file = nullptr;
+        NvmeFileStat st;
+        std::vector<float> lat_us = std::vector<float>(kLat);   ///< submit to completion, a ring
+        uint64_t lat_next = 0, lat_n = 0;
+    };
+    std::vector<DFile> dfiles_;
+    std::vector<std::string> mirror_dirs_;                 ///< #62: add_mirror's directories
+    /// #62: per source file, its verified copies (resolved on first use)
+    std::vector<std::pair<std::string, std::vector<std::string>>> copies_;
+    bool copies_of(const std::string& source, const std::vector<std::string>*& out, std::string& err);
     // #11 N1 capacity mode
     uint64_t cache_cap_ = 0;         ///< 0 = no limit
     uint64_t cache_used_ = 0;        ///< host-owned expert bytes committed now
     std::vector<uint8_t> nvme_;      ///< 1 = on NVMe only (never committed, or evicted)
     std::vector<float> score_;       ///< decayed use count per expert
+    std::vector<uint8_t> held_;      ///< #62 crash: hold() count per expert; evict_one skips these
     int64_t nvme_loads_ = 0;
     double nvme_ms_ = 0;
     bool evict_one(int64_t avoid_layer);

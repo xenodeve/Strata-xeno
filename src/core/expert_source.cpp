@@ -1178,7 +1178,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             std::string ne;
             if (!d.src->materialize_batch(d.layers, miss, nm, ne)) {
                 d.failed = true;
-                d.fail = "an NVMe-tier expert could not be read";
+                d.nvme_fail = "an NVMe-tier expert could not be read: " + ne;   // #62: e.g. a wrong mirror
+                d.fail = d.nvme_fail.c_str();
                 d.fail_layer = d.layers;
                 return;
             }
@@ -1758,6 +1759,64 @@ bool ArenaExpertSource::read_experts(const int32_t* layers, const int32_t* exper
     return read_experts_to(layers, experts, n, dsts.data(), err);
 }
 
+// #62: the same bytes at the same offsets?  Sizes first, then the first and last MiB and eight 64 KiB pages spread
+// over the file: a copy cut short, of another quant or another revision differs in its header or tensor data.
+static bool same_file_sampled(const std::string& a, const std::string& b, std::string& why) {
+    namespace fs = std::filesystem;
+    std::error_code ea, eb;
+    const uint64_t na = fs::file_size(a, ea), nb = fs::file_size(b, eb);
+    if (ea || eb) { why = "cannot read its size"; return false; }
+    if (na != nb) { why = "size " + std::to_string(nb) + " B, the source has " + std::to_string(na); return false; }
+    std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+    if (!fa || !fb) { why = "cannot open it"; return false; }
+    constexpr uint64_t MIB = 1ull << 20, PAGE = 64ull << 10;
+    std::vector<std::pair<uint64_t, uint64_t>> at = {{0, std::min(MIB, na)}, {na > MIB ? na - MIB : 0, std::min(MIB, na)}};
+    uint64_t x = na ^ 0x9e3779b97f4a7c15ull;
+    for (int i = 0; i < 8 && na > PAGE; ++i) {
+        x = x * 6364136223846793005ull + 1442695040888963407ull;
+        at.emplace_back((x >> 11) % (na - PAGE) & ~(uint64_t) 4095, PAGE);
+    }
+    std::vector<char> ba, bb;
+    for (const auto& [off, len] : at) {
+        ba.resize((size_t) len);
+        bb.resize((size_t) len);
+        fa.seekg((std::streamoff) off);
+        fb.seekg((std::streamoff) off);
+        if (!fa.read(ba.data(), (std::streamsize) len) || !fb.read(bb.data(), (std::streamsize) len)) {
+            why = "short read at " + std::to_string(off);
+            return false;
+        }
+        if (std::memcmp(ba.data(), bb.data(), (size_t) len) != 0) { why = "bytes differ at " + std::to_string(off); return false; }
+    }
+    return true;
+}
+
+bool ArenaExpertSource::copies_of(const std::string& source, const std::vector<std::string>*& out, std::string& err) {
+    for (const auto& [src, cs] : copies_) if (src == source) { out = &cs; return true; }
+    std::vector<std::string> cs;
+    const std::string name = std::filesystem::path(source).filename().string();
+    std::error_code sz;
+    const uint64_t na = std::filesystem::file_size(source, sz);
+    const int regions = na > (64ull << 10) ? 10 : 2;   // same_file_sampled: first and last MiB, then 8 pages
+    for (const std::string& dir : mirror_dirs_) {
+        const std::string copy = (std::filesystem::path(dir) / name).string();
+        std::error_code ec;
+        if (!std::filesystem::exists(copy, ec)) continue;           // this drive holds no copy of this file
+        if (std::filesystem::equivalent(copy, source, ec)) continue;
+        std::string why;
+        if (!same_file_sampled(source, copy, why)) {
+            err = "expert mirror " + copy + " is not a copy of " + source + ": " + why;
+            return false;
+        }
+        std::fprintf(stderr, "strata experts: mirror %s verified (size and %d sampled regions match %s)\n",
+                     copy.c_str(), regions, source.c_str());
+        cs.push_back(copy);
+    }
+    copies_.emplace_back(source, std::move(cs));
+    out = &copies_.back().second;
+    return true;
+}
+
 bool ArenaExpertSource::read_experts_to(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts,
                                         std::string& err) {
     using strata::platform::DirectFile;
@@ -1771,51 +1830,114 @@ bool ArenaExpertSource::read_experts_to(const int32_t* layers, const int32_t* ex
         dscratch_bytes_ = dscratch_ ? need : 0;
         if (dscratch_ == nullptr) { err = "read_experts: bounce buffer"; return false; }
     }
-    auto file_for = [&](const std::string& name) -> DirectFile* {
-        for (auto& [nm, f] : dfiles_) if (nm == name) return (DirectFile*) f;
+    auto open_file = [&](const std::string& name) -> int {   // the file's index in dfiles_, -1 on error
+        for (size_t i = 0; i < dfiles_.size(); ++i) if (dfiles_[i].name == name) return (int) i;
         auto* f = new DirectFile();
-        if (!f->open(name, err)) { delete f; return nullptr; }
-        dfiles_.emplace_back(name, f);
-        return f;
+        if (!f->open(name, err)) { delete f; return -1; }
+        DFile d;
+        d.name = name;
+        d.file = f;
+        d.st.path = name;
+        dfiles_.push_back(std::move(d));
+        return (int) dfiles_.size() - 1;
     };
-    struct Req { DirectFile* f; uint64_t skip, len; uint8_t* to; };
+    struct Req { int file; uint64_t skip, len; uint8_t* to; };
     std::vector<Req> reqs;
     reqs.reserve((size_t) n * 3);
+    std::vector<uint64_t> queued;   // #62: bytes queued per dfiles_ index in this batch
+    auto queued_of = [&](int i) -> uint64_t& {
+        if ((size_t) i >= queued.size()) queued.resize((size_t) i + 1, 0);
+        return queued[(size_t) i];
+    };
+    const double t0 = strata::timeline::now_us();
     for (int i = 0; i < n; ++i) {
         uint64_t off[3], len[3], at[3];
         const int nr = expert_ranges(lay, from_gguf_, layers[i], experts[i], off, len, at);
-        DirectFile* f = file_for(expert_file(gguf_, path_, from_gguf_, lay, layers[i]));
-        if (f == nullptr) return false;
+        const std::string source = expert_file(gguf_, path_, from_gguf_, lay, layers[i]);
+        int fi = open_file(source);
+        if (fi < 0) return false;
+        if (!mirror_dirs_.empty()) {   // #62: the whole expert to the copy with the fewest bytes queued; ties: source
+            const std::vector<std::string>* cs = nullptr;
+            if (!copies_of(source, cs, err)) return false;
+            for (const std::string& c : *cs) {
+                const int gi = open_file(c);
+                if (gi < 0) return false;
+                if (queued_of(gi) < queued_of(fi)) fi = gi;
+            }
+        }
+        DFile& d = dfiles_[(size_t) fi];
+        ++d.st.reads;
         for (int r = 0; r < nr; ++r) {
             const uint64_t a0 = off[r] & ~(A - 1), a1 = (off[r] + len[r] + A - 1) & ~(A - 1);
             uint8_t* bounce = (uint8_t*) dscratch_ + reqs.size() * slot_bytes;
-            if (!f->submit(a0, bounce, (uint32_t) (a1 - a0), (uint64_t) reqs.size(), err)) return false;
-            reqs.push_back({f, off[r] - a0, len[r], dsts[i] + at[r]});
+            if (!((DirectFile*) d.file)->submit(a0, bounce, (uint32_t) (a1 - a0), (uint64_t) reqs.size(), err))
+                return false;
+            reqs.push_back({fi, off[r] - a0, len[r], dsts[i] + at[r]});
+            d.st.bytes += a1 - a0;
+            queued_of(fi) += a1 - a0;
         }
     }
-    // collect every completion (each file's port reports its own requests)
-    std::vector<char> done(reqs.size(), 0);
+    // Collect every completion.  Each file's port reports its own requests; the ports are polled in turn, so each
+    // copy's reads are timed when they land rather than after the copy drained before it (#62: a second drive
+    // must be able to show that it was faster).  With nothing ready, one port is waited on for 1 ms.
+    const size_t nf = dfiles_.size();
+    std::vector<size_t> left(nf, 0), sent(nf, 0);
+    for (const Req& q : reqs) { ++left[(size_t) q.file]; ++sent[(size_t) q.file]; }
+    std::vector<double> last(nf, t0);
     size_t got = 0;
-    for (auto& [nm, fp] : dfiles_) {
-        DirectFile* f = (DirectFile*) fp;
-        size_t mine = 0;
-        for (const Req& q : reqs) mine += q.f == f;
+    auto take = [&](size_t fi, int timeout_ms) -> bool {   // false on a failed read
         strata::platform::Completion c[64];
-        while (mine > 0) {
-            const int k = f->wait(c, 64, -1);
-            for (int j = 0; j < k; ++j) {
-                if (c[j].tag == DirectFile::WAKE_TAG) continue;
-                const Req& q = reqs[(size_t) c[j].tag];
-                if (!c[j].ok || c[j].bytes < q.skip + q.len) { err = "read_experts: short read"; return false; }
-                std::memcpy(q.to, (uint8_t*) dscratch_ + (size_t) c[j].tag * slot_bytes + q.skip, (size_t) q.len);
-                done[(size_t) c[j].tag] = 1;
-                ++got;
-                --mine;
-            }
+        const int k = ((DirectFile*) dfiles_[fi].file)->wait(c, 64, timeout_ms);
+        const double t = strata::timeline::now_us();
+        for (int j = 0; j < k; ++j) {
+            if (c[j].tag == DirectFile::WAKE_TAG) continue;
+            const Req& q = reqs[(size_t) c[j].tag];
+            if (!c[j].ok || c[j].bytes < q.skip + q.len) { err = "read_experts: short read"; return false; }
+            std::memcpy(q.to, (uint8_t*) dscratch_ + (size_t) c[j].tag * slot_bytes + q.skip, (size_t) q.len);
+            ++got;
+            --left[fi];
+            last[fi] = t;
+            dfiles_[fi].lat_us[dfiles_[fi].lat_next++ % DFile::kLat] = (float) (t - t0);
+            dfiles_[fi].lat_n = std::min<uint64_t>(dfiles_[fi].lat_n + 1, DFile::kLat);
         }
+        return true;
+    };
+    while (got < reqs.size()) {
+        const size_t before = got;
+        for (size_t fi = 0; fi < nf; ++fi)
+            if (left[fi] > 0 && !take(fi, 0)) return false;
+        if (got == before)
+            for (size_t fi = 0; fi < nf; ++fi)
+                if (left[fi] > 0) { if (!take(fi, 1)) return false; break; }
     }
-    if (got != reqs.size()) { err = "read_experts: missing completions"; return false; }
+    for (size_t fi = 0; fi < nf; ++fi) {
+        if (sent[fi] == 0) continue;
+        dfiles_[fi].st.ms += (last[fi] - t0) / 1000.0;
+        ++dfiles_[fi].st.batches;
+        if (strata::timeline::enabled())   // #62: one span per copy and batch: submit to its last completion
+            strata::timeline::complete("nvme copy read", t0, last[fi], (int64_t) fi, (int64_t) sent[fi]);
+    }
     return true;
+}
+
+std::vector<ArenaExpertSource::NvmeFileStat> ArenaExpertSource::nvme_file_stats() const {
+    std::vector<NvmeFileStat> out;
+    for (const DFile& d : dfiles_) {
+        NvmeFileStat s = d.st;
+        std::vector<float> v(d.lat_us.begin(), d.lat_us.begin() + (std::ptrdiff_t) d.lat_n);
+        if (!v.empty()) {
+            auto at = [&](double q) {
+                const size_t k = std::min(v.size() - 1, (size_t) (q * (double) (v.size() - 1) + 0.5));
+                std::nth_element(v.begin(), v.begin() + (std::ptrdiff_t) k, v.end());
+                return (double) v[k];
+            };
+            s.p50_us = at(0.50);
+            s.p99_us = at(0.99);
+            s.max_us = *std::max_element(v.begin(), v.end());
+        }
+        out.push_back(std::move(s));
+    }
+    return out;
 }
 
 // load_rest's reader: each worker takes a layer and reads each role's 512 slices in aligned chunks of 32 experts
@@ -1920,7 +2042,8 @@ void ArenaExpertSource::set_capacity(uint64_t bytes, const std::vector<int32_t>&
     cache_cap_ = bytes;
     nvme_.assign(exclusive_.size(), 0);
     score_.assign(exclusive_.size(), 0.0f);
-    if (bytes == 0) { nvme_.clear(); score_.clear(); return; }
+    held_.assign(exclusive_.size(), 0);
+    if (bytes == 0) { nvme_.clear(); score_.clear(); held_.clear(); return; }
     // everything host-owned starts on NVMe; the first `bytes` of the order come up at load_rest
     for (size_t i = 0; i < exclusive_.size(); ++i) nvme_[i] = exclusive_[i] ? 0 : 1;
     uint64_t used = 0;
@@ -1943,12 +2066,24 @@ bool ArenaExpertSource::resident(int64_t layer, int64_t expert) const {
     return nvme_.empty() || !nvme_[i];
 }
 
+void ArenaExpertSource::hold(int64_t layer, int64_t expert) {
+    std::lock_guard<std::mutex> lk(host_mu_);
+    const size_t i = (size_t) (layer * n_expert_ + expert);
+    if (i < held_.size() && held_[i] < 255) ++held_[i];
+}
+
+void ArenaExpertSource::release_hold(int64_t layer, int64_t expert) {
+    std::lock_guard<std::mutex> lk(host_mu_);
+    const size_t i = (size_t) (layer * n_expert_ + expert);
+    if (i < held_.size() && held_[i] > 0) --held_[i];
+}
+
 bool ArenaExpertSource::evict_one(int64_t avoid_layer) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     size_t victim = SIZE_MAX;
     float best = 0.0f;
     for (size_t i = 0; i < nvme_.size(); ++i) {
-        if (nvme_[i] || exclusive_[i] || (int64_t) i / lay.n_expert == avoid_layer) continue;
+        if (nvme_[i] || exclusive_[i] || held_[i] || (int64_t) i / lay.n_expert == avoid_layer) continue;
         if (victim == SIZE_MAX || score_[i] < best) { victim = i; best = score_[i]; }
     }
     if (victim == SIZE_MAX) return false;
@@ -2063,7 +2198,7 @@ bool ArenaExpertSource::read_into(int64_t layer, int64_t expert, uint8_t* dst, s
 void ArenaExpertSource::close() {
     if (rf_.is_open()) rf_.close();
     rf_name_.clear();
-    for (auto& [nm, f] : dfiles_) delete (strata::platform::DirectFile*) f;
+    for (auto& d : dfiles_) delete (strata::platform::DirectFile*) d.file;
     dfiles_.clear();
     if (dscratch_ != nullptr) strata::platform::DirectFile::free_aligned(dscratch_);
     dscratch_ = nullptr;

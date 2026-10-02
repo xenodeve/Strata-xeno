@@ -265,7 +265,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
-                          src/platform/direct_file.cpp)
+                          src/platform/direct_file.cpp
+                          src/platform/crash_report.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON.  CUDA only: HIP compiles the tensor-core kernel out.
@@ -779,6 +780,14 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(xeno_nvme_capacity PRIVATE strata_engine)
       add_test(NAME xeno_nvme_capacity COMMAND xeno_nvme_capacity)
       set_tests_properties(xeno_nvme_capacity PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1")
+      add_executable(xeno_nvme_mirror tests/xeno/nvme_mirror.cpp)
+      target_link_libraries(xeno_nvme_mirror PRIVATE strata_engine)
+      add_test(NAME xeno_nvme_mirror COMMAND xeno_nvme_mirror)
+      set_tests_properties(xeno_nvme_mirror PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1")
+      add_executable(xeno_nvme_hold tests/xeno/nvme_hold.cpp)
+      target_link_libraries(xeno_nvme_hold PRIVATE strata_engine)
+      add_test(NAME xeno_nvme_hold COMMAND xeno_nvme_hold)
+      set_tests_properties(xeno_nvme_hold PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1")
       add_executable(xeno_exclusive_host_pages tests/xeno/exclusive_host_pages.cpp)
       target_link_libraries(xeno_exclusive_host_pages PRIVATE strata_engine)
       add_test(NAME xeno_exclusive_host_pages COMMAND xeno_exclusive_host_pages)
