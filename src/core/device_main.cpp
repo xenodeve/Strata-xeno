@@ -27,8 +27,10 @@ int main(int argc, char** argv) {
     bool secondary_requested = false;
     int secondary_touch_mib = 0;
     bool touch_requested = false;
+    bool list_devices = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
+        else if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
         else if (std::strcmp(argv[i], "--device") == 0 ||
                  std::strcmp(argv[i], "--secondary-reserve-mib") == 0 ||
                  std::strcmp(argv[i], "--secondary-touch-mib") == 0) {
@@ -46,7 +48,10 @@ int main(int argc, char** argv) {
             else { secondary_reserve_mib = value; secondary_requested = true; }
         }
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: strata-device [--selftest] [--device 1 --secondary-reserve-mib 2560 [--secondary-touch-mib 1..64]]\n");
+            std::printf("usage: strata-device [--selftest] [--list-devices]\n"
+                        "                     [--device 1 --secondary-reserve-mib 2560 [--secondary-touch-mib 1..64]]\n"
+                        "  --list-devices  every GPU the runtime enumerates, numbered as HIP_VISIBLE_DEVICES /\n"
+                        "                  CUDA_VISIBLE_DEVICES number them, and whether this binary can run it\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -62,6 +67,29 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "secondary probe needs --device 1, reserve >= 2560 MiB, no --selftest, and touch 1..64 MiB\n");
         return 2;
     }
+
+    // The runtime's numbering, which setup needs on Windows: there an integrated Radeon is HIP device 0 and pushes the
+    // discrete card to 1, while setup finds the cards in the display-adapter order (#325).  No arch check here - the
+    // cards this binary has no code for are part of the answer.  Format (setup.py's hip_devices parses it):
+    //   device N: <name>
+    //     arch gfx1201, 15.9 GiB, wave32          (CUDA: compute capability 12.0, 11.9 GiB)
+    //     cannot run: <why>                       (only for a card this binary cannot run)
+    if (list_devices) {
+        const int count = strata::core::device_count();
+        if (count == 0) std::printf("(no GPU device)\n");
+        for (int n = 0; n < count; ++n) {
+            std::string name, detail;
+            if (!strata::core::device_summary(n, name, detail)) {
+                std::printf("device %d: (the runtime cannot describe it)\n", n);
+                continue;
+            }
+            std::printf("device %d: %s\n  %s\n", n, name.c_str(), detail.c_str());
+            if (const std::string why = strata::core::gpu_arch_problem(n); !why.empty())
+                std::printf("  cannot run: %s\n", why.c_str());
+        }
+        return 0;
+    }
+
     try {
         if (secondary_requested) {
             const auto primary = strata::core::device_info(0);

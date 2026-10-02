@@ -12,6 +12,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "../core/gguf_fixture.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -39,23 +40,37 @@ int main() {
         std::fprintf(stderr, "native_fmt: %s\n", err.c_str()); return 1;
     }
     const uint64_t blob = f.bytes, per[3] = {f.up_off, f.up_off, blob - f.down_off}, at[3] = {0, f.up_off, f.down_off};
-    // a GGUF-shaped file: per layer three role tensors, each the n_expert slices back to back, at odd offsets
+    // the model's GGUF (tests/core/gguf_fixture.hpp): per layer the three role tensors, Q8_0, [cols, rows, experts],
+    // each the n_expert slices back to back.  It must be a real GGUF: since upstream v0.1.34 (#255) open() checks every
+    // role tensor against native_experts.txt (check_experts_gguf).  The payloads are then overwritten with role_byte.
     const fs::path gguf = dir / "model-00001-of-00001.gguf";
     uint64_t go[layers][3];
     {
-        std::ofstream g(gguf, std::ios::binary);
-        std::vector<uint8_t> pad(777, 0xEE);
-        g.write((const char*) pad.data(), (std::streamsize) pad.size());
+        static const char* roles[3] = {"gate", "up", "down"};
+        const uint64_t H = (uint64_t) strata::kernels::cpu::H, FF = (uint64_t) strata::kernels::cpu::FF;
+        std::vector<fixture::Tensor> ts;
         for (int l = 0; l < layers; ++l)
             for (int r = 0; r < 3; ++r) {
-                go[l][r] = (uint64_t) g.tellp();
+                fixture::Tensor t;
+                t.name = "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight";
+                t.shape = r < 2 ? std::vector<uint64_t>{H, FF, (uint64_t) experts}
+                                : std::vector<uint64_t>{FF, H, (uint64_t) experts};
+                t.type = 8;   // Q8_0, as native_experts.txt says below
+                ts.push_back(t);
+            }
+        const fixture::Written w = fixture::write(gguf, {}, ts);
+        std::fstream g(gguf, std::ios::in | std::ios::out | std::ios::binary);
+        for (int l = 0; l < layers; ++l)
+            for (int r = 0; r < 3; ++r) {
+                go[l][r] = w.data_start + w.offsets[(size_t) (3 * l + r)];
+                g.seekp((std::streamoff) go[l][r]);
                 std::vector<uint8_t> t(per[r]);
                 for (int x = 0; x < experts; ++x) {
                     for (uint64_t i = 0; i < per[r]; ++i) t[i] = role_byte(l, r, x, i);
                     g.write((const char*) t.data(), (std::streamsize) t.size());
                 }
-                g.write((const char*) pad.data(), 123);
             }
+        if (!g) { std::fprintf(stderr, "fixture: writing the payloads failed\n"); return 1; }
     }
     {
         std::ofstream txt(dir / "native_experts.txt");

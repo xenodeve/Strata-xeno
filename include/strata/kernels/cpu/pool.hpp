@@ -63,13 +63,33 @@ struct ExpertJobMulti {
     const void* nact[MAXT] = {};
 };
 
+/// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has
+/// always used and the default; the hybrid-aware ones are opt-in (--pool-affinity auto|p-cores).
+enum class PoolAffinity {
+    Auto,      ///< Hybrid: prioritize physical P-cores, then SMT, then E-cores (defaults to P-core count)
+    PCores,    ///< Restrict workers strictly to Performance cores and their SMT siblings
+    All,       ///< The default: one worker per physical core, without hybrid distinction.  On Windows the cores are
+               ///< ordered fastest EfficiencyClass first (xeno #2; stable, so the OS's order on a one-class CPU)
+};
+
+struct CpuTopology {
+    bool is_hybrid = false;
+    int p_cores = 0;                ///< Physical performance cores
+    int p_threads = 0;              ///< Total logical threads on performance cores
+    int e_cores = 0;                ///< Efficient cores
+    std::vector<int> worker_cores;  ///< Ordered logical core IDs for workers (excluding host if skip_first)
+    int host_core = -1;             ///< Logical core reserved for host thread
+};
+
+CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
+
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another
 /// worker.  On the 6-core/12-thread machine this project measures on, `hardware_concurrency()/2` workers on
 /// logical processors 0..5 would put every worker on a sibling pair and halve the useful bandwidth - which is
 /// exactly the kind of error that shows up as "the CPU path is slower than the model says" with no clue why.
 ///
 /// `skip_first` drops the first core, which P2.S3 reserves for the host loop.
-std::vector<int> physical_cores(bool skip_first);
+std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
 
 /// **THE RESERVATION IS A FICTION UNLESS THE HOST IS ACTUALLY PUT THERE.**
 ///
@@ -110,7 +130,10 @@ public:
     ///
     /// `spin_us`: how long a parked worker spins before it sleeps; -1 is `kSpinBeforeSleep`.  Capacity mode passes 0
     /// (#64: with busy SMT siblings the spinning workers starve the NVMe path).  `STRATA_POOL_SPIN_US` overrides it.
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int spin_us = -1);
+    ///
+    /// `affinity` (#272): which cores the workers go to; `All` is the default layout (see `PoolAffinity`).
+    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int spin_us = -1,
+                        PoolAffinity affinity = PoolAffinity::All);
     std::chrono::microseconds spin_before_sleep() const { return spin_before_sleep_; }
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
@@ -122,6 +145,12 @@ public:
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
+
+    bool is_hybrid() const { return topo_.is_hybrid; }
+    int p_cores() const { return topo_.p_cores; }
+    int p_threads() const { return topo_.p_threads; }
+    int e_cores() const { return topo_.e_cores; }
+    PoolAffinity affinity() const { return affinity_; }
 
     /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -257,6 +286,8 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
+    PoolAffinity affinity_ = PoolAffinity::All;
+    CpuTopology topo_;
 };
 
 }  // namespace strata::kernels::cpu
