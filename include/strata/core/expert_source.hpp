@@ -538,6 +538,15 @@ public:
     /// bytes queued in that batch (ties: the source).  A copy is checked against its source when first used (size,
     /// then the first, last and sampled pages); a mismatch fails the read.  A directory without the file is ignored.
     void add_mirror(const std::string& dir) { mirror_dirs_.push_back(dir); }
+    /// #81: an aligned expert pack (strata --write-expert-pack): each expert's blob contiguous at a 4 KiB-aligned offset,
+    /// padded to a 4 KiB stride.  NVMe-tier loads then read one request per expert, straight into a slab slot (no
+    /// bounce copy).  Header: "STRAPACK", u32 version 1, n_layers, n_expert, alignment, then per layer u64 offset,
+    /// stride, blob bytes.  A pack of another geometry or blob size is refused.  Mirrors (add_mirror) hold copies of
+    /// the pack under the same file name.
+    bool set_expert_pack(const std::string& path, std::string& err);
+    /// #81: write that pack for this model: every expert of every layer (GPU-owned ones too), read from the pack's
+    /// source (the GGUF's role slices or experts.bin) in the arena's blob layout.
+    bool write_expert_pack(const std::string& path, std::string& err);
     struct NvmeFileStat {
         std::string path;
         int64_t reads = 0;    ///< experts read from this copy
@@ -634,7 +643,7 @@ private:
     std::vector<DFile> dfiles_;
     /// #95: a submitted read batch (submit_reads), collected later (collect_reads); read_experts_to is both at once
     struct PendingReads {
-        struct Req { int file; uint64_t skip, len; uint8_t* to; };
+        struct Req { int file; uint64_t skip, len; uint8_t* to; bool direct; };   ///< direct: read into `to` (#81)
         std::vector<Req> reqs;
         size_t slot_bytes = 0;
         double t0 = 0;
@@ -647,6 +656,8 @@ private:
     int64_t mat_layer_ = -1;
     double mat_ms_ = 0;                        ///< the begin half's time (eviction, commit, submit)
     std::vector<std::string> mirror_dirs_;                 ///< #62: add_mirror's directories
+    std::string pack_path_;                                ///< #81: set_expert_pack's file ("" = the GGUF / experts.bin)
+    std::vector<uint64_t> pack_off_, pack_stride_;         ///< #81: per layer
     uint64_t mirror_turn_ = 0;                             ///< #82: the batch count, the tie-break's starting copy
     /// #62: per source file, its verified copies (resolved on first use)
     std::vector<std::pair<std::string, std::vector<std::string>>> copies_;

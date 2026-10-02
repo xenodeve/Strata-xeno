@@ -53,3 +53,15 @@ def test_request_metrics_are_parsed_and_the_tiers_add_up():
     assert r == {"entries": 39840, "primary": 15482, "secondary": 10174, "pcie": 0, "cpu": 14184, "cpu_ms": 543.3,
                  "nvme_loads": 0, "commit_gib": 38.41}
     assert r["primary"] + r["secondary"] + r["pcie"] + r["cpu"] == r["entries"]
+
+
+RATES = """strata serve: request rates: 120 windows, 250 tokens; per window: 160.0 entries (primary 38.9% + secondary 25.5% + pcie 0.0% + cpu 35.6%), 3.40 nvme loads, 1.52 ms nvme wait; per token: 1.632 nvme loads, 0.730 ms nvme wait
+"""
+
+
+def test_request_rates_per_window_and_per_token_are_parsed():
+    # #11 acceptance 7: tier hits and NVMe misses per verify window and per emitted token, one line per request
+    (r,) = rs.parse_rates(RATES)
+    assert r == {"windows": 120, "tokens": 250, "entries_per_window": 160.0, "primary_pct": 38.9,
+                 "secondary_pct": 25.5, "pcie_pct": 0.0, "cpu_pct": 35.6, "nvme_loads_per_window": 3.40,
+                 "nvme_ms_per_window": 1.52, "nvme_loads_per_token": 1.632, "nvme_ms_per_token": 0.730}

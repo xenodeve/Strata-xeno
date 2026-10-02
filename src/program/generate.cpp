@@ -329,6 +329,8 @@ struct Options {
     /// CPU-pool miss reads them (0 = off, every host-owned expert in RAM). Opt-in: it trades decode time for RAM.
     double ram_cache_gib = 0.0;
     std::vector<std::string> expert_mirrors;   ///< #62: --expert-mirror DIR, repeatable
+    std::string expert_pack;                   ///< #81: --expert-pack FILE (written by --write-expert-pack)
+    std::string write_expert_pack;             ///< #81: --write-expert-pack FILE: write the aligned pack, then exit
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -622,6 +624,11 @@ void usage() {
                      "                       bytes queued.\n"
                      "                       Copies are checked against their source on first use (size and sampled\n"
                      "                       pages); a mismatch stops the run.  Needs --ram-cache-gib.\n"
+                     "  --write-expert-pack FILE  #81: write the aligned expert pack for this model (run with the\n"
+                     "                       capacity-mode arguments) and exit; about the size of the experts\n"
+                     "  --expert-pack FILE   #81: an aligned expert pack (--write-expert-pack): the capacity-mode reader\n"
+                     "                       reads each expert as one aligned request, straight into its RAM slot.  A\n"
+                     "                       mirror holds a copy under the same file name.  Needs --ram-cache-gib.\n"
                      "  --no-tail-file       keep host copies of the prompt path's lendable cache slots (default with\n"
                      "                       exclusive primary experts: none; a tail-<key>.bin next to the pack,\n"
                      "                       ~3.5 GB at 8K chunks, refills them after a prompt; #34)\n"
@@ -1774,6 +1781,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-exclusive-secondary-experts") o.exclusive_secondary_mode = 0;
         else if (a == "--ram-cache-gib") o.ram_cache_gib = std::atof(next("--ram-cache-gib"));
         else if (a == "--expert-mirror") o.expert_mirrors.push_back(next("--expert-mirror"));
+        else if (a == "--expert-pack") o.expert_pack = next("--expert-pack");
+        else if (a == "--write-expert-pack") o.write_expert_pack = next("--write-expert-pack");
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--prefill") {
@@ -2307,6 +2316,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --ram-cache-gib needs placement-first (exclusive primary experts: a "
                              "native pack, spec >=2, a profile, an expert cache, --pcie-frac 0 and the CPU pool, "
                              "no mmap; or the 4070 tier); without it every host expert would stay in RAM\n");
+        return 2;
+    }
+    if (!o.write_expert_pack.empty() && (o.ram_cache_gib <= 0.0 || o.mmap_experts)) {   // #81: a deferred arena
+        std::fprintf(stderr, "strata generate: --write-expert-pack runs with the capacity-mode arguments (--ram-cache-gib): "
+                             "the arena is then only reserved, not loaded\n");
+        return 2;
+    }
+    if (!o.expert_pack.empty() && (o.ram_cache_gib <= 0.0 || o.mmap_experts)) {   // #81: never silently unused
+        std::fprintf(stderr, "strata generate: --expert-pack serves the capacity-mode reader; it needs --ram-cache-gib\n");
         return 2;
     }
     if (!o.expert_mirrors.empty() && (o.ram_cache_gib <= 0.0 || o.mmap_experts)) {   // #62: never silently unused
@@ -3089,6 +3107,19 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
         for (const std::string& d : o.expert_mirrors) arena_src.add_mirror(d);   // #62
+        if (!o.write_expert_pack.empty()) {   // #81: the aligned pack, then done
+            if (!arena_src.write_expert_pack(o.write_expert_pack, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: expert pack written to %s; serve with --expert-pack %s\n",
+                         o.write_expert_pack.c_str(), o.write_expert_pack.c_str());
+            return 0;
+        }
+        if (!o.expert_pack.empty() && !arena_src.set_expert_pack(o.expert_pack, err)) {   // #81
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
@@ -6370,6 +6401,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 4; ++i) tier0[i] = drive.d.tier_entries[i];
             const double cpu_ms0 = drive.cpu_ms;
             const int64_t nvme0 = arena_src.nvme_loads();
+            const double nvme_ms0 = arena_src.nvme_ms();
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
@@ -6662,6 +6694,17 @@ int main(int argc, char** argv) {
                                      "%.2f GiB\n", (long long) sum, (long long) te[0], (long long) te[1],
                              (long long) te[2], (long long) te[3], drive.cpu_ms - cpu_ms0,
                              (long long) (arena_src.nvme_loads() - nvme0), private_commit_bytes() / 1073741824.0);
+                if (dec_windows > 0) {   // #11 acceptance 7: per verify window and per emitted token
+                    const double w = (double) dec_windows, tk = produced_n > 0 ? (double) produced_n : 1.0;
+                    const double all = sum > 0 ? (double) sum : 1.0;
+                    const double nl = (double) (arena_src.nvme_loads() - nvme0), nm = arena_src.nvme_ms() - nvme_ms0;
+                    std::fprintf(stderr, "strata serve: request rates: %lld windows, %lld tokens; per window: %.1f entries "
+                                         "(primary %.1f%% + secondary %.1f%% + pcie %.1f%% + cpu %.1f%%), %.2f nvme loads, "
+                                         "%.2f ms nvme wait; per token: %.3f nvme loads, %.3f ms nvme wait\n",
+                                 (long long) dec_windows, (long long) produced_n, (double) sum / w, 100.0 * te[0] / all,
+                                 100.0 * te[1] / all, 100.0 * te[2] / all, 100.0 * te[3] / all, nl / w, nm / w, nl / tk,
+                                 nm / tk);
+                }
                 if (!o.expert_mirrors.empty())   // #62: each copy's share so far (cumulative over the session)
                     for (const auto& f : arena_src.nvme_file_stats())
                         std::fprintf(stderr, "strata serve: nvme file %s: %lld experts, %.2f GiB, %.3f ms per batch, "
@@ -7734,6 +7777,10 @@ int main(int argc, char** argv) {
             std::printf("%-24s %lld loads, %.3f per round, %.3f ms/round waiting; host tier %.2f GiB\n", "nvme tier",
                         (long long) arena_src.nvme_loads(), (double) arena_src.nvme_loads() / rounds,
                         arena_src.nvme_ms() / rounds, (double) arena_src.host_cache_bytes() / 1073741824.0);
+        if (rounds > 0 && o.ram_cache_gib > 0.0 && !produced.empty())   // #11 acceptance 7: per emitted token
+            std::printf("%-24s %.3f loads, %.3f ms waiting per emitted token (%zu tokens, %lld rounds)\n", "nvme per token",
+                        (double) arena_src.nvme_loads() / (double) produced.size(),
+                        arena_src.nvme_ms() / (double) produced.size(), produced.size(), (long long) rounds);
         if (rounds > 0 && o.ram_cache_gib > 0.0) {   // the miss-cost breakdown of the decode loads
             auto s = arena_src.nvme_stages();
             s.evict_ms -= stages0.evict_ms; s.commit_ms -= stages0.commit_ms; s.submit_ms -= stages0.submit_ms;

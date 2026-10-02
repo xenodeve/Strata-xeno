@@ -1905,8 +1905,17 @@ bool ArenaExpertSource::submit_reads(const int32_t* layers, const int32_t* exper
     pend_.t0 = t0;
     for (int i = 0; i < n; ++i) {
         uint64_t off[3], len[3], at[3];
-        const int nr = expert_ranges(lay, from_gguf_, layers[i], experts[i], off, len, at);
-        const std::string source = expert_file(gguf_, path_, from_gguf_, lay, layers[i]);
+        const bool packed = !pack_path_.empty();   // #81: one contiguous, aligned range per expert
+        int nr;
+        if (packed) {
+            off[0] = pack_off_[(size_t) layers[i]] + (uint64_t) experts[i] * pack_stride_[(size_t) layers[i]];
+            len[0] = lay.blob_bytes(layers[i]);
+            at[0] = 0;
+            nr = 1;
+        } else {
+            nr = expert_ranges(lay, from_gguf_, layers[i], experts[i], off, len, at);
+        }
+        const std::string source = packed ? pack_path_ : expert_file(gguf_, path_, from_gguf_, lay, layers[i]);
         int fi = open_file(source);
         if (fi < 0) return false;
         if (!mirror_dirs_.empty()) {   // #62: the whole expert to the copy with the fewest bytes queued
@@ -1933,15 +1942,94 @@ bool ArenaExpertSource::submit_reads(const int32_t* layers, const int32_t* exper
         ++d.st.reads;
         for (int r = 0; r < nr; ++r) {
             const uint64_t a0 = off[r] & ~(A - 1), a1 = (off[r] + len[r] + A - 1) & ~(A - 1);
-            uint8_t* bounce = (uint8_t*) dscratch_ + reqs.size() * slot_bytes;
-            if (!((DirectFile*) d.file)->submit(a0, bounce, (uint32_t) (a1 - a0), (uint64_t) reqs.size(), err))
+            // #81: a pack's expert into a slab slot directly - aligned, and the read (<= the pack's stride, the
+            // slot's stride) fits the slot; anything else lands in the bounce buffer and is copied
+            const bool direct = packed && slab_ && a0 == off[r] && ((uintptr_t) dsts[i] & (A - 1)) == 0 &&
+                                a1 - a0 <= pack_stride_[(size_t) layers[i]];
+            uint8_t* buf = direct ? dsts[i] : (uint8_t*) dscratch_ + reqs.size() * slot_bytes;
+            if (!((DirectFile*) d.file)->submit(a0, buf, (uint32_t) (a1 - a0), (uint64_t) reqs.size(), err))
                 return false;
-            reqs.push_back({fi, off[r] - a0, len[r], dsts[i] + at[r]});
+            reqs.push_back({fi, off[r] - a0, len[r], dsts[i] + at[r], direct});
             d.st.bytes += a1 - a0;
             queued_of(fi) += a1 - a0;
         }
     }
     if (used_mirror) ++mirror_turn_;
+    return true;
+}
+
+bool ArenaExpertSource::set_expert_pack(const std::string& path, std::string& err) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) { err = "expert pack: cannot open " + path; return false; }
+    const uint64_t size = (uint64_t) f.tellg();
+    std::vector<uint8_t> head(4096);
+    f.seekg(0);
+    if (size < head.size() || !f.read((char*) head.data(), (std::streamsize) head.size())) {
+        err = "expert pack: " + path + " is shorter than its header";
+        return false;
+    }
+    uint32_t h32[4];
+    std::memcpy(h32, head.data() + 8, sizeof h32);
+    if (std::memcmp(head.data(), "STRAPACK", 8) != 0 || h32[0] != 1) { err = "expert pack: " + path + " is not a v1 pack"; return false; }
+    if ((int64_t) h32[1] != lay.n_layers || (int64_t) h32[2] != n_expert_ || 24 + 24 * (uint64_t) h32[1] > head.size()) {
+        err = "expert pack: " + path + " holds " + std::to_string(h32[1]) + " layers x " + std::to_string(h32[2]) +
+              " experts, the model " + std::to_string(lay.n_layers) + " x " + std::to_string(n_expert_);
+        return false;
+    }
+    std::vector<uint64_t> off((size_t) lay.n_layers), stride((size_t) lay.n_layers);
+    for (int64_t l = 0; l < lay.n_layers; ++l) {
+        uint64_t row[3];
+        std::memcpy(row, head.data() + 24 + 24 * l, sizeof row);
+        if (row[2] != lay.blob_bytes(l) || row[1] < row[2] || row[0] % 4096 || row[1] % 4096 ||
+            row[0] + (uint64_t) n_expert_ * row[1] > size) {
+            err = "expert pack: " + path + " layer " + std::to_string(l) + " does not match the model's blobs";
+            return false;
+        }
+        off[(size_t) l] = row[0];
+        stride[(size_t) l] = row[1];
+    }
+    pack_path_ = path;
+    pack_off_ = std::move(off);
+    pack_stride_ = std::move(stride);
+    return true;
+}
+
+bool ArenaExpertSource::write_expert_pack(const std::string& path, std::string& err) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    constexpr uint64_t A = 4096;
+    std::vector<uint8_t> head(A, 0);
+    std::memcpy(head.data(), "STRAPACK", 8);
+    const uint32_t h32[4] = {1, (uint32_t) lay.n_layers, (uint32_t) n_expert_, (uint32_t) A};
+    std::memcpy(head.data() + 8, h32, sizeof h32);
+    if (24 + 24 * (uint64_t) lay.n_layers > A) { err = "expert pack: too many layers for the header"; return false; }
+    uint64_t at = A, max_stride = 0;
+    for (int64_t l = 0; l < lay.n_layers; ++l) {
+        const uint64_t blob = lay.blob_bytes(l), stride = (blob + A - 1) / A * A;
+        const uint64_t row[3] = {at, stride, blob};
+        std::memcpy(head.data() + 24 + 24 * l, row, sizeof row);
+        at += (uint64_t) n_expert_ * stride;
+        max_stride = std::max(max_stride, stride);
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) { err = "expert pack: cannot create " + path; return false; }
+    out.write((const char*) head.data(), (std::streamsize) A);
+    std::vector<uint8_t> e((size_t) max_stride);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int64_t l = 0; l < lay.n_layers; ++l) {
+        const uint64_t stride = (lay.blob_bytes(l) + A - 1) / A * A;
+        for (int64_t x = 0; x < n_expert_; ++x) {
+            std::fill(e.begin(), e.begin() + (std::ptrdiff_t) stride, (uint8_t) 0);
+            if (!read_expert(l, x, e.data(), err)) return false;
+            out.write((const char*) e.data(), (std::streamsize) stride);
+        }
+        if (!out) { err = "expert pack: writing " + path + " failed (disk full?)"; return false; }
+        std::fprintf(stderr, "strata expert pack: layer %lld of %lld written (%.1f GiB, %.0f s)\n", (long long) l + 1,
+                     (long long) lay.n_layers, (double) out.tellp() / 1073741824.0,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+    out.close();
+    if (!out) { err = "expert pack: closing " + path + " failed"; return false; }
     return true;
 }
 
@@ -1966,18 +2054,22 @@ bool ArenaExpertSource::collect_reads(std::string& err) {
         const auto tk = std::chrono::steady_clock::now();
         stages_.wait_ms += std::chrono::duration<double, std::milli>(tk - tw).count();
         const double t = strata::timeline::now_us();
+        bool copied = false;
         for (int j = 0; j < k; ++j) {
             if (c[j].tag == DirectFile::WAKE_TAG) continue;
             const Req& q = reqs[(size_t) c[j].tag];
             if (!c[j].ok || c[j].bytes < q.skip + q.len) { err = "read_experts: short read"; return false; }
-            std::memcpy(q.to, (uint8_t*) dscratch_ + (size_t) c[j].tag * slot_bytes + q.skip, (size_t) q.len);
+            if (!q.direct) {   // #81: a pack read straight into its slot has nothing to copy
+                std::memcpy(q.to, (uint8_t*) dscratch_ + (size_t) c[j].tag * slot_bytes + q.skip, (size_t) q.len);
+                copied = true;
+            }
             ++got;
             --left[fi];
             last[fi] = t;
             dfiles_[fi].lat_us[dfiles_[fi].lat_next++ % DFile::kLat] = (float) (t - t0);
             dfiles_[fi].lat_n = std::min<uint64_t>(dfiles_[fi].lat_n + 1, DFile::kLat);
         }
-        stages_.copy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tk).count();
+        if (copied) stages_.copy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tk).count();
         return true;
     };
     while (got < reqs.size()) {
