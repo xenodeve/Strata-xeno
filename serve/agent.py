@@ -63,6 +63,7 @@ class AgentContext:
     emit: Callable[[dict], None] = lambda event: None      # tool activity for the page (a todo list, a shell's output)
     question: Callable[[list], object] = lambda questions: {"answers": None}      # AskUserQuestion: the user's answers, or None when nobody answered
     checkpoint: object | None = None                       # serve/checkpoints.py Scope: the way back for the files the tools change in this prompt
+    hooks: object | None = None                            # serve/hooks.py Runner: the user's own commands before and after a call (none by default)
 
 
 class Session:
@@ -249,6 +250,10 @@ class AgentServer:
         d = permissions.decide(tool, args, ctx.policy)
         if d.kind == "deny":
             return _err(f"{tool} is denied: {d.why}")
+        if ctx.hooks:                                         # a hook can only stop a call, and runs only once the rules have not denied it
+            stopped = ctx.hooks.before(tool, args)
+            if stopped:
+                return _err(f"{tool} was stopped by a hook: {stopped}")
         if d.kind == "ask":
             rule = permissions.rule_for(tool, args)
             answer = ctx.ask({"tool": tool, "arguments": args, "why": d.why, "danger": d.danger, "judgeable": d.judgeable, "rule": rule})
@@ -262,8 +267,12 @@ class AgentServer:
             elif answer != "allow":
                 return _err(f"The user did not allow this {tool} call ({d.why}). Do not try the same thing again; ask them what they want instead.")
         try:
-            r = self._run[tool](args, ctx)
-            return self._with_nested(tool, args, ctx, r)
+            r = self._with_nested(tool, args, ctx, self._run[tool](args, ctx))
+            if ctx.hooks:
+                said = ctx.hooks.after(tool, args, r)
+                if said and r.get("content") and isinstance(r["content"][0], dict):
+                    r["content"][0]["text"] = str(r["content"][0].get("text", "")) + "\n\n" + said
+            return r
         except PermissionError as e:
             return _err(f"{tool} could not do it: {e.strerror or e}")
         except OSError as e:

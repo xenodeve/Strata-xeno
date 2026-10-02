@@ -59,7 +59,7 @@ from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's la
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
 from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
-from serve import agent as agent_mod, agent_prompt, agent_run, permissions, shell as shell_mod  # noqa: E402
+from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, shell as shell_mod  # noqa: E402
 from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -934,6 +934,16 @@ class Service:
             d = parent if parent != d else None
         tools = [t["name"] for t in self.agent.tools if t["name"] != "ExitPlanMode" or mode == "plan"]
         run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
+        try:
+            defined, _problems = hooks_mod.load(harness._cfg(self))
+        except Exception:  # noqa: BLE001 - a config that cannot be read means no hooks
+            defined = []
+        runner = hooks_mod.Runner(defined, sh, folder, sid, run._emit, lambda: run.cancel.is_set())
+        if runner:
+            run.ctx.hooks = run.hooks = runner
+            said = runner.prompt(goal)                                   # the user's own prompt hooks: what they print goes to the model with the rules
+            if said:
+                run.prompt += "\n\n" + said
         return run
 
     def replay_key(self, req: dict, ids, max_new):
@@ -1682,6 +1692,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     max_rounds = max(int(hub.settings["max_rounds"]), AGENT_ROUNDS) if agent_run is not None else int(hub.settings["max_rounds"])      # coding takes many rounds
     total, rounds, done = 0, 0, None
     messages = list(messages)
+    if agent_run is not None:
+        for e in agent_run.drain():                      # what the prompt hooks did, before the first word
+            yield "mcp", e
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
         for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
@@ -1763,6 +1776,24 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, 0 if sampling.get("stream") else 1)
+    if agent_run is not None and getattr(agent_run, "hooks", None) and not cancel.is_set() and done["finish"] != "cancel":
+        agent_run.current = None
+        worker = threading.Thread(target=agent_run.hooks.stop, args=("".join(text).strip(),), daemon=True)      # the model has finished: the user's stop hooks (their output is for the user)
+        worker.start()
+        try:
+            beat = 0
+            while worker.is_alive():
+                worker.join(0.2)
+                for e in agent_run.drain():
+                    yield "mcp", e
+                beat += 1
+                if worker.is_alive() and beat % 5 == 0:
+                    yield "ping", None
+        except GeneratorExit:
+            cancel.set()
+            raise
+        for e in agent_run.drain():
+            yield "mcp", e
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -2154,6 +2185,15 @@ def make_handler(svc: Service):
                     self._json(200, {"available": svc.agent is not None, "allowed": ok, "reason": "" if ok else why, "shell": shell_mod.describe(sh) if sh else None,
                                      "tools": [t["name"] for t in svc.agent.tools] if svc.agent else []})
                 return
+            if path == "/agent/hooks":
+                # the user's hooks (serve/hooks.py), read only: they are written in the run config; only who may use the coding tools sees the commands
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    self._json(200, {**hooks_mod.view(harness._cfg(svc)), "config_file": os.path.basename(svc.config_path) if svc.config_path else None,
+                                     "shell": bool(getattr(svc.agent, "shell", None)), "editable": bool(svc.config_path)})
+                return
             if path == "/agent/folders":
                 # the folders of this PC, to choose a project's folder from (only the names of folders, and only for who may use the coding tools)
                 if self._authorized():
@@ -2371,6 +2411,32 @@ def make_handler(svc: Service):
                 if not svc.broker.answer(body["id"], body["decision"]):
                     return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
                 return self._json(200, {"ok": True})
+            if path == "/agent/hooks":                       # which hooks are switched off (the hooks themselves are written in the run config only)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
+                if not self._own_page("the hooks can be switched"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                if not svc.config_path:
+                    return self._json(409, {"error": {"message": harness.NO_FILE}})
+                if not 0 < n <= 100_000:
+                    return self._json(413, {"error": {"message": "send a body of up to 100 KB"}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self._json(400, {"error": {"message": "the body is not JSON"}})
+                off, bad = hooks_mod.check_off(body.get("off") if isinstance(body, dict) and set(body) == {"off"} else None)
+                if bad:
+                    return self._json(400, {"error": {"message": bad}})
+                known = {h["id"] for h in hooks_mod.view(harness._cfg(svc))["hooks"]}
+                with mcp_admin._lock:
+                    try:
+                        mcp_admin.update_config(svc.config_path, lambda cfg: cfg.__setitem__("hooks_off", [x for x in off if x in known]))
+                    except (OSError, ValueError, TypeError) as e:
+                        return self._json(500, {"error": {"message": f"it could not be saved: {e}"}})
+                return self._json(200, {**hooks_mod.view(harness._cfg(svc)), "config_file": os.path.basename(svc.config_path), "shell": bool(getattr(svc.agent, "shell", None)), "editable": True})
             if path == "/import":                            # the skill switches, importing one MCP server, a rescan: a write like /mcp/config (#94)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""

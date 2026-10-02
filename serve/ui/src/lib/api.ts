@@ -2,6 +2,7 @@ import { store } from "./store"
 import { t } from "./i18n"
 import type { McpConfigView } from "./mcpconfig"
 import type { ImportView } from "./importer"
+import type { HooksView } from "./hooks"
 import type { AgentInfo } from "./agent"
 
 export const apiHeaders = (json = false): Record<string, string> => {
@@ -45,6 +46,22 @@ export async function getAgent(): Promise<AgentInfo | null> {
     const r = await fetch(url("agent"), { headers: apiHeaders() })
     return r.ok ? ((await r.json()) as AgentInfo) : null
   } catch { return null }
+}
+
+/** The user's hooks (serve/hooks.py), read only, with whether each is on; null when the server cannot be asked (not this PC, no such route). */
+export async function getHooks(): Promise<HooksView | null> {
+  try {
+    const r = await fetch(url("agent/hooks"), { headers: apiHeaders() })
+    return r.ok ? ((await r.json()) as HooksView) : null
+  } catch { return null }
+}
+
+/** Switch hooks off: `off` is the ids of all that are off (the rest are on). The answer is the new list, or why not. */
+export async function postHooksOff(off: string[]): Promise<{ view: HooksView } | { error: string }> {
+  try {
+    const r = await fetch(url("agent/hooks"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify({ off }) })
+    return r.ok ? { view: (await r.json()) as HooksView } : { error: await errorMessage(r) }
+  } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
 }
 
 export interface FolderView { path: string; parent: string | null; dirs: { name: string; path: string }[]; truncated: boolean }

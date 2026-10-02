@@ -1947,6 +1947,70 @@ export const checks = [
     },
   },
   {
+    // The user's hooks (issue #99): written in the run config, listed in Settings with a switch each, and shown in the chat where they acted.
+    name: "hooks: Settings list them with a switch kept in the run config; the chat shows what a hook did on the call and on the answer",
+    async run({ browser, importer, fast, t, errors }) {
+      const fs = await import("node:fs")
+      const NL = String.fromCharCode(10)
+      const original = fs.readFileSync(importer.config, "utf8")
+      const saved = () => JSON.parse(fs.readFileSync(importer.config, "utf8"))
+      try {
+        const pg = await open(browser, errors, { width: 1200, height: 900 })
+        await pg.goto(importer.base + "/#/settings/hooks")
+        await pg.waitForSelector("[data-hooks]")
+        await pg.waitForTimeout(600)
+        t.ok("with none written it says so, and shows how to write one", (await pg.locator("[data-hooks]").innerText()).includes("No hooks are set.") && (await pg.locator("[data-hooks] pre").innerText()).includes("before_tool"))
+
+        fs.writeFileSync(importer.config, JSON.stringify({ ...saved(), hooks: [{ event: "before_tool", matcher: "Bash", command: "./check.sh", timeout: 10 }, { event: "stop", command: "echo done" }, { event: "sometime", command: "x" }] }, null, 2))
+        await pg.reload()
+        await pg.waitForSelector("[data-hook-list]")
+        t.ok("each hook is listed with what runs it, its tools and its time limit", (await pg.locator("[data-hook-id]").count()) === 2 && (await pg.locator("[data-hook-list]").innerText()).includes("./check.sh") && (await pg.locator("[data-hook-list]").innerText()).includes("Time limit: 10 s") && (await pg.locator("[data-hook-list]").innerText()).includes("Bash"))
+        t.ok("an entry that cannot be used is reported, not hidden", (await pg.locator("[data-hook-problems]").innerText()).includes("hook 3"))
+        const sw = pg.getByRole("switch", { name: "Run the hook ./check.sh" })
+        t.ok("they are all on", (await sw.getAttribute("aria-checked")) === "true")
+        await sw.click()
+        await pg.waitForFunction(() => document.querySelector("[role=switch][aria-label='Run the hook ./check.sh']")?.getAttribute("aria-checked") === "false")
+        const after = saved()
+        t.ok("a switch is kept in the run config and the hooks themselves are left as they were", after.hooks_off.length === 1 && after.hooks.length === 3 && after.hooks[0].command === "./check.sh")
+        await pg.reload()
+        await pg.waitForSelector("[data-hook-list]")
+        t.ok("and is still off after a reload", (await pg.getByRole("switch", { name: "Run the hook ./check.sh" }).getAttribute("aria-checked")) === "false" && (await pg.getByRole("switch", { name: "Run the hook echo done" }).getAttribute("aria-checked")) === "true")
+        await pg.context().close()
+      } finally {
+        fs.writeFileSync(importer.config, original)
+      }
+
+      // what a hook did, in the chat (the server's stream is scripted)
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const ev = (e) => chunk({ choices: [{ delta: {} }], strata_mcp: e })
+      const note = (more) => ({ event: "hook", hook: "h0123abcd", command: "./check.sh", ok: false, code: 2, blocked: false, timeout: false, error: null, text: "", ms: 5, ...more })
+      const stream = ev(note({ on: "prompt", call_id: null, ok: true, code: 0, command: "git status", text: "branch is main" })) +
+        ev({ event: "start", id: "c1", name: "Bash" }) + ev({ event: "call", id: "c1", name: "Bash", server: "agent", tool: "Bash", arguments: { command: "git commit -m x" }, round: 1 }) +
+        ev(note({ on: "before_tool", call_id: "c1", tool: "Bash", blocked: true, text: "no commits to main" })) +
+        ev({ event: "result", id: "c1", ok: false, text: "Bash was stopped by a hook: no commits to main", chars: 44, truncated: false, ms: 9 }) +
+        ev(note({ on: "stop", call_id: null, ok: false, code: 1, command: "npm test", text: "1 test failed" })) +
+        chunk({ choices: [{ delta: { content: "ok" } }] }) + chunk({ choices: [], usage: { completion_tokens: 1 } }) + `data: [DONE]${NL}${NL}`
+      const info = { available: true, allowed: true, shell: "bash", tools: ["Bash"] }
+      const pg2 = await open(browser, errors, { width: 1200, height: 900 })
+      await pg2.route("**/agent", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(info) }))
+      await pg2.route("**/v1/chat/completions", (r) => r.fulfill({ status: 200, contentType: "text/event-stream", body: stream }))
+      await pg2.goto(fast.base + "/#/chat")
+      await pg2.waitForSelector("textarea[aria-label='Message']")
+      await pg2.waitForTimeout(900)
+      await pg2.fill("textarea[aria-label='Message']", "commit it")
+      await pg2.keyboard.press("Enter")
+      const call = pg2.locator("[data-agent-call='Bash']").first()
+      await call.waitFor({ timeout: 8000 })
+      await pg2.waitForTimeout(600)
+      const stopped = call.locator("[data-hook-state='blocked']")
+      t.ok("a hook that stopped a call says so on that call, with its reason and its command", (await stopped.count()) === 1 && (await stopped.innerText()).includes("A hook stopped this call") && (await stopped.innerText()).includes("no commits to main") && (await stopped.innerText()).includes("./check.sh"))
+      const answerNotes = pg2.locator("[data-hook-notes]").filter({ hasNot: pg2.locator("[data-agent-call]") })
+      t.ok("the hooks of the prompt and of the end are on the answer, not on a call", (await pg2.locator("[data-hook='prompt']").count()) === 1 && (await pg2.locator("[data-hook='stop']").count()) === 1 && (await call.locator("[data-hook='prompt'], [data-hook='stop']").count()) === 0 && (await answerNotes.count()) >= 1)
+      t.ok("one that finished badly says with which exit code, and what it printed", (await pg2.locator("[data-hook='stop']").innerText()).includes("exit code 1") && (await pg2.locator("[data-hook='stop']").innerText()).includes("1 test failed"))
+      await pg2.context().close()
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {

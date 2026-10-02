@@ -19,7 +19,7 @@ import { Spin } from "../../components/spin"
 import { SkillText } from "../../components/SkillTip"
 import { CompactingStatus } from "../../components/CompactingStatus"
 import { skillCall, type SkillCall } from "../../lib/panel"
-import { AgentCall, TodoList } from "./AgentCall"
+import { AgentCall, HookNotes, TodoList } from "./AgentCall"
 import { msg, t } from "../../lib/i18n"
 
 const TOOL_STATE: Record<ToolCall["state"], string> = { writing: msg("Writing"), asking: msg("Waiting for you"), running: msg("Running"), done: msg("Done"), error: msg("Error"), skipped: msg("Not run") }
@@ -280,6 +280,7 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
         <>
           {!!m.todos?.length && <TodoList todos={m.todos} />}
           <div className={cn(streaming && "streaming")}><Answer m={m} /></div>
+          {!!m.hooks?.length && <HookNotes notes={m.hooks} className="mt-2 rounded-md border border-line [&>div:first-child]:border-t-0" />}
         </>
       )}
       <div className="mt-1 flex min-h-6 items-center gap-2 text-[12px] text-ink-3">

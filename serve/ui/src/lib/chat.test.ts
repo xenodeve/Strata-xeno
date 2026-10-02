@@ -1674,3 +1674,49 @@ describe("questions the model asks", () => {
     expect(c.messages[1].tools![0].question!.answers).toBeNull()
   })
 })
+
+// The user's hooks (issue #99): what they did comes in the stream, on the call they were about or on the answer.
+describe("what the user's hooks did, in the chat", () => {
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+  }
+  const finish = [delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10)]
+  const note = (more: Record<string, unknown>) => ({ event: "hook", hook: "h0123abcd", command: "./check.sh", ok: false, code: 2, blocked: false, timeout: false, error: null, text: "", ms: 5, ...more })
+
+  test("a hook that stopped a call is a note on that call; a prompt or stop hook is a note on the answer", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(
+      { strata_mcp: note({ on: "prompt", call_id: null, ok: true, code: 0, text: "branch is main" }) },
+      { strata_mcp: { event: "start", id: "c1", name: "Bash" } }, { strata_mcp: { event: "call", id: "c1", name: "Bash", server: "agent", tool: "Bash", arguments: { command: "git commit" }, round: 1 } },
+      { strata_mcp: note({ on: "before_tool", call_id: "c1", tool: "Bash", blocked: true, text: "no commits to main" }) },
+      { strata_mcp: { event: "result", id: "c1", ok: false, text: "Bash was stopped by a hook: no commits to main", chars: 40, truncated: false, ms: 9 } },
+      { strata_mcp: note({ on: "stop", call_id: null, ok: true, code: 0, text: "checked" }) },
+      ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("commit", [], ctx)
+    const m = c.messages[1]
+    expect(m.hooks!.map((h) => [h.on, h.text])).toEqual([["prompt", "branch is main"], ["stop", "checked"]])
+    expect(m.tools![0].hooks!).toHaveLength(1)
+    expect(m.tools![0].hooks![0]).toMatchObject({ on: "before_tool", blocked: true, text: "no commits to main", code: 2 })
+  })
+
+  test("what is not a hook's report, and a call that is not shown, do not break the answer", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse({ strata_mcp: { event: "hook", on: "sometime" } }, { strata_mcp: note({ on: "after_tool", call_id: "gone" }) }, ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("hi", [], ctx)
+    expect(c.messages[1].text).toBe("ok")
+    expect(c.messages[1].hooks!.map((h) => h.on)).toEqual(["after_tool"])                  // no such call: it is kept on the answer
+  })
+
+  test("without hooks the message has none", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("hi", [], ctx)
+    expect(c.messages[1].hooks).toBeUndefined()
+  })
+})

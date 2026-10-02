@@ -11,6 +11,7 @@ import { cn } from "../../lib/cn"
 import { fmt } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
 import { msg, t } from "../../lib/i18n"
+import { eventText, noteText, type HookNote } from "../../lib/hooks"
 
 // A call of the chat's coding tools (issue #96: Read, Write, Edit, Glob, Grep, Bash, ...), shown by what it is: the command and its output,
 // an edit as a diff, a file's lines. When the server asks the user about it, the question is a card on the call: Allow, Allow for this chat,
@@ -155,6 +156,21 @@ function Judge({ call }: { call: ToolCall }) {
   return <div data-agent-judge={j.verdict} className={cn("border-t border-line px-3 py-1.5 text-[12px]", j.verdict === "block" ? "text-bad" : "text-ink-2")}>{text}</div>
 }
 
+/** What the user's own hooks did (Settings > Hooks): a line each, with the command and what it printed. A hook that stopped a call is shown as a refusal; one that failed or ran out of time, as a note. */
+export function HookNotes({ notes, className }: { notes?: HookNote[]; className?: string }) {
+  if (!notes?.length) return null
+  return (
+    <div className={className} data-hook-notes>
+      {notes.map((n, i) => (
+        <div key={i} data-hook={n.on} data-hook-state={n.blocked ? "blocked" : n.ok ? "ok" : "failed"} className={cn("border-t border-line px-3 py-1.5 text-[12px]", n.blocked ? "text-bad" : "text-ink-2")}>
+          <div><span className="font-medium">{noteText(n)}</span><span className="text-ink-3"> · {eventText(n.on)} · </span><span className="font-mono text-ink-3 [overflow-wrap:anywhere]">{n.command}</span></div>
+          {(n.text || n.error) && <div className="mt-0.5 whitespace-pre-wrap font-mono text-[11.5px] [overflow-wrap:anywhere]">{n.error || n.text}</div>}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function Body({ call }: { call: ToolCall }) {
   const name = call.tool || call.name
   const result = call.result != null ? <Out text={call.result} /> : null
@@ -204,6 +220,7 @@ export function AgentCall({ call }: { call: ToolCall }) {
         <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("shrink-0 text-ink-3 transition-transform duration-200", open && "rotate-180")} />
       </button>
       <Judge call={call} />
+      <HookNotes notes={call.hooks} />
       {call.question && <Ask call={call} />}
       {pending && !waiting && <Question call={call} />}
       {call.ask?.answer && <div className="border-t border-line px-3 py-1.5 text-[12px] text-ink-2">{call.ask.kept ? keptText(call.ask.kept) : call.ask.answer === "deny" ? t("You did not allow it.") : call.ask.answer === "allow_chat" ? t("You allowed it for this chat.") : t("You allowed it.")}</div>}

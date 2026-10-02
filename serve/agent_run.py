@@ -75,7 +75,7 @@ class AgentRun:
         self.cancel = self.ctx.cancel = cancel
 
     def _emit(self, event: dict) -> None:
-        self.events.put({**event, "call_id": self.current})
+        self.events.put({"call_id": self.current, **event})                # an event that names its call (or none: a prompt or stop hook) keeps it
 
     def drain(self) -> list[dict]:
         out = []

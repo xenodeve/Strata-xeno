@@ -11,6 +11,7 @@ import { compactPrompt, continuationText, estimateTokens, MIN_SUMMARY, shouldCom
 import { addRule, agentRequest, NO_AGENT, rulesOf, type AgentInfo } from "./agent"
 import { addPerm, forgetPerms, permsFor, type Effect, type Scope } from "./perms"
 import { forgetCheckpoints } from "./rewind"
+import { noteFrom, type HookNote } from "./hooks"
 import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, saveBackground, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
 
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
@@ -27,6 +28,7 @@ export interface ToolCall {
   state: "writing" | "asking" | "running" | "done" | "error" | "skipped"
   question?: AskedQuestion
   ask?: Ask; judge?: { verdict: string; severity: number | null }                // the coding tools: a question for the user, and what auto mode found
+  hooks?: HookNote[]                                                                 // what the user's hooks did about this call
   server?: string; tool?: string; arguments?: unknown; round?: number
   result?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number | null; open?: boolean
 }
@@ -44,6 +46,7 @@ export interface Message {
   error?: string; stopped?: boolean; limit?: number
   images?: { name: string; url?: string }[]; files?: { name: string; text?: string }[]; tools?: ToolCall[]
   todos?: Todo[]                                                 // the coding tools' list of steps, as the model last sent it
+  hooks?: HookNote[]                                             // what the user's prompt and stop hooks did (the ones that belong to no call)
 }
 
 /** The line under an answer ("40 tokens · 38.2 tok/s · 1 tool call"), in the language in use now. An answer stored by an
@@ -132,6 +135,7 @@ export function apiMessages(messages: Message[]): ApiMessage[] {
 interface ToolEvent {
   event: string; id: string; name: string; server?: string; tool?: string; arguments?: unknown; round?: number
   text?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number; skipped?: boolean; max_rounds?: number
+  on?: string; hook?: string; command?: string; code?: number | null; blocked?: boolean; timeout?: boolean; error?: string | null
   call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string; questions?: AskedQuestion["questions"]      // the coding tools
 }
 
@@ -139,6 +143,14 @@ interface ToolEvent {
 function onTool(m: Message, x: ToolEvent) {
   if (x.event === "limit") { m.limit = x.max_rounds; return }
   if (x.event === "todos") { if (Array.isArray(x.todos)) m.todos = x.todos; return }
+  if (x.event === "hook") {                                                                  // a hook of the user's ran: on the call it was about, else on the answer
+    const note = noteFrom(x as unknown as Record<string, unknown>)
+    if (!note) return
+    const c = x.call_id ? (m.tools || []).find((y) => y.id === x.call_id) : undefined
+    const list = c ? (c.hooks = c.hooks || []) : (m.hooks = m.hooks || [])
+    if (list.length < 20) list.push(note)
+    return
+  }
   if (x.event === "question") {                                                              // the model asks the user: a form on its call
     const c = (m.tools || []).find((y) => y.id === x.call_id)
     if (c && Array.isArray(x.questions)) { c.question = { id: x.id, questions: x.questions }; c.state = "asking" }
