@@ -8024,6 +8024,7 @@ int main(int argc, char** argv) {
     // #45 (experiment only): the merged engine's prompt-path stager threads hang in thread exit after returning
     // (traced: all four return, the first join never does); STRATA_EXP_QUICK_EXIT=1 ends the process here, after
     // every result is printed and flushed.  A bypass for measuring, not a fix.
-    if (std::getenv("STRATA_EXP_QUICK_EXIT")) { std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 0); }
+    // TerminateProcess skips atexit: the timeline is written here or never
+    if (std::getenv("STRATA_EXP_QUICK_EXIT")) { strata::timeline::flush(); std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 0); }
     return 0;
 }
