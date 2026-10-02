@@ -93,7 +93,7 @@ function Answer({ m, streaming, show, phase }: { m: Message; streaming: boolean;
     const rat = typeof tc.rat === "number" ? Math.min(tc.rat, reasoning.length) : undefined
     if (rpos !== undefined && rat !== undefined && rat > rpos) {                       // a new round: what the model thought before it called this tool
       const seg = reasoning.slice(rpos, rat)
-      if (seg.trim()) parts.push(<RoundThought key={`r${k}`} text={seg} working={false} show={show} phase={phase} />)
+      if (seg.trim()) parts.push(<RoundThought key={`r${k}`} text={seg.trim()} working={false} show={show} phase={phase} />)
       rpos = rat
     }
     if (at > pos) parts.push(<Prose key={`p${k}`} text={m.text.slice(pos, at)} />)
@@ -103,7 +103,7 @@ function Answer({ m, streaming, show, phase }: { m: Message; streaming: boolean;
   const tail = rpos !== undefined ? reasoning.slice(rpos) : ""
   if (tail.trim()) {                                                                  // the thinking after the last tool: live while the model thinks again
     const idle = !m.tools.some((c) => c.state === "running" || c.state === "writing" || c.state === "asking")
-    parts.push(<RoundThought key="tail" text={tail} working={streaming && idle && m.text.length <= pos} show={show} phase={phase} />)
+    parts.push(<RoundThought key="tail" text={tail.trim()} working={streaming && idle && m.text.length <= pos} show={show} phase={phase} />)
   }
   parts.push(<Prose key="rest" text={m.text.slice(pos)} />)
   return <>{parts}</>

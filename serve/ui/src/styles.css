@@ -278,10 +278,11 @@ html:lang(th) .t-reason-text { line-height: 1.8; }
 @media (prefers-reduced-motion: reduce) { .panel-in { animation: none; } }
 
 /* the live status under an answer gives way to its figures (components/motion.tsx Handover) */
-.handover { position: relative; display: flex; align-items: center; min-height: 1.5rem; }
+.handover { position: relative; display: inline-grid; align-items: center; justify-items: start; min-height: 1.5rem; }       /* the two layers share one cell, so the box is as wide as the wider: what follows is never covered */
+.handover-in, .handover-out { grid-area: 1 / 1; }
 .handover-in { opacity: 0; filter: blur(3px); transform: translateY(4px); transition: opacity 380ms var(--ease) 90ms, filter 380ms var(--ease) 90ms, transform 380ms var(--ease) 90ms; }
 .handover-in[data-show] { opacity: 1; filter: none; transform: none; }
-.handover-out { position: absolute; inset: 0 auto 0 0; display: flex; align-items: center; white-space: nowrap; pointer-events: none; opacity: 0; filter: blur(3px); transform: translateY(-4px); transition: opacity 300ms var(--ease), filter 300ms var(--ease), transform 300ms var(--ease); }
+.handover-out { display: flex; align-items: center; white-space: nowrap; pointer-events: none; opacity: 0; filter: blur(3px); transform: translateY(-4px); transition: opacity 300ms var(--ease), filter 300ms var(--ease), transform 300ms var(--ease); }
 .handover-out[data-show] { opacity: 1; filter: none; transform: none; animation: sharpen 280ms var(--ease) backwards; }
 @media (prefers-reduced-motion: reduce) { .handover-in, .handover-out { transition: none; filter: none; transform: none; } .handover-out[data-show] { animation: none; } }
 

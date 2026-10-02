@@ -2196,6 +2196,24 @@ export const checks = [
       t.ok("the first thought is above the first tool", order.topThought >= 0)
       t.ok("the later thoughts are their own blocks below the tools", (await pg.locator("[data-round-thought]").count()) === 2)
       t.ok("and they are closed once over, as the first is", (await pg.locator("[data-round-thought]").first().innerText()).includes("Thoughts") && !(await pg.locator("[data-round-thought]").first().innerText()).includes("SECONDTHOUGHT"))
+      // opened, each thought's text starts at the same distance under its head: the later ones are not pushed down by the blank line the rounds are joined with
+      const heads = pg.locator(".thought-head")
+      for (let i = 0; i < (await heads.count()); i++) await heads.nth(i).click()
+      await pg.waitForTimeout(900)
+      const gaps = await pg.evaluate(() => [...document.querySelectorAll(".thought")].map((th) => {
+        const head = th.querySelector(".thought-head").getBoundingClientRect()
+        const w = document.createTreeWalker(th, NodeFilter.SHOW_TEXT)
+        let n
+        while ((n = w.nextNode())) {
+          if (n.parentElement.closest(".thought-head") || !n.textContent.trim()) continue
+          const at = n.textContent.search(/\S/)                                       // the first visible character, not the blank lines before it
+          const r = document.createRange(); r.setStart(n, at); r.setEnd(n, at + 1)
+          const box = r.getBoundingClientRect()
+          return Math.round(box.top - head.bottom)
+        }
+        return null
+      }))
+      t.ok("the text of every thought starts the same distance under its head, the later ones too", gaps.length === 3 && gaps.every((g) => g !== null && Math.abs(g - gaps[0]) <= 3), JSON.stringify(gaps))
       await pg.context().close()
     },
   },
@@ -2354,6 +2372,38 @@ export const checks = [
       t.ok("when the model begins to write there is no share left", (await pg.locator("[data-read-tip]").count()) === 0)
       release()
       await pg.waitForFunction(() => document.body.innerText.includes("done"), null, { timeout: 8000 })
+      await pg.context().close()
+    },
+  },
+  {
+    // The status in words and the running count of tokens sit side by side under the answer; the status used to be drawn over the count (an absolutely placed layer that took no room).
+    name: "status line: the words and the live token count never overlap",
+    async run({ browser, long, t, errors }) {
+      const pg = await open(browser, errors, { width: 1300, height: 900 })
+      await pg.goto(long.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(1000)
+      await pg.evaluate(() => {
+        window.__both = 0
+        window.__over = []
+        const tick = () => {
+          const s = document.querySelector("[data-agent-status]"), n = document.querySelector("[data-live-tokens]")
+          if (s && n) {
+            const a = s.getBoundingClientRect(), b = n.getBoundingClientRect()
+            window.__both++
+            if (a.width > 0 && b.width > 0 && a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1) window.__over.push([Math.round(a.left), Math.round(a.right), Math.round(b.left), Math.round(b.right)])
+          }
+          window.__raf = requestAnimationFrame(tick)
+        }
+        tick()
+      })
+      await pg.fill("textarea[aria-label='Message']", "tell me something long")
+      await pg.keyboard.press("Enter")
+      await pg.waitForFunction(() => window.__both > 5, null, { timeout: 30000 })
+      await pg.waitForTimeout(1500)
+      const r = await pg.evaluate(() => { cancelAnimationFrame(window.__raf); return { both: window.__both, over: window.__over } })
+      t.ok("the status and the count were on screen together", r.both > 5, `${r.both} frames`)
+      t.ok("and in no frame did one cover the other", r.over.length === 0, `${r.over.length} frames overlapped`)
       await pg.context().close()
     },
   },
