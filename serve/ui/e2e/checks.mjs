@@ -562,24 +562,28 @@ export const checks = [
       // sideways (the program ones sit to the left, the address ones to the right) while it does
       const swap = (to) => pg.evaluate(async () => {
         const f = document.querySelector("form[aria-label='Add a server']")
-        const h = [], x = { left: [], right: [] }
+        const h = [], x = { left: [], right: [] }, pill = []
+        const mark = f.querySelector("[role=radiogroup] [data-pill]")
         f.querySelector("[role=radio][aria-checked=false]").click()
         const t0 = performance.now()
         while (performance.now() - t0 < 900) {
           h.push(Math.round(f.getBoundingClientRect().height))
           for (const p of f.querySelectorAll(".kind-pane")) x[p.dataset.side].push(Math.round(p.getBoundingClientRect().left))      // where each pane is, sideways, every frame
+          if (mark) pill.push(Math.round(mark.getBoundingClientRect().left))      // the active-button marker, sideways, every frame
           await new Promise((r) => requestAnimationFrame(r))
         }
-        return { h, x }
+        return { h, x, pill }
       })
       const moves = (a) => new Set(a).size > 3
       await pg.waitForTimeout(700)
       const toAddress = await swap()
       t.ok("switching to an address changes the form's height through in-between sizes", new Set(toAddress.h).size > 4 && toAddress.h[0] !== toAddress.h.at(-1) && toAddress.h.slice(1, -1).some((v) => v !== toAddress.h[0] && v !== toAddress.h.at(-1)), JSON.stringify([...new Set(toAddress.h)]))
       t.ok("and the address fields slide in from the right while the program fields slide out to the left", moves(toAddress.x.right) && toAddress.x.right[0] > toAddress.x.right.at(-1) && moves(toAddress.x.left) && toAddress.x.left[0] > toAddress.x.left.at(-1), JSON.stringify([toAddress.x.right.slice(0, 40), toAddress.x.left.slice(0, 40)]))
+      t.ok("the active-button marker glides from the program button to the address button, as the top navigation's does", new Set(toAddress.pill).size > 4 && toAddress.pill[0] < toAddress.pill.at(-1), JSON.stringify([...new Set(toAddress.pill)]))
       t.ok("and the address fields are what is left", (await form.locator("input[aria-label='Address']").count()) === 1 && (await form.locator("input[aria-label='Program']").count()) === 0)
       const toProgram = await swap()
       t.ok("switching back stretches it again, and the program fields are back", new Set(toProgram.h).size > 4 && (await form.locator("input[aria-label='Program']").count()) === 1 && (await form.locator("input[aria-label='Address']").count()) === 0, JSON.stringify([...new Set(toProgram.h)]))
+      t.ok("and it glides back", new Set(toProgram.pill).size > 4 && toProgram.pill[0] > toProgram.pill.at(-1), JSON.stringify([...new Set(toProgram.pill)]))
       t.ok("and this time the program fields slide in from the left", moves(toProgram.x.left) && toProgram.x.left[0] < toProgram.x.left.at(-1), JSON.stringify(toProgram.x.left.slice(0, 40)))
       await form.locator("input[aria-label='Name']").fill("a b")
       await form.locator("input[aria-label='Program']").fill(admin.py)

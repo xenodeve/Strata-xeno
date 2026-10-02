@@ -1,4 +1,4 @@
-import type { ReactNode } from "react"
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react"
 import { cn } from "../lib/cn"
 
 export function Switch({ checked, onChange, label, hint }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint?: ReactNode }) {
@@ -28,11 +28,38 @@ export function Switch({ checked, onChange, label, hint }: { checked: boolean; o
   )
 }
 
+/** Choices side by side, with one marker that glides to the one in use (measured, then moved with transform and width: the way the top
+ *  navigation's pill moves). Not drawn until it has been measured, so it does not glide in from nowhere when the group first shows. */
 export function Segmented<T extends string>({ value, options, onChange, label }: {
   value: T; options: { value: T; label: string }[]; onChange: (v: T) => void; label: string
 }) {
+  const group = useRef<HTMLDivElement>(null)
+  const [mark, setMark] = useState<{ x: number; w: number } | null>(null)
+  const [ready, setReady] = useState(false)               // no glide on the first placement
+  useLayoutEffect(() => {
+    const el = group.current
+    if (!el) return
+    const place = () => {
+      const on = el.querySelector<HTMLElement>('[aria-checked="true"]')
+      if (on && on.offsetWidth > 0) setMark((m) => (m && m.x === on.offsetLeft && m.w === on.offsetWidth ? m : { x: on.offsetLeft, w: on.offsetWidth }))
+    }
+    place()
+    const ro = new ResizeObserver(place)
+    ro.observe(el)
+    document.fonts?.ready.then(place)
+    const id = requestAnimationFrame(() => setReady(true))
+    return () => { ro.disconnect(); cancelAnimationFrame(id) }
+  }, [value])
   return (
-    <div role="radiogroup" aria-label={label} className="grid auto-cols-fr grid-flow-col gap-0.5 rounded-md bg-fill p-0.5">
+    <div ref={group} role="radiogroup" aria-label={label} className="relative grid auto-cols-fr grid-flow-col gap-0.5 rounded-md bg-fill p-0.5">
+      {mark && (
+        <span
+          aria-hidden
+          data-pill=""
+          className={cn("absolute left-0 top-0.5 h-7 rounded-sm bg-surface shadow-sm", ready && "transition-[transform,width] duration-[420ms] ease-[var(--ease)]")}
+          style={{ transform: `translateX(${mark.x}px)`, width: mark.w }}
+        />
+      )}
       {options.map((o) => (
         <button
           key={o.value}
@@ -41,8 +68,8 @@ export function Segmented<T extends string>({ value, options, onChange, label }:
           aria-checked={value === o.value}
           onClick={() => onChange(o.value)}
           className={cn(
-            "h-7 rounded-sm px-2 text-[13px] transition-colors duration-150",
-            value === o.value ? "bg-surface font-medium shadow-sm" : "text-ink-2 hover:text-ink",
+            "relative h-7 rounded-sm px-2 text-[13px] transition-colors duration-200",
+            value === o.value ? "font-medium" : "text-ink-2 hover:text-ink",
           )}
         >
           {o.label}
