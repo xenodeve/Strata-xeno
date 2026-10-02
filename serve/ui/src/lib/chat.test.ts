@@ -1610,3 +1610,67 @@ describe("rewinding a conversation", () => {
     expect(new Set(cps).size).toBe(2)
   })
 })
+
+// The model asks the user (AskUserQuestion): a form on its call, and the answers go back (issue #99).
+describe("questions the model asks", () => {
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    return data
+  }
+  const questions = [{ question: "Which library?", header: "Library", multiSelect: false, options: [{ label: "requests", description: "usual" }, { label: "httpx", description: "async" }] }]
+  const finish = [delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10)]
+
+  test("the question is a form on the call, which waits for the user", async () => {
+    keep()
+    let release!: () => void
+    const held = new Promise<void>((r) => { release = r })
+    ;(globalThis as Record<string, unknown>).fetch = async () => {
+      const first = sse({ strata_mcp: { event: "start", id: "c1", name: "AskUserQuestion" } }, { strata_mcp: { event: "call", id: "c1", name: "AskUserQuestion", server: "agent", tool: "AskUserQuestion", arguments: { questions }, round: 1 } },
+        { strata_mcp: { event: "question", id: "q1", call_id: "c1", questions } })
+      return new Response(new ReadableStream({ async start(c) { c.enqueue(enc.encode(first)); await held; c.enqueue(enc.encode(sse(...finish))); c.close() } }), { status: 200 })
+    }
+    const c = new ChatController()
+    const p = c.send("pick", [], ctx)
+    await new Promise((r) => setTimeout(r, 20))
+    const call = c.messages[1].tools![0]
+    expect(call.state).toBe("asking")
+    expect(call.question).toMatchObject({ id: "q1", questions: [{ header: "Library", multiSelect: false }] })
+    expect(call.question!.answers).toBeUndefined()
+    release()
+    await p
+  })
+
+  test("answering sends the id and the answers, and the form says it is answered", async () => {
+    keep()
+    const c = new ChatController()
+    c.messages = [{ role: "user", text: "x", time: 1 }, { role: "assistant", text: "", time: 2, tools: [{ id: "c1", name: "AskUserQuestion", at: 0, rat: 0, state: "asking", question: { id: "q1", questions } }] }]
+    const posts: { url: string; body: unknown }[] = []
+    ;(globalThis as Record<string, unknown>).fetch = async (u: string, init: { body: string }) => { posts.push({ url: u, body: JSON.parse(init.body) }); return new Response('{"ok":true}', { status: 200 }) }
+    expect(await c.answerQuestion("c1", { "Which library?": ["httpx"] })).toBe(true)
+    expect(posts[0].url).toContain("agent/question")
+    expect(posts[0].body).toEqual({ id: "q1", answers: { "Which library?": ["httpx"] } })
+    expect(c.messages[1].tools![0].question!.answers).toEqual({ "Which library?": ["httpx"] })
+    expect(c.messages[1].tools![0].state).toBe("running")
+    expect(await c.answerQuestion("c1", null)).toBe(false)                          // answered once
+  })
+
+  test("skipping sends null; a server that did not take the answer leaves the form for another try", async () => {
+    keep()
+    const c = new ChatController()
+    const errors: string[] = []
+    c.onError = (title) => errors.push(title)
+    c.messages = [{ role: "user", text: "x", time: 1 }, { role: "assistant", text: "", time: 2, tools: [{ id: "c1", name: "AskUserQuestion", at: 0, rat: 0, state: "asking", question: { id: "q1", questions } }] }]
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(JSON.stringify({ error: { message: "no such question" } }), { status: 404 })
+    expect(await c.answerQuestion("c1", null)).toBe(false)
+    expect(errors).toEqual(["The answer was not taken"])
+    expect(c.messages[1].tools![0].question!.answers).toBeUndefined()
+    const posts: unknown[] = []
+    ;(globalThis as Record<string, unknown>).fetch = async (_u: string, init: { body: string }) => { posts.push(JSON.parse(init.body)); return new Response('{"ok":true}', { status: 200 }) }
+    expect(await c.answerQuestion("c1", null)).toBe(true)
+    expect(posts).toEqual([{ id: "q1", answers: null }])
+    expect(c.messages[1].tools![0].question!.answers).toBeNull()
+  })
+})

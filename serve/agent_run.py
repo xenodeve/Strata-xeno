@@ -25,8 +25,8 @@ class Broker:
         self.lock = threading.Lock()
         self.pending: dict[str, dict] = {}
 
-    def open(self, rid: str) -> dict:
-        slot = {"event": threading.Event(), "answer": None}
+    def open(self, rid: str, kind: str = "permission") -> dict:
+        slot = {"event": threading.Event(), "answer": None, "kind": kind}
         with self.lock:
             self.pending[rid] = slot
         return slot
@@ -40,10 +40,23 @@ class Broker:
         if decision not in ANSWERS:
             return False
         with self.lock:
-            slot = self.pending.pop(rid, None) if isinstance(rid, str) else None
-        if slot is None:
-            return False
+            slot = self.pending.get(rid) if isinstance(rid, str) else None
+            if slot is None or slot.get("kind") != "permission":
+                return False
+            self.pending.pop(rid, None)
         slot["answer"] = decision
+        slot["event"].set()
+        return True
+
+    def respond(self, rid, answers) -> bool:
+        """The page's answer to a question the model asked (AskUserQuestion): {question: [labels or the user's own words]}, or None when the user skipped it. False for an id that
+        was not asked, is answered already, or is a permission question."""
+        with self.lock:
+            slot = self.pending.get(rid) if isinstance(rid, str) else None
+            if slot is None or slot.get("kind") != "question":
+                return False
+            self.pending.pop(rid, None)
+        slot["answer"] = {"answers": answers}
         slot["event"].set()
         return True
 
@@ -55,7 +68,7 @@ class AgentRun:
         self.events: queue.Queue = queue.Queue()
         self.current: str | None = None                      # the id of the model's call that is running (for the page to tie a card to it)
         self.prompt = ""                                       # the rules for the AI (serve/agent_prompt.py), set by the server
-        self.ctx = agent.AgentContext(policy=policy, session=session, ask=self.ask, cancel=cancel, emit=self._emit)
+        self.ctx = agent.AgentContext(policy=policy, session=session, ask=self.ask, cancel=cancel, emit=self._emit, question=self.question)
 
     def bind(self, cancel: threading.Event) -> None:
         """The request's own cancel event (made after the run, once the prompt is ready)."""
@@ -87,6 +100,22 @@ class AgentRun:
         if kind == "block":
             return f"blocked: auto mode judged this call too risky (severity {severity} of 5)"
         return None
+
+    def question(self, questions: list) -> dict | str:
+        """The model's questions to the user: a `question` event, and the answer ({"answers": {...} or None}), or "cancelled", or {"answers": None} when nobody answered in time."""
+        rid = uuid.uuid4().hex[:16]
+        slot = self.broker.open(rid, "question")
+        self._emit({"event": "question", "id": rid, "questions": questions})
+        end = time.monotonic() + self.timeout
+        try:
+            while not slot["event"].wait(0.25):
+                if self.cancel.is_set():
+                    return "cancelled"
+                if time.monotonic() > end:
+                    return {"answers": None}
+            return slot["answer"]
+        finally:
+            self.broker.close(rid)
 
     def ask(self, req: dict) -> str:
         rid = uuid.uuid4().hex[:16]

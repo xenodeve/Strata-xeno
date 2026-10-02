@@ -61,6 +61,7 @@ class AgentContext:
     ask: Callable[[dict], str] = lambda req: "deny"        # "allow" | "allow_chat" | "deny" | "cancelled"
     cancel: threading.Event = field(default_factory=threading.Event)
     emit: Callable[[dict], None] = lambda event: None      # tool activity for the page (a todo list, a shell's output)
+    question: Callable[[list], object] = lambda questions: {"answers": None}      # AskUserQuestion: the user's answers, or None when nobody answered
     checkpoint: object | None = None                       # serve/checkpoints.py Scope: the way back for the files the tools change in this prompt
 
 
@@ -158,6 +159,16 @@ SCHEMAS = {
               "multiline": {"type": "boolean", "description": "let . and \\n match across lines"}}, ["pattern"]),
     "ExitPlanMode": ("Use this in plan mode when your plan is ready: send the plan, and the user decides whether you may start. Do not use it for anything else.",
                      {"plan": {"type": "string", "description": "the plan, in Markdown"}}, ["plan"]),
+    "AskUserQuestion": ("Ask the user one to four questions with two to four choices each, when you need a decision that is theirs and cannot be settled from the code: which approach, which library, "
+                        "what to name something. The user can pick a choice, several (multiSelect), or write something else; the answer comes back to you. Do not ask what you can find out yourself, and do not "
+                        "ask whether the plan is ready (use ExitPlanMode).",
+                        {"questions": {"type": "array", "minItems": 1, "maxItems": 4, "items": {"type": "object", "properties": {
+                            "question": {"type": "string", "description": "the whole question, ending with a question mark"},
+                            "header": {"type": "string", "description": "a very short label, at most 12 characters (e.g. Library)"},
+                            "multiSelect": {"type": "boolean", "description": "true when more than one choice may be picked"},
+                            "options": {"type": "array", "minItems": 2, "maxItems": 4, "items": {"type": "object", "properties": {
+                                "label": {"type": "string", "description": "the choice, a few words"}, "description": {"type": "string", "description": "what it means or what follows from it"}},
+                                "required": ["label", "description"]}}}, "required": ["question", "header", "options"]}}}, ["questions"]),
     "TodoWrite": ("Keep a list of the steps of a longer task and mark them as you go: exactly one in_progress at a time. Send the whole list every time.",
                   {"todos": {"type": "array", "items": {"type": "object", "properties": {
                       "content": {"type": "string", "description": "the step, as a command"}, "status": {"type": "string", "enum": list(TODO_STATES)},
@@ -184,7 +195,7 @@ class AgentServer:
         self.last_start = 0.0
         self._sessions: collections.OrderedDict[str, Session] = collections.OrderedDict()
         self._tools = dict(SCHEMAS)
-        self._run = {"Read": self._read, "Write": self._write, "Edit": self._edit, "Glob": self._glob, "Grep": self._grep, "TodoWrite": self._todo, "ExitPlanMode": self._exit_plan, "NotebookEdit": self._notebook_edit}
+        self._run = {"Read": self._read, "Write": self._write, "Edit": self._edit, "Glob": self._glob, "Grep": self._grep, "TodoWrite": self._todo, "ExitPlanMode": self._exit_plan, "NotebookEdit": self._notebook_edit, "AskUserQuestion": self._ask_user}
         for name, (desc, props, req, fn) in (extra or {}).items():            # more tools (Bash lives in serve/shell.py)
             self._tools[name] = (desc, props, req)
             self._run[name] = fn
@@ -638,6 +649,51 @@ class AgentServer:
         ctx.policy.mode = None                                              # the user approved it (the gate asked): the default rules apply from now on
         ctx.emit({"event": "mode", "mode": "ask"})
         return _ok("The user has approved your plan. You can start now: changes and commands are allowed again (the usual questions still apply).")
+
+    # -------------------------------------------------------------------------------------------- AskUserQuestion
+    def _ask_user(self, a: dict, ctx: AgentContext) -> dict:
+        qs = a.get("questions")
+        if not isinstance(qs, list) or not 1 <= len(qs) <= 4:
+            return _err("questions must be a list of one to four questions")
+        clean = []
+        for q in qs:
+            if not isinstance(q, dict) or not isinstance(q.get("question"), str) or not q["question"].strip() or len(q["question"]) > 400:
+                return _err("each question needs a question text of up to 400 characters")
+            header = q.get("header")
+            if not isinstance(header, str) or not header.strip() or len(header) > 12:
+                return _err("each question needs a header of at most 12 characters")
+            opts = q.get("options")
+            if not isinstance(opts, list) or not 2 <= len(opts) <= 4:
+                return _err("each question needs two to four options")
+            multi = q.get("multiSelect", False)
+            if not isinstance(multi, bool):
+                return _err("multiSelect is true or false")
+            labels = []
+            for o in opts:
+                if not isinstance(o, dict) or not isinstance(o.get("label"), str) or not o["label"].strip() or len(o["label"]) > 80 or not isinstance(o.get("description"), str) or len(o["description"]) > 400:
+                    return _err("each option needs a label (up to 80 characters) and a description")
+                labels.append({"label": o["label"].strip(), "description": o["description"].strip()})
+            if len({x["label"] for x in labels}) != len(labels):
+                return _err("the options of a question must have different labels")
+            clean.append({"question": q["question"].strip(), "header": header.strip(), "multiSelect": multi, "options": labels})
+        if len({q["question"] for q in clean}) != len(clean):
+            return _err("the questions must be different")
+        got = ctx.question(clean)
+        if got == "cancelled":
+            return _err("The request was cancelled before the user answered.")
+        answers = got.get("answers") if isinstance(got, dict) else None
+        if not isinstance(answers, dict):
+            return _ok("The user did not answer the questions. Carry on with what you can do without it, or ask in plain words in your reply.")
+        parts = []
+        for q in clean:
+            v = answers.get(q["question"])
+            if isinstance(v, str):
+                v = [v]
+            if not isinstance(v, list) or not v or not all(isinstance(x, str) and x.strip() for x in v):
+                parts.append(f'"{q["question"]}"="(no answer)"')
+            else:
+                parts.append(f'"{q["question"]}"="{", ".join(x.strip()[:500] for x in v[:8])}"')
+        return _ok("The user has answered your questions: " + ", ".join(parts) + ". You can now carry on with the answers in mind.")
 
     # -------------------------------------------------------------------------------------------- TodoWrite
     def _todo(self, a: dict, ctx: AgentContext) -> dict:

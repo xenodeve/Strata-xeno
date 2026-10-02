@@ -69,6 +69,14 @@ export async function postPermission(id: string, decision: "allow" | "allow_chat
   } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
 }
 
+/** The user's answers to the questions the model asked (AskUserQuestion): {question: [choices or own words]}, or null to skip them. */
+export async function postQuestionAnswer(id: string, answers: Record<string, string[]> | null): Promise<{ ok: true } | { error: string }> {
+  try {
+    const r = await fetch(url("agent/question"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify({ id, answers }) })
+    return r.ok ? { ok: true } : { error: await errorMessage(r) }
+  } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
+}
+
 export async function getMcpConfig(): Promise<McpConfigView | null> {
   try {
     const r = await fetch(url("mcp/config"), { headers: apiHeaders() })

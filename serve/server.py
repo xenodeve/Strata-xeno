@@ -2335,6 +2335,25 @@ def make_handler(svc: Service):
                 if body.get("apply") is True:
                     return self._json(200, svc.checkpoints.apply(body["session"], body["checkpoint"], body.get("include_changed") is True))
                 return self._json(200, svc.checkpoints.preview(body["session"], body["checkpoint"]))
+            if path == "/agent/question":                    # the page's answer to a question the model asked with AskUserQuestion (serve/agent_run.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 50_000 else b""
+                if not self._own_page("A question can be answered"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                ans = body.get("answers") if isinstance(body, dict) else None
+                if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not (ans is None or (isinstance(ans, dict) and len(ans) <= 4 and all(
+                        isinstance(k, str) and len(k) <= 400 and isinstance(v, list) and 0 < len(v) <= 8 and all(isinstance(x, str) and len(x) <= 500 for x in v) for k, v in ans.items()))):
+                    return self._json(400, {"error": {"message": "send {\"id\": the question's id, \"answers\": {question: [choices]} or null to skip}"}})
+                if not svc.broker.respond(body["id"], ans):
+                    return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
+                return self._json(200, {"ok": True})
             if path == "/agent/permission":                  # the page's answer to a question of the coding tools (serve/agent_run.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""

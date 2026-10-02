@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, CheckmarkCircle02Icon, CircleIcon, Alert02Icon } from "@hugeicons/core-free-icons"
-import { chat, type Todo, type ToolCall } from "../../lib/chat"
+import { chat, type AskedQuestion, type Todo, type ToolCall } from "../../lib/chat"
 import { diffRows, toolSummary } from "../../lib/agent"
 import type { Effect, Scope } from "../../lib/perms"
 import { Collapse } from "../../components/motion"
@@ -49,6 +49,57 @@ const Out = ({ text }: { text: string }) => <pre className="tool-pre">{text}</pr
 /** What a card says after the user kept the answer as a rule. */
 function keptText(k: { scope: "project" | "everywhere"; effect: "allow" | "deny" }): string {
   return k.effect === "allow" ? (k.scope === "project" ? t("You allowed it in this project from now on.") : t("You allowed it everywhere from now on.")) : (k.scope === "project" ? t("You refused it in this project from now on.") : t("You refused it everywhere from now on."))
+}
+
+/** The model asks the user (AskUserQuestion): each question with its choices, one or several, and a line for something else; Send, or Skip. Answered, it is the answers. */
+function Ask({ call }: { call: ToolCall }) {
+  const asked = call.question!
+  const [picked, setPicked] = useState<Record<string, string[]>>({})
+  const [other, setOther] = useState<Record<string, string>>({})
+  const [busy, setBusy] = useState(false)
+  const done = asked.answers !== undefined
+  const chosen = (q: string) => [...(picked[q] ?? []), ...(other[q]?.trim() ? [other[q].trim()] : [])]
+  const complete = asked.questions.every((q) => chosen(q.question).length > 0)
+  const toggle = (q: AskedQuestion["questions"][number], label: string) => setPicked((p) => {
+    const now = p[q.question] ?? []
+    return { ...p, [q.question]: q.multiSelect ? (now.includes(label) ? now.filter((x) => x !== label) : [...now, label]) : now[0] === label ? [] : [label] }
+  })
+  const send = async (answers: Record<string, string[]> | null) => { setBusy(true); await chat.answerQuestion(call.id, answers); setBusy(false) }
+  if (done) {
+    return (
+      <div className="space-y-1 border-t border-line px-3 py-2 text-[12.5px]" data-asked-answers>
+        {asked.answers === null ? <div className="text-ink-2">{t("You skipped the questions.")}</div> : asked.questions.map((q) => (
+          <div key={q.question}><span className="text-ink-2">{q.header}: </span><span className="font-medium">{(asked.answers?.[q.question] ?? []).join(", ") || t("(no answer)")}</span></div>
+        ))}
+      </div>
+    )
+  }
+  return (
+    <div role="group" aria-label={t("The model asks you")} data-agent-question className="space-y-4 border-t border-line bg-hover/40 px-3 py-3">
+      {asked.questions.map((q) => (
+        <fieldset key={q.question} data-question={q.header} className="space-y-1.5">
+          <legend className="flex items-center gap-2 text-[13px] font-medium"><span className="rounded-sm bg-fill px-1.5 text-[11px] text-ink-2">{q.header}</span>{q.question}</legend>
+          {q.multiSelect && <div className="text-[11.5px] text-ink-3">{t("You can pick more than one.")}</div>}
+          <div className="space-y-1">
+            {q.options.map((o) => {
+              const on = (picked[q.question] ?? []).includes(o.label)
+              return (
+                <label key={o.label} data-option={o.label} className={cn("flex cursor-pointer items-start gap-2 rounded-sm border px-2.5 py-1.5 text-[13px] transition-colors", on ? "border-accent bg-fill" : "border-line hover:bg-hover")}>
+                  <input type={q.multiSelect ? "checkbox" : "radio"} name={call.id + q.question} checked={on} onChange={() => toggle(q, o.label)} className="mt-0.5" />
+                  <span><span className="block font-medium">{o.label}</span>{o.description && <span className="block text-[12px] text-ink-2">{o.description}</span>}</span>
+                </label>
+              )
+            })}
+            <input className="h-8 w-full rounded-sm border border-line bg-surface px-2.5 text-[13px] outline-none transition-colors placeholder:text-ink-3 hover:border-fill-2 focus:border-accent" aria-label={t("Something else: {question}", { question: q.header })} placeholder={t("Something else")} value={other[q.question] ?? ""} onChange={(e) => setOther((o) => ({ ...o, [q.question]: e.target.value }))} />
+          </div>
+        </fieldset>
+      ))}
+      <div className="flex flex-wrap items-center gap-2">
+        <button type="button" disabled={busy || !complete} onClick={() => void send(Object.fromEntries(asked.questions.map((q) => [q.question, chosen(q.question)])))} className="rounded-sm bg-ink px-3 py-1 text-[13px] font-medium text-surface transition-opacity disabled:opacity-40">{t("Send")}</button>
+        <button type="button" disabled={busy} onClick={() => void send(null)} className="rounded-sm border border-line px-3 py-1 text-[13px] transition-colors hover:bg-hover disabled:opacity-40">{t("Skip")}</button>
+      </div>
+    </div>
+  )
 }
 
 function Question({ call }: { call: ToolCall }) {
@@ -132,7 +183,8 @@ function Body({ call }: { call: ToolCall }) {
 
 export function AgentCall({ call }: { call: ToolCall }) {
   const name = call.tool || call.name
-  const pending = !!call.ask && !call.ask.answer
+  const waiting = !!call.question && call.question.answers === undefined
+  const pending = (!!call.ask && !call.ask.answer) || waiting
   const open = pending || !!call.open
   const busy = call.state === "running" || call.state === "writing"
   const summary = toolSummary(name, call.arguments)
@@ -152,7 +204,8 @@ export function AgentCall({ call }: { call: ToolCall }) {
         <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("shrink-0 text-ink-3 transition-transform duration-200", open && "rotate-180")} />
       </button>
       <Judge call={call} />
-      {pending && <Question call={call} />}
+      {call.question && <Ask call={call} />}
+      {pending && !waiting && <Question call={call} />}
       {call.ask?.answer && <div className="border-t border-line px-3 py-1.5 text-[12px] text-ink-2">{call.ask.kept ? keptText(call.ask.kept) : call.ask.answer === "deny" ? t("You did not allow it.") : call.ask.answer === "allow_chat" ? t("You allowed it for this chat.") : t("You allowed it.")}</div>}
       <Collapse open={open && !pending}>
         <div className="space-y-2 border-t border-line px-3 py-2.5"><Body call={call} /></div>

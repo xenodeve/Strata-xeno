@@ -1891,6 +1891,62 @@ export const checks = [
     },
   },
   {
+    // The model asks the user a question with choices (AskUserQuestion, issue #99): a form on its call, answered or skipped. The server's stream is scripted.
+    name: "askq: the model's question is a form with choices, answered or skipped",
+    async run({ browser, fast, t, errors }) {
+      const NL = String.fromCharCode(10)
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const ev = (e) => chunk({ choices: [{ delta: {} }], strata_mcp: e })
+      const done = chunk({ choices: [{ delta: { content: "ok" } }] }) + chunk({ choices: [], usage: { completion_tokens: 1 } }) + `data: [DONE]${NL}${NL}`
+      const questions = [
+        { question: "Which library should we use?", header: "Library", multiSelect: false, options: [{ label: "requests", description: "the usual one" }, { label: "httpx", description: "async too" }] },
+        { question: "Which checks should run?", header: "Checks", multiSelect: true, options: [{ label: "lint", description: "style" }, { label: "tests", description: "the suite" }, { label: "types", description: "the type checker" }] },
+      ]
+      const ask = (id, qid) => ev({ event: "start", id, name: "AskUserQuestion" }) + ev({ event: "call", id, name: "AskUserQuestion", server: "agent", tool: "AskUserQuestion", arguments: { questions }, round: 1 }) + ev({ event: "question", id: qid, call_id: id, questions }) + done
+      const info = { available: true, allowed: true, shell: "bash", tools: ["AskUserQuestion"] }
+      const pg = await open(browser, errors)
+      const answers = []
+      let n = 0
+      await pg.route("**/agent", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(info) }))
+      await pg.route("**/agent/question", (r) => { answers.push(JSON.parse(r.request().postData() || "{}")); return r.fulfill({ status: 200, contentType: "application/json", body: "{\"ok\":true}" }) })
+      await pg.route("**/v1/chat/completions", (r) => r.fulfill({ status: 200, contentType: "text/event-stream", body: [ask("c1", "q1"), ask("c2", "q2")][Math.min(n++, 1)] }))
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(900)
+      await pg.fill("textarea[aria-label='Message']", "set it up")
+      await pg.keyboard.press("Enter")
+      const form = pg.locator("[data-agent-question]").first()
+      await form.waitFor({ timeout: 8000 })
+      t.ok("the question is a form with each question, its short label, and its choices with what they mean", (await form.locator("fieldset").count()) === 2 && (await form.innerText()).includes("Library") && (await form.innerText()).includes("async too") && (await form.locator("[data-option]").count()) === 5)
+      t.ok("one question takes one choice (radio), the other several (checkboxes)", (await form.locator("fieldset").nth(0).locator("input[type=radio]").count()) === 2 && (await form.locator("fieldset").nth(1).locator("input[type=checkbox]").count()) === 3)
+      const send = form.getByRole("button", { name: "Send", exact: true })
+      t.ok("Send waits until every question has an answer", await send.isDisabled())
+      await form.locator("[data-option='httpx']").click()
+      await form.locator("[data-option='lint']").click()
+      await form.locator("[data-option='tests']").click()
+      t.ok("and is ready when they all have", await send.isEnabled())
+      await form.locator("[data-option='requests']").click()
+      await form.locator("[data-option='requests'] input").waitFor()
+      t.ok("a radio changes its choice and does not add one", (await form.locator("fieldset").nth(0).locator("input:checked").count()) === 1)
+      await form.locator("[data-option='lint']").click()
+      await form.getByLabel("Something else: Checks").fill("my own: e2e")
+      await send.click()
+      await pg.waitForTimeout(700)
+      t.ok("the answers are sent with the question's id: the choices, and what was written", JSON.stringify(answers.at(-1)) === JSON.stringify({ id: "q1", answers: { "Which library should we use?": ["requests"], "Which checks should run?": ["tests", "my own: e2e"] } }), JSON.stringify(answers.at(-1)))
+      t.ok("the form becomes the answers", (await pg.locator("[data-asked-answers]").first().innerText()).includes("requests") && (await pg.locator("[data-asked-answers]").first().innerText()).includes("tests, my own: e2e") && (await pg.locator("[data-agent-question]").count()) === 0)
+
+      // skipped
+      await pg.fill("textarea[aria-label='Message']", "and again")
+      await pg.keyboard.press("Enter")
+      await pg.waitForSelector("[data-agent-question]", { timeout: 8000 })
+      await pg.locator("[data-agent-question]").getByRole("button", { name: "Skip", exact: true }).click()
+      await pg.waitForTimeout(700)
+      t.ok("Skip sends no answers", JSON.stringify(answers.at(-1)) === JSON.stringify({ id: "q2", answers: null }))
+      t.ok("and says so", (await pg.locator("[data-asked-answers]").last().innerText()).includes("You skipped the questions."))
+      await pg.context().close()
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {

@@ -1,7 +1,7 @@
 // The chat's state and its conversation with POST /v1/chat/completions (the classic app's logic, ported).
 // A plain controller outside React: the stream mutates the answer in place and React repaints once per frame.
 import { useSyncExternalStore } from "react"
-import { apiHeaders, errorMessage, postPermission, url, type Health, type McpInfo } from "./api"
+import { apiHeaders, errorMessage, postPermission, postQuestionAnswer, url, type Health, type McpInfo } from "./api"
 import { fmt } from "./format"
 import { store } from "./store"
 import { PrefillMeter, type Prefill } from "./prefill"
@@ -16,9 +16,16 @@ import { addProject, loadIndex, moveSession, newSession, openSession, persistInd
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
 export interface Ask { id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny"; kept?: { scope: "project" | "everywhere"; effect: Effect } }
 export interface Todo { content: string; status: "pending" | "in_progress" | "completed"; activeForm: string }
+/** What the model asked the user (AskUserQuestion): one to four questions with two to four choices each; `answers` once the user answered (null: skipped). */
+export interface AskedQuestion {
+  id: string
+  questions: { question: string; header: string; multiSelect: boolean; options: { label: string; description: string }[] }[]
+  answers?: Record<string, string[]> | null
+}
 export interface ToolCall {
   id: string; name: string; at: number; rat: number
   state: "writing" | "asking" | "running" | "done" | "error" | "skipped"
+  question?: AskedQuestion
   ask?: Ask; judge?: { verdict: string; severity: number | null }                // the coding tools: a question for the user, and what auto mode found
   server?: string; tool?: string; arguments?: unknown; round?: number
   result?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number | null; open?: boolean
@@ -125,13 +132,18 @@ export function apiMessages(messages: Message[]): ApiMessage[] {
 interface ToolEvent {
   event: string; id: string; name: string; server?: string; tool?: string; arguments?: unknown; round?: number
   text?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number; skipped?: boolean; max_rounds?: number
-  call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string      // the coding tools
+  call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string; questions?: AskedQuestion["questions"]      // the coding tools
 }
 
 // a tool event from the stream (the `strata_mcp` field of a chunk)
 function onTool(m: Message, x: ToolEvent) {
   if (x.event === "limit") { m.limit = x.max_rounds; return }
   if (x.event === "todos") { if (Array.isArray(x.todos)) m.todos = x.todos; return }
+  if (x.event === "question") {                                                              // the model asks the user: a form on its call
+    const c = (m.tools || []).find((y) => y.id === x.call_id)
+    if (c && Array.isArray(x.questions)) { c.question = { id: x.id, questions: x.questions }; c.state = "asking" }
+    return
+  }
   if (x.event === "permission" || x.event === "judging" || x.event === "judged") {          // about a call that is already shown: x.call_id is its id
     const c = (m.tools || []).find((y) => y.id === x.call_id)
     if (!c) return
@@ -486,6 +498,18 @@ export class ChatController {
     if (keep && call.ask.rule) {
       if (addPerm(store, keep.scope, keep.effect, call.ask.rule)) call.ask.kept = { scope: keep.scope.kind, effect: keep.effect }
     } else if (decision === "allow_chat" && call.ask.rule) addRule(store, this.index.active ?? "new", call.ask.rule)
+    this.notify()
+    return true
+  }
+
+  /** The user's answers to what the model asked (null: skipped). The call goes on at the server; the form stays until the server says it took the answer, so a lost one can be given again. */
+  async answerQuestion(callId: string, answers: Record<string, string[]> | null): Promise<boolean> {
+    const call = this.messages.flatMap((m) => m.tools ?? []).find((c) => c.id === callId && c.question && c.question.answers === undefined)
+    if (!call?.question) return false
+    const r = await postQuestionAnswer(call.question.id, answers)
+    if ("error" in r) { this.onError(t("The answer was not taken"), r.error); return false }
+    call.question.answers = answers
+    call.state = "running"
     this.notify()
     return true
   }

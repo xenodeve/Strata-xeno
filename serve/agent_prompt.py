@@ -22,6 +22,7 @@ TOOL_HELP = {
     "Grep": "Grep: search file contents with a regular expression. Use it instead of grep or rg.",
     "Bash": "Bash: run a command in the project folder. Use it for builds, tests, git and other programs, not for reading or searching files.",
     "TodoWrite": "TodoWrite: keep the list of steps of a longer task, one in_progress at a time; mark each done as soon as it is.",
+    "AskUserQuestion": "AskUserQuestion: when a decision is the user's (which approach, which library) and the code cannot settle it, ask with two to four choices instead of guessing.",
     "ExitPlanMode": "ExitPlanMode: when your plan is ready, send it with this tool so the user can approve it.",
 }
 

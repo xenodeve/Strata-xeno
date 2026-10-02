@@ -23,8 +23,8 @@ from dataclasses import dataclass, field
 
 FILE_READ = ("Read", "Glob", "Grep")
 FILE_EDIT = ("Write", "Edit", "NotebookEdit")
-KNOWN = FILE_READ + FILE_EDIT + ("Bash", "TodoWrite", "BashOutput", "KillShell", "ExitPlanMode")
-FREE = ("TodoWrite", "BashOutput", "KillShell")      # they only act on what the user already allowed in this chat
+KNOWN = FILE_READ + FILE_EDIT + ("Bash", "TodoWrite", "BashOutput", "KillShell", "ExitPlanMode", "AskUserQuestion")
+FREE = ("TodoWrite", "BashOutput", "KillShell", "AskUserQuestion")      # they only act on what the user already allowed in this chat, or only ask the user something
 
 
 @dataclass
