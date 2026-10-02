@@ -27,7 +27,7 @@ This report is the merge's own record: what moved, every conflict, the hazards c
 
 **Conflicts and the build.**
 - 25 files conflicted; 120 hunk decisions are recorded.
-- Branch `xeno/exp-upstream-0.1.34`; the merge commit SHA is filled in at commit.
+- Branch `xeno/exp-upstream-0.1.34`; the merge commit is `22d2396` (parents `1c2b520`, `1678de3`).
 - Engine exe `build-134\strata.exe`: sha256 `9fc5e9d229c996f0…`. The first build was `725ae7c0dcae7d64…`, before two review edits.
 
 ## 2. Upstream's changes that matter here, and what the fork does with them
