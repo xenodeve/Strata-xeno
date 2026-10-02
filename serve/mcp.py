@@ -521,7 +521,7 @@ class McpHub:
             if s.status not in ("ready", "stopped"):
                 continue
             for t in s.tools:
-                name = f"{_clean(s.name)}__{_clean(t['name'])}"[:64]
+                name = (_clean(t["name"]) if getattr(s, "plain_names", False) else f"{_clean(s.name)}__{_clean(t['name'])}")[:64]       # the coding tools keep Claude Code's names
                 n = 2
                 while name in out:                       # two names that differ only in cleaned characters
                     name = f"{name[:60]}_{n}"
@@ -546,9 +546,10 @@ class McpHub:
     def openai_tools(self) -> list[dict]:
         return [{"type": "function", "function": t} for t in self.template_tools()]
 
-    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None) -> dict:
+    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None, ctx=None) -> dict:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
-        "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised."""
+        "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised.
+        `ctx`: the request's AgentContext, handed to a built-in server that asks for it (the coding tools)."""
         t0 = time.monotonic()
         server, tool = self._routes.get(name) or self.routes().get(name, (None, name))
         out = {"server": server.name if server else None, "tool": tool}
@@ -556,8 +557,11 @@ class McpHub:
             text, ok = f"error: there is no tool named {name!r}", False
         else:
             try:
-                res = server.call(tool, arguments if isinstance(arguments, dict) else {},
-                                  float(self.settings["timeout_s"]), cancel)
+                if getattr(server, "wants_context", False):
+                    res = server.call(tool, arguments if isinstance(arguments, dict) else {}, 0, cancel, ctx)       # a command's own timeout is its own parameter
+                else:
+                    res = server.call(tool, arguments if isinstance(arguments, dict) else {},
+                                      float(self.settings["timeout_s"]), cancel)
                 text, ok = result_text(res), not res.get("isError")
                 if not ok:
                     text = "error: " + (text or "the tool reported an error")
@@ -566,6 +570,8 @@ class McpHub:
             except McpError as e:
                 text, ok = f"error: {e}", False
         cap = int(self.settings["max_result_chars"])
+        if server is not None and getattr(server, "wants_context", False) and cap > 0:
+            cap = max(cap, 60000)                                 # a file or a command's output is the point of the coding tools: they cut their own
         full = len(text)
         if cap > 0 and full > cap:
             text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
@@ -579,6 +585,8 @@ class McpHub:
         routes = self.routes()
         servers = []
         for s in self.servers.values():
+            if getattr(s, "hidden", False):                                  # the chat's coding tools are not MCP tools: they have their own switch
+                continue
             if getattr(s, "kind", "") == "builtin" and not s.tools:         # a built-in with nothing to offer (no skills in use) is not listed
                 continue
             names = {tool: n for n, (srv, tool) in routes.items() if srv is s}
@@ -586,7 +594,7 @@ class McpHub:
                             "info": s.info,
                             "tools": [{"name": names.get(t["name"], t["name"]), "tool": t["name"],
                                        "description": str(t.get("description") or "")[:300]} for t in s.tools]})
-        return {"servers": servers, "tools": len(routes),
+        return {"servers": servers, "tools": sum(1 for srv, _ in routes.values() if not getattr(srv, "hidden", False)),
                 "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds")}}
 
     def close(self):

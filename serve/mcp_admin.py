@@ -289,7 +289,10 @@ def reload_hub(svc) -> None:
     cfg = _read_json(svc.config_path) if svc.config_path else {}
     try:
         importer = getattr(svc, "importer", None)                  # the skills of the other apps (serve/harness.py) are a built-in server
-        hub = hub_from_config(cfg, svc.mcp_config_path, builtins=importer.builtins() if importer else None)
+        builtins = dict(importer.builtins()) if importer else {}
+        if getattr(svc, "agent", None) is not None:
+            builtins["agent"] = svc.agent                        # the chat's coding tools (serve/agent.py) are a built-in server too
+        hub = hub_from_config(cfg, svc.mcp_config_path, builtins=builtins or None)
     except SystemExit as e:                                  # hub_from_config stops the process at start-up; here it must not
         raise ValueError(str(e)) from None
     old, svc.mcp = svc.mcp, hub

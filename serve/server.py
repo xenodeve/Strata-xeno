@@ -59,6 +59,7 @@ from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's la
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
 from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
+from serve import agent as agent_mod, agent_prompt, agent_run, permissions, shell as shell_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -854,6 +855,8 @@ class Service:
         self.config_path = None                          # the run config (--config) and the --mcp-config file: where serve/mcp_admin.py
         self.mcp_config_path = None                      # reads and writes the servers the web app sets up
         self.importer = None                             # serve/harness.py's Importer: the other coding apps' skills and MCP servers (#94)
+        self.agent = None                                # serve/agent.py's AgentServer: the chat's coding tools (Read, Write, Edit, Bash, ...); None: switched off
+        self.broker = agent_run.Broker()                 # the questions the coding tools have asked the page and not had answered yet
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
@@ -865,6 +868,51 @@ class Service:
         self.replays = collections.OrderedDict()        # xeno: replay_key -> the last greedy non-stream answer
 
     REPLAY_KEYS = ("temperature", "top_p", "top_k", "min_p", "stop_sequences", "_opening", "_think_budget")
+
+    def side_request(self, system: str, user: str, max_tokens: int = 64) -> str:
+        """The model's short answer to one question outside any chat (auto mode's judge, serve/judge.py).  Like Claude Code's own side requests
+        it is not streamed, has no tools and thinks little, and the opening its prompt asks for is written for the model (serve/forced_opening.py)."""
+        req = {"model": self.model, "system": system, "messages": [{"role": "user", "content": user}], "max_tokens": max_tokens, "stream": False,
+               "thinking": {"type": "disabled"}}
+        messages, tools, kw = anthropic_to_messages(req, vision=False)
+        think_budget.side_effort(req, kw)
+        ids, thinking, max_new = self.prepare(messages, None, kw, max_tokens, 1)
+        req = self.with_slot(req, ids)
+        opening = forced_opening.required(messages, thinking)
+        if opening:
+            req = {**req, "_opening": opening}
+        body = anthropic_collect(anthropic_events(self, req, ids, thinking, None, max_new, threading.Event()))
+        return "".join(b.get("text", "") for b in body.get("content", []) if isinstance(b, dict) and b.get("type") == "text")
+
+    def start_agent_run(self, sa: dict, messages: list):
+        """One request's use of the coding tools: the folder, mode, rules and chat the page named (anything odd is ignored), the rules for the
+        AI as a prompt, and auto mode's judge (serve/agent_run.py)."""
+        raw = sa.get("cwd")
+        folder = os.path.realpath(raw) if isinstance(raw, str) and raw.strip() and "\0" not in raw and os.path.isdir(raw) else None
+        mode = sa.get("mode") if sa.get("mode") in ("auto", "plan") else None
+        rules = lambda v: [x for x in v if isinstance(x, str) and 0 < len(x) <= 500][:200] if isinstance(v, list) else []      # noqa: E731
+        sid = sa.get("session") if isinstance(sa.get("session"), str) and 0 < len(sa["session"]) <= 80 else "default"
+        goal = ""
+        for m in reversed(messages):
+            if isinstance(m, dict) and m.get("role") == "user":
+                c = m.get("content")
+                goal = c if isinstance(c, str) else "".join(p.get("text", "") for p in c if isinstance(p, dict)) if isinstance(c, list) else ""
+                break
+        sh = getattr(self.agent, "shell", None)
+        policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")))
+        run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell_mod.describe(sh) if sh else None)
+        git, d = False, folder
+        for _ in range(6):                                              # the folder or one of the folders above it holds .git
+            if not d:
+                break
+            if os.path.exists(os.path.join(d, ".git")):
+                git = True
+                break
+            parent = os.path.dirname(d)
+            d = parent if parent != d else None
+        tools = [t["name"] for t in self.agent.tools if t["name"] != "ExitPlanMode" or mode == "plan"]
+        run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, agent_prompt.project_notes(folder), tools)
+        return run
 
     def replay_key(self, req: dict, ids, max_new):
         """The key of a request whose answer can be given again, so Claude Code's repeats of one classifier request
@@ -1598,8 +1646,9 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
+AGENT_ROUNDS = 100      # tool rounds in one answer when the chat has the coding tools
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names):
+                 mcp_names, agent_run=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -1608,7 +1657,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
     could not reach the model before the client's)."""
-    max_rounds = int(hub.settings["max_rounds"])
+    max_rounds = max(int(hub.settings["max_rounds"]), AGENT_ROUNDS) if agent_run is not None else int(hub.settings["max_rounds"])      # coding takes many rounds
     total, rounds, done = 0, 0, None
     messages = list(messages)
     while True:
@@ -1651,21 +1700,31 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
             # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
             box = {}
+            if agent_run is not None:
+                agent_run.current = c.id
 
             def work(c=c, box=box):
                 try:
-                    box["r"] = hub.call(c.name, c.arguments, cancel)
+                    box["r"] = hub.call(c.name, c.arguments, cancel, agent_run.ctx if agent_run is not None else None)
                 except McpCancelled:
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
             worker.start()
             try:
+                beat = 0
                 while worker.is_alive():
-                    worker.join(1.0)
-                    if worker.is_alive():
+                    worker.join(0.2)
+                    if agent_run is not None:
+                        for e in agent_run.drain():      # a question for the user, a todo list, ...: to the page at once
+                            yield "mcp", e
+                    beat += 1
+                    if worker.is_alive() and beat % 5 == 0:
                         yield "ping", None
+                if agent_run is not None:
+                    for e in agent_run.drain():
+                        yield "mcp", e
             except GeneratorExit:
-                cancel.set()                             # the client is gone: stop the tool too
+                cancel.set()                             # the client is gone: stop the tool too (a question that is open ends too)
                 raise
             if "r" not in box:
                 break
@@ -2065,6 +2124,14 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
+            if path == "/agent":
+                # the chat's coding tools: whether they are on, which shell commands run in, and whether this caller may use them (only from this PC, or with the key)
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    sh = getattr(svc.agent, "shell", None)
+                    self._json(200, {"available": svc.agent is not None, "allowed": ok, "reason": "" if ok else why, "shell": shell_mod.describe(sh) if sh else None,
+                                     "tools": [t["name"] for t in svc.agent.tools] if svc.agent else []})
+                return
             if path == "/mcp/config":
                 # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)
                 if self._authorized():
@@ -2164,6 +2231,23 @@ def make_handler(svc: Service):
                     return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
                 code, out = mcp_admin.apply(svc, body)
                 return self._json(code, out if code != 200 else mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
+            if path == "/agent/permission":                  # the page's answer to a question of the coding tools (serve/agent_run.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
+                if not self._own_page("A question can be answered"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict) or not isinstance(body.get("id"), str) or body.get("decision") not in agent_run.ANSWERS:
+                    return self._json(400, {"error": {"message": "send {\"id\": the question's id, \"decision\": \"allow\" | \"allow_chat\" | \"deny\"}"}})
+                if not svc.broker.answer(body["id"], body["decision"]):
+                    return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
+                return self._json(200, {"ok": True})
             if path == "/import":                            # the skill switches, importing one MCP server, a rescan: a write like /mcp/config (#94)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
@@ -2338,10 +2422,22 @@ def make_handler(svc: Service):
                 if got is None or got.get("isError"):
                     return self._json(400, {"error": {"message": f"there is no skill named {skill!r} (it may be switched off in Settings > Import)"}})
                 req = {**req, "messages": skills_mod.put_before_last_user(req.get("messages") or [], skills_mod.invoked(skill, got["content"][0]["text"]))}
+            arun = None
+            sa = req.get("strata_agent")                         # the web app's coding tools (serve/agent.py): files and commands on this PC, with the user's say-so
+            if isinstance(sa, dict):
+                if not self._own_page("The coding tools can be used"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": "The coding tools change files and run commands on this PC, so they work only from this PC itself (open the page as localhost) or with the API key. " + why}})
+                if svc.agent is None or svc.mcp is None:
+                    return self._json(409, {"error": {"message": "the coding tools are switched off on this server (\"agent\": false in the run config)"}})
+                arun = svc.start_agent_run(sa, req.get("messages") or [])
+                req = {**req, "messages": agent_prompt.with_system(req.get("messages") or [], arun.prompt)}
             messages, tools, kw = openai_to_messages(req)
             req = svc.cjk(req, messages)                                # xeno #49 S4
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
-            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            use_mcp = (req.get("strata_mcp") is True or arun is not None) and svc.mcp is not None      # the web app's opt-in (serve/mcp.py), or the coding tools
             own = {t.get("name") for t in tools or []}
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
@@ -2349,6 +2445,10 @@ def make_handler(svc: Service):
                 svc.mcp.wait(10)                                  # servers still starting (only right after start)
                 off = req.get("strata_mcp_off")                   # servers the page's list switched off for this chat; anything but a list of names is ignored
                 skip = {x for x in off if isinstance(x, str)} if isinstance(off, list) and all(isinstance(x, str) for x in off) else set()
+                if req.get("strata_mcp") is not True:
+                    skip |= {n for n in svc.mcp.servers if n != "agent"}      # the coding tools alone: no MCP server
+                if arun is None:
+                    skip.add("agent")                             # and the coding tools only when the request asks for them
                 extra = svc.mcp.template_tools(exclude=own, skip_servers=skip)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
@@ -2357,8 +2457,10 @@ def make_handler(svc: Service):
             req = {**req, "_meta": svc.meta_for("openai", messages, tools, self.headers.get("User-Agent"))}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
+            if arun is not None:
+                arun.bind(cancel)
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
+                               {t["name"] for t in extra}, arun) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
@@ -2730,7 +2832,10 @@ def main() -> int:
         tok = ST.Tokenizer(tokens, merges, types)
     importer = harness.Importer()                        # the skills (and the MCP servers, to import by a click) of the other coding apps on this PC (#94)
     importer.rescan(cfg)
-    hub = hub_from_config(cfg, a.mcp_config, builtins=importer.builtins())     # before the minutes of loading: a bad entry stops here
+    agent_server = None if cfg.get("agent") is False else agent_mod.AgentServer()      # the chat's coding tools; "agent": false in the run config switches them off
+    if agent_server is not None:
+        shell_mod.install(agent_server, shell_mod.find_shell())
+    hub = hub_from_config(cfg, a.mcp_config, builtins={**importer.builtins(), **({"agent": agent_server} if agent_server else {})})     # before the minutes of loading: a bad entry stops here
     placeholder = None
     if a.engine == "strata":
         if not cfg:
@@ -2810,6 +2915,7 @@ def main() -> int:
     if hub is not None:
         import atexit
         svc.mcp = hub
+        svc.agent = agent_server
         own = [n for n in hub.servers if n != "skills"]
         if own:
             print(f"[strata] starting {len(own)} MCP server{'s' * (len(own) != 1)} for the web app's chat: {', '.join(own)}", flush=True)
