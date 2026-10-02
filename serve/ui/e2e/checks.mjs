@@ -1812,6 +1812,85 @@ export const checks = [
     },
   },
   {
+    // Rewind (issue #99) against the real coding tools (the demo mock: a scripted model that makes a file and changes one, inside the folder): every prompt is a checkpoint; the dialog says
+    // which files would be put back, and which were changed since; the files, the conversation or both can go back.
+    name: "rewind: a prompt can be rewound: its files put back, and the conversation cut",
+    async run({ browser, agentDemo, t, errors }) {
+      const fs = await import("node:fs")
+      const path = await import("node:path")
+      const existing = path.join(agentDemo.dir, "existing.txt")
+      const made = path.join(agentDemo.dir, "rewind-demo.txt")
+      fs.writeFileSync(existing, "original text\n")
+      fs.rmSync(made, { force: true })
+      const pg = await open(browser, errors, { width: 1200, height: 900 })
+      await pg.addInitScript((dir) => { try { localStorage.setItem("strata.sampling", JSON.stringify({ agentFolder: dir })) } catch { /* private window */ } }, agentDemo.dir)
+      await pg.goto(agentDemo.base + "/#/chat")
+      await pg.evaluate(() => localStorage.removeItem("strata.chats"))
+      await pg.reload()
+      const box = pg.locator("textarea[aria-label='Message']")
+      await box.waitFor()
+      await pg.waitForTimeout(1200)
+      const prompts = pg.locator(".msg-in.group")
+      const done = async () => { await pg.waitForSelector("button[aria-label='Stop']", { timeout: 5000 }).catch(() => {}); await pg.waitForFunction(() => document.querySelectorAll("button[aria-label='Stop']").length === 0, null, { timeout: 60000 }); await pg.waitForTimeout(600) }
+      const dlg = pg.locator("[data-rewind]")
+
+      await box.fill("rewind demo one")
+      await box.press("Enter")
+      await done()
+      t.ok("the tools made a file and changed one, inside the folder, without asking", fs.existsSync(made) && fs.readFileSync(existing, "utf8").includes("changed by the model") && (await pg.locator("[data-agent-ask]").count()) === 0)
+      await box.fill("and now a plain question")
+      await box.press("Enter")
+      await done()
+      t.ok("two prompts in the chat", (await prompts.count()) === 2)
+      t.ok("each prompt has a Rewind button", (await pg.locator("[data-rewind-button]").count()) === 2)
+
+      await prompts.first().hover()
+      await pg.locator("[data-rewind-button]").first().click()
+      await dlg.waitFor({ timeout: 5000 })
+      await pg.waitForSelector("[data-rewind-file]", { timeout: 8000 })
+      const rows = await dlg.locator("[data-rewind-file]").evaluateAll((els) => els.map((e) => e.dataset.action + ":" + e.dataset.rewindFile.split(/[\\/]/).pop()).sort())
+      t.ok("the dialog lists what would be put back: the file that was changed, and the file that was made, which would be deleted", JSON.stringify(rows) === JSON.stringify(["delete:rewind-demo.txt", "restore:existing.txt"]), JSON.stringify(rows))
+      t.ok("it says that commands are not undone", (await dlg.innerText()).includes("What commands did to files is not undone."))
+      t.ok("nothing is marked as changed since", (await dlg.locator("[data-changed]").count()) === 0)
+      t.ok("nothing has been done yet", fs.existsSync(made) && fs.readFileSync(existing, "utf8").includes("changed by the model"))
+      await dlg.getByRole("radio", { name: /Only the files/ }).check()
+      await dlg.getByRole("button", { name: "Rewind", exact: true }).click()
+      await pg.waitForTimeout(1200)
+      t.ok("only the files: the changed file is back and the made file is gone", !fs.existsSync(made) && fs.readFileSync(existing, "utf8") === "original text\n")
+      t.ok("and the conversation is as it was", (await prompts.count()) === 2 && (await dlg.count()) === 0)
+
+      // again, and now someone else changes the file
+      await box.fill("rewind demo two")
+      await box.press("Enter")
+      await done()
+      t.ok("the tools changed it again", fs.existsSync(made) && fs.readFileSync(existing, "utf8").includes("changed by the model"))
+      fs.writeFileSync(existing, "edited by the user afterwards\n")
+      await prompts.last().hover()
+      await pg.locator("[data-rewind-button]").last().click()
+      await dlg.waitFor()
+      await pg.waitForSelector("[data-rewind-file]", { timeout: 8000 })
+      t.ok("a file that was changed since is marked, with a choice to put it back too", (await dlg.locator("[data-changed]").count()) === 1 && (await dlg.getByText("Also put back the files that were changed since").count()) === 1)
+      await dlg.getByRole("button", { name: "Rewind", exact: true }).click()           // the files and the conversation
+      await pg.waitForTimeout(1500)
+      t.ok("the file that was made is deleted, and the one the user changed is left alone", !fs.existsSync(made) && fs.readFileSync(existing, "utf8") === "edited by the user afterwards\n")
+      t.ok("the conversation is cut before that prompt, which goes back to the composer", (await prompts.count()) === 2 && (await box.inputValue()) === "rewind demo two", String(await prompts.count()))
+      t.ok("and the toast says what was left", (await pg.locator("[role=status]").allInnerTexts()).join(" ").includes("left as you changed"))
+
+      // /rewind
+      await box.fill("")
+      await box.fill("/rewind")
+      await box.press("Enter")
+      await dlg.waitFor({ timeout: 5000 })
+      t.ok("/rewind opens the dialog, with a choice among the prompts", (await dlg.locator("select").count()) === 1 && (await dlg.locator("select option").count()) === 2)
+      await pg.keyboard.press("Escape")
+      await pg.waitForTimeout(400)
+      t.ok("Escape closes it", (await dlg.count()) === 0)
+      await pg.context().close()
+      fs.rmSync(existing, { force: true })
+      fs.rmSync(made, { force: true })
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {
@@ -2293,7 +2372,7 @@ export const checks = [
       await plain.waitForTimeout(700)
       await plain.locator("textarea[aria-label='Message']").fill("/")
       await plain.waitForTimeout(250)
-      t.ok("with no skills at all a / lists only Strata's own commands (clear, compact, context, init, memory, permissions)", JSON.stringify(await plain.locator("[role=listbox][aria-label='Skills'] [role=option]").evaluateAll((os) => os.map((o) => o.dataset.skill))) === '["clear","compact","context","init","memory","permissions"]')
+      t.ok("with no skills at all a / lists only Strata's own commands (clear, compact, context, init, memory, permissions, rewind)", JSON.stringify(await plain.locator("[role=listbox][aria-label='Skills'] [role=option]").evaluateAll((os) => os.map((o) => o.dataset.skill))) === '["clear","compact","context","init","memory","permissions","rewind"]')
     },
   },
   {

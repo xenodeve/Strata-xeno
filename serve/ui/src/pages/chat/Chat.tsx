@@ -26,6 +26,8 @@ import { SkillsContext } from "../../components/SkillTip"
 import { msg, t } from "../../lib/i18n"
 import { CompactingLine, MessageView, QueuedMessage } from "./Messages"
 import { resolveMentions } from "../../lib/mention"
+import { RewindDialog } from "../../components/RewindDialog"
+import { isRewindCommand } from "../../lib/rewind"
 import { SettingsSheet } from "./SettingsSheet"
 import { PanelDock } from "../../components/SidePanel"
 import { ProjectPicker } from "../../components/ProjectPicker"
@@ -215,13 +217,22 @@ export function Chat({ id }: { id?: string }) {
 
   const [panel, setPanel] = useState<PanelState>(() => panelState(store.get("panel", null)))      // the right panel: open or not, and which tab (kept in the browser)
   const keepPanel = (next: PanelState) => { setPanel(next); store.set("panel", next) }
+  const [rewindAt, setRewindAt] = useState<number | null>(null)       // the rewind dialog: which prompt (an index into the chat's prompts) it opens on
   const [ctxOpen, setCtxOpen] = useState(0)                      // how many times /context was typed: the panel opens at each
+  const rewindPrompts = () => chat.messages.flatMap((m, index) => (isPrompt(m) ? [{ index, text: m.text || m.files?.map((f) => f.name).join(", ") || "", checkpoint: String(m.time) }] : []))
   const commands = [...builtinCommands(), ...skills.filter((c) => !builtinCommands().some((b) => b.name === c.name))]       // what "/" lists: Strata's own, then the skills
   const send = () => {
     if (!text.trim() && !files.length) return
     const word = files.length ? null : /^\s*\/(compact|context|memory|init|clear|permissions)\s*$/i.exec(text)?.[1]?.toLowerCase()
     if (busy && (word === "compact" || word === "init" || (!word && /^\s*\/(compact|init)\b/i.test(text)))) { toast("warn", t("Still writing"), t("Stop the answer first.")); return }
     if (!files.length && isContextCommand(text)) { setText(""); setCtxOpen((n) => n + 1); return }                // "/context": the panel with the context window opens
+    if (!files.length && isRewindCommand(text)) {                                                                                       // "/rewind": go back to before a prompt
+      setText("")
+      if (busy) toast("warn", t("Still writing"), t("Stop the answer first."))
+      else if (!rewindPrompts().length) toast("info", t("Nothing to rewind yet"), t("Send a prompt first."))
+      else setRewindAt(rewindPrompts().length - 1)
+      return
+    }
     if (!files.length && isMemoryCommand(text)) { setText(""); keepPanel({ open: true, tab: "memory" }); return }                      // "/memory": the panel opens on the notes
     if (!files.length && /^\s*\/permissions\s*$/i.test(text)) { setText(""); location.hash = href("settings", "permissions"); return }                // "/permissions": the page of the rules
     if (!files.length && /^\s*\/clear\s*$/i.test(text)) { setText(""); newChat(); return }                                              // "/clear": a new chat, this one stays in Recents
@@ -324,7 +335,7 @@ export function Chat({ id }: { id?: string }) {
         </Collapse>
         {chat.messages.map((m, i) => (
           <MessageView key={i} m={m} streaming={busy?.msg === m} compacting={chat.compacting && busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined}
-            actions={isPrompt(m) ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt } : undefined} />
+            actions={isPrompt(m) ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt, onRewind: () => setRewindAt(Math.max(0, rewindPrompts().findIndex((p) => p.index === i))) } : undefined} />
         ))}
         {chat.compacting && !!busy && !chat.messages.includes(busy.msg) && <CompactingLine />}
         {chat.queuedOf().map((q) => (
@@ -399,6 +410,20 @@ export function Chat({ id }: { id?: string }) {
       />
       <SettingsSheet open={sheet} onClose={closeSheet} efforts={choices} mcp={mcp} projectionLoaded={projection} />
     </section>
+    <RewindDialog
+      open={rewindAt !== null} prompts={rewindPrompts()} start={rewindAt ?? 0} session={chat.index.active}
+      onCancel={() => setRewindAt(null)}
+      onDone={(cut) => {
+        setRewindAt(null)
+        if (!cut) return
+        const back = chat.rewindTo(cut.index)                                         // the conversation is cut at the prompt, and the prompt goes back to the composer
+        if (!back) return
+        setLeaving(back.removed)
+        setText((cur) => (cur.trim() ? back.text + "\n\n" + cur : back.text))
+        setFiles((f) => [...back.attachments, ...f])
+        input.current?.focus()
+      }}
+    />
     <PanelDock
       open={panel.open} tab={panel.tab} onTab={(tab: PanelTab) => keepPanel({ ...panel, tab })} onClose={() => keepPanel({ ...panel, open: false })}
       data={{

@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
-import { ArrowDown01Icon, Copy01Icon, AttachmentIcon, PencilEdit01Icon, Undo02Icon } from "@hugeicons/core-free-icons"
+import { ArrowDown01Icon, Copy01Icon, AttachmentIcon, PencilEdit01Icon, RewindIcon, Undo02Icon } from "@hugeicons/core-free-icons"
 import { chat, metaText, type Message, type ToolCall } from "../../lib/chat"
 import { copyText } from "../../lib/files"
 import { Collapse, Fit, Handover } from "../../components/motion"
@@ -131,7 +131,7 @@ function Thinking({ m, streaming, show, phase }: { m: Message; streaming: boolea
 
 // What can be done to a prompt that was sent: rewrite it (it and everything after it are replaced), or, on the last one, take
 // it back (the prompt returns to the composer and its answer goes). Not offered while an answer is being written.
-export interface PromptActions { canAct: boolean; last: boolean; onEdit: (text: string) => void; onUndo: () => void }
+export interface PromptActions { canAct: boolean; last: boolean; onEdit: (text: string) => void; onUndo: () => void; onRewind?: () => void }
 
 function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: boolean; onSend: (t: string) => void; onCancel: () => void }) {
   const [value, setValue] = useState(text)
@@ -253,6 +253,7 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
           {actions?.canAct && !editing && (
             <span className="flex items-center opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100 [@media(hover:none)]:opacity-100">
               <button type="button" aria-label={t("Edit this prompt")} title={t("Edit")} onClick={() => setEditing(true)} className="flex size-6 items-center justify-center rounded-sm transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={PencilEdit01Icon} size={14} aria-hidden /></button>
+              {actions.onRewind && <button type="button" aria-label={t("Rewind to before this prompt")} title={t("Rewind: go back to before this prompt")} data-rewind-button onClick={actions.onRewind} className="flex size-6 items-center justify-center rounded-sm transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={RewindIcon} size={14} aria-hidden /></button>}
               {actions.last && <button type="button" aria-label={t("Take this prompt back")} title={t("Undo: take the prompt back")} onClick={actions.onUndo} className="flex size-6 items-center justify-center rounded-sm transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={Undo02Icon} size={14} aria-hidden /></button>}
             </span>
           )}

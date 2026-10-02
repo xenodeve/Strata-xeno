@@ -60,7 +60,7 @@ from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_me
 from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
 from serve import agent as agent_mod, agent_prompt, agent_run, permissions, shell as shell_mod  # noqa: E402
-from serve import files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
+from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -841,6 +841,7 @@ class Service:
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         self.hstore = HistoryStore(Path(tempfile.gettempdir()) / "strata-history-off", enabled=False)  # main() turns it on
+        self.checkpoints = checkpoints_mod.Checkpoints(Path(tempfile.gettempdir()) / "strata-checkpoints")      # the way back for files the tools change; main() puts it in the user's data folder
         self.model_info = None                          # the model's name and quantization, from its GGUF headers (main() fills it)
         self.keep_prompts = 0                           # POST /metrics/keep: the next N requests keep their full prompt (Q8)
         self.keep_lock = threading.Lock()
@@ -919,6 +920,9 @@ class Service:
         sh = getattr(self.agent, "shell", None)
         policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs)
         run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell_mod.describe(sh) if sh else None)
+        cp = sa.get("checkpoint")
+        if isinstance(cp, str) and sid != "default":
+            run.ctx.checkpoint = self.checkpoints.scope(sid, cp)                  # this prompt's checkpoint: the files the tools change are kept as they were
         git, d = False, folder
         for _ in range(6):                                              # the folder or one of the folders above it holds .git
             if not d:
@@ -2309,6 +2313,28 @@ def make_handler(svc: Service):
                     return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
                 code, out = mcp_admin.apply(svc, body)
                 return self._json(code, out if code != 200 else mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
+            if path in ("/agent/rewind", "/agent/checkpoints/forget"):         # the way back for the files the tools changed (serve/checkpoints.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
+                if not self._own_page("files can be put back"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict) or not isinstance(body.get("session"), str):
+                    return self._json(400, {"error": {"message": "send {\"session\": the chat's id, \"checkpoint\": the prompt's id}"}})
+                if path == "/agent/checkpoints/forget":
+                    svc.checkpoints.forget(body["session"])
+                    return self._json(200, {"ok": True})
+                if not isinstance(body.get("checkpoint"), str):
+                    return self._json(400, {"error": {"message": "send the checkpoint, the prompt's id"}})
+                if body.get("apply") is True:
+                    return self._json(200, svc.checkpoints.apply(body["session"], body["checkpoint"], body.get("include_changed") is True))
+                return self._json(200, svc.checkpoints.preview(body["session"], body["checkpoint"]))
             if path == "/agent/permission":                  # the page's answer to a question of the coding tools (serve/agent_run.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
@@ -2968,6 +2994,8 @@ def main() -> int:
     from serve.history import default_dir
     svc.hstore = HistoryStore(hist.get("dir") or default_dir(), enabled=hist.get("enabled", True) is not False,
                               detail_cap_bytes=int(float(hist.get("detail_cap_gb", 2)) * 2**30))
+    svc.checkpoints = checkpoints_mod.Checkpoints()          # the way back for files the tools change: in the user's data folder, the oldest trimmed at start
+    threading.Thread(target=svc.checkpoints.trim, daemon=True).start()
     def _model_info(files=gguf_info.files_from_args(list(cfg.get("args") or []))):
         svc.model_info = gguf_info.model_info(files)        # reads headers only (~0.1 s); a model with no GGUF gives None
     threading.Thread(target=_model_info, daemon=True).start()

@@ -330,14 +330,14 @@ describe("the coding tools in the chat", () => {
     return data
   }
 
-  test("the request names the folder, the mode and the chat, and no more than that", async () => {
+  test("the request names the folder, the mode, the chat and the prompt's checkpoint, and no more than that", async () => {
     keep()
     const seen: Record<string, unknown>[] = []
     mockFetch([sse(...finish)], seen)
     const c = new ChatController()
     c.setSettings({ ...c.settings, agentMode: "plan" })
     await c.send("hi", [], { ...ctx, agent: ON, folder: ["C:/work/app", "C:/work/app-wt2"] })
-    expect(seen[0].strata_agent).toEqual({ cwd: "C:/work/app", dirs: ["C:/work/app-wt2"], mode: "plan", session: c.index.active, allow: [] })
+    expect(seen[0].strata_agent).toEqual({ cwd: "C:/work/app", dirs: ["C:/work/app-wt2"], mode: "plan", session: c.index.active, allow: [], checkpoint: String(c.messages[0].time) })      // the prompt's time is its checkpoint
   })
 
   test("without the tools (switched off, or the server has none) the request has no strata_agent", async () => {
@@ -1535,5 +1535,78 @@ describe("messages that wait while an answer is written", () => {
     await a
     await tick()
     expect(calls).toHaveLength(1)
+  })
+})
+
+// Rewind (issue #99): the conversation is cut at a prompt, and each request carries its prompt's checkpoint.
+describe("rewinding a conversation", () => {
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    return data
+  }
+  const said = (text: string) => sse(delta({ content: text }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10))
+  const ON = { available: true, allowed: true, shell: "bash", tools: ["Write"] }
+  const three = async () => {
+    const c = new ChatController()
+    mockFetch([said("a1"), said("a2"), said("a3")], [])
+    await c.send("one", [], ctx)
+    await c.send("two", [{ kind: "file", name: "f.txt", text: "ftext" }], ctx)
+    await c.send("three", [], ctx)
+    return c
+  }
+
+  test("the chat is cut before the prompt, which comes back with the attachments that are held", async () => {
+    keep()
+    const c = await three()
+    const back = c.rewindTo(2)
+    expect(back?.text).toBe("two")
+    expect(back?.attachments.map((a) => a.name)).toEqual(["f.txt"])
+    expect(back?.removed.map((m) => m.text)).toEqual(["two", "a2", "three", "a3"])
+    expect(c.messages.map((m) => m.text)).toEqual(["one", "a1"])
+    expect(new ChatController().messages.map((m) => m.text)).toEqual(["one", "a1"])        // kept
+  })
+
+  test("to the first prompt: nothing is left, and the conversation leaves the list", async () => {
+    keep()
+    const c = await three()
+    expect(c.rewindTo(0)?.text).toBe("one")
+    expect(c.messages).toEqual([])
+    expect(c.index.items).toHaveLength(0)
+  })
+
+  test("only a prompt can be gone back to, and not while an answer is being written", async () => {
+    keep()
+    const c = await three()
+    expect(c.rewindTo(1)).toBeNull()                                            // an answer
+    expect(c.rewindTo(99)).toBeNull()
+    expect(c.rewindTo(-1)).toBeNull()
+    expect(c.messages).toHaveLength(6)
+    c.busy = { abort: new AbortController(), msg: c.messages[5] }
+    expect(c.rewindTo(2)).toBeNull()
+    c.busy = null
+  })
+
+  test("the checkpoint of a prompt is its time, and a summary has none", async () => {
+    keep()
+    const c = await three()
+    expect(c.checkpointOf(2)).toBe(String(c.messages[2].time))
+    expect(c.checkpointOf(1)).toBeNull()
+    c.messages.unshift({ role: "user", text: "summary", time: 5, compact: { before: 1, after: 1, auto: false } })
+    expect(c.checkpointOf(0)).toBeNull()
+  })
+
+  test("each request carries the checkpoint of its own prompt, so the files the tools change in it can be put back", async () => {
+    keep()
+    const c = new ChatController()
+    const seen: Record<string, unknown>[] = []
+    mockFetch([said("a"), said("b")], seen)
+    await c.send("first", [], { ...ctx, agent: ON, folder: "C:/w" })
+    await c.send("second", [], { ...ctx, agent: ON, folder: "C:/w" })
+    const cps = seen.map((b) => (b.strata_agent as { checkpoint: string }).checkpoint)
+    expect(cps).toEqual([String(c.messages[0].time), String(c.messages[2].time)])
+    expect(new Set(cps).size).toBe(2)
   })
 })

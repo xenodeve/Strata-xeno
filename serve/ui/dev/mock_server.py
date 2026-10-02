@@ -90,6 +90,15 @@ class DemoAgentEngine(FakeEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         text = bytes(t for t in ids if t < 256).decode("utf-8", "replace")
         at = text.rfind("agent demo")
+        rw = text.rfind("rewind demo")                                  # a message with "rewind demo": a file is made and one that is there is changed, both inside the folder (free), so a rewind has something to put back
+        if rw >= 0 and rw > at:
+            step = text.count("<tool_response>", rw)
+            script = [_call("Write", file_path="rewind-demo.txt", content="made by the scripted model\n"), _call("Read", file_path="existing.txt"),
+                      _call("Edit", file_path="existing.txt", old_string="original text", new_string="changed by the model")]
+            reply = script[step] if step < len(script) else "</think>\n\nDone: one file made and one changed."
+            self.script = self.tok.encode(reply, parse_special=True) + self.tok.encode(IM_END, parse_special=True)
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+            return
         if at >= 0:
             step = text.count("<tool_response>", at)
             outside = os.path.join(tempfile.gettempdir(), "strata-agent-demo.txt").replace("\\", "/")

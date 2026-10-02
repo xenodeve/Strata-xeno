@@ -10,6 +10,7 @@ import { skillOfMessage } from "./slash"
 import { compactPrompt, continuationText, estimateTokens, MIN_SUMMARY, shouldCompact, summaryOf, summaryRoom } from "./compact"
 import { addRule, agentRequest, NO_AGENT, rulesOf, type AgentInfo } from "./agent"
 import { addPerm, forgetPerms, permsFor, type Effect, type Scope } from "./perms"
+import { forgetCheckpoints } from "./rewind"
 import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, saveBackground, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
 
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
@@ -349,6 +350,7 @@ export class ChatController {
   remove(id: string): boolean {
     if (this.runs.has(id)) return false                       // not while it is being answered
     this.queues.delete(id)
+    forgetCheckpoints(id)                                     // the way back for its files goes with it
     const r = removeSession(store, this.index, id)
     this.index = r.index
     if (r.clearedActive) this.messages = []
@@ -533,6 +535,30 @@ export class ChatController {
     return { text: m.text, attachments: kept, removed }
   }
 
+  private lastStamp = 0
+  /** A time for a prompt that no other prompt has: the clock, or one more than the last, so that two prompts sent in the same millisecond still have their own checkpoints. */
+  private stamp(): number { this.lastStamp = Math.max(Date.now(), this.lastStamp + 1); return this.lastStamp }
+
+  /** The id of a prompt's checkpoint (the server keeps the files the tools changed in it), or null for a message that is not a prompt. */
+  checkpointOf(index: number): string | null {
+    const m = this.messages[index]
+    return m && isPrompt(m) ? String(m.time) : null
+  }
+
+  /** Takes the conversation back to before the prompt at `index`: it and everything after it leave the chat, and the prompt (with the attachments that are still held) is returned to be
+   *  put in the composer. Not while an answer is being written. */
+  rewindTo(index: number): { text: string; attachments: Attachment[]; removed: Message[] } | null {
+    if (this.busy) return null
+    const m = this.messages[index]
+    if (!m || !isPrompt(m)) return null
+    const { kept, lost } = attachmentsOf(m)
+    const removed = this.messages.slice(index)
+    this.messages = this.messages.slice(0, index)
+    this.save(); this.notify()
+    this.lostNote(lost)
+    return { text: m.text, attachments: kept, removed }
+  }
+
   /** Rewrites the prompt at `index`: it and everything after it are replaced by the new prompt (with its own attachments
    *  that are still held) and a new answer. False when it cannot be done: an answer is being written, the message is not a
    *  prompt, or nothing would be sent. */
@@ -554,7 +580,7 @@ export class ChatController {
     const compactFirst = this.shouldAutoCompact(ctx, text, attachments)       // measured on the conversation so far, before this prompt is part of it
     const before = compactFirst ? this.contextUsed() : 0
     this.messages.push({
-      role: "user", text, time: Date.now(),
+      role: "user", text, time: this.stamp(),
       images: attachments.filter((a) => a.kind === "image").map((a) => ({ name: a.name, url: a.url })),
       files: attachments.filter((a) => a.kind === "file").map((a) => ({ name: a.name, text: a.text })),
     })
@@ -579,7 +605,7 @@ export class ChatController {
     if (s.max) body.max_tokens = +s.max
     if (ctx.projectionLoaded) body.experimental_speed_projection = !!s.esp
     Object.assign(body, mcpRequest(s, ctx.mcp))                            // this server may run MCP tools for it (the ones not switched off)
-    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, id === NEW_KEY ? null : id, permsFor(store, rulesOf(store, id), this.currentProject())))      // the coding tools, when they are on and reachable
+    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, id === NEW_KEY ? null : id, permsFor(store, rulesOf(store, id), this.currentProject()), String(um.time)))      // the prompt's time is its checkpoint: the files the tools change in it can be put back      // the coding tools, when they are on and reachable
     const lastPrompt = [...conv].reverse().find((x) => x.role === "user")
     const skill = lastPrompt ? skillOfMessage(lastPrompt.text, ctx.skills ?? []) : null
     if (skill) body.strata_skill = skill                                   // "/name": the server loads that skill for this message

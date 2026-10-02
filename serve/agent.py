@@ -61,6 +61,7 @@ class AgentContext:
     ask: Callable[[dict], str] = lambda req: "deny"        # "allow" | "allow_chat" | "deny" | "cancelled"
     cancel: threading.Event = field(default_factory=threading.Event)
     emit: Callable[[dict], None] = lambda event: None      # tool activity for the page (a todo list, a shell's output)
+    checkpoint: object | None = None                       # serve/checkpoints.py Scope: the way back for the files the tools change in this prompt
 
 
 class Session:
@@ -256,6 +257,21 @@ class AgentServer:
         except OSError as e:
             return _err(f"{tool} could not do it: {e.strerror or e}")
 
+    def _save(self, ctx: AgentContext, path: str, text: str) -> None:
+        """Writes a file the way the tools do, keeping what it was first (once per prompt) so that it can be put back, and noting what it is now."""
+        scope = ctx.checkpoint
+        if scope is not None:
+            try:
+                scope.before(path)
+            except Exception:  # noqa: BLE001 - a way back that cannot be kept must not stop the change the user allowed
+                pass
+        _write_atomic(path, text)
+        if scope is not None:
+            try:
+                scope.after(path)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _with_nested(self, tool: str, args: dict, ctx: AgentContext, result: dict) -> dict:
         """A file in a sub-folder of the project brings that sub-folder's instruction file with it (once per chat), as Claude Code does."""
         if tool not in ("Read", "Edit", "Write", "NotebookEdit") or result.get("isError") or not ctx.policy.cwd:
@@ -399,7 +415,7 @@ class AgentServer:
                 cell.pop("outputs", None)
                 cell.pop("execution_count", None)
             msg = f"Replaced the source of cell {cid}."
-        _write_atomic(path, json.dumps(nb, indent=1, ensure_ascii=False) + "\n")
+        self._save(ctx, path, json.dumps(nb, indent=1, ensure_ascii=False) + "\n")
         self._remember(path, s)
         return _ok(msg)
 
@@ -434,7 +450,7 @@ class AgentServer:
             if why:
                 return _err(why)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        _write_atomic(path, content)
+        self._save(ctx, path, content)
         self._remember(path, s)
         return _ok(f"File {'updated' if existed else 'created'} successfully at: {a['file_path']}" if existed else f"File created successfully at: {a['file_path']}")
 
@@ -451,7 +467,7 @@ class AgentServer:
         if not os.path.exists(path):
             if old == "":
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                _write_atomic(path, new)
+                self._save(ctx, path, new)
                 self._remember(path, s)
                 return _ok(f"Created {a['file_path']}")
             return _err(f"File does not exist: {a['file_path']}")
@@ -472,7 +488,7 @@ class AgentServer:
             return _err(f"Found {n} matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. "
                         f"To replace only one occurrence, provide more context to identify the instance.\nString: {a['old_string']}")
         updated = text.replace(old, new) if every else text.replace(old, new, 1)
-        _write_atomic(path, updated)
+        self._save(ctx, path, updated)
         self._remember(path, s)
         at = text.find(old)
         line = text[:at].count("\n") + 1

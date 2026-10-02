@@ -16,6 +16,7 @@ export const builtinCommands = (): Command[] => [
   { name: "context", description: t("Show how much of the context window the conversation uses, and what it is made of."), from: "Strata", plugin: null, builtin: true },
   { name: "memory", description: t("Show the notes and instruction files the chat reads for this project."), from: "Strata", plugin: null, builtin: true },
   { name: "init", description: t("Have the model look at the project and write a CLAUDE.md for it."), from: "Strata", plugin: null, builtin: true },
+  { name: "rewind", description: t("Go back to before a prompt: the files the coding tools changed are put back, and the conversation is cut there."), from: "Strata", plugin: null, builtin: true },
   { name: "permissions", description: t("Open the rules of the coding tools: what is allowed, and what is never allowed, for good."), from: "Strata", plugin: null, builtin: true },
   { name: "clear", description: t("Start a new chat. This one stays in Recents."), from: "Strata", plugin: null, builtin: true },
 ]
