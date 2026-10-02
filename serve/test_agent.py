@@ -59,7 +59,7 @@ class Base(unittest.TestCase):
 class TheServer(Base):
     def test_it_offers_the_tools_by_claude_codes_names_and_parameters(self):
         names = {t["name"]: t for t in self.srv.tools}
-        self.assertEqual(set(names), {"Read", "Write", "Edit", "Glob", "Grep", "TodoWrite", "ExitPlanMode"})
+        self.assertEqual(set(names), {"Read", "Write", "Edit", "Glob", "Grep", "TodoWrite", "ExitPlanMode", "NotebookEdit"})
         props = lambda n: set(names[n]["inputSchema"]["properties"])  # noqa: E731
         self.assertEqual(props("Read"), {"file_path", "offset", "limit"})
         self.assertEqual(props("Write"), {"file_path", "content"})
@@ -433,6 +433,149 @@ class PlanMode(Base):
     def test_outside_plan_mode_there_is_nothing_to_leave(self):
         self.assertTrue(self.call("ExitPlanMode", {"plan": "x"})["isError"])
         self.assertEqual(self.asked, [])
+
+
+class Notebooks(Base):
+    NB = {
+        "nbformat": 4, "nbformat_minor": 5, "metadata": {"kernelspec": {"name": "python3"}},
+        "cells": [
+            {"id": "a1", "cell_type": "markdown", "metadata": {}, "source": ["# Title\n", "text"]},
+            {"id": "b2", "cell_type": "code", "metadata": {}, "execution_count": 1, "source": "print('hi')\nx = 1",
+             "outputs": [{"output_type": "stream", "name": "stdout", "text": ["hi\n"]}, {"output_type": "display_data", "data": {"image/png": "AAAA", "text/plain": ["<Figure>"]}, "metadata": {}}]},
+            {"id": "c3", "cell_type": "code", "metadata": {}, "execution_count": None, "source": "", "outputs": []},
+        ],
+    }
+
+    def nb(self, name="n.ipynb"):
+        import json
+        p = self.proj / name
+        p.write_text(json.dumps(self.NB, indent=1) + "\n", encoding="utf-8")
+        return p
+
+    def load(self, name="n.ipynb"):
+        import json
+        return json.loads((self.proj / name).read_text(encoding="utf-8"))
+
+    def test_reading_a_notebook_gives_its_cells_with_their_outputs(self):
+        self.nb()
+        t = text(self.call("Read", {"file_path": "n.ipynb"}))
+        self.assertIn('<cell id="a1" type="markdown">', t)
+        self.assertIn("# Title\ntext", t)
+        self.assertIn('<cell id="b2" type="code">', t)
+        self.assertIn("print('hi')", t)
+        self.assertIn("hi", t.split('<cell id="b2"')[1])                      # the stream output
+        self.assertIn("<Figure>", t)                                          # the text of a figure
+        self.assertNotIn("AAAA", t)                                           # not the picture's bytes
+        self.assertIn("image", t.lower())                                     # but it says there was one
+        self.assertIn('<cell id="c3" type="code">', t)
+
+    def test_a_notebook_that_is_not_json_is_an_error(self):
+        self.write("bad.ipynb", "{ nope")
+        r = self.call("Read", {"file_path": "bad.ipynb"})
+        self.assertTrue(r["isError"])
+        self.assertIn("notebook", text(r).lower())
+
+    def test_the_tool_and_its_parameters(self):
+        names = {t["name"]: t for t in self.srv.tools}
+        self.assertEqual(set(names["NotebookEdit"]["inputSchema"]["properties"]), {"notebook_path", "new_source", "cell_id", "cell_type", "edit_mode"})
+        self.assertEqual(names["NotebookEdit"]["inputSchema"]["required"], ["notebook_path", "new_source"])
+
+    def test_replace_a_cell(self):
+        self.nb()
+        self.call("Read", {"file_path": "n.ipynb"})
+        r = self.call("NotebookEdit", {"notebook_path": "n.ipynb", "cell_id": "b2", "new_source": "print('bye')"})
+        self.assertFalse(r["isError"], text(r))
+        cell = self.load()["cells"][1]
+        self.assertEqual(cell["source"], "print('bye')")
+        self.assertEqual(cell["outputs"], [])                                # the old output belongs to the old code
+        self.assertIsNone(cell["execution_count"])
+        self.assertEqual(self.load()["cells"][0]["source"], ["# Title\n", "text"])      # the other cells are as they were
+
+    def test_replace_can_change_the_type_of_a_cell(self):
+        self.nb()
+        self.call("Read", {"file_path": "n.ipynb"})
+        self.call("NotebookEdit", {"notebook_path": "n.ipynb", "cell_id": "b2", "new_source": "now text", "cell_type": "markdown"})
+        cell = self.load()["cells"][1]
+        self.assertEqual(cell["cell_type"], "markdown")
+        self.assertNotIn("outputs", cell)
+
+    def test_a_cell_can_be_named_by_its_number(self):
+        self.nb()
+        self.call("Read", {"file_path": "n.ipynb"})
+        self.assertFalse(self.call("NotebookEdit", {"notebook_path": "n.ipynb", "cell_id": "cell-0", "new_source": "# New"})["isError"])
+        self.assertEqual(self.load()["cells"][0]["source"], "# New")
+
+    def test_insert_goes_after_the_named_cell_or_at_the_start(self):
+        self.nb()
+        self.call("Read", {"file_path": "n.ipynb"})
+        r = self.call("NotebookEdit", {"notebook_path": "n.ipynb", "cell_id": "a1", "new_source": "y = 2", "cell_type": "code", "edit_mode": "insert"})
+        self.assertFalse(r["isError"], text(r))
+        ids = [c["id"] for c in self.load()["cells"]]
+        self.assertEqual(ids[0], "a1")
+        self.assertEqual(self.load()["cells"][1]["source"], "y = 2")
+        self.assertTrue(ids[1] not in ("a1", "b2", "c3"))                     # it has an id of its own
+        self.assertIn(ids[1], text(r))
+        self.assertFalse(self.call("NotebookEdit", {"notebook_path": "n.ipynb", "new_source": "first", "cell_type": "markdown", "edit_mode": "insert"})["isError"])
+        self.assertEqual(self.load()["cells"][0]["source"], "first")
+
+    def test_insert_needs_a_cell_type(self):
+        self.nb()
+        self.call("Read", {"file_path": "n.ipynb"})
+        r = self.call("NotebookEdit", {"notebook_path": "n.ipynb", "new_source": "x", "edit_mode": "insert"})
+        self.assertTrue(r["isError"])
+        self.assertIn("cell_type", text(r))
+
+    def test_delete_a_cell(self):
+        self.nb()
+        self.call("Read", {"file_path": "n.ipynb"})
+        r = self.call("NotebookEdit", {"notebook_path": "n.ipynb", "cell_id": "b2", "new_source": "", "edit_mode": "delete"})
+        self.assertFalse(r["isError"], text(r))
+        self.assertEqual([c["id"] for c in self.load()["cells"]], ["a1", "c3"])
+
+    def test_a_cell_that_is_not_there_is_an_error_that_names_it(self):
+        self.nb()
+        self.call("Read", {"file_path": "n.ipynb"})
+        r = self.call("NotebookEdit", {"notebook_path": "n.ipynb", "cell_id": "zzz", "new_source": "x"})
+        self.assertTrue(r["isError"])
+        self.assertIn("zzz", text(r))
+        self.assertTrue(self.call("NotebookEdit", {"notebook_path": "n.ipynb", "cell_id": "cell-9", "new_source": "x"})["isError"])
+
+    def test_it_must_have_been_read_and_not_changed_since(self):
+        self.nb()
+        r = self.call("NotebookEdit", {"notebook_path": "n.ipynb", "cell_id": "a1", "new_source": "x"})
+        self.assertTrue(r["isError"])
+        self.assertIn("not been read", text(r))
+
+    def test_the_file_keeps_the_notebook_format_and_the_rest_of_it(self):
+        p = self.nb()
+        self.call("Read", {"file_path": "n.ipynb"})
+        self.call("NotebookEdit", {"notebook_path": "n.ipynb", "cell_id": "a1", "new_source": "# Ünï"})
+        raw = p.read_text(encoding="utf-8")
+        self.assertTrue(raw.endswith("\n"))
+        self.assertIn("Ünï", raw)                                             # not escaped
+        self.assertEqual(self.load()["metadata"], {"kernelspec": {"name": "python3"}})
+        self.assertEqual(self.load()["nbformat"], 4)
+
+    def test_it_is_only_for_notebooks_and_the_options_are_checked(self):
+        self.write("a.txt", "x")
+        self.call("Read", {"file_path": "a.txt"})
+        self.assertTrue(self.call("NotebookEdit", {"notebook_path": "a.txt", "cell_id": "a", "new_source": "x"})["isError"])
+        self.nb()
+        self.call("Read", {"file_path": "n.ipynb"})
+        for bad in ({"edit_mode": "explode"}, {"cell_type": "raw-ish"}, {"new_source": 5}):
+            args = {"notebook_path": "n.ipynb", "cell_id": "a1", "new_source": "x", **bad}
+            self.assertTrue(self.call("NotebookEdit", args)["isError"], bad)
+
+    def test_the_gate_treats_it_like_an_edit_of_that_file(self):
+        self.nb()
+        self.out.joinpath("o.ipynb").write_text("{}", encoding="utf-8")
+        self.call("NotebookEdit", {"notebook_path": str(self.out / "o.ipynb"), "cell_id": "a", "new_source": "x"})
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(self.asked[0]["tool"], "NotebookEdit")
+        self.assertEqual(self.asked[0]["rule"], f"NotebookEdit({self.out.as_posix()}/**)")
+        r = self.call("NotebookEdit", {"notebook_path": "n.ipynb", "cell_id": "a1", "new_source": "x"}, mode="plan")
+        self.assertTrue(r["isError"])
+        self.assertIn("plan", text(r))
 
 
 class Todos(Base):

@@ -76,6 +76,7 @@ describe("toolSummary: a call in a few words", () => {
     expect(toolSummary("Read", { file_path: "src/a.py" })).toBe("src/a.py")
     expect(toolSummary("Write", { file_path: "x.txt", content: "y" })).toBe("x.txt")
     expect(toolSummary("Edit", { file_path: "src/a.py", old_string: "a", new_string: "b" })).toBe("src/a.py")
+    expect(toolSummary("NotebookEdit", { notebook_path: "analysis.ipynb", new_source: "x" })).toBe("analysis.ipynb")
     expect(toolSummary("Glob", { pattern: "**/*.py" })).toBe("**/*.py")
     expect(toolSummary("Grep", { pattern: "foo", path: "src" })).toBe("foo in src")
     expect(toolSummary("Grep", { pattern: "foo" })).toBe("foo")

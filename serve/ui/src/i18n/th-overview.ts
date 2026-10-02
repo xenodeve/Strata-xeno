@@ -267,6 +267,7 @@ export const part: Record<string, string> = {
   "Look for files here?": "ค้นหาไฟล์ที่นี่ไหม",
   "Search here?": "ค้นหาที่นี่ไหม",
   "Write this file?": "เขียนไฟล์นี้ไหม",
+  "Change this notebook?": "แก้ notebook นี้ไหม",
   "Change this file?": "แก้ไฟล์นี้ไหม",
   "Approve this plan?": "อนุมัติแผนนี้ไหม",
   "Permission needed": "ต้องขออนุญาต",

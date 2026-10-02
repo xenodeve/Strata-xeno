@@ -38,7 +38,7 @@ const why = (s: string) => (WHY[s] ? t(WHY[s]) : s)
 
 const QUESTION: Record<string, string> = {
   Bash: msg("Run this command?"), Read: msg("Read this file?"), Glob: msg("Look for files here?"), Grep: msg("Search here?"),
-  Write: msg("Write this file?"), Edit: msg("Change this file?"), ExitPlanMode: msg("Approve this plan?"),
+  Write: msg("Write this file?"), Edit: msg("Change this file?"), NotebookEdit: msg("Change this notebook?"), ExitPlanMode: msg("Approve this plan?"),
 }
 
 const str = (x: unknown) => (typeof x === "string" ? x : "")
@@ -59,6 +59,7 @@ function Question({ call }: { call: ToolCall }) {
       </div>
       {ask.tool === "Bash" && <Out text={get("command")} />}
       {(ask.tool === "Read" || ask.tool === "Write" || ask.tool === "Edit") && <div className="font-mono text-[12px] [overflow-wrap:anywhere]">{get("file_path")}</div>}
+      {ask.tool === "NotebookEdit" && <div className="font-mono text-[12px] [overflow-wrap:anywhere]">{get("notebook_path")}{get("cell_id") ? ` — ${get("cell_id")}` : ""}</div>}
       {(ask.tool === "Glob" || ask.tool === "Grep") && <div className="font-mono text-[12px] [overflow-wrap:anywhere]">{get("pattern")}{get("path") ? ` — ${get("path")}` : ""}</div>}
       {ask.tool === "ExitPlanMode" && <div className="prose-chat max-h-72 overflow-auto text-[13px]" dangerouslySetInnerHTML={{ __html: markdown(get("plan")) }} />}
       <div className="text-[12px] text-ink-2">{why(ask.why)}</div>
@@ -103,6 +104,7 @@ function Body({ call }: { call: ToolCall }) {
     )
   }
   if (name === "Write") return <div className="space-y-2"><Out text={str(arg(call, "content")).split("\n").slice(0, 60).join("\n") + (str(arg(call, "content")).split("\n").length > 60 ? "\n…" : "")} />{result}</div>
+  if (name === "NotebookEdit") return <div className="space-y-2"><Out text={str(arg(call, "new_source"))} />{result}</div>
   if (name === "ExitPlanMode") return <div className="prose-chat text-[13px]" dangerouslySetInnerHTML={{ __html: markdown(str(arg(call, "plan"))) }} />
   if (name === "TodoWrite") return <TodoList todos={Array.isArray(arg(call, "todos")) ? (arg(call, "todos") as Todo[]) : []} />
   return result ?? <Out text={JSON.stringify(call.arguments ?? {}, null, 2)} />

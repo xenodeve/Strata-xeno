@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 
 FILE_READ = ("Read", "Glob", "Grep")
-FILE_EDIT = ("Write", "Edit")
+FILE_EDIT = ("Write", "Edit", "NotebookEdit")
 KNOWN = FILE_READ + FILE_EDIT + ("Bash", "TodoWrite", "BashOutput", "KillShell", "ExitPlanMode")
 FREE = ("TodoWrite", "BashOutput", "KillShell")      # they only act on what the user already allowed in this chat
 
@@ -349,7 +349,7 @@ def rule_for(tool: str, args: dict) -> str | None:
         pre = w[0] if len(w) == 1 or w[0] not in MULTI or w[1].startswith("-") else f"{w[0]} {w[1]}"
         return f"Bash({pre}:*)"
     if tool in KNOWN and tool not in FREE and tool != "ExitPlanMode":
-        raw = args.get("file_path") if tool not in ("Glob", "Grep") else args.get("path")
+        raw = args.get("path") if tool in ("Glob", "Grep") else args.get("notebook_path") if tool == "NotebookEdit" else args.get("file_path")
         if isinstance(raw, str) and raw.strip():
             r = real(raw, None) or (os.path.realpath(os.path.expanduser(raw)) if os.path.isabs(os.path.expanduser(raw)) else None)
             if r:
@@ -372,7 +372,7 @@ def _file_target(tool: str, args: dict, pol: Policy) -> tuple[str | None, str]:
                 head = re.split(r"[*?\[{]", pat)[0]
                 raw = os.path.join(raw if isinstance(raw, str) else "", head) if not os.path.isabs(pat) else head
     else:
-        raw = args.get("file_path")
+        raw = args.get("notebook_path") if tool == "NotebookEdit" else args.get("file_path")
     if not isinstance(raw, str) or not raw.strip():
         return None, "the call does not say which path"
     r = real(raw, pol.cwd)

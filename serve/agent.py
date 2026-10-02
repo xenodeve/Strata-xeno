@@ -20,7 +20,9 @@ import os
 import re
 import tempfile
 import threading
+import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -134,6 +136,12 @@ SCHEMAS = {
              "You must have read the file first in this chat. An empty old_string creates a new file with new_string.",
              {"file_path": {"type": "string"}, "old_string": {"type": "string", "description": "the exact text to replace"}, "new_string": {"type": "string", "description": "the text to put instead"},
               "replace_all": {"type": "boolean", "description": "replace every occurrence (default false)"}}, ["file_path", "old_string", "new_string"]),
+    "NotebookEdit": ("Change a Jupyter notebook (.ipynb) by cells: replace the source of a cell, insert a new cell after a cell, or delete a cell. Name the cell by its id (as Read shows it) or by "
+                     "cell-0, cell-1 ... You must have read the notebook first in this chat.",
+                     {"notebook_path": {"type": "string", "description": "the .ipynb file"}, "new_source": {"type": "string", "description": "the new source of the cell (ignored when deleting)"},
+                      "cell_id": {"type": "string", "description": "the cell to change, or to insert after (empty: insert at the start)"},
+                      "cell_type": {"type": "string", "enum": ["code", "markdown"], "description": "required when inserting; with replace it changes the cell's type"},
+                      "edit_mode": {"type": "string", "enum": ["replace", "insert", "delete"], "description": "default replace"}}, ["notebook_path", "new_source"]),
     "Glob": ("Find files by a name pattern such as **/*.py or src/**/*.ts. Returns paths, the most recently changed first (at most 100).",
              {"pattern": {"type": "string", "description": "the glob pattern"}, "path": {"type": "string", "description": "the folder to search (default: the project folder)"}}, ["pattern"]),
     "Grep": ("Search file contents with a regular expression. output_mode: files_with_matches (default) lists the files, content shows the matching lines, count counts them per file. "
@@ -173,7 +181,7 @@ class AgentServer:
         self.last_start = 0.0
         self._sessions: collections.OrderedDict[str, Session] = collections.OrderedDict()
         self._tools = dict(SCHEMAS)
-        self._run = {"Read": self._read, "Write": self._write, "Edit": self._edit, "Glob": self._glob, "Grep": self._grep, "TodoWrite": self._todo, "ExitPlanMode": self._exit_plan}
+        self._run = {"Read": self._read, "Write": self._write, "Edit": self._edit, "Glob": self._glob, "Grep": self._grep, "TodoWrite": self._todo, "ExitPlanMode": self._exit_plan, "NotebookEdit": self._notebook_edit}
         for name, (desc, props, req, fn) in (extra or {}).items():            # more tools (Bash lives in serve/shell.py)
             self._tools[name] = (desc, props, req)
             self._run[name] = fn
@@ -270,6 +278,8 @@ class AgentServer:
         st = os.stat(path)
         s = self.session(ctx.session)
         s.reads[path] = (st.st_mtime_ns, st.st_size)
+        if path.lower().endswith(".ipynb"):                                    # a notebook is read by its cells, with their outputs
+            return self._read_notebook(text)
         lines = text.splitlines()
         if not lines:
             return _ok("<system-reminder>The file exists but its contents are empty.</system-reminder>")
@@ -282,6 +292,100 @@ class AgentServer:
         if limit is None and start + len(chunk) < len(lines):
             out += f"\n\n[The file has {len(lines)} lines; showing {start + 1}-{start + len(chunk)}. Use offset to read more.]"
         return _ok(out)
+
+    # -------------------------------------------------------------------------------------------- notebooks
+    @staticmethod
+    def _joined(v) -> str:
+        return "".join(v) if isinstance(v, list) else v if isinstance(v, str) else ""
+
+    def _read_notebook(self, text: str) -> dict:
+        try:
+            nb = json.loads(text)
+            cells = nb["cells"]
+            if not isinstance(cells, list):
+                raise TypeError
+        except (ValueError, KeyError, TypeError):
+            return _err("This does not read as a Jupyter notebook (the file is not valid notebook JSON).")
+        out = []
+        for i, c in enumerate(cells):
+            if not isinstance(c, dict):
+                continue
+            kind = c.get("cell_type", "code")
+            out.append(f'<cell id="{c.get("id", f"cell-{i}")}" type="{kind}">')
+            out.append(self._joined(c.get("source")))
+            for o in c.get("outputs") or []:
+                if not isinstance(o, dict):
+                    continue
+                if o.get("output_type") == "stream":
+                    out.append(self._joined(o.get("text")).rstrip("\n"))
+                elif o.get("output_type") == "error":
+                    out.append(f"{o.get('ename', 'Error')}: {o.get('evalue', '')}")
+                else:
+                    data = o.get("data") if isinstance(o.get("data"), dict) else {}
+                    if "text/plain" in data:
+                        out.append(self._joined(data["text/plain"]).rstrip("\n"))
+                    if any(k.startswith("image/") for k in data):
+                        out.append("[an image output is not shown here]")
+            out.append("</cell>")
+        text = "\n".join(out)
+        return _ok(text[:MAX_READ_BYTES] + ("\n[the notebook is cut here]" if len(text) > MAX_READ_BYTES else "") if text else "<system-reminder>The notebook has no cells.</system-reminder>")
+
+    def _notebook_edit(self, a: dict, ctx: AgentContext) -> dict:
+        path = self._path(a.get("notebook_path"), ctx)
+        src, mode, kind, cid = a.get("new_source"), a.get("edit_mode", "replace"), a.get("cell_type"), a.get("cell_id")
+        if path is None or not path.lower().endswith(".ipynb"):
+            return _err("NotebookEdit works only on a .ipynb notebook: notebook_path must be one")
+        if not isinstance(src, str) or mode not in ("replace", "insert", "delete") or kind not in (None, "code", "markdown") or not (cid is None or isinstance(cid, str)):
+            return _err("new_source must be text, edit_mode replace, insert or delete, cell_type code or markdown, and cell_id text")
+        if mode == "insert" and kind is None:
+            return _err("cell_type (code or markdown) is required when inserting a cell")
+        if not os.path.isfile(path):
+            return _err(f"File does not exist: {a['notebook_path']}")
+        s = self.session(ctx.session)
+        why = self._stale(path, s)
+        if why:
+            return _err(why)
+        text, _ = _read_text(path)
+        try:
+            nb = json.loads(text)
+            cells = nb["cells"]
+            if not isinstance(cells, list):
+                raise TypeError
+        except (ValueError, KeyError, TypeError):
+            return _err("This does not read as a Jupyter notebook (the file is not valid notebook JSON).")
+        at = None
+        if cid:
+            at = next((i for i, c in enumerate(cells) if isinstance(c, dict) and c.get("id") == cid), None)
+            if at is None:
+                m = re.fullmatch(r"cell-(\d+)", cid)
+                at = int(m.group(1)) if m and int(m.group(1)) < len(cells) else None
+            if at is None:
+                return _err(f"There is no cell {cid!r} in this notebook ({len(cells)} cells). Read it again to see their ids.")
+        elif mode != "insert":
+            return _err("cell_id is required to replace or delete a cell")
+        msg = ""
+        if mode == "delete":
+            del cells[at]
+            msg = f"Deleted cell {cid}."
+        elif mode == "insert":
+            new = {"id": uuid.uuid4().hex[:8], "cell_type": kind, "metadata": {}, "source": src}
+            if kind == "code":
+                new.update(outputs=[], execution_count=None)
+            cells.insert(0 if at is None else at + 1, new)
+            msg = f"Inserted cell {new['id']} ({kind})" + (f" after {cid}." if cid else " at the start.")
+        else:
+            cell = cells[at]
+            kind = kind or cell.get("cell_type", "code")
+            cell.update(cell_type=kind, source=src)
+            if kind == "code":
+                cell.update(outputs=[], execution_count=None)                  # the old output belongs to the old code
+            else:
+                cell.pop("outputs", None)
+                cell.pop("execution_count", None)
+            msg = f"Replaced the source of cell {cid}."
+        _write_atomic(path, json.dumps(nb, indent=1, ensure_ascii=False) + "\n")
+        self._remember(path, s)
+        return _ok(msg)
 
     # -------------------------------------------------------------------------------------------- Write and Edit
     def _stale(self, path: str, s: Session) -> str | None:

@@ -17,6 +17,7 @@ TOOL_HELP = {
     "Read": "Read: read a file (numbered lines). Use it instead of cat. Read a file before you Write or Edit it.",
     "Write": "Write: create a file or replace a whole file. To change part of a file use Edit.",
     "Edit": "Edit: replace an exact piece of text in a file. old_string must be unique, or set replace_all.",
+    "NotebookEdit": "NotebookEdit: change a Jupyter notebook by cells (replace, insert, delete). Read the notebook first; Read shows its cells and their ids.",
     "Glob": "Glob: find files by name pattern. Use it instead of find or ls.",
     "Grep": "Grep: search file contents with a regular expression. Use it instead of grep or rg.",
     "Bash": "Bash: run a command in the project folder. Use it for builds, tests, git and other programs, not for reading or searching files.",

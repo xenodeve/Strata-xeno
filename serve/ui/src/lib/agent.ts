@@ -69,6 +69,7 @@ export function toolSummary(tool: string, args: unknown): string {
   if (!a) return ""
   switch (tool) {
     case "Read": case "Write": case "Edit": return cut(str(a.file_path))
+    case "NotebookEdit": return cut(str(a.notebook_path))
     case "Glob": return cut(str(a.pattern))
     case "Grep": return cut(str(a.path) ? `${str(a.pattern)} in ${str(a.path)}` : str(a.pattern))
     case "Bash": return cut(str(a.description).trim() || str(a.command).split("\n")[0])

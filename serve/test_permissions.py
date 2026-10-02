@@ -90,6 +90,13 @@ class FilesInTheFolder(Base):
             self.assertIn("secret", d.why)
         self.assertEqual(self.kind("Read", {"file_path": ".env.example"}), "allow")           # a template, not a secret
 
+    def test_a_notebook_is_a_file_that_is_edited(self):
+        self.assertEqual(self.kind("NotebookEdit", {"notebook_path": "n.ipynb", "new_source": "x"}), "allow")
+        self.assertEqual(self.kind("NotebookEdit", {"notebook_path": str(self.outside / "n.ipynb"), "new_source": "x"}), "ask")
+        self.assertEqual(self.kind("NotebookEdit", {"notebook_path": "n.ipynb"}, mode="plan"), "deny")
+        self.assertEqual(self.kind("NotebookEdit", {}), "ask")
+        self.assertEqual(self.kind("NotebookEdit", {"notebook_path": str(self.outside / "n.ipynb")}, allow=[f"Edit({self.outside.as_posix()}/**)"]), "allow")        # an Edit rule covers it
+
     def test_the_git_folder_is_not_written_without_asking(self):
         self.assertEqual(self.kind("Write", {"file_path": ".git/hooks/pre-commit", "content": "x"}), "ask")
         self.assertEqual(self.kind("Read", {"file_path": ".git/HEAD"}), "allow")

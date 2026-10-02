@@ -49,6 +49,7 @@ class Prompt(unittest.TestCase):
     def test_only_the_tools_that_exist_are_described(self):
         p = self.build(tools=["Read", "Glob"])
         self.assertNotIn("TodoWrite", p)
+        self.assertNotIn("NotebookEdit", p)
         self.assertNotIn("Bash", p)
         self.assertIn("Read", p)
 

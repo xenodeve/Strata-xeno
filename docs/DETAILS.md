@@ -554,8 +554,10 @@ own `CLAUDE.md` (or `AGENTS.md`). They work only from this PC itself (or with th
 - **Trying it without a model.** `STRATA_MOCK_AGENT=1 python serve/ui/dev/mock_server.py` is the mock server with the real tools behind it; a message with
   "agent demo" in it makes the fake model use them step by step (a todo list, a search, a read, a command that only reads, a file in the temp folder and a
   command, the last two asking first).
-- **Not the same as Claude Code (yet).** No sub-agents (`Task`), no `WebSearch`/`WebFetch`, no `NotebookEdit`, no images or PDFs in `Read`,
-  no hooks; a `cd` does not carry over between commands.
+- **Notebooks.** `Read` shows a Jupyter notebook (.ipynb) by its cells, with their ids and text outputs (an image output is only named); `NotebookEdit`
+  replaces, inserts or deletes a cell by id (or `cell-N`) after the notebook was read in the chat, and is gated like any edit of that file.
+- **Not the same as Claude Code (yet).** No sub-agents (`Task`), no `WebSearch`/`WebFetch`, no images or PDFs in `Read`, no hooks; a `cd` does not
+  carry over between commands.
 
 **Skills and MCP servers from your other coding apps.** The web app can use what Claude Code, Codex, Antigravity, Gemini CLI,
 Cursor, Claude Desktop and the shared `~/.agents/skills` folder already have on this PC. It only reads their files; it never
