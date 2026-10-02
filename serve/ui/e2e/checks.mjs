@@ -1082,6 +1082,13 @@ export const checks = [
       const row = (pg) => pg.locator(".t-morph-menu [role=option]", { hasText: "Coding tools" })
       const typeAndSend = async (pg, text) => { await pg.fill("textarea[aria-label='Message']", text); await pg.keyboard.press("Enter"); await pg.waitForTimeout(900) }
 
+      const heightsNow = (pg) => pg.evaluate(async () => {
+        const el = document.querySelector("[role=dialog][aria-label='Coding tools']")
+        const seen = []
+        const t0 = performance.now()
+        while (performance.now() - t0 < 800) { seen.push(Math.round(el.getBoundingClientRect().height)); await new Promise((r) => requestAnimationFrame(r)) }
+        return seen
+      })
       // ---- the row and the panel
       const pg = await open(browser, errors)
       const { sent, answers } = await setup(pg, {
@@ -1159,7 +1166,10 @@ export const checks = [
       await row(pg).click()
       await pg.waitForTimeout(400)
       t.ok("the panel counts the rules of this chat and can forget them", (await panel.innerText()).includes("1 rules allowed for this chat"))
+      const sampling = heightsNow(pg)
       await panel.getByRole("button", { name: "Forget them" }).click()
+      const hs = await sampling
+      t.ok("the panel shrinks to what is left through in-between heights instead of jumping", new Set(hs).size > 3 && hs.at(-1) < hs[0] && hs.slice(1, -1).some((h) => h < hs[0] && h > hs.at(-1)), JSON.stringify([...new Set(hs)]))
       await pg.waitForTimeout(300)
       t.ok("forgotten", !(await panel.innerText()).includes("rules allowed"))
       await panel.locator("[role=switch][aria-label='Coding tools']").click()
