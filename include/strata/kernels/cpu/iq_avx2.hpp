@@ -17,6 +17,17 @@ void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
 /// out[t][r] = w_r . a[t], rows [r0, r1).
 void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
+/// xeno #106: the two builds behind them (iq_avx2.cpp compiled for AVX2, and again by iq_avxvnni.cpp for AVX-VNNI,
+/// where `vpdpwssd` does each token's madd + add); iq256_gu_rows / iq256_rows pick one with cpu_avxvnni_ok().  The
+/// AVX-VNNI pair only on a CPU where cpu_avxvnni_ok() holds.  Bitwise the same results.
+void iq256_gu_rows_avx2(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                        int nt, float* const* ff, int r0, int r1);
+void iq256_rows_avx2(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                     float* const* out, int r0, int r1);
+void iq256_gu_rows_avxvnni(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                           const void* const* act, int nt, float* const* ff, int r0, int r1);
+void iq256_rows_avxvnni(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                        float* const* out, int r0, int r1);
 
 /// out[t][r] = w_r . h[t] for IQ4_NL (type 20) rows against Q8_0 activations (ggml's block_q8_0).
 /// IQ4_NL is a 32-value-block format, so this does not go through iq256_rows (QK_K blocks, Q8_K acts).

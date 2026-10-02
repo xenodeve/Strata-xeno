@@ -11,6 +11,7 @@
 //
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).  IQ1_M stays on ggml-cpu.
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -21,6 +22,18 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+
+// xeno #106: this file is compiled twice - for AVX2 here, and with STRATA_IQ_AVXVNNI by iq_avxvnni.cpp for AVX-VNNI.
+// Only each token's accumulate differs: `vpdpwssd` does the `madd` + `add` in one instruction, the same integer sum
+// (neither saturates: a maddubs pair is at most 2 x 62 x 127, a scale at most 31).  IQ_NAME gives each build its own
+// entry points; iq256_gu_rows / iq256_rows (the AVX2 build) pick one at run time (cpu_avxvnni_ok).
+#if defined(STRATA_IQ_AVXVNNI)
+#define IQ_NAME(n) n##_avxvnni
+#define IQ_ACC(acc, g, ys, sc) _mm256_dpwssd_avx_epi32((acc), _mm256_maddubs_epi16((g), (ys)), (sc))
+#else
+#define IQ_NAME(n) n##_avx2
+#define IQ_ACC(acc, g, ys, sc) _mm256_add_epi32((acc), _mm256_madd_epi16(_mm256_maddubs_epi16((g), (ys)), (sc)))
+#endif
 
 namespace strata::kernels::cpu {
 namespace {
@@ -194,7 +207,7 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
                 for (int t = 0; t < NT; ++t) {
                     const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + off));
                     const __m256i ys = _mm256_sign_epi8(yv, sgn);
-                    acci[t] = _mm256_add_epi32(acci[t], _mm256_madd_epi16(_mm256_maddubs_epi16(g, ys), sc));
+                    acci[t] = IQ_ACC(acci[t], g, ys, sc);
                 }
             }
         }
@@ -280,8 +293,7 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
                 for (int t = 0; t < NT; ++t) {
                     const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + off));
                     const __m256i ys = _mm256_sign_epi8(yv, sgn);
-                    acc[t][h & 1] = _mm256_add_epi32(acc[t][h & 1],
-                        _mm256_madd_epi16(_mm256_maddubs_epi16(g, ys), sc));
+                    acc[t][h & 1] = IQ_ACC(acc[t][h & 1], g, ys, sc);
                 }
             }
         }
@@ -356,12 +368,8 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 }  // namespace
 
-bool iq256_supported(int type) noexcept {
-    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22;
-}
-
-void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
-                   float* const* ff, int r0, int r1) {
+void IQ_NAME(iq256_gu_rows)(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                            int nt, float* const* ff, int r0, int r1) {
     switch (type) {
         case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
@@ -372,8 +380,8 @@ void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
     }
 }
 
-void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
-                int r0, int r1) {
+void IQ_NAME(iq256_rows)(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                        float* const* out, int r0, int r1) {
     switch (type) {
         case 16: dot_rows_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 17: dot_rows_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;
@@ -382,6 +390,24 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
         case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
+}
+
+#if !defined(STRATA_IQ_AVXVNNI)   // the AVX2 build only: the probe, the run-time pick, and IQ4_NL
+
+bool iq256_supported(int type) noexcept {
+    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22;
+}
+
+void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                   float* const* ff, int r0, int r1) {
+    if (cpu_avxvnni_ok()) iq256_gu_rows_avxvnni(type, blob, gu_row, up_off, n, act, nt, ff, r0, r1);
+    else iq256_gu_rows_avx2(type, blob, gu_row, up_off, n, act, nt, ff, r0, r1);
+}
+
+void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
+                int r0, int r1) {
+    if (cpu_avxvnni_ok()) iq256_rows_avxvnni(type, w, row_bytes, n, act, nt, out, r0, r1);
+    else iq256_rows_avx2(type, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
 // ---- IQ4_NL (type 20): 32-value blocks of 18 bytes (f16 d + 16 nibble bytes) against Q8_0 activations.
@@ -436,5 +462,7 @@ void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* c
         }
     }
 }
+
+#endif  // !STRATA_IQ_AVXVNNI
 
 }  // namespace strata::kernels::cpu
