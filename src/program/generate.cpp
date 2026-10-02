@@ -5411,19 +5411,25 @@ int main(int argc, char** argv) {
                     cudaGetDevice(&prev);
                     cudaSetDevice(1);
                     std::vector<CopyJob> jobs;
+                    std::vector<int32_t> held_src;   // released once copied
                     for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                         const int32_t in = sc[k].second, out = sv[k].second;
                         const int32_t slot = secondary_residency[(size_t) out];
                         const int32_t in_layer = in / (int32_t) g.n_expert;
-                        const uint8_t* src = srcp->blob(in_layer, in % (int32_t) g.n_expert);
+                        // held from the lookup to the copy below: a decode load's eviction must not give its slab slot to
+                        // another expert in between (the paired swaps' acquire() does the same)
+                        const uint8_t* src = srcp == &arena_src ? arena_src.hold_resident(in_layer, in % (int32_t) g.n_expert)
+                                                                : srcp->blob(in_layer, in % (int32_t) g.n_expert);
                         const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(in_layer);
                         if (src == nullptr) break;
+                        if (srcp == &arena_src) held_src.push_back(in);
                         if (!secondary_arena.fits((uint64_t) slot, bytes)) continue;   // #11: pairs span layers
                         secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
                         jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
                         ss_pending.emplace_back(in, slot);
                     }
                     parallel_copy(jobs);
+                    for (int32_t h : held_src) arena_src.release_hold(h / (int32_t) g.n_expert, h % (int32_t) g.n_expert);
                     for (size_t k = 0; k < jobs.size(); ++k)
                         if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) ss_pending[k].second), jobs[k].dst,
                                             jobs[k].bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
@@ -7399,19 +7405,25 @@ int main(int argc, char** argv) {
                 cudaGetDevice(&prev);
                 cudaSetDevice(1);
                 std::vector<CopyJob> jobs;
+                std::vector<int32_t> held_src;   // released once copied
                 for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                     const int32_t in = sc[k].second, out = sv[k].second;
                     const int32_t slot = secondary_residency[(size_t) out];
                     const int32_t in_layer = in / (int32_t) g.n_expert;
-                    const uint8_t* src = srcp->blob(in_layer, in % (int32_t) g.n_expert);
+                    // held from the lookup to the copy below: a decode load's eviction must not give its slab slot to
+                    // another expert in between (the paired swaps' acquire() does the same)
+                    const uint8_t* src = srcp == &arena_src ? arena_src.hold_resident(in_layer, in % (int32_t) g.n_expert)
+                                                            : srcp->blob(in_layer, in % (int32_t) g.n_expert);
                     const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(in_layer);
                     if (src == nullptr) break;
+                    if (srcp == &arena_src) held_src.push_back(in);
                     if (!secondary_arena.fits((uint64_t) slot, bytes)) continue;   // #11: pairs span layers
                     secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
                     jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
                     ss_pending.emplace_back(in, slot);
                 }
                 parallel_copy(jobs);
+                for (int32_t h : held_src) arena_src.release_hold(h / (int32_t) g.n_expert, h % (int32_t) g.n_expert);
                 for (size_t k = 0; k < jobs.size(); ++k)
                     if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) ss_pending[k].second), jobs[k].dst,
                                         jobs[k].bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
@@ -7611,6 +7623,8 @@ int main(int argc, char** argv) {
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         const auto stages0 = arena_src.nvme_stages();   // the miss-cost breakdown counts decode only
+        const int64_t dec_loads0 = arena_src.nvme_loads();   // so do the NVMe tier's loads and wait
+        const double dec_nvme_ms0 = arena_src.nvme_ms();
         if (o.profile_decode_range && cudaProfilerStart() != cudaSuccess) {
             std::fprintf(stderr, "strata generate: cudaProfilerStart failed\n");
             return 1;
@@ -7778,14 +7792,19 @@ int main(int argc, char** argv) {
                         ver.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
+        // decode only, as `nvme stages` below: the prompt's loads (the CPU pool's prefill misses) are not divided
+        // by decode rounds or emitted tokens (2026-10-02 /code-review)
+        const int64_t dec_loads = arena_src.nvme_loads() - dec_loads0;
+        const double dec_nvme_ms = arena_src.nvme_ms() - dec_nvme_ms0;
         if (rounds > 0 && o.ram_cache_gib > 0.0)
-            std::printf("%-24s %lld loads, %.3f per round, %.3f ms/round waiting; host tier %.2f GiB\n", "nvme tier",
-                        (long long) arena_src.nvme_loads(), (double) arena_src.nvme_loads() / rounds,
-                        arena_src.nvme_ms() / rounds, (double) arena_src.host_cache_bytes() / 1073741824.0);
+            std::printf("%-24s %lld loads, %.3f per round, %.3f ms/round waiting (decode; %lld since start); host tier "
+                        "%.2f GiB\n", "nvme tier", (long long) dec_loads, (double) dec_loads / rounds,
+                        dec_nvme_ms / rounds, (long long) arena_src.nvme_loads(),
+                        (double) arena_src.host_cache_bytes() / 1073741824.0);
         if (rounds > 0 && o.ram_cache_gib > 0.0 && !produced.empty())   // #11 acceptance 7: per emitted token
             std::printf("%-24s %.3f loads, %.3f ms waiting per emitted token (%zu tokens, %lld rounds)\n", "nvme per token",
-                        (double) arena_src.nvme_loads() / (double) produced.size(),
-                        arena_src.nvme_ms() / (double) produced.size(), produced.size(), (long long) rounds);
+                        (double) dec_loads / (double) produced.size(), dec_nvme_ms / (double) produced.size(),
+                        produced.size(), (long long) rounds);
         if (rounds > 0 && o.ram_cache_gib > 0.0) {   // the miss-cost breakdown of the decode loads
             const auto s = arena_src.nvme_stages() - stages0;
             std::printf("%-24s evict %.3f  commit %.3f  submit %.3f  wait %.3f  copy %.3f ms/round; slab %lld slots, "

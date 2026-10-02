@@ -117,6 +117,29 @@ int main() {
     expect(packed->nvme_stages().copy_ms == 0.0, "slab slots are read straight into: nothing copied");
     expect(plain->nvme_stages().copy_ms > 0.0, "the GGUF path copies from the bounce buffer");
 
+    // read_experts_to's destinations are not slab slots (the tail file's check and build, the lent-slot refill): a
+    // pack's reads land exactly in them - an unaligned one through the bounce buffer, none past its blob (2026-10-02
+    // /code-review: `direct` was decided from the pack and the slab alone, so these reads failed or overran)
+    {
+        auto want = [&](int l, int x) {
+            std::vector<uint8_t> e(blob, 0);
+            for (int r = 0; r < 3; ++r)
+                for (uint64_t i = 0; i < per[r]; ++i) e[at[r] + i] = role_byte(l, r, x, i);
+            return e;
+        };
+        std::vector<uint8_t> raw(2 * stride + 3 * A, 0xCD);
+        uint8_t* al = (uint8_t*) (((uintptr_t) raw.data() + A - 1) & ~(uintptr_t) (A - 1));
+        uint8_t* dsts[2] = {al, al + blob + 64};   // page-aligned, then unaligned, 64 bytes of guard between
+        const int32_t ls[2] = {1, 1}, xs[2] = {0, 2};
+        err.clear();
+        expect(packed->read_experts_to(ls, xs, 2, dsts, err), "read_experts_to from the pack into plain buffers");
+        expect(std::memcmp(dsts[0], want(1, 0).data(), blob) == 0, "an aligned plain buffer gets its expert");
+        expect(std::memcmp(dsts[1], want(1, 2).data(), blob) == 0, "an unaligned plain buffer gets its expert");
+        bool guard = true;
+        for (int i = 0; i < 64; ++i) guard &= al[blob + i] == 0xCD;
+        expect(guard, "nothing is written past a plain buffer's blob");
+    }
+
     // the engine writes the pack itself (`strata --write-expert-pack`): byte for byte the format above
     const fs::path written = dir / "written.aligned";
     expect(plain->write_expert_pack(written.string(), err), "write_expert_pack");
@@ -141,6 +164,16 @@ int main() {
     err.clear();
     expect(!other.set_expert_pack(pack.string(), err) && err.find("expert pack") != std::string::npos,
            "a pack for another geometry is refused");
+    {   // the right geometry, another alignment: refused too (its strides were written for that alignment)
+        std::fstream p(pack, std::ios::in | std::ios::out | std::ios::binary);
+        const uint32_t right = experts, wrong = 8192;
+        p.seekp(16);
+        p.write((const char*) &right, 4);
+        p.write((const char*) &wrong, 4);
+    }
+    err.clear();
+    expect(!other.set_expert_pack(pack.string(), err) && err.find("alignment") != std::string::npos,
+           "a pack of another alignment is refused");
     other.close();
 
     std::error_code ec;

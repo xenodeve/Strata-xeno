@@ -544,7 +544,7 @@ public:
     /// another drive; repeatable.  read_experts_to sends each expert, all its ranges, to the copy with the fewest
     /// bytes queued in that batch (ties: the source).  A copy is checked against its source when first used (size,
     /// then the first, last and sampled pages); a mismatch fails the read.  A directory without the file is ignored.
-    void add_mirror(const std::string& dir) { mirror_dirs_.push_back(dir); }
+    void add_mirror(const std::string& dir);
     /// #81: an aligned expert pack (strata --write-expert-pack): each expert's blob contiguous at a 4 KiB-aligned offset,
     /// padded to a 4 KiB stride.  NVMe-tier loads then read one request per expert, straight into a slab slot (no
     /// bounce copy).  Header: "STRAPACK", u32 version 1, n_layers, n_expert, alignment, then per layer u64 offset,
@@ -579,6 +579,9 @@ public:
     /// committed bytes no expert uses.
     int64_t host_slots() const { return slab_committed_; }
     bool slab_on() const { return slab_; }   ///< #81: only then does an expert pack read straight into its slot
+    /// The 4070 swap's source: a resident expert's bytes, held (release_hold) so no eviction can give its slot to
+    /// another expert before the copy; null for one on NVMe (nothing is read).  Counts a use, as blob() does.
+    const uint8_t* hold_resident(int64_t layer, int64_t expert);
     uint64_t host_idle_bytes() const { return idle_bytes_; }
     /// A GPU-owned expert that comes home (paired swap copy-home) joins the host tier: account it and trim.
     void admit_home(int64_t layer, int64_t expert);
@@ -657,7 +660,10 @@ private:
         double t0 = 0;
     };
     PendingReads pend_;
-    bool submit_reads(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts, std::string& err);
+    /// `into_slots`: every destination is a slab slot (materialize_begin), so an expert pack may read straight into
+    /// it; read_experts_to's destinations are the caller's buffers and always go through the bounce buffer.
+    bool submit_reads(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts, bool into_slots,
+                      std::string& err);
     bool collect_reads(std::string& err);
     std::unique_lock<std::mutex> mat_lock_;   ///< #95: host_mu_, held from materialize_begin to materialize_end
     std::vector<int32_t> mat_es_;
@@ -667,6 +673,7 @@ private:
     std::string pack_path_;                                ///< #81: set_expert_pack's file ("" = the GGUF / experts.bin)
     std::vector<uint64_t> pack_off_, pack_stride_;         ///< #81: per layer
     uint64_t mirror_turn_ = 0;                             ///< #82: the batch count, the tie-break's starting copy
+    bool mirror_rotate_ = true;   ///< #82: STRATA_MIRROR_ROTATE=0 keeps every tie at the source
     /// #62: per source file, its verified copies (resolved on first use)
     std::vector<std::pair<std::string, std::vector<std::string>>> copies_;
     bool copies_of(const std::string& source, const std::vector<std::string>*& out, std::string& err);

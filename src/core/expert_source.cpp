@@ -1864,7 +1864,7 @@ bool ArenaExpertSource::copies_of(const std::string& source, const std::vector<s
 
 bool ArenaExpertSource::read_experts_to(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts,
                                         std::string& err) {
-    return submit_reads(layers, experts, n, dsts, err) && collect_reads(err);
+    return submit_reads(layers, experts, n, dsts, /*into_slots=*/false, err) && collect_reads(err);
 }
 
 // #81: the expert pack's alignment, which is also the slab's slot stride unit and the direct reader's sector: a pack
@@ -1873,7 +1873,7 @@ constexpr uint64_t kPackAlign = 4096;
 static uint64_t round_up(uint64_t x, uint64_t a) { return (x + a - 1) / a * a; }
 
 bool ArenaExpertSource::submit_reads(const int32_t* layers, const int32_t* experts, int n, uint8_t* const* dsts,
-                                     std::string& err) {
+                                     bool into_slots, std::string& err) {
     using strata::platform::DirectFile;
     const auto& lay = strata::kernels::cpu::expert_layout();
     constexpr uint64_t A = DirectFile::alignment();
@@ -1949,9 +1949,9 @@ bool ArenaExpertSource::submit_reads(const int32_t* layers, const int32_t* exper
         for (int r = 0; r < nr; ++r) {
             const uint64_t a0 = off[r] & ~(A - 1), a1 = (off[r] + len[r] + A - 1) & ~(A - 1);
             // #81: a pack's expert into a slab slot directly: set_expert_pack checked its offset is aligned, a slot
-            // is page-aligned and its stride is the read's length (the blob rounded up to kPackAlign); anything else
-            // lands in the bounce buffer and is copied
-            const bool direct = packed && slab_;
+            // is page-aligned and its stride is the read's length (the blob rounded up to kPackAlign).  Only the
+            // caller knows its destinations are slots; anything else lands in the bounce buffer and is copied
+            const bool direct = packed && into_slots && slab_;
             uint8_t* buf = direct ? dsts[i] : (uint8_t*) dscratch_ + reqs.size() * slot_bytes;
             if (!((DirectFile*) d.file)->submit(a0, buf, (uint32_t) (a1 - a0), (uint64_t) reqs.size(), err))
                 return false;
@@ -1960,7 +1960,7 @@ bool ArenaExpertSource::submit_reads(const int32_t* layers, const int32_t* exper
             queued_of(fi) += a1 - a0;
         }
     }
-    if (used_mirror) ++mirror_turn_;
+    if (used_mirror && mirror_rotate_) ++mirror_turn_;
     return true;
 }
 
@@ -1978,6 +1978,11 @@ bool ArenaExpertSource::set_expert_pack(const std::string& path, std::string& er
     uint32_t h32[4];
     std::memcpy(h32, head.data() + 8, sizeof h32);
     if (std::memcmp(head.data(), "STRAPACK", 8) != 0 || h32[0] != 1) { err = "expert pack: " + path + " is not a v1 pack"; return false; }
+    if (h32[3] != kPackAlign) {
+        err = "expert pack: " + path + " has alignment " + std::to_string(h32[3]) + ", this engine reads " +
+              std::to_string(kPackAlign);
+        return false;
+    }
     if ((int64_t) h32[1] != lay.n_layers || (int64_t) h32[2] != n_expert_ || 24 + 24 * (uint64_t) h32[1] > head.size()) {
         err = "expert pack: " + path + " holds " + std::to_string(h32[1]) + " layers x " + std::to_string(h32[2]) +
               " experts, the model " + std::to_string(lay.n_layers) + " x " + std::to_string(n_expert_);
@@ -2340,6 +2345,23 @@ const uint8_t* ArenaExpertSource::materialize(int64_t layer, int64_t expert, int
     return materialize_locked(layer, expert, avoid_layer, err);
 }
 
+const uint8_t* ArenaExpertSource::hold_resident(int64_t layer, int64_t expert) {
+    std::lock_guard<std::mutex> lk(host_mu_);
+    if (!resident(layer, expert)) return nullptr;
+    const size_t i = (size_t) (layer * n_expert_ + expert);
+    if (i < held_.size() && held_[i] < 255) ++held_[i];
+    if (i < score_.size()) score_[i] += 1.0f;
+    touch_up(i);
+    ++reads_;
+    return host_at(i);
+}
+
+void ArenaExpertSource::add_mirror(const std::string& dir) {
+    mirror_dirs_.push_back(dir);
+    const char* r = std::getenv("STRATA_MIRROR_ROTATE");   // #82's A/B arm: 0 = every tie to the source, as before
+    mirror_rotate_ = !(r != nullptr && *r && std::atoi(r) == 0);
+}
+
 const uint8_t* ArenaExpertSource::acquire(int64_t layer, int64_t expert, std::string& err) {
     std::lock_guard<std::mutex> lk(host_mu_);
     const size_t i = (size_t) (layer * n_expert_ + expert);
@@ -2413,7 +2435,7 @@ bool ArenaExpertSource::materialize_begin(int64_t layer, const int32_t* experts,
     }
     if (es.empty()) return true;
     const auto ts = std::chrono::steady_clock::now();
-    const bool submitted = submit_reads(ls.data(), es.data(), (int) es.size(), dsts.data(), err);
+    const bool submitted = submit_reads(ls.data(), es.data(), (int) es.size(), dsts.data(), /*into_slots=*/true, err);
     stages_.submit_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
     if (!submitted) {   // the caller fails loudly
         unwind_batch(layer, es);
