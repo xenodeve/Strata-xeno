@@ -161,7 +161,7 @@ export function Sidebar({ drawer = false, onClose }: { drawer?: boolean; onClose
         <BranchedMenu fill label={t("Recents")} sections={recentSections} active={idx.active ?? ""} onSelect={pick} open={openOf(recentSections)} onToggle={toggleFold} />
       </section>
 
-      <NewProjectDialog open={adding} onCancel={() => setAdding(false)} onCreate={(name, folder) => { chat.addProject(name, folder); setAdding(false) }} />
+      <NewProjectDialog open={adding} onCancel={() => setAdding(false)} onCreate={(name, folders) => { chat.addProject(name, folders); setAdding(false) }} />
 
       {menu && (
         <div role="menu" aria-label={t("Options")} style={menuStyle} className="toast-in z-50 w-52 rounded-lg border border-line bg-surface p-1 shadow-[0_14px_40px_-12px_rgb(0_0_0/0.28)]">

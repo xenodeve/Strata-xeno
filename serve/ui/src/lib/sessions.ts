@@ -8,7 +8,10 @@
 
 export interface StoredMessage { role: string; text: string; time?: number; files?: { name: string }[]; images?: { name: string }[] }
 export interface SessionMeta { id: string; title: string; time: number; project?: string; named?: boolean }
-export interface Project { id: string; name: string; folder?: string }      // folder: where the chat's coding tools work (issue #96)
+/** folders: where the coding tools of the project's chats work (issue #96). The first is the main one (commands run there, relative paths start there); the others are
+ *  the project's other folders, such as other git worktrees of the same repository, where files are as free as in the main one. */
+export interface Project { id: string; name: string; folders?: string[] }
+export const FOLDERS_MAX = 20
 export interface SessionIndex { active: string | null; items: SessionMeta[]; projects: Project[] }
 export interface Backing { get<T>(k: string, d: T): T; set(k: string, v: unknown): boolean; remove(k: string): void }
 
@@ -38,6 +41,12 @@ export function titleOf(messages: StoredMessage[]): string {
 const isObj = (x: unknown): x is Record<string, unknown> => !!x && typeof x === "object" && !Array.isArray(x)
 const FOLDER_MAX = 1000
 const okFolder = (x: unknown): x is string => typeof x === "string" && x.trim().length > 0 && x.trim().length <= FOLDER_MAX
+/** The folders that are text, cleaned, once each, in order, no more than FOLDERS_MAX. */
+export function cleanFolders(x: unknown): string[] {
+  const out: string[] = []
+  for (const f of Array.isArray(x) ? x : []) if (okFolder(f) && !out.includes(f.trim())) out.push(f.trim())
+  return out.slice(0, FOLDERS_MAX)
+}
 
 function sanitize(raw: unknown): SessionIndex | null {
   if (!isObj(raw) || !Array.isArray(raw.items)) return null
@@ -50,7 +59,10 @@ function sanitize(raw: unknown): SessionIndex | null {
     })
   }
   const projects: Project[] = []
-  for (const p of Array.isArray(raw.projects) ? raw.projects : []) if (isObj(p) && typeof p.id === "string" && typeof p.name === "string") projects.push({ id: p.id, name: p.name, ...(okFolder(p.folder) ? { folder: p.folder.trim() } : {}) })
+  for (const p of Array.isArray(raw.projects) ? raw.projects : []) if (isObj(p) && typeof p.id === "string" && typeof p.name === "string") {
+    const folders = cleanFolders(Array.isArray(p.folders) ? p.folders : [p.folder])        // a project made when it had one folder has `folder`
+    projects.push({ id: p.id, name: p.name, ...(folders.length ? { folders } : {}) })
+  }
   const active = typeof raw.active === "string" && items.some((i) => i.id === raw.active) ? raw.active : null
   return { active, items, projects }
 }
@@ -133,11 +145,11 @@ export function moveSession(index: SessionIndex, id: string, project: string | u
   return { ...index, items: index.items.map((i) => { if (i.id !== id) return i; const { project: _was, ...rest } = i; return project === undefined ? rest : { ...rest, project } }) }
 }
 
-/** A project is a name and the folder its chats work in (the coding tools). The page asks for the folder; projects made before that have none. */
-export function addProject(index: SessionIndex, name: string, id: string = newId(), folder?: string): SessionIndex {
+/** A project is a name and the folders its chats work in (the coding tools). The page asks for at least one; projects made before that have none. */
+export function addProject(index: SessionIndex, name: string, id: string = newId(), folders?: string[]): SessionIndex {
   const n = clean(name, NAME_MAX)
-  const f = okFolder(folder) ? folder.trim() : undefined
-  return n ? { ...index, projects: [...index.projects, { id, name: n, ...(f ? { folder: f } : {}) }] } : index
+  const f = cleanFolders(folders)
+  return n ? { ...index, projects: [...index.projects, { id, name: n, ...(f.length ? { folders: f } : {}) }] } : index
 }
 
 export function renameProject(index: SessionIndex, id: string, name: string): SessionIndex {
@@ -146,15 +158,14 @@ export function renameProject(index: SessionIndex, id: string, name: string): Se
   return { ...index, projects: index.projects.map((p) => (p.id === id ? { ...p, name: n } : p)) }
 }
 
-/** The folder a project's chats work in (the coding tools), or blank to clear it; the server checks that it is a folder. */
-export function setProjectFolder(index: SessionIndex, id: string, folder: string): SessionIndex {
+/** The folders a project's chats work in (the coding tools), in order (the first is the main one); none clears them. The server checks that they are folders. */
+export function setProjectFolders(index: SessionIndex, id: string, folders: string[]): SessionIndex {
   if (!index.projects.some((p) => p.id === id)) return index
-  const f = folder.trim()
-  if (f.length > FOLDER_MAX) return index
-  return { ...index, projects: index.projects.map((p) => { if (p.id !== id) return p; const { folder: _was, ...rest } = p; return f ? { ...rest, folder: f } : rest }) }
+  const f = cleanFolders(folders)
+  return { ...index, projects: index.projects.map((p) => { if (p.id !== id) return p; const { folders: _was, ...rest } = p; return f.length ? { ...rest, folders: f } : rest }) }
 }
 
-export const folderOf = (index: SessionIndex, project: string | undefined): string | null => (project ? index.projects.find((p) => p.id === project)?.folder ?? null : null)
+export const foldersOf = (index: SessionIndex, project: string | undefined): string[] => (project ? index.projects.find((p) => p.id === project)?.folders ?? [] : [])
 
 /** Deleting a project does not delete its conversations: they are unfiled. */
 export function removeProject(index: SessionIndex, id: string): SessionIndex {

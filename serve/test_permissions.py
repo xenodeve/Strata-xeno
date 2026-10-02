@@ -115,6 +115,50 @@ class FilesInTheFolder(Base):
         self.assertEqual(self.kind("KillShell", {"shell_id": "bash_1"}), "allow")
 
 
+class OtherFolders(Base):
+    """A project can have more than one folder (other git worktrees of the same repository, a library next to the app): the other folders are
+    as free as the main one. The main one is still where commands run and relative paths start."""
+
+    def setUp(self):
+        super().setUp()
+        self.wt = self.base / "proj-wt2"
+        (self.wt / "src").mkdir(parents=True)
+        (self.wt / "src" / "c.py").write_text("y = 2\n", encoding="utf-8")
+        (self.wt / ".git").write_text("gitdir: ../proj/.git/worktrees/wt2\n", encoding="utf-8")        # a worktree's .git is a file
+
+    def test_files_in_another_folder_are_as_free_as_in_the_main_one(self):
+        for tool, args in (("Read", {"file_path": str(self.wt / "src" / "c.py")}), ("Write", {"file_path": str(self.wt / "src" / "new.py"), "content": "z"}),
+                           ("Glob", {"pattern": "*.py", "path": str(self.wt / "src")}), ("Grep", {"pattern": "y", "path": str(self.wt)})):
+            self.assertEqual(self.kind(tool, args, dirs=[str(self.wt)]), "allow", tool)
+            self.assertEqual(self.kind(tool, args), "ask", tool)                                   # not named: outside the project
+
+    def test_what_is_in_neither_still_asks(self):
+        self.assertEqual(self.kind("Read", {"file_path": str(self.outside / "b.txt")}, dirs=[str(self.wt)]), "ask")
+
+    def test_a_folder_that_only_starts_with_the_same_name_is_not_inside(self):
+        sibling = self.base / "proj-wt2-copy"
+        sibling.mkdir()
+        (sibling / "f.txt").write_text("f", encoding="utf-8")
+        self.assertEqual(self.kind("Read", {"file_path": str(sibling / "f.txt")}, dirs=[str(self.wt)]), "ask")
+
+    def test_the_git_folder_of_any_of_them_still_asks_for_a_change(self):
+        self.assertEqual(self.kind("Write", {"file_path": str(self.wt / ".git"), "content": "x"}, dirs=[str(self.wt)]), "ask")
+        self.assertEqual(self.kind("Write", {"file_path": str(self.wt / ".git" / "hooks" / "pre-commit"), "content": "x"}, dirs=[str(self.wt)]), "ask")
+
+    def test_a_read_only_command_may_read_in_them(self):
+        cmd = f"ls {(self.wt / 'src').as_posix()}"
+        self.assertEqual(P.decide("Bash", {"command": cmd}, self.ctx(dirs=[str(self.wt)])).kind, "allow")
+        self.assertEqual(P.decide("Bash", {"command": cmd}, self.ctx()).kind, "ask")
+
+    def test_other_folders_without_a_main_one_count_for_nothing(self):
+        d = P.decide("Read", {"file_path": str(self.wt / "src" / "c.py")}, P.Policy(cwd=None, dirs=[str(self.wt)]))
+        self.assertEqual(d.kind, "ask")
+
+    def test_a_secret_in_another_folder_still_asks(self):
+        (self.wt / ".env").write_text("K=1", encoding="utf-8")
+        self.assertEqual(self.kind("Read", {"file_path": str(self.wt / ".env")}, dirs=[str(self.wt)]), "ask")
+
+
 class Rules(Base):
     def test_an_allow_rule_lets_a_path_outside_through(self):
         rule = f"Read({(self.outside).as_posix()}/**)"

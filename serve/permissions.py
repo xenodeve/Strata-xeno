@@ -29,10 +29,11 @@ FREE = ("TodoWrite", "BashOutput", "KillShell")      # they only act on what the
 
 @dataclass
 class Policy:
-    cwd: str | None                          # the chat's project folder (None: it has none)
+    cwd: str | None                          # the chat's project folder (None: it has none): where commands run and relative paths start
     mode: str | None = None                  # "plan" | "auto" | anything else is the default
     allow: list[str] = field(default_factory=list)
     deny: list[str] = field(default_factory=list)
+    dirs: list[str] = field(default_factory=list)   # the project's other folders (Claude Code's additional directories, e.g. other worktrees): files in them are as free as in `cwd`
 
 
 @dataclass
@@ -85,6 +86,14 @@ def is_secret(path: str) -> bool:
         return True
     last = parts[-1]
     return bool(SECRET_FILES.match(last)) and not ENV_TEMPLATE.match(last)
+
+
+def root_of(path: str, pol: "Policy") -> str | None:
+    """The folder of the project that holds `path` (both already resolved), or None when it is outside all of them. Other folders count only with a main one."""
+    for root in ([pol.cwd, *pol.dirs] if pol.cwd else []):
+        if inside(path, root):
+            return root
+    return None
 
 
 def in_git(path: str, root: str) -> bool:
@@ -295,7 +304,7 @@ def _readonly_segment(words: list[str], pol: Policy) -> tuple[bool, str]:
         return (False, "it names no project folder to read from") if not paths else (False, "this chat has no project folder")
     for a in paths or ["."]:
         r = real(a, pol.cwd)
-        if r is None or not inside(r, pol.cwd):
+        if r is None or root_of(r, pol) is None:
             return False, "it reads outside the project folder"
         if is_secret(r):
             return False, "it reads a file that looks like a secret"
@@ -450,8 +459,9 @@ def decide(tool: str, args: dict, pol: Policy) -> Decision:
         return ask("it looks like a secret (a key, a token, an .env file)", judge=False)
     if not pol.cwd:
         return ask("this chat has no project folder")
-    if not inside(target, pol.cwd):
+    root = root_of(target, pol)
+    if root is None:
         return ask("it is outside the project folder")
-    if tool in FILE_EDIT and in_git(target, pol.cwd):
+    if tool in FILE_EDIT and in_git(target, root):
         return ask("a change in .git can run programs (hooks) later", judge=False)
     return Decision("allow", "inside the project folder")

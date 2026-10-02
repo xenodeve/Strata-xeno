@@ -44,7 +44,7 @@ def project_notes(cwd: str | None) -> tuple[str, str] | None:
     return None
 
 
-def build(cwd: str | None, shell: str | None, mode: str | None, today: str, platform: str, git: bool, notes: tuple[str, str] | None, tools: list[str]) -> str:
+def build(cwd: str | None, shell: str | None, mode: str | None, today: str, platform: str, git: bool, notes: tuple[str, str] | None, tools: list[str], dirs: list[str] | None = None) -> str:
     has = set(tools)
     out = [
         "You are a coding assistant working on the user's own computer, in a chat. You can read and change files and run commands with the tools below. "
@@ -76,6 +76,7 @@ def build(cwd: str | None, shell: str | None, mode: str | None, today: str, plat
         "",
         "# Environment",
         f"- Project folder: {cwd}" if cwd else "- There is no project folder for this chat, so commands cannot run and any file needs the user's permission. Tell the user to choose a folder for the chat's project if you need one.",
+        *([f"- Other folders of the project (for example other git worktrees; files in them are as free as in the project folder, but commands run in the project folder, so give paths in them in full): {', '.join(dirs)}"] if dirs and cwd else []),
         *([f"- Is a git repository: yes (the project folder is in one)"] if git and cwd else []),
         f"- Platform: {platform}",
         f"- Shell: {shell}" if shell else "- Shell: none (no commands can be run)",

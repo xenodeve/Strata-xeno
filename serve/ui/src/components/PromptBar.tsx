@@ -125,7 +125,7 @@ export function PromptBar(p: PromptBarProps) {
     },
     {
       key: "agent", name: t("Coding tools"), icon: ComputerTerminal01Icon, checked: usableAgent && p.agent.on,
-      description: !p.agent.info.available ? t("Not on this server") : !p.agent.info.allowed ? t("Only from the PC that runs Strata") : p.agent.folder ? p.agent.folder : t("No folder yet. Set one to work in."),
+      description: !p.agent.info.available ? t("Not on this server") : !p.agent.info.allowed ? t("Only from the PC that runs Strata") : p.agent.folders.length ? p.agent.folders[0] + (p.agent.folders.length > 1 ? ` +${p.agent.folders.length - 1}` : "") : t("No folder yet. Set one to work in."),
       state: usableAgent ? (p.agent.on ? t("on") : t("off")) : undefined,
     },
     { key: "sampling", name: t("Sampling"), description: t("Temperature, top-p, seed and more"), icon: Settings02Icon },

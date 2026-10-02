@@ -8,15 +8,16 @@ export const NO_AGENT: AgentInfo = { available: false, allowed: false, shell: nu
 export type AgentMode = "ask" | "plan" | "auto"
 export const MODES: AgentMode[] = ["ask", "plan", "auto"]
 
-export interface AgentRequest { cwd?: string; mode: AgentMode; session: string; allow: string[] }
+export interface AgentRequest { cwd?: string; dirs?: string[]; mode: AgentMode; session: string; allow: string[] }
 
 /** What a request says: `strata_agent` when the coding tools are on (the default), reachable from here and the server has them; else nothing.
  *  An unknown mode is the default one (the server also ignores it). */
-export function agentRequest(s: { agent?: boolean; agentMode?: string }, info: AgentInfo, folder: string | null | undefined, session: string | null, rules: string[]): { strata_agent?: AgentRequest } {
+export function agentRequest(s: { agent?: boolean; agentMode?: string }, info: AgentInfo, folders: string | string[] | null | undefined, session: string | null, rules: string[]): { strata_agent?: AgentRequest } {
   if (s.agent === false || !info.available || !info.allowed) return {}
   const mode: AgentMode = s.agentMode === "plan" || s.agentMode === "auto" ? s.agentMode : "ask"
-  const cwd = typeof folder === "string" ? folder.trim() : ""
-  return { strata_agent: { ...(cwd ? { cwd } : {}), mode, session: session || "new", allow: rules.slice(0, 200) } }
+  const list = (Array.isArray(folders) ? folders : [folders]).filter((f): f is string => typeof f === "string" && f.trim().length > 0).map((f) => f.trim())
+  const [cwd, ...dirs] = list                                                  // the first is the main folder; the others are the project's other folders
+  return { strata_agent: { ...(cwd ? { cwd } : {}), ...(cwd && dirs.length ? { dirs } : {}), mode, session: session || "new", allow: rules.slice(0, 200) } }
 }
 
 // ------------------------------------------------------------------------------------------------ the rules of a chat

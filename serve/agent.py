@@ -28,6 +28,7 @@ from typing import Callable
 
 from serve import permissions
 
+MAX_DIRS = 20                                   # the project's other folders that one request may name
 MAX_READ_LINES = 2000
 MAX_LINE_CHARS = 2000
 MAX_READ_BYTES = 256 * 1024

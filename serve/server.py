@@ -890,6 +890,13 @@ class Service:
         AI as a prompt, and auto mode's judge (serve/agent_run.py)."""
         raw = sa.get("cwd")
         folder = os.path.realpath(raw) if isinstance(raw, str) and raw.strip() and "\0" not in raw and os.path.isdir(raw) else None
+        dirs: list[str] = []                                            # the project's other folders: the real ones, once each, not the main one; none without a main one
+        for d in sa.get("dirs") if folder and isinstance(sa.get("dirs"), list) else []:
+            if isinstance(d, str) and d.strip() and "\0" not in d and os.path.isdir(d):
+                r = os.path.realpath(d)
+                if os.path.normcase(r) != os.path.normcase(folder) and os.path.normcase(r) not in [os.path.normcase(x) for x in dirs]:
+                    dirs.append(r)
+        dirs = dirs[:agent_mod.MAX_DIRS]
         mode = sa.get("mode") if sa.get("mode") in ("auto", "plan") else None
         rules = lambda v: [x for x in v if isinstance(x, str) and 0 < len(x) <= 500][:200] if isinstance(v, list) else []      # noqa: E731
         sid = sa.get("session") if isinstance(sa.get("session"), str) and 0 < len(sa["session"]) <= 80 else "default"
@@ -900,7 +907,7 @@ class Service:
                 goal = c if isinstance(c, str) else "".join(p.get("text", "") for p in c if isinstance(p, dict)) if isinstance(c, list) else ""
                 break
         sh = getattr(self.agent, "shell", None)
-        policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")))
+        policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs)
         run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell_mod.describe(sh) if sh else None)
         git, d = False, folder
         for _ in range(6):                                              # the folder or one of the folders above it holds .git
@@ -912,7 +919,7 @@ class Service:
             parent = os.path.dirname(d)
             d = parent if parent != d else None
         tools = [t["name"] for t in self.agent.tools if t["name"] != "ExitPlanMode" or mode == "plan"]
-        run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, agent_prompt.project_notes(folder), tools)
+        run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, agent_prompt.project_notes(folder), tools, dirs)
         return run
 
     def replay_key(self, req: dict, ids, max_new):

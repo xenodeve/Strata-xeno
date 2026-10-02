@@ -21,6 +21,13 @@ describe("agentRequest: what a chat request says about the coding tools", () => 
     expect("cwd" in r).toBe(false)
     expect(r.mode).toBe("ask")
   })
+  test("several folders: the first is the main one, the others are the project's other folders", () => {
+    const r = agentRequest({ agent: true }, ON, [" C:/work/app ", "C:/work/app-wt2", "", "C:/lib"], "c", []).strata_agent!
+    expect(r.cwd).toBe("C:/work/app")
+    expect(r.dirs).toEqual(["C:/work/app-wt2", "C:/lib"])
+    expect("dirs" in agentRequest({ agent: true }, ON, ["C:/only"], "c", []).strata_agent!).toBe(false)
+    expect("cwd" in agentRequest({ agent: true }, ON, [], "c", []).strata_agent!).toBe(false)
+  })
   test("an empty folder text is no folder", () => { expect("cwd" in agentRequest({ agent: true }, ON, "  ", "c", []).strata_agent!).toBe(false) })
   test("switched off, or not available, or not allowed from here: nothing", () => {
     expect(agentRequest({ agent: false }, ON, "x", "c", [])).toEqual({})

@@ -274,6 +274,41 @@ class AutoMode(Fixture):
         self.assertEqual(len(self.engine.prompts), 2)                           # no judge request
 
 
+class OtherFolders(Fixture):
+    """The page names the project's other folders (strata_agent.dirs): the model is told of them and files in them are free; odd values are ignored."""
+
+    def setUp(self):
+        super().setUp()
+        self.wt = self.base / "proj-wt2"
+        self.wt.mkdir()
+        (self.wt / "c.txt").write_text("from the other worktree\n", encoding="utf-8")
+
+    def test_a_file_in_another_folder_runs_without_asking_and_the_prompt_names_it(self):
+        self.start(tool_call("Read", file_path=str(self.wt / "c.txt")), DONE)
+        status, said, events = self.chat(self.body(agent={"dirs": [str(self.wt)]}))
+        self.assertEqual(status, 200)
+        self.assertFalse([e for e in events if e["event"] == "permission"])
+        self.assertIn("from the other worktree", json.dumps(events))
+        self.assertIn("Other folders of the project", self.engine.prompt_text(0))
+        self.assertIn(str(self.wt), self.engine.prompt_text(0))
+
+    def test_without_naming_it_the_same_file_asks(self):
+        self.start(tool_call("Read", file_path=str(self.wt / "c.txt")), DONE)
+        seen = []
+        self.chat(self.body(), on_event=lambda e: e["event"] == "permission" and (seen.append(e), self.answer(e["id"], "deny")))
+        self.assertEqual(len(seen), 1)
+
+    def test_odd_values_are_ignored(self):
+        self.start(DONE)
+        odd = [5, None, "", "x\0y", str(self.base / "nope"), str(self.proj), str(self.wt), str(self.wt), {"a": 1}]
+        status, _, _ = self.chat(self.body(agent={"dirs": odd}))
+        self.assertEqual(status, 200)
+        status, _, _ = self.chat(self.body(agent={"dirs": "not a list"}))
+        self.assertEqual(status, 200)
+        status, _, _ = self.chat(self.body(agent={"cwd": "", "dirs": [str(self.wt)]}))             # other folders without a main one
+        self.assertEqual(status, 200)
+
+
 class TheDoor(Fixture):
     def test_a_foreign_origin_is_refused(self):
         self.start(DONE)

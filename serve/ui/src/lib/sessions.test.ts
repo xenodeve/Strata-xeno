@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
-  addProject, folderOf, loadIndex, moveSession, newSession, openSession, removeProject, removeSession, renameProject, renameSession, saveActive, setProjectFolder, titleOf,
+  addProject, cleanFolders, foldersOf, FOLDERS_MAX, loadIndex, moveSession, newSession, openSession, removeProject, removeSession, renameProject, renameSession, saveActive, setProjectFolders, titleOf,
   type Backing, type SessionIndex,
 } from "./sessions"
 
@@ -191,37 +191,49 @@ describe("projects", () => {
     expect(idx.projects[0].name).toBe("Home")
     expect(renameProject(idx, "p1", "")).toBe(idx)
   })
-  test("a project made with a folder keeps it; one that is no text is not kept", () => {
+  test("a project made with folders keeps them, in order, once each; what is no text is not kept", () => {
     const idx: SessionIndex = { active: null, items: [], projects: [] }
-    expect(addProject(idx, "Work", "p1", " C:/work ").projects).toEqual([{ id: "p1", name: "Work", folder: "C:/work" }])
-    expect(addProject(idx, "Work", "p1", "   ").projects).toEqual([{ id: "p1", name: "Work" }])
-    expect(addProject(idx, "   ", "p1", "C:/work")).toBe(idx)
+    expect(addProject(idx, "Work", "p1", [" C:/work ", "C:/work-wt2", "C:/work"]).projects).toEqual([{ id: "p1", name: "Work", folders: ["C:/work", "C:/work-wt2"] }])
+    expect(addProject(idx, "Work", "p1", ["   ", ""]).projects).toEqual([{ id: "p1", name: "Work" }])
+    expect(addProject(idx, "Work", "p1").projects).toEqual([{ id: "p1", name: "Work" }])
+    expect(addProject(idx, "   ", "p1", ["C:/work"])).toBe(idx)
   })
-  test("a project has a folder on this PC, for the coding tools (issue #96): set, cleaned, cleared, kept through a reload", () => {
+  test("no more folders than FOLDERS_MAX are kept", () => {
+    const many = Array.from({ length: FOLDERS_MAX + 5 }, (_, i) => `C:/w${i}`)
+    expect(cleanFolders(many)).toHaveLength(FOLDERS_MAX)
+    expect(cleanFolders(many)[0]).toBe("C:/w0")
+    expect(cleanFolders("C:/x")).toEqual([])
+  })
+  test("a project has folders on this PC, for the coding tools (issue #96): set, cleaned, in order, cleared, kept through a reload", () => {
     const b = memory()
     let idx = addProject({ active: null, items: [], projects: [] }, "Work", "p1")
-    expect(folderOf(idx, "p1")).toBeNull()
-    idx = setProjectFolder(idx, "p1", "  C:/work/app  ")
-    expect(idx.projects[0]).toEqual({ id: "p1", name: "Work", folder: "C:/work/app" })
-    expect(folderOf(idx, "p1")).toBe("C:/work/app")
+    expect(foldersOf(idx, "p1")).toEqual([])
+    idx = setProjectFolders(idx, "p1", ["  C:/work/app  ", "C:/work/app-wt2"])
+    expect(idx.projects[0]).toEqual({ id: "p1", name: "Work", folders: ["C:/work/app", "C:/work/app-wt2"] })
+    expect(foldersOf(idx, "p1")).toEqual(["C:/work/app", "C:/work/app-wt2"])
     b.set("chats", idx)
-    expect(loadIndex(b, 1).projects[0].folder).toBe("C:/work/app")
-    expect(folderOf(setProjectFolder(idx, "p1", "   "), "p1")).toBeNull()               // blank clears it
-    expect("folder" in setProjectFolder(idx, "p1", "").projects[0]).toBe(false)
-    expect(setProjectFolder(idx, "nope", "x")).toBe(idx)
-    expect(folderOf(idx, undefined)).toBeNull()
-    expect(folderOf(idx, "nope")).toBeNull()
+    expect(loadIndex(b, 1).projects[0].folders).toEqual(["C:/work/app", "C:/work/app-wt2"])
+    expect(foldersOf(setProjectFolders(idx, "p1", ["   "]), "p1")).toEqual([])           // blank clears them
+    expect("folders" in setProjectFolders(idx, "p1", []).projects[0]).toBe(false)
+    expect(setProjectFolders(idx, "nope", ["x"])).toBe(idx)
+    expect(foldersOf(idx, undefined)).toEqual([])
+    expect(foldersOf(idx, "nope")).toEqual([])
+  })
+  test("a project made when it had one folder (`folder`) still has it", () => {
+    const b = memory()
+    b.set("chats", { active: null, items: [], projects: [{ id: "p1", name: "A", folder: " C:/old " }, { id: "p2", name: "B", folder: "C:/x", folders: ["C:/y"] }] })
+    expect(loadIndex(b, 1).projects).toEqual([{ id: "p1", name: "A", folders: ["C:/old"] }, { id: "p2", name: "B", folders: ["C:/y"] }])
   })
   test("a folder that is not text, or is absurdly long, is not kept", () => {
     const b = memory()
-    b.set("chats", { active: null, items: [], projects: [{ id: "p1", name: "A", folder: 5 }, { id: "p2", name: "B", folder: "x".repeat(2000) }, { id: "p3", name: "C", folder: "C:/ok" }] })
-    expect(loadIndex(b, 1).projects.map((p) => p.folder)).toEqual([undefined, undefined, "C:/ok"])
-    expect(setProjectFolder({ active: null, items: [], projects: [{ id: "p1", name: "A" }] }, "p1", "y".repeat(2000)).projects[0].folder).toBeUndefined()
+    b.set("chats", { active: null, items: [], projects: [{ id: "p1", name: "A", folders: [5, null] }, { id: "p2", name: "B", folders: ["x".repeat(2000)] }, { id: "p3", name: "C", folders: ["C:/ok", 7, "C:/ok"] }] })
+    expect(loadIndex(b, 1).projects.map((p) => p.folders)).toEqual([undefined, undefined, ["C:/ok"]])
+    expect(setProjectFolders({ active: null, items: [], projects: [{ id: "p1", name: "A" }] }, "p1", ["y".repeat(2000)]).projects[0].folders).toBeUndefined()
   })
-  test("renaming a project keeps its folder", () => {
-    let idx = setProjectFolder(addProject({ active: null, items: [], projects: [] }, "Work", "p1"), "p1", "C:/w")
+  test("renaming a project keeps its folders", () => {
+    let idx = setProjectFolders(addProject({ active: null, items: [], projects: [] }, "Work", "p1"), "p1", ["C:/w", "C:/w2"])
     idx = renameProject(idx, "p1", "Home")
-    expect(idx.projects[0]).toEqual({ id: "p1", name: "Home", folder: "C:/w" })
+    expect(idx.projects[0]).toEqual({ id: "p1", name: "Home", folders: ["C:/w", "C:/w2"] })
   })
   test("deleting a project keeps its conversations, which are unfiled", () => {
     const b = memory()

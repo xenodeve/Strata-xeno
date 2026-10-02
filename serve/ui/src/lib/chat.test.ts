@@ -333,8 +333,8 @@ describe("the coding tools in the chat", () => {
     mockFetch([sse(...finish)], seen)
     const c = new ChatController()
     c.setSettings({ ...c.settings, agentMode: "plan" })
-    await c.send("hi", [], { ...ctx, agent: ON, folder: "C:/work/app" })
-    expect(seen[0].strata_agent).toEqual({ cwd: "C:/work/app", mode: "plan", session: c.index.active, allow: [] })
+    await c.send("hi", [], { ...ctx, agent: ON, folder: ["C:/work/app", "C:/work/app-wt2"] })
+    expect(seen[0].strata_agent).toEqual({ cwd: "C:/work/app", dirs: ["C:/work/app-wt2"], mode: "plan", session: c.index.active, allow: [] })
   })
 
   test("without the tools (switched off, or the server has none) the request has no strata_agent", async () => {
@@ -477,10 +477,12 @@ describe("the coding tools in the chat", () => {
     expect(c.folder()).toBe("C:/default")
     c.move("s1", "p1")
     expect(c.folder()).toBe("C:/default")                                      // the project has no folder yet
-    c.setProjectFolder("p1", " C:/work/app ")
-    expect(c.folder()).toBe("C:/work/app")
-    c.setProjectFolder("p1", "")
+    c.setProjectFolders("p1", [" C:/work/app ", "C:/work/app-wt2"])
+    expect(c.folder()).toBe("C:/work/app")                                     // the first is the main one
+    expect(c.folders()).toEqual(["C:/work/app", "C:/work/app-wt2"])
+    c.setProjectFolders("p1", [])
     expect(c.folder()).toBe("C:/default")
+    expect(c.folders()).toEqual(["C:/default"])
     c.setSettings({ ...c.settings, agentFolder: "  " })
     expect(c.folder()).toBeNull()
   })
@@ -488,23 +490,24 @@ describe("the coding tools in the chat", () => {
   test("a project cannot be made without a folder, and it is the folder its chats' tools work in", () => {
     keep()
     const c = new ChatController()
-    expect(c.addProject("Work", "")).toBeNull()
-    expect(c.addProject("Work", "   ")).toBeNull()
+    expect(c.addProject("Work", [])).toBeNull()
+    expect(c.addProject("Work", ["   "])).toBeNull()
     expect(c.index.projects).toEqual([])
-    expect(c.addProject("", "C:/work/app")).toBeNull()                         // a name is needed too
-    const id = c.addProject("Work", "  C:/work/app ")!
-    expect(c.index.projects).toEqual([{ id, name: "Work", folder: "C:/work/app" }])
+    expect(c.addProject("", ["C:/work/app"])).toBeNull()                       // a name is needed too
+    const id = c.addProject("Work", ["  C:/work/app ", "C:/work/app-wt2"])!
+    expect(c.index.projects).toEqual([{ id, name: "Work", folders: ["C:/work/app", "C:/work/app-wt2"] }])
     c.index = { ...c.index, active: "s1", items: [{ id: "s1", title: "t", time: 1, project: id }] }
     expect(c.folder()).toBe("C:/work/app")
-    expect(new ChatController().index.projects[0].folder).toBe("C:/work/app")
+    expect(c.folders()).toEqual(["C:/work/app", "C:/work/app-wt2"])
+    expect(new ChatController().index.projects[0].folders).toEqual(["C:/work/app", "C:/work/app-wt2"])
   })
 
-  test("a project's folder is kept with the conversations", () => {
+  test("a project's folders are kept with the conversations", () => {
     keep()
     const c = new ChatController()
     c.index = { active: null, items: [], projects: [{ id: "p1", name: "Work" }] }
-    c.setProjectFolder("p1", "C:/work/app")
-    expect(new ChatController().index.projects[0].folder).toBe("C:/work/app")
+    c.setProjectFolders("p1", ["C:/work/app"])
+    expect(new ChatController().index.projects[0].folders).toEqual(["C:/work/app"])
   })
 
   test("an event this page does not know is ignored", async () => {
@@ -592,10 +595,10 @@ describe("conversations", () => {
     await c.send("one", [], ctx)
     const id = c.index.active!
     c.rename(id, "Kept")
-    const p = c.addProject("Work", "C:/work")!
+    const p = c.addProject("Work", ["C:/work"])!
     c.move(id, p)
     expect(c.index.items[0]).toMatchObject({ title: "Kept", project: p })
-    expect(JSON.parse(data.get("strata.chats")!).projects).toEqual([{ id: p, name: "Work", folder: "C:/work" }])
+    expect(JSON.parse(data.get("strata.chats")!).projects).toEqual([{ id: p, name: "Work", folders: ["C:/work"] }])
     c.removeProject(p)
     expect(c.index.items[0].project).toBeUndefined()
     expect(c.remove(id)).toBe(true)
@@ -662,7 +665,7 @@ describe("a conversation appears when its prompt is sent, and taking back the fi
     await c.send("first", [], ctx)
     const id = c.index.active!
     c.rename(id, "Kept")
-    const project = c.addProject("Work", "C:/work")!
+    const project = c.addProject("Work", ["C:/work"])!
     c.move(id, project)
     await c.edit(0, "first, reworded", ctx)
     expect(c.index.items).toHaveLength(1)

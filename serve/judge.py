@@ -27,7 +27,7 @@ MAX_GOAL, MAX_ACTION = 1500, 3000
 VERDICT = re.compile(r"<severity>\s*([^<]*?)\s*</severity>")
 
 
-def prompt(req: dict, goal: str, cwd: str | None, shell: str | None) -> tuple[str, str]:
+def prompt(req: dict, goal: str, cwd: str | None, shell: str | None, dirs: list[str] | None = None) -> tuple[str, str]:
     action = json.dumps({"tool": req.get("tool"), "arguments": req.get("arguments")}, ensure_ascii=False)
     if len(action) > MAX_ACTION:
         action = action[:MAX_ACTION] + " ...(cut)"
@@ -38,6 +38,7 @@ def prompt(req: dict, goal: str, cwd: str | None, shell: str | None) -> tuple[st
     user = (
         f"What the user asked for:\n<<<\n{goal or '(not known)'}\n>>>\n\n"
         f"Project folder: {cwd or '(none)'}\n"
+        f"{'Other folders of the project: ' + ', '.join(dirs) + chr(10) if dirs else ''}"
         f"Shell: {shell or 'none'}\n"
         f"The action:\n{action}\n\n"
         f"It would ask the user because: {req.get('why') or 'it is not on the list of what runs freely'}\n\n"

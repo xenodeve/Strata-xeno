@@ -76,7 +76,7 @@ class AgentRun:
         """"allow", a "blocked:..." answer, or None (ask the user)."""
         self._emit({"event": "judging", "id": rid, "tool": req["tool"]})
         try:
-            system, user = judge.prompt(req, self.goal, self.policy.cwd, self.shell)
+            system, user = judge.prompt(req, self.goal, self.policy.cwd, self.shell, self.policy.dirs)
             kind, severity = judge.verdict(self.side(system, user))
         except Exception:  # noqa: BLE001 - a judge that cannot answer is no judge: the user is asked
             self._emit({"event": "judged", "id": rid, "verdict": "unavailable"})

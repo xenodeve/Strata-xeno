@@ -8,7 +8,7 @@ import { PrefillMeter, type Prefill } from "./prefill"
 import { t, tn } from "./i18n"
 import { skillOfMessage } from "./slash"
 import { addRule, agentRequest, NO_AGENT, rulesOf, type AgentInfo } from "./agent"
-import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, folderOf, setProjectFolder, type SessionIndex, type StoredMessage } from "./sessions"
+import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
 
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
 export interface Ask { id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny" }
@@ -165,7 +165,7 @@ function restore(msgs: Message[]): Message[] {
   return msgs.map((m) => (m.prefill?.state === "reading" ? { ...m, prefill: { ...m.prefill, state: "done" as const, rate: null } } : m))
 }
 
-export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | null }      // skills: the names of the skills in use, for "/name"
+export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | string[] | null }      // skills: the names of the skills in use, for "/name"
 
 export class ChatController {
   // a read that was cut off by closing the page is not still reading
@@ -237,24 +237,27 @@ export class ChatController {
   }
   rename(id: string, title: string) { this.index = renameSession(this.index, id, title); this.saveIndex() }
   move(id: string, project: string | undefined) { this.index = moveSession(this.index, id, project); this.saveIndex() }
-  /** A project needs a folder: it is where its chats' coding tools work. Null (and nothing made) without a name or without a folder. */
-  addProject(name: string, folder: string): string | null {
-    if (!folder.trim()) return null
+  /** A project needs a folder, and may have more (other worktrees): they are where its chats' coding tools work. Null (and nothing made) without a name or without a folder. */
+  addProject(name: string, folders: string[]): string | null {
+    if (!folders.some((f) => f.trim())) return null
     const before = this.index.projects.length
     const id = Math.random().toString(36).slice(2, 10)
-    this.index = addProject(this.index, name, id, folder)
+    this.index = addProject(this.index, name, id, folders)
     this.saveIndex()
     return this.index.projects.length > before ? id : null
   }
   renameProject(id: string, name: string) { this.index = renameProject(this.index, id, name); this.saveIndex() }
   removeProject(id: string) { this.index = removeProject(this.index, id); this.saveIndex() }
   setSettings(s: Settings) { this.settings = s; store.set("sampling", s); this.notify() }
-  setProjectFolder(id: string, folder: string) { this.index = setProjectFolder(this.index, id, folder); this.saveIndex() }
-  /** The folder the coding tools work in for the open conversation: its project's, else the default one (Settings); null when there is none. */
-  folder(): string | null {
+  setProjectFolders(id: string, folders: string[]) { this.index = setProjectFolders(this.index, id, folders); this.saveIndex() }
+  /** The folders the coding tools work in for the open conversation: its project's (the first is the main one), else the default one (Settings); none when there is none. */
+  folders(): string[] {
     const mine = this.index.items.find((i) => i.id === this.index.active)
-    return folderOf(this.index, mine?.project) ?? (this.settings.agentFolder?.trim() || null)
+    const own = foldersOf(this.index, mine?.project)
+    return own.length ? own : this.settings.agentFolder?.trim() ? [this.settings.agentFolder.trim()] : []
   }
+  /** The main folder: where commands run. */
+  folder(): string | null { return this.folders()[0] ?? null }
 
   stop() { this.busy?.abort.abort() }
 
