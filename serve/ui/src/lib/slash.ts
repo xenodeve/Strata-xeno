@@ -13,6 +13,7 @@ export interface Command {
 /** The commands Strata has of its own, listed with the skills when "/" is typed. A skill of the same name does not hide them. */
 export const builtinCommands = (): Command[] => [
   { name: "compact", description: t("Summarise the conversation so far to free up context. Add after it what the summary should focus on."), from: "Strata", plugin: null, builtin: true },
+  { name: "context", description: t("Show how much of the context window the conversation uses, and what it is made of."), from: "Strata", plugin: null, builtin: true },
 ]
 
 /** The query when the caret is in a slash command at the very start of the message (`/pd|`), else null: a path, a URL, a `/` further in

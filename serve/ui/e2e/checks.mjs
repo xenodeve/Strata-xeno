@@ -1209,6 +1209,25 @@ export const checks = [
       await send("hello one")
       t.ok("a prompt and its answer", (await prompts.count()) === 1 && bodies.length === 1)
 
+      // the context window: the share used, what it holds, where it is compacted
+      const chip = pg.locator("button.prompt-bar__ctx")
+      const panel = pg.locator("[role=dialog][aria-label='Context window']")
+      t.ok("the prompt bar shows the share of the context window that is used, from what the server reported", (await chip.innerText()).trim() === "12%" && (await chip.getAttribute("data-level")) === "ok", await chip.innerText())
+      await chip.click()
+      await pg.waitForTimeout(500)
+      t.ok("it opens to how much is used of how much, and what the window holds", (await panel.count()) === 1 && (await panel.locator("[data-context-figures]").innerText()).includes("120 of 1,000 tokens") && (await panel.locator("li[data-part='conversation']").count()) === 1 && (await panel.locator("li[data-part='system']").count()) === 1 && (await panel.locator("li[data-part='free']").innerText()).includes("880"), await panel.innerText())
+      t.ok("it says where the conversation is compacted by itself", (await panel.locator("[data-context-auto]").innerText()).includes("800 tokens (80%)"))
+      await pg.keyboard.press("Escape")
+      await pg.waitForTimeout(300)
+      t.ok("Escape closes it", (await panel.count()) === 0)
+      const sentBefore = bodies.length
+      await box.fill("/context")
+      await box.press("Enter")
+      await pg.waitForTimeout(500)
+      t.ok("/context opens the same panel and sends nothing", (await panel.count()) === 1 && bodies.length === sentBefore && (await box.inputValue()) === "")
+      await pg.keyboard.press("Escape")
+      await pg.waitForTimeout(300)
+
       await box.fill("/")
       const list = pg.locator("[role=listbox][aria-label='Skills']")
       await list.waitFor({ timeout: 5000 })
@@ -1236,6 +1255,7 @@ export const checks = [
       // the next prompt goes after the summary
       used = 870
       await send("hello two")
+      t.ok("near the end of the window the chip says so", (await chip.innerText()).trim() === "89%" && (await chip.getAttribute("data-level")) === "full", await chip.innerText())
       const next = bodies.at(-1)
       t.ok("the next prompt is sent after the summary, which the model reads as the earlier part", next.messages.length === 2 && String(next.messages[0].content).includes("the e2e thing") && next.messages[1].content === "hello two", JSON.stringify(next.messages.map((m) => m.role)))
 
@@ -1751,7 +1771,7 @@ export const checks = [
       await plain.waitForTimeout(700)
       await plain.locator("textarea[aria-label='Message']").fill("/")
       await plain.waitForTimeout(250)
-      t.ok("with no skills at all a / lists only Strata's own command, /compact", JSON.stringify(await plain.locator("[role=listbox][aria-label='Skills'] [role=option]").evaluateAll((os) => os.map((o) => o.dataset.skill))) === '["compact"]')
+      t.ok("with no skills at all a / lists only Strata's own commands, /compact and /context", JSON.stringify(await plain.locator("[role=listbox][aria-label='Skills'] [role=option]").evaluateAll((os) => os.map((o) => o.dataset.skill))) === '["compact","context"]')
     },
   },
   {

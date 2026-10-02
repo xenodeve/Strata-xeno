@@ -185,6 +185,27 @@
 .prompt-bar__menu[data-kind="agent"] { right: auto; width: min(420px, 100%); padding: 0; overflow: hidden; transform-origin: bottom left; }      /* the GlidePanel inside scrolls */
 
 /* the mode of the coding tools: a chip on the bar (what a chat needs to see and change often) and its small menu; a mode that does more than ask is tinted */
+/* the context window: a chip with the share used and its panel (what it holds, where it is compacted) */
+.prompt-bar__menu[data-kind="context"] { left: auto; width: min(360px, 100%); padding: 0; overflow: hidden; transform-origin: bottom right; }
+.prompt-bar__ctx { gap: 5px; }
+.prompt-bar__ring-track { stroke: color-mix(in srgb, var(--pb-ink) 18%, transparent); }
+.prompt-bar__ring-fill { stroke: currentColor; transition: stroke-dasharray 0.4s ease; }
+.prompt-bar__ctx[data-level="warn"], .prompt-bar__ctx-pct[data-level="warn"] { color: color-mix(in srgb, #d98a00 80%, var(--pb-ink)); }
+.prompt-bar__ctx[data-level="full"], .prompt-bar__ctx-pct[data-level="full"] { color: var(--bad, #d33); }
+.prompt-bar__ctx-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.prompt-bar__ctx-title { font-size: 13px; font-weight: 600; }
+.prompt-bar__ctx-pct { font-size: 13px; font-weight: 600; }
+.prompt-bar__ctx-bar { display: flex; gap: 2px; height: 8px; margin: 10px 0 10px; border-radius: 4px; overflow: hidden; }
+.prompt-bar__ctx-bar span, .prompt-bar__ctx-list i { background: var(--part, var(--fill-2)); }
+.prompt-bar__ctx-bar span { min-width: 2px; border-radius: 1px; transition: flex-grow 0.4s ease; }
+.prompt-bar__ctx-bar [data-part="conversation"], .prompt-bar__ctx-list [data-part="conversation"] { --part: color-mix(in srgb, var(--accent) 85%, transparent); }
+.prompt-bar__ctx-bar [data-part="tools"], .prompt-bar__ctx-list [data-part="tools"] { --part: color-mix(in srgb, #7c5cff 70%, transparent); }
+.prompt-bar__ctx-bar [data-part="summary"], .prompt-bar__ctx-list [data-part="summary"] { --part: color-mix(in srgb, #2aa876 75%, transparent); }
+.prompt-bar__ctx-bar [data-part="system"], .prompt-bar__ctx-list [data-part="system"] { --part: color-mix(in srgb, var(--pb-ink) 45%, transparent); }
+.prompt-bar__ctx-bar [data-part="free"], .prompt-bar__ctx-list [data-part="free"] { --part: color-mix(in srgb, var(--pb-ink) 12%, transparent); }
+.prompt-bar__ctx-list { display: grid; gap: 4px; font-size: 12.5px; }
+.prompt-bar__ctx-list li { display: grid; grid-template-columns: 10px 1fr auto; align-items: center; gap: 8px; }
+.prompt-bar__ctx-list i { width: 8px; height: 8px; border-radius: 2px; }
 .prompt-bar__menu[data-kind="mode"] { right: auto; width: min(360px, 100%); padding: 0; overflow: hidden; transform-origin: bottom left; }
 .prompt-bar__pick[data-agent-mode="plan"] { color: var(--accent); }
 .prompt-bar__pick[data-agent-mode="auto"] { color: color-mix(in srgb, #d98a00 80%, var(--pb-ink)); }

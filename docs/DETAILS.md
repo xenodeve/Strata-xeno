@@ -541,6 +541,11 @@ switch is in the sampling settings ("Compact the conversation by itself", on by 
 left out of the summary and the model is asked again. Nothing is kept of the messages that were summarised. Not done: compacting in the middle of one answer's tool
 rounds (the server's tool loop runs them without the page).
 
+**The context window in view.** The prompt bar has a chip with the share of the window that is used (a small ring and a number, amber from 60 %, red at the point where it is
+compacted by itself); it opens to how many tokens of how many, a bar and a list of what the window holds (the conversation, tool calls and results, the summary of earlier
+messages, what the server added - its instructions, the tools, the memory - and what is free) and "Compact now". `/context` opens the same panel. The figure is what the
+last answer reported, else a guess from the text (the panel says "about"); with no window size from the server there is no chip.
+
 - **What asks.** Inside the chat's project folder, reading, searching, writing and editing files are free (secrets such as `.env` or keys, and
   writing in `.git`, always ask). Outside the folder, or when the chat has no folder, everything asks. A command asks every time unless it is
   a plain read-only one (`ls`, `git status`, `cat src/a.py`, ...) that names nothing outside the folder; a command that is chained, writes a

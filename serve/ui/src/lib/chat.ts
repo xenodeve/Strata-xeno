@@ -302,6 +302,11 @@ export class ChatController {
     if (last && last.role === "assistant" && !last.error && last.stats?.ctx) return last.stats.ctx
     return estimateTokens(apiMessages(this.messages))
   }
+  /** What the last answer said the conversation uses (its prompt after every tool round, and its own tokens), or null when it said nothing (no answer yet, or messages came and went since). */
+  contextReported(): number | null {
+    const last = this.messages[this.messages.length - 1]
+    return last && last.role === "assistant" && !last.error && last.stats?.ctx ? last.stats.ctx : null
+  }
   /** Whether there is something to summarise: a prompt of the user's. */
   canCompact(): boolean { return !this.busy && this.messages.some(isPrompt) }
   private shouldAutoCompact(ctx: SendContext, text: string, attachments: Attachment[]): boolean {

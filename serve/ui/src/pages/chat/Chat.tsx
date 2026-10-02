@@ -18,6 +18,7 @@ import { Collapse, useMounted } from "../../components/motion"
 import { nextDesign, type OrbDesign } from "../../lib/orbs"
 import { builtinCommands, commandsOf, type Command } from "../../lib/slash"
 import { compactCommand } from "../../lib/compact"
+import { contextView, isContextCommand } from "../../lib/context"
 import { forgetRules, NO_AGENT, rulesOf, type AgentInfo, type AgentMode } from "../../lib/agent"
 import { store } from "../../lib/store"
 import { SkillsContext } from "../../components/SkillTip"
@@ -207,9 +208,11 @@ export function Chat({ id }: { id?: string }) {
   }, [drawer])
   const toLatest = () => { pinned.current = true; setAway(false); scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" }) }
 
+  const [ctxOpen, setCtxOpen] = useState(0)                      // how many times /context was typed: the panel opens at each
   const commands = [...builtinCommands(), ...skills.filter((c) => !builtinCommands().some((b) => b.name === c.name))]       // what "/" lists: Strata's own, then the skills
   const send = () => {
     if (busy || (!text.trim() && !files.length)) return
+    if (!files.length && isContextCommand(text)) { setText(""); setCtxOpen((n) => n + 1); return }                // "/context": the panel with the context window opens
     const asked = files.length ? null : compactCommand(text)           // "/compact" (and what to focus on) is not a message: the conversation is summarised
     if (asked) {
       setText("")
@@ -323,6 +326,7 @@ export function Chat({ id }: { id?: string }) {
           onStop={() => chat.stop()}
           onNewChat={newChat}
           onSave={download}
+          context={{ view: contextView(chat.messages, chat.contextReported(), health.max_context, chat.settings.autoCompact !== false), canCompact: chat.canCompact(), onCompact: () => { void chat.compact(ctx()) }, open: ctxOpen }}
           skills={commands}
           agent={{
             info: agentInfo, on: chat.settings.agent !== false, mode: (chat.settings.agentMode === "plan" || chat.settings.agentMode === "auto" ? chat.settings.agentMode : "ask") as AgentMode,

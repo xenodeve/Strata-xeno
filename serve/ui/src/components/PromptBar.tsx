@@ -6,8 +6,10 @@ import {
 import { msg, t } from "../lib/i18n"
 import type { McpServer } from "../lib/api"
 import { markOf, matchCommands, pickCommand, slashQuery, type Command } from "../lib/slash"
+import type { ContextView, PartKey } from "../lib/context"
+import { fmt } from "../lib/format"
 import { SkillCard } from "./SkillTip"
-import { MiniSwitch } from "./ui"
+import { Button, MiniSwitch } from "./ui"
 import { AgentControls, ModePicker, modeLabel, type AgentControlsProps } from "./AgentControls"
 import { GlidePanel } from "./motion"
 
@@ -81,6 +83,7 @@ export interface PromptBarProps {
   onSave: () => void
   onSampling: () => void
   agent: AgentControlsProps                  // the coding tools (issue #96): a row in the + menu that opens their switch, mode and folder
+  context: { view: ContextView; canCompact: boolean; onCompact: () => void; open: number }      // the context window (issue #99): a chip with the share used, a panel with what it is made of; `open` counts the times /context asked for the panel
   skills: Command[]                          // the skills in use: "/" at the start of the message lists them, to be picked by name
   mcp: { servers: McpServer[]; tools: number; on: boolean; off: string[]; onToggleAll: () => void; onToggleServer: (name: string) => void; setupHref: string }      // the MCP tools: a row in the + menu that opens the list of servers, each with its tools and its own switch
   efforts: string[]
@@ -91,6 +94,50 @@ export interface PromptBarProps {
   children?: ReactNode                       // floats above the field (the "Latest" button)
 }
 
+const PART_LABEL: Record<PartKey, string> = {
+  conversation: msg("Conversation"), tools: msg("Tool calls and results"), summary: msg("Summary of earlier messages"), system: msg("Instructions, tools and memory"), free: msg("Free"),
+}
+
+/** The share of the window that is used, as a small ring. */
+function ContextRing({ pct }: { pct: number }) {
+  const r = 5.5, c = 2 * Math.PI * r
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden className="prompt-bar__ring">
+      <circle cx="7" cy="7" r={r} fill="none" strokeWidth="2" className="prompt-bar__ring-track" />
+      <circle cx="7" cy="7" r={r} fill="none" strokeWidth="2" strokeLinecap="round" strokeDasharray={`${(c * pct) / 100} ${c}`} transform="rotate(-90 7 7)" className="prompt-bar__ring-fill" />
+    </svg>
+  )
+}
+
+/** What the context window holds: how much is used, what it is made of, where it is compacted by itself. */
+function ContextPanel({ view, canCompact, onCompact }: { view: ContextView; canCompact: boolean; onCompact: () => void }) {
+  const shown = view.parts.filter((x) => x.key === "free" || x.tokens > 0)
+  return (
+    <div data-context-panel>
+      <div className="prompt-bar__ctx-head">
+        <span className="prompt-bar__ctx-title">{t("Context window")}</span>
+        <span className="num prompt-bar__ctx-pct" data-level={view.level}>{view.pct}%</span>
+      </div>
+      <p className="num mt-0.5 text-[12px] text-ink-2" data-context-figures>{view.exact ? "" : t("About") + " "}{t("{used} of {max} tokens", { used: fmt(view.used), max: fmt(view.max) })}</p>
+      <div className="prompt-bar__ctx-bar" role="img" aria-label={t("What the context window holds")}>
+        {shown.map((x) => <span key={x.key} data-part={x.key} style={{ flexGrow: x.tokens }} />)}
+      </div>
+      <ul className="prompt-bar__ctx-list">
+        {shown.map((x) => (
+          <li key={x.key} data-part={x.key}>
+            <i aria-hidden data-part={x.key} />
+            <span>{t(PART_LABEL[x.key])}</span>
+            <span className="num">{fmt(x.tokens)}</span>
+          </li>
+        ))}
+      </ul>
+      {view.autoAt !== null && <p className="mt-2 text-[12px] text-ink-2" data-context-auto>{t("Compacted by itself at {n} tokens ({pct}%).", { n: fmt(view.autoAt), pct: Math.round((view.autoAt / view.max) * 100) })}</p>}
+      {!view.exact && <p className="mt-1 text-[12px] text-ink-3">{t("The server has not reported the use yet: this is a guess from the text.")}</p>}
+      <div className="mt-3"><Button onClick={onCompact} disabled={!canCompact}>{t("Compact now")}</Button></div>
+    </div>
+  )
+}
+
 export function PromptBar(p: PromptBarProps) {
   const root = useRef<HTMLDivElement>(null)
   const file = useRef<HTMLInputElement>(null)
@@ -99,7 +146,8 @@ export function PromptBar(p: PromptBarProps) {
   const rows = useRef<(HTMLButtonElement | null)[]>([])
   const lastOpen = useRef<string | null>(null)
   const typing = useRef({ energy: 0, strokes: 0 })
-  const [menu, setMenu] = useState<"plus" | "effort" | "mcp" | "agent" | "mode" | null>(null)
+  const asked = useRef(p.context.open)
+  const [menu, setMenu] = useState<"plus" | "effort" | "mcp" | "agent" | "mode" | "context" | null>(null)
   const [active, setActive] = useState(0)
   const [focused, setFocused] = useState(false)
   const [visible, setVisible] = useState(() => typeof document === "undefined" || !document.hidden)
@@ -110,6 +158,8 @@ export function PromptBar(p: PromptBarProps) {
   const skillRows = useRef<(HTMLButtonElement | null)[]>([])
   const mirror = useRef<HTMLDivElement>(null)
   const [tipAt, setTipAt] = useState<number | null>(null)       // pointing at the marked command: where its card goes (from the left of the bar)
+
+  useEffect(() => { if (p.context.open !== asked.current) { asked.current = p.context.open; setMenu("context") } }, [p.context.open])      // /context
 
   const usable = (x: McpServer) => x.tools.length > 0 && (x.status === "ready" || x.status === "stopped")       // a server that is up and offers tools can be switched
   const mcpOn = p.mcp.on ? p.mcp.servers.filter((x) => usable(x) && !p.mcp.off.includes(x.name)).length : 0
@@ -160,7 +210,7 @@ export function PromptBar(p: PromptBarProps) {
   const closeMenu = useCallback(() => setMenu(null), [])
   const focusInput = () => p.inputRef.current?.focus({ preventScroll: true })
   // Focus first, then set the menu: giving the field focus closes menus (its onFocus), so the order matters when the field did not have it.
-  const toggle = (kind: "plus" | "effort" | "mcp" | "mode") => { const next = menu === kind ? null : kind; setActive(0); focusInput(); setMenu(next) }
+  const toggle = (kind: "plus" | "effort" | "mcp" | "mode" | "context") => { const next = menu === kind ? null : kind; setActive(0); focusInput(); setMenu(next) }
 
   useEffect(() => {
     const on = () => setVisible(!document.hidden)
@@ -323,6 +373,14 @@ export function PromptBar(p: PromptBarProps) {
       {marked && tipAt !== null && !slashOpen && (
         <div className="prompt-bar__menu" data-kind="tip" role="tooltip" style={{ left: tipAt }}>
           <SkillCard cmd={marked.cmd} />
+        </div>
+      )}
+
+      {menu === "context" && (
+        <div className="prompt-bar__menu" role="dialog" aria-label={t("Context window")} data-kind="context" onKeyDown={(e) => { if (e.key === "Escape") { e.preventDefault(); closeMenu(); focusInput() } }}>
+          <GlidePanel cap={() => Math.min(innerHeight * 0.7, 520)} inner="px-4 pb-4 pt-3.5">
+            <ContextPanel view={p.context.view} canCompact={p.context.canCompact} onCompact={() => { closeMenu(); p.context.onCompact() }} />
+          </GlidePanel>
         </div>
       )}
 
@@ -544,6 +602,21 @@ export function PromptBar(p: PromptBarProps) {
             <span>{level}</span>
           </button>
           <span className="prompt-bar__spacer" />
+          {p.context.view.known && (
+            <button
+              type="button"
+              className="prompt-bar__pick prompt-bar__ctx"
+              aria-label={t("Context window: {pct}% used", { pct: p.context.view.pct })}
+              aria-expanded={menu === "context"}
+              data-on={menu === "context" ? "" : undefined}
+              data-level={p.context.view.level}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => toggle("context")}
+            >
+              <ContextRing pct={p.context.view.pct} />
+              <span className="num">{p.context.view.pct}%</span>
+            </button>
+          )}
           {!p.busy && <span className="prompt-bar__hint">{t("Shift+Enter: new line")}</span>}
           <button
             type="button"
