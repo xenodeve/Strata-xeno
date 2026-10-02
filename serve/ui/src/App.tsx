@@ -175,7 +175,7 @@ function Shell() {
           scrolled ? "border-line bg-[color-mix(in_srgb,var(--bg)_82%,transparent)]" : "border-transparent bg-bg",
         )}
       >
-        <div className={cn("mx-auto flex items-center gap-2 px-3 py-3 sm:gap-4 sm:px-6", wide ? "max-w-[1800px]" : "max-w-5xl")}>
+        <div className="mx-auto flex max-w-5xl items-center gap-2 px-3 py-3 sm:gap-4 sm:px-6">         {/* the bar stays where it is on every page, so it does not jump when the chat is left */}
           <Brand />
           <Nav page={route.page} />
           <button
