@@ -2154,6 +2154,14 @@ void ArenaExpertSource::set_capacity(uint64_t bytes, const std::vector<int32_t>&
     nvme_.assign(exclusive_.size(), 0);
     score_.assign(exclusive_.size(), 0.0f);
     held_.assign(exclusive_.size(), 0);
+    {
+        const char* es = std::getenv("STRATA_NVME_EVICT_SCAN");
+        evict_scan_ = es != nullptr && *es && std::atoi(es) != 0;
+        const size_t nl = n_expert_ > 0 ? exclusive_.size() / (size_t) n_expert_ : 0;
+        lmin_.assign(nl, 0.0f);
+        larg_.assign(nl, -1);
+        ldirty_.assign(nl, 1);
+    }
     if (bytes == 0) { nvme_.clear(); score_.clear(); held_.clear(); return; }
     // everything host-owned starts on NVMe; the first `bytes` of the order come up at load_rest
     for (size_t i = 0; i < exclusive_.size(); ++i) nvme_[i] = exclusive_[i] ? 0 : 1;
@@ -2180,24 +2188,44 @@ bool ArenaExpertSource::resident(int64_t layer, int64_t expert) const {
 void ArenaExpertSource::hold(int64_t layer, int64_t expert) {
     std::lock_guard<std::mutex> lk(host_mu_);
     const size_t i = (size_t) (layer * n_expert_ + expert);
-    if (i < held_.size() && held_[i] < 255) ++held_[i];
+    if (i < held_.size() && held_[i] < 255) { ++held_[i]; touch(i); }
 }
 
 void ArenaExpertSource::release_hold(int64_t layer, int64_t expert) {
     std::lock_guard<std::mutex> lk(host_mu_);
     const size_t i = (size_t) (layer * n_expert_ + expert);
-    if (i < held_.size() && held_[i] > 0) --held_[i];
+    if (i < held_.size() && held_[i] > 0) { --held_[i]; touch(i); }
 }
 
 bool ArenaExpertSource::evict_one(int64_t avoid_layer) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     size_t victim = SIZE_MAX;
     float best = 0.0f;
-    for (size_t i = 0; i < nvme_.size(); ++i) {
-        if (nvme_[i] || exclusive_[i] || held_[i] || (int64_t) i / lay.n_expert == avoid_layer) continue;
-        if (victim == SIZE_MAX || score_[i] < best) { victim = i; best = score_[i]; }
+    if (evict_scan_ || ldirty_.empty()) {   // the reference: every expert
+        for (size_t i = 0; i < nvme_.size(); ++i) {
+            if (nvme_[i] || exclusive_[i] || held_[i] || (int64_t) i / lay.n_expert == avoid_layer) continue;
+            if (victim == SIZE_MAX || score_[i] < best) { victim = i; best = score_[i]; }
+        }
+    } else {   // #97: the layers' cached minima, a dirty layer rescanned; layer order keeps the lowest-index tie
+        const size_t ne = (size_t) lay.n_expert;
+        for (size_t l = 0; l < ldirty_.size(); ++l) {
+            if ((int64_t) l == avoid_layer) continue;
+            if (ldirty_[l]) {
+                int32_t arg = -1;
+                float m = 0.0f;
+                for (size_t i = l * ne; i < (l + 1) * ne; ++i) {
+                    if (nvme_[i] || exclusive_[i] || held_[i]) continue;
+                    if (arg < 0 || score_[i] < m) { arg = (int32_t) i; m = score_[i]; }
+                }
+                larg_[l] = arg;
+                lmin_[l] = m;
+                ldirty_[l] = 0;
+            }
+            if (larg_[l] >= 0 && (victim == SIZE_MAX || lmin_[l] < best)) { victim = (size_t) larg_[l]; best = lmin_[l]; }
+        }
     }
     if (victim == SIZE_MAX) return false;
+    touch(victim);
     const int64_t l = (int64_t) victim / lay.n_expert, x = (int64_t) victim % lay.n_expert;
     if (slab_) {
         free_slot(victim);   // the next load overwrites it: nothing to decommit
@@ -2224,6 +2252,7 @@ const uint8_t* ArenaExpertSource::acquire(int64_t layer, int64_t expert, std::st
     if (p != nullptr) {
         if (i < held_.size() && held_[i] < 255) ++held_[i];
         if (i < score_.size()) score_[i] += 1.0f;   // a use, as blob() counts one
+        touch(i);
     }
     return p;
 }
@@ -2251,6 +2280,7 @@ const uint8_t* ArenaExpertSource::materialize_locked(int64_t layer, int64_t expe
     }
     nvme_[i] = 0;
     score_[i] += 1.0f;
+    touch(i);
     cache_used_ += b;
     ++nvme_loads_;
     nvme_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -2326,6 +2356,7 @@ bool ArenaExpertSource::materialize_end(std::string& err) {
             const size_t idx = (size_t) (mat_layer_ * n_expert_ + x);
             nvme_[idx] = 0;
             score_[idx] += 1.0f;
+            touch(idx);
         }
         nvme_loads_ += (int64_t) mat_es_.size();
     }
@@ -2343,6 +2374,7 @@ void ArenaExpertSource::trim(int64_t avoid_layer) {
 
 void ArenaExpertSource::decay_scores(float f) {
     for (float& v : score_) v *= f;
+    for (float& v : lmin_) v *= f;   // the same multiply as each expert's score: the cached minima stay exact
 }
 
 void ArenaExpertSource::admit_home(int64_t layer, int64_t expert) {
@@ -2352,6 +2384,7 @@ void ArenaExpertSource::admit_home(int64_t layer, int64_t expert) {
     const size_t i = (size_t) (layer * n_expert_ + expert);
     if (i < nvme_.size() && nvme_[i]) { nvme_[i] = 0; cache_used_ += lay.blob_bytes(layer); }
     score_[i] += 1.0f;
+    touch(i);
     while (cache_cap_ != 0 && cache_used_ > cache_cap_ && evict_one(-1)) {}
 }
 
@@ -2427,7 +2460,7 @@ uint8_t* ArenaExpertSource::recommit_host_copy(int64_t layer, int64_t expert, st
 void ArenaExpertSource::publish_host_copy(int64_t layer, int64_t expert) {
     std::lock_guard<std::mutex> lk(host_mu_);
     const size_t index = (size_t) (layer * n_expert_ + expert);
-    if (index < exclusive_.size()) exclusive_[index] = 0;
+    if (index < exclusive_.size()) { exclusive_[index] = 0; touch(index); }
 }
 
 bool ArenaExpertSource::release_host_copy(int64_t layer, int64_t expert, std::string& err) {
@@ -2449,6 +2482,7 @@ bool ArenaExpertSource::release_host_copy(int64_t layer, int64_t expert, std::st
     } else if (!((PinnedArena*) arena_)->decommit_interior(layout.blob_offset(layer, expert),
                                                            layout.blob_bytes(layer), decommitted, err)) return false;
     exclusive_[index] = 1; // publish ownership only after the Windows decommit succeeds
+    touch(index);
     released_host_bytes_ += decommitted;
     err.clear();
     return true;
@@ -2481,6 +2515,7 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (!nvme_.empty()) {
         if (nvme_[(size_t) idx]) return nullptr;   // #11: on NVMe; the caller materializes it
         score_[(size_t) idx] += 1.0f;
+        touch((size_t) idx);
     }
     ++reads_;
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of

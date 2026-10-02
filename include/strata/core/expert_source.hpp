@@ -664,6 +664,14 @@ private:
     double nvme_ms_ = 0;
     NvmeStages stages_;
     bool evict_one(int64_t avoid_layer);
+    // #97: the victim search's per-layer cache - the lowest eligible score and its expert (lowest index on a tie);
+    // a layer is rescanned only after one of its experts changed score, residency, hold or ownership (touch).
+    // STRATA_NVME_EVICT_SCAN=1 scans every expert per eviction instead (the reference, for the A/B and the test).
+    std::vector<float> lmin_;
+    std::vector<int32_t> larg_;            ///< -1 = no eligible expert in the layer
+    std::vector<uint8_t> ldirty_;
+    bool evict_scan_ = false;
+    void touch(size_t idx) { if (!ldirty_.empty()) ldirty_[idx / (size_t) n_expert_] = 1; }
     // capacity mode's slab (set_capacity): each host-resident expert sits in a slot of its blob size's region
     struct SlabClass {
         uint8_t* base = nullptr;           ///< reserved for every expert of these layers; committed per slot
