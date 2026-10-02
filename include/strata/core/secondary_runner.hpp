@@ -27,7 +27,7 @@ struct SecondaryTiming {
     double h2d_ms = 0, clear_ms = 0, quantize_ms = 0, expert_ms = 0, d2h_ms = 0;
 };
 
-// Device-1 grouped native Q2_0 partials. launch() queues pinned H2D, compute,
+// Device-1 grouped native partials (Q2_0, and the i-quant formats since #11). launch() queues pinned H2D, compute,
 // pinned D2H; finish() waits and copies only claimed router rows into host output.
 class SecondaryRunner {
 public:
@@ -118,6 +118,7 @@ private:
     bool graph_ = false;
     std::vector<void*> graph_exec_;   // per (token count, claimed rows): the D2H copies only the claimed rows
     std::vector<int> graph_k_;
+    std::vector<int> graph_fmts_;     // #11: the (gate/up << 8 | down) formats of each table of graph_exec_
     std::string async_err_;
     kernels::NativeExpertLayout job_layout_{};
     const SecondaryArena* job_weights_ = nullptr;

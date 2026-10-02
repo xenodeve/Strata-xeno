@@ -22,6 +22,13 @@ public:
     // Returns false and retains the pointer if CUDA could not release it, so the caller can retry.
     bool close(std::string* err = nullptr);
     uint8_t* slot_ptr(uint64_t slot) const;
+    /// #11: the bytes a slot holds (its first blob, 256-aligned); a swap's newcomer must fit it.  0 when out of range.
+    uint64_t slot_bytes(uint64_t slot) const {
+        return slot < slots() ? offsets_[(size_t) slot + 1] - offsets_[(size_t) slot] : 0;
+    }
+    /// Whether a blob of `bytes` fits `slot`: the fills, and every 4070 swap (its pairs span layers, and a native
+    /// pack's blobs differ per layer, so an unchecked newcomer would overwrite the next slot's expert).
+    bool fits(uint64_t slot, uint64_t bytes) const { return bytes > 0 && bytes <= slot_bytes(slot); }
     bool fill_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err);
     bool verify_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err);
     /// The display card's free-memory floor, checked once (a pipelined fill that bypasses fill_slot calls it last).

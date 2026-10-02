@@ -21,6 +21,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/placement_formats.hpp"
 #include "strata/core/secondary_arena.hpp"
 #include "strata/core/secondary_profile.hpp"
 #include "strata/core/secondary_runner.hpp"
@@ -32,6 +33,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -595,12 +597,18 @@ void usage() {
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                  "                       layers across CUDA1..3 (default: stripe)\n"
                  "  --cache-cpu-only     Diagnostic: prefill normally, then route verify experts to CPU.\n"
-                 "  --secondary-expert-mib N  Phase 3 Q2_0 tier on RTX 4070 SUPER;\n"
+                 "  --secondary-expert-mib N  Phase 3 expert tier on RTX 4070 SUPER (any native pack, #11);\n"
                  "  --secondary-free-floor-mib N  Experimental free floor on 4070; default 2560.\n"
                  "  --secondary-profile-timing  Opt-in CUDA event timing for secondary transfer/compute.\n"
                      "  --secondary-stage-only  Stage/verify weights, but compute all experts as before.\n"
                      "  --exclusive-primary-experts  Phase 4 static primary ownership; decommit host copies.\n"
-                     "                               Needs profile, --no-prefill-borrow, --adapt-swaps 0.\n"
+                     "                               Needs a profile, an expert cache, spec >= 2, --pcie-frac 0,\n"
+                     "                               the CPU pool and no --mmap-experts.\n"
+                     "                               On by default for all-Q2_0 native packs; pass it for i-quant packs.\n"
+                     "  --ram-cache-gib G    #11 capacity mode: only G GiB of the host-owned experts stay in RAM, the\n"
+                     "                       rest are read from the pack or GGUF on a miss (NVMe tier).  Needs\n"
+                     "                       placement-first: it asks for --exclusive-primary-experts itself, and\n"
+                     "                       stops with an error when neither that nor the 4070 tier can be had.\n"
                      "  --no-tail-file       keep host copies of the prompt path's lendable cache slots (default with\n"
                      "                       exclusive primary experts: none; a tail-<key>.bin next to the pack,\n"
                      "                       ~3.5 GB at 8K chunks, refills them after a prompt; #34)\n"
@@ -2233,27 +2241,32 @@ int main(int argc, char** argv) {
     // at 3.24 tok/s with it and 61.92 tok/s with --pcie-frac 0, prefill unchanged (292.9 vs 294.7 tok/s;
     // strata-claude-servepcie, #27). So the default is 0; --pcie-frac still turns the path on.
     if (o.pcie_frac < 0.0) o.pcie_frac = 0.0;
-    const bool secondary_q2 = native_pack &&
-        std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
-                    strata::kernels::cpu::expert_layout().fmt.end(),
-                    [](const auto& f) { return f.gu_type == 42 && f.d_type == 42; });
+    const auto pack_formats = strata::core::placement_formats(native_pack, strata::kernels::cpu::expert_layout().fmt,
+                                                              strata::kernels::iq_supported);
+    // #11: the 4070 tier computes any native format the kernels know (SecondaryRunner quantizes the activations as
+    // the 5060's verify path does, xeno_secondary_iq_parity); --secondary-expert-mib is itself the request
     if (o.secondary_expert_mib > 0 &&
         (!native_pack || (!o.secondary_stage_only && !o.cache_cpu_only &&
-                          (!secondary_q2 || o.pcie_frac != 0.0 || o.no_pool || o.spec < 2)))) {
-        std::fprintf(stderr, "strata generate: secondary compute needs native Q2_0, spec >=2, "
-                             "expert pool and --pcie-frac 0 until combined routing is validated\n");
+                          (!pack_formats.all_native || o.pcie_frac != 0.0 || o.no_pool || o.spec < 2)))) {
+        std::fprintf(stderr, "strata generate: secondary compute needs a native pack in formats the GPU kernels "
+                             "compute, spec >=2, expert pool and --pcie-frac 0\n");
         return 2;
     }
     {
-        const bool eligible = secondary_q2 && o.spec >= 2 && !o.mmap_experts && !o.cache_cpu_only && !o.no_pool &&
-                              o.pcie_frac == 0.0 && !o.expert_profile.empty() && o.expert_cache != 0;
+        // #11: requested (the flag, or --ram-cache-gib), any native pack the GPU and CPU kernels compute (an i-quant
+        // pack's NVMe tier needs placement-first); the automatic default stays Q2_0-only, where pool-hit parity is
+        // bit-exact
+        const bool runtime_ok = o.spec >= 2 && !o.mmap_experts && !o.cache_cpu_only && !o.no_pool &&
+                                o.pcie_frac == 0.0 && !o.expert_profile.empty() && o.expert_cache != 0;
+        const bool requested = strata::core::exclusive_requested(o.exclusive_mode, o.ram_cache_gib);
+        const bool eligible = runtime_ok && strata::core::exclusive_primary_formats_ok(pack_formats, requested);
         if (o.exclusive_mode == 1 && !eligible) {
-            std::fprintf(stderr, "strata generate: --exclusive-primary-experts requires native Q2_0, spec >=2, "
-                                 "a profile, an expert cache, --pcie-frac 0 "
+            std::fprintf(stderr, "strata generate: --exclusive-primary-experts requires a native pack in formats the "
+                                 "GPU and CPU kernels compute, spec >=2, a profile, an expert cache, --pcie-frac 0 "
                                  "and an enabled CPU pool; it excludes mmap/forced-CPU modes\n");
             return 2;
         }
-        o.exclusive_primary_experts = o.exclusive_mode == 1 || (o.exclusive_mode < 0 && eligible);
+        o.exclusive_primary_experts = o.exclusive_mode != 0 && eligible;
     }
     // Placement-first cold start (#4): when a GPU tier owns experts exclusively, the arena is reserved but not
     // committed or read; GPU tiers fill straight from the pack, and only the host-owned experts are committed and
@@ -2262,6 +2275,12 @@ int main(int argc, char** argv) {
                             (o.exclusive_secondary_mode < 0 && o.secondary_expert_mib > 0 && !o.mmap_experts &&
                              !(o.serve && o.adapt_secondary > 0));
     const bool place_first = !o.mmap_experts && (o.exclusive_primary_experts || o.exclusive_secondary);
+    if (o.ram_cache_gib > 0.0 && !place_first) {   // #11: never a silently ignored capacity flag
+        std::fprintf(stderr, "strata generate: --ram-cache-gib needs placement-first (exclusive primary experts: a "
+                             "native pack, spec >=2, a profile, an expert cache, --pcie-frac 0 and the CPU pool, "
+                             "no mmap; or the 4070 tier); without it every host expert would stay in RAM\n");
+        return 2;
+    }
     // #35 D6: with the peer tier and STRATA_PREFILL_EXPERT_SPLIT, big chunks run their routed experts on the 4070:
     // the prompt path's one-card MoE buffers are sized for the short chunks only, so it borrows fewer cache slots
     const bool split_env = [] {
@@ -2286,9 +2305,7 @@ int main(int argc, char** argv) {
     if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 && !(o.exclusive_secondary && o.serve) ? 8 : 0;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
-    else if (std::all_of(strata::kernels::cpu::expert_layout().fmt.begin(),
-                         strata::kernels::cpu::expert_layout().fmt.end(),
-                         [](const auto& f) { return f.gu_type == 42 && f.d_type == 42; }))
+    else if (pack_formats.all_q2)
         std::fprintf(stderr, "strata generate: native Q2_0 expert rows use %s\n",
                      strata::kernels::cpu::cpu_avx512_ok() ? "AVX-512" :
                      strata::kernels::cpu::cpu_avxvnni_ok() ? "AVX-VNNI" : "AVX2");
@@ -3471,7 +3488,7 @@ int main(int argc, char** argv) {
     std::vector<int32_t> secondary_residency;
     if (o.secondary_expert_mib > 0) {
         if (!native_pack || profile.empty() || o.expert_cache <= 0 || srcp == nullptr) {
-            std::fprintf(stderr, "strata generate: secondary experts need native Q2_0, a profile and a primary cache\n");
+            std::fprintf(stderr, "strata generate: secondary experts need a native pack, a profile and a primary cache\n");
             return 2;
         }
         std::vector<int32_t> primary_residency((size_t) (g.n_layers * g.n_expert), -1);
@@ -5319,10 +5336,11 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                         const int32_t in = sc[k].second, out = sv[k].second;
                         const int32_t slot = secondary_residency[(size_t) out];
-                        const int32_t layer = in / (int32_t) g.n_expert;
-                        const uint8_t* src = srcp->blob(layer, in % (int32_t) g.n_expert);
-                        const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+                        const int32_t in_layer = in / (int32_t) g.n_expert;
+                        const uint8_t* src = srcp->blob(in_layer, in % (int32_t) g.n_expert);
+                        const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(in_layer);
                         if (src == nullptr) break;
+                        if (!secondary_arena.fits((uint64_t) slot, bytes)) continue;   // #11: pairs span layers
                         secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
                         jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
                         ss_pending.emplace_back(in, slot);
@@ -7239,10 +7257,11 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                 const int32_t in = sc[k].second, out = sv[k].second;
                 const int32_t slot = secondary_residency[(size_t) out];
-                const int32_t layer = out / (int32_t) g.n_expert;
-                if (srcp->blob(in / (int32_t) g.n_expert, in % (int32_t) g.n_expert) == nullptr) break;
+                const int32_t out_layer = out / (int32_t) g.n_expert, in_layer = in / (int32_t) g.n_expert;
+                if (srcp->blob(in_layer, in % (int32_t) g.n_expert) == nullptr) break;
+                if (!secondary_arena.fits((uint64_t) slot, (uint64_t) lay.blob_bytes(in_layer))) continue;   // #11
                 if (cudaMemcpyAsync(ss_stage + sx_d2h.size() * ps_blob, secondary_arena.slot_ptr((uint64_t) slot),
-                                    (size_t) lay.blob_bytes(layer), cudaMemcpyDeviceToHost, ss_stream) != cudaSuccess)
+                                    (size_t) lay.blob_bytes(out_layer), cudaMemcpyDeviceToHost, ss_stream) != cudaSuccess)
                     return false;
                 sx_d2h.push_back({in, out, slot});
             }
@@ -7279,10 +7298,11 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                     const int32_t in = sc[k].second, out = sv[k].second;
                     const int32_t slot = secondary_residency[(size_t) out];
-                    const int32_t layer = in / (int32_t) g.n_expert;
-                    const uint8_t* src = srcp->blob(layer, in % (int32_t) g.n_expert);
-                    const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+                    const int32_t in_layer = in / (int32_t) g.n_expert;
+                    const uint8_t* src = srcp->blob(in_layer, in % (int32_t) g.n_expert);
+                    const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(in_layer);
                     if (src == nullptr) break;
+                    if (!secondary_arena.fits((uint64_t) slot, bytes)) continue;   // #11: pairs span layers
                     secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
                     jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
                     ss_pending.emplace_back(in, slot);
