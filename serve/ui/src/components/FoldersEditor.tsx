@@ -1,18 +1,20 @@
-import { useImperativeHandle, useRef, useState, type Ref } from "react"
+import { useEffect, useId, useImperativeHandle, useRef, useState, type Ref } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowUp01Icon, Cancel01Icon, Folder01Icon } from "@hugeicons/core-free-icons"
 import { getFolders, type FolderView } from "../lib/api"
 import { cn } from "../lib/cn"
+import { matchParts, rank, sepOf, splitTyped } from "../lib/folders"
 import { FOLDERS_MAX } from "../lib/sessions"
 import { t } from "../lib/i18n"
 import { Button, inputCls } from "./ui"
 
 // The folders of a project (issue #96): the first is the main one, where the coding tools run commands; the others are its other folders (other git worktrees of the same
 // repository, a library next to the app) where files are as free as in the main one, as Claude Code's added directories. A folder is typed or chosen from the folders of this
-// PC (the server lists them) and is checked with the server before it is added; the path that is kept is the one the server resolved. When the server cannot be asked
+// PC (the server lists them; while a path is typed, the folders that go with what is typed are offered, so a rough path and one click is enough) and is checked with the server before it is added; the path that is kept is the one the server resolved. When the server cannot be asked
 // (another PC) the path is used as typed.
 
 export type Listing = FolderView | "unknown" | null
+const SUGGEST_MAX = 8                                // the folders offered while a path is typed; "and n more" for the rest
 
 /** The path a typed folder leads to, or why it is not one. */
 export async function checkFolder(path: string): Promise<{ path: string } | { error: string }> {
@@ -53,14 +55,42 @@ export function FoldersEditor({ folders, onChange, min = 0, onDraft, onSubmit, a
   const [problem, setProblem] = useState<string | null>(null)
   const [checking, setChecking] = useState(false)
   const field = useRef<HTMLInputElement>(null)
+  const listId = useId()
+  const [typed, setTyped] = useState<string | null>(null)                       // what the user typed (not what a click put in the field): the suggestions go with it
+  const [sugg, setSugg] = useState<{ base: string; partial: string; names: string[]; more: number } | null>(null)
+  const [active, setActive] = useState(-1)
+  const [focused, setFocused] = useState(false)
   const setDraft = (v: string) => { setDraftState(v); setProblem(null); onDraft?.(v) }
+
+  useEffect(() => {                                                          // the folders in the folder that is typed, those that go with the name typed after it
+    const q = typed === null ? null : splitTyped(typed)
+    if (!q) { setSugg(null); return }
+    let stale = false
+    const timer = setTimeout(async () => {
+      const r = await getFolders(q.base)
+      if (stale) return
+      if (r === "unknown" || "error" in r) { setSugg(null); return }
+      const names = rank(r.dirs.map((d) => d.name), q.partial)
+      setSugg({ base: q.base, partial: q.partial, names: names.slice(0, SUGGEST_MAX), more: Math.max(0, names.length - SUGGEST_MAX) })
+      setActive(-1)
+    }, 120)
+    return () => { stale = true; clearTimeout(timer) }
+  }, [typed])
+  const open = focused && !!sugg && sugg.names.length > 0
+  const pick = (name: string) => {                                           // the folder is finished in the field, and what is inside it is offered next
+    if (!sugg) return
+    const v = sugg.base + name + sepOf(sugg.base)
+    setDraft(v)
+    setTyped(v)
+    field.current?.focus()
+  }
 
   const look = async (path: string, follow = true) => {                     // list a folder; the field follows where the list is
     const r = await getFolders(path)
     if (r === "unknown") { setListing("unknown"); return }
     if ("error" in r) { if (path.trim()) return look("", follow); setListing("unknown"); return }
     setListing(r)
-    if (follow && r.path) setDraft(r.path)
+    if (follow && r.path) { setDraft(r.path); setTyped(null) }
   }
   const browse = async () => {
     if (browsing) { setBrowsing(false); return }
@@ -84,7 +114,7 @@ export function FoldersEditor({ folders, onChange, min = 0, onDraft, onSubmit, a
     if ("error" in r) { setProblem(r.error); field.current?.focus(); return null }
     const next = folders.includes(r.path) ? folders : [...folders, r.path]
     onChange(next)
-    setDraftState(""); onDraft?.("")
+    setDraftState(""); setTyped(null); onDraft?.("")
     return next
   }
   useImperativeHandle(api, () => ({ commit: add, focus: () => field.current?.focus() }))                          // eslint-disable-line react-hooks/exhaustive-deps
@@ -114,18 +144,47 @@ export function FoldersEditor({ folders, onChange, min = 0, onDraft, onSubmit, a
         <input
           ref={field}
           className={cn(inputCls, "min-w-0 flex-1 font-mono")}
+          role="combobox"
           aria-label={t("Add a folder")}
+          aria-expanded={open}
+          aria-controls={listId}
+          aria-autocomplete="list"
+          aria-activedescendant={open && active >= 0 ? `${listId}-${active}` : undefined}
           aria-invalid={problem ? true : undefined}
           value={draft}
           placeholder="C:/work/my-project"
           autoComplete="off"
           spellCheck={false}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); if (draft.trim()) void add(); else onSubmit?.() } }}
+          onChange={(e) => { setDraft(e.target.value); setTyped(e.target.value) }}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          onKeyDown={(e) => {
+            if (open && sugg) {
+              const n = sugg.names.length
+              if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); setActive((a) => (e.key === "ArrowDown" ? (a + 1) % n : a <= 0 ? n - 1 : a - 1)); return }
+              if (e.key === "Enter" && active >= 0) { e.preventDefault(); pick(sugg.names[active]); return }
+              if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); setTyped(null); return }          // closes the suggestions, not the dialog
+            }
+            if (e.key === "Enter") { e.preventDefault(); if (draft.trim()) void add(); else onSubmit?.() }
+          }}
         />
         <Button onClick={() => void browse()}>{browsing ? t("Hide") : t("Browse")}</Button>
         <Button disabled={!draft.trim() || checking} onClick={() => void add()}>{t("Add")}</Button>
       </div>
+      {open && sugg && (
+        <ul id={listId} role="listbox" aria-label={t("Folders that go with what is typed")} data-suggestions onMouseDown={(e) => e.preventDefault()} className="mt-1.5 max-h-[188px] overflow-y-auto rounded-sm border border-line p-1">
+          {sugg.names.map((n, i) => {
+            const [a, m, z] = matchParts(n, sugg.partial)
+            return (
+              <li key={n} id={`${listId}-${i}`} role="option" aria-selected={i === active} data-suggestion onClick={() => pick(n)} onMouseMove={() => setActive(i)} className={cn("flex h-8 cursor-pointer items-center gap-2 rounded-sm px-2 text-[13px]", i === active ? "bg-hover" : "hover:bg-hover")}>
+                <HugeiconsIcon icon={Folder01Icon} size={14} aria-hidden className="shrink-0 text-ink-3" />
+                <span className="truncate">{a}<b className="font-semibold">{m}</b>{z}</span>
+              </li>
+            )
+          })}
+          {sugg.more > 0 && <li aria-hidden className="px-2 py-1 text-[12px] text-ink-3">{t("and {n} more. Keep typing to narrow them.", { n: sugg.more })}</li>}
+        </ul>
+      )}
       {problem && <p role="alert" className="mt-1.5 text-[12px] text-bad">{problem}</p>}
       {browsing && listing === "unknown" && <p className="mt-1.5 text-[12px] text-ink-2">{t("The folders of this PC cannot be listed from here. Type the path.")}</p>}
       {browsing && listing && listing !== "unknown" && (

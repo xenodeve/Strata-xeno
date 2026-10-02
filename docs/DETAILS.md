@@ -550,7 +550,8 @@ own `CLAUDE.md` (or `AGENTS.md`). They work only from this PC itself (or with th
   has them and this page may use them), the mode (Ask / Plan / Auto) and the folder. A chat in a project works in the project's folder; a chat in no
   project uses the default folder. A project cannot be made without a folder, and may have several (the worktrees of one repository, a library
   next to the app): the New project dialog asks for a name and folders, typed or chosen from the folders of this PC (`GET /agent/folders`, names of
-  folders only, same callers as the tools) and checked before they are added. The first is the main one (commands run there, relative paths start
+  folders only, same callers as the tools) and checked before they are added. While a path is typed the folders that go with it are offered (those in the folder typed so far whose names start with, or contain, the
+  part typed after the last separator), so a rough path and one click is enough. The first is the main one (commands run there, relative paths start
   there); the request carries the others as `strata_agent.dirs` (Claude Code's added directories) and files in them are as free as in the main one.
   Reading, searching, writing and editing follow the same rules in all of them, a change in any `.git` still asks. A call shows as what it is: the command and its output, an edit as removed and added lines, the steps of a
   longer task as a checklist. When the server asks, the call shows a card with the command or the path and why it asks. **Allow for this chat** is

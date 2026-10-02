@@ -242,6 +242,8 @@ export const part: Record<string, string> = {
   "Mode": "โหมด",
   "Folder the tools work in": "โฟลเดอร์ที่เครื่องมือทำงาน",
   "Browse": "เลือกโฟลเดอร์",
+  "Folders that go with what is typed": "โฟลเดอร์ที่ตรงกับที่พิมพ์",
+  "and {n} more. Keep typing to narrow them.": "และอีก {n} โฟลเดอร์ พิมพ์เพิ่มเพื่อกรอง",
   "Folders": "โฟลเดอร์",
   "Folders of the project": "โฟลเดอร์ของโปรเจกต์",
   "Add a folder": "เพิ่มโฟลเดอร์",
