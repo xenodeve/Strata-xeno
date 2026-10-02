@@ -11,11 +11,15 @@ import lazy_refill_sim as lr  # noqa: E402
 
 
 def trace_bytes(windows):
-    """windows: [[(layer, [ids of the window's tokens flattened])...], ...]; one token, K = len(ids)"""
-    out = b""
-    for w in windows:
+    """windows: [[(layer, [ids of the window's one token])...], ...]; K = len(ids).  `--dump-routing` format 2 (#93):
+    a format tag, one record per token (int32 layer, int32 k, k int32 ids, k float32 weights), a commit per window."""
+    def rec(layer, ids):
+        return struct.pack(f"<ii{len(ids)}i{len(ids)}f", layer, len(ids), *ids, *([0.0] * len(ids)))
+    out = rec(-2, [2])
+    for n, w in enumerate(windows):
         for layer, ids in w:
-            out += struct.pack("<3h", layer, 1, len(ids)) + struct.pack(f"<{len(ids)}h", *ids)
+            out += rec(layer, ids)
+        out += rec(-1, [n, 1, 0, 1])
     return out
 
 

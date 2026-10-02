@@ -273,7 +273,7 @@ they sleep.
 `--adapt-gate --adapt-secondary --cache-cpu-only --exclusive-primary-experts --exclusive-secondary-experts
 --lock-cpu-experts --mmvq-exact --no-exclusive-primary-experts --no-exclusive-secondary-experts --no-tail-file
 --ple-ahead --pool-priority --pool-rest --process-priority --profile-decode-range --profile-prefill-range
---ram-cache-gib --route-trace --secondary-async-launch --secondary-expert-mib --secondary-free-floor-mib
+--ram-cache-gib --secondary-async-launch --secondary-expert-mib --secondary-free-floor-mib
 --secondary-graph --secondary-profile-timing --secondary-stage-only --tail-file`
 
 No upstream flag was removed. Upstream defaults we changed through a flag: `--pcie-frac` (−1 → 0), and
@@ -371,7 +371,8 @@ into the sections above and delete the row.
 | `xeno/84-n0-trace` `14eecb9` (#64, 2026-10-02) | CPU pool (§5), configuration (§7) | capacity mode (`--ram-cache-gib` > 0) builds the pool with no park spin: `ExpertPool(..., spin_us)` (`pool.hpp:113`, `pool.cpp:202`; -1 = `kSpinBeforeSleep` 20 ms) gets 0 from `generate.cpp:3117-3120`. Default change against upstream (§7 row when folded in); way back: `STRATA_POOL_SPIN_US=20000`, which still overrides the argument (an empty value is now ignored). Other modes keep the 20 ms spin. Test `xeno_pool_spin`; measurements on #64 |
 | `xeno/84-n0-trace` `0d23ba1` (#97, 2026-10-02) | expert placement and tiers (§5), configuration (§7), diagnostics (§8) | capacity mode's host tier lives in a per-blob-size slab (`ArenaExpertSource::set_capacity`, `take_slot`, `free_slot` in `expert_source.cpp`): one reserved region per blob size, a slot committed on first use; a load takes an idle slot of its size (no commit, no demand-zero faults), an eviction leaves its slot committed and idle, idle bytes past `STRATA_NVME_SLACK_MIB` (512) are decommitted. The byte cap still decides residency and eviction; `blob()` returns the slot (`host_at`). Default on with a deferred, unpinned arena; `STRATA_NVME_SLOTS=0` keeps the fixed arena addresses (§7 rows when folded in). `acquire()` looks up and holds in one step (the three paired-swap sites in `generate.cpp`). New log line `nvme stages` (evict, commit, submit, wait, copy ms/round over decode; slab slots and idle MiB). Tests `xeno_nvme_slots`, `xeno_nvme_overlap`; measurements on #97 |
 | `xeno/84-n0-trace` `edf0ef6` (#97, 2026-10-02) | expert placement and tiers (§5) | `evict_one` takes the victim from per-layer cached minima (`lmin_`/`larg_`, a layer rescanned after `touch`), the same victim as the full scan; `STRATA_NVME_EVICT_SCAN=1` keeps the scan. Test `xeno_nvme_evict_index` |
-| `xeno/84-n0-trace`, this commit (#82, 2026-10-02) | expert placement and tiers (§5) | `submit_reads`' mirror chooser: ties start at the copy one further on each batch (`mirror_turn_`), so single-expert batches alternate copies instead of all going to the source. Test `xeno_nvme_mirror` |
+| `xeno/84-n0-trace` `94efdc2` (#82, 2026-10-02) | expert placement and tiers (§5) | `submit_reads`' mirror chooser: ties start at the copy one further on each batch (`mirror_turn_`), so single-expert batches alternate copies instead of all going to the source. Test `xeno_nvme_mirror` |
+| `xeno/84-n0-trace`, this commit (#93, 2026-10-02) | configuration (§7), diagnostics (§8) | `--route-trace` (int16) is retired: the writer and `ExpertDispatch::route_trace` are gone and the option exits 2 pointing at `--dump-routing`; `tests/xeno/perf/route_tools.py` reads format 2 (`records()` groups a window's per-token records by layer). Test `tests/xeno/test_route_tools_format2.py` |
 
 ## Keeping this file current
 

@@ -6,7 +6,7 @@ These are the scripts behind the 2026-09-28/29 reports in `docs/reports/`. They 
 |---|---|
 | `ab.py` | Same-session ABBA runner (see below). |
 | `launch_ab.py` | Starts `ab.py` fully detached, so it survives the shell that launched it. |
-| `route_tools.py` | Routing traces from `strata generate --route-trace`: counts, STRP profiles, static-tier simulation. |
+| `route_tools.py` | Routing traces from `strata generate --dump-routing` (format 2, #93): counts, STRP profiles, static-tier simulation. |
 | `blend_profile.py` | Blends EXL3 router counts with Strata traces, and evaluates the blend on held-out benchmark traces. |
 | `adapt_sim.py` | Compares static placement, an oracle, and decayed-LFU swaps with a per-round budget. |
 | `make_trace_prompts.py`, `trace-prompts/` | Training prompts for routing traces, disjoint from the benchmark prompts. |

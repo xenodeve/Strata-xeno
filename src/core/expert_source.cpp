@@ -1010,13 +1010,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
-    if (d.route_trace != nullptr) {
-        int16_t rec[3 + 128];
-        const int64_t n = n_tok * k < 128 ? n_tok * k : 128;
-        rec[0] = (int16_t) d.layers; rec[1] = (int16_t) n_tok; rec[2] = (int16_t) k;
-        for (int64_t i = 0; i < n; ++i) rec[3 + i] = (int16_t) ids[i];
-        std::fwrite(rec, sizeof(int16_t), (size_t) (3 + n), d.route_trace);
-    }
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;

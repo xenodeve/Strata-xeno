@@ -303,7 +303,6 @@ struct Options {
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
-    std::string route_trace;              ///< append each verify window's routed expert ids to this file
     int pool_priority = 2;                ///< THREAD_PRIORITY_* for pool workers + host; 2 = HIGHEST (default, 0 = off)
     int mmvq_exact = 1;                   ///< 0: llama.cpp's multi-column MMVQ layout (not bitwise equal to ncols = 1)
     int pool_rest = 1;                    ///< send the pool's workers to sleep when a verify window ends (1, default)
@@ -1764,7 +1763,11 @@ int main(int argc, char** argv) {
         else if (a == "--pool-rest") o.pool_rest = std::atoi(next("--pool-rest"));
         else if (a == "--mmvq-exact") o.mmvq_exact = std::atoi(next("--mmvq-exact"));
         else if (a == "--secondary-graph") o.secondary_graph = std::atoi(next("--secondary-graph"));
-        else if (a == "--route-trace") o.route_trace = next("--route-trace");
+        else if (a == "--route-trace") {   // #93: retired - format 2 holds everything it did
+            std::fprintf(stderr, "strata generate: --route-trace is retired; use --dump-routing FILE (format 2, "
+                                 "read by tests/xeno/perf/route_tools.py)\n");
+            return 2;
+        }
         else if (a == "--exclusive-primary-experts") o.exclusive_mode = 1;
         else if (a == "--no-exclusive-primary-experts") o.exclusive_mode = 0;
         else if (a == "--exclusive-secondary-experts") o.exclusive_secondary_mode = 1;
@@ -3962,13 +3965,6 @@ int main(int argc, char** argv) {
     Drive drive;
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
-    std::unique_ptr<std::FILE, int (*)(std::FILE*)> route_trace_file(
-        o.route_trace.empty() ? nullptr : std::fopen(o.route_trace.c_str(), "wb"), &std::fclose);
-    if (!o.route_trace.empty() && !route_trace_file) {
-        std::fprintf(stderr, "strata generate: cannot open --route-trace %s\n", o.route_trace.c_str());
-        return 1;
-    }
-    drive.d.route_trace = route_trace_file.get();
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;

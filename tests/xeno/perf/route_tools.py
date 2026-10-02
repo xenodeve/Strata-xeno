@@ -1,27 +1,37 @@
-"""Routing traces from `strata generate --route-trace`: count, rank into an STRP profile, and simulate static tiers.
+"""Routing traces from `strata generate --dump-routing` (format 2): count, rank into an STRP profile, and simulate
+static tiers.
 
-Trace record: int16 layer, int16 n_tok, int16 k, then n_tok*k int16 expert ids (-1 = none).
+records() yields one (layer, n_tok, k, ids) per verify window and layer, the window's tokens in order (#93: the
+format the retired int16 `--route-trace` wrote, rebuilt from format 2's one-record-per-token stream; a commit tag
+closes a window, other tags are skipped, see include/strata/core/routing_trace.hpp).
 
   python route_tools.py stats   TRACE...
   python route_tools.py profile OUT.bin TRACE... [--prior OLD.bin]     # rank by routed count, prior breaks ties
   python route_tools.py simulate PROFILE.bin PRIMARY SECONDARY TRACE... # static placement: primary = first PRIMARY
                                                                         # ranked, secondary = next SECONDARY
 """
-import struct, sys
+import os, struct, sys
 from collections import Counter
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "tools"))
+from make_profile import iter_records  # noqa: E402
 
 NL, NE = 48, 512
 
 
 def records(path):
-    b = open(path, "rb").read()
-    i, n = 0, len(b) // 2
-    v = struct.unpack(f"<{n}h", b[: n * 2])
-    while i + 3 <= n:
-        layer, nt, k = v[i], v[i + 1], v[i + 2]
-        m = nt * k
-        yield layer, nt, k, v[i + 3 : i + 3 + m]
-        i += 3 + m
+    layer, k, ids, nt = None, 0, [], 0
+    for l, rec in iter_records(path, strict=False):
+        if l < 0 or l != layer:   # a tag (a commit closes the window) or the next layer: the group so far is done
+            if layer is not None:
+                yield layer, nt, k, tuple(ids)
+            layer, k, ids, nt = (None, 0, [], 0) if l < 0 else (l, len(rec), [], 0)
+            if l < 0:
+                continue
+        ids.extend(rec)
+        nt += 1
+    if layer is not None:
+        yield layer, nt, k, tuple(ids)
 
 
 def counts(paths):

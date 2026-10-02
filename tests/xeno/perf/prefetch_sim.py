@@ -1,6 +1,6 @@
 """#44: could a predictor send a layer's CPU-served experts to a GPU before the router asks, like a drafter?
 
-Replays the decode rounds of `--route-trace` files against a static placement (the first PRIMARY + SECONDARY
+Replays the decode rounds of `--dump-routing` (format 2) files against a static placement (the first PRIMARY + SECONDARY
 experts of a ranked profile sit on the GPUs; the rest are CPU-served).  For each (round, layer) a predictor names K
 experts ahead of the router; the layer counts as covered only when EVERY distinct CPU-served expert of it is among the
 K, because a layer waits for its slowest path and one leftover expert keeps the CPU on it.
