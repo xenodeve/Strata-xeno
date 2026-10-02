@@ -78,17 +78,31 @@ function Tool({ call }: { call: ToolCall }) {
   )
 }
 
-// the answer's text with the tool blocks where the model called them
-function Answer({ m }: { m: Message }) {
+// the answer's text with the tool blocks where the model called them, and the thinking of each later round below the tools of the one before it: a long run of tools would otherwise leave
+// the thinking only at the top, out of sight (the first round's thinking stays above, closed once a tool has started)
+function Answer({ m, streaming, show, phase }: { m: Message; streaming: boolean; show: boolean; phase: OrbDesign | null }) {
   if (!m.tools?.length) return <Prose text={m.text || ""} />
+  const reasoning = m.reasoning || ""
   const parts: React.ReactNode[] = []
   let pos = 0
+  let rpos: number | undefined = typeof m.tools[0].rat === "number" ? Math.min(m.tools[0].rat, reasoning.length) : undefined       // what the thought above the answer has shown
   m.tools.forEach((tc, k) => {
     const at = Math.min(Math.max(tc.at || 0, pos), m.text.length)
+    const rat = typeof tc.rat === "number" ? Math.min(tc.rat, reasoning.length) : undefined
+    if (rpos !== undefined && rat !== undefined && rat > rpos) {                       // a new round: what the model thought before it called this tool
+      const seg = reasoning.slice(rpos, rat)
+      if (seg.trim()) parts.push(<RoundThought key={`r${k}`} text={seg} working={false} show={show} phase={phase} />)
+      rpos = rat
+    }
     if (at > pos) parts.push(<Prose key={`p${k}`} text={m.text.slice(pos, at)} />)
     pos = at
     parts.push(tc.server === "agent" ? <AgentCall key={tc.id} call={tc} /> : <Tool key={tc.id} call={tc} />)         // the coding tools show as what they are
   })
+  const tail = rpos !== undefined ? reasoning.slice(rpos) : ""
+  if (tail.trim()) {                                                                  // the thinking after the last tool: live while the model thinks again
+    const idle = !m.tools.some((c) => c.state === "running" || c.state === "writing" || c.state === "asking")
+    parts.push(<RoundThought key="tail" text={tail} working={streaming && idle && m.text.length <= pos} show={show} phase={phase} />)
+  }
   parts.push(<Prose key="rest" text={m.text.slice(pos)} />)
   return <>{parts}</>
 }
@@ -109,9 +123,22 @@ function ThoughtGlyph({ working, status, design }: { working: boolean; status: L
   )
 }
 
-function Thinking({ m, streaming, show, phase }: { m: Message; streaming: boolean; show: boolean; phase: OrbDesign | null }) {
+/** The thinking of one later round of an agent's work: open while it streams (if wanted), closed once it is over, as the first one is. */
+function RoundThought({ text, working, show, phase }: { text: string; working: boolean; show: boolean; phase: OrbDesign | null }) {
+  const [touched, setTouched] = useState<boolean | null>(null)
+  const open = touched ?? (working && show)
+  return (
+    <div className="mb-2" data-round-thought>
+      <Thought working={working} glyph={<ThoughtGlyph working={working} status={working ? "working" : "done"} design={phase ?? "solving"} />} open={open} onToggle={() => setTouched(!open)}>
+        <ReasonStream text={text} live={working} />
+      </Thought>
+    </div>
+  )
+}
+
+function Thinking({ m, text, streaming, show, phase }: { m: Message; text: string; streaming: boolean; show: boolean; phase: OrbDesign | null }) {
   const [touched, setTouched] = useState<boolean | null>(null)       // the user's own choice, once made
-  const thinkingNow = streaming && !m.text
+  const thinkingNow = streaming && !m.text && !m.tools?.length
   const open = touched ?? (thinkingNow && show)                      // open while it streams (if wanted), closed once the answer starts
   const status: LatticeStatus = thinkingNow ? "working" : m.error ? "error" : "done"
   return (
@@ -123,7 +150,7 @@ function Thinking({ m, streaming, show, phase }: { m: Message; streaming: boolea
         onToggle={() => setTouched(!open)}
         elapsed={thinkingNow ? null : m.thinkSecs}
       >
-        <ReasonStream text={m.reasoning || ""} live={thinkingNow} />
+        <ReasonStream text={text} live={thinkingNow} />
       </Thought>
     </div>
   )
@@ -266,9 +293,10 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
   }
   const waiting = streaming && !m.text && !m.tools?.length
   const phase = replyDesign({ streaming, reasoning: m.reasoning, text: m.text, tools: m.tools })
+  const first = m.tools?.length && typeof m.tools[0].rat === "number" ? (m.reasoning || "").slice(0, m.tools[0].rat) : m.reasoning || ""        // with tools: only the thinking before the first one is shown above them
   return (
     <div ref={ref} className="msg-in max-w-[min(100%,65ch)] text-[15px] tracking-[-0.011em] lg:max-w-[72ch]">
-      {m.reasoning && <Thinking m={m} streaming={streaming} show={show} phase={phase} />}
+      {first.trim() && <Thinking m={m} text={first} streaming={streaming} show={show} phase={phase} />}
       {m.error ? (
         <div className="rounded-md border border-line px-3 py-2 text-[13px] text-bad [overflow-wrap:anywhere]">{m.error}</div>
       ) : waiting ? (
@@ -279,7 +307,7 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
       ) : (
         <>
           {!!m.todos?.length && <TodoList todos={m.todos} />}
-          <div className={cn(streaming && "streaming")}><Answer m={m} /></div>
+          <div className={cn(streaming && "streaming")}><Answer m={m} streaming={streaming} show={show} phase={phase} /></div>
           {!!m.hooks?.length && <HookNotes notes={m.hooks} className="mt-2 rounded-md border border-line [&>div:first-child]:border-t-0" />}
         </>
       )}

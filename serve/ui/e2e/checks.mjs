@@ -2130,6 +2130,37 @@ export const checks = [
     },
   },
   {
+    // The button that opens the right panel stays in reach when a long conversation is scrolled down: it used to scroll away with the messages.
+    name: "panel button: stays at the top while the conversation is scrolled, and still opens the panel there",
+    async run({ browser, fast, t, errors }) {
+      const NL = String.fromCharCode(10)
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const long = Array.from({ length: 160 }, (_, i) => `Line number ${i + 1} of a long answer.`).join(NL + NL)
+      const body = chunk({ choices: [{ delta: { content: long } }] }) + chunk({ choices: [], usage: { completion_tokens: 1 } }) + `data: [DONE]${NL}${NL}`
+      const pg = await open(browser, errors, { width: 1400, height: 800 })
+      await pg.route("**/v1/chat/completions", (r) => r.fulfill({ status: 200, contentType: "text/event-stream", body }))
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(900)
+      await pg.fill("textarea[aria-label='Message']", "write a lot")
+      await pg.keyboard.press("Enter")
+      await pg.waitForFunction(() => document.body.innerText.includes("Line number 160"), null, { timeout: 15000 })
+      await pg.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight))
+      await pg.waitForTimeout(500)
+      const toggle = pg.locator("[data-panel-toggle]")
+      const box = await toggle.boundingBox()
+      t.ok("after scrolling far down the button is still on the screen", !!box && box.y >= 0 && box.y + box.height <= 800 && (await pg.evaluate(() => window.scrollY)) > 1500, JSON.stringify(box))
+      await toggle.click()
+      await pg.waitForTimeout(600)
+      t.ok("and clicking it there opens the panel", (await pg.locator("aside[aria-label='Session panel']").getAttribute("data-panel")) === "open")
+      await pg.evaluate(() => window.scrollTo(0, 0))
+      await pg.waitForTimeout(300)
+      const top = await toggle.boundingBox()
+      t.ok("at the top of the page it is where it was", !!top && top.y > 60 && top.y < 200, JSON.stringify(top))
+      await pg.context().close()
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {

@@ -316,11 +316,11 @@ export function Chat({ id }: { id?: string }) {
       </div>
     )}
     <section className="mx-auto flex min-h-[calc(100dvh-9rem)] w-full min-w-0 max-w-[56rem] flex-1 flex-col" onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragging(false)}>
-      <div className="mb-2 flex items-center justify-between">
-        <button type="button" onClick={() => setDrawer(true)} className="flex h-8 items-center gap-1.5 rounded-sm px-2 text-[13px] text-ink-2 transition-colors hover:bg-hover hover:text-ink md:hidden">
+      <div className="pointer-events-none sticky top-[4.5rem] z-10 mb-2 flex items-center justify-between">      {/* stays in reach when the conversation is scrolled: only its buttons take clicks, the rest lets them through to the messages */}
+        <button type="button" onClick={() => setDrawer(true)} className="pointer-events-auto flex h-8 items-center gap-1.5 rounded-sm bg-bg/85 px-2 text-[13px] text-ink-2 backdrop-blur-sm transition-colors hover:bg-hover hover:text-ink md:hidden">
           <HugeiconsIcon icon={Menu01Icon} size={16} strokeWidth={1.6} aria-hidden />{t("Recents")}
         </button>
-        <button type="button" aria-label={t("Session panel")} aria-pressed={panel.open} title={t("Git, plan, skills and context")} onClick={() => keepPanel({ ...panel, open: !panel.open })} data-panel-toggle className={cn("ml-auto flex h-8 items-center gap-1.5 rounded-sm px-2 text-[13px] transition-colors hover:bg-hover hover:text-ink", panel.open ? "bg-fill text-ink" : "text-ink-2")}>
+        <button type="button" aria-label={t("Session panel")} aria-pressed={panel.open} title={t("Git, plan, skills and context")} onClick={() => keepPanel({ ...panel, open: !panel.open })} data-panel-toggle className={cn("pointer-events-auto ml-auto flex h-8 items-center gap-1.5 rounded-sm px-2 text-[13px] backdrop-blur-sm transition-colors hover:bg-hover hover:text-ink", panel.open ? "bg-fill text-ink" : "bg-bg/85 text-ink-2")}>
           <HugeiconsIcon icon={SidebarLeftIcon} size={16} strokeWidth={1.6} aria-hidden className="-scale-x-100" />
         </button>
       </div>
