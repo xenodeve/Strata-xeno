@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
-import { ArrowDown01Icon, Menu01Icon } from "@hugeicons/core-free-icons"
+import { ArrowDown01Icon, Menu01Icon, SidebarLeftIcon } from "@hugeicons/core-free-icons"
 import { apiHeaders, getAgent, getHealth, getImport, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
 import { chat, exportMarkdown, isPrompt, useChatVersion, type Attachment, type Message } from "../../lib/chat"
 import { readFiles } from "../../lib/files"
@@ -25,6 +25,9 @@ import { SkillsContext } from "../../components/SkillTip"
 import { msg, t } from "../../lib/i18n"
 import { CompactingLine, MessageView } from "./Messages"
 import { SettingsSheet } from "./SettingsSheet"
+import { PanelDock } from "../../components/SidePanel"
+import { ProjectPicker } from "../../components/ProjectPicker"
+import { panelState, type PanelState, type PanelTab } from "../../lib/panel"
 
 const NO_MCP: McpInfo = { servers: [], tools: 0 }
 
@@ -208,6 +211,8 @@ export function Chat({ id }: { id?: string }) {
   }, [drawer])
   const toLatest = () => { pinned.current = true; setAway(false); scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" }) }
 
+  const [panel, setPanel] = useState<PanelState>(() => panelState(store.get("panel", null)))      // the right panel: open or not, and which tab (kept in the browser)
+  const keepPanel = (next: PanelState) => { setPanel(next); store.set("panel", next) }
   const [ctxOpen, setCtxOpen] = useState(0)                      // how many times /context was typed: the panel opens at each
   const commands = [...builtinCommands(), ...skills.filter((c) => !builtinCommands().some((b) => b.name === c.name))]       // what "/" lists: Strata's own, then the skills
   const send = () => {
@@ -287,9 +292,12 @@ export function Chat({ id }: { id?: string }) {
       </div>
     )}
     <section className="flex min-h-[calc(100dvh-9rem)] min-w-0 flex-1 flex-col" onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragging(false)}>
-      <div className="mb-2 md:hidden">
-        <button type="button" onClick={() => setDrawer(true)} className="flex h-8 items-center gap-1.5 rounded-sm px-2 text-[13px] text-ink-2 transition-colors hover:bg-hover hover:text-ink">
+      <div className="mb-2 flex items-center justify-between">
+        <button type="button" onClick={() => setDrawer(true)} className="flex h-8 items-center gap-1.5 rounded-sm px-2 text-[13px] text-ink-2 transition-colors hover:bg-hover hover:text-ink md:hidden">
           <HugeiconsIcon icon={Menu01Icon} size={16} strokeWidth={1.6} aria-hidden />{t("Recents")}
+        </button>
+        <button type="button" aria-label={t("Session panel")} aria-pressed={panel.open} title={t("Git, plan, skills and context")} onClick={() => keepPanel({ ...panel, open: !panel.open })} data-panel-toggle className={cn("ml-auto flex h-8 items-center gap-1.5 rounded-sm px-2 text-[13px] transition-colors hover:bg-hover hover:text-ink", panel.open ? "bg-fill text-ink" : "text-ink-2")}>
+          <HugeiconsIcon icon={SidebarLeftIcon} size={16} strokeWidth={1.6} aria-hidden className="-scale-x-100" />
         </button>
       </div>
       <div ref={list} className="flex-1 space-y-6 pb-6" aria-live="off">
@@ -297,7 +305,7 @@ export function Chat({ id }: { id?: string }) {
           <div className="mx-auto mt-[11vh] flex max-w-[44ch] flex-col items-center text-center">
             <StatusOrb live={live} stale={stale} size={64} scale={2.5} override={typing ? { design: "listening", label: t(ORB_NAMES.listening) } : ambient ? { design: ambient, label: t(ORB_NAMES[ambient]) } : undefined} />
             <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>{t("What can I help with?")}</h1>
-            {project && <p className="mt-2 text-[13px] text-ink-2" data-in-project>{t("New chat in the project {name}", { name: project.name })}</p>}
+            <div className="mt-3"><ProjectPicker projects={chat.index.projects} value={project?.id ?? null} onPick={(id) => { chat.setPendingProject(id) }} /></div>
             <p className="lede mt-3">{t("{name} runs on this PC. Nothing leaves it.", { name: metrics?.model_info?.name ? [metrics.model_info.name, metrics.model_info.variant].filter(Boolean).join(" · ") : health.model })}</p>
           </div>
         </Collapse>
@@ -371,6 +379,13 @@ export function Chat({ id }: { id?: string }) {
       />
       <SettingsSheet open={sheet} onClose={closeSheet} efforts={choices} mcp={mcp} projectionLoaded={projection} />
     </section>
+    <PanelDock
+      open={panel.open} tab={panel.tab} onTab={(tab: PanelTab) => keepPanel({ ...panel, tab })} onClose={() => keepPanel({ ...panel, open: false })}
+      data={{
+        folders: chat.folders(), allowed: agentInfo.allowed, busy: !!busy, messages: chat.messages, commands,
+        context: contextView(chat.messages, chat.contextReported(), health.max_context, chat.settings.autoCompact !== false), canCompact: chat.canCompact(), onCompact: () => { void chat.compact(ctx()) },
+      }}
+    />
     </div>
     </SkillsContext.Provider>
   )

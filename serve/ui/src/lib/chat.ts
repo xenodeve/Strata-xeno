@@ -253,6 +253,14 @@ export class ChatController {
     this.notify()
     return true
   }
+  /** The project a conversation that has not started is to work in (null: none). Only before its first prompt, and not while something runs; false otherwise or for a project that is not there. */
+  setPendingProject(project: string | null): boolean {
+    if (this.busy || this.messages.length || this.index.active !== null) return false
+    if (project !== null && !this.index.projects.some((p) => p.id === project)) return false
+    this.pendingProject = project
+    this.notify()
+    return true
+  }
   /** The project the open conversation is in, or the one a new conversation was started in. */
   currentProject(): string | undefined {
     const mine = this.index.items.find((i) => i.id === this.index.active)

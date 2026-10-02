@@ -17,12 +17,13 @@ import { ReasonStream } from "../../components/reason"
 import { Pop } from "../../components/pop"
 import { Spin } from "../../components/spin"
 import { SkillText } from "../../components/SkillTip"
+import { skillCall, type SkillCall } from "../../lib/panel"
 import { AgentCall, TodoList } from "./AgentCall"
 import { msg, t } from "../../lib/i18n"
 
 const TOOL_STATE: Record<ToolCall["state"], string> = { writing: msg("Writing"), asking: msg("Waiting for you"), running: msg("Running"), done: msg("Done"), error: msg("Error"), skipped: msg("Not run") }
 
-function Prose({ text }: { text: string }) {
+export function Prose({ text }: { text: string }) {
   // The answer is escaped first and formatted by lib/markdown; copy buttons inside code blocks are one delegated click.
   const onClick = (e: MouseEvent<HTMLDivElement>) => {
     const b = (e.target as HTMLElement).closest("[data-code-copy]")
@@ -33,7 +34,13 @@ function Prose({ text }: { text: string }) {
 
 // One MCP tool call in the answer: a compact row (name, state, a one-line preview) that opens to the arguments and the
 // result as the model read it. The body is built only while open: a result can be 20,000 characters.
+/** What a call of the skills server says in the chat: the model loaded a skill, read a file that comes with one, or looked for one. */
+function skillTitle(s: SkillCall): string {
+  return s.kind === "use" ? t("Used skill: {name}", { name: s.name ?? "?" }) : s.kind === "file" ? t("Read a file of the skill {name}", { name: s.name ?? "?" }) : t("Looked for a skill")
+}
+
 function Tool({ call }: { call: ToolCall }) {
+  const sk = skillCall(call)
   const args = call.arguments == null ? "" : JSON.stringify(call.arguments, null, 2)
   const preview = call.result != null ? call.result : args.replace(/\s+/g, " ")
   return (
@@ -45,8 +52,8 @@ function Tool({ call }: { call: ToolCall }) {
         className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-[13px] transition-colors hover:bg-hover"
       >
         {(call.state === "running" || call.state === "writing") && <Orb design={toolDesign(call.name)} size={20} />}
-        <span className={cn("font-medium", (call.state === "running" || call.state === "writing") && "t-shimmer")} title={call.name}>{call.tool || call.name || t("tool")}</span>
-        {call.server && <span className="text-ink-2">{call.server}</span>}
+        <span className={cn("font-medium", (call.state === "running" || call.state === "writing") && "t-shimmer")} title={call.name} data-skill-call={sk ? sk.kind : undefined}>{sk ? skillTitle(sk) : call.tool || call.name || t("tool")}</span>
+        {call.server && !sk && <span className="text-ink-2">{call.server}</span>}
         <span className="min-w-0 flex-1 truncate text-ink-3">{preview.slice(0, 200)}</span>
         <span className={cn("shrink-0", call.state === "error" ? "text-bad" : "text-ink-2")}>{t(TOOL_STATE[call.state])}</span>
         {call.ms != null && call.state !== "skipped" && <span className="num shrink-0 text-ink-3">{fmt(call.ms / 1000, 1)} s</span>}

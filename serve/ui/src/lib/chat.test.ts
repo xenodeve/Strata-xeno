@@ -1024,4 +1024,43 @@ describe("a new chat in a project", () => {
     expect(c.newSession(p)).toBe(false)
     c.busy = null
   })
+
+  test("the project of a chat that has not started can be chosen, and changed, and taken away", () => {
+    keep()
+    const c = new ChatController()
+    const p = c.addProject("Work", ["C:/work/app"])!
+    const q = c.addProject("Home", ["C:/home"])!
+    expect(c.setPendingProject(p)).toBe(true)
+    expect(c.currentProject()).toBe(p)
+    expect(c.folders()).toEqual(["C:/work/app"])
+    expect(c.setPendingProject(q)).toBe(true)
+    expect(c.folders()).toEqual(["C:/home"])
+    expect(c.setPendingProject(null)).toBe(true)
+    expect(c.currentProject()).toBeUndefined()
+    expect(c.folders()).toEqual([])
+  })
+
+  test("a project that is not there, a chat that has started, and an answer being written are refused", async () => {
+    keep()
+    const c = new ChatController()
+    const p = c.addProject("Work", ["C:/w"])!
+    expect(c.setPendingProject("nope")).toBe(false)
+    c.busy = { abort: new AbortController(), msg: { role: "assistant", text: "", time: 1 } }
+    expect(c.setPendingProject(p)).toBe(false)
+    c.busy = null
+    mockFetch([said("one")], [])
+    await c.send("first", [], ctx)
+    expect(c.setPendingProject(p)).toBe(false)                          // it is in the list now: moving it is the sidebar's
+    expect(c.index.items[0].project).toBeUndefined()
+  })
+
+  test("the chosen project is the project from the first prompt", async () => {
+    keep()
+    const c = new ChatController()
+    const p = c.addProject("Work", ["C:/w"])!
+    c.setPendingProject(p)
+    mockFetch([said("one")], [])
+    await c.send("first", [], ctx)
+    expect(c.index.items[0].project).toBe(p)
+  })
 })

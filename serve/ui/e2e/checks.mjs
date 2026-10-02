@@ -1183,6 +1183,30 @@ export const checks = [
       await pg.waitForTimeout(900)
       t.ok("its first prompt puts it in the project, in the sidebar", (await side.locator("section[data-projects] [data-section]", { hasText: "Work" }).locator("[data-topic]", { hasText: "inside the project" }).count()) === 1)
       t.ok("and its tools work in the project's folders from that first request", sent.at(-1)?.strata_agent?.cwd === beta && JSON.stringify(sent.at(-1)?.strata_agent?.dirs) === JSON.stringify([alpha]), JSON.stringify(sent.at(-1)?.strata_agent))
+
+      // the project can be chosen on any new chat
+      await side.getByRole("button", { name: "New chat", exact: true }).click()
+      await pg.waitForTimeout(500)
+      const picker = pg.locator("[data-project-picker] button[aria-haspopup='menu']")
+      t.ok("a new chat has a project to choose, and begins with none", (await picker.count()) === 1 && (await picker.innerText()).trim() === "No project" && (await picker.getAttribute("data-in-project")) === null)
+      await picker.click()
+      await pg.waitForTimeout(300)
+      t.ok("the menu lists the projects with their folders", (await pg.locator("[role=menu][aria-label='Choose the project this chat works in'] [role=menuitemradio]").count()) === 2 && (await pg.locator("[data-project-option='Work']").innerText()).includes("beta +1"))
+      await pg.locator("[data-project-option='Work']").click()
+      await pg.waitForTimeout(400)
+      t.ok("choosing one shows it on the new chat", (await picker.getAttribute("data-in-project")) === "Work" && (await picker.innerText()).trim() === "Work")
+      await pg.fill("textarea[aria-label='Message']", "chosen project")
+      await pg.keyboard.press("Enter")
+      await pg.waitForTimeout(900)
+      t.ok("the chat is in that project from its first prompt, and its tools work in the project's folders", (await side.locator("section[data-projects] [data-section]", { hasText: "Work" }).locator("[data-topic]", { hasText: "chosen project" }).count()) === 1 && sent.at(-1)?.strata_agent?.cwd === beta)
+      await side.getByRole("button", { name: "New chat", exact: true }).click()
+      await pg.waitForTimeout(400)
+      await picker.click()
+      await pg.locator("[data-project-option='Work']").click()
+      await picker.click()
+      await pg.getByRole("menuitemradio", { name: /No project/ }).click()
+      await pg.waitForTimeout(300)
+      t.ok("and it can be taken away again before the first prompt", (await picker.getAttribute("data-in-project")) === null)
       await pg.context().close()
       fs.rmSync(work, { recursive: true, force: true })
     },
@@ -1301,6 +1325,151 @@ export const checks = [
       await send("hello five")
       t.ok("with it off a conversation that nears the end is not summarised by itself", bodies.length === n4 + 1 && !String(bodies.at(-1).messages.at(-1).content).includes("Primary request and intent"))
       await pg.context().close()
+    },
+  },
+  {
+    // The Chat's right panel (issue #99): Git (the branch, what changed, the diff of a file, branches, worktrees, commits; read only, from the server), the plan, the skills used, the context.
+    // The repository is a real one made in a temporary folder; the model's answers are scripted.
+    name: "panel: the right panel shows the Git state of the project's folders, the plan, the skills used and the context",
+    async run({ browser, fast, t, errors }) {
+      const fs = await import("node:fs")
+      const os = await import("node:os")
+      const path = await import("node:path")
+      const cp = await import("node:child_process")
+      const NL = String.fromCharCode(10)
+      const git = (cwd, ...args) => cp.execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.autocrlf=false", ...args], { cwd, stdio: "pipe" })
+      const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "strata-panel-")))
+      const repo = path.join(base, "app"), wt = path.join(base, "app-wt"), plain = path.join(base, "plain")
+      fs.mkdirSync(repo); fs.mkdirSync(plain)
+      git(repo, "init", "-q", "-b", "main")
+      fs.writeFileSync(path.join(repo, "a.txt"), "one" + NL + "two" + NL + "three" + NL)
+      fs.writeFileSync(path.join(repo, "b.txt"), "bee" + NL)
+      git(repo, "add", "."); git(repo, "commit", "-q", "-m", "first commit")
+      git(repo, "branch", "feature/x")
+      git(repo, "worktree", "add", "-q", wt, "feature/x")
+      fs.writeFileSync(path.join(repo, "a.txt"), "one" + NL + "TWO" + NL + "three" + NL)
+      fs.writeFileSync(path.join(repo, "b.txt"), "bee" + NL + "buzz" + NL)
+      git(repo, "add", "b.txt")
+      fs.writeFileSync(path.join(repo, "new.txt"), "fresh" + NL)
+
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const ev = (e) => chunk({ choices: [{ delta: {} }], strata_mcp: e })
+      const tail = (text) => chunk({ choices: [{ delta: { content: text } }] }) + chunk({ choices: [], usage: { prompt_tokens: 300, completion_tokens: 20 } }) + `data: [DONE]${NL}${NL}`
+      const rich = ev({ event: "start", id: "s1", name: "skills__use_skill" }) + ev({ event: "call", id: "s1", name: "skills__use_skill", server: "skills", tool: "use_skill", arguments: { name: "git-flow" }, round: 1 })
+        + ev({ event: "result", id: "s1", ok: true, text: "instructions", chars: 12, truncated: false, ms: 5 })
+        + ev({ event: "start", id: "p1", name: "ExitPlanMode" }) + ev({ event: "call", id: "p1", name: "ExitPlanMode", server: "agent", tool: "ExitPlanMode", arguments: { plan: "1. Read the code" + NL + "2. Write the fix" }, round: 1 })
+        + ev({ event: "result", id: "p1", ok: true, text: "approved", chars: 8, truncated: false, ms: 5 })
+        + ev({ event: "todos", call_id: "t1", todos: [{ content: "Read the code", status: "completed", activeForm: "Reading the code" }, { content: "Write the fix", status: "in_progress", activeForm: "Writing the fix" }, { content: "Run the tests", status: "pending", activeForm: "Running the tests" }] })
+        + tail("done")
+      const info = { available: true, allowed: true, shell: "bash", tools: ["Read"] }
+
+      const pg = await open(browser, errors, { width: 1400, height: 900 })
+      await pg.route("**/agent", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(info) }))
+      await pg.route("**/health", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ model: "m", images: false, max_context: 1000 }) }))
+      let n = 0
+      await pg.route("**/v1/chat/completions", (r) => r.fulfill({ status: 200, contentType: "text/event-stream", body: n++ === 0 ? rich : tail("again") }))
+      await pg.addInitScript(([r, w, p]) => {
+        if (!localStorage.getItem("strata.chats")) localStorage.setItem("strata.chats", JSON.stringify({ active: null, items: [], projects: [{ id: "p1", name: "Work", folders: [r, w] }, { id: "p2", name: "Plain", folders: [p] }] }))
+      }, [repo, wt, plain])
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("aside[aria-label='Conversations']")
+      await pg.waitForTimeout(800)
+      const side = pg.locator("aside[aria-label='Conversations']")
+      const toggle = pg.locator("[data-panel-toggle]")
+      const dock = pg.locator("aside[aria-label='Session panel']")
+      const view = dock.locator("[data-git-view]")
+
+      await side.getByRole("button", { name: "New chat in project Work" }).click()
+      await pg.waitForTimeout(400)
+      t.ok("the panel is closed to begin with, and a button opens it", (await dock.getAttribute("data-panel")) === "closed" && (await toggle.getAttribute("aria-pressed")) === "false")
+      const widths = pg.evaluate(async () => { const el = document.querySelector("aside[aria-label='Session panel']"); const seen = []; const t0 = performance.now(); while (performance.now() - t0 < 700) { seen.push(Math.round(el.getBoundingClientRect().width)); await new Promise((r) => requestAnimationFrame(r)) } return seen })
+      await toggle.click()
+      const w = await widths
+      t.ok("it stretches open through in-between widths", new Set(w).size > 4 && w[0] <= 5 && w.at(-1) >= 330 && w.slice(1, -1).some((x) => x > 10 && x < 330), JSON.stringify([...new Set(w)]))
+      await view.waitFor({ timeout: 8000 })
+      t.ok("the Git tab is the first, with a tab for each folder of the project", (await dock.locator("[role=tab][data-tab='git']").getAttribute("aria-selected")) === "true" && (await dock.locator("[role=tablist][aria-label='Folders of the project'] [role=tab]").allInnerTexts()).join(",") === "app,app-wt")
+      t.ok("the branch of the main folder", (await view.locator("[data-branch]").innerText()).includes("main"))
+      const group = (name) => view.locator(`[data-group-title='${name}']`)
+      t.ok("what changed, in groups: staged, not staged and new", (await group("Staged").locator("[data-file]").allInnerTexts()).join().includes("b.txt") && (await group("Not staged").locator("[data-file]").allInnerTexts()).join().includes("a.txt") && (await group("New files").locator("[data-file]").allInnerTexts()).join().includes("new.txt"))
+      t.ok("each with a letter for its change", (await group("Not staged").locator("[data-file='a.txt'] button span").first().innerText()) === "M" && (await group("New files").locator("[data-file='new.txt'] button span").first().innerText()) === "?")
+      await group("Not staged").locator("[data-file='a.txt'] button").click()
+      await pg.waitForTimeout(900)
+      t.ok("a file opens to its diff, with the lines that went and the lines that came", (await view.locator("[data-line='del']").innerText()).includes("two") && (await view.locator("[data-line='add']").innerText()).includes("TWO"))
+      await group("New files").locator("[data-file='new.txt'] button").click()
+      await pg.waitForTimeout(900)
+      t.ok("a new file is shown as all added", (await group("New files").locator("[data-line='add']").innerText()).includes("fresh"))
+      await dock.locator("[data-section-title='Branches'] > button").click()
+      await pg.waitForTimeout(500)
+      t.ok("the branches are listed with the current one marked", (await view.locator("[data-branch-row]").count()) === 2 && (await view.locator("[data-branch-row][data-current]").getAttribute("data-branch-row")) === "main")
+      await dock.locator("[data-section-title='Worktrees'] > button").click()
+      await pg.waitForTimeout(500)
+      t.ok("the worktrees of the repository are listed", (await view.locator("[data-worktree]").count()) === 2)
+      t.ok("the last commits", (await view.locator("[data-commit]").first().innerText()).includes("first commit"))
+      await dock.locator("[role=tablist][aria-label='Folders of the project'] [role=tab]", { hasText: "app-wt" }).click()
+      await pg.waitForTimeout(1500)
+      t.ok("the other folder has its own branch", (await view.locator("[data-branch]").innerText()).includes("feature/x") && (await view.locator("[data-clean]").count()) === 1)
+
+      // an answer ends: the view is read again
+      fs.writeFileSync(path.join(wt, "later.txt"), "x")
+      await dock.locator("[role=tablist][aria-label='Folders of the project'] [role=tab]", { hasText: "app" }).first().click()
+      await pg.waitForTimeout(1200)
+      await pg.fill("textarea[aria-label='Message']", "go")
+      await pg.keyboard.press("Enter")
+      await pg.waitForTimeout(1500)
+      fs.writeFileSync(path.join(repo, "after.txt"), "y")
+      await pg.fill("textarea[aria-label='Message']", "once more")
+      await pg.keyboard.press("Enter")
+      await pg.waitForTimeout(1800)
+      t.ok("when an answer ends the Git view is read again, so what the model changed is there", (await view.locator("[data-file='after.txt']").count()) === 1)
+
+      // the plan
+      await dock.locator("[data-tab='plan']").click()
+      await pg.waitForTimeout(500)
+      t.ok("the plan tab has the to-do list with how far it is", (await dock.locator("[data-progress]").innerText()).includes("1 of 3 done") && (await dock.getByText("Write the fix").count()) >= 1)
+      t.ok("and the plan that was sent for approval", (await dock.locator("[data-plan-text]").innerText()).includes("Write the fix"))
+      // the skills
+      await dock.locator("[data-tab='skills']").click()
+      await pg.waitForTimeout(500)
+      t.ok("the skills tab says which skill the model loaded", (await dock.locator("[data-skill-used='git-flow']").innerText()).includes("the model loaded"))
+      t.ok("and the chat says so where it happened", (await pg.locator("[data-skill-call='use']").innerText()).includes("Used skill: git-flow"))
+      // the context
+      await dock.locator("[data-tab='context']").click()
+      await pg.waitForTimeout(500)
+      t.ok("the context tab has what the window holds", (await dock.locator("[data-context-panel]").innerText()).includes("Context window") && (await dock.locator("[data-context-figures]").innerText()).includes("of 1,000 tokens"))
+
+      // kept
+      await pg.reload()
+      await pg.waitForSelector("aside[aria-label='Session panel']")
+      await pg.waitForTimeout(900)
+      t.ok("after a reload the panel is open on the tab it was left on", (await dock.getAttribute("data-panel")) === "open" && (await dock.locator("[data-tab='context'][aria-selected='true']").count()) === 1)
+      await toggle.click()
+      await pg.waitForTimeout(600)
+      t.ok("the button closes it", (await dock.getAttribute("data-panel")) === "closed")
+
+      // a folder that is not a repository
+      await toggle.click()
+      await dock.locator("[data-tab='git']").click()
+      await side.getByRole("button", { name: "New chat in project Plain" }).click()
+      await pg.waitForTimeout(1500)
+      t.ok("a folder that is not in a repository says so", (await dock.locator("[data-not-repo]").count()) === 1)
+      await pg.context().close()
+
+      // a narrow screen: a sheet over the chat
+      const ph = await open(browser, errors, { width: 390, height: 800 })
+      await ph.route("**/agent", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(info) }))
+      await ph.addInitScript(([r]) => { if (!localStorage.getItem("strata.chats")) localStorage.setItem("strata.chats", JSON.stringify({ active: null, items: [], projects: [{ id: "p1", name: "Work", folders: [r] }] })) }, [repo])
+      await ph.goto(fast.base + "/#/chat")
+      await ph.waitForSelector("textarea[aria-label='Message']")
+      await ph.waitForTimeout(800)
+      await ph.locator("[data-panel-toggle]").click()
+      await ph.waitForTimeout(700)
+      const sheet = ph.locator("[data-panel='sheet']")
+      t.ok("on a narrow screen it opens as a sheet over the chat, and nothing is wider than the screen", (await sheet.count()) === 1 && (await ph.evaluate(() => document.documentElement.scrollWidth - innerWidth)) <= 0)
+      await ph.keyboard.press("Escape")
+      await ph.waitForTimeout(600)
+      t.ok("Escape closes the sheet", (await sheet.count()) === 0)
+      await ph.context().close()
+      fs.rmSync(base, { recursive: true, force: true })
     },
   },
   {

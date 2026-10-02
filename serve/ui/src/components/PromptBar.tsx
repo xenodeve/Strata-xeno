@@ -6,10 +6,10 @@ import {
 import { msg, t } from "../lib/i18n"
 import type { McpServer } from "../lib/api"
 import { markOf, matchCommands, pickCommand, slashQuery, type Command } from "../lib/slash"
-import type { ContextView, PartKey } from "../lib/context"
-import { fmt } from "../lib/format"
+import type { ContextView } from "../lib/context"
 import { SkillCard } from "./SkillTip"
-import { Button, MiniSwitch } from "./ui"
+import { MiniSwitch } from "./ui"
+import { ContextPanel } from "./ContextPanel"
 import { AgentControls, ModePicker, modeLabel, type AgentControlsProps } from "./AgentControls"
 import { GlidePanel } from "./motion"
 
@@ -94,10 +94,6 @@ export interface PromptBarProps {
   children?: ReactNode                       // floats above the field (the "Latest" button)
 }
 
-const PART_LABEL: Record<PartKey, string> = {
-  conversation: msg("Conversation"), tools: msg("Tool calls and results"), summary: msg("Summary of earlier messages"), system: msg("Instructions, tools and memory"), free: msg("Free"),
-}
-
 /** The share of the window that is used, as a small ring. */
 function ContextRing({ pct }: { pct: number }) {
   const r = 5.5, c = 2 * Math.PI * r
@@ -106,35 +102,6 @@ function ContextRing({ pct }: { pct: number }) {
       <circle cx="7" cy="7" r={r} fill="none" strokeWidth="2" className="prompt-bar__ring-track" />
       <circle cx="7" cy="7" r={r} fill="none" strokeWidth="2" strokeLinecap="round" strokeDasharray={`${(c * pct) / 100} ${c}`} transform="rotate(-90 7 7)" className="prompt-bar__ring-fill" />
     </svg>
-  )
-}
-
-/** What the context window holds: how much is used, what it is made of, where it is compacted by itself. */
-function ContextPanel({ view, canCompact, onCompact }: { view: ContextView; canCompact: boolean; onCompact: () => void }) {
-  const shown = view.parts.filter((x) => x.key === "free" || x.tokens > 0)
-  return (
-    <div data-context-panel>
-      <div className="prompt-bar__ctx-head">
-        <span className="prompt-bar__ctx-title">{t("Context window")}</span>
-        <span className="num prompt-bar__ctx-pct" data-level={view.level}>{view.pct}%</span>
-      </div>
-      <p className="num mt-0.5 text-[12px] text-ink-2" data-context-figures>{view.exact ? "" : t("About") + " "}{t("{used} of {max} tokens", { used: fmt(view.used), max: fmt(view.max) })}</p>
-      <div className="prompt-bar__ctx-bar" role="img" aria-label={t("What the context window holds")}>
-        {shown.map((x) => <span key={x.key} data-part={x.key} style={{ flexGrow: x.tokens }} />)}
-      </div>
-      <ul className="prompt-bar__ctx-list">
-        {shown.map((x) => (
-          <li key={x.key} data-part={x.key}>
-            <i aria-hidden data-part={x.key} />
-            <span>{t(PART_LABEL[x.key])}</span>
-            <span className="num">{fmt(x.tokens)}</span>
-          </li>
-        ))}
-      </ul>
-      {view.autoAt !== null && <p className="mt-2 text-[12px] text-ink-2" data-context-auto>{t("Compacted by itself at {n} tokens ({pct}%).", { n: fmt(view.autoAt), pct: Math.round((view.autoAt / view.max) * 100) })}</p>}
-      {!view.exact && <p className="mt-1 text-[12px] text-ink-3">{t("The server has not reported the use yet: this is a guess from the text.")}</p>}
-      <div className="mt-3"><Button onClick={onCompact} disabled={!canCompact}>{t("Compact now")}</Button></div>
-    </div>
   )
 }
 

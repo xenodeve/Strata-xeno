@@ -547,7 +547,15 @@ messages, what the server added - its instructions, the tools, the memory - and 
 last answer reported, else a guess from the text (the panel says "about"); with no window size from the server there is no chip.
 
 **A new chat inside a project.** Each project in the sidebar has a button for a new conversation in it: the conversation is in the project from its first prompt (and the
-coding tools work in the project's folders from that request); until then the empty chat says which project it will be in.
+coding tools work in the project's folders from that request); until then the empty chat says which project it will be in. A new chat can also be given a project on its empty page (a menu under the heading, shown when there are projects):
+"No project" or one of them, changed or taken away until the first prompt; after that moving it is the sidebar's.
+
+**The right panel.** A button at the top right of the Chat opens a panel beside the conversation (a sheet over it on a screen narrower than 1280 px; open state and tab are kept in
+the browser). Tabs: **Git** - for each folder of the project (a tab each), the branch (or "detached at ..."), commits ahead and behind its upstream, the changed files in groups
+(conflicts, staged, not staged, new) each opening to its diff with old and new line numbers, the branches with the current one marked, the worktrees of the repository, and the last
+commits; it is read again when an answer ends (the model may have changed files) and on request; read only, and only for who may use the coding tools. **Plan** - the model's to-do
+list with how far it is, and the plan it sent for approval. **Skills** - the skills used in the chat, those the user asked for with `/name` and those the model loaded (the chat
+also says "Used skill: name" where it happened). **Context** - the same panel as the chip on the prompt bar.
 
 - **What asks.** Inside the chat's project folder, reading, searching, writing and editing files are free (secrets such as `.env` or keys, and
   writing in `.git`, always ask). Outside the folder, or when the chat has no folder, everything asks. A command asks every time unless it is

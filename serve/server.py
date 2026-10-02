@@ -60,7 +60,7 @@ from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_me
 from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
 from serve import agent as agent_mod, agent_prompt, agent_run, permissions, shell as shell_mod  # noqa: E402
-from serve import folders as folders_mod  # noqa: E402
+from serve import folders as folders_mod, gitview  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -2149,6 +2149,18 @@ def make_handler(svc: Service):
                     seen = folders_mod.look(parse_qs(urlsplit(self.path).query).get("path", [""])[0])
                     # a path that is no folder is an answer, not an error (a 404 would be logged as one in the browser's console)
                     self._json(200, seen if seen is not None else {"ok": False, "error": "That is not a folder on this PC"})
+                return
+            if path in ("/agent/git", "/agent/git/diff"):
+                # the Git state of a folder, read only, for the Chat's right panel (serve/gitview.py); for who may use the coding tools
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    q = parse_qs(urlsplit(self.path).query)
+                    folder = q.get("path", [""])[0]
+                    if path == "/agent/git":
+                        return self._json(200, gitview.info(folder))
+                    return self._json(200, gitview.diff(folder, q.get("file", [""])[0], q.get("staged", ["0"])[0] == "1", q.get("untracked", ["0"])[0] == "1"))
                 return
             if path == "/mcp/config":
                 # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)
