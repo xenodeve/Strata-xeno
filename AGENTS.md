@@ -238,7 +238,9 @@ The web app (`serve/ui/`) must never leave the user guessing whether the model i
   task needs "the server".
 - **Capacity mode is optional** (`strata-swift-capacity.json`, keys 1 and 2: the NVMe tier for experts past RAM, `--ram-cache-gib`).
   It stays supported and tested, but it is something the developer chooses to run, not what a change is judged on.
-- D2x's RAM commit at 262k has not been measured yet (it may land near the 40 GB cap); a measurement of it needs both GPUs and is
+- **The RAM budget for Strata's private commit is 42 GB** (the developer raised it from 40 GB on 2026-10-03). It is a budget the
+  developer sets, not a flag: no config or launcher enforces it, so a run is judged against it by measuring the commit.
+- D2x's RAM commit at 262k has not been measured yet (it may land near that budget); a measurement of it needs both GPUs and is
   the engine session's job. Do not edit these configs, the launchers or `strata-hub.bat` without telling the developer.
 
 ## Other standing rules
