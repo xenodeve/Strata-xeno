@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react"
 import type { AgentInfo, AgentMode } from "../lib/agent"
 import { msg, t } from "../lib/i18n"
-import { Fit } from "./motion"
 import { Button, MiniSwitch, Segmented, inputCls } from "./ui"
 
 // The settings of the chat's coding tools (issue #96): on or off, the mode, the folder they work in, and the rules the user allowed for the
@@ -45,7 +44,7 @@ export function AgentControls(p: AgentControlsProps) {
       </div>
       <div className={p.on ? "" : "pointer-events-none opacity-50"} aria-disabled={!p.on}>
         <Segmented label={t("Mode")} value={p.mode} onChange={p.onMode} options={(["ask", "plan", "auto"] as AgentMode[]).map((m) => ({ value: m, label: modeLabel(m) }))} />
-        <div className="mt-1.5"><Fit><p className="text-[12px] text-ink-2" data-agent-mode-text>{t(MODE_TEXT[p.mode])}</p></Fit></div>      {/* only this stretches, where the text gets longer */}
+        <p className="mt-1.5 text-[12px] text-ink-2" data-agent-mode-text>{t(MODE_TEXT[p.mode])}</p>
         <label className="mt-3 block">
           <span className="text-[13px]">{t("Folder")}</span>
           <span className="mt-1.5 flex items-center gap-2">

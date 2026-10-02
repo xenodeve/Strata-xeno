@@ -2,6 +2,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } f
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon } from "@hugeicons/core-free-icons"
 import { cn } from "../lib/cn"
+import { watchGrowth } from "../lib/glide"
 
 // Motion for things that open, close, appear and disappear. Height is animated through grid rows (0fr <-> 1fr), so it
 // is exact for any content and needs no measuring; opacity rides along. One ease and one duration scale, everywhere.
@@ -89,25 +90,25 @@ export function Fit({ children, className }: { children: ReactNode; className?: 
   )
 }
 
-/** A scrolling panel whose height glides to the height of what is in it, up to a cap (then it scrolls): a section that opens inside it
- *  stretches it open, instead of the panel jumping to its largest size at once. The scrollbar's room is kept, so nothing shifts sideways
- *  when the scrollbar appears. The padding goes on `inner`: the height is measured inside it. */
+/** A scrolling panel (up to a cap, then it scrolls) whose content stretches where it really grew: a paragraph that got longer, a row that was
+ *  added. That part glides to its new height and the rest follows it in the flow - what is after it moves with it, what is before it stays (and in
+ *  a panel anchored at its bottom edge, what is after it stays and what is before it moves up). The panel as a whole is not animated. The
+ *  scrollbar's room is kept, so nothing shifts sideways when the scrollbar appears. The padding goes on `inner`. See lib/glide.ts. */
 export function GlidePanel({ children, className, inner = "", cap, ...rest }: { children: ReactNode; className?: string; inner?: string; cap: () => number } & React.HTMLAttributes<HTMLDivElement>) {
   const body = useRef<HTMLDivElement>(null)
-  const [h, setH] = useState<number | null>(null)
+  const [max, setMax] = useState<number | null>(null)
   useLayoutEffect(() => {
     const el = body.current
     if (!el) return
-    const measure = () => setH(Math.min(el.offsetHeight, cap()))
-    measure()
-    const ro = new ResizeObserver(measure)
-    ro.observe(el)
-    addEventListener("resize", measure)
-    return () => { ro.disconnect(); removeEventListener("resize", measure) }
+    const size = () => setMax(cap())
+    size()
+    addEventListener("resize", size)
+    const stop = watchGrowth(el)
+    return () => { removeEventListener("resize", size); stop() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   return (
-    <div {...rest} className={cn("glide-panel overflow-y-auto [scrollbar-gutter:stable]", className)} style={h == null ? undefined : { height: h }}>
+    <div {...rest} className={cn("overflow-y-auto [scrollbar-gutter:stable]", className)} style={max == null ? undefined : { maxHeight: max }}>
       <div ref={body} className={inner}>{children}</div>
     </div>
   )

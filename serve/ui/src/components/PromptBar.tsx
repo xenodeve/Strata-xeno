@@ -9,6 +9,7 @@ import { markOf, matchCommands, pickCommand, slashQuery, type Command } from "..
 import { SkillCard } from "./SkillTip"
 import { MiniSwitch } from "./ui"
 import { AgentControls, modeLabel, type AgentControlsProps } from "./AgentControls"
+import { GlidePanel } from "./motion"
 
 // The composer: the field, and one bar of tools under it. Adapted from React Bits' PromptBar (MIT + Commons Clause: used
 // inside this app only, see REFERENCES.md). Changes: our tokens instead of fixed colours; the arrow-to-stop morph is a
@@ -323,7 +324,9 @@ export function PromptBar(p: PromptBarProps) {
 
       {menu === "agent" && (
         <div className="prompt-bar__menu" role="dialog" aria-label={t("Coding tools")} data-kind="agent">
-          <AgentControls {...p.agent} />
+          <GlidePanel cap={() => Math.min(innerHeight * 0.7, 520)} inner="px-4 pb-4 pt-3.5">      {/* it stretches where its content grows (the description of a mode, a row that comes), not as a whole */}
+            <AgentControls {...p.agent} />
+          </GlidePanel>
         </div>
       )}
 

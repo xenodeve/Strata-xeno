@@ -1141,7 +1141,7 @@ export const checks = [
       await pnl.locator("[role=radio]", { hasText: "Plan" }).click()
       await pn.waitForTimeout(700)
       const watching = pn.evaluate(async () => {
-        const box = document.querySelector("[role=dialog][aria-label='Coding tools'] .fit-box")
+        const box = document.querySelector("[data-agent-mode-text]")
         const top = (q) => Math.round(document.querySelector(q).getBoundingClientRect().top)
         const rows = []
         const t0 = performance.now()
@@ -1157,6 +1157,24 @@ export const checks = [
       t.ok("the description stretches where the text gets longer, through in-between heights", new Set(boxes).size > 3 && boxes.at(-1) > boxes[0] && boxes.slice(1, -1).some((h) => h > boxes[0] && h < boxes.at(-1)), JSON.stringify([...new Set(boxes)]))
       t.ok("from there upward: what is above it moves up as it grows", modes[0] - modes.at(-1) > 10 && modes.slice(1, -1).some((m) => m < modes[0] && m > modes.at(-1)), JSON.stringify([...new Set(modes)]))
       t.ok("and what is below it stays exactly where it was", Math.max(...folders) - Math.min(...folders) <= 1, JSON.stringify([...new Set(folders)]))
+      // a part that is added (here a row put in at the top of the panel) stretches open from nothing, and what is below it stays
+      await pn.waitForTimeout(300)
+      const adding = await pn.evaluate(async () => {
+        const inner = document.querySelector("[role=dialog][aria-label='Coding tools'] [data-agent-controls]").parentElement
+        const row = document.createElement("div")
+        row.textContent = "a row that comes"
+        row.style.height = "24px"
+        const folder = document.querySelector("input[aria-label='Folder the tools work in']")
+        const seen = []
+        inner.insertBefore(row, inner.firstChild)
+        const t0 = performance.now()
+        while (performance.now() - t0 < 900) { seen.push({ h: Math.round(row.getBoundingClientRect().height), folder: Math.round(folder.getBoundingClientRect().top) }); await new Promise((r) => requestAnimationFrame(r)) }
+        row.remove()
+        return seen
+      })
+      const rowH = adding.map((x) => x.h), rowFolders = adding.map((x) => x.folder)
+      t.ok("a part that is added opens from nothing to its height through in-between heights", new Set(rowH).size > 3 && rowH.at(-1) === 24 && rowH.slice(0, -1).some((h) => h > 0 && h < 24), JSON.stringify([...new Set(rowH)]))
+      t.ok("and what is below it does not move", Math.max(...rowFolders) - Math.min(...rowFolders) <= 1, JSON.stringify([...new Set(rowFolders)]))
 
       // ---- the request, and a card that asks
       await typeAndSend(pg, "run the tests")
@@ -1199,7 +1217,7 @@ export const checks = [
       const sampling = heightsNow(pg)
       await panel.getByRole("button", { name: "Forget them" }).click()
       const hs = await sampling
-      t.ok("only the description stretches: a row that goes takes the panel's height in one step, the panel does not glide as a whole", new Set(hs).size <= 2 && hs.at(-1) < hs[0], JSON.stringify([...new Set(hs)]))
+      t.ok("a part that goes shrinks smoothly too: the panel's height takes in-between values as the rows round it follow", new Set(hs).size > 3 && hs.at(-1) < hs[0] && hs.slice(1, -1).some((h) => h < hs[0] && h > hs.at(-1)), JSON.stringify([...new Set(hs)]))
       await pg.waitForTimeout(300)
       t.ok("forgotten", !(await panel.innerText()).includes("rules allowed"))
       await panel.locator("[role=switch][aria-label='Coding tools']").click()

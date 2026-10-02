@@ -114,7 +114,6 @@
 /* Motion: one ease, durations 160-420 ms, opacity / transform / blur / grid-rows only. */
 .collapse-grid { display: grid; grid-template-rows: 0fr; opacity: 0; transition: grid-template-rows 320ms var(--ease), opacity 240ms var(--ease); }
 .collapse-soft { transition: grid-template-rows 520ms cubic-bezier(0.4, 0, 0.2, 1), opacity 360ms ease; }       /* a section that is a good part of a panel or a page: an even stretch and shrink */
-.glide-panel { transition: height 520ms cubic-bezier(0.4, 0, 0.2, 1); }
 /* MCP server form: the program fields sit to the left, the address fields to the right; switching slides one out and the other in while the form stretches */
 .kind-pane { --x: -28px; transition: transform 520ms cubic-bezier(0.4, 0, 0.2, 1); }
 .kind-pane[data-side="right"] { --x: 28px; }
@@ -147,7 +146,7 @@
 .msg-in { animation: rise 300ms var(--ease) backwards; }
 .swap-in { animation: sharpen 280ms var(--ease) backwards; }
 @media (prefers-reduced-motion: reduce) {
-  .collapse-grid, .collapse-soft, .glide-panel, .kind-pane { transition: none; } .kind-pane { animation: none !important; } .stagger > *, main > * > *, .row-in, .msg-in, .swap-in { animation: none; }
+  .collapse-grid, .collapse-soft, .kind-pane { transition: none; } .kind-pane { animation: none !important; } .stagger > *, main > * > *, .row-in, .msg-in, .swap-in { animation: none; }
 }
 
 /* Type: one display size for the moment that matters, a quiet lede under it. Tracking tightens with size; Thai is never tracked. */
