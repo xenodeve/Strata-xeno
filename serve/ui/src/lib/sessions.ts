@@ -133,9 +133,11 @@ export function moveSession(index: SessionIndex, id: string, project: string | u
   return { ...index, items: index.items.map((i) => { if (i.id !== id) return i; const { project: _was, ...rest } = i; return project === undefined ? rest : { ...rest, project } }) }
 }
 
-export function addProject(index: SessionIndex, name: string, id: string = newId()): SessionIndex {
+/** A project is a name and the folder its chats work in (the coding tools). The page asks for the folder; projects made before that have none. */
+export function addProject(index: SessionIndex, name: string, id: string = newId(), folder?: string): SessionIndex {
   const n = clean(name, NAME_MAX)
-  return n ? { ...index, projects: [...index.projects, { id, name: n }] } : index
+  const f = okFolder(folder) ? folder.trim() : undefined
+  return n ? { ...index, projects: [...index.projects, { id, name: n, ...(f ? { folder: f } : {}) }] } : index
 }
 
 export function renameProject(index: SessionIndex, id: string, name: string): SessionIndex {

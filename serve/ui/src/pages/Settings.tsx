@@ -56,7 +56,7 @@ function CodingTools() {
   return (
     <section>
       <h2 className="text-[15px] font-semibold">{t("Coding tools")}</h2>
-      <p className="mt-1 mb-3 text-[13px] text-ink-2">{t("The chat can read, search and change files and run commands on this PC with Claude Code's own tools, and asks you before anything that is not plainly safe. Here are the defaults; a project's own folder is set from inside one of its chats.")}</p>
+      <p className="mt-1 mb-3 text-[13px] text-ink-2">{t("The chat can read, search and change files and run commands on this PC with Claude Code's own tools, and asks you before anything that is not plainly safe. Here are the defaults; a project has its own folder, chosen when it is made.")}</p>
       <AgentControls
         info={info} on={s.agent !== false} mode={s.agentMode === "plan" || s.agentMode === "auto" ? s.agentMode : "ask"} folder={s.agentFolder?.trim() || null} folderOf={{ kind: "default" }} rules={0}
         onToggle={() => chat.setSettings({ ...s, agent: s.agent === false })} onMode={(m) => chat.setSettings({ ...s, agentMode: m })}

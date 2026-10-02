@@ -44,7 +44,8 @@ export function AgentControls(p: AgentControlsProps) {
   useEffect(() => setDraft(p.folder ?? ""), [p.folder])
   if (!p.info.available) return <p className="text-[13px] text-ink-2">{t("The coding tools are switched off on this server (\"agent\": false in the run config).")}</p>
   if (!p.info.allowed) return <p role="note" className="text-[13px] text-ink-2">{t("The coding tools work only from the PC that runs Strata (or with the API key), because they change files and run commands there.")}</p>
-  const changed = draft.trim() !== (p.folder ?? "")
+  const ofProject = p.folderOf.kind === "project"
+  const changed = draft.trim() !== (p.folder ?? "") && !(ofProject && !draft.trim())       // a project always has a folder: it can be changed, not taken away
   return (
     <div className="space-y-3" data-agent-controls>
       <div className="flex items-center justify-between gap-3">
@@ -72,7 +73,9 @@ export function AgentControls(p: AgentControlsProps) {
             <Button disabled={!changed} onClick={() => p.onFolder(draft)}>{t("Save")}</Button>
           </span>
           <span className="mt-1 block text-[12px] text-ink-2">
-            {p.folderOf.kind === "project" ? t("The folder of the project \"{name}\". Inside it files are free; outside it everything asks.", { name: p.folderOf.name }) : t("For chats that are in no project. Give a project its own folder from inside one of its chats.")}
+            {p.folderOf.kind !== "project" ? t("For chats that are in no project. A project has its own folder, chosen when it is made.")
+              : p.folder ? t("The folder of the project \"{name}\". Inside it files are free; outside it everything asks.", { name: p.folderOf.name })
+              : t("The project \"{name}\" has no folder yet, so its chats use the default one. Set its folder here.", { name: p.folderOf.name })}
           </span>
         </label>
         <p className="mt-2 text-[12px] text-ink-2">{p.info.shell ? t("Commands run in {shell}, in the folder, and ask you first unless they only read.", { shell: p.info.shell }) : t("No shell was found on this PC, so commands cannot run.")}</p>

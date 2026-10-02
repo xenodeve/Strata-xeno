@@ -9,6 +9,7 @@ import { cn } from "../lib/cn"
 import { toast } from "./toast"
 import { BranchedMenu, type BranchSection, type BranchTopic } from "./BranchedMenu"
 import { useMounted } from "./motion"
+import { NewProjectDialog } from "./NewProjectDialog"
 
 // Recents (the conversations that are in no project, newest first, on one line from "Recents") and Projects (folders that group them) beside the Chat page, as in ChatGPT, Gemini
 // and Claude, drawn as the branched menu: a project, and Recents itself, is a section, a conversation a branch, and the line is drawn
@@ -152,24 +153,15 @@ export function Sidebar({ drawer = false, onClose }: { drawer?: boolean; onClose
             <HugeiconsIcon icon={Add01Icon} size={14} aria-hidden />
           </button>
         </div>
-        {adding && (
-          <input
-            aria-label={t("Project name")}
-            placeholder={t("Project name")}
-            autoFocus
-            maxLength={60}
-            onKeyDown={(e) => { if (e.key === "Enter") { chat.addProject(e.currentTarget.value); setAdding(false) } else if (e.key === "Escape") setAdding(false) }}
-            onBlur={(e) => { if (e.currentTarget.value.trim()) chat.addProject(e.currentTarget.value); setAdding(false) }}
-            className="mx-1 mt-1 h-8 w-[calc(100%-0.5rem)] rounded-sm border border-accent bg-surface px-2 text-[13px] outline-none placeholder:text-ink-3"
-          />
-        )}
-        {idx.projects.length === 0 && !adding && <p className="mt-1 px-2.5 text-[12px] text-ink-3">{t("No projects yet.")}</p>}
+        {idx.projects.length === 0 && <p className="mt-1 px-2.5 text-[12px] text-ink-3">{t("No projects yet.")}</p>}
         <BranchedMenu fill label={t("Projects")} sections={projectSections} active={idx.active ?? ""} onSelect={pick} open={openOf(projectSections)} onToggle={toggleFold} />
       </section>
 
       <section data-recents>
         <BranchedMenu fill label={t("Recents")} sections={recentSections} active={idx.active ?? ""} onSelect={pick} open={openOf(recentSections)} onToggle={toggleFold} />
       </section>
+
+      <NewProjectDialog open={adding} onCancel={() => setAdding(false)} onCreate={(name, folder) => { chat.addProject(name, folder); setAdding(false) }} />
 
       {menu && (
         <div role="menu" aria-label={t("Options")} style={menuStyle} className="toast-in z-50 w-52 rounded-lg border border-line bg-surface p-1 shadow-[0_14px_40px_-12px_rgb(0_0_0/0.28)]">

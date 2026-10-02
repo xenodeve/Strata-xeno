@@ -47,6 +47,20 @@ export async function getAgent(): Promise<AgentInfo | null> {
   } catch { return null }
 }
 
+export interface FolderView { path: string; parent: string | null; dirs: { name: string; path: string }[]; truncated: boolean }
+
+/** The folders of this PC (serve/folders.py), to choose a project's folder from: where `path` is and the folders in it; blank is the home folder, "@drives" the drives
+ *  (Windows). `unknown` when the server cannot be asked (another PC, no such route): then the path cannot be checked, only used as typed. */
+export async function getFolders(path: string): Promise<FolderView | { error: string } | "unknown"> {
+  try {
+    const r = await fetch(url("agent/folders?path=" + encodeURIComponent(path)), { headers: apiHeaders() })
+    if (!r.ok) return "unknown"
+    const body = await r.json()
+    if (body?.ok === true) return body as FolderView
+    return typeof body?.error === "string" ? { error: body.error } : "unknown"
+  } catch { return "unknown" }
+}
+
 /** The user's answer to a question of the coding tools (a card in the chat); false with the reason when the server did not take it. */
 export async function postPermission(id: string, decision: "allow" | "allow_chat" | "deny"): Promise<{ ok: true } | { error: string }> {
   try {

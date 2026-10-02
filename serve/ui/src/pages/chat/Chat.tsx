@@ -315,7 +315,7 @@ export function Chat({ id }: { id?: string }) {
           skills={skills}
           agent={{
             info: agentInfo, on: chat.settings.agent !== false, mode: (chat.settings.agentMode === "plan" || chat.settings.agentMode === "auto" ? chat.settings.agentMode : "ask") as AgentMode,
-            folder: chat.folder(), folderOf: project ? { kind: "project", name: project.name } : { kind: "default" }, rules: rulesOf(store, chatKey).length,
+            folder: project ? project.folder ?? null : chat.folder(), folderOf: project ? { kind: "project", name: project.name } : { kind: "default" }, rules: rulesOf(store, chatKey).length,
             onToggle: () => chat.setSettings({ ...chat.settings, agent: chat.settings.agent === false }),
             onMode: (m) => chat.setSettings({ ...chat.settings, agentMode: m }),
             onFolder: (path) => (project ? chat.setProjectFolder(project.id, path) : chat.setSettings({ ...chat.settings, agentFolder: path.trim() })),

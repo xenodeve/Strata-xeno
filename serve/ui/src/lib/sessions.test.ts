@@ -191,6 +191,12 @@ describe("projects", () => {
     expect(idx.projects[0].name).toBe("Home")
     expect(renameProject(idx, "p1", "")).toBe(idx)
   })
+  test("a project made with a folder keeps it; one that is no text is not kept", () => {
+    const idx: SessionIndex = { active: null, items: [], projects: [] }
+    expect(addProject(idx, "Work", "p1", " C:/work ").projects).toEqual([{ id: "p1", name: "Work", folder: "C:/work" }])
+    expect(addProject(idx, "Work", "p1", "   ").projects).toEqual([{ id: "p1", name: "Work" }])
+    expect(addProject(idx, "   ", "p1", "C:/work")).toBe(idx)
+  })
   test("a project has a folder on this PC, for the coding tools (issue #96): set, cleaned, cleared, kept through a reload", () => {
     const b = memory()
     let idx = addProject({ active: null, items: [], projects: [] }, "Work", "p1")

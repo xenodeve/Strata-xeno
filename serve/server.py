@@ -60,6 +60,7 @@ from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_me
 from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
 from serve import agent as agent_mod, agent_prompt, agent_run, permissions, shell as shell_mod  # noqa: E402
+from serve import folders as folders_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -2131,6 +2132,16 @@ def make_handler(svc: Service):
                     sh = getattr(svc.agent, "shell", None)
                     self._json(200, {"available": svc.agent is not None, "allowed": ok, "reason": "" if ok else why, "shell": shell_mod.describe(sh) if sh else None,
                                      "tools": [t["name"] for t in svc.agent.tools] if svc.agent else []})
+                return
+            if path == "/agent/folders":
+                # the folders of this PC, to choose a project's folder from (only the names of folders, and only for who may use the coding tools)
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    seen = folders_mod.look(parse_qs(urlsplit(self.path).query).get("path", [""])[0])
+                    # a path that is no folder is an answer, not an error (a 404 would be logged as one in the browser's console)
+                    self._json(200, seen if seen is not None else {"ok": False, "error": "That is not a folder on this PC"})
                 return
             if path == "/mcp/config":
                 # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)

@@ -548,7 +548,8 @@ own `CLAUDE.md` (or `AGENTS.md`). They work only from this PC itself (or with th
   no `STRATA_*` environment variable. Output over 30,000 characters is cut in the middle.
 - **In the chat.** The + menu has a **Coding tools** row (the same controls are in Settings > Coding tools): a switch (on by default when the server
   has them and this page may use them), the mode (Ask / Plan / Auto) and the folder. A chat in a project works in the project's folder; a chat in no
-  project uses the default folder. A call shows as what it is: the command and its output, an edit as removed and added lines, the steps of a
+  project uses the default folder. A project cannot be made without a folder: the New project dialog asks for a name and a folder, typed or
+  chosen from the folders of this PC (`GET /agent/folders`, names of folders only, same callers as the tools) and checked before it is made. A call shows as what it is: the command and its output, an edit as removed and added lines, the steps of a
   longer task as a checklist. When the server asks, the call shows a card with the command or the path and why it asks. **Allow for this chat** is
   kept in this browser and sent with the chat's next requests; a dangerous command cannot be allowed for the whole chat.
 - **Trying it without a model.** `STRATA_MOCK_AGENT=1 python serve/ui/dev/mock_server.py` is the mock server with the real tools behind it; a message with

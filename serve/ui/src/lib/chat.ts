@@ -237,10 +237,12 @@ export class ChatController {
   }
   rename(id: string, title: string) { this.index = renameSession(this.index, id, title); this.saveIndex() }
   move(id: string, project: string | undefined) { this.index = moveSession(this.index, id, project); this.saveIndex() }
-  addProject(name: string): string | null {
+  /** A project needs a folder: it is where its chats' coding tools work. Null (and nothing made) without a name or without a folder. */
+  addProject(name: string, folder: string): string | null {
+    if (!folder.trim()) return null
     const before = this.index.projects.length
     const id = Math.random().toString(36).slice(2, 10)
-    this.index = addProject(this.index, name, id)
+    this.index = addProject(this.index, name, id, folder)
     this.saveIndex()
     return this.index.projects.length > before ? id : null
   }

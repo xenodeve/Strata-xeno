@@ -485,6 +485,20 @@ describe("the coding tools in the chat", () => {
     expect(c.folder()).toBeNull()
   })
 
+  test("a project cannot be made without a folder, and it is the folder its chats' tools work in", () => {
+    keep()
+    const c = new ChatController()
+    expect(c.addProject("Work", "")).toBeNull()
+    expect(c.addProject("Work", "   ")).toBeNull()
+    expect(c.index.projects).toEqual([])
+    expect(c.addProject("", "C:/work/app")).toBeNull()                         // a name is needed too
+    const id = c.addProject("Work", "  C:/work/app ")!
+    expect(c.index.projects).toEqual([{ id, name: "Work", folder: "C:/work/app" }])
+    c.index = { ...c.index, active: "s1", items: [{ id: "s1", title: "t", time: 1, project: id }] }
+    expect(c.folder()).toBe("C:/work/app")
+    expect(new ChatController().index.projects[0].folder).toBe("C:/work/app")
+  })
+
   test("a project's folder is kept with the conversations", () => {
     keep()
     const c = new ChatController()
@@ -578,10 +592,10 @@ describe("conversations", () => {
     await c.send("one", [], ctx)
     const id = c.index.active!
     c.rename(id, "Kept")
-    const p = c.addProject("Work")!
+    const p = c.addProject("Work", "C:/work")!
     c.move(id, p)
     expect(c.index.items[0]).toMatchObject({ title: "Kept", project: p })
-    expect(JSON.parse(data.get("strata.chats")!).projects).toEqual([{ id: p, name: "Work" }])
+    expect(JSON.parse(data.get("strata.chats")!).projects).toEqual([{ id: p, name: "Work", folder: "C:/work" }])
     c.removeProject(p)
     expect(c.index.items[0].project).toBeUndefined()
     expect(c.remove(id)).toBe(true)
@@ -648,7 +662,7 @@ describe("a conversation appears when its prompt is sent, and taking back the fi
     await c.send("first", [], ctx)
     const id = c.index.active!
     c.rename(id, "Kept")
-    const project = c.addProject("Work")!
+    const project = c.addProject("Work", "C:/work")!
     c.move(id, project)
     await c.edit(0, "first, reworded", ctx)
     expect(c.index.items).toHaveLength(1)
