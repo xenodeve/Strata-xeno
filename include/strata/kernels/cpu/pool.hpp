@@ -107,7 +107,11 @@ public:
     /// With `host_works`, `run()` claims jobs itself instead of spinning on `done_`, and the pool is six
     /// threads on six cores. `false` is the A/B arm and exists so the change is measurable rather than
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true);
+    ///
+    /// `spin_us`: how long a parked worker spins before it sleeps; -1 is `kSpinBeforeSleep`.  Capacity mode passes 0
+    /// (#64: with busy SMT siblings the spinning workers starve the NVMe path).  `STRATA_POOL_SPIN_US` overrides it.
+    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int spin_us = -1);
+    std::chrono::microseconds spin_before_sleep() const { return spin_before_sleep_; }
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();

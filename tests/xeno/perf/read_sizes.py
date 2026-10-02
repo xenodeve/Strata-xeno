@@ -32,6 +32,19 @@ REQ = re.compile(r"request metrics: decode entries (\d+) = primary (\d+) \+ seco
                  r"cpu experts ([\d.]+) ms; nvme loads (\d+); private commit ([\d.]+) GiB")
 
 
+RATES = re.compile(r"request rates: (\d+) windows, (\d+) tokens; per window: ([\d.]+) entries \(primary ([\d.]+)% "
+                   r"\+ secondary ([\d.]+)% \+ pcie ([\d.]+)% \+ cpu ([\d.]+)%\), ([\d.]+) nvme loads, ([\d.]+) ms nvme wait; "
+                   r"per token: ([\d.]+) nvme loads, ([\d.]+) ms nvme wait")
+
+
+def parse_rates(text: str) -> list[dict]:
+    """#11 acceptance 7: each request's tier shares and NVMe misses per verify window and per emitted token."""
+    keys = ("windows", "tokens", "entries_per_window", "primary_pct", "secondary_pct", "pcie_pct", "cpu_pct",
+            "nvme_loads_per_window", "nvme_ms_per_window", "nvme_loads_per_token", "nvme_ms_per_token")
+    return [{k: (int(v) if k in ("windows", "tokens") else float(v)) for k, v in zip(keys, m.groups())}
+            for m in RATES.finditer(text)]
+
+
 def parse_requests(text: str) -> list[dict]:
     """#9 (PRD story 47): each request's decode counters - where its routed entries ran, the CPU pool's time, NVMe
     reads and the process's private commit at its end."""

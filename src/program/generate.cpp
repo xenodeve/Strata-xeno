@@ -19,6 +19,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/routing_trace.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/placement_formats.hpp"
@@ -302,7 +303,6 @@ struct Options {
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
-    std::string route_trace;              ///< append each verify window's routed expert ids to this file
     int pool_priority = 2;                ///< THREAD_PRIORITY_* for pool workers + host; 2 = HIGHEST (default, 0 = off)
     int mmvq_exact = 1;                   ///< 0: llama.cpp's multi-column MMVQ layout (not bitwise equal to ncols = 1)
     int pool_rest = 1;                    ///< send the pool's workers to sleep when a verify window ends (1, default)
@@ -329,6 +329,8 @@ struct Options {
     /// CPU-pool miss reads them (0 = off, every host-owned expert in RAM). Opt-in: it trades decode time for RAM.
     double ram_cache_gib = 0.0;
     std::vector<std::string> expert_mirrors;   ///< #62: --expert-mirror DIR, repeatable
+    std::string expert_pack;                   ///< #81: --expert-pack FILE (written by --write-expert-pack)
+    std::string write_expert_pack;             ///< #81: --write-expert-pack FILE: write the aligned pack, then exit
     bool cache_cpu_only = false;       ///< diagnostic: keep the cache allocation, route all verify experts to CPU
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -539,7 +541,11 @@ void usage() {
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
                  "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
-                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
+                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8),\n"
+                 "                       plus tag records with a negative layer: the format version, the GPU-owned\n"
+                 "                       and boot host sets, a request tag per served request, and a commit tag\n"
+                 "                       (window, positions, accepted, phase) after each verify window\n"
+                 "                       (#85/#86; include/strata/core/routing_trace.hpp)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
@@ -618,6 +624,11 @@ void usage() {
                      "                       bytes queued.\n"
                      "                       Copies are checked against their source on first use (size and sampled\n"
                      "                       pages); a mismatch stops the run.  Needs --ram-cache-gib.\n"
+                     "  --write-expert-pack FILE  #81: write the aligned expert pack for this model (run with the\n"
+                     "                       capacity-mode arguments) and exit; about the size of the experts\n"
+                     "  --expert-pack FILE   #81: an aligned expert pack (--write-expert-pack): the capacity-mode reader\n"
+                     "                       reads each expert as one aligned request, straight into its RAM slot.  A\n"
+                     "                       mirror holds a copy under the same file name.  Needs --ram-cache-gib.\n"
                      "  --no-tail-file       keep host copies of the prompt path's lendable cache slots (default with\n"
                      "                       exclusive primary experts: none; a tail-<key>.bin next to the pack,\n"
                      "                       ~3.5 GB at 8K chunks, refills them after a prompt; #34)\n"
@@ -702,7 +713,23 @@ struct Drive {
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
     /// blob), which is why the layer index comes from there rather than from a counter of our own.
     std::FILE* routing = nullptr;
+    int32_t trace_windows = 0;   ///< #85: verify windows committed to the routing trace so far (the commit tag's id)
+    int32_t trace_requests = 0;  ///< #86: served requests seen by the routing trace (the request tag's id)
 };
+
+/// #86: a request tag as a served request starts.
+void trace_request(Drive& d) {
+    if (d.routing == nullptr) return;
+    strata::core::routing_trace::write_request(d.routing, d.trace_requests++);
+}
+
+/// #85/#86: the routing trace's commit tag for a verify window of `n_positions` with `n_accepted` drafts accepted;
+/// `phase` 0 = prompt tokens read through windows, 1 = decode.
+void trace_commit(Drive& d, int n_positions, int n_accepted, int phase) {
+    if (d.routing == nullptr) return;
+    strata::core::routing_trace::write_commit(d.routing, d.trace_windows++, (int32_t) n_positions, (int32_t) n_accepted,
+                                              (int32_t) phase);
+}
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
                 float* out) {
@@ -726,10 +753,7 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
             std::fprintf(stderr, "strata generate: the routing trace saw layer %d, outside 0..47\n", layer_idx);
             return;
         }
-        const int32_t rec[2] = {layer_idx, (int32_t) k};
-        std::fwrite(rec, sizeof rec, 1, t->routing);
-        std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing);
-        std::fwrite(weights, sizeof(float), (size_t) k, t->routing);
+        strata::core::routing_trace::write_route(t->routing, layer_idx, (int32_t) k, ids, weights);
     }
 }
 
@@ -1114,11 +1138,7 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     // signal that matters; a one-shot --dump-routing run records true weights if a weighted ranking is wanted.
     if (t->routing != nullptr && layer >= 0 && layer < 48) {
         for (int64_t tok = 0; tok < n_tok; ++tok) {
-            const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
-            std::fwrite(rec, sizeof rec, 1, t->routing);
-            std::fwrite(ids + tok * k, sizeof(int32_t), (size_t) k, t->routing);
-            static const float one[64] = {};   // k <= 64 in a verify window; zeros read as unit weights
-            std::fwrite(one, sizeof(float), (size_t) k, t->routing);
+            strata::core::routing_trace::write_route(t->routing, (int32_t) layer, (int32_t) k, ids + tok * k, nullptr);
         }
     }
 }
@@ -1750,13 +1770,19 @@ int main(int argc, char** argv) {
         else if (a == "--pool-rest") o.pool_rest = std::atoi(next("--pool-rest"));
         else if (a == "--mmvq-exact") o.mmvq_exact = std::atoi(next("--mmvq-exact"));
         else if (a == "--secondary-graph") o.secondary_graph = std::atoi(next("--secondary-graph"));
-        else if (a == "--route-trace") o.route_trace = next("--route-trace");
+        else if (a == "--route-trace") {   // #93: retired - format 2 holds everything it did
+            std::fprintf(stderr, "strata generate: --route-trace is retired; use --dump-routing FILE (format 2, "
+                                 "read by tests/xeno/perf/route_tools.py)\n");
+            return 2;
+        }
         else if (a == "--exclusive-primary-experts") o.exclusive_mode = 1;
         else if (a == "--no-exclusive-primary-experts") o.exclusive_mode = 0;
         else if (a == "--exclusive-secondary-experts") o.exclusive_secondary_mode = 1;
         else if (a == "--no-exclusive-secondary-experts") o.exclusive_secondary_mode = 0;
         else if (a == "--ram-cache-gib") o.ram_cache_gib = std::atof(next("--ram-cache-gib"));
         else if (a == "--expert-mirror") o.expert_mirrors.push_back(next("--expert-mirror"));
+        else if (a == "--expert-pack") o.expert_pack = next("--expert-pack");
+        else if (a == "--write-expert-pack") o.write_expert_pack = next("--write-expert-pack");
         else if (a == "--cache-cpu-only") o.cache_cpu_only = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--prefill") {
@@ -2290,6 +2316,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --ram-cache-gib needs placement-first (exclusive primary experts: a "
                              "native pack, spec >=2, a profile, an expert cache, --pcie-frac 0 and the CPU pool, "
                              "no mmap; or the 4070 tier); without it every host expert would stay in RAM\n");
+        return 2;
+    }
+    if (!o.write_expert_pack.empty() && (o.ram_cache_gib <= 0.0 || o.mmap_experts)) {   // #81: a deferred arena
+        std::fprintf(stderr, "strata generate: --write-expert-pack runs with the capacity-mode arguments (--ram-cache-gib): "
+                             "the arena is then only reserved, not loaded\n");
+        return 2;
+    }
+    if (!o.expert_pack.empty() && (o.ram_cache_gib <= 0.0 || o.mmap_experts)) {   // #81: never silently unused
+        std::fprintf(stderr, "strata generate: --expert-pack serves the capacity-mode reader; it needs --ram-cache-gib\n");
         return 2;
     }
     if (!o.expert_mirrors.empty() && (o.ram_cache_gib <= 0.0 || o.mmap_experts)) {   // #62: never silently unused
@@ -3072,6 +3107,19 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
         for (const std::string& d : o.expert_mirrors) arena_src.add_mirror(d);   // #62
+        if (!o.write_expert_pack.empty()) {   // #81: the aligned pack, then done
+            if (!arena_src.write_expert_pack(o.write_expert_pack, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: expert pack written to %s; serve with --expert-pack %s\n",
+                         o.write_expert_pack.c_str(), o.write_expert_pack.c_str());
+            return 0;
+        }
+        if (!o.expert_pack.empty() && !arena_src.set_expert_pack(o.expert_pack, err)) {   // #81
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
@@ -3100,7 +3148,10 @@ int main(int argc, char** argv) {
 #endif
     strata::kernels::cpu::set_worker_priority(o.pool_priority);
     strata::kernels::cpu::set_current_thread_priority(o.pool_priority);   // the host works in the pool too
-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
+    // #64: no park spin in capacity mode - with the SMT siblings busy (any other program), 13 HIGHEST workers
+    // spinning for 20 ms starve the NVMe path: thai-net decode 19 -> 34 tok/s under load, ~1.5 % slower idle
+    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker,
+                                          /*spin_us=*/o.ram_cache_gib > 0.0 ? 0 : -1);
     ExitTrace exit_trace_pool{"pool next"};
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
@@ -3700,6 +3751,11 @@ int main(int argc, char** argv) {
         for (const auto& [l, e] : profile) push(l * (int32_t) g.n_expert + e);
         for (int32_t i = 0; i < (int32_t) (g.n_layers * g.n_expert); ++i) push(i);
         arena_src.set_capacity((uint64_t) (o.ram_cache_gib * 1073741824.0), order);
+        if (!o.expert_pack.empty())   // #81: say which path the pack takes, so an A/B cannot time the wrong one
+            std::fprintf(stderr, "strata generate: expert pack %s: %s\n", o.expert_pack.c_str(),
+                         arena_src.slab_on() ? "one read per expert, straight into its slab slot"
+                                             : "one read per expert, through the bounce buffer (no slab: "
+                                               "STRATA_NVME_SLOTS=0, a pinned arena or not Windows)");
     }
     if (place_first) {
         const uint64_t commit_before = private_commit_bytes();
@@ -3945,13 +4001,6 @@ int main(int argc, char** argv) {
     Drive drive;
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
-    std::unique_ptr<std::FILE, int (*)(std::FILE*)> route_trace_file(
-        o.route_trace.empty() ? nullptr : std::fopen(o.route_trace.c_str(), "wb"), &std::fclose);
-    if (!o.route_trace.empty() && !route_trace_file) {
-        std::fprintf(stderr, "strata generate: cannot open --route-trace %s\n", o.route_trace.c_str());
-        return 1;
-    }
-    drive.d.route_trace = route_trace_file.get();
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
@@ -4059,6 +4108,18 @@ int main(int argc, char** argv) {
         if (routing == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_routing.c_str());
             return 1;
+        }
+        strata::core::routing_trace::write_format(routing);   // #85: the first record names the format
+        {   // #86: the GPU-owned set and the host tier after the boot fill (adaptive swaps change both later)
+            std::vector<int32_t> owned, boot;
+            for (int32_t i = 0; i < (int32_t) (g.n_layers * g.n_expert); ++i) {
+                const int64_t l = i / g.n_expert, e = i % g.n_expert;
+                if (arena_src.owned_by_gpu(l, e)) owned.push_back(i);
+                else if (o.ram_cache_gib > 0.0 && arena_src.resident(l, e)) boot.push_back(i);
+            }
+            namespace rt = strata::core::routing_trace;
+            rt::write_ids(routing, rt::kTagOwned, owned);
+            if (o.ram_cache_gib > 0.0) rt::write_ids(routing, rt::kTagBoot, boot);
         }
         drive.routing = routing;
     }
@@ -5350,19 +5411,25 @@ int main(int argc, char** argv) {
                     cudaGetDevice(&prev);
                     cudaSetDevice(1);
                     std::vector<CopyJob> jobs;
+                    std::vector<int32_t> held_src;   // released once copied
                     for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                         const int32_t in = sc[k].second, out = sv[k].second;
                         const int32_t slot = secondary_residency[(size_t) out];
                         const int32_t in_layer = in / (int32_t) g.n_expert;
-                        const uint8_t* src = srcp->blob(in_layer, in % (int32_t) g.n_expert);
+                        // held from the lookup to the copy below: a decode load's eviction must not give its slab slot to
+                        // another expert in between (the paired swaps' acquire() does the same)
+                        const uint8_t* src = srcp == &arena_src ? arena_src.hold_resident(in_layer, in % (int32_t) g.n_expert)
+                                                                : srcp->blob(in_layer, in % (int32_t) g.n_expert);
                         const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(in_layer);
                         if (src == nullptr) break;
+                        if (srcp == &arena_src) held_src.push_back(in);
                         if (!secondary_arena.fits((uint64_t) slot, bytes)) continue;   // #11: pairs span layers
                         secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
                         jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
                         ss_pending.emplace_back(in, slot);
                     }
                     parallel_copy(jobs);
+                    for (int32_t h : held_src) arena_src.release_hold(h / (int32_t) g.n_expert, h % (int32_t) g.n_expert);
                     for (size_t k = 0; k < jobs.size(); ++k)
                         if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) ss_pending[k].second), jobs[k].dst,
                                             jobs[k].bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
@@ -5398,10 +5465,9 @@ int main(int argc, char** argv) {
                         const size_t bytes = (size_t) lay.blob_bytes(s.layer);
                         uint8_t* st = ps_stage + i * ps_blob;
                         std::string e;
-                        const uint8_t* src = srcp->blob(s.layer, s.in);
-                        if (src == nullptr) src = srcp->materialize(s.layer, s.in, -1, e);   // #11
-                        // #62 crash: a later newcomer's materialize may evict this one before the copy below
-                        if (src != nullptr) arena_src.hold(s.layer, s.in);
+                        // #62 crash: held from the lookup on, so a later newcomer's materialize cannot evict it (with
+                        // capacity mode's slots it would hand over another expert's bytes) before the copy below
+                        const uint8_t* src = arena_src.acquire(s.layer, s.in, e);   // #11: a miss is read in
                         if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
                             uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
                             if (home == nullptr) {
@@ -5689,6 +5755,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
             }
+            trace_request(drive);   // #86
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
@@ -6120,6 +6187,7 @@ int main(int argc, char** argv) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
+                    trace_commit(drive, T, T - 1, strata::core::routing_trace::kPhasePrompt);   // #85: prompt windows commit every position
                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
                     q += T;
                 }
@@ -6344,6 +6412,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 4; ++i) tier0[i] = drive.d.tier_entries[i];
             const double cpu_ms0 = drive.cpu_ms;
             const int64_t nvme0 = arena_src.nvme_loads();
+            const double nvme_ms0 = arena_src.nvme_ms();
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
@@ -6401,6 +6470,7 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                trace_commit(drive, T, a, strata::core::routing_trace::kPhaseDecode);   // #85
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -6635,6 +6705,17 @@ int main(int argc, char** argv) {
                                      "%.2f GiB\n", (long long) sum, (long long) te[0], (long long) te[1],
                              (long long) te[2], (long long) te[3], drive.cpu_ms - cpu_ms0,
                              (long long) (arena_src.nvme_loads() - nvme0), private_commit_bytes() / 1073741824.0);
+                if (dec_windows > 0) {   // #11 acceptance 7: per verify window and per emitted token
+                    const double w = (double) dec_windows, tk = produced_n > 0 ? (double) produced_n : 1.0;
+                    const double all = sum > 0 ? (double) sum : 1.0;
+                    const double nl = (double) (arena_src.nvme_loads() - nvme0), nm = arena_src.nvme_ms() - nvme_ms0;
+                    std::fprintf(stderr, "strata serve: request rates: %lld windows, %lld tokens; per window: %.1f entries "
+                                         "(primary %.1f%% + secondary %.1f%% + pcie %.1f%% + cpu %.1f%%), %.2f nvme loads, "
+                                         "%.2f ms nvme wait; per token: %.3f nvme loads, %.3f ms nvme wait\n",
+                                 (long long) dec_windows, (long long) produced_n, (double) sum / w, 100.0 * te[0] / all,
+                                 100.0 * te[1] / all, 100.0 * te[2] / all, 100.0 * te[3] / all, nl / w, nm / w, nl / tk,
+                                 nm / tk);
+                }
                 if (!o.expert_mirrors.empty())   // #62: each copy's share so far (cumulative over the session)
                     for (const auto& f : arena_src.nvme_file_stats())
                         std::fprintf(stderr, "strata serve: nvme file %s: %lld experts, %.2f GiB, %.3f ms per batch, "
@@ -7243,14 +7324,14 @@ int main(int argc, char** argv) {
                     uint8_t* st = ss_stage + i * ps_blob;
                     std::string e;
                     uint8_t* home = arena_src.recommit_host_copy(out_layer, x.out % (int32_t) g.n_expert, e);
-                    const uint8_t* src = srcp->blob(in_layer, x.in % (int32_t) g.n_expert);
-                    if (src == nullptr) src = srcp->materialize(in_layer, x.in % (int32_t) g.n_expert, -1, e);
+                    // #62 crash: held from the lookup on (acquire), so a later newcomer's materialize cannot evict this
+                    // one's host copy before the copy below
+                    const uint8_t* src = arena_src.acquire(in_layer, x.in % (int32_t) g.n_expert, e);
                     if (home == nullptr || src == nullptr) {
+                        if (src != nullptr) arena_src.release_hold(in_layer, x.in % (int32_t) g.n_expert);
                         std::fprintf(stderr, "strata generate: paired 4070 swap copy-home: %s\n", e.c_str());
                         return false;
                     }
-                    // #62 crash: a later newcomer's materialize may evict this one's host copy before the copy below
-                    arena_src.hold(in_layer, x.in % (int32_t) g.n_expert);
                     home_jobs.push_back({home, st, (size_t) lay.blob_bytes(out_layer)});
                     in_jobs.push_back({st, src, (size_t) lay.blob_bytes(in_layer)});
                 }
@@ -7324,19 +7405,25 @@ int main(int argc, char** argv) {
                 cudaGetDevice(&prev);
                 cudaSetDevice(1);
                 std::vector<CopyJob> jobs;
+                std::vector<int32_t> held_src;   // released once copied
                 for (size_t k = 0; k < n && sc[k].first >= sv[k].first + 1.5f; ++k) {
                     const int32_t in = sc[k].second, out = sv[k].second;
                     const int32_t slot = secondary_residency[(size_t) out];
                     const int32_t in_layer = in / (int32_t) g.n_expert;
-                    const uint8_t* src = srcp->blob(in_layer, in % (int32_t) g.n_expert);
+                    // held from the lookup to the copy below: a decode load's eviction must not give its slab slot to
+                    // another expert in between (the paired swaps' acquire() does the same)
+                    const uint8_t* src = srcp == &arena_src ? arena_src.hold_resident(in_layer, in % (int32_t) g.n_expert)
+                                                            : srcp->blob(in_layer, in % (int32_t) g.n_expert);
                     const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(in_layer);
                     if (src == nullptr) break;
+                    if (srcp == &arena_src) held_src.push_back(in);
                     if (!secondary_arena.fits((uint64_t) slot, bytes)) continue;   // #11: pairs span layers
                     secondary_residency[(size_t) out] = -1;   // CPU-served from now on (its host copy stays)
                     jobs.push_back({ss_stage + ss_pending.size() * ps_blob, src, bytes});
                     ss_pending.emplace_back(in, slot);
                 }
                 parallel_copy(jobs);
+                for (int32_t h : held_src) arena_src.release_hold(h / (int32_t) g.n_expert, h % (int32_t) g.n_expert);
                 for (size_t k = 0; k < jobs.size(); ++k)
                     if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) ss_pending[k].second), jobs[k].dst,
                                         jobs[k].bytes, cudaMemcpyHostToDevice, ss_stream) != cudaSuccess) {
@@ -7379,10 +7466,9 @@ int main(int argc, char** argv) {
                         const size_t bytes = (size_t) lay.blob_bytes(s.layer);
                         uint8_t* st = ps_stage + i * ps_blob;
                         std::string e;
-                        const uint8_t* src = srcp->blob(s.layer, s.in);
-                        if (src == nullptr) src = srcp->materialize(s.layer, s.in, -1, e);   // #11
-                        // #62 crash: a later newcomer's materialize may evict this one before the copy below
-                        if (src != nullptr) arena_src.hold(s.layer, s.in);
+                        // #62 crash: held from the lookup on, so a later newcomer's materialize cannot evict it (with
+                        // capacity mode's slots it would hand over another expert's bytes) before the copy below
+                        const uint8_t* src = arena_src.acquire(s.layer, s.in, e);   // #11: a miss is read in
                         if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
                             uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
                             if (home == nullptr) {
@@ -7536,6 +7622,9 @@ int main(int argc, char** argv) {
         }
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
+        const auto stages0 = arena_src.nvme_stages();   // the miss-cost breakdown counts decode only
+        const int64_t dec_loads0 = arena_src.nvme_loads();   // so do the NVMe tier's loads and wait
+        const double dec_nvme_ms0 = arena_src.nvme_ms();
         if (o.profile_decode_range && cudaProfilerStart() != cudaSuccess) {
             std::fprintf(stderr, "strata generate: cudaProfilerStart failed\n");
             return 1;
@@ -7608,6 +7697,7 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            trace_commit(drive, T, a, strata::core::routing_trace::kPhaseDecode);   // #85
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -7702,10 +7792,27 @@ int main(int argc, char** argv) {
                         ver.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
+        // decode only, as `nvme stages` below: the prompt's loads (the CPU pool's prefill misses) are not divided
+        // by decode rounds or emitted tokens (2026-10-02 /code-review)
+        const int64_t dec_loads = arena_src.nvme_loads() - dec_loads0;
+        const double dec_nvme_ms = arena_src.nvme_ms() - dec_nvme_ms0;
         if (rounds > 0 && o.ram_cache_gib > 0.0)
-            std::printf("%-24s %lld loads, %.3f per round, %.3f ms/round reading; host tier %.2f GiB\n", "nvme tier",
-                        (long long) arena_src.nvme_loads(), (double) arena_src.nvme_loads() / rounds,
-                        arena_src.nvme_ms() / rounds, (double) arena_src.host_cache_bytes() / 1073741824.0);
+            std::printf("%-24s %lld loads, %.3f per round, %.3f ms/round waiting (decode; %lld since start); host tier "
+                        "%.2f GiB\n", "nvme tier", (long long) dec_loads, (double) dec_loads / rounds,
+                        dec_nvme_ms / rounds, (long long) arena_src.nvme_loads(),
+                        (double) arena_src.host_cache_bytes() / 1073741824.0);
+        if (rounds > 0 && o.ram_cache_gib > 0.0 && !produced.empty())   // #11 acceptance 7: per emitted token
+            std::printf("%-24s %.3f loads, %.3f ms waiting per emitted token (%zu tokens, %lld rounds)\n", "nvme per token",
+                        (double) dec_loads / (double) produced.size(), dec_nvme_ms / (double) produced.size(),
+                        produced.size(), (long long) rounds);
+        if (rounds > 0 && o.ram_cache_gib > 0.0) {   // the miss-cost breakdown of the decode loads
+            const auto s = arena_src.nvme_stages() - stages0;
+            std::printf("%-24s evict %.3f  commit %.3f  submit %.3f  wait %.3f  copy %.3f ms/round; slab %lld slots, "
+                        "%.0f MiB idle\n", "nvme stages",
+                        s.evict_ms / rounds, s.commit_ms / rounds, s.submit_ms / rounds, s.wait_ms / rounds,
+                        s.copy_ms / rounds, (long long) arena_src.host_slots(),
+                        (double) arena_src.host_idle_bytes() / 1048576.0);
+        }
         if (rounds > 0 && !o.expert_mirrors.empty())   // #62: each copy's share
             for (const auto& f : arena_src.nvme_file_stats())
                 std::printf("%-24s %lld experts, %.2f GiB, %.3f ms per batch it served, read p50 %.0f p99 %.0f "
@@ -7986,6 +8093,7 @@ int main(int argc, char** argv) {
     // #45 (experiment only): the merged engine's prompt-path stager threads hang in thread exit after returning
     // (traced: all four return, the first join never does); STRATA_EXP_QUICK_EXIT=1 ends the process here, after
     // every result is printed and flushed.  A bypass for measuring, not a fix.
-    if (std::getenv("STRATA_EXP_QUICK_EXIT")) { std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 0); }
+    // TerminateProcess skips atexit: the timeline is written here or never
+    if (std::getenv("STRATA_EXP_QUICK_EXIT")) { strata::timeline::flush(); std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 0); }
     return 0;
 }

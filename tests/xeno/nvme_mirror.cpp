@@ -83,9 +83,28 @@ int main() {
         // equal blobs, least-queued first, ties to the source: source, copy, source, copy, source
         expect(st.size() == 2 && st[0].reads == 3 && st[1].reads == 2, "the split is 3 / 2, source first");
         expect(st.size() == 2 && st[1].batches == 1 && st[1].max_us > 0, "the copy's batch and read latency are timed");
+        // #82: a decode layer misses ~0.3 experts, so most batches hold one; the tie must not always go to the source.
+        // Each batch starts its tie-break one copy further on: two single-expert batches use both copies.
+        const int32_t one_a[1] = {1}, one_b[1] = {2};
+        expect(s.materialize_batch(1, one_a, 1, err) && s.materialize_batch(1, one_b, 1, err), "two single loads");
+        const auto st2 = s.nvme_file_stats();
+        expect(st2.size() == 2 && st2[0].reads == 4 && st2[1].reads == 3, "single-expert batches alternate the copies");
         for (const auto& f : st)
             std::printf("  %s: %lld experts, %llu bytes\n", f.path.c_str(), (long long) f.reads,
                         (unsigned long long) f.bytes);
+    }
+
+    {   // #82's A/B arm (2026-10-02 /code-review): STRATA_MIRROR_ROTATE=0 sends every tie to the source, as before
+        _putenv_s("STRATA_MIRROR_ROTATE", "0");
+        strata::core::ArenaExpertSource s;
+        if (!open_source(s, a, err)) { std::fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
+        s.add_mirror(b.string());
+        _putenv_s("STRATA_MIRROR_ROTATE", "");
+        const int32_t one_a[1] = {1}, one_b[1] = {2};
+        expect(s.materialize_batch(1, one_a, 1, err) && s.materialize_batch(1, one_b, 1, err), "two single loads");
+        const auto st = s.nvme_file_stats();
+        expect(!st.empty() && st[0].reads == 2 && (st.size() == 1 || st[1].reads == 0),
+               "STRATA_MIRROR_ROTATE=0: single-expert batches all go to the source");
     }
     {   // a copy that differs is refused, loudly
         strata::core::ArenaExpertSource s;

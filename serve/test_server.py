@@ -2072,5 +2072,175 @@ class HealthTellsACrashFromAnUnload(unittest.TestCase):
         status, body = self.health(crashed=False)
         self.assertEqual((status, body["status"], body["loaded"]), (200, "ok", False))
 
+
+class DisplayFloorRecovery(unittest.TestCase):
+    """#59: the secondary (4070, the display card) free-floor monitor ends the engine with _Exit(3) when the desktop
+    needs its VRAM back.  The server must come back without a request, and when the floor is the reason, without the
+    4070 tier (serving on the 5060 alone) until the display has room again."""
+
+    BREACH = ("secondary display VRAM reserve failed: secondary runner: display VRAM below configured free floor; "
+              "terminating to release tier\n")
+    ARGS = ["--pack", "p", "--secondary-free-floor-mib", "640", "--secondary-expert-mib", "6400",
+            "--exclusive-secondary-experts", "--adapt-secondary", "8", "--ram-cache-gib", "12"]
+
+    def test_the_args_without_the_secondary_tier(self):
+        from serve.server import without_secondary
+        self.assertEqual(without_secondary(self.ARGS),
+                         ["--pack", "p", "--secondary-free-floor-mib", "640", "--secondary-expert-mib", "0",
+                          "--adapt-secondary", "0", "--ram-cache-gib", "12"])
+        self.assertEqual(without_secondary(["--pack", "p"]), ["--pack", "p"])   # no tier: nothing to drop
+
+    # the start-up refusals besides the runner's own check: the arena's open and its fill
+    ARENA_REFUSAL = ("strata generate: secondary arena: display GPU has no space above the free floor and allocation "
+                     "cushion\n")
+    FILL_REFUSAL = "strata generate: secondary fill: secondary fill crossed the display free floor\n"
+
+    def engine(self, log_text, fail_full=False, refusal=None):
+        """A StrataEngine whose start is recorded instead of spawned; `fail_full`: a start with the tier fails, its log
+        ending with `refusal` (the runner's floor check by default)."""
+        d = tempfile.mkdtemp()
+        log = os.path.join(d, "engine.log")
+        Path(log).write_text(log_text, encoding="utf-8")
+        starts, failing = [], [False]   # the first construction is the engine as it ran; failures start after
+
+        class Recorded(StrataEngine):
+            def __init__(self, exe, args, cwd=None, log=None, env=None):
+                self.spawn, self.log_path, self.info = (exe, list(args), cwd, log, env), log, {}
+                starts.append(list(args))
+                tiered = "--secondary-expert-mib" in args and args[args.index("--secondary-expert-mib") + 1] != "0"
+                if failing[0] == "all" or (failing[0] and tiered):
+                    with open(log, "a", encoding="utf-8") as f:
+                        f.write(refusal or DisplayFloorRecovery.BREACH)
+                    raise RuntimeError("the engine exited before it was ready")
+
+        eng = Recorded("strata.exe", self.ARGS, None, log, None)
+        eng.proc = type("P", (), {"kill": lambda self: None, "poll": lambda self: 3})()
+        starts.clear()
+        failing[0] = fail_full
+        self.failing = failing
+        return eng, starts
+
+    def test_a_floor_breach_restarts_without_the_tier(self):
+        eng, starts = self.engine("strata serve: ready\n" + self.BREACH)
+        self.assertTrue(eng.floor_breach())
+        eng.restart()
+        self.assertEqual(starts[-1][starts[-1].index("--secondary-expert-mib") + 1], "0")
+        self.assertTrue(eng.degraded)
+
+    def test_another_death_restarts_as_configured(self):
+        eng, starts = self.engine("strata serve: ready\nstrata: access violation\n")
+        self.assertFalse(eng.floor_breach())
+        eng.restart()
+        self.assertEqual(starts, [self.ARGS])
+        self.assertFalse(eng.degraded)
+
+    def test_a_start_the_floor_refuses_falls_back_to_no_tier(self):
+        eng, starts = self.engine("strata: access violation\n", fail_full=True)
+        eng.restart()
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(starts[1][starts[1].index("--secondary-expert-mib") + 1], "0")
+        self.assertTrue(eng.degraded)
+
+    def test_an_arena_or_fill_floor_refusal_also_falls_back_to_no_tier(self):
+        # incident (2026-10-02 /simplify review): only the runner's message was recognised, so a restore the arena's
+        # floor check refused raised instead, and the engine stayed dead
+        for refusal in (self.ARENA_REFUSAL, self.FILL_REFUSAL):
+            eng, starts = self.engine("strata: access violation\n", fail_full=True, refusal=refusal)
+            eng.restart()
+            self.assertEqual(starts[1][starts[1].index("--secondary-expert-mib") + 1], "0", refusal)
+            self.assertTrue(eng.degraded, refusal)
+
+    def test_the_staging_line_is_not_a_floor_refusal(self):
+        eng, _ = self.engine("strata generate: staged 900 next-ranked secondary experts (6.25 GiB); 4070 SUPER lower "
+                             "free 3.10 GiB (free floor 0.62 GiB); SECONDARY COMPUTE\nstrata: access violation\n")
+        self.assertFalse(eng.floor_breach())
+
+    def test_a_restore_that_fails_for_another_reason_stays_degraded(self):
+        # incident (2026-10-02 /scrutinize): restart(full=True) killed the degraded engine, the full start failed for a
+        # reason other than the floor, and it raised - the server was left with no engine, and the watch then tried the
+        # full start (a whole model load) again every 5 s instead of serving degraded
+        eng, starts = self.engine("strata serve: ready\n" + self.BREACH, refusal="strata: cudaMalloc failed\n")
+        eng.restart()
+        self.assertTrue(eng.degraded)
+        with open(eng.log_path, "a", encoding="utf-8") as f:   # the degraded engine's own start and serving
+            f.write("strata generate: loaded\n" * 6 + "strata serve: ready\n")
+        self.failing[0] = True
+        eng.restart(full=True)   # its log now ends with that failure, not with the floor
+        self.assertEqual(starts[-1][starts[-1].index("--secondary-expert-mib") + 1], "0")
+        self.assertTrue(eng.degraded)
+
+    def test_a_failed_degraded_start_keeps_the_configured_command(self):
+        # incident (2026-10-02 /scrutinize): __init__ stores the args it is given, so a degraded start that failed left
+        # the no-tier args as the engine's own and full_spawn unset: the tier could never come back
+        eng, starts = self.engine("strata serve: ready\n" + self.BREACH)
+        self.failing[0] = "all"
+        with self.assertRaises(RuntimeError):
+            eng.restart()
+        self.failing[0] = False
+        eng.restart(full=True)
+        self.assertEqual(starts[-1], self.ARGS)
+        self.assertFalse(eng.degraded)
+
+    def test_full_restores_the_tier(self):
+        eng, starts = self.engine("strata serve: ready\n" + self.BREACH)
+        eng.restart()
+        eng.restart(full=True)
+        self.assertEqual(starts[-1], self.ARGS)
+        self.assertFalse(eng.degraded)
+
+    def test_the_watch_restarts_a_dead_engine_between_requests(self):
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        eng.running = False                      # died by itself (not unloaded)
+        svc.watch_once()
+        self.assertEqual(eng.starts, 1)
+        svc.watch_once()                         # alive: nothing to do
+        self.assertEqual(eng.starts, 1)
+
+    def test_the_watch_leaves_an_unloaded_engine_alone(self):
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        eng.unload()
+        svc.watch_once()
+        self.assertEqual(eng.starts, 0)
+
+    def test_the_watch_restores_the_tier_once_idle_and_the_display_has_room(self):
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        fulls = []
+        eng.degraded = True
+        eng.restart = lambda full=None: fulls.append(full)
+        eng.secondary_need_mib = lambda: 7040
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.last_request_at = time.time()
+        svc.display_free_mib = lambda: 9000
+        svc.watch_once(upgrade_idle_s=300)
+        self.assertEqual(fulls, [])              # a request was just served: not yet
+        svc.last_request_at = time.time() - 400
+        svc.display_free_mib = lambda: 5000
+        svc.watch_once(upgrade_idle_s=300)
+        self.assertEqual(fulls, [])              # idle, but the display still lacks the room
+        svc.display_free_mib = lambda: 9000
+        svc.watch_once(upgrade_idle_s=300)
+        self.assertEqual(fulls, [True])
+
+    def test_the_watch_restores_the_tier_before_any_request(self):
+        # incident (2026-10-02 /simplify review): the watch restarts a dead engine degraded before any request, and
+        # `time.time() - None` then raised every 5 s; idle counts from the server's start instead
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        fulls = []
+        eng.degraded = True
+        eng.restart = lambda full=None: fulls.append(full)
+        eng.secondary_need_mib = lambda: 7040
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertIsNone(svc.last_request_at)
+        svc.started_at = time.time() - 400
+        svc.display_free_mib = lambda: 9000
+        svc.watch_once(upgrade_idle_s=300)
+        self.assertEqual(fulls, [True])
+
 if __name__ == "__main__":
     unittest.main()

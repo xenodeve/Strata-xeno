@@ -207,6 +207,29 @@ class CacheSlots:
             return slot
 
 
+def without_secondary(args: list[str]) -> list[str]:
+    """#59: the engine's arguments with the secondary (4070) expert tier off - its size 0, no exclusive placement and
+    no adaptive swaps there - so it serves on the primary GPU alone while the display needs that card's VRAM."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--exclusive-secondary-experts":
+            i += 1
+            continue
+        if a in ("--secondary-expert-mib", "--adapt-secondary") and i + 1 < len(args):
+            out += [a, "0"]
+            i += 2
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+# the engine's last words when the 4070 free floor ends it or refuses its start: the runner's monitor and start check
+# (secondary_runner.cpp), the arena's open and fill (secondary_arena.cpp)
+FLOOR_BREACH = ("display VRAM below configured free floor", "above the free floor", "display free floor")
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -270,16 +293,19 @@ class StrataEngine:
         if self.proc is proc:                           # xeno #49 review: a pump left over from before restart()
             self.ended = True                           # its output closed: it is gone, even before the OS says so
 
-    def death_note(self) -> str:
-        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
-        tail = ""
+    def _log_tail(self) -> str:
+        """The last 4 KiB of the engine's log ("" without one)."""
         try:
             with open(self.log_path, "rb") as f:
                 f.seek(0, 2)
                 f.seek(max(0, f.tell() - 4096))
-                tail = f.read().decode("utf-8", "replace")
+                return f.read().decode("utf-8", "replace")
         except (OSError, TypeError):
-            pass
+            return ""
+
+    def death_note(self) -> str:
+        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
+        tail = self._log_tail()
         for line in reversed(tail.splitlines()):
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
@@ -321,15 +347,50 @@ class StrataEngine:
         self.ended = True
         self.unloaded = True
 
-    def restart(self):
-        """Start the engine again (the same command) after it died; the new process has its own line queue."""
+    def floor_breach(self) -> bool:
+        """#59: the engine's last words (the end of its log) are a 4070 free-floor terminate or start refusal."""
+        last = [x for x in self._log_tail().splitlines() if x.strip()][-5:]
+        return any(m in x for x in last for m in FLOOR_BREACH)
+
+    def secondary_need_mib(self) -> int | None:
+        """The 4070 VRAM the configured tier takes plus its floor (what the display must have free to restore it)."""
+        args = getattr(self, "full_spawn", self.spawn)[1]
+        try:
+            tier = int(args[args.index("--secondary-expert-mib") + 1])
+            floor = int(args[args.index("--secondary-free-floor-mib") + 1]) if "--secondary-free-floor-mib" in args else 0
+        except (ValueError, IndexError):
+            return None
+        return tier + floor + 512 if tier > 0 else None
+
+    def restart(self, full: bool | None = None):
+        """Start the engine again after it died; the new process has its own line queue.  #59: after a 4070
+        free-floor terminate (or a start the floor refuses) it comes back without the 4070 tier (`degraded`);
+        `full=True` restores the configured command; if that start fails, it comes back degraded again rather than
+        leaving no engine."""
         try:
             self.proc.kill()
         except OSError:
             pass
         info = dict(self.info)
         self.ended = False
-        self.__init__(*self.spawn)
+        base = getattr(self, "full_spawn", self.spawn)
+        self.full_spawn = base                          # __init__ stores the args it starts with: keep the configured ones
+        exe, args, cwd, log, env = base
+        want_full = (not self.floor_breach()) if full is None else full
+        if args == without_secondary(args):
+            want_full = True                            # no tier configured: nothing to drop
+        try:
+            self.__init__(exe, args if want_full else without_secondary(args), cwd, log, env)
+        except RuntimeError:
+            if not want_full or (full is not True and not self.floor_breach()):
+                raise
+            print("[strata] " + ("the display needs the 4070's VRAM" if self.floor_breach() else
+                                 "the start with the 4070 tier failed (see the log)") +
+                  ": starting without the 4070 tier", flush=True)
+            self.__init__(exe, without_secondary(args), cwd, log, env)
+            want_full = False
+        self.full_spawn = base
+        self.degraded = not want_full
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
@@ -833,11 +894,12 @@ class Service:
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
-    def free_vram_mib(self) -> int | None:
-        """Free VRAM on the engine's (first) GPU, from NVML; None when it can't be read (then nothing is refused)."""
+    def free_vram_mib(self, index: int | None = None) -> int | None:
+        """Free VRAM on the engine's (first) GPU, or NVML device `index`; None when it can't be read (then nothing is
+        refused)."""
         try:
             from serve.telemetry import _Nvml
-            nv = _Nvml(int(getattr(self, "gpu_index", 0) or 0))
+            nv = _Nvml(int(getattr(self, "gpu_index", 0) or 0) if index is None else index)
             if not nv.ok():
                 return None
             m = nv.Mem()
@@ -924,6 +986,58 @@ class Service:
             return "unloaded"
         finally:
             self.fifo.release()
+
+    def display_free_mib(self) -> int | None:
+        """#59: free VRAM on the secondary GPU (the second of CUDA_VISIBLE_DEVICES, the 4070 here), from NVML."""
+        vis = [v for v in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if v.strip()]
+        if len(vis) < 2 or not vis[1].strip().isdigit():
+            return None
+        return self.free_vram_mib(int(vis[1]))
+
+    def watch_once(self, upgrade_idle_s: float = 300):
+        """#59: between requests, start an engine that died by itself again (no request has to pay for it), and give a
+        degraded engine (no 4070 tier) its tier back once the server has been idle and the display has the room."""
+        eng = self.engine
+        if getattr(eng, "unloaded", False) or self.restarting or not hasattr(eng, "restart"):
+            return
+        if not self.fifo.acquire(blocking=False):      # a request holds the engine: it handles a death itself
+            return
+        try:
+            if not self.loaded():
+                try:
+                    self.ensure_loaded()
+                except (EngineDied, GpuBusy) as e:
+                    print(f"[strata] the engine could not be started again yet: {e}", flush=True)
+            elif (getattr(eng, "degraded", False) and
+                  time.time() - (self.last_request_at or self.started_at) >= upgrade_idle_s):
+                need = eng.secondary_need_mib() if hasattr(eng, "secondary_need_mib") else None
+                free = self.display_free_mib() if need is not None else None
+                if free is not None and free >= need:
+                    print(f"[strata] the display has room again ({free} MiB free): restoring the 4070 tier ...",
+                          flush=True)
+                    self.restarting = True
+                    try:
+                        eng.restart(full=True)
+                    except (EngineDied, RuntimeError, OSError) as e:
+                        print(f"[strata] restoring the 4070 tier failed ({e}); the next check tries again", flush=True)
+                    finally:
+                        self.restarting = False
+        finally:
+            self.fifo.release()
+
+    def start_engine_watch(self, every_s: float = 5.0):
+        """#59: watch_once every few seconds on a daemon thread (a real engine only: it can restart)."""
+        if not hasattr(self.engine, "restart"):
+            return
+
+        def loop():
+            while True:
+                time.sleep(every_s)
+                try:
+                    self.watch_once()
+                except Exception as e:                  # the watch must never end the server
+                    print(f"[strata] engine watch: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
 
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
@@ -1889,7 +2003,8 @@ def make_handler(svc: Service):
                 self._json(200 if alive else 503, {"status": "ok" if alive else "engine_exited",
                                      "max_context": svc.engine.max_context, "model": svc.model,
                                      "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                     "loops_stopped": svc.status["loops_stopped"], "loaded": svc.loaded()})
+                                     "loops_stopped": svc.status["loops_stopped"], "loaded": svc.loaded(),
+                                     "degraded": bool(getattr(svc.engine, "degraded", False))})
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
                     return
@@ -2508,6 +2623,7 @@ def main() -> int:
         placeholder.server_close()
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    svc.start_engine_watch()                            # #59: a dead engine comes back without waiting for a request
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"

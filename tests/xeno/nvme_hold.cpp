@@ -58,6 +58,27 @@ int main() {
     s.release_hold(1, 0);
     s.trim(/*avoid_layer=*/-1);
     expect(s.host_cache_bytes() <= 2 * blob, "released, the tier trims back to its capacity");
+
+    // the 4070 swap's source (2026-10-02 /code-review): held from the lookup on, as the paired swaps' acquire() is,
+    // so a decode load's eviction cannot hand its slot to another expert before the copy; a miss reads nothing
+    int rl = -1, re = -1, ml = -1, me = -1;
+    for (int l = 0; l < layers; ++l)
+        for (int e = 0; e < experts; ++e) {
+            if (s.resident(l, e)) { if (rl < 0) { rl = l; re = e; } }
+            else if (ml < 0) { ml = l; me = e; }
+        }
+    const int64_t loads0 = s.nvme_loads();
+    expect(ml >= 0 && s.hold_resident(ml, me) == nullptr && s.nvme_loads() == loads0,
+           "hold_resident: an expert on NVMe gives null and reads nothing");
+    const uint8_t* src = rl >= 0 ? s.hold_resident(rl, re) : nullptr;
+    expect(src != nullptr, "hold_resident: a resident expert's bytes");
+    for (int l = 0; l < layers; ++l)
+        for (int e = 0; e < experts; ++e)
+            if (l != rl || e != re) (void) s.materialize(l, e, /*avoid_layer=*/-1, err);
+    expect(src != nullptr && s.resident(rl, re) && src[0] == mark(rl, re) && src[blob - 1] == (uint8_t) (mark(rl, re) + blob - 1),
+           "a held swap source keeps its bytes through every eviction");
+    if (rl >= 0) s.release_hold(rl, re);
+    s.trim(/*avoid_layer=*/-1);
     s.close();
     std::error_code ec;
     fs::remove_all(dir, ec);
