@@ -1082,13 +1082,13 @@ export const checks = [
       const row = (pg) => pg.locator(".t-morph-menu [role=option]", { hasText: "Coding tools" })
       const typeAndSend = async (pg, text) => { await pg.fill("textarea[aria-label='Message']", text); await pg.keyboard.press("Enter"); await pg.waitForTimeout(900) }
 
-      const heightsNow = (pg) => pg.evaluate(async () => {
-        const el = document.querySelector("[role=dialog][aria-label='Coding tools']")
+      const heightsNow = (pg, sel = "[role=dialog][aria-label='Coding tools']") => pg.evaluate(async (q) => {
+        const el = document.querySelector(q)
         const seen = []
         const t0 = performance.now()
         while (performance.now() - t0 < 800) { seen.push(Math.round(el.getBoundingClientRect().height)); await new Promise((r) => requestAnimationFrame(r)) }
         return seen
-      })
+      }, sel)
       // ---- the row and the panel
       const pg = await open(browser, errors)
       const { sent, answers } = await setup(pg, {
@@ -1127,6 +1127,36 @@ export const checks = [
       t.ok("and the panel says whose folder it is", (await panel.innerText()).includes("no project"))
       await panel.locator("[role=radio]", { hasText: "Ask" }).click()
       await pg.click("textarea[aria-label='Message']")
+
+      // ---- on a narrow screen the description of Auto is longer than Plan's: it stretches there, and what is the same stays where it was
+      const pn = await open(browser, errors, { width: 360, height: 700 })
+      await setup(pn)
+      await pn.goto(fast.base + "/#/chat")
+      await pn.waitForSelector("textarea")
+      await pn.waitForTimeout(1200)
+      await menu(pn)
+      await row(pn).click()
+      await pn.waitForTimeout(500)
+      const pnl = pn.locator("[role=dialog][aria-label='Coding tools']")
+      await pnl.locator("[role=radio]", { hasText: "Plan" }).click()
+      await pn.waitForTimeout(700)
+      const watching = pn.evaluate(async () => {
+        const box = document.querySelector("[role=dialog][aria-label='Coding tools'] .fit-box")
+        const top = (q) => Math.round(document.querySelector(q).getBoundingClientRect().top)
+        const rows = []
+        const t0 = performance.now()
+        while (performance.now() - t0 < 900) {
+          rows.push({ box: Math.round(box.getBoundingClientRect().height), modes: top("[role=dialog][aria-label='Coding tools'] [role=radiogroup]"), folder: top("input[aria-label='Folder the tools work in']") })
+          await new Promise((r) => requestAnimationFrame(r))
+        }
+        return rows
+      })
+      await pnl.locator("[role=radio]", { hasText: "Auto" }).click()
+      const w = await watching
+      const boxes = w.map((x) => x.box), modes = w.map((x) => x.modes), folders = w.map((x) => x.folder)
+      t.ok("the description stretches where the text gets longer, through in-between heights", new Set(boxes).size > 3 && boxes.at(-1) > boxes[0] && boxes.slice(1, -1).some((h) => h > boxes[0] && h < boxes.at(-1)), JSON.stringify([...new Set(boxes)]))
+      t.ok("from there upward: what is above it moves up as it grows", modes[0] - modes.at(-1) > 10 && modes.slice(1, -1).some((m) => m < modes[0] && m > modes.at(-1)), JSON.stringify([...new Set(modes)]))
+      t.ok("and what is below it stays exactly where it was", Math.max(...folders) - Math.min(...folders) <= 1, JSON.stringify([...new Set(folders)]))
 
       // ---- the request, and a card that asks
       await typeAndSend(pg, "run the tests")
@@ -1169,7 +1199,7 @@ export const checks = [
       const sampling = heightsNow(pg)
       await panel.getByRole("button", { name: "Forget them" }).click()
       const hs = await sampling
-      t.ok("the panel shrinks to what is left through in-between heights instead of jumping", new Set(hs).size > 3 && hs.at(-1) < hs[0] && hs.slice(1, -1).some((h) => h < hs[0] && h > hs.at(-1)), JSON.stringify([...new Set(hs)]))
+      t.ok("only the description stretches: a row that goes takes the panel's height in one step, the panel does not glide as a whole", new Set(hs).size <= 2 && hs.at(-1) < hs[0], JSON.stringify([...new Set(hs)]))
       await pg.waitForTimeout(300)
       t.ok("forgotten", !(await panel.innerText()).includes("rules allowed"))
       await panel.locator("[role=switch][aria-label='Coding tools']").click()
