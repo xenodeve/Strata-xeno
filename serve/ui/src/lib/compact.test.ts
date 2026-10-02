@@ -46,10 +46,10 @@ describe("compactCommand: /compact and what follows it", () => {
 
 describe("when and how much", () => {
   test("shouldCompact: at the share of the context, counting the prompt that is coming", () => {
-    expect(shouldCompact(7999, 0, 10000)).toBe(false)
-    expect(shouldCompact(8000, 0, 10000)).toBe(true)
-    expect(shouldCompact(7000, 1000, 10000)).toBe(true)
-    expect(COMPACT_AT).toBe(0.8)
+    expect(shouldCompact(9499, 0, 10000)).toBe(false)
+    expect(shouldCompact(9500, 0, 10000)).toBe(true)
+    expect(shouldCompact(8500, 1000, 10000)).toBe(true)
+    expect(COMPACT_AT).toBe(0.95)
   })
   test("no context size known: never by itself", () => { expect(shouldCompact(1e9, 0, 0)).toBe(false) })
   test("summaryRoom: what is left, up to the most a summary may take", () => {

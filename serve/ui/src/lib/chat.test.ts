@@ -786,9 +786,9 @@ describe("compacting the conversation", () => {
   test("a conversation that nears the end of the context is compacted before the next prompt, which and its answer stay out of the summary", async () => {
     keep()
     const c = new ChatController()
-    mockFetch([said("answer one", { prompt_tokens: 700, completion_tokens: 150 })], [])
+    mockFetch([said("answer one", { prompt_tokens: 900, completion_tokens: 50 })], [])
     await c.send("first prompt", [], small)
-    expect(c.messages[1].stats!.ctx).toBe(850)
+    expect(c.messages[1].stats!.ctx).toBe(950)
     const seen: Record<string, unknown>[] = []
     mockFetch([said(SUMMARY), said("answer two")], seen)
     await c.send("second prompt", [], small)
@@ -799,7 +799,7 @@ describe("compacting the conversation", () => {
     expect(String((seen[1] as Req).messages[0].content)).toContain("build the thing")
     expect((seen[1] as Req).messages[1].content).toBe("second prompt")
     expect(c.messages.map((m) => m.role)).toEqual(["user", "user", "assistant"])
-    expect(c.messages[0].compact).toMatchObject({ auto: true, before: 850 })
+    expect(c.messages[0].compact).toMatchObject({ auto: true, before: 950 })
     expect(c.messages[2].text).toBe("answer two")
   })
 
@@ -844,7 +844,7 @@ describe("compacting the conversation", () => {
     const c = new ChatController()
     const errors: string[] = []
     c.onError = (title) => errors.push(title)
-    mockFetch([said("answer one", { prompt_tokens: 700, completion_tokens: 150 })], [])
+    mockFetch([said("answer one", { prompt_tokens: 900, completion_tokens: 50 })], [])
     await c.send("first prompt", [], small)
     let n = 0
     ;(globalThis as Record<string, unknown>).fetch = async () => (n++ === 0 ? new Response(JSON.stringify({ error: { message: "the engine is busy" } }), { status: 500 }) : new Response(stream(said("answer two")), { status: 200 }))

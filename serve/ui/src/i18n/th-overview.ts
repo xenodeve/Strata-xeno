@@ -318,6 +318,8 @@ export const part: Record<string, string> = {
   "Compacted by itself at {n} tokens ({pct}%).": "สรุปให้เองเมื่อถึง {n} โทเคน ({pct}%)",
   "The server has not reported the use yet: this is a guess from the text.": "เซิร์ฟเวอร์ยังไม่ได้รายงานการใช้ ตัวเลขนี้เป็นการประมาณจากข้อความ",
   "Compact now": "สรุปเดี๋ยวนี้",
+  "{used} / {max} tokens": "{used} / {max} โทเคน",
+  "Click for details": "คลิกเพื่อดูรายละเอียด",
   "The server did not say how big the context window is, so nothing can be shown.": "เซิร์ฟเวอร์ไม่ได้บอกขนาดหน้าต่างบริบท จึงแสดงอะไรไม่ได้",
   "Summarise the conversation so far to free up context. Add after it what the summary should focus on.": "สรุปบทสนทนาจนถึงตอนนี้เพื่อคืนที่ในบริบท พิมพ์ต่อท้ายได้ว่าอยากให้สรุปเน้นเรื่องอะไร",
   "Command of Strata": "คำสั่งของ Strata",

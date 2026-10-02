@@ -28,7 +28,7 @@ describe("contextView", () => {
   const msgs = [u("x".repeat(260)), a("y".repeat(260))]
   test("what the server reported is the figure, and what it added is the rest", () => {
     const v = contextView(msgs, 1000, 4000, true)
-    expect(v).toMatchObject({ known: true, max: 4000, used: 1000, exact: true, pct: 25, autoAt: 3200, level: "ok" })
+    expect(v).toMatchObject({ known: true, max: 4000, used: 1000, exact: true, pct: 25, autoAt: 3800, level: "ok" })
     expect(v.parts.find((p) => p.key === "system")!.tokens).toBe(1000 - 200)
     expect(v.parts.find((p) => p.key === "free")!.tokens).toBe(3000)
     expect(v.parts.reduce((n, p) => n + p.tokens, 0)).toBe(4000)
@@ -42,7 +42,8 @@ describe("contextView", () => {
   test("levels: under 60 %, from 60 %, and at the compacting point", () => {
     expect(contextView(msgs, 2300, 4000, true).level).toBe("ok")
     expect(contextView(msgs, 2400, 4000, true).level).toBe("warn")
-    expect(contextView(msgs, 3200, 4000, true).level).toBe("full")
+    expect(contextView(msgs, 3799, 4000, true).level).toBe("warn")
+    expect(contextView(msgs, 3800, 4000, true).level).toBe("full")
   })
   test("with automatic compacting off there is no point, and no \"full\"", () => {
     const v = contextView(msgs, 3900, 4000, false)

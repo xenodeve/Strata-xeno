@@ -1251,10 +1251,22 @@ export const checks = [
       const chip = pg.locator("button.prompt-bar__ctx")
       const panel = pg.locator("[role=dialog][aria-label='Context window']")
       t.ok("the prompt bar shows the share of the context window that is used, from what the server reported", (await chip.innerText()).trim() === "12%" && (await chip.getAttribute("data-level")) === "ok", await chip.innerText())
+      await chip.hover()
+      await pg.waitForTimeout(300)
+      const tip = pg.locator("[data-context-tip]")
+      t.ok("pointing at the chip says at once how much of the window is used, without opening anything", (await tip.count()) === 1 && (await tip.innerText()).includes("120 / 1,000 tokens") && (await tip.innerText()).includes("12%") && (await panel.count()) === 0, await tip.innerText())
+      await pg.mouse.move(5, 5)
+      await pg.waitForTimeout(300)
+      t.ok("and it goes when the pointer does", (await tip.count()) === 0)
+      await chip.click()
+      await pg.waitForTimeout(500)
+      t.ok("clicking it opens the panel, and the tip is not shown over it", (await tip.count()) === 0 && (await panel.count()) === 1)
+      await pg.keyboard.press("Escape")
+      await pg.waitForTimeout(300)
       await chip.click()
       await pg.waitForTimeout(500)
       t.ok("it opens to how much is used of how much, and what the window holds", (await panel.count()) === 1 && (await panel.locator("[data-context-figures]").innerText()).includes("120 of 1,000 tokens") && (await panel.locator("li[data-part='conversation']").count()) === 1 && (await panel.locator("li[data-part='system']").count()) === 1 && (await panel.locator("li[data-part='free']").innerText()).includes("880"), await panel.innerText())
-      t.ok("it says where the conversation is compacted by itself", (await panel.locator("[data-context-auto]").innerText()).includes("800 tokens (80%)"))
+      t.ok("it says where the conversation is compacted by itself", (await panel.locator("[data-context-auto]").innerText()).includes("950 tokens (95%)"))
       await pg.keyboard.press("Escape")
       await pg.waitForTimeout(300)
       t.ok("Escape closes it", (await panel.count()) === 0)
@@ -1291,13 +1303,13 @@ export const checks = [
       t.ok("the summary is kept: after a reload it is still there", (await notice.count()) === 1)
 
       // the next prompt goes after the summary
-      used = 870
+      used = 930
       await send("hello two")
-      t.ok("near the end of the window the chip says so", (await chip.innerText()).trim() === "89%" && (await chip.getAttribute("data-level")) === "full", await chip.innerText())
+      t.ok("near the end of the window the chip says so", (await chip.innerText()).trim() === "95%" && (await chip.getAttribute("data-level")) === "full", await chip.innerText())
       const next = bodies.at(-1)
       t.ok("the next prompt is sent after the summary, which the model reads as the earlier part", next.messages.length === 2 && String(next.messages[0].content).includes("the e2e thing") && next.messages[1].content === "hello two", JSON.stringify(next.messages.map((m) => m.role)))
 
-      // near the end of the context (870 of 1000): the next prompt is preceded by a summary
+      // near the end of the context (950 of 1000): the next prompt is preceded by a summary
       const before = bodies.length
       used = 120
       await send("hello three")

@@ -3,7 +3,9 @@ import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
   Attachment01Icon, Cancel01Icon, Download01Icon, File02Icon, HelpCircleIcon, PlusSignIcon, Settings02Icon, SparklesIcon, MessageAdd01Icon, PlugSocketIcon, ComputerTerminal01Icon, Shield01Icon,
 } from "@hugeicons/core-free-icons"
+import { createPortal } from "react-dom"
 import { msg, t } from "../lib/i18n"
+import { fmt } from "../lib/format"
 import type { McpServer } from "../lib/api"
 import { markOf, matchCommands, pickCommand, slashQuery, type Command } from "../lib/slash"
 import type { ContextView } from "../lib/context"
@@ -124,9 +126,12 @@ export function PromptBar(p: PromptBarProps) {
   const [shut, setShut] = useState<string | null>(null)          // the text at which Escape closed the list: it stays closed until the text changes
   const skillRows = useRef<(HTMLButtonElement | null)[]>([])
   const mirror = useRef<HTMLDivElement>(null)
+  const [ctxTip, setCtxTip] = useState<{ right: number; bottom: number } | null>(null)     // pointing at the context chip: the used share of the window, quickly, without opening it
   const [tipAt, setTipAt] = useState<number | null>(null)       // pointing at the marked command: where its card goes (from the left of the bar)
 
   useEffect(() => { if (p.context.open !== asked.current) { asked.current = p.context.open; setMenu("context") } }, [p.context.open])      // /context
+
+  const showCtxTip = (el: HTMLElement) => { const r = el.getBoundingClientRect(); setCtxTip({ right: Math.max(8, innerWidth - r.right), bottom: innerHeight - r.top + 6 }) }
 
   const usable = (x: McpServer) => x.tools.length > 0 && (x.status === "ready" || x.status === "stopped")       // a server that is up and offers tools can be switched
   const mcpOn = p.mcp.on ? p.mcp.servers.filter((x) => usable(x) && !p.mcp.off.includes(x.name)).length : 0
@@ -341,6 +346,14 @@ export function PromptBar(p: PromptBarProps) {
         <div className="prompt-bar__menu" data-kind="tip" role="tooltip" style={{ left: tipAt }}>
           <SkillCard cmd={marked.cmd} />
         </div>
+      )}
+
+      {ctxTip && menu !== "context" && p.context.view.known && createPortal(
+        <span role="tooltip" className="skill-tip" data-context-tip style={{ right: ctxTip.right, bottom: ctxTip.bottom, left: "auto", top: "auto" }}>
+          <span className="skill-card__name num">{p.context.view.exact ? "" : t("About") + " "}{t("{used} / {max} tokens", { used: fmt(p.context.view.used), max: fmt(p.context.view.max) })} · {p.context.view.pct}%</span>
+          <span className="skill-card__from">{t("Click for details")}</span>
+        </span>,
+        document.body,
       )}
 
       {menu === "context" && (
@@ -578,7 +591,11 @@ export function PromptBar(p: PromptBarProps) {
               data-on={menu === "context" ? "" : undefined}
               data-level={p.context.view.level}
               onMouseDown={(e) => e.preventDefault()}
-              onClick={() => toggle("context")}
+              onClick={() => { setCtxTip(null); toggle("context") }}
+              onPointerEnter={(e) => { if (e.pointerType === "mouse") showCtxTip(e.currentTarget) }}
+              onPointerLeave={() => setCtxTip(null)}
+              onFocus={(e) => { if (e.currentTarget.matches(":focus-visible")) showCtxTip(e.currentTarget) }}
+              onBlur={() => setCtxTip(null)}
             >
               <ContextRing pct={p.context.view.pct} />
               <span className="num">{p.context.view.pct}%</span>

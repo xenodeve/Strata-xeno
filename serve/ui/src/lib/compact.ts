@@ -2,7 +2,7 @@
 // of everything so far, and the summary takes the place of the messages. The conversation goes on from the summary. The model is called as for any answer, with no tools.
 // This file is the text of that request and the numbers that decide when; the controller (lib/chat.ts) does the calling.
 
-export const COMPACT_AT = 0.8              // the share of the context at which a conversation is compacted by itself, before the next prompt is sent
+export const COMPACT_AT = 0.95             // the share of the context at which a conversation is compacted by itself, before the next prompt is sent (the rest is room for the summary)
 export const MAX_SUMMARY = 4096            // the most tokens a summary may take
 export const MIN_SUMMARY = 512             // less room than this and the oldest messages are left out of what is summarised
 
@@ -60,5 +60,6 @@ export function compactCommand(text: string): { focus: string } | null {
   return m ? { focus: (m[1] ?? "").trim() } : null
 }
 
-/** How many tokens the summary may take, from what is left of the context after the conversation and the request; below MIN_SUMMARY it is too little. */
+/** How many tokens the summary may take, from what is left of the context after the conversation and the request; below MIN_SUMMARY it is too little. `history` is what the
+ *  conversation uses: the figure the server reported when there is one (the safe one: a guess from the text is too low for Thai), else a guess. */
 export const summaryRoom = (max: number, history: number, request: number): number => (max > 0 ? Math.min(MAX_SUMMARY, max - history - request - 24) : MAX_SUMMARY)
