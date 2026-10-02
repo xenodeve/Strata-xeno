@@ -3,12 +3,13 @@ import { createPortal } from "react-dom"
 import { cn } from "../lib/cn"
 import { t } from "../lib/i18n"
 import { FoldersEditor, type FoldersApi } from "./FoldersEditor"
-import { useMounted } from "./motion"
+import { GlidePanel, useMounted } from "./motion"
 import { Button, inputCls } from "./ui"
 
 // A project is a name and its folders (issue #96): the folders are where the coding tools of its chats work, as Claude Code works in the folder it was started in (and in
 // the other folders it was given, such as other git worktrees). So a project cannot be made without a folder. The folders are typed or chosen from the folders of this PC
-// (components/FoldersEditor.tsx).
+// (components/FoldersEditor.tsx). The dialog stretches where its content grows (a folder added, the list of folders, what is offered while a path is typed) and closes
+// up where it shrinks: the part that changed glides and the rest follows (GlidePanel), the dialog stays centered.
 
 export function NewProjectDialog({ open, onCreate, onCancel }: { open: boolean; onCreate: (name: string, folders: string[]) => void; onCancel: () => void }) {
   const mounted = useMounted(open, 220)
@@ -63,34 +64,36 @@ export function NewProjectDialog({ open, onCreate, onCancel }: { open: boolean; 
         aria-modal="true"
         aria-labelledby={head}
         data-new-project
-        className={cn("relative max-h-[calc(100dvh-2rem)] w-full max-w-[460px] overflow-y-auto rounded-xl border border-line bg-surface p-5 shadow-[0_24px_64px_-16px_rgb(0_0_0/0.4)] transition-[opacity,transform] duration-200 ease-[var(--ease)]", shown && open ? "translate-y-0 scale-100 opacity-100" : "translate-y-2 scale-[0.98] opacity-0")}
+        className={cn("relative w-full max-w-[460px] overflow-hidden rounded-xl border border-line bg-surface shadow-[0_24px_64px_-16px_rgb(0_0_0/0.4)] transition-[opacity,transform] duration-200 ease-[var(--ease)]", shown && open ? "translate-y-0 scale-100 opacity-100" : "translate-y-2 scale-[0.98] opacity-0")}
       >
-        <h2 id={head} className="text-[16px] font-semibold">{t("New project")}</h2>
-        <p className="mt-1.5 text-[13px] leading-relaxed text-ink-2">{t("A project is one or more folders on this PC, such as the worktrees of one repository. The coding tools of its chats work in them: files inside are free to read and change, everything else asks you first. The first folder is the main one: commands run there.")}</p>
+        <GlidePanel cap={() => innerHeight - 34} inner="p-5" className="[scrollbar-gutter:auto]">
+          <h2 id={head} className="text-[16px] font-semibold">{t("New project")}</h2>
+          <p className="mt-1.5 text-[13px] leading-relaxed text-ink-2">{t("A project is one or more folders on this PC, such as the worktrees of one repository. The coding tools of its chats work in them: files inside are free to read and change, everything else asks you first. The first folder is the main one: commands run there.")}</p>
 
-        <label className="mt-4 block">
-          <span className="text-[13px]">{t("Project name")}</span>
-          <input
-            ref={nameRef}
-            className={cn(inputCls, "mt-1.5")}
-            aria-label={t("Project name")}
-            value={name}
-            maxLength={60}
-            autoComplete="off"
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); editor.current?.focus() } }}
-          />
-        </label>
+          <label className="mt-4 block">
+            <span className="text-[13px]">{t("Project name")}</span>
+            <input
+              ref={nameRef}
+              className={cn(inputCls, "mt-1.5")}
+              aria-label={t("Project name")}
+              value={name}
+              maxLength={60}
+              autoComplete="off"
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); editor.current?.focus() } }}
+            />
+          </label>
 
-        <div className="mt-3">
-          <span className="mb-1.5 block text-[13px]">{t("Folders")}</span>
-          <FoldersEditor folders={folders} onChange={setFolders} onDraft={setPending} onSubmit={() => void create()} api={editor} />
-        </div>
+          <div className="mt-3">
+            <span className="mb-1.5 block text-[13px]">{t("Folders")}</span>
+            <FoldersEditor folders={folders} onChange={setFolders} onDraft={setPending} onSubmit={() => void create()} api={editor} />
+          </div>
 
-        <div className="mt-5 flex justify-end gap-2">
-          <Button kind="quiet" onClick={onCancel}>{t("Cancel")}</Button>
-          <Button kind="primary" disabled={!ready} onClick={() => void create()}>{t("Create project")}</Button>
-        </div>
+          <div className="mt-5 flex justify-end gap-2">
+            <Button kind="quiet" onClick={onCancel}>{t("Cancel")}</Button>
+            <Button kind="primary" disabled={!ready} onClick={() => void create()}>{t("Create project")}</Button>
+          </div>
+        </GlidePanel>
       </div>
     </div>,
     document.body,

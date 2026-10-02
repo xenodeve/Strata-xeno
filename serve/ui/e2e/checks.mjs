@@ -986,6 +986,14 @@ export const checks = [
       const rows = dlg.locator("[data-folders] [data-folder]")
       const list = dlg.locator("[data-folder-list]")
       const projects = () => pg.evaluate(() => (JSON.parse(localStorage.getItem("strata.chats") || "{}").projects ?? []))
+      const heights = (ms = 900) => pg.evaluate(async (ms) => {                 // the dialog's height at every frame
+        const el = document.querySelector("[data-new-project]")
+        const seen = []
+        const t0 = performance.now()
+        while (performance.now() - t0 < ms) { seen.push(el.offsetHeight); await new Promise((r) => requestAnimationFrame(r)) }
+        return seen
+      }, ms)
+      const glides = (hs, dir) => new Set(hs).size > 4 && (dir > 0 ? hs.at(-1) > hs[0] : hs.at(-1) < hs[0]) && hs.slice(1, -1).some((h) => (dir > 0 ? h > hs[0] && h < hs.at(-1) : h < hs[0] && h > hs.at(-1))) && hs.every((h, i) => i === 0 || (dir > 0 ? h >= hs[i - 1] - 1 : h <= hs[i - 1] + 1))
 
       await side.getByRole("button", { name: "New project", exact: true }).click()
       await pg.waitForTimeout(400)
@@ -1007,8 +1015,10 @@ export const checks = [
 
       await folderIn.fill(work)
       t.ok("typing again takes the reason away", (await dlg.locator("[role=alert]").count()) === 0)
+      const opening = heights()
       await dlg.getByRole("button", { name: "Browse", exact: true }).click()
-      await pg.waitForTimeout(600)
+      const hs1 = await opening
+      t.ok("the list of folders stretches the dialog open through in-between heights, not in one jump", glides(hs1, 1), JSON.stringify([...new Set(hs1)]))
       t.ok("Browse lists the folders in it, by name, and no files and no hidden ones", (await list.locator("[data-dir]").allInnerTexts()).join(",") === "alpha,beta", (await list.innerText()).split(NL).join(" | "))
       await list.locator("[data-dir]", { hasText: "alpha" }).click()
       await pg.waitForTimeout(500)
@@ -1025,14 +1035,20 @@ export const checks = [
       t.ok("Create is ready now: the name and a folder", await create.isEnabled())
 
       // a second folder: Browse starts next to the first one
+      const closing = heights()
       await dlg.getByRole("button", { name: "Hide", exact: true }).click()
+      const hs2 = await closing
+      t.ok("hiding the list closes the dialog up through in-between heights", glides(hs2, -1), JSON.stringify([...new Set(hs2)]))
       await dlg.getByRole("button", { name: "Browse", exact: true }).click()
       await pg.waitForTimeout(700)
       t.ok("Browse starts in the folder above the last one, to pick one beside it", (await list.locator("[data-dir]").allInnerTexts()).join(",") === "alpha,beta")
       await list.locator("[data-dir]", { hasText: "beta" }).click()
       await pg.waitForTimeout(400)
+      await pg.waitForTimeout(500)                                               // the list that closed up when a folder was chosen has settled
+      const adding = heights()
       await folderIn.press("Enter")
-      await pg.waitForTimeout(500)
+      const hs3 = await adding
+      t.ok("a folder that is added stretches the dialog by its row", glides(hs3, 1), JSON.stringify([...new Set(hs3)]))
       t.ok("Enter in the field adds it too: the project has two folders, the first is the main one", (await rows.count()) === 2 && (await rows.nth(0).getAttribute("data-folder")) === "main" && (await rows.nth(1).getAttribute("data-folder")) === "other" && (await rows.nth(0).innerText()).includes("Main"))
       await folderIn.fill(alpha)
       await addBtn.click()
@@ -1061,6 +1077,25 @@ export const checks = [
       for (const d of ["app", "app-wt-fix", "my-app", "lib", ".hid"]) fs.mkdirSync(path.join(sug, d))
       const offered = dlg.locator("[data-suggestion]")
       const typeSlowly = async (text) => { await folderIn.fill(""); await folderIn.pressSequentially(text, { delay: 15 }); await pg.waitForTimeout(450) }
+
+      // two ways to choose, one list at a time: typing while the list of folders is open replaces it with what goes with what is typed
+      await dlg.getByRole("button", { name: "Browse", exact: true }).click()
+      await pg.waitForTimeout(600)
+      t.ok("the list of folders is open", (await list.count()) === 1 && (await offered.count()) === 0)
+      await typeSlowly(sug + path.sep + "ap")
+      t.ok("typing a path then leaves one list, the one that goes with what is typed, and not both", (await list.count()) === 0 && (await offered.count()) === 3 && (await dlg.locator("[data-folder-list], [data-suggestions]").count()) === 1, `${await list.count()} browse, ${await offered.count()} offered`)
+      t.ok("and Browse offers the list again", (await dlg.getByRole("button", { name: "Browse", exact: true }).count()) === 1)
+      await dlg.getByRole("button", { name: "Browse", exact: true }).click()
+      await pg.waitForTimeout(600)
+      t.ok("choosing in the list of folders gives the list and not what was offered", (await list.count()) === 1 && (await offered.count()) === 0)
+      await dlg.getByRole("button", { name: "Hide", exact: true }).click()
+      await pg.waitForTimeout(500)
+      await folderIn.fill("")
+      await pg.waitForTimeout(400)
+      const offering = heights()
+      await folderIn.fill(sug + path.sep + "ap")
+      const hs4 = await offering
+      t.ok("what is offered while a path is typed stretches the dialog open", glides(hs4, 1), JSON.stringify([...new Set(hs4)]))
       await typeSlowly(sug + path.sep + "ap")
       t.ok("typing a rough path offers the folders that go with it, those that start with it first, then those that contain it", (await offered.allInnerTexts()).join(",") === "app,app-wt-fix,my-app", (await offered.allInnerTexts()).join(","))
       t.ok("the part that matches is in bold", (await offered.first().locator("b").innerText()) === "ap")
@@ -1085,7 +1120,11 @@ export const checks = [
       await offered.first().click()
       await pg.waitForTimeout(400)
       t.ok("a path typed with / stays with /", (await folderIn.inputValue()) === sug.split(path.sep).join("/") + "/lib/", await folderIn.inputValue())
-      await typeSlowly(sug + path.sep + "zzz")
+      await typeSlowly(sug + path.sep + "ap")
+      const withdrawing = heights()
+      await folderIn.fill(sug + path.sep + "zzz")
+      const hs5 = await withdrawing
+      t.ok("and closes up when nothing goes with what is typed", glides(hs5, -1), JSON.stringify([...new Set(hs5)]))
       t.ok("nothing goes with it: nothing is offered", (await offered.count()) === 0)
       await typeSlowly(sug + path.sep + "ap")
       await pg.keyboard.press("Escape")

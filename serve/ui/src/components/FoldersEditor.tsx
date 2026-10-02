@@ -155,7 +155,7 @@ export function FoldersEditor({ folders, onChange, min = 0, onDraft, onSubmit, a
           placeholder="C:/work/my-project"
           autoComplete="off"
           spellCheck={false}
-          onChange={(e) => { setDraft(e.target.value); setTyped(e.target.value) }}
+          onChange={(e) => { setDraft(e.target.value); setTyped(e.target.value); setBrowsing(false) }}          // typing is the other way to choose: the list of the folders gives way to what is offered, never both
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           onKeyDown={(e) => {
