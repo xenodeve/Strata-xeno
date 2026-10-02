@@ -3114,7 +3114,10 @@ int main(int argc, char** argv) {
 #endif
     strata::kernels::cpu::set_worker_priority(o.pool_priority);
     strata::kernels::cpu::set_current_thread_priority(o.pool_priority);   // the host works in the pool too
-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
+    // #64: no park spin in capacity mode - with the SMT siblings busy (any other program), 13 HIGHEST workers
+    // spinning for 20 ms starve the NVMe path: thai-net decode 19 -> 34 tok/s under load, ~1.5 % slower idle
+    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker,
+                                          /*spin_us=*/o.ram_cache_gib > 0.0 ? 0 : -1);
     ExitTrace exit_trace_pool{"pool next"};
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`

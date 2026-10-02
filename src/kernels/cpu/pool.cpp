@@ -199,8 +199,9 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(host_works) {
-    if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int spin_us) : host_works_(host_works) {
+    if (spin_us >= 0) spin_before_sleep_ = std::chrono::microseconds(spin_us);
+    if (const char* e = std::getenv("STRATA_POOL_SPIN_US"); e != nullptr && *e)   // the A/B knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
     const std::vector<int> cores = physical_cores(true);
     n_ = n_workers > 0 ? n_workers : (int) cores.size();
