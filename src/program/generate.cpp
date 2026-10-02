@@ -16,6 +16,7 @@
 
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/lend_rows.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -1037,7 +1038,7 @@ bool setup_tail_file(TailFile& t, strata::core::ArenaExpertSource& arena,
 /// expert served by the CPU instead would give different floats.
 bool refill_lent(const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n_expert, strata::core::ExpertSource* src,
                  strata::core::ArenaExpertSource* arena, strata::core::ExpertCache& cache, std::vector<int32_t>& host_res,
-                 std::string& err) {
+                 std::string& err, bool tail_ok = true) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     std::vector<std::pair<int32_t, int32_t>> from_pack;   // (layer * n_expert + expert, slot)
     for (const auto& [i, slot] : lent) {
@@ -1065,7 +1066,7 @@ bool refill_lent(const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n
     const auto t_all = std::chrono::steady_clock::now();
     // with the tail file: the batch's slots, sorted, as contiguous runs read in 8 MB requests straight into the pinned
     // buffer (the bounce stride is the file's)
-    const bool use_file = g_tail.ok;
+    const bool use_file = g_tail.ok && tail_ok;   // #102: the tail file holds the primary (CUDA0) cache's slots only
     if (use_file)
         std::sort(from_pack.begin(), from_pack.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
     auto read_file_batch = [&](size_t at, int buf, std::string& e) -> bool {
@@ -5370,15 +5371,10 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         }
-        // xeno #56: this fork's serve loop lends and refills CUDA0's loan only (#35's wave lanes live in it); a
-        // stage's loan (upstream #216) would hold prompt buffers in slots its rows still name as experts - wrong
-        // tokens without an error.  Refuse the combination instead (this fork runs one primary card).  Any loan on a
-        // split is refused, not only CUDA0's: upstream's #340 lets CUDA0 keep its own buffers while a stage borrows.
-        if (pf_parts.size() > 1 && any_loan) {
-            std::fprintf(stderr, "strata serve: a layer split with prompt-path borrowing is not supported in this "
-                                 "build; add --no-prefill-borrow\n");
-            return 2;
-        }
+        // #102: a layer split may borrow - every participant (CUDA0 and each stage) lends and refills its OWN cache
+        // and marks only its OWN layers' rows (lend_rows), so no stage serves a prompt buffer as an expert.  (Before
+        // #102 this fork refused the combination: its loop lent and refilled CUDA0's loan only.)  The wave (#35 D7)
+        // stays single-card: a split never waves.
         // layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next.
         // THE CHUNK STEPS DOWN INSTEAD OF EXITING.  A split's stage caches are sized after the arena is registered, and
         // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
@@ -6823,13 +6819,13 @@ int main(int argc, char** argv) {
             // reads - so the windows always see the whole expert cache - or once the prompt is read
             std::vector<std::pair<int32_t, int32_t>> lent_now;
             int64_t lent_chunk = 0;   // the chunk the lent slots hold the prompt path's buffers for
-            // xeno #56: CUDA0's loan only - a layer split with a loan is refused at start, so upstream's per-stage
-            // refill_issue / refill_wait (#340: every stage's copies queued before the first wait) has no second
-            // stage to overlap here; its STRATA_TRACE line is kept
-            auto refill = [&](std::string& e) -> bool {
+            // #102: each participant gives its loan back into the SAME slots of its OWN cache (a slot refilled into
+            // another stage's cache would leave that cache holding an expert it does not own - plausible tokens, no
+            // error).  refill_lent fills blocking per slot, so the participants refill one after another (upstream
+            // #340 queues every stage's copies before the first wait; STRATA_REFILL_SERIAL has nothing to change
+            // here).  The residency table is uploaded to every device once the loans are back (res_upload).
+            auto refill_cuda0 = [&](std::string& e) -> bool {   // CUDA0's loan (the wave lanes live in it)
                 if (lent_now.empty()) return true;
-                tr("refill start", (long long) lent_now.size());
-                const auto t_rf = Clock::now();
                 {
                     strata::timeline::Span refill_span("refill lent slots", (long long) lent_now.size());
                     if (!refill_lent(lent_now, g.n_expert, srcp, srcp == &arena_src ? &arena_src : nullptr, xcache,
@@ -6837,67 +6833,119 @@ int main(int argc, char** argv) {
                         return false;
                 }
                 if (!xcache.sync_queued(e)) return false;
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                lent_now.clear();
+                lent_chunk = 0;
+                return true;
+            };
+            auto refill_stage = [&](PfPart& p, std::string& e) -> bool {   // one stage's loan, on its device
+                if (p.lent.empty()) return true;
+                const strata::core::OnDevice on(p.dev);
+                strata::timeline::Span refill_span("refill lent slots (stage)", (long long) p.lent.size());
+                // tail_ok false: the tail file holds CUDA0's slots; a stage's expert with no host copy (capacity mode)
+                // is read from the model instead
+                if (!refill_lent(p.lent, g.n_expert, srcp, srcp == &arena_src ? &arena_src : nullptr, *p.cache,
+                                 host_res, e, /*tail_ok=*/false) ||
+                    !p.cache->sync_queued(e))
+                    return false;
+                p.lent.clear();
+                p.lent_chunk = 0;
+                return true;
+            };
+            auto refill = [&](std::string& e) -> bool {
+                int64_t n_lent = (int64_t) lent_now.size(), n_parts = lent_now.empty() ? 0 : 1;
+                for (size_t k = 1; k < pf_parts.size(); ++k)
+                    if (!pf_parts[k].lent.empty()) { n_lent += (int64_t) pf_parts[k].lent.size(); ++n_parts; }
+                if (n_parts == 0) return true;
+                tr("refill start", (long long) n_lent);
+                const auto t_rf = Clock::now();
+                if (!refill_cuda0(e)) return false;
+                for (size_t k = 1; k < pf_parts.size(); ++k)
+                    if (!refill_stage(pf_parts[k], e)) return false;
+                res_upload();
                 if (trace) {
-                    std::fprintf(stderr, "strata trace: refilled %lld slots on 1 stage(s) in %.1f ms\n",
-                                 (long long) lent_now.size(),
+                    std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
+                                 (long long) n_lent, (long long) n_parts,
                                  std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
                     std::fflush(stderr);
                 }
-                lent_now.clear();
-                lent_chunk = 0;
                 return true;
             };
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
             // rounded up to 256), laid out in the last of the slots it may borrow
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
-                if (lend_first < 0) {                                  // its own buffers: nothing to lend
-                    sp_part_wave = sp_layout_wave;   // #35 D7: fixed lanes (a short part leaves lane 2 without a chunk)
-                    return true;
-                }
                 const auto t_ln = Clock::now();
                 const int64_t want_full = std::min<int64_t>(o.prefill_chunk, (tokens + 255) / 256 * 256);
-                // #340 (upstream): a short enough request reads in the stages' own S-token chunks (nothing lent).  It
-                // is set only on a layer split, which a loan never reaches here (refused at start; lend_first < 0 above)
+                // #340 (upstream): a short enough request reads in the stages' own S-token chunks (nothing lent); set
+                // only on a layer split (#102: reachable now that a split may borrow)
                 const int64_t want = split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
                                                                                  : want_full;
-                if (!lent_now.empty()) {
-                    if (want <= lent_chunk) {   // the lent layout holds it: a wave only if that layout is one
-                        sp_part_wave = sp_layout_wave && strata::prefill::Prefill::wave_lane_splits(want);
+                bool marked = false;   // some participant's rows changed: every device's table is uploaded once
+                // CUDA0: the fork's loan with the wave lanes; its own layers only (lend_rows: pf_parts[0].lb..le)
+                auto lend_cuda0 = [&]() -> bool {
+                    if (lend_first < 0) {                              // its own buffers: nothing to lend
+                        sp_part_wave = sp_layout_wave;   // #35 D7: fixed lanes (a short part leaves lane 2 without a chunk)
                         return true;
                     }
-                    if (!refill(e)) return false;
-                }
-                const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want)));
-                // #35 D7: the wave only where each lane's chunk still runs split (the review's 3,000-token request
-                // read 1,536-token chunks on one card each: 8.6 s against 3.8 s without the wave)
-                sp_part_wave = sp_wave && strata::prefill::Prefill::wave_lane_splits(want);
-                if (sp_part_wave) {   // each lane half the chunk, in its half of the lent region
-                    const int64_t lane_want = strata::prefill::Prefill::wave_lane_chunk(want);
-                    if (lane_want != sp.chunk() || first != lend_first_now || !sp_layout_wave) {
-                        const uint64_t lb = strata::prefill::Prefill::wave_lane_bytes(g, ss, lane_want);
-                        uint8_t* base = (uint8_t*) xcache.device_slot(first);
-                        if (2 * lb > lend_bytes(first)) { e = "the wave's lanes do not fit in the lent slots"; return false; }
-                        if (!sp.relayout(lane_want, base, lb, e) || !sp2.relayout(lane_want, base + lb, lb, e)) return false;
+                    if (!lent_now.empty()) {
+                        if (want <= lent_chunk) {   // the lent layout holds it: a wave only if that layout is one
+                            sp_part_wave = sp_layout_wave && strata::prefill::Prefill::wave_lane_splits(want);
+                            return true;
+                        }
+                        if (!refill_cuda0(e)) return false;   // ONLY CUDA0's loan: the stages' buffers are still laid out
+                        marked = true;
+                    }
+                    const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want)));
+                    // #35 D7: the wave only where each lane's chunk still runs split (the review's 3,000-token request
+                    // read 1,536-token chunks on one card each: 8.6 s against 3.8 s without the wave)
+                    sp_part_wave = sp_wave && strata::prefill::Prefill::wave_lane_splits(want);
+                    if (sp_part_wave) {   // each lane half the chunk, in its half of the lent region
+                        const int64_t lane_want = strata::prefill::Prefill::wave_lane_chunk(want);
+                        if (lane_want != sp.chunk() || first != lend_first_now || !sp_layout_wave) {
+                            const uint64_t lb = strata::prefill::Prefill::wave_lane_bytes(g, ss, lane_want);
+                            uint8_t* base = (uint8_t*) xcache.device_slot(first);
+                            if (2 * lb > lend_bytes(first)) { e = "the wave's lanes do not fit in the lent slots"; return false; }
+                            if (!sp.relayout(lane_want, base, lb, e) || !sp2.relayout(lane_want, base + lb, lb, e)) return false;
+                            lend_first_now = first;
+                            sp_layout_wave = true;
+                        }
+                    } else if (want != sp.chunk() || first != lend_first_now || sp_layout_wave) {
+                        // one lane over the whole lent region (a wave's lane 2 is idle until the next wave layout)
+                        if (!sp.relayout(want, xcache.device_slot(first), lend_bytes(first), e)) return false;
                         lend_first_now = first;
-                        sp_layout_wave = true;
+                        sp_layout_wave = false;
                     }
-                } else if (want != sp.chunk() || first != lend_first_now || sp_layout_wave) {
-                    // one lane over the whole lent region (a wave's lane 2 is idle until the next wave layout)
-                    if (!sp.relayout(want, xcache.device_slot(first), lend_bytes(first), e)) return false;
-                    lend_first_now = first;
-                    sp_layout_wave = false;
+                    // #102: CUDA0's own layers only - a stage's rows hold slot numbers of ITS cache, which can be >= first
+                    strata::core::lend_rows(host_res, g.n_expert, pf_parts[0].lb, pf_parts[0].le, first, lent_now);
+                    lent_chunk = want;
+                    marked = true;
+                    return true;
+                };
+                if (!lend_cuda0()) return false;
+                // #102: each stage out of its own cache, on its own device, marking only its own layers (upstream #216)
+                for (size_t k = 1; k < pf_parts.size(); ++k) {
+                    PfPart& p = pf_parts[k];
+                    if (p.first < 0) continue;                         // its own buffers
+                    if (!p.lent.empty()) {
+                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                        if (!refill_stage(p, e)) return false;         // ONLY this stage's loan goes back
+                        marked = true;
+                    }
+                    const strata::core::OnDevice on(p.dev);
+                    const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
+                    if (want != p.sp->chunk() || first != p.first_now) {
+                        if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                        p.first_now = first;
+                    }
+                    strata::core::lend_rows(host_res, g.n_expert, p.lb, p.le, first, p.lent);
+                    p.lent_chunk = want;
+                    marked = true;
                 }
-                for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= first) {
-                        lent_now.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
-                    }
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
-                lent_chunk = want;
+                if (marked) res_upload();
                 if (trace) {
+                    int64_t n_lent = (int64_t) lent_now.size();
+                    for (size_t k = 1; k < pf_parts.size(); ++k) n_lent += (int64_t) pf_parts[k].lent.size();
                     std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n",
-                                 (long long) lent_now.size(), (long long) want,
+                                 (long long) n_lent, (long long) want,
                                  std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
                     std::fflush(stderr);
                 }
