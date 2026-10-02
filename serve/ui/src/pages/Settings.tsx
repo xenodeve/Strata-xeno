@@ -65,7 +65,7 @@ export function Settings({ topic }: { topic?: string }) {
       </section>
       <div className="flex gap-10 max-sm:flex-col max-sm:gap-4">
         <aside className="shrink-0 sm:w-[200px]">
-          <BranchedMenu sections={sections} active={active} label={t("Settings sections")} onSelect={(x) => { location.hash = href("settings", x) }} />
+          <BranchedMenu startOpen sections={sections} active={active} label={t("Settings sections")} onSelect={(x) => { location.hash = href("settings", x) }} />
         </aside>
         <div key={active} className="panel-in min-w-0 max-w-[65ch] flex-1">
           {active === "status-marks" ? <Marks /> : active === "api-key" ? <ApiKey /> : active === "import-skills" ? <ImportSettings part="skills" /> : active === "import-mcp" ? <ImportSettings part="mcp" /> : <McpSettings part={active === "mcp-servers" ? "servers" : "limits"} />}

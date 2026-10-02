@@ -32,11 +32,12 @@ const LINE_W = 1.5
 
 const sectionOf = (sections: BranchSection[], topic: string) => sections.find((s) => s.topics.some((x) => x.value === topic))?.value
 
-export function BranchedMenu({ sections, active, onSelect, label, open: openProp, onToggle, fill = false }: {
+export function BranchedMenu({ sections, active, onSelect, label, open: openProp, onToggle, fill = false, startOpen = false }: {
   sections: BranchSection[]; active: string; onSelect: (topic: string) => void; label: string
   open?: string[]; onToggle?: (section: string) => void; fill?: boolean
+  startOpen?: boolean             // every section is open at the start (else only the one in use); a heading still folds it
 }) {
-  const [own, setOwn] = useState<Set<string>>(() => new Set([sectionOf(sections, active) ?? sections[0]?.value ?? ""]))
+  const [own, setOwn] = useState<Set<string>>(() => new Set(startOpen ? sections.map((s) => s.value) : [sectionOf(sections, active) ?? sections[0]?.value ?? ""]))
   const [seen, setSeen] = useState(active)
   if (seen !== active) {                                    // a link to a topic opens its section (set during render, not in an effect: no frame with it closed)
     setSeen(active)
