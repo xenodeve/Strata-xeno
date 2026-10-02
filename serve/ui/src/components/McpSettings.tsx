@@ -4,7 +4,7 @@ import { fmt } from "../lib/format"
 import { msg, t, tn } from "../lib/i18n"
 import { MASK, bodyFor, emptyDraft, entryFromRow, entryOf, limitsOf, parsePaste, stateOf, toDraft, type Change, type Draft, type McpConfigView, type McpLimits, type McpRow } from "../lib/mcpconfig"
 import { cn } from "../lib/cn"
-import { Reveal } from "./motion"
+import { Collapse, Reveal } from "./motion"
 import { StatusLabel } from "./orb"
 import { toast } from "./toast"
 import { Button, Field, Segmented, inputCls } from "./ui"
@@ -17,7 +17,7 @@ const STATE: Record<string, string> = {
 }
 const areaCls = "w-full resize-y rounded-sm border border-line bg-surface px-2.5 py-1.5 font-mono text-[12px] leading-snug outline-none transition-colors placeholder:text-ink-3 hover:border-fill-2 focus:border-accent disabled:opacity-50"
 
-type Form = { mode: "new" | "edit"; draft: Draft; problems: Record<string, string>; failure: string | null }
+type Form = { mode: "new" | "edit"; draft: Draft; problems: Record<string, string>; failure: string | null; moved?: boolean }
 
 export function McpSettings({ part }: { part: "servers" | "limits" }) {
   const [view, setView] = useState<McpConfigView | null>(null)
@@ -58,7 +58,7 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
   }
 
   const openForm = (mode: Form["mode"], draft: Draft) => { setPaste(null); setForm({ mode, draft, problems: {}, failure: null }) }
-  const setField = (k: keyof Draft, v: string) => setForm((f) => f && { ...f, draft: { ...f.draft, [k]: v } as Draft, problems: { ...f.problems, [k]: "" } })
+  const setField = (k: keyof Draft, v: string) => setForm((f) => f && { ...f, draft: { ...f.draft, [k]: v } as Draft, problems: { ...f.problems, [k]: "" }, ...(k === "kind" ? { moved: true } : {}) })
 
   const submit = async () => {
     if (!form) return
@@ -197,8 +197,8 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
             <div className="py-2">
               <Segmented label={t("Kind")} value={form.draft.kind} onChange={(v) => setField("kind", v)} options={[{ value: "program", label: t("A program on this PC") }, { value: "address", label: t("An address (URL)") }]} />
             </div>
-            {form.draft.kind === "program" ? (
-              <>
+            <Collapse open={form.draft.kind === "program"} soft>
+              <div className="kind-pane" data-side="left" data-moved={form.moved ? "" : undefined} data-shut={form.draft.kind !== "program" ? "" : undefined}>
                 <Field label={t("Program")} hint={form.problems.command ? <span className="text-bad">{form.problems.command}</span> : t("What Strata starts, e.g. npx or uvx or the path of a program.")}>
                   <input className={`${inputCls} font-mono`} value={form.draft.command} aria-label={t("Program")} onChange={(e) => setField("command", e.target.value)} placeholder="npx" autoComplete="off" spellCheck={false} />
                 </Field>
@@ -211,17 +211,18 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
                 <Field label={t("Folder")} hint={t("Where it runs. Empty: where Strata runs.")}>
                   <input className={`${inputCls} font-mono`} value={form.draft.cwd} aria-label={t("Folder")} onChange={(e) => setField("cwd", e.target.value)} autoComplete="off" spellCheck={false} />
                 </Field>
-              </>
-            ) : (
-              <>
+              </div>
+            </Collapse>
+            <Collapse open={form.draft.kind === "address"} soft>
+              <div className="kind-pane" data-side="right" data-moved={form.moved ? "" : undefined} data-shut={form.draft.kind !== "address" ? "" : undefined}>
                 <Field label={t("Address")} hint={form.problems.url ? <span className="text-bad">{form.problems.url}</span> : t("A server that speaks Streamable HTTP, often at /mcp.")}>
                   <input className={`${inputCls} font-mono`} value={form.draft.url} aria-label={t("Address")} onChange={(e) => setField("url", e.target.value)} placeholder="http://127.0.0.1:3000/mcp" autoComplete="off" spellCheck={false} />
                 </Field>
                 <Field label={t("Headers")} hint={form.problems.headers ? <span className="text-bad">{form.problems.headers}</span> : t("One per line: Name=value, e.g. Authorization=Bearer …. After saving the values are hidden; leave {mask} to keep one.", { mask: MASK })}>
                   <textarea className={areaCls} rows={2} value={form.draft.headers} aria-label={t("Headers")} onChange={(e) => setField("headers", e.target.value)} spellCheck={false} />
                 </Field>
-              </>
-            )}
+              </div>
+            </Collapse>
             {form.failure && <p role="alert" className="mt-1 text-[12px] text-bad [overflow-wrap:anywhere]">{form.failure}</p>}
             <div className="mt-2 flex gap-2">
               <Button type="submit" kind="primary" disabled={busy}>{t("Save")}</Button>
