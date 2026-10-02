@@ -15,7 +15,7 @@ import re
 import threading
 from pathlib import Path
 
-from serve import mcp_admin
+from serve import mcp_admin, memory as memory_mod
 from serve.skills import SkillsServer
 
 try:
@@ -468,7 +468,20 @@ def view(svc, client_ip: str, host: str, rescan: bool = False) -> dict:
         "harnesses": harnesses,
         "skills": {"settings": st, "used": sum(1 for i in items if i["used"]), "total": len(items), "items": items},
         "mcp": {"harnesses": [{"id": h["id"], "label": h["label"], "servers": [public_candidate(c, ok) for c in cands[h["id"]]]} for h in HARNESSES if cands[h["id"]]]},
+        "memory": memory_view(imp, cfg),
     }
+
+
+def memory_view(imp, cfg: dict) -> dict:
+    """The notes of other apps that the chat may read (serve/memory.py), with whether each is switched on (all are off until they are): each app's own instruction file, and the
+    memory Claude Code keeps per project (one switch for all projects)."""
+    st = memory_mod.settings(cfg)
+    sources = [{k: s[k] for k in ("id", "app", "label", "kind", "shown", "bytes", "on")} for s in memory_mod.discover(str(imp.home), [], st["on"])]
+    projects = imp.home / ".claude" / "projects"
+    if projects.is_dir():
+        sources.append({"id": "claude:memory", "app": "claude", "label": memory_mod.LABELS["claude"], "kind": "memory", "shown": ["~/.claude/projects/<folder>/memory/"], "bytes": None,
+                        "on": "claude:memory" in st["on"]})
+    return {"settings": st, "sources": sources}
 
 
 def _check_skills(value) -> tuple[dict | None, list[dict]]:
@@ -497,8 +510,13 @@ def apply(svc, body) -> tuple[int, dict | None]:
     imp = getattr(svc, "importer", None)
     if imp is None:
         return 404, {"error": {"message": "importing from other apps is not set up on this server"}}
-    if not isinstance(body, dict) or not any(k in body for k in ("skills", "import_mcp", "rescan")):
-        return 400, {"error": {"message": 'send {"skills": {...}}, {"import_mcp": {"harness", "name"}} or {"rescan": true}', "fields": []}}
+    if not isinstance(body, dict) or not any(k in body for k in ("skills", "import_mcp", "rescan", "memory")):
+        return 400, {"error": {"message": 'send {"skills": {...}}, {"memory": {"on": [...]}}, {"import_mcp": {"harness", "name"}} or {"rescan": true}', "fields": []}}
+    memory_new = None
+    if "memory" in body:
+        memory_new, merrors = memory_mod.check_settings(body["memory"])
+        if merrors:
+            return 400, {"error": {"message": f"{merrors[0]['message']} ({merrors[0]['field']})", "fields": merrors}}
     skills_new = None
     if "skills" in body:
         skills_new, errors = _check_skills(body["skills"])
@@ -516,6 +534,12 @@ def apply(svc, body) -> tuple[int, dict | None]:
                     block["skills"] = skills_new
                     cfg["import"] = block
                 mcp_admin.update_config(svc.config_path, put)
+            if memory_new is not None:
+                def put_memory(cfg):
+                    block = cfg.get("import") if isinstance(cfg.get("import"), dict) else {}
+                    block["memory"] = memory_new
+                    cfg["import"] = block
+                mcp_admin.update_config(svc.config_path, put_memory)
             if want is not None:
                 try:
                     new_own, _name = import_server(mcp_admin._servers_in(mcp_admin._read_json(svc.config_path)), want["harness"], want["name"], imp.found, imp.environ)

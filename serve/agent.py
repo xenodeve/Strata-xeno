@@ -26,7 +26,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
-from serve import permissions
+from serve import memory as memory_mod, permissions
 
 MAX_DIRS = 20                                   # the project's other folders that one request may name
 MAX_READ_LINES = 2000
@@ -67,6 +67,7 @@ class Session:
     def __init__(self):
         self.reads: dict[str, tuple[int, int]] = {}        # real path -> (mtime_ns, size) when it was last read or written here
         self.todos: list[dict] = []
+        self.loaded: set = set()                            # the instruction files of sub-folders already handed to the model (serve/memory.py nested)
         self.shells: dict = {}                              # background commands of this chat (serve/shell.py)
         self.shell_count = 0
         self.lock = threading.Lock()
@@ -248,11 +249,25 @@ class AgentServer:
             elif answer != "allow":
                 return _err(f"The user did not allow this {tool} call ({d.why}). Do not try the same thing again; ask them what they want instead.")
         try:
-            return self._run[tool](args, ctx)
+            r = self._run[tool](args, ctx)
+            return self._with_nested(tool, args, ctx, r)
         except PermissionError as e:
             return _err(f"{tool} could not do it: {e.strerror or e}")
         except OSError as e:
             return _err(f"{tool} could not do it: {e.strerror or e}")
+
+    def _with_nested(self, tool: str, args: dict, ctx: AgentContext, result: dict) -> dict:
+        """A file in a sub-folder of the project brings that sub-folder's instruction file with it (once per chat), as Claude Code does."""
+        if tool not in ("Read", "Edit", "Write", "NotebookEdit") or result.get("isError") or not ctx.policy.cwd:
+            return result
+        target = args.get("notebook_path") if tool == "NotebookEdit" else args.get("file_path")
+        path = self._path(target, ctx)
+        if not path:
+            return result
+        extra = memory_mod.nested(path, [ctx.policy.cwd, *ctx.policy.dirs], self.session(ctx.session).loaded)
+        if extra and result.get("content") and isinstance(result["content"][0], dict):
+            result["content"][0]["text"] = str(result["content"][0].get("text", "")) + "\n\n" + extra
+        return result
 
     # -------------------------------------------------------------------------------------------- Read
     def _path(self, raw, ctx: AgentContext) -> str | None:

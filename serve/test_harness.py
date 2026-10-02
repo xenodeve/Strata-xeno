@@ -815,6 +815,28 @@ class ImportEndpoints(Fixture):
         for body in ({"rescan": True}, {"skills": {"enabled": False}}, {"import_mcp": {"harness": "claude", "name": "files"}}):
             self.assertEqual(self.call("/import", "POST", body, host)[0], 403, body)
 
+    def test_the_view_lists_the_notes_of_the_other_apps_all_off_to_begin_with(self):
+        write(self.home / ".claude/CLAUDE.md", "global notes")
+        write(self.home / ".claude/projects/some-project/memory/MEMORY.md", "index")
+        code, d = self.js("/import?rescan=1")
+        self.assertEqual(code, 200)
+        mem = d["memory"]
+        self.assertEqual(mem["settings"], {"on": []})
+        by = {s["id"]: s for s in mem["sources"]}
+        self.assertEqual(set(by), {"claude:instructions", "claude:memory"})
+        self.assertFalse(by["claude:instructions"]["on"] or by["claude:memory"]["on"])
+
+    def test_a_memory_switch_is_saved_and_checked(self):
+        write(self.home / ".claude/CLAUDE.md", "global notes")
+        code, d = self.js("/import", "POST", {"memory": {"on": ["claude:instructions"]}}, self.own())
+        self.assertEqual(code, 200, d)
+        self.assertEqual(self.saved()["import"]["memory"], {"on": ["claude:instructions"]})
+        self.assertEqual(self.saved()["model"], "m")                                            # the rest of the config is kept
+        self.assertEqual(d["memory"]["settings"], {"on": ["claude:instructions"]})
+        for bad in ({"memory": {"on": ["../x"]}}, {"memory": "x"}, {"memory": {"other": 1}}):
+            self.assertEqual(self.call("/import", "POST", bad, self.own())[0], 400, bad)
+        self.assertEqual(self.call("/import", "POST", {"memory": {"on": []}}, {"Host": "10.0.0.5:8091"})[0], 403)
+
     def test_a_skill_switch_is_saved_as_an_off_list_and_takes_effect_at_once(self):
         code, d = self.js("/import", "POST", {"skills": {"harness_off": ["codex"], "off": {"claude": ["pdf-tools"]}}}, self.own())
         self.assertEqual(code, 200, d)

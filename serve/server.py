@@ -60,7 +60,7 @@ from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_me
 from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
 from serve import agent as agent_mod, agent_prompt, agent_run, permissions, shell as shell_mod  # noqa: E402
-from serve import folders as folders_mod, gitview  # noqa: E402
+from serve import folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -885,6 +885,16 @@ class Service:
         body = anthropic_collect(anthropic_events(self, req, ids, thinking, None, max_new, threading.Event()))
         return "".join(b.get("text", "") for b in body.get("content", []) if isinstance(b, dict) and b.get("type") == "text")
 
+    def memory_blocks(self, folders: list[str]) -> list[dict]:
+        """The notes the chat is handed: the project's own instruction files, and what other apps wrote down that the user switched on (serve/memory.py)."""
+        imp = getattr(self, "importer", None)
+        home = str(imp.home) if imp is not None else str(harness.home_dir())
+        try:
+            on = memory_mod.settings(harness._cfg(self))["on"]
+        except Exception:  # noqa: BLE001 - a config that cannot be read means no other app's notes
+            on = []
+        return memory_mod.collect(home, folders, on)
+
     def start_agent_run(self, sa: dict, messages: list):
         """One request's use of the coding tools: the folder, mode, rules and chat the page named (anything odd is ignored), the rules for the
         AI as a prompt, and auto mode's judge (serve/agent_run.py)."""
@@ -919,7 +929,7 @@ class Service:
             parent = os.path.dirname(d)
             d = parent if parent != d else None
         tools = [t["name"] for t in self.agent.tools if t["name"] != "ExitPlanMode" or mode == "plan"]
-        run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, agent_prompt.project_notes(folder), tools, dirs)
+        run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
         return run
 
     def replay_key(self, req: dict, ids, max_new):
@@ -2161,6 +2171,32 @@ def make_handler(svc: Service):
                     if path == "/agent/git":
                         return self._json(200, gitview.info(folder))
                     return self._json(200, gitview.diff(folder, q.get("file", [""])[0], q.get("staged", ["0"])[0] == "1", q.get("untracked", ["0"])[0] == "1"))
+                return
+            if path in ("/agent/memory", "/agent/memory/file"):
+                # the notes the chat reads for a project: the project's own files and what the user's other apps wrote down (serve/memory.py); for who may use the coding tools
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    q = parse_qs(urlsplit(self.path).query)
+                    folders = [f for f in [q.get("path", [""])[0], *q.get("dirs", [])] if f.strip() and "\0" not in f][:agent_mod.MAX_DIRS + 1]
+                    imp = getattr(svc, "importer", None)
+                    home = str(imp.home) if imp is not None else str(harness.home_dir())
+                    on = memory_mod.settings(harness._cfg(svc))["on"]
+                    sources = memory_mod.discover(home, folders, on)
+                    if path == "/agent/memory":
+                        return self._json(200, {"max": memory_mod.MAX_TOTAL, "sources": [{k: s[k] for k in ("id", "app", "label", "kind", "shown", "bytes", "on")} for s in sources]})
+                    src = next((s for s in sources if s["id"] == q.get("id", [""])[0]), None)
+                    try:
+                        n = int(q.get("n", ["0"])[0])
+                    except ValueError:
+                        n = -1
+                    if src is None or not 0 <= n < len(src["files"]):
+                        return self._json(404, {"ok": False, "error": "no such file"})
+                    got = memory_mod._read(src["files"][n], 200_000)
+                    if got is None:
+                        return self._json(200, {"ok": False, "error": "cannot be read"})
+                    return self._json(200, {"ok": True, "name": os.path.basename(src["files"][n]), "text": got[0], "cut": got[1]})
                 return
             if path == "/mcp/config":
                 # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)

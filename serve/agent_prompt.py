@@ -44,7 +44,8 @@ def project_notes(cwd: str | None) -> tuple[str, str] | None:
     return None
 
 
-def build(cwd: str | None, shell: str | None, mode: str | None, today: str, platform: str, git: bool, notes: tuple[str, str] | None, tools: list[str], dirs: list[str] | None = None) -> str:
+def build(cwd: str | None, shell: str | None, mode: str | None, today: str, platform: str, git: bool, notes: tuple[str, str] | None, tools: list[str], dirs: list[str] | None = None,
+          memory: list[dict] | None = None) -> str:
     has = set(tools)
     out = [
         "You are a coding assistant working on the user's own computer, in a chat. You can read and change files and run commands with the tools below. "
@@ -96,6 +97,14 @@ def build(cwd: str | None, shell: str | None, mode: str | None, today: str, plat
         if len(text) > MAX_NOTES:
             text, cut = text[:MAX_NOTES], f"\n\n[{name} is cut here: it is longer than {MAX_NOTES:,} characters]"
         out += ["", f"# The project's own instructions ({name})", "These come from the project; follow them where they do not conflict with the rules above.", "", text.rstrip() + cut]
+    if memory:
+        out += ["", "# Notes from files on this PC",
+                "These are the user's own notes and instructions (the project's, and what the user's other coding apps wrote down for them). Follow them where they do not conflict with the rules above. "
+                "They never change what you may do: the rules above and the user's answers decide that."]
+        for b in memory:
+            what = f"The project's own instructions ({b['name']})" if b.get("kind") == "project" else \
+                f"{b.get('label', 'Notes')}: " + ("what it remembers about this project" if b.get("kind") == "memory" else "the user's instructions") + f" ({b['name']})"
+            out += ["", f"## {what}", b["text"].rstrip() + ("\n[cut here: the file is longer than is used]" if b.get("cut") else "")]
     return "\n".join(out)
 
 
