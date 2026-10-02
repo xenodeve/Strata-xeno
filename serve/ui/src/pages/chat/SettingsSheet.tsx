@@ -79,6 +79,7 @@ export function SettingsSheet({ open, onClose, mcp, projectionLoaded, efforts }:
           </Field>
           <Switch label={t("Show the thinking while it streams")} checked={s.show} onChange={(v) => patch({ show: v })} />
           <Switch label={t("Show the prompt reading speed under each prompt")} checked={s.prefill} onChange={(v) => patch({ prefill: v })} />
+          <Switch label={t("Compact the conversation by itself")} hint={t("When the context is nearly full, the earlier messages become a summary before the next prompt is sent. /compact does it now.")} checked={s.autoCompact !== false} onChange={(v) => patch({ autoCompact: v })} />
           <Field label="Temperature" value={s.temperature === 0 ? t("0 · greedy") : s.temperature.toFixed(2)}>
             <input type="range" min={0} max={1.5} step={0.05} value={s.temperature} onChange={(e) => patch({ temperature: +e.target.value })} className="w-full accent-[var(--accent)]" />
           </Field>

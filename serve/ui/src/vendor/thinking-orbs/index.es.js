@@ -646,6 +646,20 @@ const LABELS = {
   breathing: "Thinking…",
   shaping: "Shaping…"
 };
+/** xeno: the orb's own time, in its own seconds. The upstream library drew the frame at the page's clock times the speed, so a new speed (a token rate that moved) made the
+ *  picture jump as if the orb had started over. Here time only adds up: what passes is counted at the speed it passes at, and time while the orb is stopped does not count. */
+function makeOrbClock() {
+  let t = 0;
+  let stamp = null;
+  return {
+    start(now) { stamp = now; },
+    advance(now, speed) {
+      if (stamp !== null) t += (now - stamp) * speed;
+      stamp = now;
+      return t;
+    }
+  };
+}
 function ThinkingOrb({
   state = "working",
   size = 64,
@@ -665,6 +679,8 @@ function ThinkingOrb({
   ...rest
 }) {
   const ref = useRef(null);
+  const clock = useRef(null);      // xeno: it lives as long as the orb, across a change of speed, fps, colour or pause
+  clock.current ??= makeOrbClock();
   const optsKey = optsOverride ? JSON.stringify(optsOverride) : "";
   const dark = useResolvedDark(theme, ref);
   const gravityKey = gravity ? JSON.stringify(gravity) : "";
@@ -689,6 +705,9 @@ function ThinkingOrb({
     const frameFn = customFrame ?? MODE_FRAMES[mode];
     const tint = parseTint(color);
     const effSpeed = baseSpeed * speed;
+    const clk = clock.current;
+    clk.start(performance.now() / 1e3);
+    const tick = () => clk.advance(performance.now() / 1e3, effSpeed);
     const frame = (tSec) => {
       ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
       ctx.clearRect(0, 0, size, size);
@@ -705,20 +724,21 @@ function ThinkingOrb({
     const loop = (now) => {
       if (!gap || now - last >= gap) {
         last = now;
-        frame(performance.now() / 1e3 * effSpeed);
+        frame(tick());
       }
       if (running) raf2 = requestAnimationFrame(loop);
     };
     const start = () => {
       if (running || paused) return;
       running = true;
+      clk.start(performance.now() / 1e3);      // xeno: the time it was stopped (hidden, offscreen, paused) does not count
       raf2 = requestAnimationFrame(loop);
     };
     const stop = () => {
       running = false;
       cancelAnimationFrame(raf2);
     };
-    frame(performance.now() / 1e3 * effSpeed);
+    frame(tick());
     let visible = true;
     const io = typeof IntersectionObserver !== "undefined" ? new IntersectionObserver(([entry]) => {
       visible = entry.isIntersecting;
@@ -755,6 +775,7 @@ export {
   MODE_FRAMES,
   S as STATE_TO_MODE,
   ThinkingOrb,
+  makeOrbClock,
   c as angleDelta,
   attachGravity,
   d as countDots,

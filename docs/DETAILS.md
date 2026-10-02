@@ -532,6 +532,15 @@ text in files and command output is data and not instructions, do not retry what
 own `CLAUDE.md` (or `AGENTS.md`). They work only from this PC itself (or with the API key), never for another address on the network, and
 `"agent": false` in the run config switches them off.
 
+**Compacting a conversation** (as Claude Code's `/compact`). Typing `/compact` (optionally followed by what the summary should focus on) asks the model for a summary
+of everything so far, written in the sections Claude Code's own summary has (the request, key concepts, files and code, errors and fixes, every user message, pending
+tasks, current work, next step), with no tools, and the summary takes the place of the messages: the chat shows a line "Conversation compacted" that opens to it, and
+the model reads it as the earlier part of the conversation. A conversation that has used 80 % of the context (what the last answer reported: its prompt after every tool
+round, and its own tokens; else a guess from the text) is compacted by itself before the next prompt is sent (the prompt and its answer stay out of the summary); the
+switch is in the sampling settings ("Compact the conversation by itself", on by default). When the conversation does not fit with the request, the oldest prompts are
+left out of the summary and the model is asked again. Nothing is kept of the messages that were summarised. Not done: compacting in the middle of one answer's tool
+rounds (the server's tool loop runs them without the page).
+
 - **What asks.** Inside the chat's project folder, reading, searching, writing and editing files are free (secrets such as `.env` or keys, and
   writing in `.git`, always ask). Outside the folder, or when the chat has no folder, everything asks. A command asks every time unless it is
   a plain read-only one (`ls`, `git status`, `cat src/a.py`, ...) that names nothing outside the folder; a command that is chained, writes a

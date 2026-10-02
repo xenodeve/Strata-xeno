@@ -12,7 +12,7 @@ export function SkillCard({ cmd }: { cmd: Command }) {
     <>
       <span className="skill-card__name">/{cmd.name}</span>
       {cmd.description && <span className="skill-card__desc">{cmd.description}</span>}
-      <span className="skill-card__from">{cmd.plugin ? t("Skill from {app} · plugin {plugin}", { app: cmd.from, plugin: cmd.plugin }) : t("Skill from {app}", { app: cmd.from })}</span>
+      <span className="skill-card__from">{cmd.builtin ? t("Command of Strata") : cmd.plugin ? t("Skill from {app} · plugin {plugin}", { app: cmd.from, plugin: cmd.plugin }) : t("Skill from {app}", { app: cmd.from })}</span>
     </>
   )
 }

@@ -282,7 +282,9 @@ export function PromptBar(p: PromptBarProps) {
   const onKeyDown = (e: RKeyEvent<HTMLTextAreaElement>) => {
     if (slashOpen && !e.nativeEvent.isComposing) {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); setSlashAt((slashMark + (e.key === "ArrowDown" ? 1 : found.length - 1)) % found.length); return }
-      if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") { e.preventDefault(); pickSkill(found[slashMark].name); return }
+      const marked = found[slashMark]
+      const typedInFull = e.key === "Enter" && marked.builtin && p.value.trim().toLowerCase() === "/" + marked.name                  // "/compact" and Enter: a command of Strata is sent, as in Claude Code, not completed
+      if (((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") && !typedInFull) { e.preventDefault(); pickSkill(marked.name); return }
       if (e.key === "Escape") { e.preventDefault(); setShut(p.value); return }
     }
     if (menu === "plus") {

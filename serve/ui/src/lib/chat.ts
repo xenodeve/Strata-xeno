@@ -7,6 +7,7 @@ import { store } from "./store"
 import { PrefillMeter, type Prefill } from "./prefill"
 import { t, tn } from "./i18n"
 import { skillOfMessage } from "./slash"
+import { compactPrompt, continuationText, estimateTokens, MIN_SUMMARY, shouldCompact, summaryOf, summaryRoom } from "./compact"
 import { addRule, agentRequest, NO_AGENT, rulesOf, type AgentInfo } from "./agent"
 import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
 
@@ -23,9 +24,12 @@ export interface ToolCall {
 export interface Attachment { kind: "image" | "file"; name: string; url?: string; text?: string }
 /** What the line under an answer says, as numbers: it is turned into words by `metaText` when it is shown, so that the line
  *  follows the language in use (a stored answer has no text of its own in either language). */
-export interface Stats { tokens?: number; tokS?: number | null; stopped?: boolean; tools?: number; limit?: number; projection?: "on" | "off" }
+export interface Stats { ctx?: number; tokens?: number; tokS?: number | null; stopped?: boolean; tools?: number; limit?: number; projection?: "on" | "off" }
+/** On the message that stands for what was compacted: how many tokens the conversation used before, about how many the summary takes, who started it, what it was asked to focus on. */
+export interface CompactInfo { before: number; after: number; auto: boolean; focus?: string }
 export interface Message {
   role: "user" | "assistant"; text: string; time: number
+  compact?: CompactInfo                                          // this message is the summary that took the place of the earlier ones: shown as a line, read by the model as the earlier part
   prefill?: Prefill                                              // on a prompt: the speed it was read at
   reasoning?: string; thinkSecs?: number | null; stats?: Stats; meta?: string /* legacy: the line as text, from an older version */
   error?: string; stopped?: boolean; limit?: number
@@ -55,6 +59,7 @@ export interface Settings {
   thinking: string; temperature: number; top_p: number; top_k: number
   max: string; seed: string; show: boolean; esp: boolean; mcp: boolean; mcpOff: string[]; prefill: boolean
   agent: boolean; agentMode: string; agentFolder: string        // the coding tools: on (the default), ask / plan / auto, and the folder for chats that are in no project
+  autoCompact: boolean                                          // a conversation that nears the end of the context is summarised before the next prompt (on by default)
 }
 /** What a request says about MCP: nothing when the tools are off (or no server that is not switched off has any), else `strata_mcp`
  *  and, when the + menu's list switched some servers off for this chat, their names. */
@@ -65,7 +70,7 @@ export function mcpRequest(s: Settings, mcp: McpInfo): { strata_mcp?: true; stra
   if (usable === 0 || (!mcp.servers.length && mcp.tools === 0)) return {}
   return off.length ? { strata_mcp: true, strata_mcp_off: off } : { strata_mcp: true }
 }
-export const DEFAULTS: Settings = { thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, mcpOff: [], prefill: true, agent: true, agentMode: "ask", agentFolder: "" }
+export const DEFAULTS: Settings = { thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, mcpOff: [], prefill: true, agent: true, agentMode: "ask", agentFolder: "", autoCompact: true }
 
 // a file's text in the message, fenced with more backticks than it contains itself
 const fileBlock = (f: { name: string; text: string }) => {
@@ -143,12 +148,40 @@ function onTool(m: Message, x: ToolEvent) {
   }
 }
 
+/** A message the user wrote: not the summary that a compaction left in place of earlier ones. */
+export const isPrompt = (m: Message): boolean => m.role === "user" && !m.compact
+
 export function exportMarkdown(messages: Message[], model: string): string {
   const tools = (m: Message) => (m.tools || []).filter((t) => t.result != null).map((t) =>
     `<details><summary>Tool ${t.server ? `${t.server} / ` : ""}${t.tool || t.name}${t.ok ? "" : " (error)"}</summary>\n\n` +
     `\`\`\`json\n${JSON.stringify(t.arguments || {}, null, 2)}\n\`\`\`\n\n\`\`\`\n${t.result}\n\`\`\`\n\n</details>\n\n`).join("")
-  return messages.map((m) => m.role === "user" ? `## You\n\n${m.text}\n` :
+  return messages.map((m) => m.compact ? `## Summary of the earlier conversation\n\n${m.text}\n` : m.role === "user" ? `## You\n\n${m.text}\n` :
     `## ${model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n")
+}
+
+/** The words of an answer that is streamed (the reasoning is not part of them). */
+async function readText(r: Response): Promise<string> {
+  const reader = r.body!.getReader()
+  const dec = new TextDecoder()
+  let buf = "", out = ""
+  for (;;) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buf += dec.decode(value, { stream: true })
+    let nl: number
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim()
+      buf = buf.slice(nl + 1)
+      if (!line.startsWith("data:")) continue
+      const data = line.slice(5).trim()
+      if (data === "[DONE]") continue
+      let j: any
+      try { j = JSON.parse(data) } catch { continue }
+      if (j.error) throw new Error(j.error.message || t("the engine reported an error"))
+      out += j.choices?.[0]?.delta?.content || ""
+    }
+  }
+  return out
 }
 
 /** The attachments of a sent message that can be sent again: a reload keeps only their names (the data is not stored). */
@@ -173,6 +206,7 @@ export class ChatController {
   messages: Message[] = restore(store.get<Message[]>("chat", []))   // the open one
   settings: Settings = { ...DEFAULTS, ...store.get<Partial<Settings>>("sampling", {}) }
   busy: { abort: AbortController; msg: Message } | null = null
+  compacting = false                                             // the conversation is being summarised (busy is set too: nothing else can be sent or opened meanwhile)
   onError: (title: string, text: string) => void = () => {}
   private meter: PrefillMeter | null = null
   private version = 0
@@ -261,6 +295,81 @@ export class ChatController {
 
   stop() { this.busy?.abort.abort() }
 
+  // ------------------------------------------------------------------------------------------------ compacting (lib/compact.ts)
+  /** How many tokens the conversation uses: what the last answer reported (its prompt after every tool round, and its own tokens), else a guess from the text. */
+  contextUsed(): number {
+    const last = this.messages[this.messages.length - 1]
+    if (last && last.role === "assistant" && !last.error && last.stats?.ctx) return last.stats.ctx
+    return estimateTokens(apiMessages(this.messages))
+  }
+  /** Whether there is something to summarise: a prompt of the user's. */
+  canCompact(): boolean { return !this.busy && this.messages.some(isPrompt) }
+  private shouldAutoCompact(ctx: SendContext, text: string, attachments: Attachment[]): boolean {
+    if (this.settings.autoCompact === false || !this.messages.some(isPrompt)) return false
+    const incoming = estimateTokens(text) + attachments.reduce((n, a) => n + (a.kind === "file" ? estimateTokens(a.text ?? "") : 0), 0)
+    return shouldCompact(this.contextUsed(), incoming, ctx.health.max_context)
+  }
+
+  /** `/compact`: the model summarises the conversation and the summary takes the place of its messages. False when there was nothing to do or it did not work (the
+   *  conversation is then as it was; the page says why). Stop ends it. */
+  async compact(ctx: SendContext, focus = ""): Promise<boolean> {
+    if (!this.canCompact()) return false
+    const abort = new AbortController()
+    this.busy = { abort, msg: { role: "assistant", text: "", time: Date.now() } }
+    const ok = await this.runCompact(ctx, focus, false, 0, abort, this.contextUsed())
+    this.busy = null
+    this.notify()
+    return ok
+  }
+
+  /** Summarises all but the last `tail` messages (the prompt that is being sent, and its answer, stay out of it) and puts the summary in their place. */
+  private async runCompact(ctx: SendContext, focus: string, auto: boolean, tail: number, abort: AbortController, before: number): Promise<boolean> {
+    this.compacting = true
+    this.notify()
+    let ok = false
+    try {
+      const head = this.messages.slice(0, this.messages.length - tail)
+      const summary = summaryOf(await this.summarize(ctx, head, focus, abort.signal))
+      if (!summary) throw new Error(t("The model sent no summary."))
+      const note: Message = { role: "user", text: continuationText(summary), time: Date.now(), compact: { before, after: estimateTokens(summary), auto, ...(focus ? { focus } : {}) } }
+      this.messages = [note, ...this.messages.slice(this.messages.length - tail)]
+      this.save()
+      ok = true
+    } catch (e) {
+      if ((e as Error).name !== "AbortError") this.onError(t("Could not compact the conversation"), (e as Error).message || String(e))
+    }
+    this.compacting = false
+    this.notify()
+    return ok
+  }
+
+  /** The model's summary of `head`, as it wrote it. When the conversation does not fit with the request, the oldest part is left out and it is asked again. */
+  private async summarize(ctx: SendContext, head: Message[], focus: string, signal: AbortSignal): Promise<string> {
+    const prompt = compactPrompt(focus)
+    let from = 0
+    for (;;) {
+      const history = apiMessages(head.slice(from))
+      const room = summaryRoom(ctx.health.max_context, estimateTokens(history), estimateTokens(prompt))
+      const next = this.nextStart(head, from)
+      if (room < MIN_SUMMARY && next !== null) { from = next; continue }
+      const body: Record<string, unknown> = { model: ctx.health.model, messages: [...history, { role: "user", content: prompt }], stream: true, reasoning_effort: "low", temperature: 0.3, max_tokens: Math.max(64, room) }
+      if (ctx.projectionLoaded) body.experimental_speed_projection = !!this.settings.esp
+      const r = await fetch(url("v1/chat/completions"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body), signal })
+      if (!r.ok) {
+        const why = await errorMessage(r)
+        if (next !== null && /context|room/i.test(why)) { from = next; continue }
+        throw new Error(why)
+      }
+      return readText(r)
+    }
+  }
+  /** Where a shorter part to summarise starts: at a prompt, a quarter of what is left further on; null when there is no later prompt. */
+  private nextStart(head: Message[], from: number): number | null {
+    const step = Math.max(1, Math.ceil((head.length - from) / 4))
+    for (let i = from + step; i < head.length; i++) if (isPrompt(head[i])) return i
+    return null
+  }
+
   /** The user's answer to a card of the coding tools. The call goes on (or is refused) at the server; the card stays until the server says
    *  it took the answer, so a lost one can be given again. "Allow for this chat" also keeps the rule for the next requests of this chat. */
   async answer(callId: string, decision: "allow" | "allow_chat" | "deny"): Promise<boolean> {
@@ -300,7 +409,7 @@ export class ChatController {
    *  asks first. Never while an answer is being written (nothing can be taken back then). */
   undoWouldEmpty(): boolean {
     if (this.busy) return false
-    const at = this.messages.map((m) => m.role).lastIndexOf("user")
+    const at = this.messages.map((m) => isPrompt(m)).lastIndexOf(true)
     return at === 0
   }
 
@@ -309,7 +418,7 @@ export class ChatController {
   undoLast(): { text: string; attachments: Attachment[]; removed: Message[] } | null {
     if (this.busy) return null
     let at = -1
-    for (let i = this.messages.length - 1; i >= 0 && at < 0; i--) if (this.messages[i].role === "user") at = i
+    for (let i = this.messages.length - 1; i >= 0 && at < 0; i--) if (isPrompt(this.messages[i])) at = i
     if (at < 0) return null
     const m = this.messages[at]
     const { kept, lost } = attachmentsOf(m)
@@ -325,7 +434,7 @@ export class ChatController {
    *  prompt, or nothing would be sent. */
   async edit(index: number, text: string, ctx: SendContext): Promise<boolean> {
     const m = this.messages[index]
-    if (this.busy || !m || m.role !== "user") return false
+    if (this.busy || !m || !isPrompt(m)) return false
     const { kept, lost } = attachmentsOf(m)
     if (!text.trim() && !kept.length) return false
     this.messages = this.messages.slice(0, index)
@@ -338,6 +447,8 @@ export class ChatController {
   async send(text: string, attachments: Attachment[], ctx: SendContext) {
     text = text.trim()
     if ((!text && !attachments.length) || this.busy) return
+    const compactFirst = this.shouldAutoCompact(ctx, text, attachments)       // measured on the conversation so far, before this prompt is part of it
+    const before = compactFirst ? this.contextUsed() : 0
     this.messages.push({
       role: "user", text, time: Date.now(),
       images: attachments.filter((a) => a.kind === "image").map((a) => ({ name: a.name, url: a.url })),
@@ -352,6 +463,7 @@ export class ChatController {
     this.busy = { abort, msg: m }
     this.save()                                               // the conversation is in the list now, not when its answer ends
     this.notify()
+    if (compactFirst) await this.runCompact(ctx, "", true, 2, abort, before)       // near the end of the context: the earlier messages become a summary; this prompt and its answer are not part of it
 
     const s = this.settings
     const body: Record<string, unknown> = { model: ctx.health.model, messages: apiMessages(this.messages), stream: true, reasoning_effort: s.thinking }
@@ -368,7 +480,7 @@ export class ChatController {
 
     let firstAt: number | null = null
     let thinkStart: number | null = null
-    let usage: { completion_tokens?: number } | null = null
+    let usage: { completion_tokens?: number; prompt_tokens?: number } | null = null
     let timings: { prompt_n?: number; prompt_per_second?: number | null; cache_n?: number } | null = null
     try {
       const r = await fetch(url("v1/chat/completions"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body), signal: abort.signal })
@@ -437,6 +549,7 @@ export class ChatController {
     } else if (m.stopped) {
       stats.stopped = true
     }
+    if (usage?.prompt_tokens && !m.error) stats.ctx = usage.prompt_tokens + (usage.completion_tokens ?? 0)       // how much of the context the conversation uses now (after every tool round)
     for (const tc of m.tools || []) if (tc.state === "writing" || tc.state === "running") { tc.state = "skipped"; tc.ms = null }
     const ran = (m.tools || []).filter((tc) => tc.state === "done" || tc.state === "error").length
     if (ran) stats.tools = ran

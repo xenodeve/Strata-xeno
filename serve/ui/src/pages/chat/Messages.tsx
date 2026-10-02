@@ -151,7 +151,37 @@ function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: bo
   )
 }
 
-export function MessageView({ m, streaming, show, prefill, actions, serverPhase }: { m: Message; streaming: boolean; show: boolean; prefill: boolean; actions?: PromptActions; serverPhase?: string | null }) {
+/** The line the conversation is summarised under: the model is writing the summary that will take the place of the earlier messages. */
+export function CompactingLine() {
+  return <div className="msg-in" role="status"><StatusLabel design="weaving" className="text-[13px] text-ink-2">{t("Compacting the conversation…")}</StatusLabel></div>
+}
+
+/** Where the earlier messages were summarised: a line across the chat that says so, and opens to the summary the model reads in their place. */
+function CompactNotice({ m }: { m: Message }) {
+  const [open, setOpen] = useState(false)
+  const c = m.compact!
+  return (
+    <div className="msg-in" data-compact>
+      <div className="flex items-center gap-3 text-[12px] text-ink-3">
+        <span className="h-px flex-1 bg-line" aria-hidden />
+        <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} className="num flex items-center gap-1.5 rounded-sm px-2 py-1 transition-colors hover:bg-hover hover:text-ink">
+          <span>{c.auto ? t("Conversation compacted automatically") : t("Conversation compacted")}</span>
+          <span>· {t("{before} → about {after} tokens", { before: fmt(c.before), after: fmt(c.after) })}</span>
+          <HugeiconsIcon icon={ArrowDown01Icon} size={12} aria-hidden className={cn("transition-transform duration-200", open && "rotate-180")} />
+        </button>
+        <span className="h-px flex-1 bg-line" aria-hidden />
+      </div>
+      <Collapse open={open}>
+        <div className="mt-2 rounded-md border border-line px-3 py-2.5 text-[13px] text-ink-2">
+          {c.focus && <p className="mb-2 text-ink-3">{t("Focus: {focus}", { focus: c.focus })}</p>}
+          <Prose text={m.text} />
+        </div>
+      </Collapse>
+    </div>
+  )
+}
+
+export function MessageView({ m, streaming, compacting = false, show, prefill, actions, serverPhase }: { m: Message; streaming: boolean; compacting?: boolean; show: boolean; prefill: boolean; actions?: PromptActions; serverPhase?: string | null }) {
   const ref = useRef<HTMLDivElement>(null)
   const mine = useRef<HTMLDivElement>(null)
   const [editing, setEditing] = useState(false)
@@ -166,6 +196,7 @@ export function MessageView({ m, streaming, show, prefill, actions, serverPhase 
     el.animate([{ transform: `translateY(${rise}px) scale(0.97)`, opacity: 0 }, { opacity: 1, offset: 0.35 }, { transform: "none", opacity: 1 }],
       { duration: 460, easing: "cubic-bezier(0.23, 1, 0.32, 1)" })
   }, [])
+  if (m.compact) return <CompactNotice m={m} />
   if (m.role === "user") {
     return (
       <div ref={mine} className="msg-in group flex flex-col items-end gap-1">
@@ -215,7 +246,8 @@ export function MessageView({ m, streaming, show, prefill, actions, serverPhase 
       {m.error ? (
         <div className="rounded-md border border-line px-3 py-2 text-[13px] text-bad [overflow-wrap:anywhere]">{m.error}</div>
       ) : waiting ? (
-        m.reasoning ? null : phaseKind(serverPhase).kind === "reading"
+        compacting ? <StatusLabel design="weaving" className="text-[13px] text-ink-2">{t("Compacting the conversation…")}</StatusLabel>
+        : m.reasoning ? null : phaseKind(serverPhase).kind === "reading"
           ? <StatusLabel design="listening" className="text-[13px] text-ink-2">{t("Reading the prompt…")}</StatusLabel>
           : <StatusLabel design="breathing" className="text-[13px] text-ink-2">{t("Waiting for the model…")}</StatusLabel>
       ) : (

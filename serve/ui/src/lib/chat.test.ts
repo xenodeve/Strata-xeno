@@ -700,3 +700,248 @@ describe("a conversation appears when its prompt is sent, and taking back the fi
     c.busy = null
   })
 })
+
+// Compacting (lib/compact.ts): /compact, and a conversation that nears the end of the context being summarised before the next prompt.
+describe("compacting the conversation", () => {
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    return data
+  }
+  const said = (text: string, usage: Record<string, number> = { completion_tokens: 1 }) => sse(delta({ content: text }), { choices: [], usage }, "data: [DONE]\n\n")
+  const SUMMARY = "<analysis>notes</analysis><summary>1. Primary request: build the thing\n9. Next step: tests</summary>"
+  const small = { ...ctx, health: { model: "m", images: false, max_context: 1000 } }
+  type Req = { messages: { role: string; content: unknown }[]; [k: string]: unknown }
+  const waits = () => (globalThis as Record<string, unknown>).fetch = (_u: string, init: { signal: AbortSignal }) => new Promise((_res, rej) => init.signal.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))))
+
+  async function twoExchanges(c: InstanceType<typeof ChatController>, usage = { prompt_tokens: 20, completion_tokens: 5 }) {
+    mockFetch([said("answer one", usage), said("answer two", usage)], [])
+    await c.send("first prompt", [], ctx)
+    await c.send("second prompt", [], ctx)
+  }
+
+  test("/compact: the model is asked for a summary, with no tools, and the summary takes the place of the messages", async () => {
+    keep()
+    const c = new ChatController()
+    await twoExchanges(c)
+    const seen: Record<string, unknown>[] = []
+    mockFetch([said(SUMMARY)], seen)
+    expect(await c.compact(ctx)).toBe(true)
+    const req = seen[0] as Req
+    expect(req.stream).toBe(true)
+    expect("strata_mcp" in req || "strata_agent" in req || "strata_skill" in req).toBe(false)
+    expect(req.reasoning_effort).toBe("low")
+    expect(req.messages.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant", "user"])
+    expect(String(req.messages.at(-1)!.content)).toContain("Primary request and intent")
+    expect(c.messages).toHaveLength(1)
+    expect(c.messages[0].role).toBe("user")
+    expect(c.messages[0].text).toContain("1. Primary request: build the thing")
+    expect(c.messages[0].text).not.toContain("<analysis>")
+    expect(c.messages[0].compact).toMatchObject({ auto: false })
+    expect(c.messages[0].compact!.before).toBe(25)                       // what the last answer reported: its prompt and its own tokens
+    expect(c.busy).toBeNull()
+    expect(c.compacting).toBe(false)
+  })
+
+  test("what is typed after /compact is passed on as what to focus on", async () => {
+    keep()
+    const c = new ChatController()
+    await twoExchanges(c)
+    const seen: Record<string, unknown>[] = []
+    mockFetch([said(SUMMARY)], seen)
+    await c.compact(ctx, "the failing tests")
+    expect(String((seen[0] as Req).messages.at(-1)!.content)).toContain("the failing tests")
+    expect(c.messages[0].compact!.focus).toBe("the failing tests")
+  })
+
+  test("the next prompt goes after the summary, which the model reads as the earlier part", async () => {
+    keep()
+    const c = new ChatController()
+    await twoExchanges(c)
+    mockFetch([said(SUMMARY)], [])
+    await c.compact(ctx)
+    const seen: Record<string, unknown>[] = []
+    mockFetch([said("after")], seen)
+    await c.send("third prompt", [], ctx)
+    const msgs = (seen[0] as Req).messages
+    expect(msgs.map((m) => m.role)).toEqual(["user", "user"])
+    expect(String(msgs[0].content)).toContain("1. Primary request: build the thing")
+    expect(msgs[1].content).toBe("third prompt")
+  })
+
+  test("there is nothing to compact in an empty conversation, or one that is only a summary", async () => {
+    keep()
+    const c = new ChatController()
+    expect(c.canCompact()).toBe(false)
+    expect(await c.compact(ctx)).toBe(false)
+    await twoExchanges(c)
+    expect(c.canCompact()).toBe(true)
+    mockFetch([said(SUMMARY)], [])
+    await c.compact(ctx)
+    expect(c.canCompact()).toBe(false)
+  })
+
+  test("a conversation that nears the end of the context is compacted before the next prompt, which and its answer stay out of the summary", async () => {
+    keep()
+    const c = new ChatController()
+    mockFetch([said("answer one", { prompt_tokens: 700, completion_tokens: 150 })], [])
+    await c.send("first prompt", [], small)
+    expect(c.messages[1].stats!.ctx).toBe(850)
+    const seen: Record<string, unknown>[] = []
+    mockFetch([said(SUMMARY), said("answer two")], seen)
+    await c.send("second prompt", [], small)
+    expect(seen).toHaveLength(2)
+    expect(String((seen[0] as Req).messages.at(-1)!.content)).toContain("Primary request and intent")
+    expect(JSON.stringify((seen[0] as Req).messages)).not.toContain("second prompt")
+    expect((seen[1] as Req).messages.map((m) => m.role)).toEqual(["user", "user"])
+    expect(String((seen[1] as Req).messages[0].content)).toContain("build the thing")
+    expect((seen[1] as Req).messages[1].content).toBe("second prompt")
+    expect(c.messages.map((m) => m.role)).toEqual(["user", "user", "assistant"])
+    expect(c.messages[0].compact).toMatchObject({ auto: true, before: 850 })
+    expect(c.messages[2].text).toBe("answer two")
+  })
+
+  test("a conversation that is not near the end is left alone", async () => {
+    keep()
+    const c = new ChatController()
+    mockFetch([said("answer one", { prompt_tokens: 100, completion_tokens: 50 })], [])
+    await c.send("first prompt", [], small)
+    const seen: Record<string, unknown>[] = []
+    mockFetch([said("answer two")], seen)
+    await c.send("second prompt", [], small)
+    expect(seen).toHaveLength(1)
+    expect(c.messages.some((m) => m.compact)).toBe(false)
+  })
+
+  test("with automatic compacting switched off nothing is compacted by itself", async () => {
+    keep()
+    const c = new ChatController()
+    c.setSettings({ ...c.settings, autoCompact: false })
+    mockFetch([said("answer one", { prompt_tokens: 900, completion_tokens: 50 })], [])
+    await c.send("first prompt", [], small)
+    const seen: Record<string, unknown>[] = []
+    mockFetch([said("answer two")], seen)
+    await c.send("second prompt", [], small)
+    expect(seen).toHaveLength(1)
+  })
+
+  test("a prompt with a big file counts: the conversation is compacted before it is sent", async () => {
+    keep()
+    const c = new ChatController()
+    mockFetch([said("answer one", { prompt_tokens: 300, completion_tokens: 50 })], [])
+    await c.send("first prompt", [], small)
+    const seen: Record<string, unknown>[] = []
+    mockFetch([said(SUMMARY), said("answer two")], seen)
+    await c.send("read this", [{ kind: "file", name: "big.txt", text: "x".repeat(2000) }], small)
+    expect(seen).toHaveLength(2)
+    expect(c.messages[0].compact?.auto).toBe(true)
+  })
+
+  test("when the summary cannot be had, the conversation is as it was and the prompt is still sent", async () => {
+    keep()
+    const c = new ChatController()
+    const errors: string[] = []
+    c.onError = (title) => errors.push(title)
+    mockFetch([said("answer one", { prompt_tokens: 700, completion_tokens: 150 })], [])
+    await c.send("first prompt", [], small)
+    let n = 0
+    ;(globalThis as Record<string, unknown>).fetch = async () => (n++ === 0 ? new Response(JSON.stringify({ error: { message: "the engine is busy" } }), { status: 500 }) : new Response(stream(said("answer two")), { status: 200 }))
+    await c.send("second prompt", [], small)
+    expect(errors).toContain("Could not compact the conversation")
+    expect(c.messages.some((m) => m.compact)).toBe(false)
+    expect(c.messages.map((m) => m.text)).toEqual(["first prompt", "answer one", "second prompt", "answer two"])
+  })
+
+  test("a reply with no summary in it is an error, and the conversation stays", async () => {
+    keep()
+    const c = new ChatController()
+    const errors: string[] = []
+    c.onError = (title) => errors.push(title)
+    await twoExchanges(c)
+    mockFetch([said("<analysis>only notes")], [])
+    expect(await c.compact(ctx)).toBe(false)
+    expect(errors).toEqual(["Could not compact the conversation"])
+    expect(c.messages).toHaveLength(4)
+  })
+
+  test("when the conversation does not fit with the request, the oldest prompts are left out and the model is asked again", async () => {
+    keep()
+    const c = new ChatController()
+    await twoExchanges(c)
+    mockFetch([said("answer three")], [])
+    await c.send("third prompt", [], ctx)
+    const seen: Record<string, unknown>[] = []
+    let n = 0
+    ;(globalThis as Record<string, unknown>).fetch = async (_u: string, init: { body: string }) => {
+      seen.push(JSON.parse(init.body))
+      return n++ === 0 ? new Response(JSON.stringify({ error: { message: "prompt (5000 tokens) leaves no room to answer in the context (4096)" } }), { status: 400 }) : new Response(stream(said(SUMMARY)), { status: 200 })
+    }
+    expect(await c.compact(ctx)).toBe(true)
+    expect(seen).toHaveLength(2)
+    expect((seen[1] as Req).messages.length).toBeLessThan((seen[0] as Req).messages.length)
+    expect((seen[1] as Req).messages[0].role).toBe("user")
+    expect(c.messages).toHaveLength(1)
+  })
+
+  test("Stop ends it, with no error, and the conversation is as it was", async () => {
+    keep()
+    const c = new ChatController()
+    const errors: string[] = []
+    c.onError = (title) => errors.push(title)
+    await twoExchanges(c)
+    waits()
+    const running = c.compact(ctx)
+    await new Promise((r) => setTimeout(r, 5))
+    expect(c.compacting).toBe(true)
+    expect(c.busy).not.toBeNull()
+    c.stop()
+    expect(await running).toBe(false)
+    expect(errors).toEqual([])
+    expect(c.messages).toHaveLength(4)
+    expect(c.busy).toBeNull()
+    expect(c.compacting).toBe(false)
+  })
+
+  test("while it runs nothing else can be sent", async () => {
+    keep()
+    const c = new ChatController()
+    await twoExchanges(c)
+    waits()
+    const running = c.compact(ctx)
+    await new Promise((r) => setTimeout(r, 5))
+    await c.send("another", [], ctx)
+    expect(c.messages).toHaveLength(4)
+    c.stop()
+    await running
+  })
+
+  test("taking a prompt back never takes the summary back, and a summary is not a prompt to rewrite", async () => {
+    keep()
+    const c = new ChatController()
+    await twoExchanges(c)
+    mockFetch([said(SUMMARY)], [])
+    await c.compact(ctx)
+    expect(c.undoLast()).toBeNull()                                      // only the summary is left: no prompt to take back
+    expect(await c.edit(0, "x", ctx)).toBe(false)
+    mockFetch([said("after")], [])
+    await c.send("third prompt", [], ctx)
+    expect(c.undoWouldEmpty()).toBe(false)                              // the summary stays, so the conversation does not empty
+    const back = c.undoLast()
+    expect(back?.text).toBe("third prompt")
+    expect(c.messages).toHaveLength(1)
+    expect(c.messages[0].compact).toBeDefined()
+  })
+
+  test("the summary is kept with the conversation, and the conversation is not named after it", async () => {
+    keep()
+    const c = new ChatController()
+    await twoExchanges(c)
+    mockFetch([said(SUMMARY)], [])
+    await c.compact(ctx)
+    const again = new ChatController()
+    expect(again.messages[0].compact).toMatchObject({ auto: false })
+    expect(again.index.items[0].title).toBe("first prompt")
+  })
+})

@@ -1,12 +1,19 @@
 // "/" at the start of a message opens the skills in use, to be picked by name (like Claude Code's slash commands). A message that starts
 // with the name of a skill in use asks the server to load that skill (`strata_skill`); the server checks the name again.
 import type { SkillItem } from "./importer"
+import { t } from "./i18n"
 
 export interface Command {
   name: string; description: string
   from: string                   // the app it comes from (Claude Code, Codex CLI, ...)
   plugin: string | null          // the plugin of that app, for a skill a plugin brings
+  builtin?: boolean              // a command of Strata itself (/compact), not a skill
 }
+
+/** The commands Strata has of its own, listed with the skills when "/" is typed. A skill of the same name does not hide them. */
+export const builtinCommands = (): Command[] => [
+  { name: "compact", description: t("Summarise the conversation so far to free up context. Add after it what the summary should focus on."), from: "Strata", plugin: null, builtin: true },
+]
 
 /** The query when the caret is in a slash command at the very start of the message (`/pd|`), else null: a path, a URL, a `/` further in
  *  or a space after the name (the arguments are being typed) is not one. Only what is before the caret counts. */

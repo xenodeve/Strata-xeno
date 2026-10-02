@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type DragEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, Menu01Icon } from "@hugeicons/core-free-icons"
 import { apiHeaders, getAgent, getHealth, getImport, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
-import { chat, exportMarkdown, useChatVersion, type Attachment, type Message } from "../../lib/chat"
+import { chat, exportMarkdown, isPrompt, useChatVersion, type Attachment, type Message } from "../../lib/chat"
 import { readFiles } from "../../lib/files"
 import { cn } from "../../lib/cn"
 import { toast } from "../../components/toast"
@@ -16,12 +16,13 @@ import { effortChoices, settleEffort } from "../../lib/effort"
 import { noteSend } from "../../lib/sendfx"
 import { Collapse, useMounted } from "../../components/motion"
 import { nextDesign, type OrbDesign } from "../../lib/orbs"
-import { commandsOf, type Command } from "../../lib/slash"
+import { builtinCommands, commandsOf, type Command } from "../../lib/slash"
+import { compactCommand } from "../../lib/compact"
 import { forgetRules, NO_AGENT, rulesOf, type AgentInfo, type AgentMode } from "../../lib/agent"
 import { store } from "../../lib/store"
 import { SkillsContext } from "../../components/SkillTip"
 import { msg, t } from "../../lib/i18n"
-import { MessageView } from "./Messages"
+import { CompactingLine, MessageView } from "./Messages"
 import { SettingsSheet } from "./SettingsSheet"
 
 const NO_MCP: McpInfo = { servers: [], tools: 0 }
@@ -206,14 +207,23 @@ export function Chat({ id }: { id?: string }) {
   }, [drawer])
   const toLatest = () => { pinned.current = true; setAway(false); scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" }) }
 
+  const commands = [...builtinCommands(), ...skills.filter((c) => !builtinCommands().some((b) => b.name === c.name))]       // what "/" lists: Strata's own, then the skills
   const send = () => {
     if (busy || (!text.trim() && !files.length)) return
-    const t = text, f = files
+    const asked = files.length ? null : compactCommand(text)           // "/compact" (and what to focus on) is not a message: the conversation is summarised
+    if (asked) {
+      setText("")
+      pinned.current = true
+      if (!chat.canCompact()) toast("info", t("Nothing to compact yet"), t("Send a prompt and get its answer first."))
+      else void chat.compact(ctx(), asked.focus)
+      return
+    }
+    const typed = text, f = files
     noteSend(input.current?.getBoundingClientRect())          // where the prompt rises from
     setText(""); setFiles([])
     pinned.current = true
     setAway(false)
-    void chat.send(t, f, { health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folders() })
+    void chat.send(typed, f, { health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folders() })
   }
   const ctx = () => ({ health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folders() })
   const session = chat.index.items.find((i) => i.id === chat.index.active)
@@ -235,7 +245,7 @@ export function Chat({ id }: { id?: string }) {
     setFiles((f) => [...back.attachments, ...f])
     input.current?.focus()
   }
-  const lastPrompt = chat.messages.reduce((at, m, i) => (m.role === "user" ? i : at), -1)
+  const lastPrompt = chat.messages.reduce((at, m, i) => (isPrompt(m) ? i : at), -1)
   const add = async (list: Iterable<File>) => { const a = await readFiles(list, health); if (a.length) setFiles((x) => [...x, ...a]) }
   const onDrop = (e: DragEvent) => {
     setDragging(false)
@@ -265,7 +275,7 @@ export function Chat({ id }: { id?: string }) {
   }
 
   return (
-    <SkillsContext.Provider value={skills}>
+    <SkillsContext.Provider value={commands}>
     <div className="md:flex md:gap-6">
     <div className="max-md:hidden"><Sidebar /></div>
     {drawerMounted && (
@@ -289,9 +299,10 @@ export function Chat({ id }: { id?: string }) {
           </div>
         </Collapse>
         {chat.messages.map((m, i) => (
-          <MessageView key={i} m={m} streaming={busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined}
-            actions={m.role === "user" ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt } : undefined} />
+          <MessageView key={i} m={m} streaming={busy?.msg === m} compacting={chat.compacting && busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined}
+            actions={isPrompt(m) ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt } : undefined} />
         ))}
+        {chat.compacting && !!busy && !chat.messages.includes(busy.msg) && <CompactingLine />}
         {leaving.length > 0 && <Leaving messages={leaving} onGone={() => setLeaving([])} />}
       </div>
 
@@ -312,7 +323,7 @@ export function Chat({ id }: { id?: string }) {
           onStop={() => chat.stop()}
           onNewChat={newChat}
           onSave={download}
-          skills={skills}
+          skills={commands}
           agent={{
             info: agentInfo, on: chat.settings.agent !== false, mode: (chat.settings.agentMode === "plan" || chat.settings.agentMode === "auto" ? chat.settings.agentMode : "ask") as AgentMode,
             folders: project ? project.folders ?? [] : chat.folders(), folderOf: project ? { kind: "project", name: project.name } : { kind: "default" }, rules: rulesOf(store, chatKey).length,

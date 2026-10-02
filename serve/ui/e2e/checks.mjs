@@ -1174,6 +1174,102 @@ export const checks = [
     },
   },
   {
+    // Compacting (issue #96), as Claude Code does: /compact asks the model for a summary that takes the place of the messages; a conversation that nears the end of the
+    // context is summarised by itself before the next prompt is sent. The server's answers are scripted (health with a small context, usage that says how much is used).
+    name: "compact: /compact summarises the conversation, and one that nears the end of the context is summarised before the next prompt",
+    async run({ browser, fast, t, errors }) {
+      const NL = String.fromCharCode(10)
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const reply = (text, usage) => chunk({ choices: [{ delta: { content: text } }] }) + chunk({ choices: [], usage }) + `data: [DONE]${NL}${NL}`
+      const pg = await open(browser, errors)
+      const bodies = []
+      let used = 100
+      await pg.route("**/health", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ model: "m", images: false, max_context: 1000 }) }))
+      await pg.route("**/v1/chat/completions", async (r) => {
+        const b = JSON.parse(r.request().postData() || "{}")
+        bodies.push(b)
+        const asked = String(b.messages.at(-1)?.content ?? "").includes("Primary request and intent")
+        if (asked) await new Promise((res) => setTimeout(res, 700))
+        return r.fulfill({ status: 200, contentType: "text/event-stream", body: asked ? reply("<analysis>n</analysis><summary>1. Primary request: the e2e thing</summary>", { prompt_tokens: 900, completion_tokens: 30 }) : reply("answer " + bodies.length, { prompt_tokens: used, completion_tokens: 20 }) })
+      })
+      await pg.goto(fast.base + "/#/chat")
+      await pg.evaluate(() => localStorage.clear())
+      await pg.reload()
+      const box = pg.locator("textarea[aria-label='Message']")
+      await box.waitFor()
+      await pg.waitForTimeout(700)
+      const prompts = pg.locator(".msg-in.group")
+      const notice = pg.locator("[data-compact]")
+      const send = async (text) => { await box.fill(text); await box.press("Enter"); await pg.waitForTimeout(900) }
+
+      // nothing to compact yet
+      await send("/compact")
+      t.ok("with nothing said yet /compact says there is nothing to compact, and sends nothing", (await notice.count()) === 0 && bodies.length === 0 && (await pg.locator("[role=status], [role=alert]").allInnerTexts()).join(" ").includes("Nothing to compact"), (await pg.locator("[role=status], [role=alert]").allInnerTexts()).join(" | "))
+
+      await send("hello one")
+      t.ok("a prompt and its answer", (await prompts.count()) === 1 && bodies.length === 1)
+
+      await box.fill("/")
+      const list = pg.locator("[role=listbox][aria-label='Skills']")
+      await list.waitFor({ timeout: 5000 })
+      const opt = list.locator("[role=option][data-skill='compact']")
+      t.ok("a / lists /compact, a command of Strata, with what it does", (await opt.count()) === 1 && (await opt.innerText()).includes("Summarise the conversation"), (await list.innerText()).split(NL).join(" | "))
+      await box.fill("/compact focus on the tests")
+      await pg.waitForTimeout(200)
+      await box.press("Enter")
+      await pg.waitForTimeout(250)
+      t.ok("while the model writes the summary the chat says so, and the composer is empty", (await pg.getByText("Compacting the conversation…").count()) >= 1 && (await box.inputValue()) === "")
+      t.ok("and nothing else can be sent meanwhile (Stop is offered)", (await pg.locator("button[aria-label='Stop']").count()) === 1)
+      await pg.waitForTimeout(1200)
+      const last = bodies.at(-1)
+      t.ok("the request is for the summary: the conversation, then the request with what to focus on, and no tools", bodies.length === 2 && String(last.messages.at(-1).content).includes("focus on the tests") && last.messages.length === 3 && !("strata_mcp" in last) && !("strata_agent" in last), JSON.stringify(last.messages.map((m) => m.role)))
+      t.ok("the messages are replaced by a line that says so, with the sizes", (await notice.count()) === 1 && (await prompts.count()) === 0 && (await notice.innerText()).includes("Conversation compacted") && (await notice.innerText()).includes("tokens"), await notice.innerText())
+      t.ok("and what was asked of /compact is not a message of the conversation", !(await pg.locator("body").innerText()).includes("/compact focus"))
+      await notice.getByRole("button").click()
+      await pg.waitForTimeout(600)
+      t.ok("the line opens to the summary the model reads, and what it was asked to focus on", (await notice.innerText()).includes("Primary request: the e2e thing") && (await notice.innerText()).includes("focus on the tests"))
+      await pg.reload()
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(800)
+      t.ok("the summary is kept: after a reload it is still there", (await notice.count()) === 1)
+
+      // the next prompt goes after the summary
+      used = 870
+      await send("hello two")
+      const next = bodies.at(-1)
+      t.ok("the next prompt is sent after the summary, which the model reads as the earlier part", next.messages.length === 2 && String(next.messages[0].content).includes("the e2e thing") && next.messages[1].content === "hello two", JSON.stringify(next.messages.map((m) => m.role)))
+
+      // near the end of the context (870 of 1000): the next prompt is preceded by a summary
+      const before = bodies.length
+      used = 120
+      await send("hello three")
+      await pg.waitForTimeout(900)
+      t.ok("near the end of the context the conversation is summarised before the next prompt, without it", bodies.length === before + 2 && String(bodies.at(-2).messages.at(-1).content).includes("Primary request and intent") && !JSON.stringify(bodies.at(-2).messages).includes("hello three"), String(bodies.length - before))
+      t.ok("the prompt is shown with its answer after the line that says it was compacted by itself", (await notice.count()) === 1 && (await notice.innerText()).includes("automatically") && (await prompts.count()) === 1 && (await prompts.first().innerText()).includes("hello three") && (await pg.locator("body").innerText()).includes("answer "))
+      t.ok("the request that carried the prompt starts with the summary and has the prompt, not the old messages", bodies.at(-1).messages.length === 2 && bodies.at(-1).messages[1].content === "hello three")
+
+      // switched off
+      await pg.click("button[aria-label='Photos, files, new chat, save']")
+      await pg.waitForTimeout(500)
+      await pg.locator(".t-morph-menu [role=option]", { hasText: "Sampling" }).click()
+      await pg.waitForTimeout(600)
+      const sw = pg.getByRole("switch", { name: "Compact the conversation by itself" })
+      t.ok("a switch in the sampling settings says it is on", (await sw.getAttribute("aria-checked")) === "true")
+      await sw.click()
+      await pg.waitForTimeout(300)
+      t.ok("it can be turned off", (await sw.getAttribute("aria-checked")) === "false")
+      await pg.getByRole("button", { name: "Apply", exact: true }).click()
+      await pg.waitForTimeout(500)
+      t.ok("which is kept when the settings are applied", (await pg.evaluate(() => JSON.parse(localStorage.getItem("strata.sampling") || "{}").autoCompact)) === false)
+      used = 950
+      await send("hello four")
+      const n4 = bodies.length
+      await send("hello five")
+      t.ok("with it off a conversation that nears the end is not summarised by itself", bodies.length === n4 + 1 && !String(bodies.at(-1).messages.at(-1).content).includes("Primary request and intent"))
+      await pg.context().close()
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {
@@ -1655,7 +1751,7 @@ export const checks = [
       await plain.waitForTimeout(700)
       await plain.locator("textarea[aria-label='Message']").fill("/")
       await plain.waitForTimeout(250)
-      t.ok("with no skills at all a / opens nothing", (await plain.locator("[role=listbox][aria-label='Skills']").count()) === 0)
+      t.ok("with no skills at all a / lists only Strata's own command, /compact", JSON.stringify(await plain.locator("[role=listbox][aria-label='Skills'] [role=option]").evaluateAll((os) => os.map((o) => o.dataset.skill))) === '["compact"]')
     },
   },
   {

@@ -6,7 +6,7 @@
 // on top. A conversation is added when its first prompt is saved, and one that has been emptied is dropped, so there is never a
 // blank item in the list. A write the browser refuses (its storage is full) is returned as `ok: false`, never swallowed.
 
-export interface StoredMessage { role: string; text: string; time?: number; files?: { name: string }[]; images?: { name: string }[] }
+export interface StoredMessage { role: string; text: string; time?: number; compact?: unknown; files?: { name: string }[]; images?: { name: string }[] }
 export interface SessionMeta { id: string; title: string; time: number; project?: string; named?: boolean }
 /** folders: where the coding tools of the project's chats work (issue #96). The first is the main one (commands run there, relative paths start there); the others are
  *  the project's other folders, such as other git worktrees of the same repository, where files are as free as in the main one. */
@@ -33,7 +33,7 @@ function clean(text: string, max: number): string | null {
 
 /** A conversation's title: its first prompt, or the name of the file or picture it was (empty when there is no prompt). */
 export function titleOf(messages: StoredMessage[]): string {
-  const first = messages.find((m) => m.role === "user")
+  const first = messages.find((m) => m.role === "user" && !m.compact)             // not the summary a compaction left in place of the first prompts
   if (!first) return ""
   return clean(first.text || "", TITLE_MAX) ?? first.files?.[0]?.name ?? first.images?.[0]?.name ?? ""
 }
