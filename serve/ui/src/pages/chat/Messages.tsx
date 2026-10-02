@@ -17,9 +17,10 @@ import { ReasonStream } from "../../components/reason"
 import { Pop } from "../../components/pop"
 import { Spin } from "../../components/spin"
 import { SkillText } from "../../components/SkillTip"
+import { AgentCall, TodoList } from "./AgentCall"
 import { msg, t } from "../../lib/i18n"
 
-const TOOL_STATE: Record<ToolCall["state"], string> = { writing: msg("Writing"), running: msg("Running"), done: msg("Done"), error: msg("Error"), skipped: msg("Not run") }
+const TOOL_STATE: Record<ToolCall["state"], string> = { writing: msg("Writing"), asking: msg("Waiting for you"), running: msg("Running"), done: msg("Done"), error: msg("Error"), skipped: msg("Not run") }
 
 function Prose({ text }: { text: string }) {
   // The answer is escaped first and formatted by lib/markdown; copy buttons inside code blocks are one delegated click.
@@ -78,7 +79,7 @@ function Answer({ m }: { m: Message }) {
     const at = Math.min(Math.max(tc.at || 0, pos), m.text.length)
     if (at > pos) parts.push(<Prose key={`p${k}`} text={m.text.slice(pos, at)} />)
     pos = at
-    parts.push(<Tool key={tc.id} call={tc} />)
+    parts.push(tc.server === "agent" ? <AgentCall key={tc.id} call={tc} /> : <Tool key={tc.id} call={tc} />)         // the coding tools show as what they are
   })
   parts.push(<Prose key="rest" text={m.text.slice(pos)} />)
   return <>{parts}</>
@@ -218,7 +219,10 @@ export function MessageView({ m, streaming, show, prefill, actions, serverPhase 
           ? <StatusLabel design="listening" className="text-[13px] text-ink-2">{t("Reading the prompt…")}</StatusLabel>
           : <StatusLabel design="breathing" className="text-[13px] text-ink-2">{t("Waiting for the model…")}</StatusLabel>
       ) : (
-        <div className={cn(streaming && "streaming")}><Answer m={m} /></div>
+        <>
+          {!!m.todos?.length && <TodoList todos={m.todos} />}
+          <div className={cn(streaming && "streaming")}><Answer m={m} /></div>
+        </>
       )}
       <div className="mt-1 flex min-h-6 items-center gap-2 text-[12px] text-ink-3">
         <Handover live={phase === "composing" ? <StatusLabel design="composing" className="text-[13px] text-ink-2">{t("Answering…")}</StatusLabel>

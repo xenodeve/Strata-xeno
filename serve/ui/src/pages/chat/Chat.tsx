@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, Menu01Icon } from "@hugeicons/core-free-icons"
-import { apiHeaders, getHealth, getImport, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
+import { apiHeaders, getAgent, getHealth, getImport, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
 import { chat, exportMarkdown, useChatVersion, type Attachment, type Message } from "../../lib/chat"
 import { readFiles } from "../../lib/files"
 import { cn } from "../../lib/cn"
@@ -17,6 +17,8 @@ import { noteSend } from "../../lib/sendfx"
 import { Collapse, useMounted } from "../../components/motion"
 import { nextDesign, type OrbDesign } from "../../lib/orbs"
 import { commandsOf, type Command } from "../../lib/slash"
+import { forgetRules, NO_AGENT, rulesOf, type AgentInfo, type AgentMode } from "../../lib/agent"
+import { store } from "../../lib/store"
 import { SkillsContext } from "../../components/SkillTip"
 import { msg, t } from "../../lib/i18n"
 import { MessageView } from "./Messages"
@@ -78,6 +80,12 @@ export function Chat({ id }: { id?: string }) {
   const [mcp, setMcp] = useState<McpInfo>(NO_MCP)
   const [projection, setProjection] = useState(false)
   const [skills, setSkills] = useState<Command[]>([])            // the skills in use, for "/" in the prompt
+  const [agentInfo, setAgentInfo] = useState<AgentInfo>(NO_AGENT)  // the coding tools: does the server have them, and may this page use them
+  useEffect(() => {
+    let gone = false
+    void getAgent().then((v) => { if (!gone && v) setAgentInfo(v) })
+    return () => { gone = true }
+  }, [])
   useEffect(() => {
     let gone = false
     void getImport().then((v) => { if (!gone && v?.available && v.skills?.settings.enabled) setSkills(commandsOf(v.skills.items, Object.fromEntries((v.harnesses ?? []).map((h) => [h.id, h.label])))) })
@@ -205,9 +213,12 @@ export function Chat({ id }: { id?: string }) {
     setText(""); setFiles([])
     pinned.current = true
     setAway(false)
-    void chat.send(t, f, { health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name) })
+    void chat.send(t, f, { health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folder() })
   }
-  const ctx = () => ({ health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name) })
+  const ctx = () => ({ health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folder() })
+  const session = chat.index.items.find((i) => i.id === chat.index.active)
+  const project = chat.index.projects.find((p) => p.id === session?.project)       // the open conversation's project: its folder is where the coding tools work
+  const chatKey = chat.index.active ?? "new"
   const editPrompt = (i: number, t: string) => { pinned.current = true; setAway(false); void chat.edit(i, t, ctx()) }
   const [leaving, setLeaving] = useState<Message[]>([])        // what an undo took away: it closes up (height and fade) before it is gone
   const [asking, setAsking] = useState(false)               // taking back the first prompt deletes the conversation: asked first
@@ -302,6 +313,14 @@ export function Chat({ id }: { id?: string }) {
           onNewChat={newChat}
           onSave={download}
           skills={skills}
+          agent={{
+            info: agentInfo, on: chat.settings.agent !== false, mode: (chat.settings.agentMode === "plan" || chat.settings.agentMode === "auto" ? chat.settings.agentMode : "ask") as AgentMode,
+            folder: chat.folder(), folderOf: project ? { kind: "project", name: project.name } : { kind: "default" }, rules: rulesOf(store, chatKey).length,
+            onToggle: () => chat.setSettings({ ...chat.settings, agent: chat.settings.agent === false }),
+            onMode: (m) => chat.setSettings({ ...chat.settings, agentMode: m }),
+            onFolder: (path) => (project ? chat.setProjectFolder(project.id, path) : chat.setSettings({ ...chat.settings, agentFolder: path.trim() })),
+            onForget: () => { forgetRules(store, chatKey); chat.notify() },
+          }}
           mcp={{
             servers: mcp.servers, tools: mcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings", "mcp-servers"),
             onToggleAll: () => chat.setSettings({ ...chat.settings, mcp: chat.settings.mcp === false }),

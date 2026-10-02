@@ -6,6 +6,10 @@ let ChatController: typeof import("./chat").ChatController
 let metaText: typeof import("./chat").metaText
 let mcpRequest: typeof import("./chat").mcpRequest
 let DEFAULTS: typeof import("./chat").DEFAULTS
+let store: typeof import("./store").store
+let addRule: typeof import("./agent").addRule
+let rulesOf: typeof import("./agent").rulesOf
+type Message = import("./chat").Message
 
 beforeAll(async () => {
   const g = globalThis as Record<string, unknown>
@@ -14,6 +18,8 @@ beforeAll(async () => {
   g.cancelAnimationFrame = clearTimeout
   g.location = { pathname: "/next/", search: "" }
   ;({ ChatController, metaText, mcpRequest, DEFAULTS } = await import("./chat"))
+  ;({ store } = await import("./store"))
+  ;({ addRule, rulesOf } = await import("./agent"))
 })
 
 const enc = new TextEncoder()
@@ -302,6 +308,198 @@ describe("a message that starts with a skill's name", () => {
     await c.send("/tdd write the tests", [], { ...ctx, skills: ["tdd"] })
     await c.send("and then?", [], { ...ctx, skills: ["tdd"] })
     expect([seen[0].strata_skill, "strata_skill" in seen[1]]).toEqual(["tdd", false])
+  })
+})
+
+// The coding tools (issue #96): the request names the folder, mode and chat; the stream brings cards, verdicts and todo lists; the page answers.
+describe("the coding tools in the chat", () => {
+  const ON = { available: true, allowed: true, shell: "bash", tools: ["Read", "Write", "Bash"] }
+  const call = (id = "c1", name = "Bash", args: unknown = { command: "npm test" }) => [
+    { strata_mcp: { event: "start", id, name } },
+    { strata_mcp: { event: "call", id, name, server: "agent", tool: name, arguments: args, round: 1 } },
+  ]
+  const finish = [delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]\n\n"]
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    return data
+  }
+
+  test("the request names the folder, the mode and the chat, and no more than that", async () => {
+    keep()
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(...finish)], seen)
+    const c = new ChatController()
+    c.setSettings({ ...c.settings, agentMode: "plan" })
+    await c.send("hi", [], { ...ctx, agent: ON, folder: "C:/work/app" })
+    expect(seen[0].strata_agent).toEqual({ cwd: "C:/work/app", mode: "plan", session: c.index.active, allow: [] })
+  })
+
+  test("without the tools (switched off, or the server has none) the request has no strata_agent", async () => {
+    keep()
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(...finish), sse(...finish)], seen)
+    const c = new ChatController()
+    await c.send("hi", [], ctx)
+    c.setSettings({ ...c.settings, agent: false })
+    await c.send("again", [], { ...ctx, agent: ON })
+    expect(seen.map((b) => "strata_agent" in b)).toEqual([false, false])
+  })
+
+  test("what the user allowed for this chat goes with the next request", async () => {
+    keep()
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(...finish), sse(...finish)], seen)
+    const c = new ChatController()
+    await c.send("one", [], { ...ctx, agent: ON })
+    addRule(store, c.index.active!, "Bash(git status:*)")
+    await c.send("two", [], { ...ctx, agent: ON })
+    expect((seen[1].strata_agent as { allow: string[] }).allow).toEqual(["Bash(git status:*)"])
+    expect((seen[0].strata_agent as { allow: string[] }).allow).toEqual([])
+  })
+
+  test("a question is a card on its call; the call waits until it is answered and then finishes", async () => {
+    keep()
+    mockFetch([sse(...call(), { strata_mcp: { event: "permission", id: "q1", call_id: "c1", tool: "Bash", arguments: { command: "npm test" }, why: "a command asks every time", danger: false, rule: "Bash(npm test:*)" } },
+      { strata_mcp: { event: "result", id: "c1", ok: true, text: "passed", chars: 6, truncated: false, ms: 900 } }, ...finish)], [])
+    const c = new ChatController()
+    await c.send("test it", [], { ...ctx, agent: ON })
+    const t = c.messages[1].tools![0]
+    expect(t.ask).toMatchObject({ id: "q1", why: "a command asks every time", danger: false, rule: "Bash(npm test:*)" })
+    expect(t.server).toBe("agent")
+    expect(t.state).toBe("done")                                              // the result came after
+  })
+
+  test("while it waits the call says so", async () => {
+    keep()
+    let release!: () => void
+    const first = sse(...call(), { strata_mcp: { event: "permission", id: "q1", call_id: "c1", tool: "Bash", arguments: {}, why: "w", danger: true, rule: null } })
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(new ReadableStream<Uint8Array>({
+      start(ctl) { ctl.enqueue(enc.encode(first)); release = () => { ctl.enqueue(enc.encode(sse(...finish))); ctl.close() } },
+    }), { status: 200 })
+    const c = new ChatController()
+    const p = c.send("go", [], { ...ctx, agent: ON })
+    await new Promise((r) => setTimeout(r, 30))
+    const t = c.messages[1].tools![0]
+    expect(t.state).toBe("asking")
+    expect(t.ask?.danger).toBe(true)
+    release()
+    await p
+  })
+
+  test("answering sends the id and the choice; Allow for this chat also remembers the rule", async () => {
+    keep()
+    const c = new ChatController()
+    c.messages = [{ role: "user", text: "x", time: 1 }, { role: "assistant", text: "", time: 2, tools: [{ id: "c1", name: "Bash", at: 0, rat: 0, state: "asking", server: "agent", ask: { id: "q1", tool: "Bash", why: "w", danger: false, rule: "Bash(npm test:*)" } }] }]
+    c.index = { ...c.index, active: "chat9" }
+    const posts: { url: string; body: unknown }[] = []
+    ;(globalThis as Record<string, unknown>).fetch = async (u: string, init: { body: string }) => { posts.push({ url: u, body: JSON.parse(init.body) }); return new Response('{"ok":true}', { status: 200 }) }
+    expect(await c.answer("c1", "allow_chat")).toBe(true)
+    expect(posts).toHaveLength(1)
+    expect(posts[0].url).toContain("agent/permission")
+    expect(posts[0].body).toEqual({ id: "q1", decision: "allow_chat" })
+    expect(c.messages[1].tools![0].ask?.answer).toBe("allow_chat")
+    expect(c.messages[1].tools![0].state).toBe("running")
+    expect(rulesOf(store, "chat9")).toEqual(["Bash(npm test:*)"])
+  })
+
+  test("Deny and Allow once remember nothing", async () => {
+    keep()
+    const c = new ChatController()
+    const mk = (id: string): Message => ({ role: "assistant", text: "", time: 2, tools: [{ id, name: "Bash", at: 0, rat: 0, state: "asking", ask: { id: "q" + id, tool: "Bash", why: "w", danger: false, rule: "Bash(ls:*)" } }] })
+    c.messages = [{ role: "user", text: "x", time: 1 }, mk("a"), mk("b")]
+    c.index = { ...c.index, active: "chat9" }
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response('{"ok":true}', { status: 200 })
+    await c.answer("a", "allow")
+    await c.answer("b", "deny")
+    expect(rulesOf(store, "chat9")).toEqual([])
+    expect(c.messages[2].tools![0].state).toBe("running")                      // the server says how it ended: with the result
+  })
+
+  test("an answer the server did not take leaves the card to answer again, and says why", async () => {
+    keep()
+    const c = new ChatController()
+    const errors: string[] = []
+    c.onError = (title, text) => errors.push(`${title}: ${text}`)
+    c.messages = [{ role: "user", text: "x", time: 1 }, { role: "assistant", text: "", time: 2, tools: [{ id: "c1", name: "Bash", at: 0, rat: 0, state: "asking", ask: { id: "q1", tool: "Bash", why: "w", danger: false, rule: null } }] }]
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(JSON.stringify({ error: { message: "no question with that id is waiting" } }), { status: 404 })
+    expect(await c.answer("c1", "allow")).toBe(false)
+    expect(c.messages[1].tools![0].ask?.answer).toBeUndefined()
+    expect(c.messages[1].tools![0].state).toBe("asking")
+    expect(errors[0]).toContain("no question with that id is waiting")
+  })
+
+  test("answering a call that is not there does nothing", async () => {
+    keep()
+    const c = new ChatController()
+    ;(globalThis as Record<string, unknown>).fetch = async () => { throw new Error("must not be called") }
+    expect(await c.answer("nope", "allow")).toBe(false)
+  })
+
+  test("the auto-mode check is shown on the call: what it found", async () => {
+    keep()
+    mockFetch([sse(...call("c1", "Read", { file_path: "../x" }), { strata_mcp: { event: "judging", id: "q1", call_id: "c1", tool: "Read" } },
+      { strata_mcp: { event: "judged", id: "q1", call_id: "c1", verdict: "allow", severity: 1 } },
+      { strata_mcp: { event: "result", id: "c1", ok: true, text: "x", chars: 1, truncated: false, ms: 5 } }, ...finish)], [])
+    const c = new ChatController()
+    await c.send("go", [], { ...ctx, agent: ON })
+    expect(c.messages[1].tools![0].judge).toEqual({ verdict: "allow", severity: 1 })
+    expect(c.messages[1].tools![0].ask).toBeUndefined()
+  })
+
+  test("a todo list from the stream is the answer's list, and a later one replaces it", async () => {
+    keep()
+    const t1 = [{ content: "a", status: "in_progress", activeForm: "Doing a" }]
+    const t2 = [{ content: "a", status: "completed", activeForm: "Doing a" }, { content: "b", status: "in_progress", activeForm: "Doing b" }]
+    mockFetch([sse({ strata_mcp: { event: "todos", call_id: "c1", todos: t1 } }, { strata_mcp: { event: "todos", call_id: "c2", todos: t2 } }, ...finish)], [])
+    const c = new ChatController()
+    await c.send("plan it", [], { ...ctx, agent: ON })
+    expect(c.messages[1].todos).toEqual(t2)
+  })
+
+  test("approving a plan switches the page back to the default mode", async () => {
+    keep()
+    mockFetch([sse({ strata_mcp: { event: "mode", call_id: "c1", mode: "ask" } }, ...finish)], [])
+    const c = new ChatController()
+    c.setSettings({ ...c.settings, agentMode: "plan" })
+    await c.send("go", [], { ...ctx, agent: ON })
+    expect(c.settings.agentMode).toBe("ask")
+  })
+
+  test("the folder is the project's, else the default one for chats that are in no project", () => {
+    keep()
+    const c = new ChatController()
+    c.setSettings({ ...c.settings, agentFolder: "C:/default" })
+    expect(c.folder()).toBe("C:/default")                                      // a chat that is not saved yet is in no project
+    c.index = { active: "s1", items: [{ id: "s1", title: "t", time: 1 }], projects: [{ id: "p1", name: "Work" }] }
+    expect(c.folder()).toBe("C:/default")
+    c.move("s1", "p1")
+    expect(c.folder()).toBe("C:/default")                                      // the project has no folder yet
+    c.setProjectFolder("p1", " C:/work/app ")
+    expect(c.folder()).toBe("C:/work/app")
+    c.setProjectFolder("p1", "")
+    expect(c.folder()).toBe("C:/default")
+    c.setSettings({ ...c.settings, agentFolder: "  " })
+    expect(c.folder()).toBeNull()
+  })
+
+  test("a project's folder is kept with the conversations", () => {
+    keep()
+    const c = new ChatController()
+    c.index = { active: null, items: [], projects: [{ id: "p1", name: "Work" }] }
+    c.setProjectFolder("p1", "C:/work/app")
+    expect(new ChatController().index.projects[0].folder).toBe("C:/work/app")
+  })
+
+  test("an event this page does not know is ignored", async () => {
+    keep()
+    mockFetch([sse(...call(), { strata_mcp: { event: "something-new", id: "zz", call_id: "c1" } }, { strata_mcp: { event: "result", id: "c1", ok: true, text: "x", chars: 1, truncated: false, ms: 1 } }, ...finish)], [])
+    const c = new ChatController()
+    await c.send("go", [], { ...ctx, agent: ON })
+    expect(c.messages[1].tools).toHaveLength(1)
+    expect(c.messages[1].tools![0].state).toBe("done")
   })
 })
 

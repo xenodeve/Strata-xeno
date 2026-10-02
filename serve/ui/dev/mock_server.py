@@ -5,6 +5,9 @@
 
 What is fake: the answer text, and the engine's per-request STATS and prefill chunks (fixtures below, labelled as such).
 STRATA_MOCK_MCP_CONFIG=file.json: the MCP servers of that run config are started and can be set up in Settings (issue #79).
+STRATA_MOCK_AGENT=1: the chat's coding tools (issue #96) are on, and a message with "agent demo" in it makes the fake model use them step by step
+(a todo list, a search, a read, a command that only reads, a file outside the folder, a command that asks): the server, the permission cards and the tools
+are the real ones; only the model is a script.
 STRATA_HOME=folder: the "other apps" whose skills and MCP servers Settings > Import shows are read from there, never from the real home (issue #94).
 What is real: the hardware (GPUs, CPU, RAM, disks of THIS PC), the routes, the history on disk (a temp dir), the pages.
 The daily server (:8091) is never touched; this one is its own process and port.
@@ -20,10 +23,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-from serve import gguf_info, harness, mcp_admin  # noqa: E402
+from serve import agent, gguf_info, harness, mcp_admin, shell  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.history import HistoryStore  # noqa: E402
-from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
+from serve.server import IM_END, ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 THINKING = ("The user asks something open, so first I should work out what they actually want to know.\n\n"
             "There are two readings of the question. The narrow one has a short answer; the wide one needs the background first. I will check which one the wording supports, and note what each would cost to answer.\n\n"
@@ -76,9 +79,38 @@ class FakeEngine(MockEngine):
                          "prefill_points": [(2005, 1000.0), (4005, 3000.0), (4805, 3400.0)], "stats": dict(FAKE_STATS)}
 
 
+def _call(function: str, **params) -> str:
+    body = "".join(f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in params.items())
+    return f"</think>\n\nLet me do the next step.\n\n<tool_call>\n<function={function}>\n{body}</function>\n</tool_call>"
+
+
+class DemoAgentEngine(FakeEngine):
+    """The fake model, but a message with "agent demo" in it is answered with a script of tool calls (one step per tool result so far)."""
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        text = bytes(t for t in ids if t < 256).decode("utf-8", "replace")
+        at = text.rfind("agent demo")
+        if at >= 0:
+            step = text.count("<tool_response>", at)
+            outside = os.path.join(tempfile.gettempdir(), "strata-agent-demo.txt").replace("\\", "/")
+            if step == 0 and os.path.exists(outside):                  # a demo that is run again starts from the same place (a file that is there must be read before it is written)
+                os.remove(outside)
+            todos = json.dumps([{"content": "Look around", "status": "in_progress", "activeForm": "Looking around"}, {"content": "Make two files", "status": "pending", "activeForm": "Making two files"}])
+            script = [_call("TodoWrite", todos=todos), _call("Glob", pattern="*"), _call("Read", file_path="README.md", limit=5), _call("Bash", command="git status --short", description="What changed"),
+                      _call("Write", file_path=outside, content="written by the scripted model\n"), _call("Bash", command="touch strata-agent-demo.txt", description="Make a file here")]
+            reply = script[step] if step < len(script) else "</think>\n\nThat was the demo of the coding tools: a list of steps, a search, a read, a command that only reads, a file outside the folder and a command that asked. Nothing else was changed."
+            end = self.tok.encode(IM_END, parse_special=True)
+            self.script = self.tok.encode(reply, parse_special=True) + end
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
 def main(port: int = 8099, model_files: list[str] | None = None):
     tok = ByteTokenizer()
-    svc = Service(FakeEngine(tok, ANSWER, max_context=4096), tok, ChatTemplate(ROOT / "serve" / "chat_template.jinja"))
+    demo = bool(os.environ.get("STRATA_MOCK_AGENT"))
+    svc = Service((DemoAgentEngine if demo else FakeEngine)(tok, ANSWER, max_context=400_000 if demo else 4096), tok, ChatTemplate(ROOT / "serve" / "chat_template.jinja"))
+    if demo:                                                         # the coding tools: the real ones, with a fake model
+        svc.agent = agent.AgentServer()
+        shell.install(svc.agent, shell.find_shell())
     svc.gpu_indices = [0, 1]                                         # as monitor_gpus() lists them on the real server
     svc.engine.info = {"cpu_isa": "AVX-VNNI", "pool_workers": 13, "kv": "int8", "engine": "0.1.30 (fixture)", "mtp_max": 4, "lookup": 3, "spec": 6,    # fixture: what a real engine's INFO lines carry
                        "gpu_arch": "sm120@NVIDIA_GeForce_RTX_5060_Ti,sm89@NVIDIA_GeForce_RTX_4070_SUPER"}
@@ -90,7 +122,7 @@ def main(port: int = 8099, model_files: list[str] | None = None):
         svc.importer.rescan(json.loads(Path(config).read_text(encoding="utf-8")) if config else {})
     if config:                                       # a run config file (JSON with "mcp_servers"): the MCP servers can be set up in Settings
         svc.config_path = config
-    if config or svc.importer is not None:
+    if config or svc.importer is not None or svc.agent is not None:
         mcp_admin.reload_hub(svc)
     httpd = serve(svc, port=port)
     print(f"mock server on http://127.0.0.1:{port}/  (new app at /next/, classic at /classic/)", flush=True)

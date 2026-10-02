@@ -229,7 +229,7 @@ export const checks = [
       for (let i = 0; i < 9; i++) { await pg.waitForTimeout(40); grow.push(await box()) }
       t.ok("it grows into the menu through in-between sizes", new Set(grow.map((g) => g.h)).size > 3 && grow[grow.length - 1].h > b0.h + 80 && grow[grow.length - 1].w > b0.w + 150, grow.map((g) => `${g.w}x${g.h}`).join(" "))
       await pg.waitForTimeout(400)
-      t.ok("the four actions are there to use", (await pg.locator(".t-morph-menu [role=option]").count()) === 4 && (await pg.locator(".t-morph-menu [role=option]").first().isVisible()))
+      t.ok("the five actions are there to use", (await pg.locator(".t-morph-menu [role=option]").count()) === 5 && (await pg.locator(".t-morph-menu [role=option]").first().isVisible()))
       await pg.keyboard.press("Escape")
       const shrink = []
       for (let i = 0; i < 9; i++) { await pg.waitForTimeout(40); shrink.push(await box()) }
@@ -1055,6 +1055,186 @@ export const checks = [
       await th.waitForTimeout(400)
       t.ok("in Thai the question is Thai", (await th.locator("[role=alertdialog]").innerText()).includes("ลบการสนทนานี้ไหม"))
       await th.context().close()
+    },
+  },
+  {
+    // The chat's coding tools (issue #96), against pages whose server answers are scripted (GET /agent, the chat stream, POST /agent/permission):
+    // the + menu's row and panel (switch, mode, folder), the request, the cards (Allow, Allow for this chat, Deny, a dangerous one), the diff, the
+    // steps, auto mode's verdict, and a server that has none or does not allow this page.
+    name: "agent: the coding tools: a panel, cards that ask, the call shown as what it is",
+    async run({ browser, fast, t, errors }) {
+      const NL = String.fromCharCode(10)
+      const info = { available: true, allowed: true, shell: "bash", tools: ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "TodoWrite"] }
+      const chunk = (extra) => `data: ${JSON.stringify({ choices: [{ delta: {} }], ...extra })}${NL}${NL}`
+      const ev = (e) => chunk({ strata_mcp: e })
+      const calls = (...list) => list.map(([id, name, args]) => ev({ event: "start", id, name }) + ev({ event: "call", id, name, server: "agent", tool: name, arguments: args, round: 1 })).join("")
+      const tail = `data: ${JSON.stringify({ choices: [{ delta: { content: "ok" } }] })}${NL}${NL}` + `data: ${JSON.stringify({ choices: [], usage: { completion_tokens: 1 } })}${NL}${NL}` + `data: [DONE]${NL}${NL}`
+      const script = (body) => ({ status: 200, contentType: "text/event-stream", body })
+      const setup = async (pg, { agent = info, stream = [] } = {}) => {
+        const sent = [], answers = []
+        await pg.route("**/agent", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(agent) }))
+        await pg.route("**/agent/permission", (r) => { answers.push(JSON.parse(r.request().postData() || "{}")); return r.fulfill({ status: 200, contentType: "application/json", body: "{\"ok\":true}" }) })
+        let n = 0
+        await pg.route("**/v1/chat/completions", (r) => { sent.push(JSON.parse(r.request().postData() || "{}")); return r.fulfill(script(stream[Math.min(n++, stream.length - 1)] ?? tail)) })
+        return { sent, answers }
+      }
+      const menu = async (pg) => { await pg.click("button[aria-label='Photos, files, new chat, save']"); await pg.waitForTimeout(500) }
+      const row = (pg) => pg.locator(".t-morph-menu [role=option]", { hasText: "Coding tools" })
+      const typeAndSend = async (pg, text) => { await pg.fill("textarea[aria-label='Message']", text); await pg.keyboard.press("Enter"); await pg.waitForTimeout(900) }
+
+      // ---- the row and the panel
+      const pg = await open(browser, errors)
+      const { sent, answers } = await setup(pg, {
+        stream: [
+          calls(["c1", "Bash", { command: "npm test" }]) + ev({ event: "permission", id: "q1", call_id: "c1", tool: "Bash", arguments: { command: "npm test" }, why: "a command asks every time", danger: false, rule: "Bash(npm test:*)" }) + tail,
+          calls(["c2", "Bash", { command: "rm -rf ~" }]) + ev({ event: "permission", id: "q2", call_id: "c2", tool: "Bash", arguments: { command: "rm -rf ~" }, why: "this command can do harm that is hard to undo", danger: true, rule: null }) + tail,
+          calls(["c3", "Edit", { file_path: "src/a.py", old_string: "keep\nold\nend", new_string: "keep\nnew\nend" }]) + ev({ event: "judging", id: "q3", call_id: "c3", tool: "Edit" }) + ev({ event: "judged", id: "q3", call_id: "c3", verdict: "allow", severity: 1 })
+            + ev({ event: "result", id: "c3", ok: true, text: "The file src/a.py has been updated successfully", chars: 46, truncated: false, ms: 12 })
+            + ev({ event: "todos", call_id: "c4", todos: [{ content: "Write the test", status: "completed", activeForm: "Writing the test" }, { content: "Fix the bug", status: "in_progress", activeForm: "Fixing the bug" }, { content: "Run everything", status: "pending", activeForm: "Running everything" }] }) + tail,
+        ],
+      })
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea")
+      await pg.waitForTimeout(1200)
+      await menu(pg)
+      const r = row(pg)
+      const rt = async () => (await r.innerText()).split(NL).join(" | ")
+      t.ok("the + menu has a Coding tools row that says what mode it is in and that no folder is set", (await r.count()) === 1 && (await rt()).includes("Ask") && (await rt()).includes("No folder yet"), await rt())
+      await r.click()
+      await pg.waitForTimeout(500)
+      const panel = pg.locator("[role=dialog][aria-label='Coding tools']")
+      t.ok("clicking it opens the panel with a switch, the modes and the folder", (await panel.count()) === 1 && (await panel.locator("[role=switch][aria-label='Coding tools']").getAttribute("aria-checked")) === "true" && (await panel.locator("[role=radio]").allInnerTexts()).join(",") === "Ask,Plan,Auto")
+      await panel.locator("[role=radio]", { hasText: "Plan" }).click()
+      await pg.waitForTimeout(200)
+      t.ok("choosing a mode says what it means", (await panel.locator("[data-agent-mode-text]").innerText()).includes("Nothing is changed"))
+      await panel.locator("[role=radio]", { hasText: "Auto" }).click()
+      await pg.waitForTimeout(200)
+      t.ok("auto says a second check decides", (await panel.locator("[data-agent-mode-text]").innerText()).includes("second check"))
+      const saveBtn = panel.getByRole("button", { name: "Save", exact: true })
+      t.ok("Save is off until the folder changes", await saveBtn.isDisabled())
+      await panel.locator("input[aria-label='Folder the tools work in']").fill("C:/work/app")
+      await saveBtn.click()
+      await pg.waitForTimeout(300)
+      const saved = await pg.evaluate(() => JSON.parse(localStorage.getItem("strata.sampling") || "{}"))
+      t.ok("the folder and the mode are kept (this chat is in no project, so it is the default folder)", saved.agentFolder === "C:/work/app" && saved.agentMode === "auto", JSON.stringify([saved.agentFolder, saved.agentMode]))
+      t.ok("and the panel says whose folder it is", (await panel.innerText()).includes("no project"))
+      await panel.locator("[role=radio]", { hasText: "Ask" }).click()
+      await pg.click("textarea[aria-label='Message']")
+
+      // ---- the request, and a card that asks
+      await typeAndSend(pg, "run the tests")
+      t.ok("the request names the folder, the mode and the chat", sent.length === 1 && sent[0].strata_agent?.cwd === "C:/work/app" && sent[0].strata_agent?.mode === "ask" && !!sent[0].strata_agent?.session && JSON.stringify(sent[0].strata_agent?.allow) === "[]", JSON.stringify(sent[0]?.strata_agent))
+      const callBox = pg.locator("[data-agent-call='Bash']").first()
+      const card = callBox.locator("[data-agent-ask]")
+      t.ok("the call shows as Bash with the command, and says it waits for the user", (await callBox.count()) === 1 && (await callBox.innerText()).includes("npm test") && (await callBox.innerText()).includes("Waiting for you"))
+      t.ok("its card asks, shows the command and why, and has Allow, Allow for this chat and Deny", (await card.count()) === 1 && (await card.innerText()).includes("Run this command?") && (await card.innerText()).includes("A command asks every time.") && (await card.getByRole("button", { name: "Allow", exact: true }).count()) === 1 && (await card.getByRole("button", { name: "Allow for this chat" }).count()) === 1 && (await card.getByRole("button", { name: "Deny", exact: true }).count()) === 1)
+      t.ok("the rule it would remember is shown", (await card.innerText()).includes("Bash(npm test:*)"))
+      await card.getByRole("button", { name: "Allow for this chat" }).click()
+      await pg.waitForTimeout(500)
+      t.ok("the answer goes to the server with the id of the question", answers.length === 1 && answers[0].id === "q1" && answers[0].decision === "allow_chat", JSON.stringify(answers))
+      t.ok("the card is gone and says what the user did", (await card.count()) === 0 && (await callBox.innerText()).includes("You allowed it for this chat."))
+      await typeAndSend(pg, "again")
+      t.ok("the rule goes with the next request of this chat", JSON.stringify(sent[1].strata_agent?.allow) === JSON.stringify(["Bash(npm test:*)"]), JSON.stringify(sent[1]?.strata_agent?.allow))
+
+      // ---- a dangerous command
+      const danger = pg.locator("[data-agent-call='Bash']").nth(1).locator("[data-agent-ask]")
+      t.ok("a dangerous command says so, and cannot be allowed for the whole chat", (await danger.count()) === 1 && (await danger.innerText()).includes("hard to undo") && (await danger.getByRole("button", { name: "Allow for this chat" }).count()) === 0)
+      await danger.getByRole("button", { name: "Deny", exact: true }).click()
+      await pg.waitForTimeout(400)
+      t.ok("Deny is sent as deny", answers.length === 2 && answers[1].id === "q2" && answers[1].decision === "deny")
+
+      // ---- an edit as a diff, auto mode's verdict, the steps
+      await typeAndSend(pg, "fix it")
+      const edit = pg.locator("[data-agent-call='Edit']")
+      t.ok("an Edit shows its file and what auto mode found", (await edit.count()) === 1 && (await edit.innerText()).includes("src/a.py") && (await edit.locator("[data-agent-judge='allow']").innerText()).includes("safe (1/5)"))
+      await edit.locator("button[aria-expanded]").first().click()
+      await pg.waitForTimeout(500)
+      const rows = await edit.locator("[data-diff]").evaluateAll((els) => els.map((e) => [e.dataset.diff, e.textContent.trim()]))
+      t.ok("opened, an Edit is a diff: what stays, what goes, what comes", JSON.stringify(rows) === JSON.stringify([["same", "keep"], ["del", "- old"], ["add", "+ new"], ["same", "end"]]), JSON.stringify(rows))
+      const todos = pg.locator("[data-todos]")
+      t.ok("the steps are a list: done, the one in progress by its -ing form, and what is left", (await todos.count()) === 1 && (await todos.innerText()).includes("1 of 3 steps done") && (await todos.locator("[data-todo='in_progress']").innerText()).includes("Fixing the bug") && (await todos.locator("[data-todo='completed']").count()) === 1 && (await todos.locator("[data-todo='pending']").count()) === 1)
+
+      // ---- forgetting the rules, and the switch
+      await menu(pg)
+      await row(pg).click()
+      await pg.waitForTimeout(400)
+      t.ok("the panel counts the rules of this chat and can forget them", (await panel.innerText()).includes("1 rules allowed for this chat"))
+      await panel.getByRole("button", { name: "Forget them" }).click()
+      await pg.waitForTimeout(300)
+      t.ok("forgotten", !(await panel.innerText()).includes("rules allowed"))
+      await panel.locator("[role=switch][aria-label='Coding tools']").click()
+      await pg.click("textarea[aria-label='Message']")
+      await typeAndSend(pg, "plain question")
+      t.ok("switched off, the request has no strata_agent", !("strata_agent" in sent.at(-1)))
+
+      // ---- a server that does not have them, and one that does not allow this page
+      for (const [label, agent, text] of [["has none", { available: false, allowed: false, shell: null, tools: [] }, "Not on this server"], ["does not allow this page", { available: true, allowed: false, shell: "bash", tools: ["Read"], reason: "from this PC only" }, "Only from the PC that runs Strata"]]) {
+        const p2 = await open(browser, errors)
+        const s2 = await setup(p2, { agent })
+        await p2.goto(fast.base + "/#/chat")
+        await p2.waitForSelector("textarea")
+        await p2.waitForTimeout(1200)
+        await menu(p2)
+        t.ok(`a server that ${label}: the row says so`, (await row(p2).innerText()).includes(text), (await row(p2).innerText()).split(NL).join(" | "))
+        await p2.keyboard.press("Escape")
+        await typeAndSend(p2, "hi")
+        t.ok(`and the request has no strata_agent (${label})`, s2.sent.length === 1 && !("strata_agent" in s2.sent[0]))
+      }
+
+      // ---- Thai
+      const th = await open(browser, errors, { lang: "th" })
+      await setup(th)
+      await th.goto(fast.base + "/#/chat")
+      await th.waitForSelector("textarea")
+      await th.waitForTimeout(1200)
+      await th.click(".t-morph-plus")
+      await th.waitForTimeout(500)
+      t.ok("in Thai the row has a Thai name", (await th.locator(".t-morph-menu [role=option]", { hasText: "เครื่องมือเขียนโค้ด" }).count()) === 1)
+    },
+  },
+  {
+    // The whole path with a scripted model (the mock server with STRATA_MOCK_AGENT=1): the real server, the real tools and the real permission cards. A
+    // message with "agent demo" makes the model call TodoWrite, Glob, Read, a read-only Bash, a Write outside the folder and a Bash that asks.
+    name: "agentdemo: the chat uses the real coding tools: free steps run, a file outside the folder and a command ask first",
+    async run({ browser, agentDemo, t, errors }) {
+      const fs = await import("node:fs")
+      const os = await import("node:os")
+      const path = await import("node:path")
+      const outside = path.join(os.tmpdir(), "strata-agent-demo.txt")
+      const inside = path.join(agentDemo.dir, "strata-agent-demo.txt")
+      fs.rmSync(outside, { force: true })
+      fs.rmSync(inside, { force: true })
+      const pg = await open(browser, errors)
+      await pg.addInitScript((dir) => { try { if (!localStorage.getItem("strata.sampling")) localStorage.setItem("strata.sampling", JSON.stringify({ agentFolder: dir })) } catch { /* private window */ } }, agentDemo.dir)
+      await pg.goto(agentDemo.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(1200)
+      await pg.fill("textarea[aria-label='Message']", "agent demo please")
+      await pg.keyboard.press("Enter")
+      const card = pg.locator("[data-agent-ask]")
+      await card.first().waitFor({ timeout: 30000 })
+      const todos = pg.locator("[data-todos]")
+      t.ok("the steps the model wrote are a list, and the free steps ran before anything asked", (await todos.count()) === 1 && (await pg.locator("[data-agent-call='Glob']").count()) === 1 && (await pg.locator("[data-agent-call='Read']").count()) === 1)
+      await pg.locator("[data-agent-call='Read'] button[aria-expanded]").click()
+      await pg.waitForTimeout(500)
+      t.ok("a Read inside the folder ran without asking and shows the file", (await pg.locator("[data-agent-call='Read']").innerText()).includes("demo project"))
+      t.ok("a command that only reads ran without asking too", (await pg.locator("[data-agent-call='Bash']").first().locator("[data-agent-ask]").count()) === 0)
+      t.ok("the first card is the file outside the folder, and says why", (await card.count()) === 1 && (await card.first().innerText()).includes("Write this file?") && (await card.first().innerText()).includes("outside the project folder") && (await card.first().innerText()).includes("strata-agent-demo.txt"))
+      t.ok("nothing has been written yet", !fs.existsSync(outside))
+      await card.first().getByRole("button", { name: "Allow", exact: true }).click()
+      await pg.waitForFunction(() => document.body.innerText.includes("Make a file here"), null, { timeout: 30000 })
+      t.ok("allowed, the file was written", fs.existsSync(outside) && fs.readFileSync(outside, "utf8").includes("scripted model"))
+      const cmd = pg.locator("[data-agent-ask]")
+      await cmd.first().waitFor({ timeout: 30000 })
+      t.ok("then a command that is not a plain read asks, with the command and a rule to remember", (await cmd.first().innerText()).includes("Run this command?") && (await cmd.first().innerText()).includes("touch strata-agent-demo.txt") && (await cmd.first().innerText()).includes("Bash(touch:*)"))
+      t.ok("and the file it would make is not there yet", !fs.existsSync(inside))
+      await cmd.first().getByRole("button", { name: "Allow for this chat" }).click()
+      await pg.waitForFunction(() => document.body.innerText.includes("That was the demo of the coding tools"), null, { timeout: 30000 })
+      t.ok("allowed for this chat, the command ran", fs.existsSync(inside))
+      const rules = await pg.evaluate(() => JSON.parse(localStorage.getItem("strata.agent.rules") || "{}"))
+      t.ok("and the rule is kept for the chat", Object.values(rules.rules || {}).flat().includes("Bash(touch:*)"), JSON.stringify(rules))
+      t.ok("no card is left waiting, and the calls ended as done", (await pg.locator("[data-agent-ask]").count()) === 0 && (await pg.locator("[data-agent-call][data-state='asking']").count()) === 0)
+      fs.rmSync(outside, { force: true })
     },
   },
   {

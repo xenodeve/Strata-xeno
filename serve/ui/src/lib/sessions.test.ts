@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
-  addProject, loadIndex, moveSession, newSession, openSession, removeProject, removeSession, renameProject, renameSession, saveActive, titleOf,
+  addProject, folderOf, loadIndex, moveSession, newSession, openSession, removeProject, removeSession, renameProject, renameSession, saveActive, setProjectFolder, titleOf,
   type Backing, type SessionIndex,
 } from "./sessions"
 
@@ -190,6 +190,32 @@ describe("projects", () => {
     idx = renameProject(idx, "p1", "Home")
     expect(idx.projects[0].name).toBe("Home")
     expect(renameProject(idx, "p1", "")).toBe(idx)
+  })
+  test("a project has a folder on this PC, for the coding tools (issue #96): set, cleaned, cleared, kept through a reload", () => {
+    const b = memory()
+    let idx = addProject({ active: null, items: [], projects: [] }, "Work", "p1")
+    expect(folderOf(idx, "p1")).toBeNull()
+    idx = setProjectFolder(idx, "p1", "  C:/work/app  ")
+    expect(idx.projects[0]).toEqual({ id: "p1", name: "Work", folder: "C:/work/app" })
+    expect(folderOf(idx, "p1")).toBe("C:/work/app")
+    b.set("chats", idx)
+    expect(loadIndex(b, 1).projects[0].folder).toBe("C:/work/app")
+    expect(folderOf(setProjectFolder(idx, "p1", "   "), "p1")).toBeNull()               // blank clears it
+    expect("folder" in setProjectFolder(idx, "p1", "").projects[0]).toBe(false)
+    expect(setProjectFolder(idx, "nope", "x")).toBe(idx)
+    expect(folderOf(idx, undefined)).toBeNull()
+    expect(folderOf(idx, "nope")).toBeNull()
+  })
+  test("a folder that is not text, or is absurdly long, is not kept", () => {
+    const b = memory()
+    b.set("chats", { active: null, items: [], projects: [{ id: "p1", name: "A", folder: 5 }, { id: "p2", name: "B", folder: "x".repeat(2000) }, { id: "p3", name: "C", folder: "C:/ok" }] })
+    expect(loadIndex(b, 1).projects.map((p) => p.folder)).toEqual([undefined, undefined, "C:/ok"])
+    expect(setProjectFolder({ active: null, items: [], projects: [{ id: "p1", name: "A" }] }, "p1", "y".repeat(2000)).projects[0].folder).toBeUndefined()
+  })
+  test("renaming a project keeps its folder", () => {
+    let idx = setProjectFolder(addProject({ active: null, items: [], projects: [] }, "Work", "p1"), "p1", "C:/w")
+    idx = renameProject(idx, "p1", "Home")
+    expect(idx.projects[0]).toEqual({ id: "p1", name: "Home", folder: "C:/w" })
   })
   test("deleting a project keeps its conversations, which are unfiled", () => {
     const b = memory()

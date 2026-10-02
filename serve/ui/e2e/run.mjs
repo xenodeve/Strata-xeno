@@ -68,6 +68,10 @@ const importConfig = path.join(mkdtempSync(path.join(os.tmpdir(), "strata-e2e-im
 writeFileSync(importConfig, JSON.stringify({ model: "m" }, null, 2))
 const importer = { ...(await startMock({ STRATA_MOCK_THINK_MS: "2", STRATA_MOCK_PREFILL_TPS: "20000", STRATA_MOCK_MCP_CONFIG: importConfig, STRATA_HOME: fakeHome, APPDATA: path.join(fakeHome, "AppData") }, 18774)), config: importConfig, home: fakeHome, secret: SECRET_IMPORT }
 const admin = { ...(await startMock({ STRATA_MOCK_THINK_MS: "2", STRATA_MOCK_PREFILL_TPS: "20000", STRATA_MOCK_MCP_CONFIG: adminConfig }, 18773)), config: adminConfig, py: PY, fakeMcp: FAKE_MCP, secret: SECRET }
+// agentDemo: the coding tools (issue #96) are on and a message with "agent demo" makes the fake model use them; the folder is a temp one
+const demoDir = mkdtempSync(path.join(os.tmpdir(), "strata-e2e-agent-"))
+writeFileSync(path.join(demoDir, "README.md"), "# demo project\nline 2\nline 3\n")
+const agentDemo = { ...(await startMock({ STRATA_MOCK_AGENT: "1", STRATA_MOCK_THINK_MS: "2", STRATA_MOCK_PREFILL_TPS: "20000" }, 18775)), dir: demoDir }
 let failed = 0
 try {
   // one request in the history, so the request page has something to open
@@ -78,14 +82,14 @@ try {
     const results = []
     const t = { ok: (name, pass, detail = "") => results.push({ name, pass: !!pass, detail }) }
     const t0 = Date.now()
-    try { await c.run({ browser, fast, long, admin, importer, t, errors }) } catch (e) { results.push({ name: "the check ran to its end", pass: false, detail: String(e).split("\n")[0] }) }
+    try { await c.run({ browser, fast, long, admin, importer, agentDemo, t, errors }) } catch (e) { results.push({ name: "the check ran to its end", pass: false, detail: String(e).split("\n")[0] }) }
     if (errors.length) results.push({ name: "no console error or page error", pass: false, detail: errors.slice(0, 3).join(" | ") })
     for (const r of results) { console.log(`${r.pass ? "PASS" : "FAIL"} ${c.name.split(":")[0]}: ${r.name}${r.detail ? "  " + r.detail : ""}`); if (!r.pass) failed++ }
     console.log(`     (${c.name.split(":")[0]}: ${((Date.now() - t0) / 1000).toFixed(1)} s)`)
   }
 } finally {
   await browser.close()
-  fast.stop(); long.stop(); admin.stop(); importer.stop()
+  fast.stop(); long.stop(); admin.stop(); importer.stop(); agentDemo.stop()
 }
 console.log(failed ? `\n${failed} check(s) failed` : "\nall browser checks passed")
 process.exit(failed ? 1 : 0)

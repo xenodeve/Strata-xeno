@@ -1,17 +1,22 @@
 // The chat's state and its conversation with POST /v1/chat/completions (the classic app's logic, ported).
 // A plain controller outside React: the stream mutates the answer in place and React repaints once per frame.
 import { useSyncExternalStore } from "react"
-import { apiHeaders, errorMessage, url, type Health, type McpInfo } from "./api"
+import { apiHeaders, errorMessage, postPermission, url, type Health, type McpInfo } from "./api"
 import { fmt } from "./format"
 import { store } from "./store"
 import { PrefillMeter, type Prefill } from "./prefill"
 import { t, tn } from "./i18n"
 import { skillOfMessage } from "./slash"
-import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, type SessionIndex, type StoredMessage } from "./sessions"
+import { addRule, agentRequest, NO_AGENT, rulesOf, type AgentInfo } from "./agent"
+import { addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, folderOf, setProjectFolder, type SessionIndex, type StoredMessage } from "./sessions"
 
+/** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
+export interface Ask { id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny" }
+export interface Todo { content: string; status: "pending" | "in_progress" | "completed"; activeForm: string }
 export interface ToolCall {
   id: string; name: string; at: number; rat: number
-  state: "writing" | "running" | "done" | "error" | "skipped"
+  state: "writing" | "asking" | "running" | "done" | "error" | "skipped"
+  ask?: Ask; judge?: { verdict: string; severity: number | null }                // the coding tools: a question for the user, and what auto mode found
   server?: string; tool?: string; arguments?: unknown; round?: number
   result?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number | null; open?: boolean
 }
@@ -25,6 +30,7 @@ export interface Message {
   reasoning?: string; thinkSecs?: number | null; stats?: Stats; meta?: string /* legacy: the line as text, from an older version */
   error?: string; stopped?: boolean; limit?: number
   images?: { name: string; url?: string }[]; files?: { name: string; text?: string }[]; tools?: ToolCall[]
+  todos?: Todo[]                                                 // the coding tools' list of steps, as the model last sent it
 }
 
 /** The line under an answer ("40 tokens · 38.2 tok/s · 1 tool call"), in the language in use now. An answer stored by an
@@ -48,6 +54,7 @@ export function metaText(m: Message): string {
 export interface Settings {
   thinking: string; temperature: number; top_p: number; top_k: number
   max: string; seed: string; show: boolean; esp: boolean; mcp: boolean; mcpOff: string[]; prefill: boolean
+  agent: boolean; agentMode: string; agentFolder: string        // the coding tools: on (the default), ask / plan / auto, and the folder for chats that are in no project
 }
 /** What a request says about MCP: nothing when the tools are off (or no server that is not switched off has any), else `strata_mcp`
  *  and, when the + menu's list switched some servers off for this chat, their names. */
@@ -58,7 +65,7 @@ export function mcpRequest(s: Settings, mcp: McpInfo): { strata_mcp?: true; stra
   if (usable === 0 || (!mcp.servers.length && mcp.tools === 0)) return {}
   return off.length ? { strata_mcp: true, strata_mcp_off: off } : { strata_mcp: true }
 }
-export const DEFAULTS: Settings = { thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, mcpOff: [], prefill: true }
+export const DEFAULTS: Settings = { thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, mcpOff: [], prefill: true, agent: true, agentMode: "ask", agentFolder: "" }
 
 // a file's text in the message, fenced with more backticks than it contains itself
 const fileBlock = (f: { name: string; text: string }) => {
@@ -111,11 +118,21 @@ export function apiMessages(messages: Message[]): ApiMessage[] {
 interface ToolEvent {
   event: string; id: string; name: string; server?: string; tool?: string; arguments?: unknown; round?: number
   text?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number; skipped?: boolean; max_rounds?: number
+  call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string      // the coding tools
 }
 
 // a tool event from the stream (the `strata_mcp` field of a chunk)
 function onTool(m: Message, x: ToolEvent) {
   if (x.event === "limit") { m.limit = x.max_rounds; return }
+  if (x.event === "todos") { if (Array.isArray(x.todos)) m.todos = x.todos; return }
+  if (x.event === "permission" || x.event === "judging" || x.event === "judged") {          // about a call that is already shown: x.call_id is its id
+    const c = (m.tools || []).find((y) => y.id === x.call_id)
+    if (!c) return
+    if (x.event === "permission") { c.ask = { id: x.id, tool: String(x.tool ?? c.name), why: x.why ?? "", danger: !!x.danger, rule: x.rule ?? null, arguments: x.arguments }; c.state = "asking" }
+    else if (x.event === "judged" && (x.verdict === "allow" || x.verdict === "block" || x.verdict === "ask")) c.judge = { verdict: x.verdict, severity: x.severity ?? null }
+    return
+  }
+  if (x.event !== "start" && x.event !== "call" && x.event !== "result") return                // a kind of event this page does not know
   m.tools = m.tools || []
   let t = m.tools.find((y) => y.id === x.id)
   if (!t) { t = { id: x.id, name: x.name, at: m.text.length, rat: (m.reasoning || "").length, state: "writing" }; m.tools.push(t) }
@@ -148,7 +165,7 @@ function restore(msgs: Message[]): Message[] {
   return msgs.map((m) => (m.prefill?.state === "reading" ? { ...m, prefill: { ...m.prefill, state: "done" as const, rate: null } } : m))
 }
 
-export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[] }      // skills: the names of the skills in use, for "/name"
+export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | null }      // skills: the names of the skills in use, for "/name"
 
 export class ChatController {
   // a read that was cut off by closing the page is not still reading
@@ -230,8 +247,28 @@ export class ChatController {
   renameProject(id: string, name: string) { this.index = renameProject(this.index, id, name); this.saveIndex() }
   removeProject(id: string) { this.index = removeProject(this.index, id); this.saveIndex() }
   setSettings(s: Settings) { this.settings = s; store.set("sampling", s); this.notify() }
+  setProjectFolder(id: string, folder: string) { this.index = setProjectFolder(this.index, id, folder); this.saveIndex() }
+  /** The folder the coding tools work in for the open conversation: its project's, else the default one (Settings); null when there is none. */
+  folder(): string | null {
+    const mine = this.index.items.find((i) => i.id === this.index.active)
+    return folderOf(this.index, mine?.project) ?? (this.settings.agentFolder?.trim() || null)
+  }
 
   stop() { this.busy?.abort.abort() }
+
+  /** The user's answer to a card of the coding tools. The call goes on (or is refused) at the server; the card stays until the server says
+   *  it took the answer, so a lost one can be given again. "Allow for this chat" also keeps the rule for the next requests of this chat. */
+  async answer(callId: string, decision: "allow" | "allow_chat" | "deny"): Promise<boolean> {
+    const call = this.messages.flatMap((m) => m.tools ?? []).find((c) => c.id === callId && c.ask && !c.ask.answer)
+    if (!call?.ask) return false
+    const r = await postPermission(call.ask.id, decision)
+    if ("error" in r) { this.onError(t("The answer was not taken"), r.error); return false }
+    call.ask.answer = decision
+    call.state = "running"
+    if (decision === "allow_chat" && call.ask.rule) addRule(store, this.index.active ?? "new", call.ask.rule)
+    this.notify()
+    return true
+  }
 
   /** One look at /metrics while a request runs: the engine's position in the prompt gives the speed under the prompt that
    *  was sent (the mean over the last second) while it is read, and the engine's own mean as soon as it is read. The tokens
@@ -319,6 +356,7 @@ export class ChatController {
     if (s.max) body.max_tokens = +s.max
     if (ctx.projectionLoaded) body.experimental_speed_projection = !!s.esp
     Object.assign(body, mcpRequest(s, ctx.mcp))                            // this server may run MCP tools for it (the ones not switched off)
+    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, this.index.active, rulesOf(store, this.index.active ?? "new")))      // the coding tools, when they are on and reachable
     const lastPrompt = [...this.messages].reverse().find((x) => x.role === "user")
     const skill = lastPrompt ? skillOfMessage(lastPrompt.text, ctx.skills ?? []) : null
     if (skill) body.strata_skill = skill                                   // "/name": the server loads that skill for this message
@@ -349,7 +387,10 @@ export class ChatController {
           if (j.error) throw new Error(j.error.message || t("the engine reported an error"))
           if (j.usage) usage = j.usage
           if (j.timings) timings = j.timings
-          if (j.strata_mcp) onTool(m, j.strata_mcp)
+          if (j.strata_mcp) {
+            onTool(m, j.strata_mcp)
+            if (j.strata_mcp.event === "mode" && (j.strata_mcp.mode === "ask" || j.strata_mcp.mode === "plan" || j.strata_mcp.mode === "auto")) this.setSettings({ ...this.settings, agentMode: j.strata_mcp.mode })      // the plan was approved
+          }
           const d = j.choices?.[0]?.delta || {}
           const lastTool = m.tools?.length ? m.tools[m.tools.length - 1] : null    // a new round after a tool
           if (d.reasoning_content) {

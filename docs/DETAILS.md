@@ -546,6 +546,14 @@ own `CLAUDE.md` (or `AGENTS.md`). They work only from this PC itself (or with th
 - **Safety nets.** A file must be read in the chat before it can be overwritten or edited, and not have changed since; a command runs in a
   fresh shell in the folder, with a time limit (default 2 minutes, at most 10), is stopped with all it started on a timeout or Stop, and gets
   no `STRATA_*` environment variable. Output over 30,000 characters is cut in the middle.
+- **In the chat.** The + menu has a **Coding tools** row (the same controls are in Settings > Coding tools): a switch (on by default when the server
+  has them and this page may use them), the mode (Ask / Plan / Auto) and the folder. A chat in a project works in the project's folder; a chat in no
+  project uses the default folder. A call shows as what it is: the command and its output, an edit as removed and added lines, the steps of a
+  longer task as a checklist. When the server asks, the call shows a card with the command or the path and why it asks. **Allow for this chat** is
+  kept in this browser and sent with the chat's next requests; a dangerous command cannot be allowed for the whole chat.
+- **Trying it without a model.** `STRATA_MOCK_AGENT=1 python serve/ui/dev/mock_server.py` is the mock server with the real tools behind it; a message with
+  "agent demo" in it makes the fake model use them step by step (a todo list, a search, a read, a command that only reads, a file in the temp folder and a
+  command, the last two asking first).
 - **Not the same as Claude Code (yet).** No sub-agents (`Task`), no `WebSearch`/`WebFetch`, no `NotebookEdit`, no images or PDFs in `Read`,
   no hooks; a `cd` does not carry over between commands.
 

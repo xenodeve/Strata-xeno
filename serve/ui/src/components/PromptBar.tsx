@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as RKeyEvent, type PointerEvent as RPointerEvent, type ReactNode, type RefObject } from "react"
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import {
-  Attachment01Icon, Cancel01Icon, Download01Icon, File02Icon, HelpCircleIcon, PlusSignIcon, Settings02Icon, SparklesIcon, MessageAdd01Icon, PlugSocketIcon,
+  Attachment01Icon, Cancel01Icon, Download01Icon, File02Icon, HelpCircleIcon, PlusSignIcon, Settings02Icon, SparklesIcon, MessageAdd01Icon, PlugSocketIcon, ComputerTerminal01Icon,
 } from "@hugeicons/core-free-icons"
 import { msg, t } from "../lib/i18n"
 import type { McpServer } from "../lib/api"
 import { markOf, matchCommands, pickCommand, slashQuery, type Command } from "../lib/slash"
 import { SkillCard } from "./SkillTip"
 import { MiniSwitch } from "./ui"
+import { AgentControls, modeLabel, type AgentControlsProps } from "./AgentControls"
 
 // The composer: the field, and one bar of tools under it. Adapted from React Bits' PromptBar (MIT + Commons Clause: used
 // inside this app only, see REFERENCES.md). Changes: our tokens instead of fixed colours; the arrow-to-stop morph is a
@@ -78,6 +79,7 @@ export interface PromptBarProps {
   onNewChat: () => void
   onSave: () => void
   onSampling: () => void
+  agent: AgentControlsProps                  // the coding tools (issue #96): a row in the + menu that opens their switch, mode and folder
   skills: Command[]                          // the skills in use: "/" at the start of the message lists them, to be picked by name
   mcp: { servers: McpServer[]; tools: number; on: boolean; off: string[]; onToggleAll: () => void; onToggleServer: (name: string) => void; setupHref: string }      // the MCP tools: a row in the + menu that opens the list of servers, each with its tools and its own switch
   efforts: string[]
@@ -96,7 +98,7 @@ export function PromptBar(p: PromptBarProps) {
   const rows = useRef<(HTMLButtonElement | null)[]>([])
   const lastOpen = useRef<string | null>(null)
   const typing = useRef({ energy: 0, strokes: 0 })
-  const [menu, setMenu] = useState<"plus" | "effort" | "mcp" | null>(null)
+  const [menu, setMenu] = useState<"plus" | "effort" | "mcp" | "agent" | null>(null)
   const [active, setActive] = useState(0)
   const [focused, setFocused] = useState(false)
   const [visible, setVisible] = useState(() => typeof document === "undefined" || !document.hidden)
@@ -110,6 +112,7 @@ export function PromptBar(p: PromptBarProps) {
 
   const usable = (x: McpServer) => x.tools.length > 0 && (x.status === "ready" || x.status === "stopped")       // a server that is up and offers tools can be switched
   const mcpOn = p.mcp.on ? p.mcp.servers.filter((x) => usable(x) && !p.mcp.off.includes(x.name)).length : 0
+  const usableAgent = p.agent.info.available && p.agent.info.allowed
   const list: Row[] = [
     { key: "attach", name: t("Photos & files"), description: p.attachTitle, icon: Attachment01Icon },
     { key: "new", name: t("New chat"), description: t("Starts a new chat; this one stays in Recents"), icon: MessageAdd01Icon, disabled: p.busy },
@@ -118,6 +121,11 @@ export function PromptBar(p: PromptBarProps) {
       key: "mcp", name: t("MCP tools"), icon: PlugSocketIcon, checked: mcpOn > 0,
       description: p.mcp.servers.length === 0 ? t("No server is set up. Add them in Settings.") : p.mcp.tools ? t("{on} of {n} servers on · {tools} tools", { on: mcpOn, n: p.mcp.servers.length, tools: p.mcp.tools }) : t("No server is connected yet."),
       state: p.mcp.servers.length === 0 ? undefined : mcpOn === 0 ? t("off") : mcpOn === p.mcp.servers.length ? t("on") : `${mcpOn}/${p.mcp.servers.length}`,
+    },
+    {
+      key: "agent", name: t("Coding tools"), icon: ComputerTerminal01Icon, checked: usableAgent && p.agent.on,
+      description: !p.agent.info.available ? t("Not on this server") : !p.agent.info.allowed ? t("Only from the PC that runs Strata") : p.agent.folder ? p.agent.folder : t("No folder yet. Set one to work in."),
+      state: usableAgent ? (p.agent.on ? modeLabel(p.agent.mode) : t("off")) : undefined,
     },
   ]
   const cursor = Math.min(active, list.length - 1)
@@ -246,6 +254,7 @@ export function PromptBar(p: PromptBarProps) {
 
   const runRow = (key: string) => {
     if (key === "mcp") { setMenu("mcp"); return }             // opens the list of servers, each with its tools and its own switch
+    if (key === "agent") { setMenu("agent"); return }         // opens the coding tools: switch, mode, folder
     closeMenu()
     if (key === "attach") file.current?.click()
     else if (key === "new") p.onNewChat()
@@ -309,6 +318,12 @@ export function PromptBar(p: PromptBarProps) {
       {marked && tipAt !== null && !slashOpen && (
         <div className="prompt-bar__menu" data-kind="tip" role="tooltip" style={{ left: tipAt }}>
           <SkillCard cmd={marked.cmd} />
+        </div>
+      )}
+
+      {menu === "agent" && (
+        <div className="prompt-bar__menu" role="dialog" aria-label={t("Coding tools")} data-kind="agent">
+          <AgentControls {...p.agent} />
         </div>
       )}
 
