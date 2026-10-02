@@ -1377,3 +1377,163 @@ describe("rules that last", () => {
     expect(loadPerms(store).projects[p]).toBeUndefined()
   })
 })
+
+// Messages typed while an answer is being written wait in line and go when it ends (issue #99).
+describe("messages that wait while an answer is written", () => {
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    return data
+  }
+  const tick = () => new Promise((r) => setTimeout(r, 8))
+  type Call = { body: Record<string, any>; chunk: (text: string) => void; end: () => void }
+  function gated(): Call[] {
+    const calls: Call[] = []
+    ;(globalThis as Record<string, unknown>).fetch = (_u: string, init: { body: string; signal: AbortSignal }) => {
+      let ctl!: ReadableStreamDefaultController<Uint8Array>
+      const body = new ReadableStream<Uint8Array>({ start(c) { ctl = c } })
+      const call: Call = {
+        body: JSON.parse(init.body),
+        chunk: (text) => ctl.enqueue(enc.encode(sse(delta({ content: text })))),
+        end: () => { ctl.enqueue(enc.encode(sse({ choices: [], usage: { prompt_tokens: 50, completion_tokens: 5 } }, "data: [DONE]\n\n"))); ctl.close() },
+      }
+      init.signal.addEventListener("abort", () => { try { ctl.error(Object.assign(new Error("aborted"), { name: "AbortError" })) } catch { /* closed */ } })
+      calls.push(call)
+      return Promise.resolve(new Response(body, { status: 200 }))
+    }
+    return calls
+  }
+  const file = { kind: "file" as const, name: "a.py", text: "x = 1" }
+
+  test("a message typed while the answer is written is kept, and one typed when it is not is not", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    expect(c.queue("early", [], ctx)).toBe(false)                         // nothing is answering: it is to be sent, not kept
+    const a = c.send("first", [], ctx)
+    await tick()
+    expect(c.queue("  second  ", [file], ctx)).toBe(true)
+    expect(c.queue("   ", [], ctx)).toBe(false)                           // nothing to keep
+    expect(c.queuedOf().map((q) => [q.text, q.files.length])).toEqual([["second", 1]])
+    calls[0].chunk("one"); calls[0].end()
+    await a
+  })
+
+  test("when the answer ends well the next one goes by itself, then the next, in order, each after the one before", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    const a = c.send("first", [], ctx)
+    await tick()
+    c.queue("second", [], ctx)
+    c.queue("third", [file], ctx)
+    expect(calls).toHaveLength(1)
+    calls[0].chunk("answer 1"); calls[0].end()
+    await a
+    await tick()
+    expect(calls).toHaveLength(2)                                         // the second went when the first ended
+    expect(calls[1].body.messages.map((m: { content: unknown }) => (typeof m.content === "string" ? m.content : "?")).slice(-1)).toEqual(["second"])
+    expect(c.queuedOf().map((q) => q.text)).toEqual(["third"])
+    calls[1].chunk("answer 2"); calls[1].end()
+    await tick(); await tick()
+    expect(calls).toHaveLength(3)
+    const last = calls[2].body.messages.at(-1).content
+    expect(String(last)).toContain("third")
+    expect(String(last)).toContain("a.py")                                // its file went with it
+    calls[2].chunk("answer 3"); calls[2].end()
+    await tick(); await tick()
+    expect(c.messages.map((m) => m.text)).toEqual(["first", "answer 1", "second", "answer 2", "third", "answer 3"])
+    expect(c.queuedOf()).toEqual([])
+  })
+
+  test("Stop sends nothing: the messages stay, and can be sent, taken back or dropped", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    const a = c.send("first", [], ctx)
+    await tick()
+    c.queue("second", [], ctx)
+    c.queue("third", [], ctx)
+    c.stop()
+    await a
+    await tick()
+    expect(calls).toHaveLength(1)
+    expect(c.queuedOf().map((q) => q.text)).toEqual(["second", "third"])
+    const back = c.unqueue(c.queuedOf()[1].id)
+    expect(back?.text).toBe("third")
+    expect(c.unqueue("nope")).toBeNull()
+    const sending = c.sendQueued(c.queuedOf()[0].id)
+    await tick()
+    expect(calls).toHaveLength(2)
+    expect(c.queuedOf()).toEqual([])
+    calls[1].end()
+    expect(await sending).toBe(true)
+  })
+
+  test("an answer that failed sends nothing either", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(JSON.stringify({ error: { message: "the engine is busy" } }), { status: 500 })
+    const c = new ChatController()
+    c.onError = () => {}
+    const a = c.send("first", [], ctx)
+    c.queue("second", [], ctx)
+    await a
+    expect(c.queuedOf().map((q) => q.text)).toEqual(["second"])
+  })
+
+  test("each conversation has its own line, and one that is not open goes on when it is opened", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    const a = c.send("in A", [], ctx)
+    await tick()
+    const idA = c.index.active!
+    c.queue("waits in A", [], ctx)
+    c.newSession()
+    expect(c.queuedOf()).toEqual([])                                      // B has none
+    calls[0].chunk("answer A"); calls[0].end()
+    await a
+    await tick()
+    expect(calls).toHaveLength(1)                                         // A is not open: its waiting message does not go by itself
+    expect(c.open(idA)).toBe(true)
+    await tick()
+    expect(calls).toHaveLength(2)                                         // it goes when A is opened
+    expect(String(calls[1].body.messages.at(-1).content)).toBe("waits in A")
+    calls[1].end()
+    await tick()
+  })
+
+  test("a conversation that is deleted takes its line with it", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    const a = c.send("in A", [], ctx)
+    await tick()
+    const idA = c.index.active!
+    c.queue("waits", [], ctx)
+    c.newSession()
+    calls[0].end()
+    await a
+    expect(c.remove(idA)).toBe(true)
+    expect(c.open(idA)).toBe(false)
+    await tick()
+    expect(calls).toHaveLength(1)
+  })
+
+  test("no more than twenty wait", async () => {
+    keep()
+    const calls = gated()
+    const c = new ChatController()
+    const a = c.send("first", [], ctx)
+    await tick()
+    for (let i = 0; i < 25; i++) c.queue("m" + i, [], ctx)
+    expect(c.queuedOf()).toHaveLength(20)
+    expect(c.queuedOf()[0].text).toBe("m5")                                // the oldest were let go
+    c.stop()
+    await a
+    await tick()
+    expect(calls).toHaveLength(1)
+  })
+})

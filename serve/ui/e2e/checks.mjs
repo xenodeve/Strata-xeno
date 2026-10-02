@@ -1697,6 +1697,121 @@ export const checks = [
     },
   },
   {
+    // `@file` in the prompt and messages that wait while an answer is written (issue #99). The project's folder is a real temporary one; the model's answers are scripted.
+    name: "mention: @ offers the files of the project and sends the ones mentioned; a message typed while it answers waits in line",
+    async run({ browser, fast, t, errors }) {
+      const fs = await import("node:fs")
+      const os = await import("node:os")
+      const path = await import("node:path")
+      const NL = String.fromCharCode(10)
+      const proj = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "strata-at-")))
+      for (const [rel, text] of [["src/app.py", "print('the app')" + NL], ["src/util/application.py", "x = 1" + NL], ["docs/my-app.md", "# my app" + NL], ["README.md", "readme text" + NL], [".env", "TOKEN=hunter2" + NL]]) {
+        fs.mkdirSync(path.dirname(path.join(proj, rel)), { recursive: true })
+        fs.writeFileSync(path.join(proj, rel), text)
+      }
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const answer = (text) => chunk({ choices: [{ delta: { content: text } }] }) + chunk({ choices: [], usage: { prompt_tokens: 50, completion_tokens: 5 } }) + `data: [DONE]${NL}${NL}`
+      const info = { available: true, allowed: true, shell: "bash", tools: ["Read"] }
+      const pg = await open(browser, errors)
+      const bodies = []
+      let slow = 0                                               // how many of the next requests are held back, to have an answer that is being written
+      await pg.route("**/agent", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(info) }))
+      await pg.route("**/v1/chat/completions", async (r) => {
+        bodies.push(JSON.parse(r.request().postData() || "{}"))
+        if (slow > 0) { slow--; await new Promise((res) => setTimeout(res, 1800)) }
+        return r.fulfill({ status: 200, contentType: "text/event-stream", body: answer("answer " + bodies.length) })
+      })
+      await pg.addInitScript((p) => { if (!localStorage.getItem("strata.chats")) localStorage.setItem("strata.chats", JSON.stringify({ active: null, items: [], projects: [{ id: "p1", name: "Files", folders: [p] }] })) }, proj)
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("aside[aria-label='Conversations']")
+      await pg.waitForTimeout(800)
+      await pg.getByRole("button", { name: "New chat in project Files" }).click()
+      await pg.waitForTimeout(400)
+      const box = pg.locator("textarea[aria-label='Message']")
+      const list = pg.locator("[role=listbox][aria-label='Files']")
+      const names = () => list.locator("[role=option]").evaluateAll((os) => os.map((o) => o.dataset.file))
+
+      await box.click()
+      await box.pressSequentially("look at @ap", { delay: 15 })
+      await list.waitFor({ timeout: 5000 })
+      const offered = await names()
+      t.ok("typing @ and a few letters offers the files of the project that go with them, the name that starts with them first", offered[0] === "src/app.py" && offered.includes("src/util/application.py") && offered.includes("docs/my-app.md"), JSON.stringify(offered))
+      t.ok("a secret is not offered", !offered.some((n) => n.includes(".env")))
+      await pg.keyboard.press("ArrowDown")
+      await pg.waitForTimeout(100)
+      t.ok("the arrow keys move the mark", (await list.locator("[role=option][aria-selected=true]").getAttribute("data-file")) === offered[1])
+      await pg.keyboard.press("Escape")
+      await pg.waitForTimeout(200)
+      t.ok("Escape closes the list and keeps what was typed", (await list.count()) === 0 && (await box.inputValue()) === "look at @ap")
+      await box.fill("")
+      await box.pressSequentially("look at @ap", { delay: 15 })
+      await list.waitFor()
+      await list.locator("[data-file='src/app.py']").click()
+      await pg.waitForTimeout(300)
+      t.ok("picking a file writes it as @path and a space", (await box.inputValue()) === "look at @src/app.py ", await box.inputValue())
+      await box.pressSequentially("and @.env and @nope.txt please", { delay: 5 })
+      await box.press("Enter")
+      await pg.waitForTimeout(1200)
+      const sentBody = bodies.at(-1)
+      const content = String(sentBody.messages.at(-1).content)
+      t.ok("the file that is mentioned goes with the prompt, as text", content.includes("File: src/app.py") && content.includes("print('the app')") && content.includes("@src/app.py"), content.slice(0, 200))
+      t.ok("a secret that is mentioned is not sent, nor a file that is not there", !content.includes("hunter2") && !content.includes("nope.txt\n"))
+      t.ok("the prompt shows the file as an attachment", (await pg.locator(".msg-in.group").first().innerText()).includes("src/app.py"))
+      await box.fill("")
+      await box.pressSequentially("mail me@example.com", { delay: 5 })
+      await pg.waitForTimeout(400)
+      t.ok("an e-mail address is not a mention", (await list.count()) === 0)
+      await box.fill("")
+
+      // a message typed while the answer is written
+      slow = 1
+      await box.fill("first question")
+      await box.press("Enter")
+      await pg.waitForSelector("button[aria-label='Stop']")
+      t.ok("while it answers the composer says what typing does", (await box.getAttribute("placeholder")).includes("sent when the answer ends"))
+      await box.fill("second question")
+      await box.press("Enter")
+      await pg.waitForTimeout(400)
+      const queued = pg.locator("[data-queued]")
+      t.ok("a message typed meanwhile waits in line, as a dashed bubble that says so, and the composer is free", (await queued.count()) === 1 && (await queued.innerText()).includes("second question") && (await queued.innerText()).includes("Waits for the answer to end") && (await box.inputValue()) === "")
+      await box.fill("third question")
+      await box.press("Enter")
+      await pg.waitForTimeout(300)
+      t.ok("and several can wait", (await queued.count()) === 2)
+      await queued.nth(1).getByRole("button", { name: "Remove" }).click()
+      await pg.waitForTimeout(300)
+      t.ok("one can be dropped", (await queued.count()) === 1)
+      const before = bodies.length
+      await pg.waitForFunction(() => document.querySelectorAll("button[aria-label='Stop']").length === 0, null, { timeout: 15000 })
+      await pg.waitForTimeout(1500)
+      t.ok("when the answer ends the next goes by itself, with the answer before it in the conversation", bodies.length === before + 1 && String(bodies.at(-1).messages.at(-1).content) === "second question" && bodies.at(-1).messages.some((m) => m.content === "first question"))
+      t.ok("and nothing waits any more", (await queued.count()) === 0)
+      const mine = (await pg.locator(".msg-in.group").allInnerTexts()).join(" | ")
+      t.ok("the conversation has them in order", mine.indexOf("first question") < mine.indexOf("second question") && !mine.includes("third question"), mine)
+
+      // Stop: nothing is sent, and what waits can be sent or taken back
+      slow = 1
+      await box.fill("long one")
+      await box.press("Enter")
+      await pg.waitForSelector("button[aria-label='Stop']")
+      await box.fill("kept for later")
+      await box.press("Enter")
+      await pg.waitForTimeout(300)
+      const n1 = bodies.length
+      await pg.click("button[aria-label='Stop']")
+      await pg.waitForTimeout(1200)
+      t.ok("Stop sends nothing: what waited is still there and says it was not sent", bodies.length === n1 && (await queued.count()) === 1 && (await queued.innerText()).includes("Not sent: the answer was stopped"))
+      await queued.getByRole("button", { name: "Edit" }).click()
+      await pg.waitForTimeout(300)
+      t.ok("Edit takes it back to the composer", (await queued.count()) === 0 && (await box.inputValue()) === "kept for later")
+      await box.press("Enter")
+      await pg.waitForTimeout(1500)
+      t.ok("and it can be sent as any prompt", String(bodies.at(-1).messages.at(-1).content) === "kept for later")
+      await pg.context().close()
+      fs.rmSync(proj, { recursive: true, force: true })
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {

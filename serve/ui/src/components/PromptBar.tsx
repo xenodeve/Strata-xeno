@@ -8,6 +8,7 @@ import { msg, t } from "../lib/i18n"
 import { fmt } from "../lib/format"
 import type { McpServer } from "../lib/api"
 import { markOf, matchCommands, pickCommand, slashQuery, type Command } from "../lib/slash"
+import { atQuery, getFiles, pickMention, type FoundFile } from "../lib/mention"
 import type { ContextView } from "../lib/context"
 import { SkillCard } from "./SkillTip"
 import { MiniSwitch } from "./ui"
@@ -86,6 +87,7 @@ export interface PromptBarProps {
   onSampling: () => void
   agent: AgentControlsProps                  // the coding tools (issue #96): a row in the + menu that opens their switch, mode and folder
   context: { view: ContextView; canCompact: boolean; onCompact: () => void; open: number }      // the context window (issue #99): a chip with the share used, a panel with what it is made of; `open` counts the times /context asked for the panel
+  mention: { folders: string[]; enabled: boolean }          // `@file`: the files of the project's folders are offered while a name is typed after an @ (enabled: this page may read them)
   skills: Command[]                          // the skills in use: "/" at the start of the message lists them, to be picked by name
   mcp: { servers: McpServer[]; tools: number; on: boolean; off: string[]; onToggleAll: () => void; onToggleServer: (name: string) => void; setupHref: string }      // the MCP tools: a row in the + menu that opens the list of servers, each with its tools and its own switch
   efforts: string[]
@@ -125,6 +127,9 @@ export function PromptBar(p: PromptBarProps) {
   const [slashAt, setSlashAt] = useState(0)                      // the mark in the list of skills
   const [shut, setShut] = useState<string | null>(null)          // the text at which Escape closed the list: it stays closed until the text changes
   const skillRows = useRef<(HTMLButtonElement | null)[]>([])
+  const [fileList, setFileList] = useState<FoundFile[]>([])        // the files that go with the name typed after an @
+  const [fileAt, setFileAt] = useState(0)
+  const [fileShut, setFileShut] = useState<string | null>(null)   // the text at which Escape closed that list
   const mirror = useRef<HTMLDivElement>(null)
   const [ctxTip, setCtxTip] = useState<{ right: number; bottom: number } | null>(null)     // pointing at the context chip: the used share of the window, quickly, without opening it
   const [tipAt, setTipAt] = useState<number | null>(null)       // pointing at the marked command: where its card goes (from the left of the bar)
@@ -164,6 +169,24 @@ export function PromptBar(p: PromptBarProps) {
   const slashOpen = found.length > 0 && shut !== p.value && menu === null
   const slashMark = Math.min(slashAt, Math.max(0, found.length - 1))
   const marked = markOf(p.value, p.skills)                       // the message starts with /name of a skill in use: that word is shown in bold
+  const at = p.mention.enabled && !slashOpen ? atQuery(p.value, caret) : null
+  const foldersKey = p.mention.folders.join("|")
+  useEffect(() => {
+    if (!at) { setFileList([]); return }
+    let stale = false
+    const timer = setTimeout(async () => { const r = await getFiles(p.mention.folders, at.query); if (!stale) { setFileList(r ?? []); setFileAt(0) } }, 120)
+    return () => { stale = true; clearTimeout(timer) }
+  }, [at?.query, at?.start, foldersKey]) // eslint-disable-line react-hooks/exhaustive-deps
+  const mentionOpen = !!at && fileList.length > 0 && fileShut !== p.value && menu === null
+  const fileMark = Math.min(fileAt, Math.max(0, fileList.length - 1))
+  const pickFile = (path: string) => {
+    if (!at) return
+    const r = pickMention(p.value, at, caret, path)
+    p.onChange(r.text)
+    setCaret(r.caret)
+    setFileList([])
+    requestAnimationFrame(() => { const el = p.inputRef.current; if (el) { el.focus({ preventScroll: true }); el.setSelectionRange(r.caret, r.caret) } })
+  }
   const pointAt = (e: { clientX: number; clientY: number }) => {
     const m = mirror.current?.querySelector("[data-mark]"), r = root.current?.getBoundingClientRect()
     const b = m?.getBoundingClientRect()
@@ -302,6 +325,11 @@ export function PromptBar(p: PromptBarProps) {
   }
 
   const onKeyDown = (e: RKeyEvent<HTMLTextAreaElement>) => {
+    if (mentionOpen && !e.nativeEvent.isComposing) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); setFileAt((fileMark + (e.key === "ArrowDown" ? 1 : fileList.length - 1)) % fileList.length); return }
+      if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") { e.preventDefault(); pickFile(fileList[fileMark].path); return }
+      if (e.key === "Escape") { e.preventDefault(); setFileShut(p.value); return }
+    }
     if (slashOpen && !e.nativeEvent.isComposing) {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); setSlashAt((slashMark + (e.key === "ArrowDown" ? 1 : found.length - 1)) % found.length); return }
       const marked = found[slashMark]
@@ -314,7 +342,7 @@ export function PromptBar(p: PromptBarProps) {
       if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") { e.preventDefault(); if (!list[cursor].disabled) runRow(list[cursor].key); return }
     }
     if (e.key === "Escape" && menu) { e.preventDefault(); closeMenu(); return }
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); if (canSend && !p.busy) p.onSend() }   // not while an IME is composing
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); if (canSend) p.onSend() }   // while an answer is written it waits in line (Chat); not while an IME is composing
   }
 
   return (
@@ -337,6 +365,27 @@ export function PromptBar(p: PromptBarProps) {
             >
               <span className="prompt-bar__skill-name">/{c.name}</span>
               <span className="prompt-bar__skill-desc">{c.description}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {mentionOpen && (
+        <div className="prompt-bar__menu" data-kind="slash" role="listbox" aria-label={t("Files")}>
+          {fileList.map((f, i) => (
+            <button
+              key={f.folder + ":" + f.path}
+              type="button"
+              role="option"
+              aria-selected={i === fileMark}
+              data-file={f.path}
+              className="prompt-bar__skill"
+              onMouseDown={(e) => e.preventDefault()}
+              onPointerEnter={() => setFileAt(i)}
+              onClick={() => pickFile(f.path)}
+            >
+              <span className="prompt-bar__skill-name">{f.path.split("/").pop()}</span>
+              <span className="prompt-bar__skill-desc">{f.path}{p.mention.folders.length > 1 ? ` · ${p.mention.folders[f.folder]?.split(/[\\/]/).pop() ?? ""}` : ""}</span>
             </button>
           ))}
         </div>
@@ -492,13 +541,14 @@ export function PromptBar(p: PromptBarProps) {
           className="prompt-bar__input"
           rows={1}
           value={p.value}
-          placeholder={t("Message")}
+          placeholder={p.busy ? t("Message: it is sent when the answer ends") : t("Message")}
           aria-label={t("Message")}
           onChange={(e) => {
             p.onChange(e.target.value)
             setCaret(e.target.selectionStart ?? e.target.value.length)
             setSlashAt(0)
             setShut(null)
+            setFileShut(null)
             typing.current.energy = Math.min(1.6, typing.current.energy + 0.22)
             typing.current.strokes = Math.min(4, typing.current.strokes + 1)
             closeMenu()

@@ -159,6 +159,23 @@ function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: bo
   )
 }
 
+/** A message that was typed while the answer was being written: it waits in line (dashed), and can be taken back to be edited, dropped, or - when the answer was stopped - sent. */
+export function QueuedMessage({ text, files, answering, onEdit, onRemove, onSend }: { text: string; files: { name: string }[]; answering: boolean; onEdit: () => void; onRemove: () => void; onSend: () => void }) {
+  const small = "rounded-sm px-1.5 py-0.5 transition-colors hover:bg-hover hover:text-ink"
+  return (
+    <div className="msg-in flex flex-col items-end gap-1" data-queued>
+      {files.length > 0 && <div className="flex flex-wrap justify-end gap-1.5">{files.map((f, i) => <span key={i} className="inline-flex items-center gap-1 rounded-sm bg-fill px-2 py-1 text-[12px]"><HugeiconsIcon icon={AttachmentIcon} size={12} aria-hidden />{f.name}</span>)}</div>}
+      {text && <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md border border-dashed border-line px-4 py-2.5 text-[15px] tracking-[-0.011em] text-ink-2 [overflow-wrap:anywhere]">{text}</div>}
+      <div className="flex items-center gap-1 px-1 text-[12px] text-ink-3">
+        <span>{answering ? t("Waits for the answer to end") : t("Not sent: the answer was stopped")}</span>
+        {!answering && <button type="button" onClick={onSend} className={small}>{t("Send now")}</button>}
+        <button type="button" onClick={onEdit} className={small}>{t("Edit")}</button>
+        <button type="button" onClick={onRemove} className={small}>{t("Remove")}</button>
+      </div>
+    </div>
+  )
+}
+
 /** The line the conversation is summarised under: the model is writing the summary that will take the place of the earlier messages. */
 export function CompactingLine() {
   return <div className="msg-in"><CompactingStatus className="text-[13px] text-ink-2" /></div>

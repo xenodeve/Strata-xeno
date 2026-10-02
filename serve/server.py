@@ -60,7 +60,7 @@ from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_me
 from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
 from serve import agent as agent_mod, agent_prompt, agent_run, permissions, shell as shell_mod  # noqa: E402
-from serve import folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
+from serve import files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 
@@ -2171,6 +2171,18 @@ def make_handler(svc: Service):
                     if path == "/agent/git":
                         return self._json(200, gitview.info(folder))
                     return self._json(200, gitview.diff(folder, q.get("file", [""])[0], q.get("staged", ["0"])[0] == "1", q.get("untracked", ["0"])[0] == "1"))
+                return
+            if path in ("/agent/files", "/agent/mention"):
+                # `@file` in the prompt: the files of the project's folders that go with typed letters, and the text of one that was mentioned (serve/files.py); for who may use the coding tools
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    q = parse_qs(urlsplit(self.path).query)
+                    folders = [f for f in [q.get("path", [""])[0], *q.get("dirs", [])] if f.strip() and "\0" not in f][:agent_mod.MAX_DIRS + 1]
+                    if path == "/agent/files":
+                        return self._json(200, {"files": files_mod.find(folders, q.get("q", [""])[0])})
+                    return self._json(200, files_mod.read(folders, q.get("rel", [""])[0]))
                 return
             if path in ("/agent/memory", "/agent/memory/file"):
                 # the notes the chat reads for a project: the project's own files and what the user's other apps wrote down (serve/memory.py); for who may use the coding tools

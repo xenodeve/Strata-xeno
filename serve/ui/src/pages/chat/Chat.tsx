@@ -24,7 +24,8 @@ import { forgetRules, NO_AGENT, rulesOf, type AgentInfo, type AgentMode } from "
 import { store } from "../../lib/store"
 import { SkillsContext } from "../../components/SkillTip"
 import { msg, t } from "../../lib/i18n"
-import { CompactingLine, MessageView } from "./Messages"
+import { CompactingLine, MessageView, QueuedMessage } from "./Messages"
+import { resolveMentions } from "../../lib/mention"
 import { SettingsSheet } from "./SettingsSheet"
 import { PanelDock } from "../../components/SidePanel"
 import { ProjectPicker } from "../../components/ProjectPicker"
@@ -217,7 +218,9 @@ export function Chat({ id }: { id?: string }) {
   const [ctxOpen, setCtxOpen] = useState(0)                      // how many times /context was typed: the panel opens at each
   const commands = [...builtinCommands(), ...skills.filter((c) => !builtinCommands().some((b) => b.name === c.name))]       // what "/" lists: Strata's own, then the skills
   const send = () => {
-    if (busy || (!text.trim() && !files.length)) return
+    if (!text.trim() && !files.length) return
+    const word = files.length ? null : /^\s*\/(compact|context|memory|init|clear|permissions)\s*$/i.exec(text)?.[1]?.toLowerCase()
+    if (busy && (word === "compact" || word === "init" || (!word && /^\s*\/(compact|init)\b/i.test(text)))) { toast("warn", t("Still writing"), t("Stop the answer first.")); return }
     if (!files.length && isContextCommand(text)) { setText(""); setCtxOpen((n) => n + 1); return }                // "/context": the panel with the context window opens
     if (!files.length && isMemoryCommand(text)) { setText(""); keepPanel({ open: true, tab: "memory" }); return }                      // "/memory": the panel opens on the notes
     if (!files.length && /^\s*\/permissions\s*$/i.test(text)) { setText(""); location.hash = href("settings", "permissions"); return }                // "/permissions": the page of the rules
@@ -231,11 +234,18 @@ export function Chat({ id }: { id?: string }) {
       return
     }
     const typed = !files.length && isInitCommand(text) ? INIT_PROMPT : text, f = files                                    // "/init": the prompt that has the model write the project's CLAUDE.md
-    noteSend(input.current?.getBoundingClientRect())          // where the prompt rises from
+    const folders = chat.folders()
+    const go = async () => {
+      const found = agentInfo.allowed ? await resolveMentions(folders, typed) : []                                    // the files the prompt mentions with @ go with it
+      const all = [...f, ...found.filter((x) => !f.some((y) => y.name === x.name))]
+      const context = { health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: folders }
+      if (!(busy && chat.queue(typed, all, context))) void chat.send(typed, all, context)                          // an answer is being written: this waits in line and goes when it ends
+    }
+    if (!busy) noteSend(input.current?.getBoundingClientRect())          // where the prompt rises from
     setText(""); setFiles([])
     pinned.current = true
     setAway(false)
-    void chat.send(typed, f, { health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folders() })
+    void go()
   }
   const ctx = () => ({ health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folders() })
   const project = chat.index.projects.find((p) => p.id === chat.currentProject())       // the open conversation's project (or the one a new conversation was started in): its folders are where the coding tools work
@@ -317,6 +327,12 @@ export function Chat({ id }: { id?: string }) {
             actions={isPrompt(m) ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt } : undefined} />
         ))}
         {chat.compacting && !!busy && !chat.messages.includes(busy.msg) && <CompactingLine />}
+        {chat.queuedOf().map((q) => (
+          <QueuedMessage key={q.id} text={q.text} files={q.files} answering={!!busy}
+            onEdit={() => { const x = chat.unqueue(q.id); if (x) { setText((cur) => (cur.trim() ? x.text + "\n\n" + cur : x.text)); setFiles((fs) => [...x.files, ...fs]); input.current?.focus() } }}
+            onRemove={() => { chat.unqueue(q.id) }}
+            onSend={() => { void chat.sendQueued(q.id) }} />
+        ))}
         {leaving.length > 0 && <Leaving messages={leaving} onGone={() => setLeaving([])} />}
       </div>
 
@@ -338,6 +354,7 @@ export function Chat({ id }: { id?: string }) {
           onNewChat={newChat}
           onSave={download}
           context={{ view: contextView(chat.messages, chat.contextReported(), health.max_context, chat.settings.autoCompact !== false), canCompact: chat.canCompact(), onCompact: () => { void chat.compact(ctx()) }, open: ctxOpen }}
+          mention={{ folders: chat.folders(), enabled: agentInfo.allowed }}
           skills={commands}
           agent={{
             info: agentInfo, on: chat.settings.agent !== false, mode: (chat.settings.agentMode === "plan" || chat.settings.agentMode === "auto" ? chat.settings.agentMode : "ask") as AgentMode,

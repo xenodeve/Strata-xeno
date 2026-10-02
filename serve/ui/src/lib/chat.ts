@@ -204,6 +204,9 @@ export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: b
 /** An answer that is being written (or a conversation that is being summarised) for one conversation. Several can run at once, each for its own conversation: the page shows one,
  *  and the others go on in the background (the server takes their requests one after the other). `messages` is the live list of that conversation. */
 interface Run { abort: AbortController; msg: Message; messages: Message[]; meter: PrefillMeter | null; compacting: boolean }
+/** A message typed while the conversation was answering: it waits, and is sent when the answer ends. */
+export interface Queued { id: string; text: string; files: Attachment[]; ctx: SendContext }
+const MAX_QUEUED = 20
 const NEW_KEY = "new"                                         // a conversation that is not in the list yet (only before its first prompt is saved)
 
 /** A conversation as it is stored: attachments are kept by name only, and an answer that is still being written (`skip`) is left out. */
@@ -218,6 +221,7 @@ export class ChatController {
   messages: Message[] = restore(store.get<Message[]>("chat", []))   // the open one
   settings: Settings = { ...DEFAULTS, ...store.get<Partial<Settings>>("sampling", {}) }
   private runs = new Map<string, Run>()                       // the conversations that are being answered, by id
+  private queues = new Map<string, Queued[]>()                 // what was typed meanwhile, by conversation
   /** The open conversation's answer that is being written, or null. (Another conversation may be answering in the background: see `runningIds`.) */
   get busy(): { abort: AbortController; msg: Message } | null {
     const r = this.runs.get(this.index.active ?? NEW_KEY)
@@ -230,6 +234,47 @@ export class ChatController {
   }
   /** The open conversation is being summarised. */
   get compacting(): boolean { return !!this.runs.get(this.index.active ?? NEW_KEY)?.compacting }
+  /** The messages of the open conversation that wait for its answer to end. */
+  queuedOf(): Queued[] { return this.queues.get(this.index.active ?? NEW_KEY) ?? [] }
+  /** Keeps a message to be sent when the open conversation's answer ends. False when it is not answering (it is sent then, not kept) or there is nothing to keep. */
+  queue(text: string, files: Attachment[], ctx: SendContext): boolean {
+    const typed = text.trim()
+    if (!this.busy || (!typed && !files.length)) return false
+    const key = this.index.active ?? NEW_KEY
+    this.queues.set(key, [...(this.queues.get(key) ?? []), { id: Math.random().toString(36).slice(2, 10), text: typed, files, ctx }].slice(-MAX_QUEUED))
+    this.notify()
+    return true
+  }
+  /** Takes a waiting message back (to be edited, or dropped). */
+  unqueue(id: string): Queued | null {
+    const key = this.index.active ?? NEW_KEY
+    const q = this.queues.get(key) ?? []
+    const at = q.findIndex((x) => x.id === id)
+    if (at < 0) return null
+    const [gone] = q.splice(at, 1)
+    if (!q.length) this.queues.delete(key)
+    this.notify()
+    return gone
+  }
+  /** Sends a waiting message now (when the answer was stopped, so nothing sent it). */
+  async sendQueued(id: string): Promise<boolean> {
+    if (this.busy) return false
+    const q = this.unqueue(id)
+    if (!q) return false
+    await this.send(q.text, q.files, q.ctx)
+    return true
+  }
+  /** The next waiting message of a conversation goes when its answer ended well and the conversation is the one that is open; an answer that was stopped, or failed, sends nothing. */
+  private drain(key: string) {
+    const q = this.queues.get(key)
+    if (!q?.length || this.index.active !== key || this.busy) return
+    const last = this.messages[this.messages.length - 1]
+    if (last && last.role === "assistant" && (last.stopped || last.error)) return
+    const next = q.shift()!
+    if (!q.length) this.queues.delete(key)
+    this.notify()
+    void this.send(next.text, next.files, next.ctx)
+  }
   /** The conversations that are being answered now (the open one too), and those among them that wait for the user's answer to a question of the coding tools. */
   runningIds(): string[] { return [...this.runs.keys()].filter((k) => k !== NEW_KEY) }
   askingIds(): string[] { return [...this.runs].filter(([k, r]) => k !== NEW_KEY && (r.msg.tools || []).some((c) => c.state === "asking")).map(([k]) => k) }
@@ -298,10 +343,12 @@ export class ChatController {
     this.messages = live ? live.messages : restore(r.messages as Message[])
     this.pendingProject = null
     this.notify()
+    this.drain(id)                                            // what was typed in it while it answered in the background goes now
     return true
   }
   remove(id: string): boolean {
     if (this.runs.has(id)) return false                       // not while it is being answered
+    this.queues.delete(id)
     const r = removeSession(store, this.index, id)
     this.index = r.index
     if (r.clearedActive) this.messages = []
@@ -623,6 +670,7 @@ export class ChatController {
       if (!r.ok) this.storageFull()
     }
     this.notify()
+    this.drain(id)                                            // what was typed while it answered goes next
   }
 }
 
