@@ -20,10 +20,12 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 FILE_READ = ("Read", "Glob", "Grep")
 FILE_EDIT = ("Write", "Edit", "NotebookEdit")
-KNOWN = FILE_READ + FILE_EDIT + ("Bash", "TodoWrite", "BashOutput", "KillShell", "ExitPlanMode", "AskUserQuestion")
+WEB = ("WebFetch", "WebSearch")                                  # they send something off this PC: every call asks, unless the user wrote a rule for it
+KNOWN = FILE_READ + FILE_EDIT + WEB + ("Bash", "TodoWrite", "BashOutput", "KillShell", "ExitPlanMode", "AskUserQuestion")
 FREE = ("TodoWrite", "BashOutput", "KillShell", "AskUserQuestion")      # they only act on what the user already allowed in this chat, or only ask the user something
 
 
@@ -143,6 +145,19 @@ def _path_rule_matches(spec: str, path: str, cwd: str | None) -> bool:
     if base is not None and (target == base or (os.name == "nt" and target.lower() == base.lower())):
         return True
     return bool(_glob_re(spec).match(target))
+
+
+def _web_rule_matches(spec: str | None, tool: str, args: dict) -> bool:
+    """A rule for WebFetch or WebSearch: the tool alone, or WebFetch(domain:example.com) for that site and its sub-domains."""
+    if spec is None:
+        return True
+    m = re.fullmatch(r"\s*domain:\s*([A-Za-z0-9.-]+)\s*", spec)
+    if tool != "WebFetch" or not m:
+        return False
+    url = args.get("url")
+    host = (urlsplit(url).hostname or "").lower().rstrip(".") if isinstance(url, str) else ""
+    want = m.group(1).lower().rstrip(".")
+    return bool(host) and (host == want or host.endswith("." + want))
 
 
 def _family(tool: str) -> str:
@@ -349,6 +364,10 @@ MULTI = {"git", "npm", "pnpm", "yarn", "docker", "kubectl", "cargo", "go", "gh",
 
 def rule_for(tool: str, args: dict) -> str | None:
     """The rule the page may remember when the user chooses "allow for this chat" (None when there is no sensible one)."""
+    if tool == "WebFetch":
+        url = args.get("url")
+        host = (urlsplit(url).hostname or "").lower().rstrip(".") if isinstance(url, str) else ""
+        return f"WebFetch(domain:{host})" if re.fullmatch(r"[a-z0-9.-]+", host) and "." in host else None      # a search has no sensible rule: it asks every time
     if tool == "Bash":
         c = args.get("command")
         p = parse(c) if isinstance(c, str) else None
@@ -403,6 +422,9 @@ def decide(tool: str, args: dict, pol: Policy) -> Decision:
             c = args.get("command")
             if isinstance(c, str) and any(_segment_matches(spec, w) for w in parse(c).segments + _inner_commands(c)):
                 return Decision("deny", f"denied by the rule {rule}", rule=rule)
+        elif tool in WEB:
+            if _web_rule_matches(spec, tool, args):
+                return Decision("deny", f"denied by the rule {rule}", rule=rule)
         else:
             t, _ = _file_target(tool, args, pol)
             if t and _path_rule_matches(spec, t, pol.cwd):
@@ -420,7 +442,17 @@ def decide(tool: str, args: dict, pol: Policy) -> Decision:
     if tool not in KNOWN:
         return ask(f"{tool} is not a tool this chat knows", judge=False)
 
-    # 2. a command
+    # 2. the web: it leaves this PC, so it asks every time (what the user wrote a rule for is theirs to have allowed); no judge settles it, and plan mode does not change that
+    if tool in WEB:
+        for rule in pol.allow:
+            rt, spec = _rule_parts(rule)
+            if rt == tool and _web_rule_matches(spec, tool, args):
+                return Decision("allow", f"allowed by the rule {rule}", rule=rule)
+        url = args.get("url")
+        host = (urlsplit(url).hostname or "") if tool == "WebFetch" and isinstance(url, str) else ""
+        return ask(f"it fetches a page from {host or 'the internet'}: the address leaves this PC" if tool == "WebFetch" else "it sends your search words to a search engine: they leave this PC", judge=False)
+
+    # 3. a command
     if tool == "Bash":
         c = args.get("command")
         if not isinstance(c, str) or not c.strip():
@@ -442,7 +474,7 @@ def decide(tool: str, args: dict, pol: Policy) -> Decision:
             return ask("this command can do harm that is hard to undo", danger=True)
         return ask(why_not or "a command asks every time", judge=not secret)
 
-    # 3. a file tool
+    # 4. a file tool
     target, why = _file_target(tool, args, pol)
     if target is None:
         return ask(why, judge=False)

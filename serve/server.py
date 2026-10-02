@@ -59,7 +59,7 @@ from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's la
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
 from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
-from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, shell as shell_mod  # noqa: E402
+from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, shell as shell_mod, web as web_mod  # noqa: E402
 from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -932,12 +932,17 @@ class Service:
                 break
             parent = os.path.dirname(d)
             d = parent if parent != d else None
-        tools = [t["name"] for t in self.agent.tools if t["name"] != "ExitPlanMode" or mode == "plan"]
-        run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
         try:
-            defined, _problems = hooks_mod.load(harness._cfg(self))
-        except Exception:  # noqa: BLE001 - a config that cannot be read means no hooks
-            defined = []
+            conf = harness._cfg(self)
+        except Exception:  # noqa: BLE001 - a config that cannot be read means the defaults: no web access, no hooks
+            conf = {}
+        web = web_mod.settings(conf)
+        run.hidden = set() if web["on"] else set(getattr(self.agent, "web_tools", ()))          # web access is off until the user switches it on: the model is not even offered the tools
+        if web["on"]:
+            run.ctx.web = web_mod.Web(web)
+        tools = [t["name"] for t in self.agent.tools if (t["name"] != "ExitPlanMode" or mode == "plan") and t["name"] not in run.hidden]
+        run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
+        defined, _problems = hooks_mod.load(conf)
         run.ctx.vision = self.vision is not None and not self._vision_down()          # Read can give an image to the model only when the vision encoder is there
         runner = hooks_mod.Runner(defined, sh, folder, sid, run._emit, lambda: run.cancel.is_set())
         if runner:
@@ -2195,6 +2200,15 @@ def make_handler(svc: Service):
                     self._json(200, {**hooks_mod.view(harness._cfg(svc)), "config_file": os.path.basename(svc.config_path) if svc.config_path else None,
                                      "shell": bool(getattr(svc.agent, "shell", None)), "editable": bool(svc.config_path)})
                 return
+            if path == "/agent/web":
+                # web access (serve/web.py): off by default; only who may use the coding tools sees the settings
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    self._json(200, {**web_mod.public_view(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "web_tools", ())), "editable": bool(svc.config_path),
+                                     "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
+                return
             if path == "/agent/folders":
                 # the folders of this PC, to choose a project's folder from (only the names of folders, and only for who may use the coding tools)
                 if self._authorized():
@@ -2412,6 +2426,31 @@ def make_handler(svc: Service):
                 if not svc.broker.answer(body["id"], body["decision"]):
                     return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
                 return self._json(200, {"ok": True})
+            if path == "/agent/web":                         # web access on or off, and the search provider (serve/web.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
+                if not self._own_page("web access can be changed"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                if not svc.config_path:
+                    return self._json(409, {"error": {"message": harness.NO_FILE}})
+                if not 0 < n <= 100_000:
+                    return self._json(413, {"error": {"message": "send a body of up to 100 KB"}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self._json(400, {"error": {"message": "the body is not JSON"}})
+                new, errors = web_mod.check_settings({**web_mod.settings(harness._cfg(svc)), **body} if isinstance(body, dict) else body)
+                if errors:
+                    return self._json(400, {"error": {"message": f"{errors[0]['message']} ({errors[0]['field']})", "fields": errors}})
+                with mcp_admin._lock:
+                    try:
+                        mcp_admin.update_config(svc.config_path, lambda cfg: cfg.__setitem__("web", new))
+                    except (OSError, ValueError, TypeError) as e:
+                        return self._json(500, {"error": {"message": f"it could not be saved: {e}"}})
+                return self._json(200, {**web_mod.public_view(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "web_tools", ())), "editable": True, "config_file": os.path.basename(svc.config_path)})
             if path == "/agent/hooks":                       # which hooks are switched off (the hooks themselves are written in the run config only)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
@@ -2639,7 +2678,7 @@ def make_handler(svc: Service):
                     skip |= {n for n in svc.mcp.servers if n != "agent"}      # the coding tools alone: no MCP server
                 if arun is None:
                     skip.add("agent")                             # and the coding tools only when the request asks for them
-                extra = svc.mcp.template_tools(exclude=own, skip_servers=skip)       # the request's own tools win a name clash
+                extra = svc.mcp.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
@@ -3025,6 +3064,7 @@ def main() -> int:
     agent_server = None if cfg.get("agent") is False else agent_mod.AgentServer()      # the chat's coding tools; "agent": false in the run config switches them off
     if agent_server is not None:
         shell_mod.install(agent_server, shell_mod.find_shell())
+        web_mod.install(agent_server)                         # WebFetch and WebSearch: offered to a chat only when the user has switched web access on
     hub = hub_from_config(cfg, a.mcp_config, builtins={**importer.builtins(), **({"agent": agent_server} if agent_server else {})})     # before the minutes of loading: a bad entry stops here
     placeholder = None
     if a.engine == "strata":

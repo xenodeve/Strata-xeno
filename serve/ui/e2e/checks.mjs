@@ -2011,6 +2011,70 @@ export const checks = [
     },
   },
   {
+    // Web access (issue #99): off by default, switched on in Settings (kept in the run config), the Brave key never shown again, and every fetch asks first with the address and "Always allow this site".
+    name: "web: Settings switch it on from off, keep the provider and a key that is never shown again; a fetch asks with the address and offers the site as a rule",
+    async run({ browser, importer, fast, t, errors }) {
+      const fs = await import("node:fs")
+      const NL = String.fromCharCode(10)
+      const original = fs.readFileSync(importer.config, "utf8")
+      const saved = () => JSON.parse(fs.readFileSync(importer.config, "utf8"))
+      try {
+        const pg = await open(browser, errors, { width: 1200, height: 900 })
+        await pg.goto(importer.base + "/#/settings/web")
+        await pg.waitForSelector("[data-web]")
+        await pg.waitForTimeout(700)
+        const sw = pg.getByRole("switch", { name: "Let the model use the web" })
+        t.ok("it is off by default and says nothing leaves the PC", (await sw.getAttribute("aria-checked")) === "false" && (await pg.locator("[data-web]").innerText()).includes("Off: nothing leaves this PC."))
+        t.ok("the page warns that it sends things off this PC", (await pg.locator("[data-web]").innerText()).includes("sends something off this PC"))
+        await sw.click()
+        await pg.waitForFunction(() => document.querySelector("[role=switch][aria-label='Let the model use the web']")?.getAttribute("aria-checked") === "true")
+        t.ok("switching it on is kept in the run config", saved().web?.on === true)
+
+        await pg.getByRole("radio", { name: "Brave Search" }).click()
+        await pg.waitForSelector("#web-brave")
+        await pg.fill("#web-brave", "BSAe2esecret")
+        await pg.getByRole("button", { name: "Save", exact: true }).click()
+        await pg.waitForFunction(() => /key is saved/.test(document.querySelector("[data-web]")?.textContent || ""))
+        t.ok("a key is kept on the server and the provider with it", saved().web?.brave_key === "BSAe2esecret" && saved().web?.provider === "brave")
+        t.ok("the page is never given the key back", !(await pg.content()).includes("BSAe2esecret") && (await pg.inputValue("#web-brave")) === "")
+        await pg.reload()
+        await pg.waitForSelector("[data-web]")
+        await pg.waitForTimeout(500)
+        t.ok("after a reload it is still on, with the key still unseen", (await pg.getByRole("switch", { name: "Let the model use the web" }).getAttribute("aria-checked")) === "true" && !(await pg.content()).includes("BSAe2esecret"))
+        await pg.getByRole("button", { name: "Remove the key" }).click()
+        await pg.waitForFunction(() => !/key is saved/.test(document.querySelector("[data-web]")?.textContent || ""))
+        t.ok("the key can be removed", !saved().web?.brave_key)
+        await pg.context().close()
+      } finally {
+        fs.writeFileSync(importer.config, original)
+      }
+
+      // a fetch asks first, with the address and a rule for the site (the server's stream is scripted)
+      const chunk = (o) => `data: ${JSON.stringify(o)}${NL}${NL}`
+      const ev = (e) => chunk({ choices: [{ delta: {} }], strata_mcp: e })
+      const stream = ev({ event: "start", id: "w1", name: "WebFetch" }) + ev({ event: "call", id: "w1", name: "WebFetch", server: "agent", tool: "WebFetch", arguments: { url: "https://docs.example.com/guide" }, round: 1 }) +
+        ev({ event: "permission", id: "p1", call_id: "w1", tool: "WebFetch", arguments: { url: "https://docs.example.com/guide" }, why: "it fetches a page from docs.example.com: the address leaves this PC", danger: false, rule: "WebFetch(domain:docs.example.com)" }) +
+        chunk({ choices: [{ delta: { content: "ok" } }] }) + chunk({ choices: [], usage: { completion_tokens: 1 } }) + `data: [DONE]${NL}${NL}`
+      const info = { available: true, allowed: true, shell: "bash", tools: ["WebFetch"] }
+      const pg2 = await open(browser, errors, { width: 1200, height: 900 })
+      await pg2.route("**/agent", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(info) }))
+      await pg2.route("**/v1/chat/completions", (r) => r.fulfill({ status: 200, contentType: "text/event-stream", body: stream }))
+      await pg2.goto(fast.base + "/#/chat")
+      await pg2.waitForSelector("textarea[aria-label='Message']")
+      await pg2.waitForTimeout(900)
+      await pg2.fill("textarea[aria-label='Message']", "read the guide")
+      await pg2.keyboard.press("Enter")
+      const call = pg2.locator("[data-agent-call='WebFetch']").first()
+      await call.waitFor({ timeout: 8000 })
+      await pg2.waitForTimeout(500)
+      const text = await call.innerText()
+      t.ok("the call shows the address, and the card says why it asks", text.includes("https://docs.example.com/guide") && text.includes("the address leaves this PC"))
+      await call.getByRole("button", { name: "More choices" }).click()
+      t.ok("and offers the site as a rule", (await call.locator("[data-ask-keep]").innerText()).includes("Always allow everywhere") && (await call.innerText()).includes("WebFetch(domain:docs.example.com)"))
+      await pg2.context().close()
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {

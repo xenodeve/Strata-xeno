@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from "react"
-import { BookOpen01Icon, Brain01Icon, ComputerTerminal01Icon, Shield01Icon, Download04Icon, Key01Icon, PaintBoardIcon, PlugSocketIcon, ServerStack01Icon, WebhookIcon } from "@hugeicons/core-free-icons"
+import { BookOpen01Icon, Brain01Icon, ComputerTerminal01Icon, Shield01Icon, Download04Icon, Key01Icon, PaintBoardIcon, PlugSocketIcon, ServerStack01Icon, WebhookIcon, Globe02Icon } from "@hugeicons/core-free-icons"
 import { href } from "../lib/router"
 import { msg, t, useLang } from "../lib/i18n"
 import { store } from "../lib/store"
@@ -11,6 +11,7 @@ import { McpSettings } from "../components/McpSettings"
 import { ImportSettings } from "../components/ImportSettings"
 import { PermissionsSettings } from "../components/PermissionsSettings"
 import { HooksSettings } from "../components/HooksSettings"
+import { WebSettings } from "../components/WebSettings"
 import { AgentControls } from "../components/AgentControls"
 import { getAgent } from "../lib/api"
 import { chat } from "../lib/chat"
@@ -19,15 +20,15 @@ import { NO_AGENT, type AgentInfo } from "../lib/agent"
 // What can be set in the app, apart from what About tells. A menu of sections and topics; the address says which topic shows
 // (#/settings/mcp-servers), so a link can point at one. The status marks and the API key are kept in this browser; the MCP
 // servers and their limits are saved in the run config, from this PC.
-const TOPICS = ["status-marks", "api-key", "coding-tools", "permissions", "hooks", "mcp-servers", "mcp-limits", "import-skills", "import-mcp", "import-memory"] as const
+const TOPICS = ["status-marks", "api-key", "coding-tools", "permissions", "hooks", "web", "mcp-servers", "mcp-limits", "import-skills", "import-mcp", "import-memory"] as const
 type Topic = (typeof TOPICS)[number]
-const LABEL: Record<Topic, string> = { "status-marks": msg("Status marks"), "api-key": msg("API key"), "coding-tools": msg("Coding tools"), permissions: msg("Permissions"), hooks: msg("Hooks"), "mcp-servers": msg("Servers"), "mcp-limits": msg("Limits"), "import-skills": msg("Skills"), "import-mcp": msg("MCP servers"), "import-memory": msg("Memory") }
+const LABEL: Record<Topic, string> = { "status-marks": msg("Status marks"), "api-key": msg("API key"), "coding-tools": msg("Coding tools"), permissions: msg("Permissions"), hooks: msg("Hooks"), web: msg("Web access"), "mcp-servers": msg("Servers"), "mcp-limits": msg("Limits"), "import-skills": msg("Skills"), "import-mcp": msg("MCP servers"), "import-memory": msg("Memory") }
 const SECTIONS: { value: string; label: string; topics: Topic[] }[] = [
-  { value: "general", label: msg("General"), topics: ["status-marks", "api-key", "coding-tools", "permissions", "hooks"] },
+  { value: "general", label: msg("General"), topics: ["status-marks", "api-key", "coding-tools", "permissions", "hooks", "web"] },
   { value: "mcp", label: msg("MCP tools"), topics: ["mcp-servers", "mcp-limits"] },
   { value: "import", label: msg("Import"), topics: ["import-skills", "import-mcp", "import-memory"] },
 ]
-const ICON = { "status-marks": PaintBoardIcon, "api-key": Key01Icon, "coding-tools": ComputerTerminal01Icon, permissions: Shield01Icon, hooks: WebhookIcon, "mcp-servers": ServerStack01Icon, "mcp-limits": PlugSocketIcon, "import-skills": BookOpen01Icon, "import-mcp": Download04Icon, "import-memory": Brain01Icon }
+const ICON = { "status-marks": PaintBoardIcon, "api-key": Key01Icon, "coding-tools": ComputerTerminal01Icon, permissions: Shield01Icon, hooks: WebhookIcon, web: Globe02Icon, "mcp-servers": ServerStack01Icon, "mcp-limits": PlugSocketIcon, "import-skills": BookOpen01Icon, "import-mcp": Download04Icon, "import-memory": Brain01Icon }
 
 function ApiKey() {
   const [key, setKey] = useState(() => store.get("apikey", ""))
@@ -93,7 +94,7 @@ export function Settings({ topic }: { topic?: string }) {
           <BranchedMenu startOpen sections={sections} active={active} label={t("Settings sections")} onSelect={(x) => { location.hash = href("settings", x) }} />
         </aside>
         <div key={active} className="panel-in min-w-0 max-w-[65ch] flex-1">
-          {active === "status-marks" ? <Marks /> : active === "api-key" ? <ApiKey /> : active === "coding-tools" ? <CodingTools /> : active === "permissions" ? <PermissionsSettings /> : active === "hooks" ? <HooksSettings /> : active === "import-skills" ? <ImportSettings part="skills" /> : active === "import-mcp" ? <ImportSettings part="mcp" /> : active === "import-memory" ? <ImportSettings part="memory" /> : <McpSettings part={active === "mcp-servers" ? "servers" : "limits"} />}
+          {active === "status-marks" ? <Marks /> : active === "api-key" ? <ApiKey /> : active === "coding-tools" ? <CodingTools /> : active === "permissions" ? <PermissionsSettings /> : active === "hooks" ? <HooksSettings /> : active === "web" ? <WebSettings /> : active === "import-skills" ? <ImportSettings part="skills" /> : active === "import-mcp" ? <ImportSettings part="mcp" /> : active === "import-memory" ? <ImportSettings part="memory" /> : <McpSettings part={active === "mcp-servers" ? "servers" : "limits"} />}
         </div>
       </div>
     </div>

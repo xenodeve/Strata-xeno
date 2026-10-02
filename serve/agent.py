@@ -65,6 +65,7 @@ class AgentContext:
     checkpoint: object | None = None                       # serve/checkpoints.py Scope: the way back for the files the tools change in this prompt
     hooks: object | None = None                            # serve/hooks.py Runner: the user's own commands before and after a call (none by default)
     vision: bool = False                                   # the server has the vision encoder: Read can give an image to the model
+    web: object | None = None                              # serve/web.py Web: set only when the user switched web access on (WebFetch and WebSearch run only with it)
 
 
 class Session:

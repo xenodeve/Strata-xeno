@@ -48,6 +48,24 @@ export async function getAgent(): Promise<AgentInfo | null> {
   } catch { return null }
 }
 
+export interface WebView { on: boolean; provider: "searxng" | "brave"; searxng_url: string; brave_key_set: boolean; available: boolean; editable: boolean; config_file: string | null }
+
+/** Web access for the coding tools (serve/web.py): whether it is on, the search provider, whether there is a Brave key (never the key). null when the server cannot be asked (not this PC, no such route). */
+export async function getWeb(): Promise<WebView | null> {
+  try {
+    const r = await fetch(url("agent/web"), { headers: apiHeaders() })
+    return r.ok ? ((await r.json()) as WebView) : null
+  } catch { return null }
+}
+
+/** Change web access: any of `on`, `provider`, `searxng_url`, `brave_key` (the others stay). The answer is the new state, or why not. */
+export async function postWeb(body: Record<string, unknown>): Promise<{ view: WebView } | { error: string }> {
+  try {
+    const r = await fetch(url("agent/web"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body) })
+    return r.ok ? { view: (await r.json()) as WebView } : { error: await errorMessage(r) }
+  } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
+}
+
 /** The user's hooks (serve/hooks.py), read only, with whether each is on; null when the server cannot be asked (not this PC, no such route). */
 export async function getHooks(): Promise<HooksView | null> {
   try {

@@ -92,6 +92,8 @@ describe("toolSummary: a call in a few words", () => {
     expect(toolSummary("TodoWrite", { todos: [1, 2, 3] })).toBe("3 steps")
     expect(toolSummary("BashOutput", { bash_id: "bash_1" })).toBe("bash_1")
     expect(toolSummary("KillShell", { shell_id: "bash_2" })).toBe("bash_2")
+    expect(toolSummary("WebFetch", { url: "https://example.com/a" })).toBe("https://example.com/a")
+    expect(toolSummary("WebSearch", { query: "rice recipes" })).toBe("rice recipes")
   })
   test("arguments that are not what they should be give nothing, not a crash", () => {
     expect(toolSummary("Read", null)).toBe("")

@@ -68,6 +68,8 @@ class AgentRun:
         self.events: queue.Queue = queue.Queue()
         self.current: str | None = None                      # the id of the model's call that is running (for the page to tie a card to it)
         self.prompt = ""                                       # the rules for the AI (serve/agent_prompt.py), set by the server
+        self.hidden: set = set()                               # coding tools that are not offered to the model in this request (web access, until it is switched on)
+        self.hooks = None                                      # serve/hooks.py Runner, when the user has hooks
         self.ctx = agent.AgentContext(policy=policy, session=session, ask=self.ask, cancel=cancel, emit=self._emit, question=self.question)
 
     def bind(self, cancel: threading.Event) -> None:
