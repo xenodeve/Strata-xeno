@@ -260,8 +260,9 @@ inline int ring_slots(size_t T) {
     const int r = v ? std::atoi(v) : g_ring_override > 0 ? g_ring_override : (g_pinned_share >= 0.9 ? pinned_ring : 96);
     if (v && r == STAGE) return STAGE; // Explicit opt-in to routed-only staging, including large chunks.
     const int big = r < 16 ? 16 : r > ring_cap() ? ring_cap() : r;
-    // xeno #56: the same threshold as `stream_all` - the split layout keeps 2048 (a ring for 1024+ chunks there grew each
-    // wave lane's loan by ~0.5 GB for a chunk that cannot stream all)
+    // xeno #56: the same threshold as `stream_all` - the split layout's split_min() (#119; default 2048: a ring for
+    // 1024+ chunks once grew each wave lane's loan by ~0.5 GB for a chunk that could not stream all; at 256 and 512 the
+    // served D2x still borrows 2,740 slots, sm119-*.log)
     return (int64_t) T >= (g_split_layout ? split_min() : stream_all_min()) ? big : STAGE;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)

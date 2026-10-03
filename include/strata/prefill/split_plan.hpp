@@ -23,8 +23,12 @@ SplitPlan split_plan(bool native, const std::vector<char>& mmq_layer);
 /// one-card layer of a split chunk publishes its own hand-off to the other lane.
 bool wave_ok(const SplitPlan& p);
 
+/// #119: the old constant STREAM_ALL_MIN - the split's default chunk floor, and the smallest lane the wave runs.
+inline constexpr int64_t kSplitMinDefault = 2048;
+
 /// #119: the smallest prompt chunk the split runs on (and that streams every expert under the split layout):
-/// STRATA_PREFILL_SPLIT_MIN, 256-65536 tokens; unset or anything else is the old constant, 2048.
+/// STRATA_PREFILL_SPLIT_MIN, 256-2048 tokens (above 2048 nothing was measured, and a floor above the wave's lane
+/// runs both lanes unsplit); unset or anything else is the old constant, 2048.
 int64_t split_min_from(const char* env);
 
 /// #119: a prompt part waves (two lanes of half the chunk) only where each lane still reads 2048+ tokens, whatever
