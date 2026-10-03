@@ -238,7 +238,7 @@ class ToolLoop(unittest.TestCase):
         self.log = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
         self.log.close()
         os.environ["FAKE_MCP_LOG"] = self.log.name
-        self.hub = McpHub({"fake": stdio(), "broken": stdio("--crash-at-start")},
+        self.hub = McpHub({"fake": stdio(), "second": stdio(), "broken": stdio("--crash-at-start")},
                           {"timeout_s": 10, "max_result_chars": 500, "max_rounds": 2})
         self.hub.start(wait=True)
         self.httpd = None
@@ -346,6 +346,37 @@ class ToolLoop(unittest.TestCase):
         self.assertIn('"name": "fake__echo"', self.engine.prompt_text(0))
         self.assertEqual(len(self.engine.prompts), 1)
 
+    def test_a_server_the_page_switched_off_offers_no_tools(self):
+        """The + menu's list: `strata_mcp_off` names the servers this chat does not use; the others still are."""
+        self.start(call_script("fake__echo", text="x"), "</think>\n\nok")
+        code, text = self.post({"strata_mcp": True, "strata_mcp_off": ["second"]})
+        self.assertEqual(code, 200, text)
+        first = self.engine.prompt_text(0)
+        self.assertIn('"name": "fake__echo"', first)
+        self.assertNotIn("second__", first)
+        mcp = [c["strata_mcp"] for c in self.chunks(text) if "strata_mcp" in c]
+        self.assertEqual((mcp[1]["server"], mcp[1]["tool"]), ("fake", "echo"))       # and it still ran
+
+    def test_with_every_server_switched_off_there_are_no_mcp_tools(self):
+        self.start(call_script("fake__echo", text="x"), "</think>\n\nnever")
+        code, text = self.post({"strata_mcp": True, "strata_mcp_off": ["fake", "second", "broken"]})
+        self.assertEqual(code, 200, text)
+        self.assertNotIn("fake__", self.engine.prompt_text(0))
+        self.assertNotIn("second__", self.engine.prompt_text(0))
+        self.assertFalse([c for c in self.chunks(text) if "strata_mcp" in c])
+        self.assertNotIn('"call"', Path(self.log.name).read_text())                  # nothing ran
+
+    def test_a_malformed_off_list_switches_nothing_off(self):
+        for bad in ("fake", [1, None], {"fake": True}):
+            with self.subTest(bad=bad):
+                self.start(call_script("fake__echo", text="x"), "</think>\n\nok")
+                self.post({"strata_mcp": True, "strata_mcp_off": bad})
+                self.assertIn('"name": "fake__echo"', self.engine.prompt_text(0))
+                self.assertIn('"name": "second__echo"', self.engine.prompt_text(0))
+                self.httpd.shutdown()
+                self.httpd.server_close()
+                self.httpd = None
+
     def test_tool_error_is_a_result(self):
         self.start(call_script("fake__fail"), "</think>\n\nIt failed.")
         code, text = self.post({"strata_mcp": True})
@@ -416,7 +447,7 @@ class ToolLoop(unittest.TestCase):
         self.assertIn("fake__echo", [t["name"] for t in servers["fake"]["tools"]])
         self.assertEqual(servers["broken"]["status"], "failed")
         self.assertIn("missing configuration", servers["broken"]["error"])
-        self.assertEqual(st["tools"], len(fake.TOOLS))
+        self.assertEqual(st["tools"], 2 * len(fake.TOOLS))              # "fake" and "second" are both up
         self.assertEqual(st["settings"]["max_rounds"], 2)
         self.svc.api_key = "k"
         with self.assertRaises(urllib.error.HTTPError):

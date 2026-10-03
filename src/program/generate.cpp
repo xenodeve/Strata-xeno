@@ -6482,6 +6482,20 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        {   // xeno UI S4: the facts the Hardware page labels (not performance numbers): the CPU kernels in use and each
+            // visible card's compute capability, in CUDA's order (the primary first)
+            std::string arch;
+            int n_dev = 0;
+            if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
+            for (int dv = 0; dv < n_dev; ++dv) {   // sm<N>@<card name, spaces as _>: the Hardware page matches by name
+                cudaDeviceProp pr{};
+                if (cudaGetDeviceProperties(&pr, dv) != cudaSuccess) continue;
+                std::string nm = pr.name;
+                for (char& ch : nm) if (ch == ' ') ch = '_';
+                arch += (arch.empty() ? "sm" : ",sm") + std::to_string(pr.major * 10 + pr.minor) + "@" + nm;
+            }
+            std::printf("INFO cpu_isa=%s gpu_arch=%s\n", strata::kernels::cpu::cpu_expert_isa(), arch.empty() ? "none" : arch.c_str());
+        }
         std::printf("INFO cache_slots=%d cache_storage=temporary-disk\n", multi_gpu ? 1 : 4);
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
@@ -7501,6 +7515,20 @@ int main(int argc, char** argv) {
             }
             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
+            {   // xeno UI S4: this request's decode counters, one STATS key=value line just before DONE (readers
+                //     that do not know it skip it; DONE is unchanged). The deltas of the same counters the
+                //     STRATA_DECODE_TIMING line and the request metrics above print: no extra sync or copy.
+                const DecSnap d1 = dec_snap();
+                std::printf("STATS windows=%lld tier_primary=%lld tier_secondary=%lld tier_pcie=%lld tier_cpu=%lld "
+                            "cpu_expert_ms=%.1f nvme_loads=%lld nvme_ms=%.1f ms_verify=%.1f ms_gpu_wait=%.1f ms_pool=%.1f "
+                            "ms_plan=%.1f ms_actq=%.1f ms_jobs=%.1f ms_cpu=%.1f ms_stage=%.1f ms_commit=%.1f ms_draft=%.1f\n",
+                            (long long) dec_windows, (long long) (drive.d.tier_entries[0] - tier0[0]),
+                            (long long) (drive.d.tier_entries[1] - tier0[1]), (long long) (drive.d.tier_entries[2] - tier0[2]),
+                            (long long) (drive.d.tier_entries[3] - tier0[3]), drive.cpu_ms - cpu_ms0,
+                            (long long) (arena_src.nvme_loads() - nvme0), arena_src.nvme_ms() - nvme_ms0, dt_run,
+                            d1.wait - ds0.wait, d1.pool - ds0.pool, d1.plan - ds0.plan, d1.actq - ds0.actq,
+                            d1.jobs - ds0.jobs, d1.run - ds0.run, d1.host - ds0.host, dt_commit, dt_draft);
+            }
             // #471: the prompt tokens this request read - all the fresh ones, or as far as the prompt pass got when a
             // cancel stopped it part-way (a cancelled request used to be logged and counted as having read them all)
             const int64_t fresh = n - resume;

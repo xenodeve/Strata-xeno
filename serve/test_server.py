@@ -650,6 +650,188 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("HIP_VISIBLE_DEVICES"), os.environ.get("HIP_VISIBLE_DEVICES"))
 
 
+class RequestHistory(unittest.TestCase):
+    """xeno UI S3: each request carries an id and its dialect, lands on disk, and is read back over /metrics/requests."""
+
+    def setUp(self):
+        from serve.history import HistoryStore
+        self.tmp = tempfile.TemporaryDirectory()
+        tok = ByteTokenizer()
+        self.svc = Service(RecordingEngine(tok, "</think>\n\nhello", max_context=CTX), tok,
+                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.hstore = HistoryStore(self.tmp.name)
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.tmp.cleanup()
+
+    def call(self, path, body, headers=None):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+
+    def get(self, path, headers=None):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(self.base + path, headers=headers or {}), timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_both_dialects_are_recorded_with_id_client_and_preview(self):
+        msgs = [{"role": "user", "content": "hello there"}]
+        self.call("/v1/chat/completions", {"model": "m", "messages": msgs, "max_tokens": 5},
+                  {"User-Agent": "open-webui/0.6"})
+        self.call("/v1/messages", {"model": "m", "messages": msgs, "max_tokens": 5}, {"User-Agent": "claude-cli/2.1"})
+        code, page = self.get("/metrics/requests")
+        self.assertEqual(code, 200)
+        self.assertEqual(page["total"], 2)
+        newest, oldest = page["items"]
+        self.assertEqual((oldest["dialect"], newest["dialect"]), ("openai", "anthropic"))
+        self.assertEqual((oldest["client"], newest["client"]), ("open-webui/0.6", "claude-cli/2.1"))
+        self.assertEqual(newest["preview"], "hello there")
+        self.assertNotEqual(oldest["id"], newest["id"])
+        self.assertEqual(self.svc.metrics()["requests"][0]["id"], newest["id"])       # same row in /metrics
+
+    def test_one_request_by_id_and_a_deleted_detail(self):
+        self.call("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5})
+        rid = self.get("/metrics/requests")[1]["items"][0]["id"]
+        (Path(self.tmp.name) / "detail" / f"{rid}.json.gz").unlink()      # the cap deleted it, the summary stays
+        code, one = self.get(f"/metrics/requests/{rid}")
+        self.assertEqual((code, one["summary"]["id"], one["detail_state"], one["detail"]), (200, rid, "deleted", None))
+        self.svc.hstore.write_detail(rid, {"rounds": [1]})
+        self.assertEqual(self.get(f"/metrics/requests/{rid}")[1]["detail"], {"rounds": [1]})
+        self.assertEqual(self.get("/metrics/requests/nope")[0], 404)
+        self.assertEqual(self.get("/metrics/requests/..%2F..%2Fx")[0], 404)
+        self.assertEqual(self.get("/metrics/requests?page=x")[0], 400)
+
+    def test_prefill_chunks_and_stats_go_to_the_summary_and_the_detail(self):
+        class PrefillEngine(ClockedEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+                self.last["prefill_points"] = [(2005, 1000.0), (4005, 3000.0)]   # REUSED = 5: two 2000-token chunks
+                self.last["stats"] = {"windows": 4}
+        tok = ByteTokenizer()
+        self.svc.engine = PrefillEngine(tok, "</think>\n\nhi", max_context=CTX)
+        self.call("/v1/chat/completions", {"model": "m", "max_tokens": 3,
+                                           "messages": [{"role": "user", "content": "x" * 50}]})
+        row = self.get("/metrics/requests")[1]["items"][0]
+        self.assertEqual(row["prefill"], {"chunks": 2, "tok_s_max": 2000.0, "tok_s_min": 1000.0, "tok_s_mean": 1333.3})
+        one = self.get(f"/metrics/requests/{row['id']}")[1]
+        self.assertEqual(one["detail_state"], "kept")
+        self.assertEqual(one["detail"]["prefill_chunks"], [[2000, 1000.0], [2000, 2000.0]])
+        self.assertEqual(one["detail"]["stats"], {"windows": 4})
+        self.assertIn("decode_series", one["detail"])
+        self.assertEqual(set(row["decode"]), {"windows", "tok_s_min", "tok_s_max", "tok_s_mean"})   # no series in the row
+
+    def post_keep(self, body, headers=None):
+        req = urllib.request.Request(self.base + "/metrics/keep", data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_the_full_prompt_is_kept_only_for_the_next_n_requests_asked_for(self):
+        chat = {"model": "m", "max_tokens": 3, "messages": [{"role": "user", "content": "the secret question " + "x" * 300}]}
+        self.call("/v1/chat/completions", chat)                                   # not asked for: not kept
+        self.assertEqual(self.post_keep({"next": 2}), (200, {"keep_prompts_left": 2}))
+        self.call("/v1/chat/completions", chat)
+        self.call("/v1/messages", chat)
+        self.call("/v1/chat/completions", chat)                                   # the third is past N
+        items = self.get("/metrics/requests")[1]["items"]
+        kept = [bool(r.get("prompt_kept")) for r in items]
+        self.assertEqual(kept, [False, True, True, False])                        # newest first
+        for r in items:
+            self.assertNotIn("prompt", r)                                         # never in the summary row
+        d = self.get(f"/metrics/requests/{items[1]['id']}")[1]["detail"]
+        self.assertEqual(d["prompt"][0]["content"][:19], "the secret question")
+        self.assertEqual(len(d["prompt"][0]["content"]), len(chat["messages"][0]["content"]))      # in full, not 200 chars
+        self.assertNotIn("prompt", self.get(f"/metrics/requests/{items[0]['id']}")[1]["detail"])
+        self.assertEqual(self.svc.keep_prompts, 0)
+
+    def test_a_kept_prompt_is_written_once_per_request_not_once_per_round(self):
+        # scrutiny of PR #104: an agent request calls run() once per round (up to 100); the shared meta kept `_prompt`, so
+        # every round wrote the same prompt again and pushed useful detail files out under the size cap
+        import threading
+        from serve.history import request_meta
+        meta = {**request_meta("openai", [{"role": "user", "content": "q"}], None, None), "_prompt": [{"role": "user", "content": "q"}]}
+        sampling = {"_meta": meta}
+        for _ in range(3):
+            list(self.svc.run(self.svc.tok.encode("q"), False, None, 3, sampling, threading.Event()))
+        items = self.get("/metrics/requests")[1]["items"]
+        self.assertEqual(len(items), 3)
+        self.assertEqual(sorted(bool(r.get("prompt_kept")) for r in items), [False, False, True])
+        kept = [r for r in items if r.get("prompt_kept")][0]
+        self.assertEqual(kept["id"], meta["id"])                                   # the request's own row, not round -2 or -3
+
+    def test_keep_needs_a_sane_number_and_the_key(self):
+        self.assertEqual(self.post_keep({"next": -1})[0], 400)
+        self.assertEqual(self.post_keep({"next": 1000})[0], 400)
+        self.assertEqual(self.post_keep({"next": "x"})[0], 400)
+        self.assertEqual(self.post_keep({"next": 0}), (200, {"keep_prompts_left": 0}))   # 0 turns it off
+        self.svc.api_key = "secret"
+        self.assertEqual(self.post_keep({"next": 1})[0], 401)
+        self.assertEqual(self.post_keep({"next": 1}, {"Authorization": "Bearer secret"})[0], 200)
+
+    def test_every_engine_call_of_one_request_has_its_own_history_row(self):
+        # an MCP request calls Service.run once per tool round with the same request: one id, one row per round
+        from serve.history import request_meta
+        req = {"_meta": request_meta("openai", [{"role": "user", "content": "q"}], None, "ua")}
+        for _ in range(3):
+            list(self.svc.run([1, 2, 3], False, None, 4, req, threading.Event()))
+        ids = [r["id"] for r in self.get("/metrics/requests")[1]["items"]]
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(len(set(ids)), 3)
+        self.assertEqual(ids[-1], req["_meta"]["id"])                      # the first round keeps the request's own id
+        self.assertTrue(all(i.startswith(req["_meta"]["id"]) for i in ids))
+        for i in ids:
+            self.assertIsNotNone(self.svc.hstore.detail(i))                # no round overwrote another's detail
+
+    def test_metrics_carries_the_models_name_and_quantization(self):
+        self.assertIsNone(self.get("/metrics")[1]["model_info"])                    # until main() has read the headers
+        self.svc.model_info = {"name": "M", "variant": "Q2_0", "bpw": 3.0, "roles": [{"role": "experts", "types": ["Q2_0"], "bpw": 2.25}]}
+        self.assertEqual(self.get("/metrics")[1]["model_info"]["roles"][0]["types"], ["Q2_0"])
+
+    def test_the_history_needs_the_key_when_one_is_set(self):
+        self.svc.api_key = "secret"
+        self.assertEqual(self.get("/metrics/requests")[0], 401)
+        self.assertEqual(self.get("/metrics/requests", {"Authorization": "Bearer secret"})[0], 200)
+
+
+class MonitorGpus(unittest.TestCase):
+    """The Monitor lists every card the engine can see, not only the config's \"gpu\" (xeno UI S0): the D2x config has
+    no \"gpu\" key and the launcher sets CUDA_VISIBLE_DEVICES=1,0, so the old code watched NVML card 0 alone."""
+
+    def pick(self, cfg, env, count):
+        from serve.server import monitor_gpus
+        return monitor_gpus(cfg, env, lambda: count)
+
+    def test_config_gpu_wins(self):
+        self.assertEqual(self.pick({"gpu": [0, 2]}, {"CUDA_VISIBLE_DEVICES": "1"}, 4), [0, 2])
+
+    def test_no_key_follows_the_launchers_visible_devices(self):
+        self.assertEqual(self.pick({}, {"CUDA_VISIBLE_DEVICES": "1,0"}, 2), [0, 1])     # a set, nvidia-smi order
+        self.assertEqual(self.pick({}, {"CUDA_VISIBLE_DEVICES": "1"}, 2), [1])
+
+    def test_no_key_no_env_lists_every_card(self):
+        self.assertEqual(self.pick({}, {}, 2), [0, 1])
+        self.assertEqual(self.pick({}, {"CUDA_VISIBLE_DEVICES": ""}, 3), [0, 1, 2])
+
+    def test_unreadable_env_falls_back_to_every_card(self):
+        self.assertEqual(self.pick({}, {"CUDA_VISIBLE_DEVICES": "GPU-1234abcd"}, 2), [0, 1])
+
+    def test_ids_beyond_the_card_count_are_dropped(self):
+        self.assertEqual(self.pick({}, {"CUDA_VISIBLE_DEVICES": "0,5"}, 2), [0])
+
+    def test_no_nvml_keeps_the_old_default(self):
+        self.assertEqual(self.pick({}, {}, 0), [])
+
+
 class RecordingPrompt(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_ids = list(ids)
@@ -1314,7 +1496,7 @@ class WebApp(unittest.TestCase):
             return e.code, e.headers.get("Content-Type", ""), e.read()
 
     def test_page_and_files(self):
-        code, ctype, body = self.get("/")
+        code, ctype, body = self.get("/classic/")                  # the classic app, which "/" no longer is by default
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
         self.assertIn(b"\"web/app.js\"", body)   # relative since #82 (works behind a path-prefixed proxy)
@@ -1599,6 +1781,81 @@ class TimingsDrafts(unittest.TestCase):
         self.assertEqual((t["prompt_n"], t["cache_n"]), (20, 4))
         self.assertNotIn("draft_n", request_timings(24, 20, base))
         self.assertIsNone(request_timings(24, 20, {}))
+
+
+class EngineStats(unittest.TestCase):
+    """xeno UI S4: the engine's per-request `STATS key=value ...` line, just before DONE, reaches engine.last["stats"];
+    a reader that does not know it (and DONE itself) is unchanged."""
+
+    STATS = ("STATS windows=12 tier_primary=100 tier_secondary=40 tier_pcie=7 tier_cpu=53 cpu_expert_ms=81.5 "
+             "nvme_loads=3 nvme_ms=12.25 ms_verify=900.5 ms_gpu_wait=300.0 ms_pool=410.1 ms_plan=20.0 ms_actq=15.5 "
+             "ms_jobs=30.0 ms_cpu=345.0 ms_stage=60.0 ms_commit=8.5 ms_draft=40.0")
+    DONE = "DONE 24 100 250.0 1900.5 stop 5 9 0 700 1000"
+
+    def engine(self, lines):
+        class Proc:
+            class stdin:
+                written = []
+                write = staticmethod(lambda s: Proc.stdin.written.append(s))
+                flush = staticmethod(lambda: None)
+            poll = staticmethod(lambda: None)
+        e = StrataEngine.__new__(StrataEngine)
+        e.proc, e.lines, e.QUIET_S, e.last, e.can_stop = Proc, queue.Queue(), 1, {}, False
+        for ln in lines:
+            e.lines.put(ln)
+        return e
+
+    def run_generate(self, lines):
+        e = self.engine(lines)
+        toks = [t for t in e.generate([1, 2, 3], 24, {}, threading.Event()) if t is not None]
+        return e, toks
+
+    def test_stats_before_done_lands_in_last(self):
+        e, toks = self.run_generate(["T 5", "T 6", self.STATS, self.DONE])
+        self.assertEqual(toks, [5, 6])
+        s = e.last["stats"]
+        self.assertEqual((s["windows"], s["tier_primary"], s["tier_cpu"], s["nvme_loads"]), (12, 100, 53, 3))
+        self.assertEqual((s["cpu_expert_ms"], s["ms_gpu_wait"], s["ms_draft"]), (81.5, 300.0, 40.0))
+        self.assertEqual((e.last["generated"], e.last["prompt_ms"], e.last["lookups"]), (24, 250.0, 1000))   # DONE as before
+
+    def test_no_stats_line_is_an_engine_without_it(self):
+        e, _ = self.run_generate(["T 5", self.DONE])
+        self.assertNotIn("stats", e.last)
+        self.assertEqual(e.last["generated"], 24)
+
+    def test_stats_of_one_request_do_not_leak_into_the_next(self):
+        e, _ = self.run_generate([self.STATS, self.DONE])
+        e.last = {}
+        for ln in ("T 1", self.DONE):                       # the next request: an engine that sent no STATS
+            e.lines.put(ln)
+        list(e.generate([1], 1, {}, threading.Event()))
+        self.assertNotIn("stats", e.last)
+
+    def test_a_malformed_stats_line_is_skipped_not_fatal(self):
+        e, toks = self.run_generate(["T 5", "STATS windows=x broken", "STATS", self.DONE])
+        self.assertEqual(toks, [5])
+        self.assertNotIn("stats", e.last)
+        self.assertEqual(e.last["generated"], 24)
+
+    def test_the_request_record_keeps_the_stats(self):
+        class StatsEngine(ClockedEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+                self.last["stats"] = {"windows": 3, "tier_cpu": 9}
+        tok = ByteTokenizer()
+        svc = Service(StatsEngine(tok, "</think>\n\nhi", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps({"model": "m", "max_tokens": 3,
+                                                          "messages": [{"role": "user", "content": "hello"}]}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=30).read()
+            self.assertEqual(svc.metrics()["requests"][0]["stats"], {"windows": 3, "tier_cpu": 9})
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 class ToolResultContent(unittest.TestCase):
@@ -3404,6 +3661,114 @@ class AmdTelemetry(unittest.TestCase):
             self.tree(d)
             with mock.patch.object(telemetry, "SYSFS", d):
                 self.assertEqual(svc.free_vram_mib(), 26 << 10)
+
+
+class EffortLevelsTests(unittest.TestCase):
+    """The thinking levels a model's chat template accepts, so a client offers those and no others (the shipped template:
+    low, medium and xhigh, which is also its default, and no thinking at all)."""
+
+    def template(self, source):
+        d = tempfile.mkdtemp(prefix="strata-tpl-")
+        p = Path(d) / "t.jinja"
+        p.write_text(source, encoding="utf-8")
+        return ChatTemplate(p)
+
+    def test_the_shipped_template_offers_low_medium_xhigh_and_off(self):
+        t = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        self.assertEqual(t.efforts(), {"levels": ["low", "medium", "xhigh"], "default": "xhigh", "off": True})
+
+    def test_a_template_that_knows_no_effort_offers_none(self):
+        t = self.template("{{ messages[0].content }}")
+        self.assertEqual(t.efforts(), {"levels": [], "default": None, "off": False})
+
+    def test_levels_are_what_it_renders_without_an_error(self):
+        t = self.template("{% set e = reasoning_effort|default('high') %}{% if e not in ('low', 'high') %}"
+                          "{{ raise_exception('no') }}{% endif %}{{ e }}:{{ messages[0].content }}")
+        self.assertEqual(t.efforts(), {"levels": ["low", "high"], "default": "high", "off": False})
+
+    def test_metrics_lists_them_for_the_client(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        eng = svc.metrics()["engine"]
+        self.assertEqual(eng["efforts"], ["none", "low", "medium", "xhigh"])
+        self.assertEqual(eng["effort_default"], "xhigh")
+
+    def test_other_apps_may_be_given_xhigh_as_their_default(self):
+        from serve.server import clean_shared_defaults
+        self.assertEqual(clean_shared_defaults({"reasoning_effort": "xhigh"}), {"reasoning_effort": "xhigh"})
+        with self.assertRaises(ValueError):
+            clean_shared_defaults({"reasoning_effort": "extreme"})
+
+
+class WebSecurity(unittest.TestCase):
+    """Security review of the new web app (#71). With no API key a web page on another site must not reach the monitor: not by
+    DNS rebinding (the page's own name resolves to this PC, so the browser sends that name as Host), and not by a "simple"
+    cross-site POST that needs no preflight."""
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        self.svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def call(self, path, method="GET", headers=None, body=None):
+        req = urllib.request.Request(self.base + path, method=method, data=body, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+
+    def test_a_host_that_is_not_this_pc_is_refused_when_there_is_no_key(self):
+        for host in ("attacker.com", "attacker.com:8091", "evil.example.org"):
+            for path in ("/metrics", "/metrics/requests", "/", "/next/"):
+                with self.subTest(host=host, path=path):
+                    self.assertEqual(self.call(path, headers={"Host": host})[0], 421)
+        status, _, _ = self.call("/settings", "POST", {"Host": "attacker.com", "Content-Type": "application/json", "Origin": "http://attacker.com"}, b"{}")
+        self.assertEqual(status, 421)
+
+    def test_this_pc_by_any_of_its_own_names_is_served(self):
+        for host in ("127.0.0.1:8091", "localhost:8091", "[::1]:8091", "192.168.1.20", "my-pc", "my-pc.local:8091", "foo.localhost"):
+            with self.subTest(host=host):
+                self.assertEqual(self.call("/metrics", headers={"Host": host})[0], 200)
+
+    def test_a_name_can_be_allowed_in_the_config(self):
+        self.svc.allowed_hosts = {"strata.example.com"}
+        self.assertEqual(self.call("/metrics", headers={"Host": "strata.example.com"})[0], 200)
+        self.assertEqual(self.call("/metrics", headers={"Host": "attacker.com"})[0], 421)
+
+    def test_with_a_key_the_key_decides_not_the_host(self):
+        self.svc.api_key = "secret"
+        self.assertEqual(self.call("/metrics", headers={"Host": "proxy.example.com"})[0], 401)           # not 421: the key is the gate
+        self.assertEqual(self.call("/metrics", headers={"Host": "proxy.example.com", "Authorization": "Bearer secret"})[0], 200)
+
+    def test_keep_needs_json_and_the_own_page(self):
+        plain = self.call("/metrics/keep", "POST", {"Content-Type": "text/plain"}, b'{"next": 50}')      # a "simple" cross-site request
+        self.assertEqual(plain[0], 415)
+        foreign = self.call("/metrics/keep", "POST", {"Content-Type": "application/json", "Origin": "http://evil.example"}, b'{"next": 50}')
+        self.assertEqual(foreign[0], 403)
+        self.assertEqual(self.svc.keep_prompts, 0)
+        own = self.call("/metrics/keep", "POST", {"Content-Type": "application/json", "Origin": self.base}, b'{"next": 3}')
+        self.assertEqual(own[0], 200)
+        self.assertEqual(self.svc.keep_prompts, 3)
+
+    def test_load_and_unload_refuse_a_foreign_origin(self):
+        for path in ("/load", "/unload"):
+            with self.subTest(path=path):
+                self.assertEqual(self.call(path, "POST", {"Origin": "http://evil.example"}, b"")[0], 403)
+
+    def test_the_app_cannot_be_framed(self):
+        for path in ("/", "/next/"):
+            with self.subTest(path=path):
+                status, headers, _ = self.call(path)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["X-Frame-Options"], "DENY")
+                self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+                self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
 
 
 class SilentEngine(unittest.TestCase):

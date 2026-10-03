@@ -494,9 +494,11 @@ def _clean(name: str) -> str:
 class McpHub:
     """Every configured server, and the merged, namespaced tool list the model sees."""
 
-    def __init__(self, servers: dict[str, dict], settings: dict | None = None):
+    def __init__(self, servers: dict[str, dict], settings: dict | None = None, builtins: dict | None = None):
+        """`builtins`: servers that run inside Strata (serve/skills.py) and look like an McpServer to the hub: name, kind, status, tools, call."""
         self.settings = {**DEFAULTS, **(settings or {})}
         self.servers = {name: McpServer(name, cfg, self.settings) for name, cfg in servers.items()}
+        self.servers.update(builtins or {})
         self.threads: list[threading.Thread] = []
         self._routes: dict[str, tuple[McpServer, str]] = {}
 
@@ -523,7 +525,7 @@ class McpHub:
             if s.status not in ("ready", "stopped"):
                 continue
             for t in s.tools:
-                name = f"{_clean(s.name)}__{_clean(t['name'])}"[:64]
+                name = (_clean(t["name"]) if getattr(s, "plain_names", False) else f"{_clean(s.name)}__{_clean(t['name'])}")[:64]       # the coding tools keep Claude Code's names
                 n = 2
                 while name in out:                       # two names that differ only in cleaned characters
                     name = f"{name[:60]}_{n}"
@@ -532,12 +534,12 @@ class McpHub:
         self._routes = out
         return out
 
-    def template_tools(self, exclude=()) -> list[dict]:
+    def template_tools(self, exclude=(), skip_servers=()) -> list[dict]:
         """The tools in the chat template's form ({name, description, parameters}); `exclude`: names the request
-        brought itself (those win)."""
+        brought itself (those win); `skip_servers`: servers the page switched off for this chat."""
         out = []
         for name, (s, tool) in self.routes().items():
-            if name in exclude:
+            if name in exclude or s.name in skip_servers:
                 continue
             t = next(x for x in s.tools if x["name"] == tool)
             schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
@@ -548,9 +550,10 @@ class McpHub:
     def openai_tools(self) -> list[dict]:
         return [{"type": "function", "function": t} for t in self.template_tools()]
 
-    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None) -> dict:
+    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None, ctx=None) -> dict:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
-        "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised."""
+        "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised.
+        `ctx`: the request's AgentContext, handed to a built-in server that asks for it (the coding tools)."""
         t0 = time.monotonic()
         server, tool = self._routes.get(name) or self.routes().get(name, (None, name))
         out = {"server": server.name if server else None, "tool": tool}
@@ -558,8 +561,17 @@ class McpHub:
             text, ok = f"error: there is no tool named {name!r}", False
         else:
             try:
-                res = server.call(tool, arguments if isinstance(arguments, dict) else {},
-                                  float(self.settings["timeout_s"]), cancel)
+                if getattr(server, "wants_context", False):
+                    res = server.call(tool, arguments if isinstance(arguments, dict) else {}, 0, cancel, ctx)       # a command's own timeout is its own parameter
+                else:
+                    res = server.call(tool, arguments if isinstance(arguments, dict) else {},
+                                      float(self.settings["timeout_s"]), cancel)
+                if getattr(server, "wants_context", False):               # the coding tools may give the model an image (Read): it goes with the result, not as text
+                    for b in res.get("content") or []:
+                        if isinstance(b, dict) and b.get("type") == "image" and isinstance(b.get("data"), str) and isinstance(b.get("mimeType"), str):
+                            out.setdefault("images", []).append(f"data:{b['mimeType']};base64,{b['data']}")
+                    if out.get("images"):
+                        res = {**res, "content": [b for b in res.get("content") or [] if not (isinstance(b, dict) and b.get("type") == "image")]}
                 text, ok = result_text(res), not res.get("isError")
                 if not ok:
                     text = "error: " + (text or "the tool reported an error")
@@ -568,6 +580,8 @@ class McpHub:
             except McpError as e:
                 text, ok = f"error: {e}", False
         cap = int(self.settings["max_result_chars"])
+        if server is not None and getattr(server, "wants_context", False) and cap > 0:
+            cap = max(cap, 60000)                                 # a file or a command's output is the point of the coding tools: they cut their own
         full = len(text)
         if cap > 0 and full > cap:
             text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
@@ -581,12 +595,16 @@ class McpHub:
         routes = self.routes()
         servers = []
         for s in self.servers.values():
+            if getattr(s, "hidden", False):                                  # the chat's coding tools are not MCP tools: they have their own switch
+                continue
+            if getattr(s, "kind", "") == "builtin" and not s.tools:         # a built-in with nothing to offer (no skills in use) is not listed
+                continue
             names = {tool: n for n, (srv, tool) in routes.items() if srv is s}
             servers.append({"name": s.name, "transport": s.kind, "status": s.status, "error": s.error,
                             "info": s.info,
                             "tools": [{"name": names.get(t["name"], t["name"]), "tool": t["name"],
                                        "description": str(t.get("description") or "")[:300]} for t in s.tools]})
-        return {"servers": servers, "tools": len(routes),
+        return {"servers": servers, "tools": sum(1 for srv, _ in routes.values() if not getattr(srv, "hidden", False)),
                 "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds")}}
 
     def close(self):
@@ -645,7 +663,7 @@ def settings_from(cfg: dict) -> dict:
     return out
 
 
-def hub_from_config(cfg: dict, mcp_config_path: str | None = None) -> McpHub | None:
+def hub_from_config(cfg: dict, mcp_config_path: str | None = None, builtins: dict | None = None) -> McpHub | None:
     """The run config's `"mcp_servers"` (or `"mcpServers"`) plus the servers in the --mcp-config file (Claude
     Desktop's format: {"mcpServers": {...}}); a name in both takes the file's entry.  None when there are none."""
     servers = {}
@@ -661,9 +679,9 @@ def hub_from_config(cfg: dict, mcp_config_path: str | None = None) -> McpHub | N
         if block is None:
             raise SystemExit(f"[strata] --mcp-config {mcp_config_path}: expected {{\"mcpServers\": {{...}}}}")
         servers.update(servers_from(block, f"--mcp-config {mcp_config_path}"))
-    if not servers:
+    if not servers and not builtins:
         return None
-    return McpHub(servers, settings_from(cfg))
+    return McpHub(servers, settings_from(cfg), builtins)
 
 
 if __name__ == "__main__":                               # python -m serve.mcp config.json: list what a config offers

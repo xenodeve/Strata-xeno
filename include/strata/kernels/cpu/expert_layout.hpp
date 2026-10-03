@@ -46,6 +46,9 @@ struct ExpertLayout {
 bool cpu_avx512_ok();
 // xeno: AVX-VNNI (CPUID.(7,1):EAX[4]) with OS YMM state; STRATA_FORCE_AVX2=1 turns it off
 bool cpu_avxvnni_ok();
+/// xeno UI S4: the ISA q2_rows_any dispatches the Q2_0 rows to on this CPU: "AVX-512", "AVX-VNNI" or "AVX2".
+const char* cpu_expert_isa();
+
 /// Whether this CPU (and its OS) runs the AVX2 kernels (AVX, AVX2, FMA, F16C): the floor of every expert kernel
 /// (q2_avx2.cpp, iq_avx2.cpp, and ggml-cpu in the portable build).  STRATA_FORCE_AVX2 does not change it.
 bool cpu_avx2_ok();

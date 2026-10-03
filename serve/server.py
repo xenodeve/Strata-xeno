@@ -26,6 +26,7 @@ import contextlib
 import base64
 import hashlib
 import hmac
+import ipaddress
 import codecs
 import heapq
 import itertools
@@ -56,9 +57,14 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.loop_guard import LoopGuard
-from serve import cjk_guard, forced_opening, think_budget  # noqa: E402  (xeno #49 S4, S7 follow-up, S3)
+from serve import cjk_guard, forced_opening, gguf_info, think_budget  # noqa: E402  (xeno #49 S4, S7 follow-up, S3)
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
+from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
+from serve import harness, mcp_admin  # noqa: E402
+from serve import skills as skills_mod  # noqa: E402
+from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, runs as runs_mod, shell as shell_mod, subagent as subagent_mod, web as web_mod  # noqa: E402
+from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -559,6 +565,22 @@ class StrataEngine:
             self.last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
         if len(f) >= 15:                                  # #471 (engine 0.1.36+): the prompt tokens actually read
             self.last.update(prompt_read=int(f[14]))
+        if getattr(self, "_stats", None):                 # the STATS line just before it (xeno UI S4)
+            self.last["stats"], self._stats = self._stats, None
+        if getattr(self, "_pp", None):                    # and the PP lines of its prompt read
+            self.last["prefill_points"], self._pp = self._pp, []
+
+    def _parse_stats(self, line):
+        """`STATS key=value ...` (xeno UI S4): this request's decode counters, printed by the engine just before its
+        DONE. Numbers only; a malformed line is skipped, never fatal."""
+        stats = {}
+        for kv in line.split()[1:]:
+            k, _, v = kv.partition("=")
+            try:
+                stats[k] = int(v) if v.lstrip("-").isdigit() else float(v)
+            except ValueError:
+                return
+        self._stats = stats or None
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -628,6 +650,8 @@ class StrataEngine:
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         self.progress = None
+        self._stats = None          # xeno UI S4: this request's STATS line, once the engine sends it
+        self._pp = []               # ... and its PP lines (position, ms): the prefill speed per chunk
         self.drained = []           # xeno #49 review: tokens the engine committed after an early stop (read in the drain)
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
@@ -675,6 +699,10 @@ class StrataEngine:
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                         self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+                        try:                                              # xeno UI S4: (position, ms since the read began), per chunk
+                            self._pp.append((int(f[1]), float(f[3]))) if len(f) >= 4 else None
+                        except ValueError:
+                            pass
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
@@ -683,6 +711,8 @@ class StrataEngine:
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
+                elif line.startswith("STATS "):
+                    self._parse_stats(line)
                 elif line.startswith("RESUME "):          # the reused tokens: the first chunk starts after them
                     try:
                         read_to = int(line.split()[1])
@@ -724,6 +754,8 @@ class StrataEngine:
                         break
                     if line.startswith("T "):
                         self.drained.append(int(line[2:]))
+                    elif line.startswith("STATS "):
+                        self._parse_stats(line)
                     elif line.startswith("DONE"):
                         self._parse_done(line)
                         break
@@ -920,6 +952,27 @@ def gpu_list(cfg: dict) -> list[int]:
         return []
     items = g if isinstance(g, (list, tuple)) else str(g).split(",")
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
+
+
+def monitor_gpus(cfg: dict, env=None, count=None) -> list[int]:
+    """The cards the Monitor reads: the config's "gpu" when it names any; else the launcher's CUDA_VISIBLE_DEVICES
+    (numbers, taken as NVML numbers them: right where CUDA's order matches the PCI order, and when it does not the
+    set of two cards is still both); else every card NVML sees. A config
+    with no "gpu" key (D2x) used to leave only card 0 on the Monitor."""
+    named = gpu_list(cfg)
+    if named:
+        return named
+    if count is None:
+        from serve.telemetry import nvml_device_count as count
+    n = count()
+    if n <= 0:
+        return []
+    raw = ((os.environ if env is None else env).get("CUDA_VISIBLE_DEVICES") or "").strip()
+    try:
+        ids = sorted({int(x) for x in raw.split(",") if x.strip() != ""})
+    except ValueError:                                  # UUIDs: not mappable here, show every card
+        ids = []
+    return [i for i in ids if 0 <= i < n] or list(range(n))
 
 
 def engine_silence_s(cfg: dict) -> float:
@@ -1169,6 +1222,7 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.efforts = template.efforts() if hasattr(template, "efforts") else {"levels": [], "default": None, "off": False}
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -1179,6 +1233,7 @@ class Service:
         self.fifo = RequestGate()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.allowed_hosts: set = set()                # names besides this PC's own that may be used as Host when there is no key (config "allowed_hosts")
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
         # matters); empty = no CORS headers at all, as before
         self.cors_origins: list[str] = []
@@ -1193,6 +1248,12 @@ class Service:
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
+        self.hstore = HistoryStore(Path(tempfile.gettempdir()) / "strata-history-off", enabled=False)  # main() turns it on
+        self.checkpoints = checkpoints_mod.Checkpoints(Path(tempfile.gettempdir()) / "strata-checkpoints")      # the way back for files the tools change; main() puts it in the user's data folder
+        self.model_info = None                          # the model's name and quantization, from its GGUF headers (main() fills it)
+        self.keep_prompts = 0                           # POST /metrics/keep: the next N requests keep their full prompt (Q8)
+        self.keep_lock = threading.Lock()
+        self.ui = "next"                                # which web app "/" serves: the new one; config "ui": "classic" brings the old one back
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0,
@@ -1202,6 +1263,12 @@ class Service:
         self.started_at = time.time()
         self.status_lock = threading.Lock()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
+        self.config_path = None                          # the run config (--config) and the --mcp-config file: where serve/mcp_admin.py
+        self.mcp_config_path = None                      # reads and writes the servers the web app sets up
+        self.importer = None                             # serve/harness.py's Importer: the other coding apps' skills and MCP servers (#94)
+        self.agent = None                                # serve/agent.py's AgentServer: the chat's coding tools (Read, Write, Edit, Bash, ...); None: switched off
+        self.broker = agent_run.Broker()                 # the questions the coding tools have asked the page and not had answered yet
+        self.runs = runs_mod.RunStore()                  # the answers that use the coding tools: they go on when the page that asked is refreshed or closed (serve/runs.py)
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
@@ -1215,6 +1282,93 @@ class Service:
         self.replays = collections.OrderedDict()        # xeno: replay_key -> the last greedy non-stream answer
 
     REPLAY_KEYS = ("temperature", "top_p", "top_k", "min_p", "stop_sequences", "_opening", "_think_budget")
+
+    def side_request(self, system: str, user: str, max_tokens: int = 64) -> str:
+        """The model's short answer to one question outside any chat (auto mode's judge, serve/judge.py).  Like Claude Code's own side requests
+        it is not streamed, has no tools and thinks little, and the opening its prompt asks for is written for the model (serve/forced_opening.py)."""
+        req = {"model": self.model, "system": system, "messages": [{"role": "user", "content": user}], "max_tokens": max_tokens, "stream": False,
+               "thinking": {"type": "disabled"}}
+        messages, tools, kw = anthropic_to_messages(req, vision=False)
+        think_budget.side_effort(req, kw)
+        ids, thinking, max_new = self.prepare(messages, None, kw, max_tokens, 1)
+        req = self.with_slot(req, ids)
+        opening = forced_opening.required(messages, thinking)
+        if opening:
+            req = {**req, "_opening": opening}
+        body = anthropic_collect(anthropic_events(self, req, ids, thinking, None, max_new, threading.Event()))
+        return "".join(b.get("text", "") for b in body.get("content", []) if isinstance(b, dict) and b.get("type") == "text")
+
+    def memory_blocks(self, folders: list[str]) -> list[dict]:
+        """The notes the chat is handed: the project's own instruction files, and what other apps wrote down that the user switched on (serve/memory.py)."""
+        imp = getattr(self, "importer", None)
+        home = str(imp.home) if imp is not None else str(harness.home_dir())
+        try:
+            on = memory_mod.settings(harness._cfg(self))["on"]
+        except Exception:  # noqa: BLE001 - a config that cannot be read means no other app's notes
+            on = []
+        return memory_mod.collect(home, folders, on)
+
+    def start_agent_run(self, sa: dict, messages: list):
+        """One request's use of the coding tools: the folder, mode, rules and chat the page named (anything odd is ignored), the rules for the
+        AI as a prompt, and auto mode's judge (serve/agent_run.py)."""
+        raw = sa.get("cwd")
+        folder = os.path.realpath(raw) if isinstance(raw, str) and raw.strip() and "\0" not in raw and os.path.isdir(raw) else None
+        dirs: list[str] = []                                            # the project's other folders: the real ones, once each, not the main one; none without a main one
+        for d in sa.get("dirs") if folder and isinstance(sa.get("dirs"), list) else []:
+            if isinstance(d, str) and d.strip() and "\0" not in d and os.path.isdir(d):
+                r = os.path.realpath(d)
+                if os.path.normcase(r) != os.path.normcase(folder) and os.path.normcase(r) not in [os.path.normcase(x) for x in dirs]:
+                    dirs.append(r)
+        dirs = dirs[:agent_mod.MAX_DIRS]
+        mode = sa.get("mode") if sa.get("mode") in ("auto", "plan") else None
+        rules = lambda v: [x for x in v if isinstance(x, str) and 0 < len(x) <= 500][:200] if isinstance(v, list) else []      # noqa: E731
+        sid = sa.get("session") if isinstance(sa.get("session"), str) and 0 < len(sa["session"]) <= 80 else "default"
+        goal = ""
+        for m in reversed(messages):
+            if isinstance(m, dict) and m.get("role") == "user":
+                c = m.get("content")
+                goal = c if isinstance(c, str) else "".join(p.get("text", "") for p in c if isinstance(p, dict)) if isinstance(c, list) else ""
+                break
+        sh = getattr(self.agent, "shell", None)
+        policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs,
+                                    protected=[p for p in (self.config_path, self.mcp_config_path) if p])   # hooks, web access and keys live there: never changed unasked
+        run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell_mod.describe(sh) if sh else None)
+        cp = sa.get("checkpoint")
+        if isinstance(cp, str) and sid != "default":
+            run.ctx.checkpoint = self.checkpoints.scope(sid, cp)                  # this prompt's checkpoint: the files the tools change are kept as they were
+        git, d = False, folder
+        for _ in range(6):                                              # the folder or one of the folders above it holds .git
+            if not d:
+                break
+            if os.path.exists(os.path.join(d, ".git")):
+                git = True
+                break
+            parent = os.path.dirname(d)
+            d = parent if parent != d else None
+        try:
+            conf = harness._cfg(self)
+        except Exception:  # noqa: BLE001 - a config that cannot be read means the defaults: no web access, no hooks
+            conf = {}
+        web = web_mod.settings(conf)
+        run.hidden = set() if web["on"] else set(getattr(self.agent, "web_tools", ()))          # web access is off until the user switches it on: the model is not even offered the tools
+        if web["on"]:
+            run.ctx.web = web_mod.Web(web)
+        helpers = getattr(self.agent, "helper_tools", ())
+        if subagent_mod.settings(conf)["on"] and helpers:                                         # helpers are off until the user switches them on, for the same reason
+            run.ctx.spawn = lambda kind, prompt, description: subagent_mod.execute(self, run, kind, prompt, description, run_with_mcp)
+        else:
+            run.hidden |= set(helpers)
+        tools = [t["name"] for t in self.agent.tools if (t["name"] != "ExitPlanMode" or mode == "plan") and t["name"] not in run.hidden]
+        run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
+        defined, _problems = hooks_mod.load(conf)
+        run.ctx.vision = self.vision is not None and not self._vision_down()          # Read can give an image to the model only when the vision encoder is there
+        runner = hooks_mod.Runner(defined, sh, folder, sid, run._emit, lambda: run.cancel.is_set(), begin=run._emit)
+        if runner:
+            run.ctx.hooks = run.hooks = runner
+            said = runner.prompt(goal)                                   # the user's own prompt hooks: what they print goes to the model with the rules
+            if said:
+                run.prompt += "\n\n" + said
+        return run
 
     def replay_key(self, req: dict, ids, max_new):
         """The key of a request whose answer can be given again, so Claude Code's repeats of one classifier request
@@ -1533,6 +1687,16 @@ class Service:
                     req["output_config"] = {"effort": effort}
         return req
 
+    def meta_for(self, dialect, messages, tools, user_agent) -> dict:
+        """The request's history meta; while "keep the next N prompts" is on it also carries the full prompt (`_prompt`,
+        which run() moves to the detail file and never into the summary row)."""
+        meta = request_meta(dialect, messages, tools, user_agent)
+        with self.keep_lock:
+            if self.keep_prompts > 0:
+                self.keep_prompts -= 1
+                meta["_prompt"] = prompt_for_keep(messages)
+        return meta
+
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
@@ -1541,6 +1705,8 @@ class Service:
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
+                                       busy_fn=lambda: bool(self.status.get("busy")),      # 5 Hz while a request runs
+                                       model_path=getattr(self.engine, "model_path", None),
                                        amd=getattr(self, "backend", None) == "hip")
 
     def _tok_s(self):
@@ -1631,12 +1797,15 @@ class Service:
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
+                  "efforts": (["none"] if self.efforts["off"] else []) + self.efforts["levels"],      # what the model's template accepts
+                  "effort_default": self.efforts["default"],
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+                tel["static"], "history": tel["history"], "time": now, "keep_prompts_left": self.keep_prompts,
+                "model_info": self.model_info}
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -1865,6 +2034,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         stop_detail = None
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        tok_times = []                                  # when each token reached the server
         emb = getattr(self.embeddings, "path", None)
         if self.restarting:            # xeno #49 S2: the native API's answer while the model loads - retry later
             raise EngineDied("the engine is loading again after it stopped")
@@ -1911,6 +2081,7 @@ class Service:
                                 yield "ping", None
                                 continue
                             n += 1
+                            tok_times.append(time.monotonic())      # xeno UI S3: the decode speed over a sliding window
                             if n == 1:
                                 timeline.instant("first token", len(ids))
                             if trace is not None and trace["first_token_s"] is None:
@@ -1986,6 +2157,7 @@ class Service:
                 finally:
                     # #266: settle this request's status, history and totals while still holding the fifo: once
                     # it is released the next request sets its own status, which this must not record or clear
+                    to_disk = None
                     with self.status_lock:
                         if self.status.get("busy"):
                             # only this request's DONE counts: same object means no DONE arrived (death, error,
@@ -1997,14 +2169,32 @@ class Service:
                             loaded = str(cvec) not in ("0", "", "None")
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
-                            self.history.append({
+                            meta = dict((sampling or {}).get("_meta") or request_meta("", [], None, None))
+                            # one request can call run() several times (an MCP tool round, the thinking budget's second call):
+                            # the first keeps the request's id, the later ones get -2, -3 ... so no row or detail overwrites another
+                            shared = (sampling or {}).get("_meta")
+                            if shared is not None:
+                                calls = shared["calls"] = shared.get("calls", 0) + 1
+                                if calls > 1:
+                                    meta["id"] = f"{shared['id']}-{calls}"
+                            meta.pop("calls", None)
+                            prompt = meta.pop("_prompt", None)                  # Q8: only when asked for; the detail file, never the row
+                            if shared is not None:
+                                shared.pop("_prompt", None)                   # once per request: the later rounds of an agent run do not write it again
+                            chunks = chunk_stats(last.get("prefill_points") or [], last.get("reused") or 0)
+                            decode = window_rates(tok_times)
+                            rec = summary_record({
+                                **meta,
+                                "decode": {k: v for k, v in decode.items() if k != "series"} if decode else None,
+                                "prompt_kept": prompt is not None,
+                                "prefill": {k: v for k, v in chunks.items() if k != "items"} if chunks else None,
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
-                                "engine_generated": last.get("generated"),
+                                "engine_generated": last.get("generated"), "stats": last.get("stats"),
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
@@ -2014,6 +2204,11 @@ class Service:
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
+                            self.history.append(rec)
+                            to_disk = (rec, {"prefill_chunks": chunks["items"] if chunks else [],
+                                             "decode_series": decode["series"] if decode else [],
+                                             "stats": last.get("stats"),
+                                             **({"prompt": prompt} if prompt is not None else {})})   # written after the lock is let go
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen
@@ -2044,6 +2239,12 @@ class Service:
                         self.status["last_stop_reason"] = stop_detail or finish
                         self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
                         self.status.pop("tool", None)
+                    if to_disk is not None:                     # on disk, kept: outside status_lock (it is /status's and /metrics's lock),
+                        try:                                    # and a full disk must not fail the request
+                            self.hstore.append(to_disk[0])
+                            self.hstore.write_detail(to_disk[0]["id"], to_disk[1])
+                        except OSError as e:
+                            print(f"[strata] history not saved: {e}", flush=True)
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
@@ -2124,8 +2325,9 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
+AGENT_ROUNDS = 100      # tool rounds in one answer when the chat has the coding tools
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names):
+                 mcp_names, agent_run=None, rounds_limit=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -2134,9 +2336,15 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
     could not reach the model before the client's)."""
-    max_rounds = int(hub.settings["max_rounds"])
+    max_rounds = max(int(hub.settings["max_rounds"]), AGENT_ROUNDS) if agent_run is not None else int(hub.settings["max_rounds"])      # coding takes many rounds
+    if rounds_limit is not None:                                  # a helper (serve/subagent.py) stops sooner
+        max_rounds = rounds_limit
     total, rounds, done = 0, 0, None
+    dec_n, dec_ms = 0, 0.0                                       # the tokens decoded and the time the engine spent decoding them, over every round
     messages = list(messages)
+    if agent_run is not None:
+        for e in agent_run.drain():                      # what the prompt hooks did, before the first word
+            yield "mcp", e
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
         for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
@@ -2159,10 +2367,25 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                     reasoning.append(ev.text)
             yield kind, x
         total += done["completion_tokens"]
+        tm = done.get("timings") or {}
+        if tm.get("predicted_per_second") and tm.get("predicted_ms"):
+            dec_n += round(tm["predicted_per_second"] * tm["predicted_ms"] / 1000)
+            dec_ms += tm["predicted_ms"]
         run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
         if run_them and rounds >= max_rounds:
             yield "mcp", {"event": "limit", "max_rounds": max_rounds}
+            if agent_run is not None:
+                agent_run.limit_hit = True
             run_them = False
+        if not run_them and agent_run is not None and not calls and not own_calls and done["finish"] == "stop" and not cancel.is_set():
+            said_now = agent_run.take_steers()                    # the answer was about to end, and the user had sent something meanwhile: it is read now, in the same run
+            if said_now:
+                messages.append({"role": "assistant", "content": "".join(text).strip(), **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {})})
+                for said in said_now:
+                    messages.append({"role": "user", "content": said})
+                    yield "mcp", {"event": "steered", "text": said}
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, 0 if sampling.get("stream") else 1)
+                continue
         if not run_them:
             for c in calls:                              # announced, never run: close them in the client's view
                 yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
@@ -2177,28 +2400,38 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
             # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
             box = {}
+            if agent_run is not None:
+                agent_run.current = c.id
 
             def work(c=c, box=box):
                 try:
-                    box["r"] = hub.call(c.name, c.arguments, cancel)
+                    box["r"] = hub.call(c.name, c.arguments, cancel, agent_run.ctx if agent_run is not None else None)
                 except McpCancelled:
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
             worker.start()
             try:
+                beat = 0
                 while worker.is_alive():
-                    worker.join(1.0)
-                    if worker.is_alive():
+                    worker.join(0.2)
+                    if agent_run is not None:
+                        for e in agent_run.drain():      # a question for the user, a todo list, ...: to the page at once
+                            yield "mcp", e
+                    beat += 1
+                    if worker.is_alive() and beat % 5 == 0:
                         yield "ping", None
+                if agent_run is not None:
+                    for e in agent_run.drain():
+                        yield "mcp", e
             except GeneratorExit:
-                cancel.set()                             # the client is gone: stop the tool too
+                cancel.set()                             # the client is gone: stop the tool too (a question that is open ends too)
                 raise
             if "r" not in box:
                 break
             r = box["r"]
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            results.append(r["text"])
+            results.append([{"type": "text", "text": r["text"]}, *({"type": "image", "source": u} for u in r["images"])] if r.get("images") else r["text"])      # an image goes to the model as an image
             yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
@@ -2207,7 +2440,31 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
+        if agent_run is not None:
+            for said in agent_run.take_steers():                  # what the user sent while the agent worked is read at this step
+                messages.append({"role": "user", "content": said})
+                yield "mcp", {"event": "steered", "text": said}
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, 0 if sampling.get("stream") else 1)
+    if agent_run is not None and getattr(agent_run, "hooks", None) and not cancel.is_set() and done["finish"] != "cancel":
+        agent_run.current = None
+        worker = threading.Thread(target=agent_run.hooks.stop, args=("".join(text).strip(),), daemon=True)      # the model has finished: the user's stop hooks (their output is for the user)
+        worker.start()
+        try:
+            beat = 0
+            while worker.is_alive():
+                worker.join(0.2)
+                for e in agent_run.drain():
+                    yield "mcp", e
+                beat += 1
+                if worker.is_alive() and beat % 5 == 0:
+                    yield "ping", None
+        except GeneratorExit:
+            cancel.set()
+            raise
+        for e in agent_run.drain():
+            yield "mcp", e
+    if rounds and dec_ms > 0 and done.get("timings"):            # several rounds: the speed of the decoding is that of all of them, not of the last (a tool's time and the next prompt's reading are not decoding)
+        done = {**done, "timings": {**done["timings"], "predicted_n": total, "predicted_ms": round(dec_ms, 1), "predicted_per_second": round(dec_n / (dec_ms / 1000), 1), "rounds": rounds + 1}}
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -2573,7 +2830,74 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
+        def _host_ok(self) -> bool:
+            """With no API key, only this PC's own names as Host (see host_allowed); with one, the key is the gate."""
+            if svc.api_key or host_allowed(self.headers.get("Host", ""), svc.allowed_hosts):
+                return True
+            self._json(421, {"error": {"message": "this name does not reach this server: use the PC's address, or list the name in the run config's allowed_hosts"}})
+            return False
+
+        def _foreign_origin(self) -> bool:
+            """A browser sends Origin on a cross-site POST; one that is not this server's own page is refused (403)."""
+            origin = self.headers.get("Origin")
+            if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
+                self._json(403, {"error": {"message": "only from Strata's own page"}})
+                return True
+            return False
+
+        def _ui_prefix(self) -> bool:
+            """xeno UI S1: /classic/... is the classic web app under a prefix (its relative URLs then land on the
+            same routes), /next/... the new one (serve/ui/dist). True when this call answered."""
+            p = self.path.split("?")[0]
+            for name in ("classic", "next"):
+                if p == "/" + name:                          # relative, so a path-prefixed proxy still works
+                    self.send_response(301)
+                    self.send_header("Location", name + "/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return True
+            if p.startswith("/classic/"):
+                self.path = self.path[len("/classic"):]
+                return False
+            rel = None                                       # the path inside dist/, when this request is for the new app
+            if p.startswith("/next/"):
+                rel = p[len("/next/"):]
+            elif getattr(svc, "ui", "next") == "next":       # the new app at / unless the config says "ui": "classic" (its assets at /assets/)
+                if p == "/":
+                    rel = ""
+                elif p.startswith("/assets/"):
+                    rel = p[1:]
+            if rel is None:
+                return False
+            types = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+                     ".woff2": "font/woff2", ".svg": "image/svg+xml", ".png": "image/png", ".webp": "image/webp"}
+            f, ctype, cache = None, "text/html; charset=utf-8", "no-cache"
+            if rel == "":
+                f = ROOT / "serve" / "ui" / "dist" / "index.html"
+            elif rel.startswith("assets/") and "/" not in rel[7:] and "\\" not in rel and os.path.splitext(rel)[1] in types:
+                f, ctype, cache = ROOT / "serve" / "ui" / "dist" / "assets" / rel[7:], types[os.path.splitext(rel)[1]], \
+                    "public, max-age=31536000, immutable"       # hashed names never change
+            if f is None or not f.is_file():
+                self._json(404, {"error": {"message": "not found"}})
+                return True
+            body = f.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", cache)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if f.suffix == ".html":                          # the app is never shown inside another page (clickjacking the buttons)
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+
         def do_GET(self):
+            if not self._host_ok():
+                return
+            if self._ui_prefix():
+                return
             path = self.path.split("?")[0].rstrip("/")
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
@@ -2608,6 +2932,23 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path == "/metrics/requests" or path.startswith("/metrics/requests/"):
+                if self._authorized():                     # the history on disk (xeno UI S3): a page, or one request
+                    q = parse_qs(urlsplit(self.path).query)
+                    if path == "/metrics/requests":
+                        try:
+                            page, size = int(q.get("page", ["0"])[0]), int(q.get("size", ["50"])[0])
+                        except ValueError:
+                            return self._json(400, {"error": {"message": "page and size are numbers"}})
+                        return self._json(200, svc.hstore.page(page, size))
+                    rid = path[len("/metrics/requests/"):]
+                    summary = svc.hstore.summary(rid)
+                    if summary is None:
+                        return self._json(404, {"error": {"message": "no such request"}})
+                    detail = svc.hstore.detail(rid)
+                    return self._json(200, {"summary": summary, "detail": detail,
+                                            "detail_state": "kept" if detail is not None else "deleted"})
+                return
             if path == "/metrics":
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
@@ -2630,6 +2971,131 @@ def make_handler(svc: Service):
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
+                return
+            if path == "/agent":
+                # the chat's coding tools: whether they are on, which shell commands run in, and whether this caller may use them (only from this PC, or with the key)
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    sh = getattr(svc.agent, "shell", None)
+                    self._json(200, {"available": svc.agent is not None, "allowed": ok, "reason": "" if ok else why, "shell": shell_mod.describe(sh) if sh else None,
+                                     "tools": [t["name"] for t in svc.agent.tools] if svc.agent else []})
+                return
+            if path == "/agent/hooks":
+                # the user's hooks (serve/hooks.py), read only: they are written in the run config; only who may use the coding tools sees the commands
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    self._json(200, {**hooks_mod.view(harness._cfg(svc)), "config_file": os.path.basename(svc.config_path) if svc.config_path else None,
+                                     "shell": bool(getattr(svc.agent, "shell", None)), "editable": bool(svc.config_path)})
+                return
+            if path == "/agent/helpers":
+                # sub-agents (serve/subagent.py): off by default; only who may use the coding tools sees the setting
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    self._json(200, {**subagent_mod.settings(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "helper_tools", ())), "editable": bool(svc.config_path),
+                                     "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
+                return
+            if path == "/agent/run":
+                # a run that went on while the page was away (serve/runs.py): its events from number `from` on, as they come; only for who may use the coding tools
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    origin = self.headers.get("Origin")
+                    if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
+                        return self._json(403, {"error": {"message": "a run can be read only from Strata's own page"}})
+                    q = parse_qs(urlsplit(self.path).query)
+                    run = svc.runs.get(q.get("id", [""])[0])
+                    if run is None:
+                        return self._json(404, {"error": {"message": "there is no such run (it ended long ago, or the server was restarted)"}})
+                    try:
+                        start = int(q.get("from", ["0"])[0])
+                    except ValueError:
+                        return self._json(400, {"error": {"message": "from is a number"}})
+                    self._sse(now=True)
+                    self._follow(run, start)
+                return
+            if path == "/agent/web":
+                # web access (serve/web.py): off by default; only who may use the coding tools sees the settings
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    self._json(200, {**web_mod.public_view(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "web_tools", ())), "editable": bool(svc.config_path),
+                                     "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
+                return
+            if path == "/agent/folders":
+                # the folders of this PC, to choose a project's folder from (only the names of folders, and only for who may use the coding tools)
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    seen = folders_mod.look(parse_qs(urlsplit(self.path).query).get("path", [""])[0])
+                    # a path that is no folder is an answer, not an error (a 404 would be logged as one in the browser's console)
+                    self._json(200, seen if seen is not None else {"ok": False, "error": "That is not a folder on this PC"})
+                return
+            if path in ("/agent/git", "/agent/git/diff"):
+                # the Git state of a folder, read only, for the Chat's right panel (serve/gitview.py); for who may use the coding tools
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    q = parse_qs(urlsplit(self.path).query)
+                    folder = q.get("path", [""])[0]
+                    if path == "/agent/git":
+                        return self._json(200, gitview.info(folder))
+                    return self._json(200, gitview.diff(folder, q.get("file", [""])[0], q.get("staged", ["0"])[0] == "1", q.get("untracked", ["0"])[0] == "1"))
+                return
+            if path in ("/agent/files", "/agent/mention"):
+                # `@file` in the prompt: the files of the project's folders that go with typed letters, and the text of one that was mentioned (serve/files.py); for who may use the coding tools
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    q = parse_qs(urlsplit(self.path).query)
+                    folders = [f for f in [q.get("path", [""])[0], *q.get("dirs", [])] if f.strip() and "\0" not in f][:agent_mod.MAX_DIRS + 1]
+                    if path == "/agent/files":
+                        return self._json(200, {"files": files_mod.find(folders, q.get("q", [""])[0])})
+                    return self._json(200, files_mod.read(folders, q.get("rel", [""])[0]))
+                return
+            if path in ("/agent/memory", "/agent/memory/file"):
+                # the notes the chat reads for a project: the project's own files and what the user's other apps wrote down (serve/memory.py); for who may use the coding tools
+                if self._authorized():
+                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    if not ok:
+                        return self._json(403, {"error": {"message": why}})
+                    q = parse_qs(urlsplit(self.path).query)
+                    folders = [f for f in [q.get("path", [""])[0], *q.get("dirs", [])] if f.strip() and "\0" not in f][:agent_mod.MAX_DIRS + 1]
+                    imp = getattr(svc, "importer", None)
+                    home = str(imp.home) if imp is not None else str(harness.home_dir())
+                    on = memory_mod.settings(harness._cfg(svc))["on"]
+                    sources = memory_mod.discover(home, folders, on)
+                    if path == "/agent/memory":
+                        return self._json(200, {"max": memory_mod.MAX_TOTAL, "sources": [{k: s[k] for k in ("id", "app", "label", "kind", "shown", "bytes", "on")} for s in sources]})
+                    src = next((s for s in sources if s["id"] == q.get("id", [""])[0]), None)
+                    try:
+                        n = int(q.get("n", ["0"])[0])
+                    except ValueError:
+                        n = -1
+                    if src is None or not 0 <= n < len(src["files"]):
+                        return self._json(404, {"ok": False, "error": "no such file"})
+                    got = memory_mod._read(src["files"][n], 200_000)
+                    if got is None:
+                        return self._json(200, {"ok": False, "error": "cannot be read"})
+                    return self._json(200, {"ok": True, "name": os.path.basename(src["files"][n]), "text": got[0], "cut": got[1]})
+                return
+            if path == "/mcp/config":
+                # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)
+                if self._authorized():
+                    self._json(200, mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
+                return
+            if path == "/import":
+                # the skills and the MCP servers of the other coding apps on this PC, with what may be changed (#94)
+                if self._authorized():
+                    self._json(200, harness.view(svc, self.client_address[0], self.headers.get("Host", ""), rescan="rescan=1" in self.path))
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
@@ -2696,11 +3162,230 @@ def make_handler(svc: Service):
                 self._do_post()
 
         def _do_post(self):
+            if not self._host_ok():
+                return
+            if self.path.startswith("/classic/"):             # the classic app under its prefix (xeno UI S1)
+                self.path = self.path[len("/classic"):]
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path == "/settings":
                 self._settings()
+                return
+            if path == "/mcp/config":                        # set up the MCP servers: a write that decides which programs Strata starts (#79)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
+                if not self._own_page("MCP servers can be changed"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                if not svc.config_path:
+                    return self._json(409, {"error": {"message": "this server was started without a run config file (--config), so there is nowhere to save the servers"}})
+                if not 0 < n <= 1_000_000:
+                    return self._json(413, {"error": {"message": "send a body of up to 1 MB"}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
+                code, out = mcp_admin.apply(svc, body)
+                return self._json(code, out if code != 200 else mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
+            if path in ("/agent/rewind", "/agent/checkpoints/forget"):         # the way back for the files the tools changed (serve/checkpoints.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
+                if not self._own_page("files can be put back"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict) or not isinstance(body.get("session"), str):
+                    return self._json(400, {"error": {"message": "send {\"session\": the chat's id, \"checkpoint\": the prompt's id}"}})
+                if path == "/agent/checkpoints/forget":
+                    svc.checkpoints.forget(body["session"])
+                    return self._json(200, {"ok": True})
+                if not isinstance(body.get("checkpoint"), str):
+                    return self._json(400, {"error": {"message": "send the checkpoint, the prompt's id"}})
+                if body.get("apply") is True:
+                    return self._json(200, svc.checkpoints.apply(body["session"], body["checkpoint"], body.get("include_changed") is True))
+                return self._json(200, svc.checkpoints.preview(body["session"], body["checkpoint"]))
+            if path == "/agent/steer":                       # what the user sends while the agent works: the agent reads it at its next step (serve/runs.py, run_with_mcp)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
+                if not self._own_page("A message can be sent to a run"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not isinstance(body.get("text"), str) or not 0 < len(body["text"].strip()) <= 20_000:
+                    return self._json(400, {"error": {"message": "send {\"id\": the run's id, \"text\": the message (1 to 20,000 characters)}"}})
+                return self._json(200, {"ok": True, "found": svc.runs.steer(body["id"], body["text"].strip())})
+            if path == "/agent/cancel":                      # the user's Stop for an answer that runs on its own (serve/runs.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
+                if not self._own_page("A run can be stopped"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict) or not isinstance(body.get("id"), str):
+                    return self._json(400, {"error": {"message": "send {\"id\": the run's id}"}})
+                return self._json(200, {"ok": True, "found": svc.runs.cancel(body["id"])})
+            if path == "/agent/question":                    # the page's answer to a question the model asked with AskUserQuestion (serve/agent_run.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 50_000 else b""
+                if not self._own_page("A question can be answered"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                ans = body.get("answers") if isinstance(body, dict) else None
+                if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not (ans is None or (isinstance(ans, dict) and len(ans) <= 4 and all(
+                        isinstance(k, str) and len(k) <= 400 and isinstance(v, list) and 0 < len(v) <= 8 and all(isinstance(x, str) and len(x) <= 500 for x in v) for k, v in ans.items()))):
+                    return self._json(400, {"error": {"message": "send {\"id\": the question's id, \"answers\": {question: [choices]} or null to skip}"}})
+                if not svc.broker.respond(body["id"], ans):
+                    return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
+                return self._json(200, {"ok": True})
+            if path == "/agent/permission":                  # the page's answer to a question of the coding tools (serve/agent_run.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
+                if not self._own_page("A question can be answered"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict) or not isinstance(body.get("id"), str) or body.get("decision") not in agent_run.ANSWERS:
+                    return self._json(400, {"error": {"message": "send {\"id\": the question's id, \"decision\": \"allow\" | \"allow_chat\" | \"deny\"}"}})
+                if not svc.broker.answer(body["id"], body["decision"]):
+                    return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
+                return self._json(200, {"ok": True})
+            if path == "/agent/helpers":                     # sub-agents on or off (serve/subagent.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
+                if not self._own_page("sub-agents can be switched"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                if not svc.config_path:
+                    return self._json(409, {"error": {"message": harness.NO_FILE}})
+                if not 0 < n <= 10_000:
+                    return self._json(413, {"error": {"message": "send a body of up to 10 KB"}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self._json(400, {"error": {"message": "the body is not JSON"}})
+                new, errors = subagent_mod.check_settings(body)
+                if errors:
+                    return self._json(400, {"error": {"message": f"{errors[0]['message']} ({errors[0]['field']})", "fields": errors}})
+                with mcp_admin._lock:
+                    try:
+                        mcp_admin.update_config(svc.config_path, lambda cfg: cfg.__setitem__("agents", new))
+                    except (OSError, ValueError, TypeError) as e:
+                        return self._json(500, {"error": {"message": f"it could not be saved: {e}"}})
+                return self._json(200, {**subagent_mod.settings(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "helper_tools", ())), "editable": True, "config_file": os.path.basename(svc.config_path)})
+            if path == "/agent/web":                         # web access on or off, and the search provider (serve/web.py)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
+                if not self._own_page("web access can be changed"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                if not svc.config_path:
+                    return self._json(409, {"error": {"message": harness.NO_FILE}})
+                if not 0 < n <= 100_000:
+                    return self._json(413, {"error": {"message": "send a body of up to 100 KB"}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self._json(400, {"error": {"message": "the body is not JSON"}})
+                new, errors = web_mod.check_settings({**web_mod.settings(harness._cfg(svc)), **body} if isinstance(body, dict) else body)
+                if errors:
+                    return self._json(400, {"error": {"message": f"{errors[0]['message']} ({errors[0]['field']})", "fields": errors}})
+                with mcp_admin._lock:
+                    try:
+                        mcp_admin.update_config(svc.config_path, lambda cfg: cfg.__setitem__("web", new))
+                    except (OSError, ValueError, TypeError) as e:
+                        return self._json(500, {"error": {"message": f"it could not be saved: {e}"}})
+                return self._json(200, {**web_mod.public_view(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "web_tools", ())), "editable": True, "config_file": os.path.basename(svc.config_path)})
+            if path == "/agent/hooks":                       # which hooks are switched off (the hooks themselves are written in the run config only)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
+                if not self._own_page("the hooks can be switched"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                if not svc.config_path:
+                    return self._json(409, {"error": {"message": harness.NO_FILE}})
+                if not 0 < n <= 100_000:
+                    return self._json(413, {"error": {"message": "send a body of up to 100 KB"}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self._json(400, {"error": {"message": "the body is not JSON"}})
+                off, bad = hooks_mod.check_off(body.get("off") if isinstance(body, dict) and set(body) == {"off"} else None)
+                if bad:
+                    return self._json(400, {"error": {"message": bad}})
+                known = {h["id"] for h in hooks_mod.view(harness._cfg(svc))["hooks"]}
+                with mcp_admin._lock:
+                    try:
+                        mcp_admin.update_config(svc.config_path, lambda cfg: cfg.__setitem__("hooks_off", [x for x in off if x in known]))
+                    except (OSError, ValueError, TypeError) as e:
+                        return self._json(500, {"error": {"message": f"it could not be saved: {e}"}})
+                return self._json(200, {**hooks_mod.view(harness._cfg(svc)), "config_file": os.path.basename(svc.config_path), "shell": bool(getattr(svc.agent, "shell", None)), "editable": True})
+            if path == "/import":                            # the skill switches, importing one MCP server, a rescan: a write like /mcp/config (#94)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
+                if not self._own_page("the import can be changed"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                if not svc.config_path:
+                    return self._json(409, {"error": {"message": harness.NO_FILE}})
+                if not 0 < n <= 1_000_000:
+                    return self._json(413, {"error": {"message": "send a body of up to 1 MB"}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
+                code, out = harness.apply(svc, body)
+                return self._json(code, out if code != 200 else harness.view(svc, self.client_address[0], self.headers.get("Host", "")))
+            if path == "/metrics/keep":                      # keep the full prompt of the next N requests (0: off)
+                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if not self._own_page("prompts can be kept"):      # xeno #71: a "simple" cross-site POST must not switch this on
+                    return
+                try:
+                    n = json.loads(raw or b"{}").get("next")
+                except ValueError:
+                    n = None
+                if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 50:
+                    return self._json(400, {"error": {"type": "invalid_request_error", "message": "next is a number from 0 to 50"}})
+                with svc.keep_lock:
+                    svc.keep_prompts = n
+                return self._json(200, {"keep_prompts_left": n})
+            if path in ("/unload", "/load") and self._foreign_origin():
                 return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
@@ -2850,14 +3535,25 @@ def make_handler(svc: Service):
                   if shared else "[strata] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
-        def _sse(self):
+        def _sse(self, now: bool = False):
             self._note(http_status=200)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
+            if now:
+                self.send_header("X-Strata-Now", str(int(time.time() * 1000)))      # the server's clock, so that the page can set the events' times (`strata_t`) against its own
             self._cors()
             self.end_headers()
+
+        def _follow(self, run, start: int = 0):
+            """Send a run's stream from event `start` on, as it grows.  A page that goes away ends only this reading: the run goes on (serve/runs.py)."""
+            try:
+                for ev in run.follow(start):
+                    self.wfile.write(b": keep-alive\n\n" if ev is None else ev)
+                    self.wfile.flush()
+            except OSError:
+                pass
 
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
@@ -2895,8 +3591,31 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            skill = req.get("strata_skill")                       # the web app's "/name": that skill is loaded here, not left for the model to ask for
+            if isinstance(skill, str):                            # anything but a name is ignored
+                if not self._own_page("A skill can be used"):
+                    return
+                hub = svc.mcp.servers.get("skills") if svc.mcp is not None else None
+                got = hub.call("use_skill", {"name": skill}) if hub is not None else None
+                if got is None or got.get("isError"):
+                    return self._json(400, {"error": {"message": f"there is no skill named {skill!r} (it may be switched off in Settings > Import)"}})
+                req = {**req, "messages": skills_mod.put_before_last_user(req.get("messages") or [], skills_mod.invoked(skill, got["content"][0]["text"]))}
+            arun = None
+            sa = req.get("strata_agent")                         # the web app's coding tools (serve/agent.py): files and commands on this PC, with the user's say-so
+            if isinstance(sa, dict):
+                if not self._own_page("The coding tools can be used"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": "The coding tools change files and run commands on this PC, so they work only from this PC itself (open the page as localhost) or with the API key. " + why}})
+                if svc.agent is None or svc.mcp is None:
+                    return self._json(409, {"error": {"message": "the coding tools are switched off on this server (\"agent\": false in the run config)"}})
+                arun = svc.start_agent_run(sa, req.get("messages") or [])
+                req = {**req, "messages": agent_prompt.with_system(req.get("messages") or [], arun.prompt)}
             messages, tools, kw = openai_to_messages(req)
             req = svc.cjk(req, messages)                                # xeno #49 S4
+            if arun is not None:
+                arun.kw, arun.sampling = kw, req                      # a helper (serve/subagent.py) runs with the same settings
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
@@ -2905,27 +3624,49 @@ def make_handler(svc: Service):
             # wait minutes)
             svc.load(wait_for_restart=True)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
-            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            use_mcp = (req.get("strata_mcp") is True or arun is not None) and svc.mcp is not None      # the web app's opt-in (serve/mcp.py), or the coding tools
             own = {t.get("name") for t in tools or []}
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
                 svc.mcp.wait(10)                                  # servers still starting (only right after start)
-                extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
+                off = req.get("strata_mcp_off")                   # servers the page's list switched off for this chat; anything but a list of names is ignored
+                skip = {x for x in off if isinstance(x, str)} if isinstance(off, list) and all(isinstance(x, str) for x in off) else set()
+                if req.get("strata_mcp") is not True:
+                    skip |= {n for n in svc.mcp.servers if n != "agent"}      # the coding tools alone: no MCP server
+                if arun is None:
+                    skip.add("agent")                             # and the coding tools only when the request asks for them
+                extra = svc.mcp.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
+            req = {**req, "_meta": svc.meta_for("openai", messages, tools, self.headers.get("User-Agent"))}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            rid = sa.get("run") if isinstance(sa, dict) else None
+            detached = arun is not None and bool(req.get("stream")) and isinstance(rid, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,64}", rid) is not None
+            if arun is not None:
+                arun.bind(cancel)
+            if not detached:
+                self._watch_client(cancel)                   # #430 #431 (a run that goes on when the page goes away is not cancelled by it: serve/runs.py)
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
+                               {t["name"] for t in extra}, arun) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
+            if detached:
+                def describe(e):
+                    if isinstance(e, EngineDied):
+                        return {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                    return {"error": {"type": "server_error", "message": str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"}}
+                buf = svc.runs.launch(rid, chunks, cancel, describe, owner=arun)             # the answer is written on its own thread: a refresh of the page does not stop it
+                if buf is None:
+                    return self._json(409, {"error": {"message": "there is a run with that id already"}})
+                self._sse()
+                return self._follow(buf, 0)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -2980,6 +3721,7 @@ def make_handler(svc: Service):
             think_budget.side_effort(req, kw)                         # xeno #49 S3: before the template renders
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
+            req = {**req, "_meta": svc.meta_for("anthropic", messages, tools, self.headers.get("User-Agent"))}
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
             if budget and thinking:
                 req = {**req, "_think_budget": budget}
@@ -3116,6 +3858,30 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
+def host_allowed(host: str, allowed=()) -> bool:
+    """Whether the Host a request names is this PC (xeno #71). A web page on another site whose name has been re-pointed at
+    this PC (DNS rebinding) is then same-origin with the server, and its requests carry that site's name as Host. An IP
+    address cannot be re-pointed, `localhost` and a name with no dot (a machine on the LAN) cannot be a public site, `.local`
+    is mDNS; any other name has to be in the run config's `allowed_hosts`. No Host at all is no browser."""
+    h = (host or "").strip().lower()
+    if not h:
+        return True
+    if h.startswith("["):
+        name = h[1:h.find("]")] if "]" in h else h
+    else:
+        name = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+    name = name.rstrip(".")
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    return name == "localhost" or name.endswith(".localhost") or "." not in name or name.endswith(".local") or name in allowed
+
+
+def ui_choice(cfg: dict) -> str:
+    """Which web app `/` serves: the new one, unless the run config says `"ui": "classic"` (the classic app is at /classic/ either way)."""
+    return "classic" if (cfg or {}).get("ui") == "classic" else "next"
 def origins_of(value, key: str, wildcard: bool) -> list[str]:
     """#321: a config's origin list ("https://chat.example.com" or a list of them) - scheme://host[:port], no path;
     "*" only where `wildcard` allows it.  A wrong entry stops the start rather than opening less or more than meant."""
@@ -3153,8 +3919,8 @@ def clean_shared_defaults(d) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
-                raise ValueError("reasoning_effort: none, low, medium or high")
+            if value not in ("none", "low", "medium", "high", "xhigh"):
+                raise ValueError("reasoning_effort: none, low, medium, high or xhigh")
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")
@@ -3323,7 +4089,14 @@ def main() -> int:
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
-    hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
+    importer = harness.Importer()                        # the skills (and the MCP servers, to import by a click) of the other coding apps on this PC (#94)
+    importer.rescan(cfg)
+    agent_server = None if cfg.get("agent") is False else agent_mod.AgentServer()      # the chat's coding tools; "agent": false in the run config switches them off
+    if agent_server is not None:
+        shell_mod.install(agent_server, shell_mod.find_shell())
+        web_mod.install(agent_server)                         # WebFetch and WebSearch: offered to a chat only when the user has switched web access on
+        subagent_mod.install(agent_server)                    # Task: the same, for helpers
+    hub = hub_from_config(cfg, a.mcp_config, builtins={**importer.builtins(), **({"agent": agent_server} if agent_server else {})})     # before the minutes of loading: a bad entry stops here
     placeholder = None
     if a.engine == "strata":
         if not cfg:
@@ -3407,6 +4180,18 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
+    hist = cfg.get("history") if isinstance(cfg.get("history"), dict) else {}      # {"enabled", "dir", "detail_cap_gb"}
+    from serve.history import default_dir
+    svc.hstore = HistoryStore(hist.get("dir") or default_dir(), enabled=hist.get("enabled", True) is not False,
+                              detail_cap_bytes=int(float(hist.get("detail_cap_gb", 2)) * 2**30))
+    svc.checkpoints = checkpoints_mod.Checkpoints()          # the way back for files the tools change: in the user's data folder, the oldest trimmed at start
+    threading.Thread(target=svc.checkpoints.trim, daemon=True).start()
+    def _model_info(files=gguf_info.files_from_args(list(cfg.get("args") or []))):
+        svc.model_info = gguf_info.model_info(files)        # reads headers only (~0.1 s); a model with no GGUF gives None
+    threading.Thread(target=_model_info, daemon=True).start()
+    svc.ui = ui_choice(cfg)                                            # which web app "/" serves (xeno UI)
+    svc.config_path, svc.mcp_config_path = a.config, a.mcp_config      # where the web app saves and reads the MCP servers (#79)
+    svc.allowed_hosts = {str(h).strip().lower().rstrip(".") for h in (cfg.get("allowed_hosts") or []) if str(h).strip()}   # xeno #71
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -3420,9 +4205,9 @@ def main() -> int:
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
-    svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
-    svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
+    svc.gpu_indices = gpu_list(cfg) if svc.backend == "hip" else monitor_gpus(cfg)      # every card the engine can see (issue #112; UI S0: no "gpu" key); NVML sees no AMD card
+    svc.gpu_index = (svc.gpu_indices or [0])[0]         # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
@@ -3432,11 +4217,18 @@ def main() -> int:
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
+    svc.importer = importer
+    skills_in_use = len(importer.skills._skills)
+    if skills_in_use:
+        print(f"[strata] {skills_in_use} skill{'s' * (skills_in_use != 1)} imported from your other coding apps for the web app's chat "
+              "(switch them off in Settings > Import)", flush=True)
     if hub is not None:
         import atexit
         svc.mcp = hub
-        print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
-              f"chat: {', '.join(hub.servers)}", flush=True)
+        svc.agent = agent_server
+        own = [n for n in hub.servers if n != "skills"]
+        if own:
+            print(f"[strata] starting {len(own)} MCP server{'s' * (len(own) != 1)} for the web app's chat: {', '.join(own)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
     if placeholder is not None:

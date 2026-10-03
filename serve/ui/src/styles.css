@@ -1,0 +1,335 @@
+@import "tailwindcss";
+
+/* Fonts: local OFL files (Inter, Anuphan for Thai, JetBrains Mono), bundled by Vite with relative URLs.
+   System stack first: SF itself is never shipped (Apple licence). */
+@font-face { font-family: "Inter Variable"; font-style: normal; font-weight: 100 900; font-display: swap;
+  src: url("@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: "Anuphan Variable"; font-style: normal; font-weight: 100 700; font-display: swap;
+  src: url("@fontsource-variable/anuphan/files/anuphan-thai-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0E01-0E5B, U+200C-200D, U+25CC; }
+@font-face { font-family: "Anuphan Variable"; font-style: normal; font-weight: 100 700; font-display: swap;
+  src: url("@fontsource-variable/anuphan/files/anuphan-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: "JetBrains Mono Variable"; font-style: normal; font-weight: 100 800; font-display: swap;
+  src: url("@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+
+/* Tokens. Near-monochrome ink on neutral surfaces; every level is the ink mixed into the surface. */
+:root {
+  color-scheme: light;
+  --bg: #f5f5f7;
+  --surface: #ffffff;
+  --ink: #131316;
+  --accent: #0a62d6;
+  --ok: #1a8a4a;
+  --bad: #c6322b;
+  --ease: cubic-bezier(0.23, 1, 0.32, 1);
+  --r-1: 8px; --r-2: 12px; --r-3: 16px;
+  --font-sans: -apple-system, "SF Pro Text", "SF Thai", "Inter Variable", "Anuphan Variable", system-ui, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0b0b0d; --surface: #151518; --ink: #f1f1f3; --accent: #5aa2ff; --ok: #4cc380; --bad: #ff7a70;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0b0b0d; --surface: #151518; --ink: #f1f1f3; --accent: #5aa2ff; --ok: #4cc380; --bad: #ff7a70;
+  }
+}
+:root {
+  --ink-2: color-mix(in srgb, var(--ink) 62%, var(--surface));   /* secondary text: 4.5:1 on both surfaces */
+  --ink-3: color-mix(in srgb, var(--ink) 40%, var(--surface));   /* hints, never body text */
+  --hover: color-mix(in srgb, var(--ink) 8%, transparent);
+  --fill: color-mix(in srgb, var(--ink) 12%, transparent);
+  --fill-2: color-mix(in srgb, var(--ink) 18%, transparent);
+  --line: color-mix(in srgb, var(--ink) 11%, transparent);
+}
+
+@theme inline {
+  --color-bg: var(--bg); --color-surface: var(--surface); --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2); --color-ink-3: var(--ink-3); --color-hover: var(--hover);
+  --color-fill: var(--fill); --color-fill-2: var(--fill-2); --color-line: var(--line);
+  --color-accent: var(--accent); --color-ok: var(--ok); --color-bad: var(--bad);
+  --font-sans: var(--font-sans); --font-mono: var(--font-mono);
+  --radius-sm: var(--r-1); --radius-md: var(--r-2); --radius-lg: var(--r-3);
+}
+
+@layer base {
+  html { background: var(--bg); }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 400 14px/1.5 var(--font-sans); letter-spacing: -0.01em;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  }
+  h1, h2, h3 { text-wrap: balance; letter-spacing: -0.02em; line-height: 1.25; margin: 0; }
+  .num, [data-num] { font-variant-numeric: tabular-nums; }
+  code, kbd, .mono { font-family: var(--font-mono); font-size: 0.92em; letter-spacing: 0; }
+
+  /* The parts the browser draws */
+  ::selection { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-1); }
+  * { scrollbar-width: thin; scrollbar-color: var(--fill-2) transparent; }
+  input, textarea { caret-color: var(--accent); }
+  a { color: inherit; text-underline-offset: 3px; text-decoration-color: var(--fill-2); }
+}
+
+/* One authored moment: a page change sharpens in. Opacity, transform and blur only. */
+@keyframes sharpen { from { opacity: 0; filter: blur(6px); transform: scale(0.985); } to { opacity: 1; filter: none; transform: none; } }
+.page-in { animation: sharpen 260ms var(--ease) backwards; }   /* backwards: nothing left behind to become a containing block */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}
+
+/* Chat */
+.prose-chat { overflow-wrap: anywhere; }
+.prose-chat > :first-child { margin-top: 0; } .prose-chat > :last-child { margin-bottom: 0; }
+.prose-chat p { margin: 0 0 0.8em; line-height: 1.68; }
+.prose-chat h3, .prose-chat h4 { margin: 1.1em 0 0.4em; font-weight: 600; }
+.prose-chat h3 { font-size: 15px; } .prose-chat h4 { font-size: 14px; }
+.prose-chat ul, .prose-chat ol { margin: 0 0 0.75em; padding-left: 1.4em; } .prose-chat ul { list-style: disc; } .prose-chat ol { list-style: decimal; } .prose-chat li { margin: 0.2em 0; }
+.prose-chat blockquote { margin: 0 0 0.75em; padding-left: 0.9em; border-left: 1px solid var(--fill-2); color: var(--ink-2); }
+.prose-chat hr { border: 0; border-top: 1px solid var(--line); margin: 1.2em 0; }
+.prose-chat a { text-decoration: underline; text-decoration-color: var(--fill-2); } .prose-chat a:hover { text-decoration-color: currentColor; }
+.prose-chat code.inline { background: var(--fill); border-radius: 4px; padding: 0.1em 0.35em; }
+.prose-chat table { border-collapse: collapse; margin: 0 0 0.75em; display: block; overflow-x: auto; max-width: 100%; }
+.prose-chat th, .prose-chat td { border: 1px solid var(--line); padding: 0.35em 0.7em; text-align: left; }
+.prose-chat th { background: var(--hover); font-weight: 600; }
+.code-block { margin: 0 0 0.75em; border: 1px solid var(--line); border-radius: var(--r-2); overflow: hidden; }
+.code-head { display: flex; align-items: center; justify-content: space-between; padding: 0.35em 0.5em 0.35em 0.8em; background: var(--hover); color: var(--ink-2); font-size: 12px; }
+.code-head button { border-radius: var(--r-1); padding: 0.15em 0.55em; color: var(--ink-2); transition: background-color 150ms; }
+.code-head button:hover { background: var(--fill); color: var(--ink); }
+.code-block pre { margin: 0; padding: 0.8em; overflow-x: auto; font: 12.5px/1.55 var(--font-mono); letter-spacing: 0; tab-size: 2; }
+.tool-pre { margin: 0; max-height: 16rem; overflow: auto; border-radius: var(--r-1); background: var(--hover); padding: 0.6em 0.75em; font: 12px/1.5 var(--font-mono); letter-spacing: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.streaming .prose-chat > :last-child::after { content: ""; display: inline-block; width: 0.5em; height: 1em; margin-left: 2px; vertical-align: text-bottom; background: var(--ink-3); border-radius: 2px; animation: blink 1s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } }
+.toast-in { animation: toast-in 240ms var(--ease) both; }
+@media (prefers-reduced-motion: reduce) { .streaming .prose-chat > :last-child::after { animation: none; } }
+/* uPlot: its own stylesheet sets a white-ish cursor; tint it from the tokens */
+.uplot { font-family: var(--font-sans); } .u-cursor-x, .u-cursor-y { border-color: var(--fill-2) !important; }
+
+/* Motion: one ease, durations 160-420 ms, opacity / transform / blur / grid-rows only. */
+.collapse-grid { display: grid; grid-template-rows: 0fr; opacity: 0; transition: grid-template-rows 320ms var(--ease), opacity 240ms var(--ease); }
+.collapse-soft { transition: grid-template-rows 520ms cubic-bezier(0.4, 0, 0.2, 1), opacity 360ms ease; }       /* a section that is a good part of a panel or a page: an even stretch and shrink */
+/* MCP server form: the program fields sit to the left, the address fields to the right; switching slides one out and the other in while the form stretches */
+.kind-pane { --x: -28px; transition: transform 520ms cubic-bezier(0.4, 0, 0.2, 1); }
+.kind-pane[data-side="right"] { --x: 28px; }
+.kind-pane[data-shut] { transform: translateX(var(--x)); }
+.kind-pane[data-moved]:not([data-shut]) { animation: kind-in 520ms cubic-bezier(0.4, 0, 0.2, 1) backwards; }
+@keyframes kind-in { from { transform: translateX(var(--x)); } }
+/* the slash command of a skill in a message: bold, and a card that says what skill it is (shown on hover or focus, drawn on the page itself) */
+.skill-tag { font-weight: 600; cursor: default; outline: none; border-radius: 3px; }
+.skill-tag:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* a conversation that is answering in the background (the sidebar): a small pulsing dot, amber when it waits for the user */
+.run-dot { flex: none; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: var(--accent); animation: run-pulse 1.4s ease-in-out infinite; }
+.run-dot[data-running="asking"] { background: #d98a00; }
+@keyframes run-pulse { 0%, 100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.1); } }
+@media (prefers-reduced-motion: reduce) { .run-dot { animation: none; } }
+.skill-tip {
+  position: fixed; z-index: 60; width: max-content; max-width: min(300px, calc(100vw - 16px)); padding: 8px 12px; box-sizing: border-box;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); box-shadow: 0 6px 24px rgb(0 0 0 / 0.10);
+  font-size: 12px; font-weight: 400; line-height: 1.4; letter-spacing: 0; text-align: left; white-space: normal; pointer-events: none;
+  animation: skill-in 150ms var(--ease) backwards;
+}
+@keyframes skill-in { from { opacity: 0; transform: translateY(-3px); } }
+.skill-card__name, .skill-card__desc, .skill-card__from { display: block; }
+.skill-card__name { font-size: 13px; font-weight: 600; }
+.skill-card__desc { color: var(--ink-2); }
+.skill-card__from { margin-top: 2px; color: var(--ink-3); }
+
+.collapse-grid.is-open { grid-template-rows: 1fr; opacity: 1; }
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes row-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+.stagger > *, main > * > * { animation: rise 420ms var(--ease) backwards; }
+.stagger > *:nth-child(2), main > * > *:nth-child(2) { animation-delay: 50ms; } .stagger > *:nth-child(3), main > * > *:nth-child(3) { animation-delay: 100ms; }
+.stagger > *:nth-child(4), main > * > *:nth-child(4) { animation-delay: 150ms; } .stagger > *:nth-child(5), main > * > *:nth-child(5) { animation-delay: 200ms; }
+.stagger > *:nth-child(6), main > * > *:nth-child(6) { animation-delay: 250ms; } .stagger > *:nth-child(n+7), main > * > *:nth-child(n+7) { animation-delay: 300ms; }
+.row-in { animation: row-in 360ms var(--ease) backwards; }
+.msg-in { animation: rise 300ms var(--ease) backwards; }
+.swap-in { animation: sharpen 280ms var(--ease) backwards; }
+@media (prefers-reduced-motion: reduce) {
+  .collapse-grid, .collapse-soft, .kind-pane { transition: none; } .kind-pane { animation: none !important; } .stagger > *, main > * > *, .row-in, .msg-in, .swap-in { animation: none; }
+}
+
+/* Type: one display size for the moment that matters, a quiet lede under it. Tracking tightens with size; Thai is never tracked. */
+.display { font-size: clamp(30px, 4.6vw, 48px); line-height: 1.02; letter-spacing: -0.04em; font-weight: 600; text-wrap: balance; }
+.lede { font-size: 15px; line-height: 1.5; color: var(--ink-2); letter-spacing: -0.012em; }
+.num-lg { font-variant-numeric: tabular-nums; letter-spacing: -0.03em; }
+:lang(th), .th { letter-spacing: 0; }
+/* A block's "Open" arrow slides in a little when its heading is reached; rows wash on hover. */
+.open-link { color: var(--ink-3); transition: color 200ms var(--ease); }
+.open-link .arrow { display: inline-block; transition: transform 260ms var(--ease); }
+.block-head:hover .open-link, .open-link:focus-visible { color: var(--ink); }
+.block-head:hover .open-link .arrow { transform: translateX(3px); }
+/* the wash reaches 8px past the row on each side (a shadow, not a margin), so borders and columns keep their alignment */
+.row-wash { transition: background-color 180ms var(--ease), box-shadow 180ms var(--ease); }
+.row-wash:hover { background: var(--hover); box-shadow: -8px 0 0 var(--hover), 8px 0 0 var(--hover); }
+
+/* Page heads: every page opens the same way - a title at a confident size, one quiet line under it. */
+.page-title { font-size: clamp(26px, 3.4vw, 34px); line-height: 1.08; letter-spacing: -0.035em; font-weight: 600; text-wrap: balance; margin: 0; }
+.page-sub { text-wrap: pretty; margin: 0.6rem 0 0; max-width: 62ch; font-size: 14.5px; line-height: 1.55; color: var(--ink-2); letter-spacing: -0.01em; }
+.page-head { padding-bottom: 2rem; }
+
+/* Orbs: one slot, the old design fades out while the new fades in; a live status line shimmers (a band of full ink travels
+   over text at half strength, left to right, 2 s, linear - the thinking-orbs web demo's t-shimmer). */
+.orb-slot { position: relative; display: inline-block; flex: none; vertical-align: middle; }
+.orb-layer { position: absolute; inset: 0; display: grid; place-items: center; }      /* a grid, so an inline child (a loader, an svg) is centered in the slot and not set on the text baseline */
+.orb-layer canvas { display: block; }
+.orb-in { animation: orb-in 450ms var(--ease) both; }
+.orb-out { animation: orb-out 450ms var(--ease) both; pointer-events: none; }
+@keyframes orb-in { from { opacity: 0; transform: scale(0.82); filter: blur(3px); } to { opacity: 1; transform: none; filter: blur(0); } }
+@keyframes orb-out { from { opacity: 1; transform: none; filter: blur(0); } to { opacity: 0; transform: scale(1.16); filter: blur(3px); } }
+.fade-swap { animation: orb-fade 250ms var(--ease) both; }      /* a line whose words are replaced (the live speed becomes the mean) */
+@keyframes orb-fade { from { opacity: 0; } to { opacity: 1; } }
+.t-shimmer {
+  background: linear-gradient(90deg, transparent, var(--ink), transparent) no-repeat, linear-gradient(color-mix(in srgb, var(--ink) 48%, transparent), color-mix(in srgb, var(--ink) 48%, transparent));
+  background-size: 80% 100%, 100% 100%; background-position: -400% 0, 0 0;
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; color: transparent;
+  animation: t-shimmer 2s linear infinite;
+}
+@keyframes t-shimmer { to { background-position: 500% 0, 0 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .orb-in, .orb-out, .fade-swap { animation: none; } .orb-out { display: none; }
+  .t-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; color: inherit; }
+}
+
+/* Thai (the page's lang is "th"): vowels and tone marks stack above and below the line, so a tight line height clips them and
+   a negative letter-spacing makes them collide. Tracking is off everywhere, and every tight line gets room. */
+html:lang(th) * { letter-spacing: 0 !important; }
+html:lang(th) .display, html:lang(th) .page-title, html:lang(th) h1, html:lang(th) h2, html:lang(th) h3 { line-height: 1.35; }
+html:lang(th) .lede, html:lang(th) .page-sub { line-height: 1.7; }
+html:lang(th) .prose-chat p, html:lang(th) .prose-chat li { line-height: 1.8; }
+html:lang(th) .thought { line-height: 1.6; }
+html:lang(th) .prompt-bar__input { line-height: 28px; min-height: 28px; }
+html:lang(th) .prompt-bar { line-height: 24px; }
+.fit-box { transition: height 300ms var(--ease); }
+.ghost .msg-in { animation: none; }       /* a message that is leaving must not play its entrance */
+@media (prefers-reduced-motion: reduce) { .fit-box { transition: none; } }
+
+/* ---- transitions.dev (Jakub Antalik): "Number pop-in", "Reasoning stream" and (in prompt-bar.css) "Plus to menu morph", pulled with its CLI on the developer's instruction;
+   the snippets are namespaced .t-* with their tokens as variables. Changes: a digit that was already there is not animated
+   (data-still); the stream is a real window onto text that grows (native scrolling, fades only where there is more) and not the
+   looping ticker of the demo. Reduced motion stays off, as the snippets require. ---- */
+:root {
+  --digit-dur: 320ms; --digit-distance: 6px; --digit-stagger: 38ms; --digit-blur: 2px;
+  --digit-ease: cubic-bezier(0.34, 1.45, 0.64, 1); --digit-dir-x: 0; --digit-dir-y: 1;
+  --morph-open-dur: 350ms; --morph-close-dur: 250ms; --morph-ease: cubic-bezier(0.34, 1.25, 0.64, 1); --morph-close-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --morph-r-closed: 9px; --morph-r-open: 14px; --morph-fade-dur: 200ms; --morph-slide: 40px; --morph-rotate: 45deg; --morph-scale: 0.97; --morph-blur: 2px;   /* radii for our 30 px button and rows; the rest as shipped */
+  --reel-dur: 450ms; --reel-cell: 1.35em; --reel-spin-blur: 3px; --reel-stagger: 45ms; --reel-ease: cubic-bezier(0.16, 1, 0.3, 1);   /* shorter and in em for a figure in a line of text */
+  --reason-hold: 840ms; --reason-step: 500ms; --reason-fade: 28px; --reason-ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes t-digit-pop-in {
+  0% { transform: translate(calc(var(--digit-distance) * var(--digit-dir-x)), calc(var(--digit-distance) * var(--digit-dir-y))); opacity: 0; filter: blur(var(--digit-blur)); }
+  100% { transform: translate(0, 0); opacity: 1; filter: blur(0); }
+}
+.t-digit-group { display: inline-flex; align-items: baseline; }
+.t-digit { display: inline-block; will-change: transform, opacity, filter; }
+.t-digit-group.is-animating .t-digit { animation: t-digit-pop-in var(--digit-dur) var(--digit-ease) both; }
+.t-digit-group.is-animating .t-digit[data-stagger="1"] { animation-delay: var(--digit-stagger); }
+.t-digit-group.is-animating .t-digit[data-stagger="2"] { animation-delay: calc(var(--digit-stagger) * 2); }
+.t-digit-group .t-digit[data-still] { animation: none; }
+@media (prefers-reduced-motion: reduce) { .t-digit-group .t-digit { animation: none !important; } }
+
+@property --reason-fade-top { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --reason-fade-bottom { syntax: "<length>"; inherits: false; initial-value: 0px; }
+.t-reason-viewport {
+  max-height: var(--reason-height, 10.5rem); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin;
+  --reason-fade-top: 0px; --reason-fade-bottom: 0px;
+  transition: --reason-fade-top 240ms var(--reason-ease), --reason-fade-bottom 240ms var(--reason-ease);
+  -webkit-mask-image: linear-gradient(transparent 0, black var(--reason-fade-top), black calc(100% - var(--reason-fade-bottom)), transparent 100%);
+  mask-image: linear-gradient(transparent 0, black var(--reason-fade-top), black calc(100% - var(--reason-fade-bottom)), transparent 100%);
+}
+.t-reason-viewport[data-above] { --reason-fade-top: var(--reason-fade); }          /* more above */
+.t-reason-viewport[data-below] { --reason-fade-bottom: var(--reason-fade); }       /* more below */
+html:lang(th) .t-reason-text { line-height: 1.8; }
+@media (prefers-reduced-motion: reduce) { .t-reason-viewport { transition: none; } }
+
+/* "Spinning counter" (transitions.dev): a reel per digit; the strip is one text node of fifty lines moved by --pos cells. */
+.t-reel { display: inline-flex; align-items: center; height: var(--reel-cell); vertical-align: 0.07em; font-variant-numeric: tabular-nums; }
+.t-reel-col {
+  position: relative; display: inline-block; width: 1ch; height: var(--reel-cell); overflow: hidden; text-align: center;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 22%, #000 78%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0%, #000 22%, #000 78%, transparent 100%);
+}
+.t-reel-strip {
+  display: block; white-space: pre; line-height: var(--reel-cell); will-change: transform;
+  transform: translateY(calc(var(--reel-cell) * var(--pos, 0) * -1));
+  transition: transform var(--reel-dur) var(--reel-ease);
+}
+.t-reel-strip[data-moving] { filter: url(#t-reel-blur); }
+.t-reel-sep { display: inline-block; }
+@media (prefers-reduced-motion: reduce) { .t-reel-strip { transition: none !important; filter: none !important; } }
+
+/* "Matrix dot loader" (transitions.dev): 16 dots, one colour pulse, a delay table per variant. The tokens use our ink so it follows the theme;
+   the dot and the gap are variables so it can be shown at any size. */
+:root { --matrix-cycle: 1200ms; --matrix-base: color-mix(in srgb, var(--ink) 14%, var(--bg)); --matrix-active: var(--ink-2); --matrix-ease: ease-in-out; }
+.t-matrix { display: grid; grid-template-columns: repeat(4, var(--matrix-dot, 2px)); grid-auto-rows: var(--matrix-dot, 2px); gap: var(--matrix-gap, 2px); }
+.t-matrix i { display: block; border-radius: 22%; background: var(--matrix-base); animation: t-matrix-pulse var(--matrix-cycle) var(--matrix-ease) infinite; animation-delay: calc(var(--d, 0) * 1ms); }
+.t-matrix i.is-gap { visibility: hidden; animation: none; }
+.t-matrix[data-paused] i { animation-play-state: paused; }
+@keyframes t-matrix-pulse { 0%, 45%, 100% { background-color: var(--matrix-base); } 15% { background-color: var(--matrix-active); } }
+@media (prefers-reduced-motion: reduce) { .t-matrix i { animation: none !important; } }
+
+.panel-in { animation: panel-in 220ms var(--ease) both; }
+@keyframes panel-in { from { opacity: 0; transform: translateY(4px); } }
+@media (prefers-reduced-motion: reduce) { .panel-in { animation: none; } }
+
+/* the live status under an answer gives way to its figures (components/motion.tsx Handover) */
+.handover { position: relative; display: inline-grid; align-items: center; justify-items: start; min-height: 1.5rem; }       /* the two layers share one cell, so the box is as wide as the wider: what follows is never covered */
+.handover-in, .handover-out { grid-area: 1 / 1; }
+.handover-in { opacity: 0; filter: blur(3px); transform: translateY(4px); transition: opacity 380ms var(--ease) 90ms, filter 380ms var(--ease) 90ms, transform 380ms var(--ease) 90ms; }
+.handover-in[data-show] { opacity: 1; filter: none; transform: none; }
+.handover-out { display: flex; align-items: center; white-space: nowrap; pointer-events: none; opacity: 0; filter: blur(3px); transform: translateY(-4px); transition: opacity 300ms var(--ease), filter 300ms var(--ease), transform 300ms var(--ease); }
+.handover-out[data-show] { opacity: 1; filter: none; transform: none; animation: sharpen 280ms var(--ease) backwards; }
+@media (prefers-reduced-motion: reduce) { .handover-in, .handover-out { transition: none; filter: none; transform: none; } .handover-out[data-show] { animation: none; } }
+
+.side-in { animation: orb-fade 260ms var(--ease) backwards; }
+@media (prefers-reduced-motion: reduce) { .side-in { animation: none; } }
+
+/* ---- Code in an answer is coloured like an IDE (lib/highlight.ts; the classes are highlight.js's). The colours are VS Code's Light+ (light) and Monokai, the theme of Claude Code's own code (dark),
+   as tokens that follow the app's theme, in the same three places as the other tokens. ---- */
+:root {
+  --syn-keyword: #0000ff; --syn-string: #a31515; --syn-comment: #008000; --syn-number: #098658; --syn-func: #795e26; --syn-type: #267f99;
+  --syn-var: #001080; --syn-attr: #0451a5; --syn-meta: #af00db; --syn-regexp: #811f3f; --syn-tag: #800000; --syn-add: #098658; --syn-del: #a31515;
+  --syn-literal: #0000ff; --syn-builtin: #795e26; --syn-param: #001080;
+  --code-bg: color-mix(in srgb, var(--ink) 3.5%, var(--surface));
+}
+:root[data-theme="dark"] {
+  --syn-keyword: #f92672; --syn-string: #e6db74; --syn-comment: #75715e; --syn-number: #ae81ff; --syn-func: #a6e22e; --syn-type: #66d9ef;
+  --syn-var: #f8f8f2; --syn-attr: #a6e22e; --syn-meta: #a6e22e; --syn-regexp: #e6db74; --syn-tag: #f92672; --syn-add: #a6e22e; --syn-del: #f92672;
+  --syn-literal: #ae81ff; --syn-builtin: #66d9ef; --syn-param: #fd971f;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --syn-keyword: #f92672; --syn-string: #e6db74; --syn-comment: #75715e; --syn-number: #ae81ff; --syn-func: #a6e22e; --syn-type: #66d9ef;
+    --syn-var: #f8f8f2; --syn-attr: #a6e22e; --syn-meta: #a6e22e; --syn-regexp: #e6db74; --syn-tag: #f92672; --syn-add: #a6e22e; --syn-del: #f92672;
+    --syn-literal: #ae81ff; --syn-builtin: #66d9ef; --syn-param: #fd971f;
+  }
+}
+.code-block pre { background: var(--code-bg); }
+.hljs-keyword, .hljs-selector-tag, .hljs-doctag { color: var(--syn-keyword); }
+.hljs-literal, .hljs-symbol, .hljs-bullet { color: var(--syn-literal); }
+.hljs-string, .hljs-template-variable { color: var(--syn-string); }
+.hljs-comment, .hljs-quote { color: var(--syn-comment); font-style: italic; }
+.hljs-number { color: var(--syn-number); }
+.hljs-title, .hljs-title.function_, .hljs-function { color: var(--syn-func); }
+.hljs-built_in { color: var(--syn-builtin); }
+.hljs-title.class_, .hljs-title.class_.inherited__, .hljs-type, .hljs-class .hljs-title { color: var(--syn-type); }
+.hljs-variable, .hljs-property, .hljs-subst { color: var(--syn-var); }
+.hljs-params { color: var(--syn-param); }
+.hljs-subst { color: inherit; }
+.hljs-attr, .hljs-attribute, .hljs-selector-attr, .hljs-selector-pseudo { color: var(--syn-attr); }
+.hljs-meta, .hljs-meta .hljs-keyword, .hljs-meta-keyword { color: var(--syn-meta); }
+.hljs-meta .hljs-string, .hljs-meta-string { color: var(--syn-string); }
+.hljs-regexp { color: var(--syn-regexp); }
+.hljs-tag, .hljs-name, .hljs-selector-class, .hljs-selector-id { color: var(--syn-tag); }
+.hljs-tag .hljs-attr { color: var(--syn-attr); }
+.hljs-section { color: var(--syn-keyword); font-weight: 600; }
+.hljs-link { color: var(--syn-attr); text-decoration: underline; }
+.hljs-addition { color: var(--syn-add); background: color-mix(in srgb, var(--syn-add) 14%, transparent); }
+.hljs-deletion { color: var(--syn-del); background: color-mix(in srgb, var(--syn-del) 14%, transparent); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }

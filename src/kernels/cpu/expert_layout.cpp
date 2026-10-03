@@ -72,6 +72,10 @@ bool cpu_avxvnni_ok() {
     return ok;
 }
 
+const char* cpu_expert_isa() {      // the same order as q2_rows_any below
+    return cpu_avx512_ok() ? "AVX-512" : cpu_avxvnni_ok() ? "AVX-VNNI" : "AVX2";
+}
+
 bool cpu_avx2_ok() {
     static const bool ok = [] {
         unsigned r[4] = {0, 0, 0, 0};

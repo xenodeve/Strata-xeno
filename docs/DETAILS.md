@@ -591,7 +591,17 @@ also paste as it is (key `"mcpServers"`):
 ```
 
 Or keep them in their own file and start the server with `--mcp-config path\to\claude_desktop_config.json` (a file
-with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change.
+with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change to
+these files.
+
+**Or set them up in the web app** (new app, **Settings > MCP tools > Servers**; needs the server started with `--config`): the list
+shows each server's state and tools, and you can add, edit, turn off and delete one, paste a block from Claude Desktop,
+and set the three limits. A change is written to the run config (its other keys are kept; the original is copied once
+to `<config>.bak-mcp`) and the servers start again at once - no restart. Servers from `--mcp-config` are listed but
+only edited in that file. The values of `env` and `headers` are never sent to the browser: they show as `********`, and
+leaving that in keeps the stored value. Because this decides which programs Strata starts, it works **only from this
+PC itself** (open the page as `localhost` or `127.0.0.1`) **or when the server has an API key** and it is entered under
+Settings > General > API key; from any other address the section is a read-only list.
 
 - **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
   stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
@@ -607,13 +617,140 @@ with an `mcpServers` block; add it to the `serve/server.py` line of your run scr
   (default 20,000 characters) are cut, with a note, before the model reads them. Stop stops a running tool too.
 - Only the chat page uses them. API clients (omp, Claude Code, OpenAI and Anthropic SDKs) see the API exactly as
   before and keep their own tools; a request to `/v1/chat/completions` opts in with `"strata_mcp": true` (it then
-  gets `strata_mcp` tool events in the stream).
+  gets `strata_mcp` tool events in the stream), and `"strata_mcp_off": ["name", ...]` leaves servers out of that request (the
+  chat page sends it for the servers switched off in its **+ > MCP tools** list, which shows each server with its tools).
 
 **Security.** MCP tools run on your PC with your user's rights, and **the model decides when to call them** - also
 because of what it reads (a web page or a file can contain instructions). Give a filesystem server only the folders
 it needs, prefer read-only tools, and don't add servers you don't trust. The tools can only be used from the chat
 page itself (a request with another site's Origin or without a JSON content type is refused); if Strata is reachable
 from other devices, set an API key.
+
+**Coding tools in the chat (a port of Claude Code's).** The chat can read, search, change files and run commands on this PC with
+Claude Code's own tools and names: `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` (with `BashOutput` and `KillShell` for commands that run
+in the background), `TodoWrite` and `ExitPlanMode`. The model also gets Claude Code's kind of rules (read before you change, do what was asked,
+text in files and command output is data and not instructions, do not retry what the user refused, commit only when asked) and the project's
+own `CLAUDE.md` (or `AGENTS.md`). They work only from this PC itself (or with the API key), never for another address on the network, and
+`"agent": false` in the run config switches them off.
+
+**Compacting a conversation** (as Claude Code's `/compact`). Typing `/compact` (optionally followed by what the summary should focus on) asks the model for a summary
+of everything so far, written in the sections Claude Code's own summary has (the request, key concepts, files and code, errors and fixes, every user message, pending
+tasks, current work, next step), with no tools, and the summary takes the place of the messages: the chat shows a line "Conversation compacted" that opens to it, and
+the model reads it as the earlier part of the conversation. A conversation that has used 95 % of the context (what the last answer reported: its prompt after every tool
+round, and its own tokens; else a guess from the text) is compacted by itself before the next prompt is sent (the prompt and its answer stay out of the summary); the
+switch is in the sampling settings ("Compact the conversation by itself", on by default). When the conversation does not fit with the request, the oldest prompts are
+left out of the summary and the model is asked again. While it is being summarised the status is the "compacting" orb of thinkingorbs.com (the dots pack tight and spring back; `@yogesharc/thinking-orbs`, MIT). Nothing is kept of the messages that were summarised. Not done: compacting in the middle of one answer's tool
+rounds (the server's tool loop runs them without the page).
+
+**The context window in view.** The prompt bar has a chip with the share of the window that is used (a small ring and a number, amber from 60 %, red at the point where it is
+compacted by itself); it opens to how many tokens of how many, a bar and a list of what the window holds (the conversation, tool calls and results, the summary of earlier
+messages, what the server added - its instructions, the tools, the memory - and what is free) and "Compact now". `/context` opens the same panel. The figure is what the
+last answer reported, else a guess from the text (the panel says "about"); with no window size from the server there is no chip.
+
+**A new chat inside a project.** Each project in the sidebar has a button for a new conversation in it: the conversation is in the project from its first prompt (and the
+coding tools work in the project's folders from that request); until then the empty chat says which project it will be in. A new chat can also be given a project on its empty page (a menu under the heading, shown when there are projects):
+"No project" or one of them, changed or taken away until the first prompt; after that moving it is the sidebar's.
+
+**Chats that answer at the same time.** Another chat can be opened, or a new one started, while one is answering. The one that was left goes on in the background (the server takes the
+requests one after the other, so the second waits for its turn), is marked in the sidebar by a pulsing dot (amber when it waits for the user's answer to a question of the coding tools),
+and is saved in its own place when it ends; coming back to it shows what has been written so far, with Stop. A chat answers one question at a time, and cannot be deleted while it answers.
+Stop ends the open chat's answer only. Nothing of this survives closing the page: an answer still being written then is lost, as before.
+
+**Memory and instruction files.** The chat reads the project's own instruction files (`CLAUDE.md`, `CLAUDE.local.md`, `.claude/CLAUDE.md`, `AGENTS.md` when there is no `CLAUDE.md`, `.claude/rules/*.md`) of every folder of the project, following `@file` lines inside the folder a few levels deep, and hands them to the model after the rules and under them; a file in a sub-folder is handed over, once per chat, when the model reads or changes a file there. What other apps wrote down is **off until switched on** (in the import settings, or the Memory tab): each app's user instruction file (Claude Code `~/.claude/CLAUDE.md`, Codex, the shared agents folder, Gemini CLI) and the memory Claude Code keeps for a project (`~/.claude/projects/<folder>/memory/`). Each file is cut at 20,000 characters and all together at 60,000. None of it changes what the model may do: the permission rules decide that.
+The panel's Memory tab lists the sources for the open chat's folders (each file opens to its text, a button puts "Please update <file>: " in the composer, and the other apps' sources have their switches); Settings > Import > Memory has the same switches. `/memory` opens the tab, `/init` sends the prompt that has the model look at the project and write its `CLAUDE.md` (improving one that is there), `/clear` starts a new chat.
+
+**Permissions that last.** A card that asks has "More choices": always allow in this project, always allow everywhere, never in this project, never anywhere ("allow for this chat" is kept with the chat as before). The rule behind the card (`Bash(npm test:*)`, `Read(src/**)`, Claude Code's syntax) is kept in the browser for the project or for everywhere and every request carries them (`strata_agent.allow` for the chat's, the project's and everywhere's allowed rules, `strata_agent.deny` for the refused ones of the project and everywhere). Settings > Permissions lists them by place (everywhere, each project), adds a rule (allowed or never) and removes one; `/permissions` opens it; deleting a project deletes its rules. The server's order is unchanged: a deny rule beats an allow rule, and no rule settles a secret, a change in `.git` or a command that can do harm that is hard to undo (those ask every time).
+
+**Questions from the model.** The AskUserQuestion tool (Claude Code's shape: one to four questions, each with a header of at most 12 characters, two to four choices with their meaning, and multiSelect) lets the model ask for a decision that is the user's instead of guessing. It needs no permission and works in every mode, including plan mode. The question is a form on its call in the chat (one choice or several, and a line for something else); Send answers it (`POST /agent/question`), Skip tells the model the user did not answer. The answers go back to the model as the tool's result, and the request waits meanwhile (up to ten minutes, or until it is stopped).
+
+**Refreshing the page while the agent works.** An answer that uses the coding tools runs in the server on its own, so refreshing or closing the page does not stop it and does not end in a "network error". The page remembers the run's id; when it is back it reads the run again from its start, so the conversation looks as it would have, a question the agent was waiting on is still there to answer, and the answer goes on to its end (its speed is not shown, since it was read all at once). Stop is a request of its own to the server. A run that the server no longer has (it was restarted, or it ended more than half an hour ago) is said so in the conversation, and the message is kept. A run that nobody looks at for 15 minutes is stopped.
+
+**Sending a message while the agent works.** What you type while an agent works (also while it is thinking) is handed to it at once and shown as "Sent to the agent: it reads it at its next step". The agent reads it at its next step: after the tools of the round it is in, together with their results, or, if that round was its last, in the same run instead of ending. It then becomes your message in the conversation, the answer so far ends above it and the reply is a new answer below. A message that cannot be handed over (it has attachments, the answer is not an agent's, the server did not take it) waits in line and goes when the answer ends, as before. Stop still stops the whole run, and an answer that is stopped (or fails) while a question is open closes the card: it says the answer stopped before you answered, and no buttons are left that lead nowhere.
+
+**The speed shown under an answer** is the engine's own decoding speed over every round of the answer (the tokens it wrote over the time it spent decoding them), not the tokens over the time of the whole answer: that time holds the tools and the reading of each next prompt, and an agent's answer showed 23 tok/s where the engine decoded at 50.
+
+**What the page keeps when another page is opened, and what it draws again.** A counter, a timer or a draft belongs to the app, not to the part of the page that shows it: that part is taken away when another page is opened and made again when it is opened, and whatever it held in itself starts again from nothing. So: the thinking timer is counted from when the thinking began (`thinkAt`, `doneAt`), the tokens written live are counted in the controller, what is typed in the composer (`chat.draft`) and a thought that was opened (kept with its message) are still there, the Requests list is shown at once from what was kept (the newest page is read again and put in front of it), a prompt being rewritten is still being rewritten with what was written, and the disks' graphs are fed by every reading of the server whichever page is open (`lib/trails.ts`). An answer read again after a refresh has the real times too: the server writes the time each event happened at (`strata_t`) and its own clock in the `X-Strata-Now` header of `GET /agent/run`, so the page sets the thinking's start and length ("Thought for 12.4s") against its own clock, and not to the milliseconds the replay took.
+
+**A thought that goes on for a long time** (two minutes; `strata.longThinkMs` in the browser's storage changes that) gets a line under it: it says the model may be going round in a loop, with Stop beside it. Nothing is stopped by itself; a hard problem may take that long. The other way round, a message that did not change is not drawn again: the server's status is read twice a second while it works, and each reading used to draw every message of the conversation and parse its markdown again; a message now carries a signature of what it draws (`lib/msgsig.ts`) and only the answer that is being written, and the messages whose signature changed, are drawn; the list of conversations is drawn when the list changes, not at every word of an answer.
+
+**What an agent's work looks like.** The thinking of each round is shown under the tools of the round before it, not only once at the top (the first round's thinking stays above and closes once a tool starts), so that a long run of tools shows what the agent is thinking now. There is always one line in words for what is going on now (a design principle, in `AGENTS.md`): *writing the call to Bash*, *running Bash*, *a helper is working*, *running your hook* (the server says when a hook begins, not only when it ends), *auto mode is checking the call*, *waiting for you*, then, once a tool has answered, *reading the tool's result* while the server reads the prompt that holds it, *planning the next step* once the model is writing again, and *answering*; one step gives way to the next one's words, never to silence, even when the model wrote something before it called the tool. While it reads, a share ("42%") stands beside the words, and pointing at it gives the tokens read of the tokens to read (the position includes what the conversation cache already held). While an answer is being written a count of the tokens written so far runs beside it (the rounds added up, moving on between the server's readings by the speed it reports), so that a long run is seen to be going on. The button that opens the right panel stays at the top of the conversation when it is scrolled.
+
+**Sub-agents.** The Task tool lets the model hand a side task (a long search, reading through many files) to a helper that works on it with its own conversation and answers with a short report, which keeps the search out of the chat. It exists only when you switch **Settings > Sub-agents** on, and it is off by default: a helper uses the same model, and a local model has one engine slot, so the main answer waits for the helper (one at a time, even when the model asks for two) and the conversation is read again afterwards. The helper does not see the chat, only the task the model wrote. The usual kind, `explore`, can only read and search (Read, Glob, Grep); `general` can also change files and run commands, under the same rules as the chat: its permission questions come to you on the Task's card like any other, a "never" rule binds it, and what it changes can be rewound. A helper cannot start a helper or ask you questions, and it stops after 25 rounds, in which case the model is told that it did not finish. The Task's card lists the helper's steps as they happen.
+
+**Web access.** Two more tools, WebFetch (a page's text) and WebSearch, exist only when you switch **Settings > Web access** on, and it is off by default: it is the one thing in Strata that sends something off this PC (the address of a page, or your search words). While it is off the model is not even told about them. When it is on, every fetch and every search asks you first and shows the address or the words; the card's More choices has "Always allow this site" (a rule `WebFetch(domain:example.com)`, which also covers its sub-domains), and a search has no such rule. Addresses on this PC or on a private network (localhost, 10.x, 192.168.x, 169.254.x, a name with no dot or ending in .local) are refused, also after a redirect and also when a name resolves to one, and what a page or a search result says is given to the model as text from the internet, never as an instruction. A page is made into readable text (headings, lists, links), cut at 40,000 characters, and a reply is read up to 2 MB or 20 seconds. Searching goes through the provider you choose: a SearXNG of your own (its address may be on your network) or Brave Search with your API key, which is kept on the server and never shown again. DuckDuckGo is not offered, because it answers a program with a challenge.
+
+**Images and PDFs.** The Read tool also reads an image (png, jpg, gif, bmp, webp, up to 5 MB; a large one is made smaller first) and shows it to the model in its next turn, when the server has the vision encoder; without it Read says so instead of failing silently. A PDF is read by `pages` (for example `1-5`; one of more than 10 pages needs it, and at most 20 pages are read at once) as the text of each page, up to 60,000 characters; a page with no text layer (a scan) is given as an image when vision is on (up to 8 in one read), else a note says it cannot be read. The picture itself is kept out of the chat page, which shows only a line about it.
+
+**Hooks.** Commands of your own that run around the chat's tool calls, as in Claude Code. They are written by hand in the server's run config (`"hooks": [{"event": "before_tool", "matcher": "Bash", "command": "./check.sh", "timeout": 10}]`), never through a page, so a web page cannot make Strata run a command; none are set by default. There are four events: `before_tool` (just before a call; exit code 2 stops it and the hook's output goes to the model as the reason), `after_tool` (what the hook prints is added to the tool's result for the model, for example a failed lint), `prompt` (when you send a prompt; what it prints goes to the model with the rules) and `stop` (when the model has finished; what it prints is shown in the chat). `matcher` is a regular expression that must match the whole tool name (`Edit|Write`); none or `*` means every tool. A hook runs in the project's folder in the chat's shell with no `STRATA_*` environment variable, gets the event as JSON on its input, and has a time limit (30 s by default, at most 300). A hook can only make a call stricter: it runs after the rules have not denied the call and nothing it says allows anything, so a deny rule, a secret, `.git` and a dangerous command stay as they were. One that fails, cannot start or runs out of time is shown in the chat and never stops or hangs the answer. Settings > Hooks lists them (from this PC only) with a switch each, kept in the run config as `hooks_off`; each call and answer shows what its hooks did.
+
+**Rewind.** Every prompt is a checkpoint: before the Write, Edit or NotebookEdit tool first changes a file during a prompt, the server keeps the file as it was (or that it did not exist), and notes what it is after each change. The button on a prompt (and `/rewind`, which also lets you choose the prompt) opens a dialog that says which files would be put back (a file the tools made is deleted), marks the ones that were changed by someone else since (you, a build, a command), which are left unless you tick the box, and offers the files and the conversation, only the files, or only the conversation; the conversation is cut at the prompt, which goes back to the composer. What the shell tool does to files is not tracked and not undone (the dialog says so). At most 200 files and 100 MB are kept for one prompt, a file over 5 MB is listed as one that cannot be put back, the newest 40 prompts of the newest 30 chats are kept, and a chat's checkpoints go when the chat is deleted.
+
+**`@file` and messages that wait.** Typing `@` and a few letters in the prompt offers the files of the project's folders that go with them (the name that starts with them first; secrets, `.git`, `node_modules` and the like are never offered; `GET /agent/files`); a picked file is written `@path`, and when the prompt is sent the text of each file it mentions goes with it as an attachment, cut at 60,000 characters and only from inside the project's folders (`GET /agent/mention`: a path that leaves them by `..` or a link, a secret and a binary file are refused). A message typed while an answer is being written is not lost: it waits in line (shown as a dashed bubble that can be edited or dropped, up to 20 per chat) and goes when the answer ends well, one after the other; Stop sends nothing, and what waited can be sent, taken back or dropped. A chat that answered in the background sends what waited in it when it is opened.
+
+**The right panel.** A button at the top right of the Chat opens a panel beside the conversation (a sheet over it on a screen narrower than 1280 px; open state and tab are kept in
+the browser). Tabs: **Git** - for each folder of the project (a tab each), the branch (or "detached at ..."), commits ahead and behind its upstream, the changed files in groups
+(conflicts, staged, not staged, new) each opening to its diff with old and new line numbers, the branches with the current one marked, the worktrees of the repository, and the last
+commits; it is read again when an answer ends (the model may have changed files) and on request; read only, and only for who may use the coding tools. **Plan** - the model's to-do
+list with how far it is, and the plan it sent for approval. **Skills** - the skills used in the chat, those the user asked for with `/name` and those the model loaded (the chat
+also says "Used skill: name" where it happened). **Context** - the same panel as the chip on the prompt bar.
+
+- **What asks.** Inside the chat's project folder, reading, searching, writing and editing files are free (secrets such as `.env` or keys, and
+  writing in `.git`, always ask). Outside the folder, or when the chat has no folder, everything asks. A command asks every time unless it is
+  a plain read-only one (`ls`, `git status`, `cat src/a.py`, ...) that names nothing outside the folder; a command that is chained, writes a
+  file or hides what runs asks. A card says what and why; the answer is **Allow**, **Allow for this chat** (remembered as a rule such as
+  `Bash(git commit:*)` or `Read(/some/dir/**)`) or **Deny** (the model is told not to retry).
+- **Rules.** The same syntax as Claude Code's `allow`/`deny` rules: `Tool` or `Tool(specifier)`; deny beats allow beats the defaults. A rule
+  never unlocks a secret.
+- **Modes.** *Ask* (the default), *Plan* (nothing is changed: writes and commands that are not read-only are refused until you approve the
+  plan the model sends with `ExitPlanMode`) and *Auto* (like Claude Code's auto mode: a second check by the same model decides what would
+  ask - 1-2 runs it, 3 asks you, 4-5 blocks it and says why; it sees what you asked and the call, never tool output; a dangerous command, a
+  secret or `.git` is never left to it). There is no mode that turns the questions off.
+- **Safety nets.** A file must be read in the chat before it can be overwritten or edited, and not have changed since; a command runs in the
+  chat's folder (a `cd` carries over to its next command while it stays inside the project's folders, variables do not), with a time limit (default 2 minutes, at most 10), is stopped with all it started on a timeout or Stop, and gets
+  no `STRATA_*` environment variable. Output over 30,000 characters is cut in the middle.
+- **In the chat.** The + menu has a **Coding tools** row (the same controls are in Settings > Coding tools): a switch (on by default when the server
+  has them and this page may use them), the mode (Ask / Plan / Auto) and the folder. A chat in a project works in the project's folder; a chat in no
+  project uses the default folder. A project cannot be made without a folder, and may have several (the worktrees of one repository, a library
+  next to the app): the New project dialog asks for a name and folders, typed or chosen from the folders of this PC (`GET /agent/folders`, names of
+  folders only, same callers as the tools) and checked before they are added. While a path is typed the folders that go with it are offered (those in the folder typed so far whose names start with, or contain, the
+  part typed after the last separator), so a rough path and one click is enough. The first is the main one (commands run there, relative paths start
+  there); the request carries the others as `strata_agent.dirs` (Claude Code's added directories) and files in them are as free as in the main one.
+  Reading, searching, writing and editing follow the same rules in all of them, a change in any `.git` still asks. A call shows as what it is: the command and its output, an edit as removed and added lines, the steps of a
+  longer task as a checklist. When the server asks, the call shows a card with the command or the path and why it asks. **Allow for this chat** is
+  kept in this browser and sent with the chat's next requests; a dangerous command cannot be allowed for the whole chat.
+- **Trying it without a model.** `STRATA_MOCK_AGENT=1 python serve/ui/dev/mock_server.py` is the mock server with the real tools behind it; a message with
+  "agent demo" in it makes the fake model use them step by step (a todo list, a search, a read, a command that only reads, a file in the temp folder and a
+  command, the last two asking first).
+- **Notebooks.** `Read` shows a Jupyter notebook (.ipynb) by its cells, with their ids and text outputs (an image output is only named); `NotebookEdit`
+  replaces, inserts or deletes a cell by id (or `cell-N`) after the notebook was read in the chat, and is gated like any edit of that file.
+- **Not the same as Claude Code (yet).** No sub-agents (`Task`), no `WebSearch`/`WebFetch`, no images or PDFs in `Read`, no hooks; a `cd` does not
+  carry over between commands.
+
+**Skills and MCP servers from your other coding apps.** The web app can use what Claude Code, Codex, Antigravity, Gemini CLI,
+Cursor, Claude Desktop and the shared `~/.agents/skills` folder already have on this PC. It only reads their files; it never
+writes there.
+
+- **Skills are imported automatically and are on** (Settings > Import > Skills): the model gets three tools, `find_skills`
+  (search by a few words), `use_skill` (loads a skill's instructions) and `read_skill_file` (a file bundled with it). A skill
+  is not in the prompt until the model loads it. Switch off the whole import, an app, or one skill; a skill found later is on,
+  one you switched off stays off (the choices are saved in the run config under `import`). The same skill in several apps is one.
+  On the PC this was written on that was 755 skills found, 462 in use, and the three tools' descriptions together 466 characters.
+  A skill's files are read inside the skill's own folder only (no `..`, no links out, no hidden files or keys, text under 100 KB).
+  A skill may tell the model to run a script: Strata has no shell of its own, so that works only if you import and enable a shell
+  MCP server (the model decides when to call tools, as with any MCP server).
+- **`/` in the chat picks a skill, like Claude Code's slash commands.** Typing `/` at the very start of the message lists the skills
+  in use (type more to narrow the list; arrow keys and Enter or Tab, or a click, pick one; Escape closes it). A message that starts
+  with `/name` of a skill in use makes the page send `strata_skill: "name"`; the server then loads that skill itself (the same text
+  `use_skill` gives, behind the same folder fence) and puts it in front of that message, so it does not depend on the model asking for
+  it. The message is shown and stored as typed. Only that message gets the skill: a later plain one does not repeat it. A name that
+  is not a skill in use, or one switched off since, is refused with 400 and its name; the request must come from Strata's own page.
+- **MCP servers are listed by app and imported by a click** (Settings > Import > MCP servers): nothing is started until you press
+  **Import** on one. Import copies the server (with its environment variables and headers, on the server: they never go to the
+  browser) into Strata's own `mcp_servers`; from then on it is an ordinary server of Strata's (Settings > MCP tools > Servers), which
+  you can edit, turn off or delete. A name Strata already uses gets the app's name added; a server Strata already has shows "Already
+  in Strata"; one that is off in its own app is imported off; SSE-only servers cannot be imported.
+- Like setting up MCP servers, changing any of this works only from this PC itself or with the API key; from elsewhere the page is a
+  list of names. `STRATA_HOME` (an environment variable) makes Strata read another folder instead of your home folder (for tests).
 
 **Context extension past 262K (rope scaling, EXPERIMENTAL, off unless you pick it).** The model was trained on
 262,144 positions (rotary base 1e7). Rope scaling rescales the rotation angles so that longer contexts stay usable,

@@ -231,9 +231,42 @@ blueprint and checkpoint:
 - **Verification:** each gate with its numbers and data files (build, tests, parity, greedy output hashes against the
   pre-merge line, same-session A/B), and what was not run.
 - **What is left:** refused combinations, opt-in features not measured, follow-up issues.
+- **The classic web app:** what changed in upstream's own web app (`serve/web/`, kept untouched and served at `/classic/`) and
+  needs porting to the new one (`serve/ui/`), or "nothing changed" (xeno #67).
 
 Link the report from the merge's tracking issue and from `docs/BLUEPRINT.md`'s revision log, and commit it on the merge
 branch. A merge without this report is not finished.
+
+## Web app: always show what the model is doing now (design principle, developer, 2026-10-03)
+
+The web app (`serve/ui/`) must never leave the user guessing whether the model is working. At every moment of an answer there is
+**one visible status in words for what is going on now**, and a change from one step to the next is a change of words, never a gap.
+
+- Other harnesses leave the last tool's card showing "done", or say only "reading the prompt", while the model reads the tool's
+  result and plans its next move. The user then sees a series of separate notices with silence between them and the work feels
+  slow even when it is not. Here the status says what is true: *writing the call to Bash*, *running Bash*, *running your hook*,
+  *auto mode is checking the call*, *waiting for you*, *reading the tool's result*, *planning the next step*, *thinking*,
+  *answering*, *a helper is working*.
+- The status is told from what the page and the server already know (the order of the events of the answer, the server's live
+  state), so it costs the engine nothing. It lives in one function, `serve/ui/src/lib/status.ts` (`agentStatus`), with its tests;
+  a new step an agent can be in is added there, with its words and its Thai, and an event the server sends when the step begins
+  (not only when it ends: a step that is only reported afterwards is a gap).
+- Alongside it, work that is running shows that it is: the count of tokens written so far runs live, the thinking of each round is
+  shown where it happened (under the tools of the round before it), and a refreshed page reads the running answer again instead of
+  failing (`serve/runs.py`).
+- A change that adds a step with no status, or that makes a status wait for the end of the step before it appears, breaks this rule.
+
+## Which server is the main one (developer, 2026-10-03)
+
+- **D2x is the main serving profile** (`strata-flash-next-d2x.json`, key 3 of `strata-hub.bat`): Swift 1.5 IQ2_XS with dynamic
+  experts only (no NVMe tier), context 262,144 since 2026-10-03. Build, test and measure for it first, and default to it when a
+  task needs "the server".
+- **Capacity mode is optional** (`strata-swift-capacity.json`, keys 1 and 2: the NVMe tier for experts past RAM, `--ram-cache-gib`).
+  It stays supported and tested, but it is something the developer chooses to run, not what a change is judged on.
+- **The RAM budget for Strata's private commit is 42 GB** (the developer raised it from 40 GB on 2026-10-03). It is a budget the
+  developer sets, not a flag: no config or launcher enforces it, so a run is judged against it by measuring the commit.
+- D2x's RAM commit at 262k has not been measured yet (it may land near that budget); a measurement of it needs both GPUs and is
+  the engine session's job. Do not edit these configs, the launchers or `strata-hub.bat` without telling the developer.
 
 ## Other standing rules
 
