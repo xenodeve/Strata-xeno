@@ -4,6 +4,7 @@
 // without the model.  It is also the run-time half of the sm_120 policy: CMake refuses to COMPILE for another
 // architecture, and this refuses to RUN on one.
 #include "strata/core/device.hpp"
+#include "strata/core/secondary_arena.hpp"
 #include "strata/core/secondary_budget.hpp"
 #include "strata/core/secondary_vram.hpp"
 #include "strata/plan/plan.hpp"
@@ -97,19 +98,14 @@ int main(int argc, char** argv) {
     }
 
     try {
-        if (secondary_requested) {
-            const auto primary = strata::core::device_info(0);
-            if (primary.name.find("5060 Ti") == std::string::npos) {
-                std::fprintf(stderr, "CUDA device 0 is %s, expected 5060 Ti; set CUDA_VISIBLE_DEVICES=1,0\n",
-                             primary.name.c_str());
-                return 2;
-            }
-        }
         const strata::core::DeviceInfo d = strata::core::device_info(ordinal, secondary_requested);
         if (secondary_requested) {
-            if (d.name.find("4070 SUPER") == std::string::npos || d.cc_major != 8 || d.cc_minor != 9) {
-                std::fprintf(stderr, "CUDA device 1 is %s (sm_%d%d), expected RTX 4070 SUPER sm_89\n",
-                             d.name.c_str(), d.cc_major, d.cc_minor);
+            const auto primary = strata::core::device_info(0);   // #117: the pair by its rule, not by name
+            std::string why;
+            if (!strata::core::secondary_pair_ok(primary.cc_major * 10 + primary.cc_minor, d.cc_major * 10 + d.cc_minor,
+                                                 ordinal != 0, why)) {
+                std::fprintf(stderr, "CUDA devices 0 (%s) and %d (%s): %s\n", primary.name.c_str(), ordinal,
+                             d.name.c_str(), why.c_str());
                 return 2;
             }
             const uint64_t reserve = (uint64_t) secondary_reserve_mib << 20;

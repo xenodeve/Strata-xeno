@@ -11,6 +11,19 @@
 #include <utility>
 
 namespace strata::core {
+
+bool secondary_pair_ok(int primary_cc, int secondary_cc, bool distinct, std::string& why) {
+    if (!distinct) {
+        why = "the secondary tier needs a second card (device 1 is device 0)";
+        return false;
+    }
+    if (primary_cc < 80 || secondary_cc < 80) {
+        why = "the secondary tier needs sm_80 or newer on both cards (sm_" + std::to_string(primary_cc) + " and sm_" +
+              std::to_string(secondary_cc) + ")";
+        return false;
+    }
+    return true;
+}
 namespace {
 
 constexpr uint64_t kAllocationCushion = 64ull << 20;
@@ -68,12 +81,13 @@ bool SecondaryArena::open(int ordinal, const std::vector<uint64_t>& ranked_blob_
     }
     const RestoreDevice restore{previous};
     cudaDeviceProp primary{}, display{};
-    if (cudaGetDeviceProperties(&primary, 0) != cudaSuccess ||
-        cudaGetDeviceProperties(&display, ordinal) != cudaSuccess ||
-        std::strstr(primary.name, "5060 Ti") == nullptr ||
-        std::strstr(display.name, "4070 SUPER") == nullptr ||
-        display.major != 8 || display.minor != 9) {
-        err = "secondary arena requires CUDA_VISIBLE_DEVICES=1,0 (5060 Ti then 4070 SUPER sm_89)";
+    if (cudaGetDeviceProperties(&primary, 0) != cudaSuccess || cudaGetDeviceProperties(&display, ordinal) != cudaSuccess) {
+        err = "secondary arena cannot read the cards' properties";
+        return false;
+    }
+    std::string why;   // #117: any two distinct sm_80+ cards (was: a 5060 Ti then a 4070 SUPER sm_89, by name)
+    if (!secondary_pair_ok(primary.major * 10 + primary.minor, display.major * 10 + display.minor, ordinal != 0, why)) {
+        err = "secondary arena: " + why;
         return false;
     }
     auto snapshot = [&](uint64_t& lower) {

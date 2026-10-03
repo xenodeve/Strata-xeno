@@ -6,6 +6,10 @@
 
 namespace strata::core {
 
+// #117: the cards a secondary tier may pair: device 0 the primary, device 1 the tier, two distinct cards, each
+// sm_80 or newer (`cc` = major * 10 + minor).  Before #117 only a 5060 Ti then a 4070 SUPER sm_89, by name.
+bool secondary_pair_ok(int primary_cc, int secondary_cc, bool distinct, std::string& why);
+
 // Read-only expert slots on the display GPU. open() touches the whole allocation and
 // refuses a result below the measured 2560 MiB free-VRAM floor.
 class SecondaryArena {

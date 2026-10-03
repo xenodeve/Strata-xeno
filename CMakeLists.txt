@@ -208,6 +208,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(WIN32 AND STRATA_BUILD_XENO_TESTS)
     add_executable(xeno_secondary_arena tests/xeno/secondary_arena.cpp)
     target_link_libraries(xeno_secondary_arena PRIVATE strata_secondary)
+    # #117: which two cards a secondary tier may pair (pure: no GPU)
+    add_executable(xeno_secondary_pair tests/xeno/secondary_pair.cpp)
+    target_link_libraries(xeno_secondary_pair PRIVATE strata_secondary)
+    add_test(NAME xeno_secondary_pair COMMAND xeno_secondary_pair)
     # Hardware smoke test is run manually with CUDA_VISIBLE_DEVICES=1,0; it is not a default CTest.
   endif()
 
