@@ -2180,6 +2180,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             else std::fprintf(stderr, "strata prefill: expert_split off: %s\n", se.empty() ? "no relay stream" : se.c_str());
         }
+        // #115 (scrutiny): a wave lane whose split did not init (the 4070 out of memory) must fail the wave, not run on
+        // one card: the other lane waits for its plan (wait_split_owner) or its stream (consumed1) and would hang.
+        // On a full split the moe_tokens check below caught this; a partial split's one-card buffers hold the chunk.
+        if (wave && split_on && !m.split) {
+            err = "prefill: a wave lane's expert split did not start (see the expert_split line above); restart without "
+                  "STRATA_PREFILL_WAVE";
+            return false;
+        }
         const bool split_base = split_on && m.split != nullptr;   // #35 D7: the wave's lane 1 plans with full chunks
         split_on = split_base && T >= STREAM_ALL_MIN;   // every candidate expert streams: big chunks only
         if (!split_on && (int64_t) T > m.moe_tokens) {
