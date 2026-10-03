@@ -397,6 +397,13 @@ export class ChatController {
   /** The conversations that are being answered now (the open one too), and those among them that wait for the user's answer to a question of the coding tools. */
   runningIds(): string[] { return [...this.runs.keys()].filter((k) => k !== NEW_KEY) }
   askingIds(): string[] { return [...this.runs].filter(([k, r]) => k !== NEW_KEY && (r.msg.tools || []).some((c) => c.state === "asking")).map(([k]) => k) }
+  /** What is typed in the composer and not sent. It is kept here, not in the page: the page is taken away when another one is opened, and what was being written must be there when the Chat is opened again. */
+  draft: { text: string; files: Attachment[] } = { text: "", files: [] }
+  /** What the list of conversations shows, as one string: it changes when a conversation is added, renamed, moved, opened, starts or stops being answered, or waits for the user. The list is drawn for that, not for every word of an answer. */
+  listSig(): string {
+    const i = this.index
+    return JSON.stringify([i.active, i.items.map((s) => [s.id, s.title, s.project ?? null, s.time, s.named ?? false]), i.projects, this.runningIds(), this.askingIds()])
+  }
   pendingProject: string | null = null                          // the project a new conversation (one that is not in the list yet) was started in
   onError: (title: string, text: string) => void = () => {}
   private version = 0
@@ -900,3 +907,5 @@ export class ChatController {
 
 export const chat = new ChatController()
 export const useChatVersion = () => useSyncExternalStore(chat.subscribe, chat.getVersion)
+/** For the part that shows only the list of conversations (and which of them are at work): it is drawn when that changes, not at every change of the open answer. */
+export const useChatList = () => useSyncExternalStore(chat.subscribe, () => chat.listSig())

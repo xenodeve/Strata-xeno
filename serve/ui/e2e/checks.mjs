@@ -2505,6 +2505,94 @@ export const checks = [
     },
   },
   {
+    // What the page was holding belongs to the app, not to the page: opening another page and coming back finds the composer, the opened thoughts, the list and the graphs as they were.
+    name: "remember: the draft, an opened thought and the list of requests are as they were when another page was opened and the Chat is opened again",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors, { width: 1100, height: 800 })
+      await pg.addInitScript(() => { if (!localStorage.getItem("strata.chat")) localStorage.setItem("strata.chat", JSON.stringify([{ role: "user", text: "from before", time: 1 }, { role: "assistant", text: "yes", reasoning: "I looked at it closely.", thinkSecs: 2, time: 2 }])) })
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(900)
+      await pg.fill("textarea[aria-label='Message']", "half a sentence that was not sent")
+      const head = pg.locator(".thought-head").first()
+      await head.click()
+      t.ok("a thought is opened by the reader", (await head.getAttribute("aria-expanded")) === "true")
+      await pg.getByRole("link", { name: "Settings", exact: true }).click()
+      await pg.waitForTimeout(500)
+      t.ok("the Chat is not on screen meanwhile", (await pg.locator("textarea[aria-label='Message']").count()) === 0)
+      await pg.getByRole("link", { name: "Chat", exact: true }).click()
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      t.ok("what was typed and not sent is still in the composer", (await pg.inputValue("textarea[aria-label='Message']")) === "half a sentence that was not sent")
+      t.ok("the thought the reader opened is still open", (await pg.locator(".thought-head").first().getAttribute("aria-expanded")) === "true")
+      await pg.fill("textarea[aria-label='Message']", "make a request")
+      await pg.keyboard.press("Enter")
+      await finished(pg)
+      await pg.getByRole("link", { name: "Requests", exact: true }).click()
+      await pg.waitForSelector("li", { timeout: 8000 })
+      await pg.getByRole("link", { name: "Chat", exact: true }).click()
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      let slow = false
+      await pg.route("**/metrics/requests?*", async (r) => { slow = true; await sleep(2500); return r.continue() })       // the server is slow to answer the second time
+      await pg.getByRole("link", { name: "Requests", exact: true }).click()
+      await pg.waitForTimeout(400)
+      t.ok("the list is on screen at once, while the newest are read again", slow && (await pg.locator("li").count()) > 0 && (await pg.getByText("Loading…").count()) === 0)
+      await pg.context().close()
+    },
+  },
+  {
+    // The disks' graphs go on counting while another page is open: coming back does not show them starting from nothing.
+    name: "remember: a disk's graph goes on while another page is open",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors, { width: 1100, height: 800 })
+      await pg.route("**/metrics", async (r) => {
+        if (r.request().method() !== "GET" || !r.request().url().endsWith("/metrics")) return r.fallback()
+        const real = await (await r.fetch()).json()
+        const body = { ...real, hardware: { ...real.hardware, disks: [{ index: 0, read_mb: 5, write_mb: 1, read_ms_op: 0.4 }] }, hardware_static: { ...real.hardware_static, storage: { disks: [{ index: 0, model: "Test disk", bus: "NVMe", media: "SSD", size_gb: 500 }], model_disk: 0 } } }
+        return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) })
+      })
+      await pg.goto(fast.base + "/#/hardware/ssd/0")
+      const points = () => pg.evaluate(() => Number(document.querySelector("[data-points]")?.getAttribute("data-points") || 0))
+      await pg.waitForFunction(() => Number(document.querySelector("[data-points]")?.getAttribute("data-points") || 0) >= 3, null, { timeout: 15000 })
+      const before = await points()
+      await pg.getByRole("link", { name: "Dashboard", exact: true }).click()
+      await pg.waitForTimeout(4500)
+      await pg.evaluate(() => { location.hash = "#/hardware/ssd/0" })
+      await pg.waitForSelector("[data-points]")
+      const after = await points()
+      t.ok("the graph kept its past and went on through the time the page was not open", after >= before + 3, JSON.stringify({ before, after }))
+      await pg.context().close()
+    },
+  },
+  {
+    // A conversation that is not changing is not drawn again every time the server's status is read (twice a second while it works, once a second otherwise).
+    name: "redraw: a long conversation is not drawn again at each reading of the server",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors, { width: 1100, height: 800 })
+      await pg.addInitScript(() => {
+        if (localStorage.getItem("strata.chat")) return
+        const m = []
+        for (let i = 0; i < 12; i++) m.push({ role: "user", text: "question " + i, time: 1 + i * 2 }, { role: "assistant", text: "an answer with `code` and **bold** number " + i, reasoning: "thinking " + i, thinkSecs: 1, time: 2 + i * 2 })
+        localStorage.setItem("strata.chat", JSON.stringify(m))
+      })
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(2500)                                                              // the page settles: the first readings of the server come
+      const drawn = () => pg.evaluate(() => globalThis.__strataDraws?.settled ?? -1)
+      const before = await drawn()
+      await pg.waitForTimeout(3500)                                                              // three or more readings of the server
+      const after = await drawn()
+      t.ok("the counter is there and the 24 messages were drawn", before >= 24, String(before))
+      t.ok("no message is drawn again while nothing changes", after === before, JSON.stringify({ before, after }))
+      await pg.fill("textarea[aria-label='Message']", "one more")
+      await pg.keyboard.press("Enter")
+      await finished(pg)
+      const mid = await drawn()
+      t.ok("a new prompt and its answer are drawn", mid > after && (await pg.getByText("one more").count()) === 1, JSON.stringify({ after, mid }))
+      t.ok("and what is drawn again with them is the new messages and the prompts (whose Edit buttons go while the answer is written and come back), not the answers", mid - after < 80, JSON.stringify({ after, mid }))
+      await pg.context().close()
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {

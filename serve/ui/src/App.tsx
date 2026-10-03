@@ -7,6 +7,7 @@ import { cn } from "./lib/cn"
 import { MetricsProvider, useMetrics } from "./lib/metrics"
 import { chat } from "./lib/chat"
 import type { LiveReading } from "./lib/livetokens"
+import { feedTrails } from "./lib/trails"
 import { href, PAGES, useRoute, type Page } from "./lib/router"
 import { useTheme, type Theme } from "./lib/theme"
 import { msg, setLang, t, useLang } from "./lib/i18n"
@@ -142,6 +143,7 @@ function Nav({ page }: { page: Page }) {
 function Brand() {
   const { data, stale } = useMetrics()
   useEffect(() => { if (data?.live) chat.noteLive(data.live as LiveReading, performance.now()) }, [data])        // the count of tokens written goes on whichever page is open
+  useEffect(() => { if (data) feedTrails(data) }, [data])                                                       // so do the disks' graphs
   return (
     <a href={href("dashboard")} className="flex items-center gap-2 no-underline" aria-label={t("Strata, the dashboard")}>
       <StatusOrb live={data?.live ?? { state: "idle", queued: 0, tok_s: null }} stale={stale} size={20} />

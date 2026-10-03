@@ -1,6 +1,7 @@
 import { Empty, Loading, Orb } from "../components/orb"
 import { gpuDesign } from "../lib/orbs"
-import { useEffect, useRef, type ReactNode } from "react"
+import type { ReactNode } from "react"
+import { trailOf } from "../lib/trails"
 import { Chart } from "../components/Chart"
 import { NOT_MEASURED, Row, Rows, Section, val } from "../components/bits"
 import { fmt, gb } from "../lib/format"
@@ -182,15 +183,9 @@ export function GpuPage({ n }: { n: string }) {
 
 export function SsdPage({ n }: { n: string }) {
   const { data: m, error } = useMetrics()
-  const trail = useRef<{ read: (number | null)[]; write: (number | null)[]; lat: (number | null)[] }>({ read: [], write: [], lat: [] })
   const idx = Number(n)
   const r = m ? rates(m)?.find((x) => x.index === idx) : undefined
-  useEffect(() => {
-    if (!m) return
-    const tr = trail.current
-    const push = (a: (number | null)[], v: number | null) => { a.push(v); if (a.length > 120) a.shift() }
-    push(tr.read, r?.read_mb ?? null); push(tr.write, r?.write_mb ?? null); push(tr.lat, r?.read_ms_op ?? null)
-  }, [m?.time]) // eslint-disable-line react-hooks/exhaustive-deps
+  const trail = trailOf(idx)                                    // the graphs go on whichever page is open (lib/trails.ts), so they do not start again from nothing when this page is opened
   if (!m) return <Loading error={error} />
   const d = disksOf(m).find((x) => x.index === idx)
   if (!d) return <div><p>{t("This disk is not listed.")}</p><p><a href={href("hardware")}>Back to Hardware</a></p></div>
@@ -221,8 +216,8 @@ export function SsdPage({ n }: { n: string }) {
               <Row k={t("Time per read")} v={val(r.read_ms_op, (v) => v.toFixed(2), "ms")} />
             </Rows>
             <div className="mt-3 space-y-4">
-              <div><div className="mb-1 text-[12px] text-ink-2">{t("Read, MB/s")}</div><Chart series={[{ label: t("read"), values: trail.current.read }]} height={80} area /></div>
-              <div><div className="mb-1 text-[12px] text-ink-2">{t("Time per read, ms")}</div><Chart series={[{ label: "ms", values: trail.current.lat }]} height={80} /></div>
+              <div><div className="mb-1 text-[12px] text-ink-2">{t("Read, MB/s")}</div><Chart series={[{ label: t("read"), values: trail.read }]} height={80} area /></div>
+              <div><div className="mb-1 text-[12px] text-ink-2">{t("Time per read, ms")}</div><Chart series={[{ label: "ms", values: trail.lat }]} height={80} /></div>
             </div>
           </>
         )}

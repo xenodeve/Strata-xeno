@@ -64,7 +64,7 @@ export function Chart({ series, x, height = 120, unit = "", area = false, zero =
 
   return (
     <div className="relative">
-      <div ref={host} className="w-full" role="img" aria-label={series.map((s) => s.label).join(", ")} />
+      <div ref={host} className="w-full" role="img" data-points={xs.length} aria-label={series.map((s) => s.label).join(", ")} />
       {tip && (
         <div className="num pointer-events-none absolute top-0 rounded-sm bg-surface/90 px-1.5 py-0.5 text-[12px] font-medium shadow-[0_1px_8px_rgb(0_0_0/0.08)]" style={{ left: Math.min(tip.x + 52, 9999), transform: "translateX(-50%)" }}>
           {+tip.v.toFixed(1)}{unit}

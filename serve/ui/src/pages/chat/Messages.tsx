@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, Copy01Icon, AttachmentIcon, PencilEdit01Icon, RewindIcon, Undo02Icon } from "@hugeicons/core-free-icons"
 import { chat, metaText, type Message, type ToolCall } from "../../lib/chat"
@@ -22,7 +22,19 @@ import { SkillText } from "../../components/SkillTip"
 import { CompactingStatus } from "../../components/CompactingStatus"
 import { skillCall, type SkillCall } from "../../lib/panel"
 import { AgentCall, HookNotes, TodoList } from "./AgentCall"
-import { msg, t } from "../../lib/i18n"
+import { msg, t, useLang } from "../../lib/i18n"
+
+/** How many times a message was drawn (a test reads it: a message that did not change is not drawn again when the page is drawn). */
+export const draws = { messages: 0, settled: 0 }
+;(globalThis as { __strataDraws?: typeof draws }).__strataDraws = draws
+
+// What the reader opened or closed in a message (a thought) is kept with the message, not in the part that shows it: the part is taken away when the Chat is left and made again when it
+// is opened, and a thought that was opened would be shut again.
+const choices = new WeakMap<Message, Map<string, boolean>>()
+function useKept(m: Message, key: string): [boolean | null, (v: boolean) => void] {
+  const [, redraw] = useState(0)
+  return [choices.get(m)?.get(key) ?? null, (v) => { let k = choices.get(m); if (!k) choices.set(m, (k = new Map())); k.set(key, v); redraw((n) => n + 1) }]
+}
 
 const TOOL_STATE: Record<ToolCall["state"], string> = { writing: msg("Writing"), asking: msg("Waiting for you"), running: msg("Running"), done: msg("Done"), error: msg("Error"), skipped: msg("Not run") }
 
@@ -32,7 +44,8 @@ export function Prose({ text }: { text: string }) {
     const b = (e.target as HTMLElement).closest("[data-code-copy]")
     if (b) void copyText(b.closest(".code-block")!.querySelector("pre")!.textContent || "")
   }
-  return <div className="prose-chat" onClick={onClick} dangerouslySetInnerHTML={{ __html: markdown(text) }} />
+  const html = useMemo(() => ({ __html: markdown(text) }), [text])                    // parsed when the text is another one, not at every draw
+  return <div className="prose-chat" onClick={onClick} dangerouslySetInnerHTML={html} />
 }
 
 // One MCP tool call in the answer: a compact row (name, state, a one-line preview) that opens to the arguments and the
@@ -93,7 +106,7 @@ function Answer({ m, streaming, show, phase }: { m: Message; streaming: boolean;
     const rat = typeof tc.rat === "number" ? Math.min(tc.rat, reasoning.length) : undefined
     if (rpos !== undefined && rat !== undefined && rat > rpos) {                       // a new round: what the model thought before it called this tool
       const seg = reasoning.slice(rpos, rat)
-      if (seg.trim()) parts.push(<RoundThought key={`r${k}`} text={seg.trim()} working={false} show={show} phase={phase} since={m.tools?.[k - 1]?.doneAt} />)
+      if (seg.trim()) parts.push(<RoundThought key={`r${k}`} m={m} id={`r${k}`} text={seg.trim()} working={false} show={show} phase={phase} since={m.tools?.[k - 1]?.doneAt} />)
       rpos = rat
     }
     if (at > pos) parts.push(<Prose key={`p${k}`} text={m.text.slice(pos, at)} />)
@@ -103,7 +116,7 @@ function Answer({ m, streaming, show, phase }: { m: Message; streaming: boolean;
   const tail = rpos !== undefined ? reasoning.slice(rpos) : ""
   if (tail.trim()) {                                                                  // the thinking after the last tool: live while the model thinks again
     const idle = !m.tools.some((c) => c.state === "running" || c.state === "writing" || c.state === "asking")
-    parts.push(<RoundThought key="tail" text={tail.trim()} working={streaming && idle && m.text.length <= pos} show={show} phase={phase} since={m.tools[m.tools.length - 1]?.doneAt} />)
+    parts.push(<RoundThought key="tail" m={m} id="tail" text={tail.trim()} working={streaming && idle && m.text.length <= pos} show={show} phase={phase} since={m.tools[m.tools.length - 1]?.doneAt} />)
   }
   parts.push(<Prose key="rest" text={m.text.slice(pos)} />)
   return <>{parts}</>
@@ -126,8 +139,8 @@ function ThoughtGlyph({ working, status, design }: { working: boolean; status: L
 }
 
 /** The thinking of one later round of an agent's work: open while it streams (if wanted), closed once it is over, as the first one is. */
-function RoundThought({ text, working, show, phase, since }: { text: string; working: boolean; show: boolean; phase: OrbDesign | null; since?: number }) {
-  const [touched, setTouched] = useState<boolean | null>(null)
+function RoundThought({ m, id, text, working, show, phase, since }: { m: Message; id: string; text: string; working: boolean; show: boolean; phase: OrbDesign | null; since?: number }) {
+  const [touched, setTouched] = useKept(m, id)
   const open = touched ?? (working && show)
   return (
     <div className="mb-2" data-round-thought>
@@ -139,7 +152,7 @@ function RoundThought({ text, working, show, phase, since }: { text: string; wor
 }
 
 function Thinking({ m, text, streaming, show, phase }: { m: Message; text: string; streaming: boolean; show: boolean; phase: OrbDesign | null }) {
-  const [touched, setTouched] = useState<boolean | null>(null)       // the user's own choice, once made
+  const [touched, setTouched] = useKept(m, "first")                     // the user's own choice, once made (kept with the message)
   const thinkingNow = streaming && !m.text && !m.tools?.length
   const open = touched ?? (thinkingNow && show)                      // open while it streams (if wanted), closed once the answer starts
   const status: LatticeStatus = thinkingNow ? "working" : m.error ? "error" : "done"
@@ -184,7 +197,9 @@ function ReadShare({ p }: { p?: { read: number; total: number; percent: number }
 
 // What can be done to a prompt that was sent: rewrite it (it and everything after it are replaced), or, on the last one, take
 // it back (the prompt returns to the composer and its answer goes). Not offered while an answer is being written.
-export interface PromptActions { canAct: boolean; last: boolean; onEdit: (text: string) => void; onUndo: () => void; onRewind?: () => void }
+export interface PromptActions { canAct: boolean; last: boolean; index: number }
+/** What those actions do. One object that lives as long as the page, so that handing it to a message does not make the message look changed. */
+export interface PromptOps { edit: (index: number, text: string) => void; undo: () => void; rewind: (index: number) => void }
 
 function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: boolean; onSend: (t: string) => void; onCancel: () => void }) {
   const [value, setValue] = useState(text)
@@ -236,7 +251,8 @@ export function CompactingLine() {
 
 /** Where the earlier messages were summarised: a line across the chat that says so, and opens to the summary the model reads in their place. */
 function CompactNotice({ m }: { m: Message }) {
-  const [open, setOpen] = useState(false)
+  const [kept, setOpen] = useKept(m, "summary")
+  const open = kept ?? false
   const c = m.compact!
   return (
     <div className="msg-in" data-compact>
@@ -259,7 +275,17 @@ function CompactNotice({ m }: { m: Message }) {
   )
 }
 
-export function MessageView({ m, streaming, compacting = false, show, prefill, actions, serverPhase, serverState, reading }: { m: Message; streaming: boolean; compacting?: boolean; show: boolean; prefill: boolean; actions?: PromptActions; serverPhase?: string | null; serverState?: string | null; reading?: { read: number; total: number; percent: number } | null }) {
+interface ViewProps { m: Message; sig?: string; streaming: boolean; compacting?: boolean; show: boolean; prefill: boolean; actions?: PromptActions; ops?: PromptOps; serverPhase?: string | null; serverState?: string | null; reading?: { read: number; total: number; percent: number } | null }
+
+/** A message is drawn again only when it changed: `sig` (lib/msgsig.ts) is what it looked like at the last draw. The answer being written is drawn at every change, as before. */
+export const MessageView = memo(MessageViewOf, (a: ViewProps, b: ViewProps) =>
+  !a.streaming && !b.streaming && a.sig !== undefined && a.sig === b.sig && a.m === b.m && a.compacting === b.compacting && a.show === b.show && a.prefill === b.prefill
+  && a.ops === b.ops && a.actions?.canAct === b.actions?.canAct && a.actions?.last === b.actions?.last && a.actions?.index === b.actions?.index)
+
+function MessageViewOf({ m, streaming, compacting = false, show, prefill, actions, ops, serverPhase, serverState, reading }: ViewProps) {
+  draws.messages++
+  if (!streaming) draws.settled++                              // not the answer that is being written: those are drawn at every change, as they must
+  useLang()                                                    // a draw is skipped for a message that did not change: the language is its own reason to draw again
   const ref = useRef<HTMLDivElement>(null)
   const mine = useRef<HTMLDivElement>(null)
   const [editing, setEditing] = useState(false)
@@ -296,18 +322,18 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
         )}
         {(m.text || editing) && (        // a prompt of only files has no words, so no empty bubble
           <Fit className="flex w-full justify-end">
-            {editing && actions
-              ? <PromptEditor text={m.text} last={actions.last} onCancel={() => setEditing(false)} onSend={(t) => { setEditing(false); actions.onEdit(t) }} />
+            {editing && actions && ops
+              ? <PromptEditor text={m.text} last={actions.last} onCancel={() => setEditing(false)} onSend={(t) => { setEditing(false); ops.edit(actions.index, t) }} />
               : <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] [overflow-wrap:anywhere]"><SkillText text={m.text} /></div>}
           </Fit>
         )}
         <div className="num flex items-center gap-1 px-1 text-[12px] text-ink-3">
           <span>{t("You · {time}", { time: timeStr(m.time) })}</span>
-          {actions?.canAct && !editing && (
+          {actions?.canAct && ops && !editing && (
             <span className="flex items-center opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100 [@media(hover:none)]:opacity-100">
               <button type="button" aria-label={t("Edit this prompt")} title={t("Edit")} onClick={() => setEditing(true)} className="flex size-6 items-center justify-center rounded-sm transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={PencilEdit01Icon} size={14} aria-hidden /></button>
-              {actions.onRewind && <button type="button" aria-label={t("Rewind to before this prompt")} title={t("Rewind: go back to before this prompt")} data-rewind-button onClick={actions.onRewind} className="flex size-6 items-center justify-center rounded-sm transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={RewindIcon} size={14} aria-hidden /></button>}
-              {actions.last && <button type="button" aria-label={t("Take this prompt back")} title={t("Undo: take the prompt back")} onClick={actions.onUndo} className="flex size-6 items-center justify-center rounded-sm transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={Undo02Icon} size={14} aria-hidden /></button>}
+              <button type="button" aria-label={t("Rewind to before this prompt")} title={t("Rewind: go back to before this prompt")} data-rewind-button onClick={() => ops.rewind(actions.index)} className="flex size-6 items-center justify-center rounded-sm transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={RewindIcon} size={14} aria-hidden /></button>
+              {actions.last && <button type="button" aria-label={t("Take this prompt back")} title={t("Undo: take the prompt back")} onClick={ops.undo}className="flex size-6 items-center justify-center rounded-sm transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={Undo02Icon} size={14} aria-hidden /></button>}
             </span>
           )}
         </div>

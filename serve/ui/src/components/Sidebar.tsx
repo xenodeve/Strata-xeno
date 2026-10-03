@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { Add01Icon, MessageAdd01Icon, MoreHorizontalIcon, SidebarLeftIcon } from "@hugeicons/core-free-icons"
-import { chat, useChatVersion } from "../lib/chat"
+import { chat, useChatList } from "../lib/chat"
 import type { SessionMeta } from "../lib/sessions"
 import { t } from "../lib/i18n"
 import { store } from "../lib/store"
@@ -22,7 +22,7 @@ type Target = { kind: "chat" | "project"; id: string }
 interface Open extends Target { x: number; y: number; moving?: boolean }
 
 export function Sidebar({ drawer = false, onClose }: { drawer?: boolean; onClose?: () => void }) {
-  useChatVersion()
+  useChatList()                                                               // drawn when the list changes, not at every word of the answer
   const idx = chat.index
   const running = chat.runningIds()                                           // the conversations that are being answered (the open one too)
   const asking = chat.askingIds()                                             // those among them that wait for the user's answer to a question of the coding tools

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type DragEvent } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, Menu01Icon, SidebarLeftIcon } from "@hugeicons/core-free-icons"
 import { apiHeaders, getAgent, getHealth, getImport, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
@@ -25,7 +25,8 @@ import { forgetRules, NO_AGENT, rulesOf, type AgentInfo, type AgentMode } from "
 import { store } from "../../lib/store"
 import { SkillsContext } from "../../components/SkillTip"
 import { msg, t } from "../../lib/i18n"
-import { CompactingLine, MessageView, QueuedMessage } from "./Messages"
+import { CompactingLine, MessageView, QueuedMessage, type PromptOps } from "./Messages"
+import { messageSig } from "../../lib/msgsig"
 import { resolveMentions } from "../../lib/mention"
 import { RewindDialog } from "../../components/RewindDialog"
 import { isRewindCommand } from "../../lib/rewind"
@@ -101,8 +102,11 @@ export function Chat({ id }: { id?: string }) {
     void getImport().then((v) => { if (!gone && v?.available && v.skills?.settings.enabled) setSkills(commandsOf(v.skills.items, Object.fromEntries((v.harnesses ?? []).map((h) => [h.id, h.label])))) })
     return () => { gone = true }
   }, [])
-  const [text, setText] = useState("")
-  const [files, setFiles] = useState<Attachment[]>([])
+  // What was typed and not sent is kept by the controller, not by this page: opening another page and coming back finds the composer as it was left.
+  const [text, setText] = useState(() => chat.draft.text)
+  const [files, setFiles] = useState<Attachment[]>(() => chat.draft.files)
+  useEffect(() => { chat.draft.text = text }, [text])
+  useEffect(() => { chat.draft.files = files }, [files])
   const [sheet, setSheet] = useState(false)
   const [dragging, setDragging] = useState(false)
   const list = useRef<HTMLDivElement>(null)
@@ -280,6 +284,10 @@ export function Chat({ id }: { id?: string }) {
     setFiles((f) => [...back.attachments, ...f])
     input.current?.focus()
   }
+  // What the actions on a prompt do, as one object for the life of the page (the functions above are made again at every draw, and a message handed a new one each time would be drawn again each time).
+  const doing = useRef({ edit: editPrompt, undo: undoPrompt, rewind: (i: number) => setRewindAt(Math.max(0, rewindPrompts().findIndex((p) => p.index === i))) })
+  doing.current = { edit: editPrompt, undo: undoPrompt, rewind: (i: number) => setRewindAt(Math.max(0, rewindPrompts().findIndex((p) => p.index === i))) }
+  const ops = useMemo<PromptOps>(() => ({ edit: (i, t) => doing.current.edit(i, t), undo: () => doing.current.undo(), rewind: (i) => doing.current.rewind(i) }), [])
   const lastPrompt = chat.messages.reduce((at, m, i) => (isPrompt(m) ? i : at), -1)
   const add = async (list: Iterable<File>) => { const a = await readFiles(list, health); if (a.length) setFiles((x) => [...x, ...a]) }
   const onDrop = (e: DragEvent) => {
@@ -338,7 +346,7 @@ export function Chat({ id }: { id?: string }) {
         </Collapse>
         {chat.messages.map((m, i) => (
           <MessageView key={i} m={m} streaming={busy?.msg === m} compacting={chat.compacting && busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined} serverState={busy?.msg === m ? live.state : undefined} reading={busy?.msg === m && live.state === "reading" ? readProgress((live as { prompt_read?: number | null }).prompt_read, (live as { prompt_total?: number | null }).prompt_total) : null}
-            actions={isPrompt(m) ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt, onRewind: () => setRewindAt(Math.max(0, rewindPrompts().findIndex((p) => p.index === i))) } : undefined} />
+            sig={messageSig(m)} ops={ops} actions={isPrompt(m) ? { canAct: !busy, last: i === lastPrompt, index: i } : undefined} />
         ))}
         {chat.compacting && !!busy && !chat.messages.includes(busy.msg) && <CompactingLine />}
         {chat.queuedOf().map((q) => (

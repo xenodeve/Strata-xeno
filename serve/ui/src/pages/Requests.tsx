@@ -8,6 +8,7 @@ import { attribute, overlapOpportunityMs } from "../lib/stall"
 import { getKeepLeft, getRequest, getRequestPage, promptSplit, setKeep, type RequestDetail, type RequestRow } from "../lib/metrics"
 import { href } from "../lib/router"
 import { msg, t } from "../lib/i18n"
+import { appendPage, mergeNewest } from "../lib/requestlist"
 
 /** Puts elements (a bold figure, a link) into a translated sentence at its {name} places, so the sentence stays one piece for the translator. */
 function rich(text: string, parts: Record<string, ReactNode>): ReactNode {
@@ -81,19 +82,41 @@ export function RequestList({ rows, empty }: { rows: RequestRow[]; empty: ReactN
   )
 }
 
+// The list as it was when the page was left: opening the page again shows it at once, as far down as it had been opened, and the newest of it are read again.
+const seen: { rows: RequestRow[]; total: number; page: number } = { rows: [], total: 0, page: 0 }
+const SIZE = 50
+
 export function Requests() {
-  const [rows, setRows] = useState<RequestRow[]>([])
-  const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(0)
+  const [rows, setRows] = useState<RequestRow[]>(seen.rows)
+  const [total, setTotal] = useState(seen.total)
+  const [page, setPage] = useState(seen.page)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  const SIZE = 50
 
-  useEffect(() => {
+  useEffect(() => {                                              // opened: the newest page is read again, and what was kept stays below it
+    let cancelled = false
+    getRequestPage(0, SIZE)
+      .then((p) => {
+        if (cancelled) return
+        const next = mergeNewest(seen.rows, p.items)
+        seen.rows = next.rows; seen.total = p.total
+        if (next.reset) { seen.page = 0; setPage(0) }
+        setRows(next.rows); setTotal(p.total); setError(null)
+      })
+      .catch((e: Error) => !cancelled && setError(e.message))
+      .finally(() => !cancelled && setLoading(false))
+    return () => { cancelled = true }
+  }, [])
+  useEffect(() => {                                              // "Show more": the next page is added below
+    if (page <= seen.page) return
     let cancelled = false
     setLoading(true)
     getRequestPage(page, SIZE)
-      .then((p) => { if (!cancelled) { setRows((x) => (page === 0 ? p.items : [...x, ...p.items])); setTotal(p.total); setError(null) } })
+      .then((p) => {
+        if (cancelled) return
+        seen.rows = appendPage(seen.rows, p.items); seen.total = p.total; seen.page = page
+        setRows(seen.rows); setTotal(p.total); setError(null)
+      })
       .catch((e: Error) => !cancelled && setError(e.message))
       .finally(() => !cancelled && setLoading(false))
     return () => { cancelled = true }
