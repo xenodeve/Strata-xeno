@@ -2735,8 +2735,8 @@ int main(int argc, char** argv) {
                      strata::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0);
     }
     // #113: the expert split runs per layer (a layer not on MMQ runs a split chunk on CUDA0), and the wave needs every
-    // layer split: without that its two lanes both streamed every expert on CUDA0 (#112).  Decided here, once the
-    // pack has set the expert layout that the MMQ plan reads.
+    // layer split: without that its two lanes both streamed every expert on CUDA0 (#112).  The MMQ plan reads the
+    // expert layout (expert_layout_load, above) and is cached on its first call, so nothing may ask for it earlier.
     if (o.exclusive_secondary && split_env) {
         const std::vector<int> here = strata::prefill::Prefill::split_one_card_layers();
         const size_t layers = strata::kernels::cpu::expert_layout().fmt.size();
