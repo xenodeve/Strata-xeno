@@ -12,16 +12,18 @@ import { addRule, agentRequest, NO_AGENT, rulesOf, type AgentInfo } from "./agen
 import { addPerm, forgetPerms, permsFor, type Effect, type Scope } from "./perms"
 import { forgetCheckpoints } from "./rewind"
 import { noteFrom, type HookNote } from "./hooks"
+import { LiveTokens, type LiveReading } from "./livetokens"
 import { slotKey, addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, saveBackground, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
 
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
-export interface Ask { id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny"; kept?: { scope: "project" | "everywhere"; effect: Effect } }
+export interface Ask { stopped?: boolean; id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny"; kept?: { scope: "project" | "everywhere"; effect: Effect } }
 export interface Todo { content: string; status: "pending" | "in_progress" | "completed"; activeForm: string }
 /** What the model asked the user (AskUserQuestion): one to four questions with two to four choices each; `answers` once the user answered (null: skipped). */
 export interface AskedQuestion {
   id: string
   questions: { question: string; header: string; multiSelect: boolean; options: { label: string; description: string }[] }[]
   answers?: Record<string, string[]> | null
+  stopped?: boolean                                           // the answer ended (Stop, or an error) before the user answered: nothing is waiting any more
 }
 /** One call a helper made while it worked on a Task: the nested list on the Task's card. */
 export interface Step { id: string; name: string; arguments?: unknown; state: "running" | "done" | "error"; text?: string }
@@ -33,6 +35,7 @@ export interface ToolCall {
   hooks?: HookNote[]                                                                 // what the user's hooks did about this call
   judging?: boolean                                                                  // auto mode is checking this call now
   hookRunning?: string | null                                                        // a hook of the user's is running for this call now (its command)
+  doneAt?: number                                                                    // when its result came (epoch ms): the thinking after it began then
   helper?: { kind: string; description: string; state: "running" | "done" | "failed"; steps: number }      // a Task call: the helper that works on it
   steps?: Step[]                                                                     // and what that helper did, step by step
   server?: string; tool?: string; arguments?: unknown; round?: number
@@ -54,6 +57,7 @@ export interface Message {
   todos?: Todo[]                                                 // the coding tools' list of steps, as the model last sent it
   hooks?: HookNote[]                                             // what the user's prompt and stop hooks did (the ones that belong to no call)
   hookRunning?: string | null                                    // one of those is running now (its command)
+  thinkAt?: number                                               // when the thinking began (epoch ms): the timer is counted from it, so it goes on when the page is left and opened again
 }
 
 /** The line under an answer ("40 tokens · 38.2 tok/s · 1 tool call"), in the language in use now. An answer stored by an
@@ -208,7 +212,7 @@ function onTool(m: Message, x: ToolEvent) {
   if (x.event === "call") {
     Object.assign(t, { name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running" })
   } else if (x.event === "result") {
-    Object.assign(t, { result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, state: x.skipped ? "skipped" : x.ok ? "done" : "error", judging: false })
+    Object.assign(t, { result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, state: x.skipped ? "skipped" : x.ok ? "done" : "error", judging: false, doneAt: Date.now() })
   }
 }
 
@@ -289,7 +293,7 @@ const setPending = (key: string, rec: PendingRun | null) => {
 }
 const newRunId = (): string => (globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`).replace(/[^A-Za-z0-9_-]/g, "")
 /** A message typed while the conversation was answering: it waits, and is sent when the answer ends. */
-export interface Queued { id: string; text: string; files: Attachment[]; ctx: SendContext }
+export interface Queued { id: string; text: string; files: Attachment[]; ctx: SendContext; steered?: boolean }      // `steered`: already handed to the running agent, which reads it at its next step
 const MAX_QUEUED = 20
 const NEW_KEY = "new"                                         // a conversation that is not in the list yet (only before its first prompt is saved)
 
@@ -328,6 +332,37 @@ export class ChatController {
     this.queues.set(key, [...(this.queues.get(key) ?? []), { id: Math.random().toString(36).slice(2, 10), text: typed, files, ctx }].slice(-MAX_QUEUED))
     this.notify()
     return true
+  }
+  /** Hands a message to the agent that is working: it reads it at its next step (after the tools of the round it is in, or, if that round is its last, in the same run), so it does not wait for the whole
+   *  answer. False - and the caller queues it as before - when the answer is not an agent's (no run to hand it to), the message has attachments, or the server did not take it. */
+  async steer(text: string, files: Attachment[], ctx: SendContext): Promise<boolean> {
+    const typed = text.trim()
+    const key = this.index.active ?? NEW_KEY
+    const run = this.runs.get(key)
+    if (!run?.runId || files.length || !typed) return false
+    const entry: Queued = { id: Math.random().toString(36).slice(2, 10), text: typed, files: [], ctx, steered: true }
+    this.queues.set(key, [...(this.queues.get(key) ?? []), entry].slice(-MAX_QUEUED))             // shown at once, and before the request is answered: the step may read it first
+    this.notify()
+    const gone = () => { const q = this.queues.get(key) ?? []; const at = q.findIndex((x) => x.id === entry.id); if (at >= 0) { q.splice(at, 1); if (!q.length) this.queues.delete(key); this.notify() } }
+    try {
+      const r = await fetch(url("agent/steer"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify({ id: run.runId, text: typed }) })
+      const body = r.ok ? await r.json().catch(() => null) : null
+      if (body?.found === true) return true
+    } catch { /* the server could not be reached: it waits in line instead */ }
+    gone()                                                                                    // not taken: the caller queues it the usual way
+    return false
+  }
+  /** A message the agent read at a step: the answer so far ends here, the message follows it as the user's, and the model's reply to it is a new answer. */
+  private steered(key: string, run: Run, conv: Message[], text: string): { msg: Message; prompt: Message } {
+    const q = this.queues.get(key) ?? []
+    const at = q.findIndex((x) => x.steered && x.text === text)
+    if (at >= 0) q.splice(at, 1)
+    if (!q.length) this.queues.delete(key)
+    const prompt: Message = { role: "user", text, time: this.stamp() }
+    const msg: Message = { role: "assistant", text: "", reasoning: "", time: Date.now() }
+    conv.push(prompt, msg)
+    run.msg = msg
+    return { msg, prompt }
   }
   /** Takes a waiting message back (to be edited, or dropped). */
   unqueue(id: string): Queued | null {
@@ -468,6 +503,10 @@ export class ChatController {
     if (run?.runId) void fetch(url("agent/cancel"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify({ id: run.runId }) }).catch(() => {})       // the answer goes on in the server when the page goes: Stop says so
     run?.abort.abort()
   }
+  /** The count of tokens written so far in the answer that is being made. It lives here and not in the page, so that it goes on when the page is left and opened again; the app's one look at the
+   *  server's status (a reading every half second) feeds it, whichever page is open. */
+  liveTokens = new LiveTokens()
+  noteLive(live: LiveReading, now: number) { this.liveTokens.sample(this.busy?.msg ?? null, live, now) }
   /** True once the page is being left (refreshed or closed): a read that is cut then is not a failure, the answer goes on in the server. */
   private leaving = false
   constructor() { if (typeof window !== "undefined") window.addEventListener("pagehide", () => { this.leaving = true }) }
@@ -749,12 +788,13 @@ export class ChatController {
   }
 
   /** Reads an answer's stream into `m` - a request just sent, or a run that went on in the server while the page was away - and settles the conversation when it ends. */
-  private async stream(id: string, run: Run, conv: Message[], m: Message, um: Message, open: () => Promise<Response>, ctx: SendContext | null, resumed: boolean) {
+  private async stream(id: string, run: Run, conv: Message[], m0: Message, um0: Message, open: () => Promise<Response>, ctx: SendContext | null, resumed: boolean) {
     const s = this.settings
+    let m = m0, um = um0                                       // a message the user sent meanwhile ends the answer so far and starts another: they move on
     let firstAt: number | null = null
     let thinkStart: number | null = null
     let usage: { completion_tokens?: number; prompt_tokens?: number } | null = null
-    let timings: { prompt_n?: number; prompt_per_second?: number | null; cache_n?: number } | null = null
+    let timings: { prompt_n?: number; prompt_per_second?: number | null; cache_n?: number; predicted_per_second?: number | null } | null = null
     try {
       const r = await open()
       if (!r.ok) throw new Error(await errorMessage(r))
@@ -777,6 +817,12 @@ export class ChatController {
           if (j.error) throw new Error(j.error.message || t("the engine reported an error"))
           if (j.usage) usage = j.usage
           if (j.timings) timings = j.timings
+          if (j.strata_mcp?.event === "steered" && typeof j.strata_mcp.text === "string") {
+            const next = this.steered(id, run, conv, j.strata_mcp.text)
+            m = next.msg; um = next.prompt; firstAt = null; thinkStart = null
+            this.notify()
+            continue
+          }
           if (j.strata_mcp) {
             onTool(m, j.strata_mcp)
             if (j.strata_mcp.event === "mode" && (j.strata_mcp.mode === "ask" || j.strata_mcp.mode === "plan" || j.strata_mcp.mode === "auto")) this.setSettings({ ...this.settings, agentMode: j.strata_mcp.mode })      // the plan was approved
@@ -784,6 +830,7 @@ export class ChatController {
           const d = j.choices?.[0]?.delta || {}
           const lastTool = m.tools?.length ? m.tools[m.tools.length - 1] : null    // a new round after a tool
           if (d.reasoning_content) {
+            m.thinkAt ??= Date.now()
             firstAt ??= performance.now()
             thinkStart ??= performance.now()
             if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) m.reasoning += "\n\n"
@@ -817,14 +864,21 @@ export class ChatController {
     if (n && firstAt) {
       const secs = (performance.now() - firstAt) / 1000
       stats.tokens = n
-      if (secs > 0.25 && !resumed) stats.tokS = n / secs                      // read again from the start, its speed is not what it was written at
+      if (timings?.predicted_per_second) stats.tokS = timings.predicted_per_second      // the engine's own decoding speed (over every round of a run with tools)
+      else if (secs > 0.25 && !resumed) stats.tokS = n / secs                      // else tokens over the time since the first one; read again from the start, that is not what it was written at
       if (m.stopped) stats.stopped = true
       if (ctx?.projectionLoaded) stats.projection = s.esp ? "on" : "off"
     } else if (m.stopped) {
       stats.stopped = true
     }
     if (usage?.prompt_tokens && !m.error) stats.ctx = usage.prompt_tokens + (usage.completion_tokens ?? 0)       // how much of the context the conversation uses now (after every tool round)
-    for (const tc of m.tools || []) { tc.judging = false; tc.hookRunning = null; if (tc.state === "writing" || tc.state === "running") { tc.state = "skipped"; tc.ms = null } }
+    for (const tc of m.tools || []) {
+      tc.judging = false; tc.hookRunning = null
+      const cut = !!(m.stopped || m.error)                                                                     // Stop, or the answer failed: a question that was open is closed, no card is left waiting for a click that cannot reach anything
+      if (cut && tc.ask && !tc.ask.answer) { tc.ask.answer = "deny"; tc.ask.stopped = true }
+      if (cut && tc.question && tc.question.answers === undefined) { tc.question.answers = null; tc.question.stopped = true }
+      if (tc.state === "writing" || tc.state === "running" || (cut && tc.state === "asking")) { tc.state = "skipped"; tc.ms = null }
+    }
     m.hookRunning = null
     const ran = (m.tools || []).filter((tc) => tc.state === "done" || tc.state === "error").length
     if (ran) stats.tools = ran

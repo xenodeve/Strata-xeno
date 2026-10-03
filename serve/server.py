@@ -1706,6 +1706,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     if rounds_limit is not None:                                  # a helper (serve/subagent.py) stops sooner
         max_rounds = rounds_limit
     total, rounds, done = 0, 0, None
+    dec_n, dec_ms = 0, 0.0                                       # the tokens decoded and the time the engine spent decoding them, over every round
     messages = list(messages)
     if agent_run is not None:
         for e in agent_run.drain():                      # what the prompt hooks did, before the first word
@@ -1732,12 +1733,25 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                     reasoning.append(ev.text)
             yield kind, x
         total += done["completion_tokens"]
+        tm = done.get("timings") or {}
+        if tm.get("predicted_per_second") and tm.get("predicted_ms"):
+            dec_n += round(tm["predicted_per_second"] * tm["predicted_ms"] / 1000)
+            dec_ms += tm["predicted_ms"]
         run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
         if run_them and rounds >= max_rounds:
             yield "mcp", {"event": "limit", "max_rounds": max_rounds}
             if agent_run is not None:
                 agent_run.limit_hit = True
             run_them = False
+        if not run_them and agent_run is not None and not calls and not own_calls and done["finish"] == "stop" and not cancel.is_set():
+            said_now = agent_run.take_steers()                    # the answer was about to end, and the user had sent something meanwhile: it is read now, in the same run
+            if said_now:
+                messages.append({"role": "assistant", "content": "".join(text).strip(), **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {})})
+                for said in said_now:
+                    messages.append({"role": "user", "content": said})
+                    yield "mcp", {"event": "steered", "text": said}
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, 0 if sampling.get("stream") else 1)
+                continue
         if not run_them:
             for c in calls:                              # announced, never run: close them in the client's view
                 yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
@@ -1792,6 +1806,10 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
+        if agent_run is not None:
+            for said in agent_run.take_steers():                  # what the user sent while the agent worked is read at this step
+                messages.append({"role": "user", "content": said})
+                yield "mcp", {"event": "steered", "text": said}
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, 0 if sampling.get("stream") else 1)
     if agent_run is not None and getattr(agent_run, "hooks", None) and not cancel.is_set() and done["finish"] != "cancel":
         agent_run.current = None
@@ -1811,6 +1829,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             raise
         for e in agent_run.drain():
             yield "mcp", e
+    if rounds and dec_ms > 0 and done.get("timings"):            # several rounds: the speed of the decoding is that of all of them, not of the last (a tool's time and the next prompt's reading are not decoding)
+        done = {**done, "timings": {**done["timings"], "predicted_n": total, "predicted_ms": round(dec_ms, 1), "predicted_per_second": round(dec_n / (dec_ms / 1000), 1), "rounds": rounds + 1}}
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -2430,6 +2450,21 @@ def make_handler(svc: Service):
                 if body.get("apply") is True:
                     return self._json(200, svc.checkpoints.apply(body["session"], body["checkpoint"], body.get("include_changed") is True))
                 return self._json(200, svc.checkpoints.preview(body["session"], body["checkpoint"]))
+            if path == "/agent/steer":                       # what the user sends while the agent works: the agent reads it at its next step (serve/runs.py, run_with_mcp)
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
+                if not self._own_page("A message can be sent to a run"):
+                    return
+                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                if not ok:
+                    return self._json(403, {"error": {"message": why}})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not isinstance(body.get("text"), str) or not 0 < len(body["text"].strip()) <= 20_000:
+                    return self._json(400, {"error": {"message": "send {\"id\": the run's id, \"text\": the message (1 to 20,000 characters)}"}})
+                return self._json(200, {"ok": True, "found": svc.runs.steer(body["id"], body["text"].strip())})
             if path == "/agent/cancel":                      # the user's Stop for an answer that runs on its own (serve/runs.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
@@ -2788,7 +2823,7 @@ def make_handler(svc: Service):
                     if isinstance(e, EngineDied):
                         return {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                     return {"error": {"type": "server_error", "message": str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"}}
-                buf = svc.runs.launch(rid, chunks, cancel, describe)             # the answer is written on its own thread: a refresh of the page does not stop it
+                buf = svc.runs.launch(rid, chunks, cancel, describe, owner=arun)             # the answer is written on its own thread: a refresh of the page does not stop it
                 if buf is None:
                     return self._json(409, {"error": {"message": "there is a run with that id already"}})
                 self._sse()

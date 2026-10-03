@@ -48,8 +48,8 @@ const clock = (ds: number) => (ds < 600 ? `${(ds / 10).toFixed(1)}s` : `${Math.f
 /** The thinking line. While `working` the label shimmers and a timer counts; when it stops the label becomes `doneLabel`
  *  (with the timer, "Thought for 2.4s", when the time is known) and the timer glides to the end of the shorter text.
  *  `elapsed` (seconds) fixes the timer to a known length. The thought itself is `children`, shown while `open`. */
-export function Thought({ working, glyph, open, onToggle, elapsed, label, children }: {
-  working: boolean; glyph: ReactNode; open: boolean; onToggle: () => void; elapsed?: number | null; label?: string; children: ReactNode
+export function Thought({ working, glyph, open, onToggle, elapsed, label, since, children }: {
+  working: boolean; glyph: ReactNode; open: boolean; onToggle: () => void; elapsed?: number | null; label?: string; since?: number; children: ReactNode
 }) {
   const timed = working || elapsed != null
   const doneText = timed ? t("Thought for") : t("Thoughts")
@@ -65,11 +65,11 @@ export function Thought({ working, glyph, open, onToggle, elapsed, label, childr
   useLayoutEffect(() => {
     if (elapsed != null) { paint(Math.round(elapsed * 10)); return }
     if (!working) return
-    const t0 = performance.now()
-    paint(0)
+    const t0 = performance.now() - (since ? Math.max(0, Date.now() - since) : 0)           // counted from when the thinking began, not from when this block was drawn: it goes on when the page is left and opened again
+    paint(Math.floor((performance.now() - t0) / 100))
     const id = setInterval(() => paint(Math.floor((performance.now() - t0) / 100)), 100)
     return () => clearInterval(id)
-  }, [working, elapsed])
+  }, [working, elapsed, since])
 
   // The timer sits after the wider of the two labels (they are stacked in one grid cell); shift it left by the difference
   // so it follows the one that shows. On a change it glides (a CSS transition); when only the text resizes it jumps.

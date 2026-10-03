@@ -2003,3 +2003,189 @@ describe("a question that was answered before the page read the run again", () =
   })
 })
 
+describe("the speed under an answer is the engine's decoding speed", () => {
+  const finish = (timings: Record<string, unknown> | null) => [delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1318, prompt_tokens: 100 }, ...(timings ? { timings } : {}) }, "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10)]
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+  }
+  test("the server's speed over every round is shown, not the tokens over the whole answer's time (which holds the tools and the reading of each prompt)", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(new ReadableStream({
+      async start(ctl) { ctl.enqueue(enc.encode(sse(delta({ content: "a" })))); await new Promise((r) => setTimeout(r, 400)); ctl.enqueue(enc.encode(sse(...finish({ predicted_per_second: 49.7, predicted_n: 1318 })))); ctl.close() },
+    }), { status: 200 })
+    const c = new ChatController()
+    await c.send("work", [], ctx)
+    expect(c.messages[1].stats?.tokS).toBe(49.7)                                   // 1318 tokens over 0.4 s would have said 3,000
+    expect(c.messages[1].stats?.tokens).toBe(1318)
+  })
+
+  test("without the server's figure it is tokens over the time since the first one, as before", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(new ReadableStream({
+      async start(ctl) { ctl.enqueue(enc.encode(sse(delta({ content: "a" })))); await new Promise((r) => setTimeout(r, 500)); ctl.enqueue(enc.encode(sse(...finish(null)))); ctl.close() },
+    }), { status: 200 })
+    const c = new ChatController()
+    await c.send("work", [], ctx)
+    const v = c.messages[1].stats?.tokS
+    expect(v && v > 1000 && v < 3000).toBe(true)                                   // 1318 tokens in about half a second
+  })
+})
+
+describe("an answer that ends with a question still open", () => {
+  const questions = [{ question: "Which?", header: "Library", multiSelect: false, options: [{ label: "a", description: "x" }, { label: "b", description: "y" }] }]
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+  }
+  test("Stop while a permission card waits leaves no card to click: it says the answer stopped", async () => {
+    keep()
+    const c = new ChatController()
+    ;(globalThis as Record<string, unknown>).fetch = async (_u: string, init?: { signal?: AbortSignal }) => new Response(new ReadableStream({
+      start(ctl) {
+        ctl.enqueue(enc.encode(sse(
+          { strata_mcp: { event: "start", id: "c1", name: "Bash" } }, { strata_mcp: { event: "call", id: "c1", name: "Bash", server: "agent", tool: "Bash", arguments: { command: "curl x" }, round: 1 } },
+          { strata_mcp: { event: "permission", id: "p1", call_id: "c1", tool: "Bash", arguments: { command: "curl x" }, why: "asks", danger: false, rule: null } },
+          { strata_mcp: { event: "start", id: "c2", name: "AskUserQuestion" } }, { strata_mcp: { event: "call", id: "c2", name: "AskUserQuestion", server: "agent", tool: "AskUserQuestion", arguments: { questions }, round: 1 } },
+          { strata_mcp: { event: "question", id: "q1", call_id: "c2", questions } })))
+        init?.signal?.addEventListener("abort", () => ctl.error(new DOMException("aborted", "AbortError")))
+      },
+    }), { status: 200 })
+    const p = c.send("go", [], ctx)
+    await new Promise((r) => setTimeout(r, 30))
+    expect(c.messages[1].tools![0].state).toBe("asking")
+    c.stop()
+    await p
+    const [bash, ask] = c.messages[1].tools!
+    expect(c.messages[1].stopped).toBe(true)
+    expect(bash.ask).toMatchObject({ answer: "deny", stopped: true })
+    expect(bash.state).toBe("skipped")
+    expect(ask.question).toMatchObject({ answers: null, stopped: true })
+    expect(ask.state).toBe("skipped")
+  })
+
+  test("a question that was answered keeps its answer when the run ends", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(
+      { strata_mcp: { event: "start", id: "c1", name: "Bash" } }, { strata_mcp: { event: "call", id: "c1", name: "Bash", server: "agent", tool: "Bash", arguments: {}, round: 1 } },
+      { strata_mcp: { event: "permission", id: "p1", call_id: "c1", tool: "Bash", arguments: {}, why: "asks", danger: false, rule: null } },
+      { strata_mcp: { event: "answered", id: "p1", answer: "allow" } }, { strata_mcp: { event: "result", id: "c1", ok: true, text: "ok", chars: 2, truncated: false, ms: 1 } },
+      delta({ content: "done" }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10)), { status: 200 })
+    const c = new ChatController()
+    await c.send("go", [], ctx)
+    expect(c.messages[1].tools![0].ask).toMatchObject({ answer: "allow" })
+    expect(c.messages[1].tools![0].ask!.stopped).toBeUndefined()
+  })
+})
+
+describe("a message sent while the agent works", () => {
+  const ON = { available: true, allowed: true, shell: "bash", tools: ["Read"] }
+  const finish = [delta({ content: "second answer" }), { choices: [], usage: { completion_tokens: 7 } }, "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10)]
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+  }
+  /** The run's stream stays open until `emit` gives it the rest; the steer request is answered with `found`. */
+  function harness(found: boolean | "fail") {
+    const posts: { url: string; body: Record<string, unknown> }[] = []
+    let push!: (text: string) => void
+    let close!: () => void
+    ;(globalThis as Record<string, unknown>).fetch = async (u: string, init?: { body?: string }) => {
+      if (String(u).includes("agent/steer")) {
+        posts.push({ url: String(u), body: JSON.parse(init!.body!) })
+        if (found === "fail") throw new TypeError("network error")
+        return new Response(JSON.stringify({ ok: true, found }), { status: 200 })
+      }
+      return new Response(new ReadableStream({ start(ctl) { push = (x) => ctl.enqueue(enc.encode(x)); close = () => ctl.close(); push(sse(delta({ content: "first answer" }))) } }), { status: 200 })
+    }
+    return { posts, push: (x: string) => push(x), close: () => close() }
+  }
+
+  test("it is handed to the run, shown as sent, and when the agent reads it it becomes the user's message and the reply a new answer", async () => {
+    keep()
+    const h = harness(true)
+    const c = new ChatController()
+    const p = c.send("start", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    await new Promise((r) => setTimeout(r, 20))
+    expect(await c.steer("also check b.txt", [], ctx)).toBe(true)
+    expect(h.posts).toHaveLength(1)
+    expect(h.posts[0].body.text).toBe("also check b.txt")
+    expect(typeof h.posts[0].body.id).toBe("string")
+    expect(c.queuedOf()).toMatchObject([{ text: "also check b.txt", steered: true }])
+    h.push(sse({ strata_mcp: { event: "steered", text: "also check b.txt" } }, ...finish))
+    h.close()
+    await p
+    expect(c.queuedOf()).toEqual([])                                                       // it is a message of the conversation now, not a waiting one
+    expect(c.messages.map((m) => [m.role, m.text])).toEqual([["user", "start"], ["assistant", "first answer"], ["user", "also check b.txt"], ["assistant", "second answer"]])
+    expect(c.busy).toBeNull()
+  })
+
+  test("the tools of the first part stay with it and the second answer starts clean", async () => {
+    keep()
+    const h = harness(true)
+    const c = new ChatController()
+    const p = c.send("start", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    await new Promise((r) => setTimeout(r, 20))
+    h.push(sse({ strata_mcp: { event: "start", id: "c1", name: "Read" } }, { strata_mcp: { event: "call", id: "c1", name: "Read", server: "agent", tool: "Read", arguments: { file_path: "a" }, round: 1 } },
+      { strata_mcp: { event: "result", id: "c1", ok: true, text: "x", chars: 1, truncated: false, ms: 1 } }))
+    await c.steer("and then?", [], ctx)
+    h.push(sse({ strata_mcp: { event: "steered", text: "and then?" } }, ...finish))
+    h.close()
+    await p
+    expect(c.messages[1].tools).toHaveLength(1)
+    expect(c.messages[3].tools).toBeUndefined()
+    expect(c.messages[3].reasoning).toBe("")
+  })
+
+  test("a server that has no such run does not take it: it is not left shown as sent, and the caller queues it", async () => {
+    keep()
+    const h = harness(false)
+    const c = new ChatController()
+    const p = c.send("start", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    await new Promise((r) => setTimeout(r, 20))
+    expect(await c.steer("hello?", [], ctx)).toBe(false)
+    expect(c.queuedOf()).toEqual([])
+    expect(c.queue("hello?", [], ctx)).toBe(true)                                          // the usual waiting in line
+    expect(c.queuedOf()[0].steered).toBeUndefined()
+    h.push(sse(...finish)); h.close()
+    await p
+  })
+
+  test("a server that cannot be reached, a message with attachments and an answer that is not an agent's are not handed over", async () => {
+    keep()
+    const h = harness("fail")
+    const c = new ChatController()
+    const p = c.send("start", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    await new Promise((r) => setTimeout(r, 20))
+    expect(await c.steer("x", [], ctx)).toBe(false)
+    expect(c.queuedOf()).toEqual([])
+    expect(await c.steer("with a file", [{ kind: "file", name: "a.txt", text: "t" }], ctx)).toBe(false)
+    expect(h.posts).toHaveLength(1)                                                        // the file one never went
+    h.push(sse(...finish)); h.close()
+    await p
+    keep()
+    const posts: string[] = []
+    ;(globalThis as Record<string, unknown>).fetch = async (u: string) => { posts.push(String(u)); return new Response(new ReadableStream({ start(ctl) { ctl.enqueue(enc.encode(sse(delta({ content: "a" })))); setTimeout(() => { ctl.enqueue(enc.encode(sse(...finish))); ctl.close() }, 40) } }), { status: 200 }) }
+    const d = new ChatController()
+    const q = d.send("plain chat", [], ctx)                                                // no coding tools: no run to hand it to
+    await new Promise((r) => setTimeout(r, 10))
+    expect(await d.steer("meanwhile", [], ctx)).toBe(false)
+    expect(posts.some((u) => u.includes("agent/steer"))).toBe(false)
+    await q
+  })
+
+  test("an empty message is not handed over, and nothing is handed over when no answer is being written", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response("{}", { status: 200 })
+    const c = new ChatController()
+    expect(await c.steer("   ", [], ctx)).toBe(false)
+    expect(await c.steer("hi", [], ctx)).toBe(false)
+  })
+})
+

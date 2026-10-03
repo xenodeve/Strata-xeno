@@ -72,7 +72,19 @@ class AgentRun:
         self.hooks = None                                      # serve/hooks.py Runner, when the user has hooks
         self.kw, self.sampling = {}, {}                        # the request's template settings and sampling: a helper (serve/subagent.py) runs with the same
         self.limit_hit = False                                 # the tool loop stopped at its limit of rounds
+        self.steers: queue.Queue = queue.Queue()               # what the user sent while the agent worked: read by the model at the next step (serve/server.py run_with_mcp)
         self.ctx = agent.AgentContext(policy=policy, session=session, ask=self.ask, cancel=cancel, emit=self._emit, question=self.question)
+
+    def steer(self, text: str) -> None:
+        self.steers.put(text)
+
+    def take_steers(self) -> list[str]:
+        out = []
+        while True:
+            try:
+                out.append(self.steers.get_nowait())
+            except queue.Empty:
+                return out
 
     def bind(self, cancel: threading.Event) -> None:
         """The request's own cancel event (made after the run, once the prompt is ready)."""

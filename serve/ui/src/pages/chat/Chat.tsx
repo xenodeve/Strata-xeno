@@ -11,7 +11,6 @@ import { PromptBar } from "../../components/PromptBar"
 import { Sidebar } from "../../components/Sidebar"
 import { ConfirmDialog } from "../../components/ConfirmDialog"
 import { useMetrics } from "../../lib/metrics"
-import { LiveTokens, type LiveReading } from "../../lib/livetokens"
 import { readProgress } from "../../lib/status"
 import { href } from "../../lib/router"
 import { effortChoices, settleEffort } from "../../lib/effort"
@@ -113,14 +112,7 @@ export function Chat({ id }: { id?: string }) {
   const busy = chat.busy
   const { data: metrics, stale } = useMetrics()
   const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
-  // the tokens written so far in the answer that is being made, counted live and run on between the server's readings, so that it shows that the agent is still at work
   useEffect(() => { void chat.resumeRuns() }, [])                // an answer that was being written when the page was refreshed went on in the server: it is read again
-  const counter = useRef(new LiveTokens())
-  const [, tickCount] = useState(0)
-  const working = !!busy
-  useEffect(() => { if (!working) return; const id = setInterval(() => tickCount((n) => n + 1), 250); return () => clearInterval(id) }, [working])
-  counter.current.sample(busy?.msg ?? null, live as LiveReading, performance.now())
-  const counted = counter.current.shown(performance.now())
   const closeSheet = useCallback(() => setSheet(false), [])
   // The thinking levels are the model's: what its template accepts, as the server lists them. A level saved for another model
   // (or "high" where this one calls it "xhigh") is moved onto one this model has.
@@ -260,7 +252,8 @@ export function Chat({ id }: { id?: string }) {
       const found = agentInfo.allowed ? await resolveMentions(folders, typed) : []                                    // the files the prompt mentions with @ go with it
       const all = [...f, ...found.filter((x) => !f.some((y) => y.name === x.name))]
       const context = { health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: folders }
-      if (!(busy && chat.queue(typed, all, context))) void chat.send(typed, all, context)                          // an answer is being written: this waits in line and goes when it ends
+      if (!busy) void chat.send(typed, all, context)
+      else void chat.steer(typed, all, context).then((taken) => { if (!taken && !chat.queue(typed, all, context)) void chat.send(typed, all, context) })        // an agent is working: it reads this at its next step; else it waits in line and goes when the answer ends
     }
     if (!busy) noteSend(input.current?.getBoundingClientRect())          // where the prompt rises from
     setText(""); setFiles([])
@@ -344,12 +337,12 @@ export function Chat({ id }: { id?: string }) {
           </div>
         </Collapse>
         {chat.messages.map((m, i) => (
-          <MessageView key={i} m={m} streaming={busy?.msg === m} compacting={chat.compacting && busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined} serverState={busy?.msg === m ? live.state : undefined} reading={busy?.msg === m && live.state === "reading" ? readProgress((live as { prompt_read?: number | null }).prompt_read, (live as { prompt_total?: number | null }).prompt_total) : null} liveTokens={busy?.msg === m ? counted : null}
+          <MessageView key={i} m={m} streaming={busy?.msg === m} compacting={chat.compacting && busy?.msg === m} show={chat.settings.show} prefill={chat.settings.prefill} serverPhase={busy?.msg === m ? (live as { phase?: string | null }).phase : undefined} serverState={busy?.msg === m ? live.state : undefined} reading={busy?.msg === m && live.state === "reading" ? readProgress((live as { prompt_read?: number | null }).prompt_read, (live as { prompt_total?: number | null }).prompt_total) : null}
             actions={isPrompt(m) ? { canAct: !busy, last: i === lastPrompt, onEdit: (t) => editPrompt(i, t), onUndo: undoPrompt, onRewind: () => setRewindAt(Math.max(0, rewindPrompts().findIndex((p) => p.index === i))) } : undefined} />
         ))}
         {chat.compacting && !!busy && !chat.messages.includes(busy.msg) && <CompactingLine />}
         {chat.queuedOf().map((q) => (
-          <QueuedMessage key={q.id} text={q.text} files={q.files} answering={!!busy}
+          <QueuedMessage key={q.id} text={q.text} files={q.files} answering={!!busy} steered={q.steered}
             onEdit={() => { const x = chat.unqueue(q.id); if (x) { setText((cur) => (cur.trim() ? x.text + "\n\n" + cur : x.text)); setFiles((fs) => [...x.files, ...fs]); input.current?.focus() } }}
             onRemove={() => { chat.unqueue(q.id) }}
             onSend={() => { void chat.sendQueued(q.id) }} />

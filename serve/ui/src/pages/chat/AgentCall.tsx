@@ -69,7 +69,7 @@ function Ask({ call }: { call: ToolCall }) {
   if (done) {
     return (
       <div className="space-y-1 border-t border-line px-3 py-2 text-[12.5px]" data-asked-answers>
-        {asked.answers === null ? <div className="text-ink-2">{t("You skipped the questions.")}</div> : asked.questions.map((q) => (
+        {asked.answers === null ? <div className="text-ink-2">{asked.stopped ? t("The answer stopped before you answered.") : t("You skipped the questions.")}</div> : asked.questions.map((q) => (
           <div key={q.question}><span className="text-ink-2">{q.header}: </span><span className="font-medium">{(asked.answers?.[q.question] ?? []).join(", ") || t("(no answer)")}</span></div>
         ))}
       </div>
@@ -248,7 +248,7 @@ export function AgentCall({ call }: { call: ToolCall }) {
       <HookNotes notes={call.hooks} />
       {call.question && <Ask call={call} />}
       {pending && !waiting && <Question call={call} />}
-      {call.ask?.answer && <div className="border-t border-line px-3 py-1.5 text-[12px] text-ink-2">{call.ask.kept ? keptText(call.ask.kept) : call.ask.answer === "deny" ? t("You did not allow it.") : call.ask.answer === "allow_chat" ? t("You allowed it for this chat.") : t("You allowed it.")}</div>}
+      {call.ask?.answer && <div className="border-t border-line px-3 py-1.5 text-[12px] text-ink-2">{call.ask.stopped ? t("The answer stopped before you answered.") : call.ask.kept ? keptText(call.ask.kept) : call.ask.answer === "deny" ? t("You did not allow it.") : call.ask.answer === "allow_chat" ? t("You allowed it for this chat.") : t("You allowed it.")}</div>}
       <Collapse open={open && !pending}>
         <div className="space-y-2 border-t border-line px-3 py-2.5"><Body call={call} /></div>
       </Collapse>

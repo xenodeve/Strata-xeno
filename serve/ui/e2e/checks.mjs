@@ -2408,6 +2408,103 @@ export const checks = [
     },
   },
   {
+    // A message sent while the agent works is handed to it and read at its next step, instead of waiting for the whole answer (real server, scripted model).
+    name: "steer: a message sent while the agent works is read at its next step and becomes the user's message in the conversation",
+    async run({ browser, agentDemo, t, errors }) {
+      const fs = await import("node:fs")
+      const os = await import("node:os")
+      const path = await import("node:path")
+      const outside = path.join(os.tmpdir(), "strata-agent-demo.txt")
+      const inside = path.join(agentDemo.dir, "strata-agent-demo.txt")
+      fs.rmSync(outside, { force: true })
+      fs.rmSync(inside, { force: true })
+      const pg = await open(browser, errors)
+      await pg.addInitScript((dir) => { try { if (!localStorage.getItem("strata.sampling")) localStorage.setItem("strata.sampling", JSON.stringify({ agentFolder: dir })) } catch { /* private window */ } }, agentDemo.dir)
+      await pg.goto(agentDemo.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(1200)
+      await pg.fill("textarea[aria-label='Message']", "agent demo please")
+      await pg.keyboard.press("Enter")
+      const card = pg.locator("[data-agent-ask]")
+      await card.first().waitFor({ timeout: 30000 })
+      await pg.fill("textarea[aria-label='Message']", "and tell me when you are done")
+      await pg.keyboard.press("Enter")
+      const waiting = pg.locator("[data-queued]")
+      await waiting.first().waitFor({ timeout: 8000 })
+      t.ok("while the agent waits for the user the message is shown as handed to it", (await waiting.first().innerText()).includes("and tell me when you are done") && (await pg.locator("[data-queued-state='steered']").count()) === 1)
+      t.ok("and it cannot be taken back from here (it is with the agent already)", (await waiting.first().getByRole("button", { name: "Remove" }).count()) === 0)
+      await card.first().getByRole("button", { name: "Allow", exact: true }).click()
+      await pg.waitForFunction(() => document.querySelectorAll("[data-queued]").length === 0, null, { timeout: 30000 })
+      t.ok("at the next step it is read: the bubble gives way to the user's message in the conversation", (await pg.getByText("and tell me when you are done").count()) === 1 && (await pg.locator("[data-queued]").count()) === 0)
+      await card.first().waitFor({ timeout: 30000 })
+      await card.first().getByRole("button", { name: "Allow for this chat" }).click()
+      await pg.waitForFunction(() => document.body.innerText.includes("That was the demo of the coding tools"), null, { timeout: 30000 })
+      t.ok("the run goes on to its end, and nothing was sent twice", (await pg.getByText("and tell me when you are done").count()) === 1 && !(await pg.locator("body").innerText()).toLowerCase().includes("network error"))
+      const order = await pg.evaluate(() => {
+        const text = document.body.innerText
+        return [text.indexOf("agent demo please"), text.indexOf("and tell me when you are done"), text.indexOf("That was the demo")]
+      })
+      t.ok("in the order it happened: the prompt, the message sent meanwhile, the end of the demo", order[0] >= 0 && order[0] < order[1] && order[1] < order[2], JSON.stringify(order))
+      fs.rmSync(outside, { force: true })
+    },
+  },
+  {
+    // Stop while a question waits: no card is left on screen with buttons that lead nowhere, and a new prompt goes on without trouble.
+    name: "stop: a question that was open when the answer was stopped is closed, not left waiting",
+    async run({ browser, agentDemo, t, errors }) {
+      const fs = await import("node:fs")
+      const os = await import("node:os")
+      const path = await import("node:path")
+      fs.rmSync(path.join(os.tmpdir(), "strata-agent-demo.txt"), { force: true })
+      const pg = await open(browser, errors)
+      await pg.addInitScript((dir) => { try { if (!localStorage.getItem("strata.sampling")) localStorage.setItem("strata.sampling", JSON.stringify({ agentFolder: dir })) } catch { /* private window */ } }, agentDemo.dir)
+      await pg.goto(agentDemo.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(1200)
+      await pg.fill("textarea[aria-label='Message']", "agent demo please")
+      await pg.keyboard.press("Enter")
+      const card = pg.locator("[data-agent-ask]")
+      await card.first().waitFor({ timeout: 30000 })
+      await pg.getByRole("button", { name: /Stop/ }).first().click()
+      await pg.waitForFunction(() => document.querySelectorAll("[data-agent-ask]").length === 0, null, { timeout: 15000 })
+      t.ok("the card with its buttons is gone, and the call says why", (await card.count()) === 0 && (await pg.locator("body").innerText()).includes("The answer stopped before you answered."))
+      t.ok("the call is not shown as waiting or running", (await pg.locator("[data-agent-call][data-state='asking']").count()) === 0 && (await pg.locator("[data-agent-call][data-state='running']").count()) === 0)
+      await pg.fill("textarea[aria-label='Message']", "hello again")
+      await pg.keyboard.press("Enter")
+      await pg.waitForFunction(() => document.body.innerText.includes("hello again"), null, { timeout: 15000 })
+      t.ok("a new prompt after the stop goes on", (await pg.locator("body").innerText()).includes("hello again"))
+      await pg.context().close()
+    },
+  },
+  {
+    // The timer of the thinking and the count of tokens belong to the answer, not to the page: leaving the Chat for another page and coming back does not start them again from 0.
+    name: "timers: the thinking time and the token count go on when another page is opened and the Chat is opened again",
+    async run({ browser, long, t, errors }) {
+      const pg = await open(browser, errors, { width: 1100, height: 800 })
+      await pg.goto(long.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(900)
+      await pg.fill("textarea[aria-label='Message']", "think about it at length")
+      await pg.keyboard.press("Enter")
+      await pg.waitForSelector(".thought-timer", { timeout: 20000 })
+      await pg.waitForFunction(() => parseFloat(document.querySelector(".thought-timer")?.textContent || "0") >= 3, null, { timeout: 20000 })
+      const seconds = () => pg.evaluate(() => parseFloat(document.querySelector(".thought-timer")?.textContent || "0"))
+      const count = () => pg.evaluate(() => parseInt((document.querySelector("[data-live-tokens]")?.textContent || "0").replace(/,/g, ""), 10) || 0)
+      const before = { s: await seconds(), n: await count() }
+      await pg.getByRole("link", { name: "Settings", exact: true }).click()                           // another page: the Chat is drawn away
+      await pg.waitForSelector("[data-topic], aside[aria-label='Settings sections']", { timeout: 8000 }).catch(() => {})
+      t.ok("the Chat is not on screen meanwhile", (await pg.locator("textarea[aria-label='Message']").count()) === 0)
+      await pg.waitForTimeout(4000)
+      await pg.getByRole("link", { name: "Chat", exact: true }).click()
+      await pg.waitForSelector(".thought-timer", { timeout: 8000 })
+      await pg.waitForTimeout(400)
+      const after = { s: await seconds(), n: await count() }
+      t.ok("the thinking time is counted from when it began: it does not start again at 0", after.s >= before.s + 3.5 && after.s < before.s + 12, JSON.stringify({ before: before.s, after: after.s }))
+      t.ok("and the count of tokens is not lost: it is at least what it was", after.n >= before.n, JSON.stringify({ before: before.n, after: after.n }))
+      await pg.context().close()
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {

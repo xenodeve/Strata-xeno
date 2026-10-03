@@ -21,8 +21,8 @@ BEAT_S = 5.0                  # how often a reader that is waiting is given a si
 
 
 class Run:
-    def __init__(self, rid: str, cancel: threading.Event):
-        self.id, self.cancel = rid, cancel
+    def __init__(self, rid: str, cancel: threading.Event, owner=None):
+        self.id, self.cancel, self.owner = rid, cancel, owner         # `owner`: the AgentRun whose steering queue what the user sends meanwhile goes to
         self.events: list[bytes] = []             # each a whole SSE event: b"data: {...}\n\n"
         self.size = 0
         self.done = False
@@ -83,10 +83,10 @@ class RunStore:
         with self.lock:
             return self.runs.get(rid) if isinstance(rid, str) else None
 
-    def launch(self, rid: str, chunks: Iterator, cancel: threading.Event, describe: Callable[[BaseException], dict | None]) -> Run | None:
+    def launch(self, rid: str, chunks: Iterator, cancel: threading.Event, describe: Callable[[BaseException], dict | None], owner=None) -> Run | None:
         """Start a run that writes what `chunks` yields (dicts, None for a keep-alive) into a buffer; None when there is already a run with that id.
         `describe(exc)`: the error chunk to write when the stream breaks, or None to let it end quietly."""
-        run = Run(rid, cancel)
+        run = Run(rid, cancel, owner)
         with self.lock:
             if rid in self.runs:
                 return None
@@ -122,6 +122,14 @@ class RunStore:
         if run is None:
             return False
         run.cancel.set()
+        return True
+
+    def steer(self, rid, text: str) -> bool:
+        """Hand what the user sent while the run works to its agent; False when there is no such run, or it is over."""
+        run = self.get(rid)
+        if run is None or run.done or run.owner is None or not hasattr(run.owner, "steer"):
+            return False
+        run.owner.steer(text)
         return True
 
     def _prune(self, now: float | None = None) -> None:

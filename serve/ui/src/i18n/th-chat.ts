@@ -241,4 +241,6 @@ export const part: Record<string, string> = {
   "Running {tool}…": "กำลังรัน {tool}…",
   "A helper is working…": "ตัวช่วยกำลังทำงาน…",
   "{read} of {total} tokens read": "อ่านแล้ว {read} จาก {total} token",
+  "The answer stopped before you answered.": "คำตอบหยุดไปก่อนที่คุณจะตอบ",
+  "Sent to the agent: it reads it at its next step": "ส่งให้ agent แล้ว: มันจะอ่านในขั้นตอนถัดไป",
 }

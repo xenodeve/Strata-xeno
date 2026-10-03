@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, Copy01Icon, AttachmentIcon, PencilEdit01Icon, RewindIcon, Undo02Icon } from "@hugeicons/core-free-icons"
 import { chat, metaText, type Message, type ToolCall } from "../../lib/chat"
@@ -93,7 +93,7 @@ function Answer({ m, streaming, show, phase }: { m: Message; streaming: boolean;
     const rat = typeof tc.rat === "number" ? Math.min(tc.rat, reasoning.length) : undefined
     if (rpos !== undefined && rat !== undefined && rat > rpos) {                       // a new round: what the model thought before it called this tool
       const seg = reasoning.slice(rpos, rat)
-      if (seg.trim()) parts.push(<RoundThought key={`r${k}`} text={seg.trim()} working={false} show={show} phase={phase} />)
+      if (seg.trim()) parts.push(<RoundThought key={`r${k}`} text={seg.trim()} working={false} show={show} phase={phase} since={m.tools?.[k - 1]?.doneAt} />)
       rpos = rat
     }
     if (at > pos) parts.push(<Prose key={`p${k}`} text={m.text.slice(pos, at)} />)
@@ -103,7 +103,7 @@ function Answer({ m, streaming, show, phase }: { m: Message; streaming: boolean;
   const tail = rpos !== undefined ? reasoning.slice(rpos) : ""
   if (tail.trim()) {                                                                  // the thinking after the last tool: live while the model thinks again
     const idle = !m.tools.some((c) => c.state === "running" || c.state === "writing" || c.state === "asking")
-    parts.push(<RoundThought key="tail" text={tail.trim()} working={streaming && idle && m.text.length <= pos} show={show} phase={phase} />)
+    parts.push(<RoundThought key="tail" text={tail.trim()} working={streaming && idle && m.text.length <= pos} show={show} phase={phase} since={m.tools[m.tools.length - 1]?.doneAt} />)
   }
   parts.push(<Prose key="rest" text={m.text.slice(pos)} />)
   return <>{parts}</>
@@ -126,12 +126,12 @@ function ThoughtGlyph({ working, status, design }: { working: boolean; status: L
 }
 
 /** The thinking of one later round of an agent's work: open while it streams (if wanted), closed once it is over, as the first one is. */
-function RoundThought({ text, working, show, phase }: { text: string; working: boolean; show: boolean; phase: OrbDesign | null }) {
+function RoundThought({ text, working, show, phase, since }: { text: string; working: boolean; show: boolean; phase: OrbDesign | null; since?: number }) {
   const [touched, setTouched] = useState<boolean | null>(null)
   const open = touched ?? (working && show)
   return (
     <div className="mb-2" data-round-thought>
-      <Thought working={working} glyph={<ThoughtGlyph working={working} status={working ? "working" : "done"} design={phase ?? "solving"} />} open={open} onToggle={() => setTouched(!open)}>
+      <Thought working={working} since={since} glyph={<ThoughtGlyph working={working} status={working ? "working" : "done"} design={phase ?? "solving"} />} open={open} onToggle={() => setTouched(!open)}>
         <ReasonStream text={text} live={working} />
       </Thought>
     </div>
@@ -147,6 +147,7 @@ function Thinking({ m, text, streaming, show, phase }: { m: Message; text: strin
     <div className="mb-2">
       <Thought
         working={thinkingNow}
+        since={m.thinkAt}
         glyph={<ThoughtGlyph working={thinkingNow} status={status} design={phase ?? "solving"} />}
         open={open}
         onToggle={() => setTouched(!open)}
@@ -156,6 +157,15 @@ function Thinking({ m, text, streaming, show, phase }: { m: Message; text: strin
       </Thought>
     </div>
   )
+}
+
+/** The count of tokens written so far, running (its own small clock: only this re-draws, not the whole conversation). */
+function LiveCount() {
+  const [, tick] = useState(0)
+  useEffect(() => { const id = setInterval(() => tick((n) => n + 1), 250); return () => clearInterval(id) }, [])
+  const v = chat.liveTokens.shown(performance.now())
+  if (!v) return null
+  return <span className="num" data-live-tokens role="status" aria-label={t("Tokens written so far")}>{t("{n} tokens", { n: fmt(v.tokens) })}{v.tokS ? ` · ${fmt(v.tokS, 1)} tok/s` : ""}</span>
 }
 
 /** How far the server is in reading what it is reading, as a share beside the words; pointing at it gives the tokens read of the tokens to read. */
@@ -203,17 +213,17 @@ function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: bo
 }
 
 /** A message that was typed while the answer was being written: it waits in line (dashed), and can be taken back to be edited, dropped, or - when the answer was stopped - sent. */
-export function QueuedMessage({ text, files, answering, onEdit, onRemove, onSend }: { text: string; files: { name: string }[]; answering: boolean; onEdit: () => void; onRemove: () => void; onSend: () => void }) {
+export function QueuedMessage({ text, files, answering, steered = false, onEdit, onRemove, onSend }: { text: string; files: { name: string }[]; answering: boolean; steered?: boolean; onEdit: () => void; onRemove: () => void; onSend: () => void }) {
   const small = "rounded-sm px-1.5 py-0.5 transition-colors hover:bg-hover hover:text-ink"
   return (
     <div className="msg-in flex flex-col items-end gap-1" data-queued>
       {files.length > 0 && <div className="flex flex-wrap justify-end gap-1.5">{files.map((f, i) => <span key={i} className="inline-flex items-center gap-1 rounded-sm bg-fill px-2 py-1 text-[12px]"><HugeiconsIcon icon={AttachmentIcon} size={12} aria-hidden />{f.name}</span>)}</div>}
       {text && <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md border border-dashed border-line px-4 py-2.5 text-[15px] tracking-[-0.011em] text-ink-2 [overflow-wrap:anywhere]">{text}</div>}
       <div className="flex items-center gap-1 px-1 text-[12px] text-ink-3">
-        <span>{answering ? t("Waits for the answer to end") : t("Not sent: the answer was stopped")}</span>
+        <span data-queued-state={steered && answering ? "steered" : answering ? "waiting" : "stopped"}>{steered && answering ? t("Sent to the agent: it reads it at its next step") : answering ? t("Waits for the answer to end") : t("Not sent: the answer was stopped")}</span>
         {!answering && <button type="button" onClick={onSend} className={small}>{t("Send now")}</button>}
-        <button type="button" onClick={onEdit} className={small}>{t("Edit")}</button>
-        <button type="button" onClick={onRemove} className={small}>{t("Remove")}</button>
+        {!(steered && answering) && <button type="button" onClick={onEdit} className={small}>{t("Edit")}</button>}
+        {!(steered && answering) && <button type="button" onClick={onRemove} className={small}>{t("Remove")}</button>}
       </div>
     </div>
   )
@@ -249,7 +259,7 @@ function CompactNotice({ m }: { m: Message }) {
   )
 }
 
-export function MessageView({ m, streaming, compacting = false, show, prefill, actions, serverPhase, serverState, reading, liveTokens }: { m: Message; streaming: boolean; compacting?: boolean; show: boolean; prefill: boolean; actions?: PromptActions; serverPhase?: string | null; serverState?: string | null; reading?: { read: number; total: number; percent: number } | null; liveTokens?: { tokens: number; tokS: number | null } | null }) {
+export function MessageView({ m, streaming, compacting = false, show, prefill, actions, serverPhase, serverState, reading }: { m: Message; streaming: boolean; compacting?: boolean; show: boolean; prefill: boolean; actions?: PromptActions; serverPhase?: string | null; serverState?: string | null; reading?: { read: number; total: number; percent: number } | null }) {
   const ref = useRef<HTMLDivElement>(null)
   const mine = useRef<HTMLDivElement>(null)
   const [editing, setEditing] = useState(false)
@@ -332,7 +342,7 @@ export function MessageView({ m, streaming, compacting = false, show, prefill, a
         <Handover live={status && status.kind !== "thinking" ? <span data-agent-status={status.kind} className="inline-flex items-center gap-2"><StatusLabel design={status.design} className="text-[13px] text-ink-2">{status.label}</StatusLabel>{status.kind === "reading" && <ReadShare p={reading} />}</span> : null}>
           <span className="num">{metaText(m) || (streaming ? "" : m.stopped ? t("Stopped") : "")}</span>
         </Handover>
-        {streaming && !!liveTokens && <span className="num" data-live-tokens role="status" aria-label={t("Tokens written so far")}>{t("{n} tokens", { n: fmt(liveTokens.tokens) })}{liveTokens.tokS ? ` · ${fmt(liveTokens.tokS, 1)} tok/s` : ""}</span>}
+        {streaming && <LiveCount />}
         {!streaming && !!m.text && (
           <button
             type="button"
