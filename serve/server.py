@@ -1330,7 +1330,8 @@ class Service:
                 goal = c if isinstance(c, str) else "".join(p.get("text", "") for p in c if isinstance(p, dict)) if isinstance(c, list) else ""
                 break
         sh = getattr(self.agent, "shell", None)
-        policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs)
+        policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs,
+                                    protected=[p for p in (self.config_path, self.mcp_config_path) if p])   # hooks, web access and keys live there: never changed unasked
         run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell_mod.describe(sh) if sh else None)
         cp = sa.get("checkpoint")
         if isinstance(cp, str) and sid != "default":
@@ -2178,6 +2179,8 @@ class Service:
                                     meta["id"] = f"{shared['id']}-{calls}"
                             meta.pop("calls", None)
                             prompt = meta.pop("_prompt", None)                  # Q8: only when asked for; the detail file, never the row
+                            if shared is not None:
+                                shared.pop("_prompt", None)                   # once per request: the later rounds of an agent run do not write it again
                             chunks = chunk_stats(last.get("prefill_points") or [], last.get("reused") or 0)
                             decode = window_rates(tok_times)
                             rec = summary_record({

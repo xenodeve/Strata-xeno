@@ -165,6 +165,15 @@ class KeepPrompt(unittest.TestCase):
         self.assertEqual(msgs[0]["content"][1]["image_url"]["url"][:5], "data:")      # the request itself is untouched
 
 
+class KeepPromptAnthropicImages(unittest.TestCase):
+    def test_an_image_part_of_a_converted_request_is_a_note_too(self):
+        # scrutiny of PR #104: the Anthropic dialect's images arrive converted as {"type": "image", "source": "data:..."}
+        from serve.history import prompt_for_keep
+        msgs = [{"role": "user", "content": [{"type": "image", "source": "data:image/png;base64," + "A" * 5000}]}]
+        self.assertEqual(prompt_for_keep(msgs)[0]["content"][0], {"type": "image", "source": "[image omitted]"})
+        self.assertEqual(msgs[0]["content"][0]["source"][:5], "data:")
+
+
 class Meta(unittest.TestCase):
     def test_meta_keeps_numbers_names_and_200_chars_not_the_prompt(self):
         from serve.history import request_meta

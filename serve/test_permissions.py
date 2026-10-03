@@ -279,6 +279,21 @@ class Modes(Base):
         d = P.decide("Read", {"file_path": ".env"}, self.ctx(mode="auto"))
         self.assertFalse(d.judgeable)                                                          # nor for a secret
 
+    def test_the_servers_own_config_is_never_read_or_changed_without_asking(self):
+        # security review of PR #104: the run config switches hooks, web access and helpers on and holds the keys; a model
+        # steered by a fetched page must not rewrite it inside the project folder and have the next run obey it
+        conf = self.proj / "strata.json"
+        conf.write_text("{}", encoding="utf-8")
+        guarded = [str(conf)]
+        for tool, args in (("Write", {"file_path": "strata.json", "content": "{}"}),
+                           ("Edit", {"file_path": str(conf), "old_string": "{", "new_string": "{ "}),
+                           ("Read", {"file_path": "strata.json"})):
+            for allow in ([], ["Write"], ["Edit(**)"], ["Read"]):
+                d = P.decide(tool, args, self.ctx(mode="auto", allow=allow, protected=guarded))
+                self.assertEqual(d.kind, "ask", (tool, allow))
+                self.assertFalse(d.judgeable, (tool, allow))
+        self.assertEqual(self.kind("Write", {"file_path": "other.json", "content": "{}"}, protected=guarded), "allow")
+
     def test_auto_may_judge_a_path_outside_the_folder_but_not_a_command_naming_a_secret(self):
         self.assertTrue(P.decide("Read", {"file_path": str(self.outside / "b.txt")}, self.ctx(mode="auto")).judgeable)
         self.assertFalse(P.decide("Bash", {"command": "cat .env"}, self.ctx(mode="auto")).judgeable)

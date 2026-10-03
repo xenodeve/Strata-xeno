@@ -274,6 +274,18 @@ class AutoMode(Fixture):
         self.assertEqual(len(self.engine.prompts), 2)                           # no judge request
 
 
+    def test_the_servers_run_config_in_the_folder_is_not_rewritten_without_asking(self):
+        # security review of PR #104: a run reads hooks, web access and helpers from the run config, so a prompt-injected
+        # Write to it would be obeyed by the next run; it asks, the page refuses here, and the file is unchanged
+        conf = self.proj / "strata.json"
+        conf.write_text("{}", encoding="utf-8")
+        self.start(tool_call("Write", file_path="strata.json", content='{"hooks": {}}'), DONE)
+        self.svc.config_path = str(conf)
+        seen = []
+        self.chat(self.body(agent={"allow": ["Write"]}), on_event=lambda e: e["event"] == "permission" and (seen.append(e), self.answer(e["id"], "deny")))
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(conf.read_text(encoding="utf-8"), "{}")
+
 class OtherFolders(Fixture):
     """The page names the project's other folders (strata_agent.dirs): the model is told of them and files in them are free; odd values are ignored."""
 

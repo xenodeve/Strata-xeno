@@ -36,6 +36,7 @@ class Policy:
     allow: list[str] = field(default_factory=list)
     deny: list[str] = field(default_factory=list)
     dirs: list[str] = field(default_factory=list)   # the project's other folders (Claude Code's additional directories, e.g. other worktrees): files in them are as free as in `cwd`
+    protected: list[str] = field(default_factory=list)   # the server's own files (the run config, the --mcp-config file): they switch hooks, web access and helpers on and hold keys, so reading or changing them asks every time
 
 
 @dataclass
@@ -478,6 +479,10 @@ def decide(tool: str, args: dict, pol: Policy) -> Decision:
     target, why = _file_target(tool, args, pol)
     if target is None:
         return ask(why, judge=False)
+    if any(_norm(target) == _norm(real(p, None) or p) for p in pol.protected):   # before any rule: nothing settles these
+        if plan and tool in FILE_EDIT:
+            return Decision("deny", "plan mode: nothing is changed")
+        return ask("it is the server's own config (hooks, web access, keys)", judge=False)
     secret = is_secret(target)
     root_here = root_of(target, pol)
     in_dot_git = tool in FILE_EDIT and root_here is not None and in_git(target, root_here)

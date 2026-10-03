@@ -28,7 +28,8 @@ def default_dir() -> Path:
 
 
 def _safe(name: str) -> str | None:
-    return name if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", name) else None
+    # no "." or ":": a name is joined onto the store, so "..", "." or a drive ("C:") would lead outside it (forget() deletes)
+    return name if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", name) else None
 
 
 def _hash(path: str) -> str | None:

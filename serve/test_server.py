@@ -754,6 +754,21 @@ class RequestHistory(unittest.TestCase):
         self.assertNotIn("prompt", self.get(f"/metrics/requests/{items[0]['id']}")[1]["detail"])
         self.assertEqual(self.svc.keep_prompts, 0)
 
+    def test_a_kept_prompt_is_written_once_per_request_not_once_per_round(self):
+        # scrutiny of PR #104: an agent request calls run() once per round (up to 100); the shared meta kept `_prompt`, so
+        # every round wrote the same prompt again and pushed useful detail files out under the size cap
+        import threading
+        from serve.history import request_meta
+        meta = {**request_meta("openai", [{"role": "user", "content": "q"}], None, None), "_prompt": [{"role": "user", "content": "q"}]}
+        sampling = {"_meta": meta}
+        for _ in range(3):
+            list(self.svc.run(self.svc.tok.encode("q"), False, None, 3, sampling, threading.Event()))
+        items = self.get("/metrics/requests")[1]["items"]
+        self.assertEqual(len(items), 3)
+        self.assertEqual(sorted(bool(r.get("prompt_kept")) for r in items), [False, False, True])
+        kept = [r for r in items if r.get("prompt_kept")][0]
+        self.assertEqual(kept["id"], meta["id"])                                   # the request's own row, not round -2 or -3
+
     def test_keep_needs_a_sane_number_and_the_key(self):
         self.assertEqual(self.post_keep({"next": -1})[0], 400)
         self.assertEqual(self.post_keep({"next": 1000})[0], 400)

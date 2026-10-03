@@ -237,5 +237,17 @@ class WithTheChat(Fixture):
         self.assertEqual(cm.exception.code, 403)
 
 
+class SessionNames(Base):
+    def test_a_session_name_cannot_reach_outside_the_store(self):
+        # security review of PR #104: "..", "." or a drive name joined onto the store would let forget() delete elsewhere
+        keep = self.base / "keep.txt"
+        keep.write_text("x", encoding="utf-8")
+        (self.base / "cp").mkdir(exist_ok=True)
+        for name in ("..", ".", "C:", "a..b", "x:y"):
+            self.assertIsNone(self.store._dir(name), name)
+            self.store.forget(name)
+        self.assertTrue(keep.exists())
+        self.assertIsNotNone(self.store._dir("chat-1_A"))
+
 if __name__ == "__main__":
     unittest.main()

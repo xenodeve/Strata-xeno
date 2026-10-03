@@ -51,8 +51,9 @@ def prompt_for_keep(messages) -> list:
     for m in messages or []:
         c = m.get("content") if isinstance(m, dict) else None
         if isinstance(c, list):
-            c = [{**p, "image_url": {"url": "[image omitted]"}} if isinstance(p, dict) and p.get("type") == "image_url" else p
-                 for p in c]
+            c = [{**p, "image_url": {"url": "[image omitted]"}} if isinstance(p, dict) and p.get("type") == "image_url"
+                 else {**p, "source": "[image omitted]"} if isinstance(p, dict) and p.get("type") == "image"   # the Anthropic dialect, converted
+                 else p for p in c]
             m = {**m, "content": c}
         out.append(m)
     return out
