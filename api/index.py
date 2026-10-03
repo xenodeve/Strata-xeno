@@ -22,13 +22,14 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
 ROOT = Path(__file__).resolve().parents[1]
-SANDBOX = Path(tempfile.gettempdir()) / "strata-demo-work"
+WORK = Path(tempfile.gettempdir()) / "strata-demo-work"
+SANDBOX = WORK / "demo-project"                 # the one folder the demo's coding tools work in
 HOME = Path(tempfile.gettempdir()) / "strata-demo-home"
 MAX_BODY = 256 * 1024
 MAX_CHATS = 6
@@ -138,7 +139,12 @@ async def front(full: str, request: Request):
     query = request.url.query
     p = path.rstrip("/")
     if method == "GET" and p == "/agent/folders":              # the folder picker: the one folder there is, whatever was asked
-        return Response(json.dumps({"ok": True, "path": str(SANDBOX), "parent": None, "dirs": [], "truncated": False}), media_type="application/json")
+        _backend()
+        asked = parse_qs(query).get("path", [""])[0].replace("\\", "/").rstrip("/")
+        inside = asked == str(SANDBOX).replace("\\", "/")
+        seen = ({"ok": True, "path": str(SANDBOX), "parent": str(WORK), "dirs": [], "truncated": False} if inside else
+                {"ok": True, "path": str(WORK), "parent": None, "dirs": [{"name": SANDBOX.name, "path": str(SANDBOX)}], "truncated": False})
+        return Response(json.dumps(seen), media_type="application/json")
     if method == "GET" and p in FOLDER_VIEWS:
         _backend()
         q = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True) if k not in ("path", "dirs")]
