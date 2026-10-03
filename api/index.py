@@ -19,6 +19,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import uuid
 import threading
 import time
 from pathlib import Path
@@ -46,6 +47,7 @@ SITE_HOSTS = {h.strip().lower() for h in os.environ.get("DEMO_SITE_HOSTS", "stra
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "host", "content-length",
        "accept-encoding"}
 
+INSTANCE = uuid.uuid4().hex[:8]                # which copy of the function answered (the demo's chat state lives in one copy)
 _lock = threading.Lock()
 _port: int | None = None
 _chats = threading.Semaphore(MAX_CHATS)
@@ -126,6 +128,8 @@ async def front(full: str, request: Request):
     if path == "/next":                        # the site's rewrite can drop the trailing slash, and the server's redirect to "next/" is relative: serve the page itself
         path = "/next/"
     method = request.method
+    if path == "/__instance":
+        return Response(INSTANCE, media_type="text/plain", headers={"Cache-Control": "no-store"})
     if method == "OPTIONS":
         return Response(status_code=204, headers={"Allow": "GET, HEAD, POST"})
     if not _allowed(method, path):
@@ -178,6 +182,7 @@ async def front(full: str, request: Request):
     out = {k: v for k, v in resp.getheaders() if k.lower() not in HOP | {"x-frame-options", "content-security-policy", "content-encoding"}}
     out["Content-Security-Policy"] = "frame-ancestors 'self'"
     out["X-Robots-Tag"] = "noindex"
+    out["X-Demo-Instance"] = INSTANCE
 
     def chunks():
         try:
