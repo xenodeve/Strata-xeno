@@ -95,6 +95,7 @@ public:
     /// #113: the split runs per layer; `full` = every layer on MMQ (the wave needs that), `one_card` = the layers a
     /// split chunk keeps on this card.  Valid once the expert layout is loaded (the MMQ plan reads it, once).
     static bool split_layout_full();
+    static bool split_wave_ok();   // #115: the wave may run on this pack's split
     static std::vector<int> split_one_card_layers();
     static double pinned_share();
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule

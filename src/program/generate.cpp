@@ -2734,8 +2734,8 @@ int main(int argc, char** argv) {
                      o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
                      strata::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0);
     }
-    // #113: the expert split runs per layer (a layer not on MMQ runs a split chunk on CUDA0), and the wave needs every
-    // layer split: without that its two lanes both streamed every expert on CUDA0 (#112).  The MMQ plan reads the
+    // #113: the expert split runs per layer (a layer not on MMQ runs a split chunk on CUDA0), and the wave needs the
+    // split (#115: a partial one is enough): without it its two lanes both streamed every expert on CUDA0 (#112).  The MMQ plan reads the
     // expert layout (expert_layout_load, above) and is cached on its first call, so nothing may ask for it earlier.
     if (o.exclusive_secondary && split_env) {
         const std::vector<int> here = strata::prefill::Prefill::split_one_card_layers();
@@ -2751,9 +2751,9 @@ int main(int argc, char** argv) {
                                  "CUDA0; the other %zu run their routed experts on the peer card\n",
                          ls.c_str(), layers - here.size());
         }
-        if (g_prefill_wave && !strata::prefill::Prefill::split_layout_full()) {
+        if (g_prefill_wave && !strata::prefill::Prefill::split_wave_ok()) {
             g_prefill_wave = false;
-            std::fprintf(stderr, "strata generate: STRATA_PREFILL_WAVE is off: the wave needs every layer split\n");
+            std::fprintf(stderr, "strata generate: STRATA_PREFILL_WAVE is off: the wave needs the expert split\n");
         }
     }
     // Plan v0.3 P1: tensors served in native form are not also loaded in canonical form (~2.7 GB of VRAM back

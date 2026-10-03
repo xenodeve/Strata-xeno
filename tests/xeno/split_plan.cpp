@@ -32,6 +32,12 @@ int main() {
     p = split_plan(true, {});
     expect(!p.usable && !p.full, "no layers: not usable");
 
+    // #115: the wave runs wherever the split can run - a one-card layer publishes its hand-off itself
+    expect(strata::prefill::wave_ok(split_plan(true, all)), "every layer on MMQ: the wave may run");
+    expect(strata::prefill::wave_ok(split_plan(true, swift)), "three IQ1_M layers: the wave may run");
+    expect(!strata::prefill::wave_ok(split_plan(true, std::vector<char>(48, 0))), "no MMQ layer: no wave");
+    expect(!strata::prefill::wave_ok(split_plan(false, all)), "not a native pack: no wave");
+
     if (bad == 0) std::printf("split_plan: all cases pass\n");
     return bad == 0 ? 0 : 1;
 }

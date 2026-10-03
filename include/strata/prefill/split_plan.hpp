@@ -11,11 +11,15 @@ namespace strata::prefill {
 
 struct SplitPlan {
     bool usable = false;           // a native pack with at least one MMQ layer: the split can run
-    bool full = false;             // every layer is on MMQ: the one-card buffers may stay short-chunk sized, the wave may run
+    bool full = false;             // every layer is on MMQ: the one-card buffers may stay short-chunk sized
     std::vector<int> one_card;     // the layers that stay on CUDA0 (ascending)
 };
 
 /// `native`: the experts come from a native pack; `mmq_layer[l]`: layer l's experts are on MMQ.
 SplitPlan split_plan(bool native, const std::vector<char>& mmq_layer);
+
+/// #115: the wave (two lanes overlapping the cards) may run on this plan: wherever the split can run, since a
+/// one-card layer of a split chunk publishes its own hand-off to the other lane.
+bool wave_ok(const SplitPlan& p);
 
 }  // namespace strata::prefill

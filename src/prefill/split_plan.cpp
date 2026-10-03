@@ -14,4 +14,6 @@ SplitPlan split_plan(bool native, const std::vector<char>& mmq_layer) {
     return p;
 }
 
+bool wave_ok(const SplitPlan& p) { return p.usable; }
+
 }  // namespace strata::prefill

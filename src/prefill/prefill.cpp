@@ -1798,6 +1798,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_split_layout(bool on) { g_split_layout = on; }
 bool Prefill::split_layout_full() { return strata::prefill::split_layout_full(); }
+bool Prefill::split_wave_ok() { return wave_ok(the_split_plan()); }
 std::vector<int> Prefill::split_one_card_layers() { return the_split_plan().one_card; }
 void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
 double Prefill::pinned_share() { return g_pinned_share; }
@@ -3391,8 +3392,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
                 }
                 // #35 D7: chunk c+1 may start layer l - in a split layer only once this chunk's MoE is handed to the
-                // 4070 (split_experts), or its trunk occupies this card and delays that hand-off (tlS: 37 ms a layer)
-                if (wave && half == 0 && !split_on) wave->publish_attn(chunk_i, l, m.cs);
+                // 4070 (split_experts), or its trunk occupies this card and delays that hand-off (tlS: 37 ms a layer).
+                // #115: a layer of a split chunk that stays on this card (not on MMQ) publishes here
+                if (wave && half == 0 && !(split_on && split_layer(l))) wave->publish_attn(chunk_i, l, m.cs);
                 if (half == 1 && strata::kernels::cvec().covers(l))   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
