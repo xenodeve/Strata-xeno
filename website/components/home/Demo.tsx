@@ -113,7 +113,7 @@ export function Demo() {
                 <span />
                 <span />
                 <span />
-                <em className="mono">{where ? where.host : "demo"}/next/ · demo</em>
+                <em className="mono">{where ? where.host : "demo"}/demo/next/</em>
               </div>
               <div ref={stage} className="demo__stage">
                 {up === "up" && (

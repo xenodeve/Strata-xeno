@@ -5,7 +5,7 @@ on a loopback port inside the function, and passes requests to it. What the demo
 hardware page shows the cloud machine the function runs on, and the history lives in the function's temp folder (it goes when the instance does).
 
 This file is a public front door to a server that was written for one person's PC, so it is a short allowlist, not a pass-through:
-  - GET only the app's own files and the read-only status pages; never the pages that list folders, files, git or notes of the machine.
+  - GET only the app's own files and the read-only status pages. The folder picker, git and @file pages answer for the demo's temp folder only; notes are never served.
   - POST only the chat and the answers to its permission / question / steer / cancel cards; never a setting, a load or a rewind.
   - The chat request's working folder is replaced with a temp folder of this file's own, whatever the page sent.
 """
@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
@@ -35,7 +36,12 @@ MAX_CHATS = 6
 GET_EXACT = {"", "/", "/next", "/health", "/api/health", "/status", "/props", "/v1/models", "/v1/status", "/metrics", "/metrics/requests",
              "/settings", "/agent", "/agent/run", "/agent/helpers", "/agent/hooks", "/agent/web", "/mcp", "/mcp/config", "/import"}
 GET_PREFIX = ("/next/", "/assets/", "/fonts/", "/metrics/requests/")
+# pages that look at "the project's folder": allowed, but only ever at the demo's own temp folder (the query's path is replaced, other folders dropped)
+FOLDER_VIEWS = {"/agent/git", "/agent/git/diff", "/agent/files", "/agent/mention"}
 POST_EXACT = {"/v1/chat/completions", "/agent/steer", "/agent/cancel", "/agent/question", "/agent/permission"}
+# The server's own guard lets the coding tools be used only from "its own page" (the Origin must be its own host). Behind this front door the page's origin is
+# the site (or this function's own address), so for those origins, and only those, the Origin is rewritten to the server's loopback address.
+SITE_HOSTS = {h.strip().lower() for h in os.environ.get("DEMO_SITE_HOSTS", "strata-xeno-website.vercel.app,strata-xeno.vercel.app").split(",") if h.strip()}
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "host", "content-length",
        "accept-encoding"}
 
@@ -88,7 +94,7 @@ def _allowed(method: str, path: str) -> bool:
         return False
     p = path.rstrip("/") if path != "/" else path
     if method in ("GET", "HEAD"):
-        return p in GET_EXACT or path.startswith(GET_PREFIX)
+        return p in GET_EXACT or p in FOLDER_VIEWS or p == "/agent/folders" or path.startswith(GET_PREFIX)
     if method == "POST":
         return p in POST_EXACT
     return False
@@ -130,6 +136,13 @@ async def front(full: str, request: Request):
             return Response(json.dumps({"error": {"message": "too large for the demo"}}), status_code=413, media_type="application/json")
         body = _sandboxed(body, path)
     query = request.url.query
+    p = path.rstrip("/")
+    if method == "GET" and p == "/agent/folders":              # the folder picker: the one folder there is, whatever was asked
+        return Response(json.dumps({"ok": True, "path": str(SANDBOX), "parent": None, "dirs": [], "truncated": False}), media_type="application/json")
+    if method == "GET" and p in FOLDER_VIEWS:
+        _backend()
+        q = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True) if k not in ("path", "dirs")]
+        query = urlencode([("path", str(SANDBOX)), *q])
     target = path + ("?" + query if query else "")
     chat = path.rstrip("/") == "/v1/chat/completions"
     if chat and not _chats.acquire(blocking=False):
@@ -140,6 +153,14 @@ async def front(full: str, request: Request):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP}
         headers["Host"] = f"127.0.0.1:{port}"
+        origin = request.headers.get("origin")
+        if origin and urlsplit(origin).netloc.lower() in SITE_HOSTS | {request.headers.get("host", "").lower()}:
+            headers.pop("origin", None)
+            headers["Origin"] = f"http://127.0.0.1:{port}"
+        referer = request.headers.get("referer")
+        if referer and urlsplit(referer).netloc.lower() in SITE_HOSTS | {request.headers.get("host", "").lower()}:
+            headers.pop("referer", None)
+            headers["Referer"] = f"http://127.0.0.1:{port}/next/"
         if method == "POST":
             headers["Content-Length"] = str(len(body))
         conn.request(method, target, body=body or None, headers=headers)
