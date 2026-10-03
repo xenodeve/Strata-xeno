@@ -38,6 +38,27 @@ int main() {
     expect(!strata::prefill::wave_ok(split_plan(true, std::vector<char>(48, 0))), "no MMQ layer: no wave");
     expect(!strata::prefill::wave_ok(split_plan(false, all)), "not a native pack: no wave");
 
+    // #119: the split's chunk floor - opt-in, the old constant otherwise
+    using strata::prefill::split_min_from;
+    expect(split_min_from(nullptr) == 2048, "unset: 2048, as before");
+    expect(split_min_from("1024") == 1024, "1024: the split from 1,024-token chunks");
+    expect(split_min_from("512") == 512, "512");
+    expect(split_min_from("abc") == 2048 && split_min_from("") == 2048, "not a number: 2048");
+    expect(split_min_from("100") == 2048 && split_min_from("99999999") == 2048, "out of 256-65536: 2048");
+    expect(split_min_from("256") == 256 && split_min_from("2048") == 2048, "the bounds are inclusive");
+    // scrutiny of 7673c02: above 2048 nothing was measured, and a floor above the wave's lane makes both lanes run
+    // unsplit (the slow pattern of tl119-*.json) while a SplitTier sits unused on the 4070
+    expect(split_min_from("255") == 2048 && split_min_from("4096") == 2048 && split_min_from("65536") == 2048,
+           "outside 256-2048: 2048");
+    expect(split_min_from("512x") == 2048 && split_min_from("-512") == 2048, "trailing garbage or negative: 2048");
+
+    // #119: the wave keeps its 2048-token lanes when the split's floor is lowered (lanes of ~1K were 5.1-5.6 s against
+    // 3.2 s on one lane for 1,768-2,248-token parts)
+    using strata::prefill::wave_lane_ok;
+    expect(wave_lane_ok(2048, 2048) && wave_lane_ok(4096, 1024), "lanes of 2048+: wave, as before");
+    expect(!wave_lane_ok(1024, 1024), "floor 1024, lanes of 1024: no wave (one lane runs split)");
+    expect(!wave_lane_ok(1024, 512) && !wave_lane_ok(1500, 2048), "lanes below 2048: no wave");
+
     if (bad == 0) std::printf("split_plan: all cases pass\n");
     return bad == 0 ? 0 : 1;
 }

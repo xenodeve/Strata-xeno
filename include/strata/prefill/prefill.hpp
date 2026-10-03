@@ -88,7 +88,8 @@ public:
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
-    /// #35 D6: the split layout (STRATA_PREFILL_EXPERT_SPLIT with the peer tier): a chunk of STREAM_ALL_MIN tokens or
+    /// #35 D6: the split layout (STRATA_PREFILL_EXPERT_SPLIT with the peer tier): a chunk of split_min() tokens (#119:
+    /// STRATA_PREFILL_SPLIT_MIN, default 2048) or
     /// more runs its routed experts on the peer card, so the one-card MoE buffers (expert rows, MMQ scratch, stream
     /// ring) are sized only for the shorter chunks that still run here.  Set before bytes_needed and init.
     static void set_split_layout(bool on);

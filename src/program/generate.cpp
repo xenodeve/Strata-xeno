@@ -58,6 +58,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/split_plan.hpp"
 #include "strata/timeline.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -2750,6 +2751,16 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: expert split: layers %s are not on MMQ and run a split chunk on "
                                  "CUDA0; the other %zu run their routed experts on the peer card\n",
                          ls.c_str(), layers - here.size());
+        }
+        // #119: name the split's chunk floor when it is set, and a value that does not apply
+        if (const char* sv = std::getenv("STRATA_PREFILL_SPLIT_MIN"); sv != nullptr) {
+            const int64_t fl = strata::prefill::split_min_from(sv);
+            if (fl == strata::prefill::kSplitMinDefault && std::strcmp(sv, "2048") != 0)
+                std::fprintf(stderr, "strata generate: STRATA_PREFILL_SPLIT_MIN=%s is not 256-2048: the split runs from "
+                                     "%lld-token chunks\n", sv, (long long) fl);
+            else
+                std::fprintf(stderr, "strata generate: the split runs from %lld-token chunks (STRATA_PREFILL_SPLIT_MIN)\n",
+                             (long long) fl);
         }
         if (g_prefill_wave && !strata::prefill::Prefill::split_wave_ok()) {
             g_prefill_wave = false;
