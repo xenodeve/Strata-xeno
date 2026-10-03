@@ -1886,11 +1886,12 @@ namespace {
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfWaitHost, kPfCount };
+               kPfWaitHost, kPfSplitHand, kPfWait4070, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "wait host"};
+                                        "gdn recurrence", "gdn out proj", "wait host",
+                                        "split hand-off", "wait 4070"};   // #118: a split layer's CUDA0 side
 // "wait host" (#31): marked after the last kernel an expert enqueues, so the time until the next expert's work reaches
 // the stream is the GPU idle while the launching thread is elsewhere (a stager or issuer wait, a copy issue); it used
 // to land on "dequant", the phase before it.
@@ -3008,6 +3009,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 timeline::Span qs("split: quantize enqueue", l);
                                 mmq::quantize(m.mixed, nullptr, m.Xtok, mmq_gt, N, N, T, m.cs);
                             }
+                            if (split_l) pt.mark(kPfSplitHand, cs);   // #118: the host hands this layer to the 4070
                             if (split_l && !split_experts(m, l, T, unit, chunk_i, order_4070, mmq_gt, mmq_dt, mmq_gub, mmq_db, err))
                                 return false;
                             // the layer's rows per expert (absolute), then each group's sub-products: at most mmq_rows
@@ -3349,6 +3351,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfCombine, cs);
                     if (split_l) {
                         if (!shared_expert()) return false;   // while the 4070 runs the routed experts
+                        pt.mark(kPfWait4070, cs);   // #118: from here until bo is back, CUDA0 waits for the 4070
                         if (!split_output_up(m, l, T, err)) return false;
                         cudaStreamWaitEvent(m.cs, m.split->ev_done, 0);   // same card: the 4070's routed sum is in bo
                         moe_shared_finish(m.shared, m.sg, m.bo, T, m.cs);
