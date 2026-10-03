@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::prefill {
 
@@ -91,6 +92,10 @@ public:
     /// more runs its routed experts on the peer card, so the one-card MoE buffers (expert rows, MMQ scratch, stream
     /// ring) are sized only for the shorter chunks that still run here.  Set before bytes_needed and init.
     static void set_split_layout(bool on);
+    /// #113: the split runs per layer; `full` = every layer on MMQ (the wave needs that), `one_card` = the layers a
+    /// split chunk keeps on this card.  Valid once the expert layout is loaded (the MMQ plan reads it, once).
+    static bool split_layout_full();
+    static std::vector<int> split_one_card_layers();
     static double pinned_share();
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.

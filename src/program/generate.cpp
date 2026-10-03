@@ -2734,6 +2734,28 @@ int main(int argc, char** argv) {
                      o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
                      strata::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0);
     }
+    // #113: the expert split runs per layer (a layer not on MMQ runs a split chunk on CUDA0), and the wave needs every
+    // layer split: without that its two lanes both streamed every expert on CUDA0 (#112).  Decided here, once the
+    // pack has set the expert layout that the MMQ plan reads.
+    if (o.exclusive_secondary && split_env) {
+        const std::vector<int> here = strata::prefill::Prefill::split_one_card_layers();
+        const size_t layers = strata::kernels::cpu::expert_layout().fmt.size();
+        if (here.empty() && !strata::prefill::Prefill::split_layout_full()) {
+            std::fprintf(stderr, "strata generate: expert split: not a native pack, so it cannot run\n");
+        } else if (!here.empty() && here.size() >= layers) {
+            std::fprintf(stderr, "strata generate: expert split: no layer is on MMQ, so it cannot run\n");
+        } else if (!here.empty()) {
+            std::string ls;
+            for (int l : here) ls += (ls.empty() ? "" : ", ") + std::to_string(l);
+            std::fprintf(stderr, "strata generate: expert split: layers %s are not on MMQ and run a split chunk on "
+                                 "CUDA0; the other %zu run their routed experts on the peer card\n",
+                         ls.c_str(), layers - here.size());
+        }
+        if (g_prefill_wave && !strata::prefill::Prefill::split_layout_full()) {
+            g_prefill_wave = false;
+            std::fprintf(stderr, "strata generate: STRATA_PREFILL_WAVE is off: the wave needs every layer split\n");
+        }
+    }
     // Plan v0.3 P1: tensors served in native form are not also loaded in canonical form (~2.7 GB of VRAM back
     // to the expert cache with --native).  `--keep-canonical` loads both, as before.
     std::set<std::string> skip;
