@@ -1,0 +1,13 @@
+# The live demo (api/index.py) needs serve/ only; the rest of the repo stays out of that deployment.
+.git
+/bench
+/data
+/docs
+/src
+/include
+/tests
+/tools
+third_party
+/cmake
+/ref
+/website
