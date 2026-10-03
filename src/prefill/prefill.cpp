@@ -29,6 +29,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/frontier.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/prefill/split_plan.hpp"
 #include "strata/timeline.hpp"
 #include "strata/timeline_gpu.hpp"
 
@@ -286,9 +287,12 @@ inline bool gr_unfused() {
 }
 // #35 D6: the tokens the one-card MoE buffers hold: every chunk, or in the split layout only the chunks below
 // STREAM_ALL_MIN (a bigger one runs its routed experts on the peer card and never touches them)
-bool split_layout_usable();   // below: the split's static conditions (a native pack, every layer on MMQ)
+bool split_layout_usable();   // below: the split's static conditions (a native pack, a layer on MMQ)
+bool split_layout_full();     // ... and every layer on MMQ (#113)
+bool split_layer(int64_t l);  // layer l's routed experts run on the peer card in a split chunk (#113)
+// #113: a layer that is not on MMQ runs a split chunk on this card, so the one-card buffers then hold the chunk
 inline size_t moe_cap(size_t T) {
-    return g_split_layout && split_layout_usable() ? std::min(T, (size_t) STREAM_ALL_MIN - 1) : T;
+    return g_split_layout && split_layout_full() ? std::min(T, (size_t) STREAM_ALL_MIN - 1) : T;
 }
 
 
@@ -1333,13 +1337,16 @@ const MmqPlan& mmq_plan() {
     }();
     return plan;
 }
-// #35 D6 (review): the split layout applies only where every big chunk can run split, or such a chunk has no
-// one-card buffers to fall back to
-bool split_layout_usable() {
-    const auto& lay = strata::kernels::cpu::expert_layout();
-    if (!lay.native || !mmq_plan().any) return false;
-    for (char c : mmq_plan().layer) if (!c) return false;
-    return true;
+// #35 D6 / #113: the split runs per layer - a layer on MMQ hands its routed experts to the peer card, a layer that
+// is not (IQ1_M: no MMQ tile) runs the chunk on this card.  Before #113 one such layer turned the whole split off.
+const SplitPlan& the_split_plan() {
+    static const SplitPlan p = split_plan(strata::kernels::cpu::expert_layout().native, mmq_plan().layer);
+    return p;
+}
+bool split_layout_usable() { return the_split_plan().usable; }
+bool split_layout_full() { return the_split_plan().full; }
+bool split_layer(int64_t l) {
+    return the_split_plan().usable && l >= 0 && (size_t) l < mmq_plan().layer.size() && mmq_plan().layer[(size_t) l];
 }
 // #136 P3: a layout whose chunks run the fused experts (STRATA_PF_FUSED=1, the Q2_0 pack, a streamed chunk of
 // stream_all_min() tokens or more).  `src`: the layout streams experts (Prefill::init got an ExpertSource; without one
@@ -1790,6 +1797,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
 }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_split_layout(bool on) { g_split_layout = on; }
+bool Prefill::split_layout_full() { return strata::prefill::split_layout_full(); }
+std::vector<int> Prefill::split_one_card_layers() { return the_split_plan().one_card; }
 void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
@@ -2154,7 +2163,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             m.split.reset();
             std::string se;
             size_t gub = 0, db = 0;
-            for (int64_t l = 0; l < g.n_layers; ++l) {   // every layer is on MMQ (split_layout_usable)
+            for (int64_t l = 0; l < g.n_layers; ++l) {   // the layers on MMQ (#113: only those run split)
+                if (!split_layer(l)) continue;
                 gub = std::max(gub, mmq::matrix_bytes(lay0.fmt[(size_t) l].gu_type, 1280, N));
                 db = std::max(db, mmq::matrix_bytes(lay0.fmt[(size_t) l].d_type, N, 640));
             }
@@ -2191,7 +2201,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 for (int32_t ei = 0; ei < m.g->n_expert; ++ei) {
                     const int32_t e = expert_at(l, ei, m.g->n_expert);   // #41 gate 2
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                    if (split_on) break;   // #32 S4: every routed expert of the layer runs on the 4070
+                    if (split_on && split_layer(l)) break;   // #32 S4: the layer's routed experts run on the 4070
                     const int32_t ps = m.peer_res ? m.peer_res[(size_t) l * m.g->n_expert + e] : -1;
                     // CS-T: a transient blob is copied by the source into the stager's buffer (not asked for here)
                     const bool transient = ps < 0 && m.src->transient(l, e);
@@ -2255,6 +2265,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 std::vector<Stager::Job>& js4 = sp.unit_jobs[(size_t) u];
                 for (int64_t l = 0; l < g.n_layers; ++l) {
                     sp.seq_start[(size_t) (u * (g.n_layers + 1) + l)] = sp.seq.size();
+                    if (!split_layer(l)) continue;   // #113: this layer runs here (an empty range there)
                     for (int32_t ei = 0; ei < m.g->n_expert; ++ei) {
                         const int32_t e = expert_at(l, ei, m.g->n_expert);   // #41 gate 2
                         if (m.peer_res[(size_t) l * m.g->n_expert + e] >= 0) continue;   // the 4070's own
@@ -2821,9 +2832,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
                         return true;
                     };
-                    if (!split_on && !shared_expert()) return false;
-                    // #32 S4: with expert_split, the 5060's experts' rows first and the 4070's (the peer tier's) after
-                    const bool split_l = split_on;   // a split chunk runs every layer's routed experts there
+                    // #32 S4 / #113: a split chunk runs a layer's routed experts on the 4070 when the layer is on MMQ
+                    const bool split_l = split_on && split_layer(l);
+                    if (!split_l && !shared_expert()) return false;
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
