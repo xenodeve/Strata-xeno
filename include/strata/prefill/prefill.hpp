@@ -63,6 +63,11 @@ public:
     Prefill(const Prefill&) = delete;
     Prefill& operator=(const Prefill&) = delete;
 
+    /// Frees every buffer, stream and event `init` made (as the destructor does) and starts over empty, so `init` can
+    /// run again - with a smaller chunk when the first one did not fit.  The stage range (`set_stage`) and the
+    /// callbacks stay.  The device `init` ran on must be current.
+    void reset();
+
     /// `host_res`: the static residency table (n_layers x n_expert, slot or -1) or null; `cache` its slots.
     /// `borrow`/`borrow_bytes`: device memory to carve every buffer from (the top slots of the expert cache,
     /// lent for the prompt and refilled after it); null = allocate normally.
@@ -87,6 +92,9 @@ public:
     /// ring) are sized only for the shorter chunks that still run here.  Set before bytes_needed and init.
     static void set_split_layout(bool on);
     static double pinned_share();
+    /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
+    /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
+    static void set_ring_override(int slots);
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
@@ -155,6 +163,7 @@ private:
     Prefill* next_ = nullptr;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+    void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;

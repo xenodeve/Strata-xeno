@@ -188,6 +188,7 @@ bool SecondaryRunner::set_graph(bool on, std::string& err) {
     graph_ = on;
     graph_exec_.assign((size_t) (max_tokens_ + 1) * (size_t) (max_entries_ + 1), nullptr);
     graph_k_.assign(graph_exec_.size(), 0);
+    graph_fmts_.clear();
     err.clear();
     return true;
 }
@@ -240,10 +241,14 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
                                  std::string& err) {
     if (stream_ == nullptr || pending_ || failed_ || x == nullptr || selected_slots == nullptr ||
         n_tokens <= 0 || n_tokens > max_tokens_ || k <= 0 || k > max_entries_ / n_tokens ||
-        layout.n_embd != n_embd_ || layout.n_ff != n_ff_ || layout.gu_type != 42 || layout.d_type != 42) {
+        layout.n_embd != n_embd_ || layout.n_ff != n_ff_ || !kernels::iq_supported(layout.gu_type) ||
+        !kernels::iq_supported(layout.d_type)) {
         err = "secondary runner: invalid launch geometry or pending work";
         return false;
     }
+    // #11: activations as the 5060's verify path quantizes them (verify.cpp): CPU-order rounding plus fp32 scales
+    // for a Q2_0 layer, plain q8_1 for any other, so a layer gives the same bytes on either card
+    const bool q2 = layout.gu_type == 42 && layout.d_type == 42;
     const auto launch_t0 = std::chrono::steady_clock::now();
     ptr_.clear(); start_.clear(); dst_.clear(); tok_.clear(); selected_rows_.clear(); group_slots_.clear();
     const int entries = n_tokens * k;
@@ -314,7 +319,17 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
     };
     if (graph_ && !profile_timing_) {
         const size_t rows = selected_rows_.size();
-        const size_t gi = (size_t) n_tokens * (size_t) (max_entries_ + 1) + rows;
+        // a captured graph bakes in the layer's formats: one table of graphs per (gate/up, down) pair
+        const int fmt_key = layout.gu_type << 8 | layout.d_type;
+        const size_t per = (size_t) (max_tokens_ + 1) * (size_t) (max_entries_ + 1);
+        size_t fi = 0;
+        while (fi < graph_fmts_.size() && graph_fmts_[fi] != fmt_key) ++fi;
+        if (fi == graph_fmts_.size()) {
+            graph_fmts_.push_back(fmt_key);
+            graph_exec_.resize((fi + 1) * per, nullptr);
+            graph_k_.resize(graph_exec_.size(), 0);
+        }
+        const size_t gi = fi * per + (size_t) n_tokens * (size_t) (max_entries_ + 1) + rows;
         void*& ge = graph_exec_[gi];
         if (ge != nullptr && graph_k_[gi] != k) {
             cudaGraphExecDestroy((cudaGraphExec_t) ge);
@@ -326,10 +341,11 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
             cudaMemcpyAsync(device_ptr_, host_meta_, meta_bytes_, cudaMemcpyHostToDevice, stream);
             cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float), cudaMemcpyHostToDevice,
                             stream);
-            kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
+            if (q2) kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
+            else kernels::quantize_q8_1_rows(device_x_, n_tokens, n_embd_, device_xq_, stream);
             kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
                                            entries, entries, device_xq_, device_scratch_, device_out_, stream,
-                                           device_scales_);
+                                           q2 ? device_scales_ : nullptr);
             cudaMemcpyAsync(host_out_, device_out_, rows * (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost,
                             stream);
             cudaGraph_t graph = nullptr;
@@ -364,11 +380,12 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
         !cuda_ok(cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float),
                                  cudaMemcpyHostToDevice, stream), "runner activation H2D", err) ||
         !mark(1) || !mark(2)) return fail_enqueued();   // no clear: the down kernel writes every claimed row
-    kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
+    if (q2) kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
+    else kernels::quantize_q8_1_rows(device_x_, n_tokens, n_embd_, device_xq_, stream);
     if (!mark(3)) return fail_enqueued();
     kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
                                    host_count_, (int) dst_.size(), device_xq_, device_scratch_, device_out_, stream,
-                                   device_scales_);
+                                   q2 ? device_scales_ : nullptr);
     if (!mark(4)) return fail_enqueued();
     const size_t full_d2h_bytes = (size_t) entries * n_embd_ * sizeof(float);
     const size_t requested_d2h_bytes = selected_rows_.size() * (size_t) n_embd_ * sizeof(float);

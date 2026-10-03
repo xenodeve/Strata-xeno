@@ -16,6 +16,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
@@ -98,6 +99,40 @@ class MaxTokens(unittest.TestCase):
                 del self.engine.info
             else:
                 self.engine.info = previous
+
+    def test_anthropic_thinks_only_when_asked(self):
+        # #278: Anthropic's thinking is opt-in; "thinking", an effort or a reasoning_budget_tokens (#123) asks for it
+        from serve.frontend import anthropic_to_messages
+        msgs = [{"role": "user", "content": "u"}]
+        kw = lambda **r: anthropic_to_messages({"messages": msgs, **r}, think_unasked=False)[2]   # noqa: E731
+        # the default ("anthropic_thinking": "model") renders an unasked request as 0.1.31 did
+        self.assertNotIn("enable_thinking", anthropic_to_messages({"messages": msgs})[2])
+        self.assertEqual(kw(), {"enable_thinking": False})
+        self.assertEqual(kw(thinking={"type": "disabled"}), {"enable_thinking": False})
+        self.assertNotIn("enable_thinking", kw(thinking={"type": "enabled", "budget_tokens": 2048}))
+        self.assertNotIn("enable_thinking", kw(output_config={"effort": "high"}))
+        self.assertNotIn("enable_thinking", kw(reasoning_budget_tokens=30))
+
+    def test_count_tokens_is_the_prompt_messages_reads(self):
+        # /v1/messages/count_tokens renders and tokenizes the same prompt /v1/messages would read, without running it.
+        # Merge of 0.1.34 (xeno): the fork renders a non-streamed request without tools as a side request at the low
+        # effort (#49 S3, serve/think_budget.py), which the count does not predict - it counts the main turn's prompt
+        # (tests/xeno/test_count_tokens.py) - so side requests are off here: the same request, the same prompt.
+        msgs = [{"role": "user", "content": "how many tokens is this?"}]
+        with mock.patch.dict(os.environ, {"STRATA_SIDE_BUDGET": "0"}):
+            s, b = self.post("/v1/messages/count_tokens", {"model": "m", "messages": msgs})
+            self.assertEqual(s, 200)
+            s2, _, n_in, _ = self.call("anthropic", "how many tokens is this?", max_tokens=8)
+        self.assertEqual(s2, 200)
+        self.assertEqual(b["input_tokens"], n_in)
+
+    def test_request_line_parses_the_engine_summary(self):
+        line = ("strata serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
+                "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
+        from serve.server import ENGINE_REQUEST
+        m = ENGINE_REQUEST.search(line)
+        self.assertIsNotNone(m)
+        self.assertEqual((m["prompt"], m["reused"], m["gen"], m["tg"]), ("1200", "1000", "30", "100.0"))
 
     def test_unset_budget_is_the_rest_of_the_context(self):
         cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
@@ -286,6 +321,115 @@ class ToolCallTerminators(unittest.TestCase):
                         self.assertEqual(json.loads(streamed), {"path": "doc.md", "content": self.CONTENT})
 
 
+class UnfinishedToolCall(unittest.TestCase):
+    """#211: a call the output ends inside is not reported as a whole one - its streamed JSON is not closed and the
+    finish reason is not "tool_calls" / "tool_use" - so a client can tell it from a call to run."""
+    CALL = ("</think>\n\n<tool_call>\n<function=write>\n<parameter=path>\nnotes.txt\n</parameter>\n"
+            "<parameter=content>\n")
+    CUT = CALL + "first half of the fi"                            # the model's turn ends here
+    WHOLE = CALL + "all of it\n</parameter>\n</function>\n</tool_call>"
+    PROPS = {"path": {"type": "string"}, "content": {"type": "string"}}
+
+    def test_parser(self):
+        from serve.frontend import OutputParser
+        schema = [{"name": "write", "parameters": {"properties": self.PROPS}}]
+        for text, content in ((self.CUT, None), (self.WHOLE, "all of it"),
+                              (self.WHOLE[:-len("</tool_call>")], "all of it")):   # only </tool_call> missing: whole
+            for step in (1, 7, 10_000):
+                with self.subTest(end=text[-12:], step=step):
+                    p = OutputParser(thinking=True, tools=schema, stream_tools=True)
+                    evs = []
+                    for i in range(0, len(text), step):
+                        evs += p.feed(text[i:i + step])
+                    evs += p.finish()
+                    streamed = "".join(e.text for e in evs if e.kind == "tool_args")
+                    calls = [e for e in evs if e.kind == "tool_call"]
+                    if content is None:
+                        self.assertEqual((calls, streamed), ([], '{"path":"notes.txt","content":"first half of the fi'))
+                    else:
+                        self.assertEqual(len(calls), 1)
+                        self.assertEqual(json.loads(streamed), {"path": "notes.txt", "content": content})
+
+    def answers(self, script, max_tokens=500):
+        """(finish reason, the call's arguments) from OpenAI and Anthropic, whole and streamed, for the model's `script`."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        tools = {"openai": [{"type": "function", "function": {"name": "write", "parameters": {
+                     "type": "object", "properties": self.PROPS}}}],
+                 "anthropic": [{"name": "write", "input_schema": {"type": "object", "properties": self.PROPS}}]}
+        out = {}
+        try:
+            for api, path in (("openai", "/v1/chat/completions"), ("anthropic", "/v1/messages")):
+                for stream in (False, True):
+                    body = {"model": "x", "max_tokens": max_tokens, "stream": stream, "tools": tools[api],
+                            "messages": [{"role": "user", "content": "save my notes"}]}
+                    req = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={
+                        "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        raw = r.read().decode()
+                    if stream:
+                        evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+                        if api == "openai":
+                            out[api, stream] = (evs[-1]["choices"][0]["finish_reason"], "".join(
+                                (tc.get("function") or {}).get("arguments") or "" for e in evs
+                                for tc in e["choices"][0]["delta"].get("tool_calls") or []))
+                        else:
+                            out[api, stream] = (evs[-2]["delta"]["stop_reason"], "".join(
+                                e["delta"]["partial_json"] for e in evs if e["type"] == "content_block_delta"
+                                and e["delta"]["type"] == "input_json_delta"))
+                    elif api == "openai":
+                        c = json.loads(raw)["choices"][0]
+                        out[api, stream] = (c["finish_reason"], [tc["function"]["arguments"]
+                                                                 for tc in c["message"].get("tool_calls") or []])
+                    else:
+                        m = json.loads(raw)
+                        out[api, stream] = (m["stop_reason"], [b["input"] for b in m["content"] if b["type"] == "tool_use"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        return out
+
+    def test_a_cut_call(self):
+        cut = '{"path":"notes.txt","content":"first half of the fi'
+        self.assertEqual(self.answers(self.CUT), {
+            ("openai", False): ("stop", []), ("openai", True): ("stop", cut),    # whole answers leave the cut
+            ("anthropic", False): ("end_turn", []),                      # call out: it has no arguments to give
+            ("anthropic", True): ("end_turn", cut)})
+
+    def test_a_call_cut_at_the_token_limit(self):
+        """The same cut by max_tokens: "length" / "max_tokens", and the whole (non-streamed) answers leave the call
+        out in both APIs."""
+        a = self.answers(self.CUT + "rest of the file, never reached" * 40, max_tokens=len(self.CUT))
+        self.assertEqual((a["openai", False], a["anthropic", False]), (("length", []), ("max_tokens", [])))
+        self.assertEqual((a["openai", True][0], a["anthropic", True][0]), ("length", "max_tokens"))
+
+    def test_collect_keeps_calls_whose_arguments_parse(self):
+        from serve.server import openai_collect
+
+        def chunk(delta, finish=None):
+            return {"id": "c", "created": 1, "model": "m", "usage": {},
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        whole = {"index": 0, "id": "a", "type": "function", "function": {"name": "f", "arguments": '{"x": 1}'}}
+        cut = {"index": 1, "id": "b", "type": "function", "function": {"name": "g", "arguments": '{"y": "ha'}}
+        for finish, want in (("stop", ["a"]), ("length", ["a"]), ("tool_calls", ["a", "b"])):
+            with self.subTest(finish=finish):
+                msg = openai_collect([chunk({"tool_calls": [whole]}), chunk({"tool_calls": [cut]}),
+                                      chunk({}, finish)])["choices"][0]["message"]
+                self.assertEqual([c["id"] for c in msg["tool_calls"]], want)
+        msg = openai_collect([chunk({"tool_calls": [cut]}), chunk({}, "stop")])["choices"][0]["message"]
+        self.assertNotIn("tool_calls", msg)
+
+    def test_a_whole_call(self):
+        whole = {"path": "notes.txt", "content": "all of it"}
+        a = self.answers(self.WHOLE)
+        self.assertEqual((a["openai", False][0], [json.loads(x) for x in a["openai", False][1]]), ("tool_calls", [whole]))
+        self.assertEqual((a["openai", True][0], json.loads(a["openai", True][1])), ("tool_calls", whole))
+        self.assertEqual(a["anthropic", False], ("tool_use", [whole]))
+        self.assertEqual((a["anthropic", True][0], json.loads(a["anthropic", True][1])), ("tool_use", whole))
+
+
 class ClientShapes(unittest.TestCase):
     """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the
     conversation as a mid-conversation system message (issue #56); some OpenAI clients send a late developer message."""
@@ -349,6 +493,43 @@ class ClientShapes(unittest.TestCase):
         for part in ("Be brief.", "Now use digits.", "Also this.", "1+1?"):
             self.assertIn(part, text)
 
+    def test_no_user_turn_is_a_400(self):
+        # #365: the template's own refusal (Qwen's "No user query found in messages." when no turn is a user's query)
+        # answers 400, not a dropped connection
+        with tempfile.TemporaryDirectory() as d:
+            tpl = Path(d) / "chat_template.jinja"
+            tpl.write_text("{% if messages[-1].role != 'user' %}{{ raise_exception('No user query found in messages.') }}"
+                           "{% endif %}{{ messages[-1].content }}", encoding="utf-8")
+            template, self.svc.template = self.svc.template, ChatTemplate(tpl)
+            try:
+                status, b = self.post("/v1/chat/completions", {
+                    "model": "x", "max_tokens": 20, "messages": [{"role": "system", "content": "Only a system."}]})
+                self.assertEqual(status, 400, b)
+                self.assertIn("No user query found", b["error"]["message"])
+            finally:
+                self.svc.template = template
+        status, b = self.post("/v1/chat/completions", {"model": "x", "max_tokens": 20,
+                                                       "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200, b)                            # the server goes on
+
+    def test_vision_temp_image_removed_when_the_pipe_fails(self):
+        # #352: the temporary image goes even when the encoder's pipe raises
+        from serve.server import Vision
+
+        class Gone:
+            def write(self, _):
+                raise BrokenPipeError("the encoder is gone")
+
+        v = Vision.__new__(Vision)
+        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="strata-vision-test-")), threading.Lock(), {}
+        v.proc = mock.Mock(stdin=Gone())
+        with mock.patch.object(Vision, "load", return_value=b""), mock.patch.object(Vision, "normalize",
+                                                                                   return_value=b"png"):
+            with self.assertRaises(BrokenPipeError):
+                v.encode("x")
+        self.assertEqual(list(v.dir.iterdir()), [])
+        v.dir.rmdir()
+
     def test_leading_system_unchanged(self):
         from serve.frontend import anthropic_to_messages, openai_to_messages
         msgs, _, _ = openai_to_messages({"messages": [{"role": "developer", "content": "D"}, {"role": "user", "content": "u"}]})
@@ -396,6 +577,30 @@ class GpuChoice(unittest.TestCase):
         plain = child_env({})                     # no choice: the environment as it was (existing installs)
         self.assertEqual(plain.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
+
+    def test_vision_device(self):
+        # #408: the image encoder on its own card; the engine's environment stays as it was
+        from serve.server import child_env, vision_env
+        cfg = {"gpu": [0, 1], "vision": {"exe": "v", "cuda_device": 2}}
+        env = child_env(cfg)
+        venv = vision_env(cfg, env)
+        self.assertEqual(venv["CUDA_VISIBLE_DEVICES"], "2")
+        self.assertEqual(venv["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
+        plain = {"gpu": [0, 1], "vision": {"exe": "v"}}
+        self.assertIs(vision_env(plain, env), env)          # no cuda_device: the engine's environment, unchanged
+
+    def test_hip_ordinal(self):
+        """#325: on Windows the HIP ordinal setup resolved wins over the config's "gpu" (an iGPU takes HIP's 0)."""
+        from serve.server import child_env
+        self.assertEqual(child_env({"backend": "hip", "gpu": 1})["HIP_VISIBLE_DEVICES"], "1")       # Linux: KFD order
+        self.assertEqual(child_env({"backend": "hip", "hip_ordinal": 1})["HIP_VISIBLE_DEVICES"], "1")
+        self.assertEqual(child_env({"backend": "hip", "gpu": 0, "hip_ordinal": 1})["HIP_VISIBLE_DEVICES"], "1")
+        self.assertEqual(child_env({"backend": "hip", "gpu": [1, 0], "hip_ordinal": 2})["HIP_VISIBLE_DEVICES"],
+                         "1,0")                                          # a layer split keeps its list
+        self.assertEqual(child_env({"backend": "hip", "gpu": 0, "hip_ordinal": "x"})["HIP_VISIBLE_DEVICES"], "0")
+        plain = child_env({"backend": "hip"})
+        self.assertEqual(plain.get("HIP_VISIBLE_DEVICES"), os.environ.get("HIP_VISIBLE_DEVICES"))
 
 
 class RequestHistory(unittest.TestCase):
@@ -591,6 +796,59 @@ class DyingEngine(MockEngine):
                 self.dead = True
                 raise EngineDied("the engine stopped unexpectedly (exit code -9)")
             yield t
+
+
+class SlowPromptEngine(MockEngine):
+    """Reads a "long prompt" for up to 20 s without a token (the engine sends nothing then), stopping on cancel."""
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.cancelled_after = None
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 20:
+            if cancel.is_set():
+                self.cancelled_after = time.monotonic() - t0
+                return
+            time.sleep(0.05)
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class ClientHangUp(unittest.TestCase):
+    """#430 #431: a client that hangs up during a long prompt read cancels the request within about a second -
+    non-streamed (which writes nothing until the end) and streamed (one keep-alive per prompt chunk) alike."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = SlowPromptEngine(tok, "</think>\n\nOK", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.port = cls.httpd.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def hang_up(self, stream):
+        import socket as so
+        body = json.dumps({"model": "x", "max_tokens": 20, "stream": stream,
+                           "messages": [{"role": "user", "content": "a long prompt"}]}).encode()
+        c = so.create_connection(("127.0.0.1", self.port))
+        c.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        time.sleep(1.0)
+        c.close()
+        t0 = time.monotonic()
+        while self.engine.cancelled_after is None and time.monotonic() - t0 < 10:
+            time.sleep(0.05)
+        self.assertIsNotNone(self.engine.cancelled_after, "the request was not cancelled")
+        self.assertLess(self.engine.cancelled_after, 3.0)
+
+    def test_non_streamed(self):
+        self.hang_up(False)
+
+    def test_streamed(self):
+        self.hang_up(True)
 
 
 class EngineDeath(unittest.TestCase):
@@ -875,6 +1133,29 @@ class SharedSettings(unittest.TestCase):
         finally:
             self.svc.api_key = ""
 
+    def test_proxy_headers_do_not_make_a_page_strata_s_own(self):
+        # #321: X-Forwarded-*, CF-Ray or CF-Connecting-IP say nothing about the page that sent the request - any web
+        # page behind any proxy would otherwise change the settings (or run MCP tools)
+        for extra in ({"X-Forwarded-Host": "proxy.example.com"}, {"CF-Ray": "1234567890"},
+                      {"X-Forwarded-For": "203.0.113.9"}, {"CF-Connecting-IP": "203.0.113.9"}):
+            code, _ = self.req("/settings", {"defaults": {"temperature": 1}},
+                               {"Origin": "https://proxy.example.com", **extra})
+            self.assertEqual(code, 403, extra)
+        # another port on the same host is another site (a local dev server's page)
+        code, _ = self.req("/settings", {"defaults": {"temperature": 1}}, {"Origin": "http://127.0.0.1:1"})
+        self.assertEqual(code, 403)
+
+    def test_a_trusted_origin_is_strata_s_own_page(self):
+        # the web app behind a reverse proxy or tunnel: the config's trusted_origins
+        self.svc.trusted_origins = ["https://strata.example.com"]
+        try:
+            code, _ = self.req("/settings", {"defaults": {}}, {"Origin": "https://strata.example.com"})
+            self.assertEqual(code, 200)
+            code, _ = self.req("/settings", {"defaults": {}}, {"Origin": "https://evil.example.com"})
+            self.assertEqual(code, 403)
+        finally:
+            self.svc.trusted_origins = []
+
 
 class WebApp(unittest.TestCase):
     """The web app (PR #22's dashboard idea, rebuilt): its page and files, and GET /metrics."""
@@ -1067,6 +1348,58 @@ class UsageAndStatus(unittest.TestCase):
             return json.loads(raw)
         return [json.loads(line[6:]) for line in raw.decode().splitlines()
                 if line.startswith("data: {")]
+
+    def preflight(self, path, origin="https://chat.example.com"):
+        req = urllib.request.Request(self.base + path, method="OPTIONS",
+                                     headers={"Origin": origin, "Access-Control-Request-Method": "POST",
+                                              "Access-Control-Request-Headers": "authorization, content-type"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.headers
+
+    def test_cors_is_off_by_default(self):
+        # #321: OPTIONS is answered, but without cors_origins no page of another origin is let in
+        status, h = self.preflight("/v1/chat/completions")
+        self.assertEqual(status, 204)
+        self.assertIsNone(h.get("Access-Control-Allow-Origin"))
+        with urllib.request.urlopen(self.base + "/health", timeout=10) as r:
+            self.assertIsNone(r.headers.get("Access-Control-Allow-Origin"))
+
+    def test_cors_for_the_configured_origins_on_the_api_only(self):
+        self.svc.cors_origins = ["https://chat.example.com"]
+        try:
+            status, h = self.preflight("/v1/chat/completions")
+            self.assertEqual((status, h.get("Access-Control-Allow-Origin")), (204, "https://chat.example.com"))
+            self.assertIn("OPTIONS", h.get("Access-Control-Allow-Methods", ""))
+            self.assertIn("authorization", h.get("Access-Control-Allow-Headers", ""))
+            self.assertIsNone(self.preflight("/v1/chat/completions", "https://evil.example.com")[1]
+                              .get("Access-Control-Allow-Origin"))
+            # never on the app's own endpoints (/settings, /unload, ...)
+            self.assertIsNone(self.preflight("/settings")[1].get("Access-Control-Allow-Origin"))
+            req = urllib.request.Request(self.base + "/v1/models", headers={"Origin": "https://chat.example.com"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), "https://chat.example.com")
+            self.svc.cors_origins = ["*"]
+            self.assertEqual(self.preflight("/v1/messages", "https://any.example.com")[1]
+                             .get("Access-Control-Allow-Origin"), "*")
+        finally:
+            self.svc.cors_origins = []
+
+    def test_sse_is_not_buffered_by_proxies(self):
+        req = urllib.request.Request(self.base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
+                                     data=json.dumps({"model": "m", "stream": True,
+                                                      "messages": [{"role": "user", "content": "hi"}]}).encode())
+        with urllib.request.urlopen(req, timeout=30) as r:
+            self.assertEqual(r.headers.get("X-Accel-Buffering"), "no")
+            r.read()
+
+    def test_origin_lists_are_checked(self):
+        from serve.server import origins_of
+        self.assertEqual(origins_of(None, "k", True), [])
+        self.assertEqual(origins_of("https://a.example.com/", "k", False), ["https://a.example.com"])
+        self.assertEqual(origins_of(["*", "http://localhost:3000"], "k", True), ["*", "http://localhost:3000"])
+        for bad in ("*", "a.example.com", "https://a.example.com/path", "https://*.example.com", 5):
+            with self.assertRaises(SystemExit):
+                origins_of(bad, "k", False)
 
     def test_openai(self):
         b = self.chat("/v1/chat/completions")
@@ -1339,6 +1672,33 @@ class EnginePipe(unittest.TestCase):
         self.assertTrue(eng.lines.empty())
         self.assertEqual([old_lines.get_nowait(), old_lines.get_nowait()], ["INFO x\n", None])
 
+    def test_a_restart_after_an_exit_whose_pipe_stayed_open_does_not_hang(self):
+        # merge of 0.1.34 (review): restart() closes the old engine first (#333).  #48's engine exited with its stdout
+        # never at end-of-file, so its pump sits in a read holding that pipe's lock, and closing stdout waited for
+        # ever: the watch (#59) or the request restarting it hung with `restarting` set, and no engine came back
+        r, w = os.pipe()                                 # w stays open: the pipe never reaches end-of-file
+        starts = []
+
+        class Recorded(StrataEngine):
+            def __init__(self, exe, args, cwd=None, log=None, env=None):
+                self.proc, self.pump, self.log = None, None, None   # as StrataEngine.__init__ begins
+                self.spawn, self.log_path, self.info = (exe, list(args), cwd, log, env), log, {}
+                starts.append(list(args))
+
+        eng = Recorded("strata.exe", ["--pack", "p"])
+        eng.proc, eng.lines = ExitedProc(), queue.Queue()
+        eng.proc.stdout = io.open(r, "r", encoding="utf-8")
+        pump = eng.pump = threading.Thread(target=eng._pump, args=(eng.proc, eng.lines), daemon=True)
+        pump.start()
+        self.addCleanup(eng.proc.stdout.close)           # cleanups run last-first: the pipe ends, its pump, then this
+        self.addCleanup(pump.join, 5)
+        self.addCleanup(os.close, w)
+        restarter = threading.Thread(target=eng.restart, daemon=True)
+        restarter.start()
+        restarter.join(10)
+        self.assertFalse(restarter.is_alive(), "restart() hangs closing the pipe the old pump still reads")
+        self.assertEqual(starts, [["--pack", "p"]] * 2)
+
 
 class LegLog(MockEngine):
     """A mock with the real engine's two habits the thinking budget meets: after an early stop it has committed a
@@ -1347,6 +1707,7 @@ class LegLog(MockEngine):
              "drafts_offered": 80},
             {"prompt_ms": 40.0, "decode_ms": 200.0, "generated": 10, "reused": 374, "drafts_accepted": 5,
              "drafts_offered": 8}]
+    DRAIN = 3                                           # the tokens committed past an early stop
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.prompts = getattr(self, "prompts", []) + [list(ids)]
@@ -1358,7 +1719,7 @@ class LegLog(MockEngine):
                 yield t
         finally:
             if leg == 0:
-                self.drained = list(self.script[n:n + 3])
+                self.drained = list(self.script[n:n + self.DRAIN])
             self.last = dict(LegLog.LEGS[min(leg, 1)], prompt_tokens=len(ids))
 
 
@@ -1387,6 +1748,32 @@ class BudgetContinuation(unittest.TestCase):
         self.assertEqual(h["prompt_ms"], 5000.0)        # the real prompt read is leg 1's
         self.assertEqual(h["reused"], 0)                 # not leg 2's reuse of its own continuation
         self.assertEqual(h["decode_ms"], 20000.0 + 40.0 + 200.0)   # re-reading CLOSE is part of making the output
+
+    def test_the_expert_tier_counters_cover_both_legs(self):
+        # merge of 0.1.34: the DONE line's RAM / file blobs and file MB (engine 0.1.31+) are per engine call, too
+        legs = [dict(LegLog.LEGS[0], ram_blobs=7, file_blobs=3, file_mb=1.5),
+                dict(LegLog.LEGS[1], ram_blobs=2, file_blobs=1, file_mb=0.25)]
+        with mock.patch.object(LegLog, "LEGS", legs):
+            tok, eng, svc, ids, out = self.run_cut()
+        h = svc.history[-1]
+        self.assertEqual((h["ram_blobs"], h["file_blobs"], h["file_mb"]), (9, 4, 1.75))
+
+    def test_tokens_past_the_cut_that_end_the_thinking_get_no_close(self):
+        # merge of 0.1.34 (review): the tokens the engine committed past the cut can hold the model's own </think> (one
+        # token with the real tokenizer); the close (#123's wrap-up, S3's CLOSE) then went out as answer text with a
+        # second </think> in it.  Upstream's #123 dropped those tokens; the fork keeps them for the engine's cache
+        tok = ByteTokenizer()
+        for sampling in ({"reasoning_budget_tokens": 8}, {"_think_budget": 8}):
+            with self.subTest(sampling=sampling), mock.patch.object(LegLog, "DRAIN", 10):   # "</think>\n\n"
+                eng = LegLog(tok, ["abcdefgh</think>\n\nThe answer is 42.", "The answer is 42."], max_context=16384)
+                svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+                ids, thinking, max_new = svc.prepare([{"role": "user", "content": "hi"}], None, {}, 4000)
+                out = list(svc.run(ids, thinking, None, max_new, sampling, threading.Event()))
+                shown = {kind: "".join(x.text for k, x in out if k == "event" and x.kind == kind)
+                         for kind in ("reasoning", "content")}
+                self.assertEqual(shown, {"reasoning": "abcdefgh", "content": "The answer is 42."})
+                first, second = eng.prompts
+                self.assertEqual(second, first + tok.encode("abcdefgh</think>\n\n"))   # the model's own end, no close
 
 
 class RestartOverloaded(unittest.TestCase):
@@ -2115,6 +2502,39 @@ class ClassifierStageOne(unittest.TestCase):
         post("the same benchmark prompt")
         self.assertEqual(eng.calls, 6)
 
+    def test_B_an_answer_a_hang_up_cut_short_is_not_replayed(self):
+        """Merge of 0.1.34: upstream's #430/#431 cancel a non-streamed request whose client hung up, and the cut answer
+        ends as "end_turn" - which the replay cache keeps, so the identical retry would have got the cut answer."""
+        import socket as so
+        tok = ByteTokenizer()
+        eng = self.Counting(tok, "no</block>", max_context=16384, delay_s=0.2)   # a token every 0.2 s
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        body = json.dumps({"model": "m", "max_tokens": 64, "stream": False, "system": "You judge actions.",
+                           "thinking": {"type": "disabled"},
+                           "messages": [{"role": "user", "content": "<transcript>ls</transcript>\n" + self.MUST}]})
+        c = so.create_connection(("127.0.0.1", httpd.server_address[1]))
+        c.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body.encode())
+        time.sleep(1.0)                                  # mid-answer
+        c.close()
+        deadline = time.time() + 10
+        while not svc.history and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual([r["finish"] for r in svc.history], ["cancel"])
+        time.sleep(0.5)                                  # the handler's end: the answer collected, kept or not
+        self.assertEqual(len(svc.replays), 0)
+        eng.delay = 0
+        req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/messages", data=body.encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            again = json.loads(r.read())
+        self.assertEqual(eng.calls, 2)                   # generated again, not the cut answer
+        self.assertEqual(self.text(again), "<block>no</block>")
+        self.assertEqual(len(svc.replays), 1)            # a whole answer is still kept
+
 
 class LoadingAnswers529(unittest.TestCase):
     """Live (2026-09-30): the server bound its port only after the model loaded (1-2 minutes), so every restart
@@ -2283,6 +2703,7 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
         self.assertEqual(self.req("/health")[1]["loaded"], True)
 
+
 class HealthTellsACrashFromAnUnload(unittest.TestCase):
     """#56 review (xeno): after the 0.1.30 merge /health answered 200 for a crashed engine - its test for an unload
     (`not loaded()`) is also true after a crash.  A crash is 503 `engine_exited`; an unload on purpose (#208) is 200."""
@@ -2313,6 +2734,619 @@ class HealthTellsACrashFromAnUnload(unittest.TestCase):
     def test_an_unloaded_engine_is_ok(self):
         status, body = self.health(crashed=False)
         self.assertEqual((status, body["status"], body["loaded"]), (200, "ok", False))
+
+
+class DisplayFloorRecovery(unittest.TestCase):
+    """#59: the secondary (4070, the display card) free-floor monitor ends the engine with _Exit(3) when the desktop
+    needs its VRAM back.  The server must come back without a request, and when the floor is the reason, without the
+    4070 tier (serving on the 5060 alone) until the display has room again."""
+
+    BREACH = ("secondary display VRAM reserve failed: secondary runner: display VRAM below configured free floor; "
+              "terminating to release tier\n")
+    ARGS = ["--pack", "p", "--secondary-free-floor-mib", "640", "--secondary-expert-mib", "6400",
+            "--exclusive-secondary-experts", "--adapt-secondary", "8", "--ram-cache-gib", "12"]
+
+    def test_the_args_without_the_secondary_tier(self):
+        from serve.server import without_secondary
+        self.assertEqual(without_secondary(self.ARGS),
+                         ["--pack", "p", "--secondary-free-floor-mib", "640", "--secondary-expert-mib", "0",
+                          "--adapt-secondary", "0", "--ram-cache-gib", "12"])
+        self.assertEqual(without_secondary(["--pack", "p"]), ["--pack", "p"])   # no tier: nothing to drop
+
+    # the start-up refusals besides the runner's own check: the arena's open and its fill
+    ARENA_REFUSAL = ("strata generate: secondary arena: display GPU has no space above the free floor and allocation "
+                     "cushion\n")
+    FILL_REFUSAL = "strata generate: secondary fill: secondary fill crossed the display free floor\n"
+
+    def engine(self, log_text, fail_full=False, refusal=None):
+        """A StrataEngine whose start is recorded instead of spawned; `fail_full`: a start with the tier fails, its log
+        ending with `refusal` (the runner's floor check by default)."""
+        d = tempfile.mkdtemp()
+        log = os.path.join(d, "engine.log")
+        Path(log).write_text(log_text, encoding="utf-8")
+        starts, failing = [], [False]   # the first construction is the engine as it ran; failures start after
+
+        class Recorded(StrataEngine):
+            def __init__(self, exe, args, cwd=None, log=None, env=None):
+                self.proc, self.pump, self.log = None, None, None   # as StrataEngine.__init__ begins: close() reads
+                self.spawn, self.log_path, self.info = (exe, list(args), cwd, log, env), log, {}
+                starts.append(list(args))
+                tiered = "--secondary-expert-mib" in args and args[args.index("--secondary-expert-mib") + 1] != "0"
+                if failing[0] == "all" or (failing[0] and tiered):
+                    with open(log, "a", encoding="utf-8") as f:
+                        f.write(refusal or DisplayFloorRecovery.BREACH)
+                    raise RuntimeError("the engine exited before it was ready")
+
+        eng = Recorded("strata.exe", self.ARGS, None, log, None)
+        # the engine as it ended: restart() closes it first (0.1.34, #333), its pipes too
+        eng.proc = type("P", (), {"kill": lambda self: None, "poll": lambda self: 3,
+                                  "stdin": io.StringIO(), "stdout": io.StringIO()})()
+        starts.clear()
+        failing[0] = fail_full
+        self.failing = failing
+        return eng, starts
+
+    def test_a_floor_breach_restarts_without_the_tier(self):
+        eng, starts = self.engine("strata serve: ready\n" + self.BREACH)
+        self.assertTrue(eng.floor_breach())
+        eng.restart()
+        self.assertEqual(starts[-1][starts[-1].index("--secondary-expert-mib") + 1], "0")
+        self.assertTrue(eng.degraded)
+
+    def test_another_death_restarts_as_configured(self):
+        eng, starts = self.engine("strata serve: ready\nstrata: access violation\n")
+        self.assertFalse(eng.floor_breach())
+        eng.restart()
+        self.assertEqual(starts, [self.ARGS])
+        self.assertFalse(eng.degraded)
+
+    def test_a_start_the_floor_refuses_falls_back_to_no_tier(self):
+        eng, starts = self.engine("strata: access violation\n", fail_full=True)
+        eng.restart()
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(starts[1][starts[1].index("--secondary-expert-mib") + 1], "0")
+        self.assertTrue(eng.degraded)
+
+    def test_an_arena_or_fill_floor_refusal_also_falls_back_to_no_tier(self):
+        # incident (2026-10-02 /simplify review): only the runner's message was recognised, so a restore the arena's
+        # floor check refused raised instead, and the engine stayed dead
+        for refusal in (self.ARENA_REFUSAL, self.FILL_REFUSAL):
+            eng, starts = self.engine("strata: access violation\n", fail_full=True, refusal=refusal)
+            eng.restart()
+            self.assertEqual(starts[1][starts[1].index("--secondary-expert-mib") + 1], "0", refusal)
+            self.assertTrue(eng.degraded, refusal)
+
+    def test_the_staging_line_is_not_a_floor_refusal(self):
+        eng, _ = self.engine("strata generate: staged 900 next-ranked secondary experts (6.25 GiB); 4070 SUPER lower "
+                             "free 3.10 GiB (free floor 0.62 GiB); SECONDARY COMPUTE\nstrata: access violation\n")
+        self.assertFalse(eng.floor_breach())
+
+    def test_a_restore_that_fails_for_another_reason_stays_degraded(self):
+        # incident (2026-10-02 /scrutinize): restart(full=True) killed the degraded engine, the full start failed for a
+        # reason other than the floor, and it raised - the server was left with no engine, and the watch then tried the
+        # full start (a whole model load) again every 5 s instead of serving degraded
+        eng, starts = self.engine("strata serve: ready\n" + self.BREACH, refusal="strata: cudaMalloc failed\n")
+        eng.restart()
+        self.assertTrue(eng.degraded)
+        with open(eng.log_path, "a", encoding="utf-8") as f:   # the degraded engine's own start and serving
+            f.write("strata generate: loaded\n" * 6 + "strata serve: ready\n")
+        self.failing[0] = True
+        eng.restart(full=True)   # its log now ends with that failure, not with the floor
+        self.assertEqual(starts[-1][starts[-1].index("--secondary-expert-mib") + 1], "0")
+        self.assertTrue(eng.degraded)
+
+    def test_a_failed_degraded_start_keeps_the_configured_command(self):
+        # incident (2026-10-02 /scrutinize): __init__ stores the args it is given, so a degraded start that failed left
+        # the no-tier args as the engine's own and full_spawn unset: the tier could never come back
+        eng, starts = self.engine("strata serve: ready\n" + self.BREACH)
+        self.failing[0] = "all"
+        with self.assertRaises(RuntimeError):
+            eng.restart()
+        self.failing[0] = False
+        eng.restart(full=True)
+        self.assertEqual(starts[-1], self.ARGS)
+        self.assertFalse(eng.degraded)
+
+    def test_full_restores_the_tier(self):
+        eng, starts = self.engine("strata serve: ready\n" + self.BREACH)
+        eng.restart()
+        eng.restart(full=True)
+        self.assertEqual(starts[-1], self.ARGS)
+        self.assertFalse(eng.degraded)
+
+    def test_the_watch_restarts_a_dead_engine_between_requests(self):
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        eng.running = False                      # died by itself (not unloaded)
+        svc.watch_once()
+        self.assertEqual(eng.starts, 1)
+        svc.watch_once()                         # alive: nothing to do
+        self.assertEqual(eng.starts, 1)
+
+    def test_the_watch_leaves_an_unloaded_engine_alone(self):
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        eng.unload()
+        svc.watch_once()
+        self.assertEqual(eng.starts, 0)
+
+    def test_the_watch_restores_the_tier_once_idle_and_the_display_has_room(self):
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        fulls = []
+        eng.degraded = True
+        eng.restart = lambda full=None: fulls.append(full)
+        eng.secondary_need_mib = lambda: 7040
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.last_request_at = time.time()
+        svc.display_free_mib = lambda: 9000
+        svc.watch_once(upgrade_idle_s=300)
+        self.assertEqual(fulls, [])              # a request was just served: not yet
+        svc.last_request_at = time.time() - 400
+        svc.display_free_mib = lambda: 5000
+        svc.watch_once(upgrade_idle_s=300)
+        self.assertEqual(fulls, [])              # idle, but the display still lacks the room
+        svc.display_free_mib = lambda: 9000
+        svc.watch_once(upgrade_idle_s=300)
+        self.assertEqual(fulls, [True])
+
+    def test_the_watch_restores_the_tier_before_any_request(self):
+        # incident (2026-10-02 /simplify review): the watch restarts a dead engine degraded before any request, and
+        # `time.time() - None` then raised every 5 s; idle counts from the server's start instead
+        tok = ByteTokenizer()
+        eng = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        fulls = []
+        eng.degraded = True
+        eng.restart = lambda full=None: fulls.append(full)
+        eng.secondary_need_mib = lambda: 7040
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertIsNone(svc.last_request_at)
+        svc.started_at = time.time() - 400
+        svc.display_free_mib = lambda: 9000
+        svc.watch_once(upgrade_idle_s=300)
+        self.assertEqual(fulls, [True])
+
+
+class ThinkingEngine(MockEngine):
+    """Thinks THOUGHT, then answers; a prompt that already ends its thinking (the budget's wrap-up) gets the answer
+    at once, the way the model continues after </think>.  Records every prompt it is given."""
+    THOUGHT = "Let me think step by step about two plus two. " * 4          # 184 reasoning tokens (one per byte)
+    ANSWER = "The answer is 4."
+
+    def __init__(self, tok):
+        super().__init__(tok, "x", max_context=CTX)
+        self.prompts = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        done = self.tok.decode(ids).endswith("</think>\n\n")
+        text = self.ANSWER if done else self.THOUGHT + "</think>\n\n" + self.ANSWER
+        for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class ReasoningBudget(unittest.TestCase):
+    """#123: reasoning_budget_tokens (opt-in): at the budget the thinking is wrapped up and the model answers,
+    continuing from the prompt plus what it generated plus the wrap-up (a prefix the engine already holds).
+    (Upstream's ThinkingBudget; renamed in the 0.1.34 merge, since the fork's #49 S3 ThinkingBudget above has the
+    name, and a second class of the same name would have hidden it.)"""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = ThinkingEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), headers={
+            "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read().decode()
+                return r.status, (json.loads(raw) if not body.get("stream") else raw)
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def openai(self, **extra):
+        return self.post("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "2+2?"}],
+                                                  "max_tokens": 400, **extra})
+
+    def test_off_by_default(self):
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual((msg["reasoning_content"], msg["content"]), (ThinkingEngine.THOUGHT, ThinkingEngine.ANSWER))
+        self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_the_budget_wraps_up_the_thinking(self):
+        from serve.server import REASONING_WRAP_UP
+        code, b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        wrap = REASONING_WRAP_UP.split("</think>")[0]
+        self.assertEqual(msg["reasoning_content"], ThinkingEngine.THOUGHT[:20] + wrap)
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        first, second = self.engine.prompts
+        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+        self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)   # a prefix + more
+        self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
+        self.assertEqual(b["usage"]["prompt_tokens"], len(first))
+
+    def test_anthropic_stream(self):
+        from serve.server import REASONING_WRAP_UP
+        code, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 400, "stream": True,
+                                               "reasoning_budget_tokens": 30,
+                                               "messages": [{"role": "user", "content": "2+2?"}]})
+        self.assertEqual(code, 200)
+        evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        thinking = "".join(e["delta"].get("thinking", "") for e in evs if e["type"] == "content_block_delta")
+        text = "".join(e["delta"].get("text", "") for e in evs if e["type"] == "content_block_delta")
+        self.assertEqual(thinking, ThinkingEngine.THOUGHT[:30] + REASONING_WRAP_UP.split("</think>")[0])
+        self.assertEqual(text, ThinkingEngine.ANSWER)
+        self.assertEqual(evs[-2]["delta"]["stop_reason"], "end_turn")
+
+    def test_a_budget_the_thinking_stays_under(self):
+        code, b = self.openai(reasoning_budget_tokens=10_000)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+        self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_the_config_default_and_a_request_that_turns_it_off(self):
+        self.svc.reasoning_budget_tokens = 20
+        code, b = self.openai()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
+        code, b = self.openai(reasoning_budget_tokens=0)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+        self.assertEqual(len(self.engine.prompts), 3)
+
+    def test_without_thinking_there_is_nothing_to_limit(self):
+        self.engine.THOUGHT = ""
+        code, b = self.openai(reasoning_budget_tokens=5, reasoning_effort="none")
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_no_room_left_to_answer(self):
+        code, b = self.openai(reasoning_budget_tokens=20, max_tokens=40)    # 20 thought + the wrap-up > 40
+        self.assertEqual(b["choices"][0]["finish_reason"], "length")
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT[:20])
+
+    def test_a_bad_value_is_a_400(self):
+        for bad in ("lots", 2.5, True, [1]):
+            with self.subTest(value=bad):
+                code, b = self.openai(reasoning_budget_tokens=bad)
+                self.assertEqual(code, 400)
+                self.assertIn("reasoning_budget_tokens", b["error"]["message"])
+        self.assertEqual(self.engine.prompts, [])
+
+
+class StatusHandover(unittest.TestCase):
+    """#266: a stream aborted mid-way and the next request, which was waiting for the fifo.  The aborted request's
+    status/history block ran after the fifo was released, so the waiting request could start in that gap: the old
+    request then recorded the NEW request's status as its own, set busy=False and popped `tail`, and the new request
+    crashed in _note (KeyError 'tail').  The fifo below lets the waiting request run to its first token as soon as
+    it is released, before the releasing thread goes on - the worst case of that gap, every time."""
+
+    def test_abort_then_the_next_request(self):
+        tok = ByteTokenizer()
+        second_running = threading.Event()
+
+        class Engine(MockEngine):
+            calls = 0
+
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                Engine.calls += 1
+                me = Engine.calls
+                for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+                    if me == 2 and i == 2:
+                        second_running.set()        # the second request has its status and two tokens noted
+                    yield t
+
+        class SlowRelease:
+            """A Lock whose release waits (briefly) until the thread it let in has started generating."""
+
+            def __init__(self):
+                self.lock, self.armed = threading.Lock(), False
+
+            def acquire(self, blocking=True):
+                return self.lock.acquire(blocking)
+
+            def __enter__(self):
+                self.lock.acquire()
+
+            def __exit__(self, *exc):
+                self.lock.release()
+                if self.armed:
+                    self.armed = False
+                    second_running.wait(5)
+
+            def slot(self, priority=1):
+                # the fork's RequestGate.slot (xeno #49 S6), which Service.run takes: here the lock itself
+                return self
+
+            def release(self):
+                self.lock.release()
+
+        svc = Service(Engine(tok, "</think>\n\n" + "y" * 40, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.fifo = SlowRelease()
+        ids = tok.encode("hi")
+        first = svc.run(ids, True, None, 30, {}, threading.Event())
+        for _ in range(5):
+            next(first)                                 # mid-answer
+        out, errors = [], []
+
+        def second():
+            try:
+                out.extend(svc.run(ids, True, None, 20, {}, threading.Event()))
+            except Exception as e:                      # noqa: BLE001 - the crash this test is about
+                errors.append(e)
+
+        waiter = threading.Thread(target=second)
+        waiter.start()
+        deadline = time.time() + 5
+        while svc.status.get("queued") != 1 and time.time() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(svc.status.get("queued"), 1, "the second request never queued")
+        svc.fifo.armed = True
+        first.close()                                   # the client went away: GeneratorExit in the first request
+        waiter.join(10)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(out[-1][0], "done")
+        self.assertEqual(out[-1][1]["completion_tokens"], 20)
+        rows = list(svc.history)
+        self.assertEqual([r["finish"] for r in rows], ["disconnect", "length"])
+        self.assertTrue(0 < rows[0]["output_tokens"] < 30, rows)     # where the first one stopped, not the second's
+        self.assertEqual(rows[1]["output_tokens"], 20)
+        self.assertEqual(svc.totals["requests"], 2)
+        self.assertEqual(svc.totals["output_tokens"], rows[0]["output_tokens"] + 20)
+        self.assertFalse(svc.status["busy"])
+        self.assertNotIn("tail", svc.status)
+
+
+FAKE_STRATA = '''import pathlib, sys, time
+gate = pathlib.Path(sys.argv[sys.argv.index("--gate") + 1])
+print("INFO engine=0.0.0", flush=True)
+while not gate.exists():                     # the test says when the engine is "ready"
+    time.sleep(0.01)
+print("READY 4096 stop", flush=True)
+for line in sys.stdin:
+    if line.startswith("QUIT"):
+        break
+'''
+
+
+class RestartWindow(unittest.TestCase):
+    """#344: while the engine restarts it is not alive (a request waits for the restart instead of reading
+    max_context 0), and a request that still meets max_context 0 gets a 503 "starting" (529 on /v1/messages, xeno #49
+    S2), not a 400 about its prompt."""
+
+    def test_not_alive_until_ready(self):
+        from unittest import mock
+        import serve.server as server
+        with tempfile.TemporaryDirectory() as d:
+            script, gate = Path(d) / "fake_strata.py", Path(d) / "ready"
+            script.write_text(FAKE_STRATA, encoding="utf-8")
+            real = server.subprocess.Popen
+            with mock.patch.object(server.subprocess, "Popen",
+                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
+                gate.touch()
+                eng = StrataEngine("strata", ["--gate", str(gate)])
+                try:
+                    self.assertEqual(eng.max_context, 4096)
+                    self.assertTrue(eng.alive())
+                    gate.unlink()
+                    old = eng.proc
+                    old.kill()
+                    old.wait(10)
+                    deadline = time.time() + 10
+                    while not getattr(eng, "ended", False) and time.time() < deadline:
+                        time.sleep(0.01)                  # the server has noticed: its output closed
+                    self.assertFalse(eng.alive())
+                    t = threading.Thread(target=eng.restart)
+                    t.start()
+                    deadline = time.time() + 10
+                    while eng.proc is old and time.time() < deadline:
+                        time.sleep(0.005)
+                    self.assertIsNot(eng.proc, old, "restart never started the engine")
+                    time.sleep(0.2)                       # the new engine is up, but has not said READY
+                    self.assertEqual(eng.max_context, 0)
+                    self.assertFalse(eng.alive(), "alive before READY: a request would plan with context 0")
+                    gate.touch()
+                    t.join(10)
+                    self.assertFalse(t.is_alive())
+                    self.assertTrue(eng.alive())
+                    self.assertEqual(eng.max_context, 4096)
+                    # restart() of a running engine kills it first: that engine's output thread ends after the new
+                    # one is up, and must not mark it dead (it did: every request after restarted it again)
+                    eng.restart()
+                    time.sleep(0.5)
+                    self.assertTrue(eng.alive())
+                    self.assertEqual(eng.max_context, 4096)
+                finally:
+                    gate.touch()
+                    eng.unload()
+
+    def test_context_zero_is_503(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=0), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            for path, body in (("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                                                         "max_tokens": 16}),
+                               ("/v1/messages", {"model": "m", "max_tokens": 16,
+                                                 "messages": [{"role": "user", "content": "hi"}]})):
+                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(req, timeout=30)
+                with cm.exception as e:
+                    # xeno #49 S2 (merge of 0.1.34): the native API answers its retryable 529 while the engine loads
+                    # - Claude Code shows a 503 as a failed turn
+                    self.assertEqual(e.code, 529 if path == "/v1/messages" else 503, path)
+                    text = e.read().decode()
+                self.assertIn("starting", text)
+                self.assertNotIn("leaves no room", text)
+                if path == "/v1/messages":
+                    self.assertEqual(json.loads(text)["error"]["type"], "overloaded_error")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class ModelAliases(unittest.TestCase):
+    """#297: the config's `aliases` are listed by /v1/models and accepted as model names (answered under that name)."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"), model_name="qwen3.8-flash-next-iq3_xxs")
+        cls.svc.set_aliases(["qwen", "local-model", "qwen", " ", "qwen3.8-flash-next-iq3_xxs"])
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=30) as r:
+            return json.loads(r.read())
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read().decode()
+
+    def test_set_aliases(self):
+        self.assertEqual(self.svc.aliases, ["qwen", "local-model"])        # duplicates, blanks and the name itself
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.set_aliases("a, b")
+        self.assertEqual(svc.aliases, ["a", "b"])
+        svc.set_aliases(None)
+        self.assertEqual(svc.aliases, [])
+        for bad in (3, ["a", 1], {"a": 1}):
+            with self.assertRaises(ValueError):
+                svc.set_aliases(bad)
+
+    def test_models_lists_them(self):
+        data = self.get("/v1/models")["data"]
+        self.assertEqual([m["id"] for m in data], ["qwen3.8-flash-next-iq3_xxs", "qwen", "local-model"])
+        self.assertEqual(data[0]["aliases"], ["qwen", "local-model"])
+        self.assertEqual(data[1]["alias_of"], "qwen3.8-flash-next-iq3_xxs")
+        self.assertEqual(self.get("/props?model=local-model")["model_alias"], "qwen3.8-flash-next-iq3_xxs")
+
+    def test_requests_are_answered_under_the_alias(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        for asked, want in (("qwen", "qwen"), ("local-model", "local-model"),
+                            ("qwen3.8-flash-next-iq3_xxs", "qwen3.8-flash-next-iq3_xxs"),
+                            ("something-else", "qwen3.8-flash-next-iq3_xxs")):    # still served, as before
+            with self.subTest(asked=asked):
+                out = json.loads(self.post("/v1/chat/completions", {"model": asked, "messages": msgs, "max_tokens": 8}))
+                self.assertEqual(out["model"], want)
+                text = self.post("/v1/chat/completions", {"model": asked, "messages": msgs, "max_tokens": 8,
+                                                          "stream": True})
+                first = json.loads(text.split("data: ", 2)[1].strip())
+                self.assertEqual(first["model"], want)
+                out = json.loads(self.post("/v1/messages", {"model": asked, "messages": msgs, "max_tokens": 8}))
+                self.assertEqual(out["model"], want)
+
+    def test_without_aliases_nothing_changes(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_address[1]}/v1/models", timeout=30) as r:
+                data = json.loads(r.read())["data"]
+            self.assertEqual(len(data), 1)
+            self.assertNotIn("aliases", data[0])
+            self.assertEqual(svc.model_for({"model": "x"}), svc.model)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class AmdTelemetry(unittest.TestCase):
+    """#301: the AMD backend's readings from a fake amdgpu sysfs tree: KFD node -> render node, as setup numbers the
+    cards (the CPU node skipped), and free_vram_mib on HIP."""
+
+    def tree(self, d):
+        nodes = Path(d) / "class/kfd/kfd/topology/nodes"
+        for n, props in ((0, "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\ndrm_render_minor 0\n"),
+                         (1, "simd_count 128\ngfx_target_version 120001\ndrm_render_minor 129\n"),
+                         (2, "simd_count 128\ngfx_target_version 120001\ndrm_render_minor 128\n")):
+            (nodes / str(n)).mkdir(parents=True)
+            (nodes / str(n) / "properties").write_text(props)
+        for minor, used, busy, temp, power in ((129, 2 << 30, 37, 51000, 85000000), (128, 6 << 30, 99, 64000, None)):
+            dev = Path(d) / f"class/drm/renderD{minor}/device"
+            hw = dev / "hwmon" / "hwmon4"
+            hw.mkdir(parents=True)
+            (dev / "gpu_busy_percent").write_text(f"{busy}\n")
+            (dev / "mem_info_vram_used").write_text(f"{used}\n")
+            (dev / "mem_info_vram_total").write_text(f"{32 << 30}\n")
+            (dev / "product_name").write_text("AMD Radeon AI PRO R9700\n")
+            (hw / "temp1_input").write_text(f"{temp}\n")
+            if power is not None:
+                (hw / "power1_average").write_text(f"{power}\n")
+            else:
+                (hw / "power1_input").write_text("120000000\n")
+            (hw / "power1_cap").write_text("300000000\n")
+
+    def test_readings(self):
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            with mock.patch.object(telemetry, "SYSFS", d):
+                self.assertTrue(telemetry.amd_device_dir(0).endswith(os.path.join("renderD129", "device")))
+                self.assertTrue(telemetry.amd_device_dir(1).endswith(os.path.join("renderD128", "device")))
+                self.assertIsNone(telemetry.amd_device_dir(2))
+                g = telemetry.gpu_reader(0, amd=True)
+                self.assertTrue(g.ok())
+                self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
+                self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
+                                            "power": 85.0, "power_limit": 300.0})
+                r = telemetry.gpu_reader(1, amd=True).read()
+                self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
+                self.assertEqual(telemetry.free_vram_mib(0, amd=True), 30 << 10)
+                self.assertIsNone(telemetry.free_vram_mib(5, amd=True))
+                t = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True)
+                s = t.sample()
+                self.assertEqual(t.static["gpu_name"], "AMD Radeon AI PRO R9700 + AMD Radeon AI PRO R9700")
+                self.assertEqual((s["gpu_mem_used"], s["gpu_util"], s["gpu_temp"], s["gpu_power"]),
+                                 (8 << 30, 68.0, 64.0, 205.0))
+        with tempfile.TemporaryDirectory() as d:                    # no amdgpu: nothing, and nothing breaks
+            with mock.patch.object(telemetry, "SYSFS", d):
+                self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
+                self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
+
+    def test_free_vram_on_hip(self):
+        from serve import telemetry
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.backend, svc.gpu_index = "hip", 1
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            with mock.patch.object(telemetry, "SYSFS", d):
+                self.assertEqual(svc.free_vram_mib(), 26 << 10)
+
 
 class EffortLevelsTests(unittest.TestCase):
     """The thinking levels a model's chat template accepts, so a client offers those and no others (the shipped template:

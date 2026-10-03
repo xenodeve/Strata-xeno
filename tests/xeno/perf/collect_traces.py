@@ -1,6 +1,6 @@
 """Routing traces: six training prompts (trace-prompts/*.ids) + the four benchmark prompts, one run each.
 
-Same command as the benchmark (codex dispatch-detail code256) with --tokens-file swapped, --route-trace added,
+Same command as the benchmark (codex dispatch-detail code256) with --tokens-file swapped, --dump-routing added (format 2, #93),
 and --pool-priority 2 (AGENTS.md). Waits for a running sweep (argv[1] summary.log) to finish first.
 """
 import glob, json, os, subprocess, sys, time
@@ -25,7 +25,7 @@ cuda = os.path.join("C:" + os.sep, "Program Files", "NVIDIA GPU Computing Toolki
 env["PATH"] = os.pathsep.join([cuda, os.path.join(cuda, "x64"), env["PATH"]])
 log = open(os.path.join(OUT, "summary.log"), "a", encoding="utf-8")
 for name, ids in jobs:
-    cmd = base[:i + 1] + [ids] + base[i + 2:] + ["--route-trace", os.path.join(OUT, name + ".trace"), "--pool-priority", "2"]
+    cmd = base[:i + 1] + [ids] + base[i + 2:] + ["--dump-routing", os.path.join(OUT, name + ".bin"), "--pool-priority", "2"]
     p = subprocess.run([EXE] + cmd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
     open(os.path.join(OUT, name + ".stdout"), "w", encoding="utf-8").write(p.stdout)
     open(os.path.join(OUT, name + ".stderr"), "w", encoding="utf-8").write(p.stderr)
