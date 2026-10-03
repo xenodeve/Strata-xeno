@@ -112,7 +112,8 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // attention halves instead of waiting for each layer's routing.
 constexpr int RING_MAX = 512;           // the arrays; the ring itself is ring_slots(), at most ring_cap()
                                         // (xeno #103: upstream 1024 - its P3 ring, not ported: see ring_cap)
-constexpr int64_t STREAM_ALL_MIN = 2048;
+// #119: the split layout's chunk floor (STRATA_PREFILL_SPLIT_MIN, default 2048: was the constant STREAM_ALL_MIN)
+inline int64_t split_min() { static const int64_t v = split_min_from(std::getenv("STRATA_PREFILL_SPLIT_MIN")); return v; }
 constexpr int MMQ_GROUP = 16;
 static_assert(MMQ_GROUP <= mmq::kGatherGroupMax, "one gather_native_group launch must hold an MMQ group");                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
@@ -253,7 +254,7 @@ inline int ring_slots(size_t T) {
     }();
     // (xeno: the split layout's threshold, as below)
     if (!v && g_ring_override <= 0 && wmma)
-        return (int64_t) T >= (g_split_layout ? STREAM_ALL_MIN : stream_all_min()) ? 96 : STAGE;
+        return (int64_t) T >= (g_split_layout ? split_min() : stream_all_min()) ? 96 : STAGE;
 #endif
     const int pinned_ring = fused_ring() ? 512 : 384;   // (xeno #103: upstream 1024, capped to ring_cap() here)
     const int r = v ? std::atoi(v) : g_ring_override > 0 ? g_ring_override : (g_pinned_share >= 0.9 ? pinned_ring : 96);
@@ -261,7 +262,7 @@ inline int ring_slots(size_t T) {
     const int big = r < 16 ? 16 : r > ring_cap() ? ring_cap() : r;
     // xeno #56: the same threshold as `stream_all` - the split layout keeps 2048 (a ring for 1024+ chunks there grew each
     // wave lane's loan by ~0.5 GB for a chunk that cannot stream all)
-    return (int64_t) T >= (g_split_layout ? STREAM_ALL_MIN : stream_all_min()) ? big : STAGE;
+    return (int64_t) T >= (g_split_layout ? split_min() : stream_all_min()) ? big : STAGE;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
@@ -286,13 +287,13 @@ inline bool gr_unfused() {
     return v;
 }
 // #35 D6: the tokens the one-card MoE buffers hold: every chunk, or in the split layout only the chunks below
-// STREAM_ALL_MIN (a bigger one runs its routed experts on the peer card and never touches them)
+// split_min() (a bigger one runs its routed experts on the peer card and never touches them)
 bool split_layout_usable();   // below: the split's static conditions (a native pack, a layer on MMQ)
 bool split_layout_full();     // ... and every layer on MMQ (#113)
 bool split_layer(int64_t l);  // layer l's routed experts run on the peer card in a split chunk (#113)
 // #113: a layer that is not on MMQ runs a split chunk on this card, so the one-card buffers then hold the chunk
 inline size_t moe_cap(size_t T) {
-    return g_split_layout && split_layout_full() ? std::min(T, (size_t) STREAM_ALL_MIN - 1) : T;
+    return g_split_layout && split_layout_full() ? std::min(T, (size_t) split_min() - 1) : T;
 }
 
 
@@ -969,7 +970,7 @@ struct Prefill::WaveLink {
     }
 };
 std::shared_ptr<Prefill::WaveLink> Prefill::make_wave_link() { return std::make_shared<WaveLink>(); }
-bool Prefill::wave_lane_splits(int64_t chunk) { return wave_lane_chunk(chunk) >= STREAM_ALL_MIN; }
+bool Prefill::wave_lane_splits(int64_t chunk) { return wave_lane_ok(wave_lane_chunk(chunk), split_min()); }   // #119
 bool Prefill::run_wave(Prefill& a, Prefill& b, WaveLink& link, const int64_t* tokens, int64_t n, int64_t pos0,
                        int64_t n_layers, std::string& err) {
     wave_reset(link, (n + a.chunk() - 1) / a.chunk(), n_layers);
@@ -2154,8 +2155,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         // xeno #56: upstream 0.1.30 streams every expert from 1024-token chunks; the split layout (#32/#35) keeps
-        // 2048 (STREAM_ALL_MIN), which its one-card MoE buffers and wave lanes are sized for (not measured lower)
-        const bool stream_all = m.ring > STAGE && T >= (g_split_layout ? STREAM_ALL_MIN : stream_all_min()) &&
+        // split_min() (#119: STRATA_PREFILL_SPLIT_MIN, default 2048), which its one-card MoE buffers and wave lanes are sized for
+        const bool stream_all = m.ring > STAGE && T >= (g_split_layout ? split_min() : stream_all_min()) &&
                                 m.src != nullptr;
         // #32 S4: expert_split for this chunk (MMQ layers of a native pack whose peer tier is set)
         static const bool split_env = [] { const char* v = std::getenv("STRATA_PREFILL_EXPERT_SPLIT"); return v && std::atoi(v) != 0; }();
@@ -2189,7 +2190,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             return false;
         }
         const bool split_base = split_on && m.split != nullptr;   // #35 D7: the wave's lane 1 plans with full chunks
-        split_on = split_base && T >= STREAM_ALL_MIN;   // every candidate expert streams: big chunks only
+        split_on = split_base && T >= split_min();   // every candidate expert streams: big chunks only
         if (!split_on && (int64_t) T > m.moe_tokens) {
             err = "prefill: the split layout holds one-card MoE buffers for " + std::to_string(m.moe_tokens) +
                   " tokens, and this " + std::to_string(T) + "-token chunk cannot run split (see the expert_split "
@@ -2244,7 +2245,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // consumes that stream; a lane whose chunk does not run split steps over its share of the unit
         const bool wave_split = wave != nullptr && m.split != nullptr;
         const size_t unit = wave ? (size_t) (chunk_i / 2) : 0;
-        if (wave_split && m.wave_lane == 1 && split_base && m.T >= STREAM_ALL_MIN) {
+        if (wave_split && m.wave_lane == 1 && split_base && m.T >= split_min()) {
             // lane 1's first chunk is full (this lane has a chunk), so it planned the stream: consume it
             SplitTier* owner = wave->wait_split_owner();
             if (owner == nullptr) { err = "prefill: the other wave lane failed"; return false; }
