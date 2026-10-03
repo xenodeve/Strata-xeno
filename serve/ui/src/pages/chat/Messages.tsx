@@ -11,6 +11,7 @@ import { agentStatus } from "../../lib/status"
 import { useAvatar } from "../../lib/avatar"
 import { Lattice, Thought, type LatticeStatus } from "../../components/thought"
 import { cn } from "../../lib/cn"
+import { store } from "../../lib/store"
 import { fmt, timeStr } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
 import { prefillText } from "../../lib/prefill"
@@ -35,6 +36,8 @@ function useKept(m: Message, key: string): [boolean | null, (v: boolean) => void
   const [, redraw] = useState(0)
   return [choices.get(m)?.get(key) ?? null, (v) => { let k = choices.get(m); if (!k) choices.set(m, (k = new Map())); k.set(key, v); redraw((n) => n + 1) }]
 }
+
+const edits = new WeakMap<Message, string>()                      // a prompt being rewritten: what is written so far
 
 const TOOL_STATE: Record<ToolCall["state"], string> = { writing: msg("Writing"), asking: msg("Waiting for you"), running: msg("Running"), done: msg("Done"), error: msg("Error"), skipped: msg("Not run") }
 
@@ -138,6 +141,21 @@ function ThoughtGlyph({ working, status, design }: { working: boolean; status: L
   )
 }
 
+/** A thought that goes on for a long time may be the model going round in a loop (a small model at a high thinking level can). The words say so once it has gone on for two minutes (`strata.longThinkMs` changes that), with
+ *  Stop beside them: nothing is stopped for the reader, who may know the problem is a hard one. Counted from when the thinking began, so it does not start again when the page is left and opened again. */
+function LongThinking({ since }: { since?: number }) {
+  const [, tick] = useState(0)
+  useEffect(() => { const id = setInterval(() => tick((n) => n + 1), 1000); return () => clearInterval(id) }, [])
+  const after = store.get<number>("longThinkMs", 120_000)
+  if (!since || Date.now() - since < (Number.isFinite(after) && after > 0 ? after : 120_000)) return null
+  return (
+    <div className="mt-1 flex items-center gap-2 text-[12px] text-ink-3" data-long-thinking role="status">
+      <span>{t("Thinking for a long time. If it seems to go round in a loop, stop it and ask again.")}</span>
+      <button type="button" onClick={() => chat.stop()} className="rounded-sm px-1.5 py-0.5 text-ink-2 transition-colors hover:bg-hover hover:text-ink">{t("Stop")}</button>
+    </div>
+  )
+}
+
 /** The thinking of one later round of an agent's work: open while it streams (if wanted), closed once it is over, as the first one is. */
 function RoundThought({ m, id, text, working, show, phase, since }: { m: Message; id: string; text: string; working: boolean; show: boolean; phase: OrbDesign | null; since?: number }) {
   const [touched, setTouched] = useKept(m, id)
@@ -147,6 +165,7 @@ function RoundThought({ m, id, text, working, show, phase, since }: { m: Message
       <Thought working={working} since={since} glyph={<ThoughtGlyph working={working} status={working ? "working" : "done"} design={phase ?? "solving"} />} open={open} onToggle={() => setTouched(!open)}>
         <ReasonStream text={text} live={working} />
       </Thought>
+      {working && <LongThinking since={since} />}
     </div>
   )
 }
@@ -168,6 +187,7 @@ function Thinking({ m, text, streaming, show, phase }: { m: Message; text: strin
       >
         <ReasonStream text={text} live={thinkingNow} />
       </Thought>
+      {thinkingNow && <LongThinking since={m.thinkAt} />}
     </div>
   )
 }
@@ -201,8 +221,7 @@ export interface PromptActions { canAct: boolean; last: boolean; index: number }
 /** What those actions do. One object that lives as long as the page, so that handing it to a message does not make the message look changed. */
 export interface PromptOps { edit: (index: number, text: string) => void; undo: () => void; rewind: (index: number) => void }
 
-function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: boolean; onSend: (t: string) => void; onCancel: () => void }) {
-  const [value, setValue] = useState(text)
+function PromptEditor({ value, onValue, last, onSend, onCancel }: { value: string; onValue: (t: string) => void; last: boolean; onSend: (t: string) => void; onCancel: () => void }) {
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Escape") { e.preventDefault(); onCancel() }
     else if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); if (value.trim()) onSend(value) }
@@ -213,7 +232,7 @@ function PromptEditor({ text, last, onSend, onCancel }: { text: string; last: bo
         autoFocus
         aria-label={t("Edit the prompt")}
         value={value}
-        onChange={(e) => setValue(e.target.value)}
+        onChange={(e) => onValue(e.target.value)}
         onKeyDown={onKey}
         onFocus={(e) => e.currentTarget.setSelectionRange(e.currentTarget.value.length, e.currentTarget.value.length)}
         className="field-sizing-content block max-h-72 min-h-12 w-full resize-none rounded-[20px] bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] outline-none ring-1 ring-line focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
@@ -288,7 +307,9 @@ function MessageViewOf({ m, streaming, compacting = false, show, prefill, action
   useLang()                                                    // a draw is skipped for a message that did not change: the language is its own reason to draw again
   const ref = useRef<HTMLDivElement>(null)
   const mine = useRef<HTMLDivElement>(null)
-  const [editing, setEditing] = useState(false)
+  const [, redraw] = useState(0)
+  const editing = edits.has(m)                                  // a prompt being rewritten, and what is written so far, are kept with the message: they are still there when another page is opened and the Chat is opened again
+  const setEditing = (on: boolean) => { if (on) edits.set(m, m.text); else edits.delete(m); redraw((n) => n + 1) }
   // The prompt that was just sent rises out of the composer (which it left a moment ago) to its place, fading in on the way. Its
   // own entrance is replaced by this; a message that was not just sent (a reload, a rewrite) keeps the plain one.
   useLayoutEffect(() => {
@@ -323,7 +344,7 @@ function MessageViewOf({ m, streaming, compacting = false, show, prefill, action
         {(m.text || editing) && (        // a prompt of only files has no words, so no empty bubble
           <Fit className="flex w-full justify-end">
             {editing && actions && ops
-              ? <PromptEditor text={m.text} last={actions.last} onCancel={() => setEditing(false)} onSend={(t) => { setEditing(false); ops.edit(actions.index, t) }} />
+              ? <PromptEditor value={edits.get(m) ?? m.text} onValue={(v) => { edits.set(m, v); redraw((n) => n + 1) }} last={actions.last} onCancel={() => setEditing(false)} onSend={(t) => { setEditing(false); ops.edit(actions.index, t) }} />
               : <div className="max-w-[85%] whitespace-pre-wrap rounded-[20px] rounded-br-md bg-fill px-4 py-2.5 text-[15px] tracking-[-0.011em] [overflow-wrap:anywhere]"><SkillText text={m.text} /></div>}
           </Fit>
         )}

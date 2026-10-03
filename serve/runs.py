@@ -100,6 +100,8 @@ class RunStore:
             for c in chunks:
                 if c is None:
                     continue
+                if isinstance(c, dict):
+                    c = {**c, "strata_t": int(time.time() * 1000)}         # when it happened: a page that reads the run again later shows the real times (a thought's length), not the time of the replay
                 if not run.add(b"data: " + json.dumps(c, ensure_ascii=False).encode("utf-8") + b"\n\n"):
                     run.cancel.set()                                       # a stream of this size is not kept: stop it, and say so
                     run.add(b"data: " + json.dumps({"error": {"type": "server_error", "message": "the answer grew too large to be kept"}}).encode() + b"\n\n", force=True)

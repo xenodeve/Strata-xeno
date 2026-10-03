@@ -52,6 +52,16 @@ class TheStore(unittest.TestCase):
         self.assertEqual(self.read(run, 4), [])
         self.assertEqual(self.read(run, 99), [])
 
+    def test_each_event_says_when_it_happened_so_a_page_that_reads_it_later_shows_the_real_times(self):
+        before = int(time.time() * 1000)
+        run = self.launch("run-tttttttt", [{"n": 1}, {"n": 2}])
+        events = [json.loads(e[len("data: "):]) for e in self.read(run) if not e.endswith("[DONE]" + chr(10) + chr(10))]
+        after = int(time.time() * 1000)
+        self.assertEqual([e["n"] for e in events], [1, 2])
+        for e in events:
+            self.assertTrue(before <= e["strata_t"] <= after, e)
+        self.assertLessEqual(events[0]["strata_t"], events[1]["strata_t"])
+
     def test_a_reader_gets_events_as_they_come_and_ends_with_the_run(self):
         hold = threading.Event()
         run = self.launch("run-bbbbbbbb", gen({"n": 1}, hold=hold))

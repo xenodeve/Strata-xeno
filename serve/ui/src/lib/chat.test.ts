@@ -1854,6 +1854,27 @@ describe("a refresh while the agent is working", () => {
     expect(new ChatController().messages).toHaveLength(2)                                // and it is stored: another refresh finds the answer
   })
 
+  test("read again, the thinking has the time it took and began, from the events' own times and the server's clock (not the time of the replay)", async () => {
+    keep()
+    const c = new ChatController()
+    const calls: { url: string; body?: string }[] = []
+    const leave = cutAfterFirst(c, calls)
+    const p = c.send("work on it", [], { ...ctx, agent: ON, folder: "C:/proj" })
+    await new Promise((r) => setTimeout(r, 20))
+    leave()
+    await p
+
+    const back = new ChatController()
+    const served = Date.now() + 3_600_000                                               // the server's clock is an hour ahead of this page's
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(
+      sse({ ...delta({ reasoning_content: "thinking" }), strata_t: served - 60_000 }, { ...delta({ content: "done" }), strata_t: served - 50_000 }),
+      { status: 200, headers: { "x-strata-now": String(served) } })
+    await back.resumeRuns()
+    const m = back.messages[1]
+    expect(m.thinkSecs).toBeCloseTo(10, 0)                                               // from the first thought to the first word: ten seconds, not the milliseconds the replay took
+    expect(Math.abs(m.thinkAt! - (Date.now() - 60_000))).toBeLessThan(2000)             // it began a minute ago by this page's clock
+  })
+
   test("while it is read again the conversation shows the answer being written, and Stop stops it in the server", async () => {
     keep()
     const c = new ChatController()

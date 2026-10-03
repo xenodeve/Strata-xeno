@@ -2593,6 +2593,48 @@ export const checks = [
     },
   },
   {
+    // A thought that goes on and on may be a loop: after a while the page says so, with Stop beside it; nothing is stopped for the reader.
+    name: "long thinking: after a long time the page says so and offers Stop, and Stop ends the answer",
+    async run({ browser, long, t, errors }) {
+      const pg = await open(browser, errors, { width: 1100, height: 800 })
+      await pg.addInitScript(() => { try { localStorage.setItem("strata.longThinkMs", "2000") } catch { /* private window */ } })
+      await pg.goto(long.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(900)
+      await pg.fill("textarea[aria-label='Message']", "think about it at length")
+      await pg.keyboard.press("Enter")
+      await pg.waitForSelector(".thought-timer", { timeout: 20000 })
+      t.ok("not at once: the hint is not there in the first moments", (await pg.locator("[data-long-thinking]").count()) === 0)
+      await pg.waitForSelector("[data-long-thinking]", { timeout: 20000 })
+      t.ok("after the time set the hint says so", (await pg.locator("[data-long-thinking]").innerText()).includes("Thinking for a long time"))
+      await pg.locator("[data-long-thinking]").getByRole("button", { name: "Stop" }).click()
+      await pg.waitForFunction(() => !document.querySelector("button[aria-label='Stop']"), null, { timeout: 15000 })
+      t.ok("Stop ended the answer and the hint is gone", (await pg.locator("[data-long-thinking]").count()) === 0)
+      await pg.context().close()
+    },
+  },
+  {
+    // A prompt that is being rewritten stays so, with what was written, when another page is opened and the Chat is opened again.
+    name: "remember: a prompt being rewritten is still being rewritten, with what was written, when the Chat is opened again",
+    async run({ browser, fast, t, errors }) {
+      const pg = await open(browser, errors, { width: 1100, height: 800 })
+      await pg.addInitScript(() => { if (!localStorage.getItem("strata.chat")) localStorage.setItem("strata.chat", JSON.stringify([{ role: "user", text: "the first words", time: 1 }, { role: "assistant", text: "yes", time: 2 }])) })
+      await pg.goto(fast.base + "/#/chat")
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      await pg.waitForTimeout(900)
+      await pg.getByRole("button", { name: "Edit this prompt" }).click({ force: true })
+      await pg.fill("textarea[aria-label='Edit the prompt']", "the first words, and some more")
+      await pg.getByRole("link", { name: "About", exact: true }).click()
+      await pg.waitForTimeout(500)
+      await pg.getByRole("link", { name: "Chat", exact: true }).click()
+      await pg.waitForSelector("textarea[aria-label='Message']")
+      t.ok("the editor is still open with what was written", (await pg.locator("textarea[aria-label='Edit the prompt']").count()) === 1 && (await pg.inputValue("textarea[aria-label='Edit the prompt']")) === "the first words, and some more")
+      await pg.getByRole("button", { name: "Cancel" }).click()
+      t.ok("Cancel closes it, as before", (await pg.locator("textarea[aria-label='Edit the prompt']").count()) === 0)
+      await pg.context().close()
+    },
+  },
+  {
     // code in an answer is coloured like an IDE, in the colours of the theme, and Copy still copies the plain text
     name: "code: code in an answer is coloured like an IDE in both themes and copies as plain text",
     async run({ browser, fast, t, errors }) {

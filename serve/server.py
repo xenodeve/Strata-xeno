@@ -2257,7 +2257,7 @@ def make_handler(svc: Service):
                         start = int(q.get("from", ["0"])[0])
                     except ValueError:
                         return self._json(400, {"error": {"message": "from is a number"}})
-                    self._sse()
+                    self._sse(now=True)
                     self._follow(run, start)
                 return
             if path == "/agent/web":
@@ -2749,10 +2749,12 @@ def make_handler(svc: Service):
                   if shared else "[strata] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
-        def _sse(self):
+        def _sse(self, now: bool = False):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
+            if now:
+                self.send_header("X-Strata-Now", str(int(time.time() * 1000)))      # the server's clock, so that the page can set the events' times (`strata_t`) against its own
             self.end_headers()
 
         def _follow(self, run, start: int = 0):

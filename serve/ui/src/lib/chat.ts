@@ -152,7 +152,7 @@ interface ToolEvent {
 }
 
 // a tool event from the stream (the `strata_mcp` field of a chunk)
-function onTool(m: Message, x: ToolEvent) {
+function onTool(m: Message, x: ToolEvent, at = Date.now()) {
   if (x.event === "limit") { m.limit = x.max_rounds; return }
   if (x.event === "todos") { if (Array.isArray(x.todos)) m.todos = x.todos; return }
   if (x.event === "answered" || x.event === "question_answered") {                           // a question was answered (by this page, or by another one before a refresh): read again, a card is not left waiting
@@ -212,7 +212,7 @@ function onTool(m: Message, x: ToolEvent) {
   if (x.event === "call") {
     Object.assign(t, { name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running" })
   } else if (x.event === "result") {
-    Object.assign(t, { result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, state: x.skipped ? "skipped" : x.ok ? "done" : "error", judging: false, doneAt: Date.now() })
+    Object.assign(t, { result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, state: x.skipped ? "skipped" : x.ok ? "done" : "error", judging: false, doneAt: at })
   }
 }
 
@@ -799,12 +799,16 @@ export class ChatController {
     const s = this.settings
     let m = m0, um = um0                                       // a message the user sent meanwhile ends the answer so far and starts another: they move on
     let firstAt: number | null = null
-    let thinkStart: number | null = null
+    let thinkFrom: number | null = null                        // when the thinking began (epoch ms, the time it happened, not the time it was read)
+    let lastAt = Date.now()                                    // the time of the latest event read
+    let skew = 0                                               // the server's clock against this page's (read again from its start, the events carry the time they happened at)
     let usage: { completion_tokens?: number; prompt_tokens?: number } | null = null
     let timings: { prompt_n?: number; prompt_per_second?: number | null; cache_n?: number; predicted_per_second?: number | null } | null = null
     try {
       const r = await open()
       if (!r.ok) throw new Error(await errorMessage(r))
+      const served = Number(r.headers.get("x-strata-now"))
+      if (resumed && Number.isFinite(served) && served > 0) skew = Date.now() - served
       const reader = r.body!.getReader()
       const dec = new TextDecoder()
       let buf = ""
@@ -822,30 +826,32 @@ export class ChatController {
           let j: any
           try { j = JSON.parse(data) } catch { continue }
           if (j.error) throw new Error(j.error.message || t("the engine reported an error"))
+          const at = resumed && typeof j.strata_t === "number" ? Math.min(Date.now(), j.strata_t + skew) : Date.now()        // the time it happened (read again from the start: not the time of the reading)
+          lastAt = at
           if (j.usage) usage = j.usage
           if (j.timings) timings = j.timings
           if (j.strata_mcp?.event === "steered" && typeof j.strata_mcp.text === "string") {
             const next = this.steered(id, run, conv, j.strata_mcp.text)
-            m = next.msg; um = next.prompt; firstAt = null; thinkStart = null
+            m = next.msg; um = next.prompt; firstAt = null; thinkFrom = null
             this.notify()
             continue
           }
           if (j.strata_mcp) {
-            onTool(m, j.strata_mcp)
+            onTool(m, j.strata_mcp, at)
             if (j.strata_mcp.event === "mode" && (j.strata_mcp.mode === "ask" || j.strata_mcp.mode === "plan" || j.strata_mcp.mode === "auto")) this.setSettings({ ...this.settings, agentMode: j.strata_mcp.mode })      // the plan was approved
           }
           const d = j.choices?.[0]?.delta || {}
           const lastTool = m.tools?.length ? m.tools[m.tools.length - 1] : null    // a new round after a tool
           if (d.reasoning_content) {
-            m.thinkAt ??= Date.now()
+            m.thinkAt ??= at
             firstAt ??= performance.now()
-            thinkStart ??= performance.now()
+            thinkFrom ??= at
             if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) m.reasoning += "\n\n"
             m.reasoning += d.reasoning_content
           }
           if (d.content) {
             firstAt ??= performance.now()
-            if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000
+            if (thinkFrom && m.thinkSecs == null) m.thinkSecs = Math.max(0, at - thinkFrom) / 1000
             if (lastTool && m.text && lastTool.at === m.text.length) m.text += "\n\n"
             m.text += d.content
           }
@@ -858,7 +864,7 @@ export class ChatController {
       if (err.name === "AbortError") m.stopped = true
       else { m.error = err.message || String(err); if (!resumed) this.onError(t("The request failed"), m.error) }
     }
-    if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000
+    if (thinkFrom && m.thinkSecs == null) m.thinkSecs = Math.max(0, lastAt - thinkFrom) / 1000
     // The read is over: the engine's own mean replaces the live speed. After a tool round the final timings are the last
     // round's (a different prompt), so then the mean is the one measured while the first prompt was read.
     const sampled = run.meter?.mean() ?? null

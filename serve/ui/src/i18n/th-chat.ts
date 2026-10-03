@@ -243,4 +243,5 @@ export const part: Record<string, string> = {
   "{read} of {total} tokens read": "อ่านแล้ว {read} จาก {total} token",
   "The answer stopped before you answered.": "คำตอบหยุดไปก่อนที่คุณจะตอบ",
   "Sent to the agent: it reads it at its next step": "ส่งให้ agent แล้ว: มันจะอ่านในขั้นตอนถัดไป",
+  "Thinking for a long time. If it seems to go round in a loop, stop it and ask again.": "คิดนานผิดปกติ ถ้าดูเหมือนวนซ้ำ ให้หยุดแล้วถามใหม่",
 }
