@@ -116,6 +116,8 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 @app.api_route("/{full:path}", methods=["GET", "HEAD", "POST", "OPTIONS"])
 async def front(full: str, request: Request):
     path = "/" + full
+    if path == "/next":                        # the site's rewrite can drop the trailing slash, and the server's redirect to "next/" is relative: serve the page itself
+        path = "/next/"
     method = request.method
     if method == "OPTIONS":
         return Response(status_code=204, headers={"Allow": "GET, HEAD, POST"})
