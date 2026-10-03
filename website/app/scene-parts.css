@@ -1,0 +1,259 @@
+/* The parts the scenes move with (components/scenes/parts.tsx), styled as the app styles them (serve/ui/src/styles.css, thought.css),
+   in the scene's own tokens: --a-ink is the app's ink, --a-mute its ink-2, --a-faint its ink-3. Written from what the app does; the
+   app's stylesheets are not copied. Reduced motion never reaches a scene as motion: a scene is only its last frame then. */
+
+.a-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* number pop-in */
+.a-popn {
+  display: inline-flex;
+  align-items: baseline;
+}
+.a-popn__d {
+  display: inline-block;
+  will-change: transform, opacity, filter;
+}
+.a-num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* the spinning counter: a reel per digit, a strip of fifty lines moved by whole cells, a streak while it moves */
+.a-reel {
+  --a-reel-cell: 1.35em;
+  display: inline-flex;
+  align-items: center;
+  height: var(--a-reel-cell);
+  vertical-align: 0.07em;
+  font-variant-numeric: tabular-nums;
+}
+.a-reel__col {
+  position: relative;
+  display: inline-block;
+  width: 1ch;
+  height: var(--a-reel-cell);
+  overflow: hidden;
+  text-align: center;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 22%, #000 78%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0%, #000 22%, #000 78%, transparent 100%);
+}
+.a-reel__strip {
+  display: block;
+  white-space: pre;
+  line-height: var(--a-reel-cell);
+  will-change: transform;
+}
+.a-reel__sep {
+  display: inline-block;
+}
+
+/* the lattice: the supplied LatticeLoader (app/lattice-loader.css); this only sets its colour and place */
+.a-lat {
+  display: inline-flex;
+  flex: none;
+  vertical-align: middle;
+  color: var(--a-mute);
+}
+
+/* the matrix: sixteen dots, one pulse of colour across them */
+.a-matrix {
+  --m-base: color-mix(in srgb, var(--a-ink) 14%, var(--a-bg));
+  --m-active: var(--a-mute);
+  display: inline-grid;
+  flex: none;
+  grid-template-columns: repeat(4, var(--m-dot, 2px));
+  grid-auto-rows: var(--m-dot, 2px);
+  gap: var(--m-gap, 2px);
+  vertical-align: middle;
+}
+.a-matrix i {
+  display: block;
+  border-radius: 22%;
+  background: var(--m-base);
+  animation: a-matrix-pulse 1200ms ease-in-out infinite;
+}
+.a-matrix i.is-gap {
+  visibility: hidden;
+  animation: none;
+}
+@keyframes a-matrix-pulse {
+  0%,
+  45%,
+  100% {
+    background-color: var(--m-base);
+  }
+  15% {
+    background-color: var(--m-active);
+  }
+}
+
+/* a live status: a band of full ink travels over half-strength ink, left to right, 2 s, linear */
+.a-shimmer {
+  background: linear-gradient(90deg, transparent, var(--a-ink), transparent) no-repeat, linear-gradient(color-mix(in srgb, var(--a-ink) 48%, transparent), color-mix(in srgb, var(--a-ink) 48%, transparent));
+  background-size: 80% 100%, 100% 100%;
+  background-position: -400% 0, 0 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: a-shimmer 2s linear infinite;
+}
+@keyframes a-shimmer {
+  to {
+    background-position: 500% 0, 0 0;
+  }
+}
+
+/* the thought line */
+.a-thought {
+  color: var(--a-ink);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.2;
+}
+.a-thought__head {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.25rem 0;
+  white-space: nowrap;
+}
+.a-thought__glyph {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+}
+.a-thought__label {
+  display: inline-grid;
+}
+.a-thought__text {
+  grid-area: 1 / 1;
+  width: max-content;
+}
+.a-thought__shimmer {
+  display: inline-block;
+  background: linear-gradient(100deg, color-mix(in srgb, var(--a-ink) 50%, transparent) 30%, var(--a-ink) 50%, color-mix(in srgb, var(--a-ink) 50%, transparent) 70%);
+  background-size: 250% 100%;
+  background-position: 125% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: a-thought-shimmer 1.8s linear infinite;
+}
+@keyframes a-thought-shimmer {
+  to {
+    background-position: -125% 0;
+  }
+}
+.a-thought__timer {
+  font-variant-numeric: tabular-nums;
+}
+.a-thought__chev {
+  flex: none;
+  margin-left: 0.1em;
+  opacity: 0.55;
+}
+
+/* the thought as it is written: a window of 10.5 rem, edges that fade only where there is more */
+@property --reason-fade-top {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --reason-fade-bottom {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+.a-reason {
+  max-height: 10.5rem;
+  margin-top: 4px;
+  overflow-y: hidden;
+  --reason-fade-top: 0px;
+  --reason-fade-bottom: 0px;
+  transition: --reason-fade-top 240ms var(--ease), --reason-fade-bottom 240ms var(--ease);
+  -webkit-mask-image: linear-gradient(transparent 0, black var(--reason-fade-top), black calc(100% - var(--reason-fade-bottom)), transparent 100%);
+  mask-image: linear-gradient(transparent 0, black var(--reason-fade-top), black calc(100% - var(--reason-fade-bottom)), transparent 100%);
+}
+.a-reason[data-above] {
+  --reason-fade-top: 28px;
+}
+.a-reason[data-below] {
+  --reason-fade-bottom: 28px;
+}
+.a-reason__text {
+  padding-left: 12px;
+  border-left: 1px solid var(--a-line);
+  color: var(--a-mute);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.625;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* the caret at the end of an answer that is still being written (`.streaming .prose-chat > :last-child::after`):
+   a block half an em wide, an em tall, in ink-3, that blinks once a second */
+.a-stream {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  border-radius: 2px;
+  background: var(--a-faint);
+  animation: a-blink 1s steps(2, start) infinite;
+}
+
+/* the orb: a slot of the size asked for; the library's canvas (a tuned 64, 32 or 20) is scaled to fit it */
+.a-orbslot {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  vertical-align: middle;
+}
+.a-orbslot__in {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  transform-origin: 0 0;
+}
+.a-orbslot canvas {
+  display: block;
+}
+
+/* a scene that glides: its box is as tall as what is on it, and takes a new height the way the app's panels do (lib/glide.ts: 420 ms,
+   cubic-bezier(0.4, 0, 0.2, 1)). Without it a scene that grows as it plays jumps, and what is centred round it jumps with it. */
+.scene--glide .scene__in {
+  min-height: 0;
+}
+.scene--glide.is-gliding {
+  transition: height 420ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* how far a scene has played: a thin bar along its foot, over the whole round (the scene, then its rest), as the progress of a short film */
+.scene__bar {
+  /* a span, not a div: the compare window gives every div directly in a scene the whole height of it */
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 4;
+  display: block;
+  height: 3px;
+  background: color-mix(in srgb, var(--a-ink) 8%, transparent);
+  pointer-events: none;
+}
+.scene__bar > i {
+  display: block;
+  height: 100%;
+  background: var(--a-accent);
+  transform-origin: 0 50%;
+  will-change: transform;
+}

@@ -1,0 +1,448 @@
+/* scenes: monitor-a - the Dashboard and Live pages (components/scenes/monitor-a-parts.tsx), laid out as serve/ui/src/pages/Dashboard.tsx and
+   Live.tsx lay them out, in the scene's own tokens (--a-ink is the app's ink, --a-mute its ink-2, --a-faint its ink-3). Nothing here moves:
+   what moves is a function of the clock in the component. */
+
+/* the orb in its slot: layers on top of each other (.orb-slot, .orb-layer) */
+.ma-orb {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  vertical-align: middle;
+}
+.ma-orb__l {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+}
+
+/* the head of a page: the orb, the state as a sentence, one quiet line */
+.ma-head {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  margin-bottom: 26px;
+}
+.ma-head.is-live {
+  gap: 14px;
+  margin-bottom: 8px;
+}
+.ma-head__t {
+  min-width: 0;
+}
+.ma-h1.m-head__h {
+  width: fit-content;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 1.08;
+}
+.ma-h1.is-dash {
+  font-size: 40px;
+  letter-spacing: -0.04em;
+  line-height: 1.02;
+}
+.ma-lede {
+  margin-top: 8px;
+  color: var(--a-mute);
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: -0.012em;
+}
+.ma-lede.is-sub {
+  margin-top: 4px;
+  font-size: 13px;
+}
+.ma-last {
+  margin-top: 3px;
+  color: var(--a-faint);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+html[lang="th"] .ma-h1.m-head__h {
+  letter-spacing: 0;
+  line-height: 1.35;
+}
+html[lang="th"] .ma-lede {
+  line-height: 1.7;
+  letter-spacing: 0;
+}
+
+/* the Dashboard's two columns (7 : 5), and the blocks in each */
+.ma-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 26px 40px;
+}
+@container (min-width: 760px) {
+  .ma-cols {
+    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+  }
+}
+.ma-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  min-width: 0;
+}
+
+/* a block (Dashboard) or a section (Live): a rule, a heading, a quiet word at the right */
+.ma-block {
+  padding-top: 14px;
+  border-top: 1px solid var(--a-line);
+}
+.ma-block.is-live {
+  margin-top: 26px;
+}
+.ma-block__h {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+.ma-block__h b {
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+.ma-block__h span {
+  color: var(--a-faint);
+  font-size: 11.5px;
+}
+.ma-block.is-live .ma-block__h span {
+  color: var(--a-mute);
+}
+.ma-block__b {
+  margin-top: 8px;
+}
+html[lang="th"] .ma-block__h b {
+  letter-spacing: 0;
+  line-height: 1.5;
+}
+
+/* a few labelled figures on one line (Facts) */
+.ma-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 26px;
+  margin: 0;
+}
+.ma-facts dt {
+  color: var(--a-faint);
+  font-size: 11px;
+}
+.ma-facts dd {
+  margin: 0;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+.ma-unit {
+  color: var(--a-mute);
+}
+.ma-dim {
+  color: var(--a-faint);
+}
+
+/* the rows of a section (Rows, Row) */
+.ma-rows {
+  margin: 0;
+}
+.ma-rows > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--a-line);
+  font-size: 13.5px;
+}
+.ma-rows > div:last-child {
+  border-bottom: 0;
+}
+.ma-rows dt {
+  color: var(--a-mute);
+}
+.ma-rows dt small {
+  margin-left: 8px;
+  color: var(--a-faint);
+  font-size: 11px;
+}
+.ma-rows dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* the chart: an axis of values at the left, a plot with gridlines, a line and the wash under it */
+.ma-chart-h {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 14px 0 4px;
+  color: var(--a-faint);
+  font-size: 11px;
+}
+.ma-chart-h span:last-child {
+  font-variant-numeric: tabular-nums;
+}
+.ma-chart-wrap {
+  margin-top: 12px;
+}
+.ma-chart-t {
+  margin-bottom: 4px;
+  color: var(--a-mute);
+  font-size: 11px;
+}
+.ma-chart {
+  position: relative;
+  overflow: visible;
+}
+.ma-chart__plot {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  bottom: 6px;
+  left: 44px;
+}
+.ma-chart__plot.is-bare {
+  left: 0;
+}
+.ma-chart__plot svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.ma-chart__g {
+  stroke: var(--a-line);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.ma-chart__l {
+  fill: none;
+  stroke: var(--a-ink);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.ma-chart__y {
+  position: absolute;
+  left: 0;
+  width: 38px;
+  color: var(--a-mute);
+  font-size: 11px;
+  line-height: 1;
+  text-align: right;
+  transform: translateY(-50%);
+  font-variant-numeric: tabular-nums;
+}
+
+/* numbers that pop in: one group per number */
+.ma-pop {
+  display: inline-flex;
+  align-items: baseline;
+}
+.ma-pop__d {
+  display: inline-block;
+  will-change: transform, opacity, filter;
+}
+
+/* the list of requests (RequestList): a row is the prompt and its line, then what was read and the two speeds */
+.ma-reqs-gap {
+  margin-top: 10px;
+}
+.ma-reqs {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ma-reqs > li {
+  border-bottom: 1px solid var(--a-line);
+}
+.ma-reqs > li:last-child {
+  border-bottom: 0;
+}
+.ma-req {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 22px;
+  padding: 9px 0;
+}
+.ma-req__t {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+.ma-req__p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.ma-req__m {
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--a-mute);
+  font-size: 11px;
+}
+.ma-req__n {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  min-width: 0;
+  align-items: baseline;
+  gap: 18px;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+.ma-req__n > span:first-child {
+  color: var(--a-mute);
+}
+
+/* the Hardware block: a card per GPU (orb, name, load, a bar, memory and link), then the CPU and RAM side by side */
+.ma-block .m-gpu {
+  padding: 7px 0;
+}
+.ma-gpu__l {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+}
+.ma-gpu__n {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  white-space: nowrap;
+}
+.ma-gpu__n i {
+  margin-left: -3px;
+  color: var(--a-faint);
+  font-style: normal;
+}
+.ma-gpu__v {
+  flex: none;
+  color: var(--a-mute);
+  font-variant-numeric: tabular-nums;
+}
+.ma-bar {
+  width: 100%;
+  height: 4px;
+  margin-top: 6px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: var(--a-fill);
+}
+.ma-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--a-mute);
+}
+.ma-gpu__s {
+  margin-top: 4px;
+  color: var(--a-faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.ma-duo {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 20px;
+  margin-top: 8px;
+}
+.ma-duo__h {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--a-faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.ma-duo__h b {
+  color: var(--a-mute);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.ma-model-on {
+  margin-top: 10px;
+  font-size: 11px;
+}
+
+/* where the last request's experts ran: one bar of four shades of ink, and what each is */
+.ma-block .m-stack {
+  height: 8px;
+  margin-bottom: 0;
+  border-radius: 99px;
+  background: var(--a-fill);
+}
+.ma-block .m-stack > i {
+  display: block;
+  background: var(--a-ink);
+}
+.ma-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  margin: 12px 0 0;
+  font-size: 12.5px;
+}
+.ma-legend > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ma-legend__d {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--a-ink);
+}
+.ma-legend dt {
+  color: var(--a-mute);
+}
+.ma-legend dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.ma-over {
+  margin-top: 8px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* the two blocks that open when asked (Disclosure): title, a hint, a chevron */
+.ma-fold {
+  padding: 6px 0;
+  border-top: 1px solid var(--a-line);
+}
+.ma-fold__b {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: 14.5px;
+}
+.ma-fold__b b {
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+.ma-fold__b em {
+  margin-left: 10px;
+  color: var(--a-faint);
+  font-size: 11.5px;
+  font-style: normal;
+  font-weight: 400;
+}
+.ma-fold__c {
+  flex: none;
+  color: var(--a-faint);
+}

@@ -1,0 +1,229 @@
+/* scenes: monitor-b - new rules for the parts rewritten to move as the app moves (components/scenes/monitor-b-parts.tsx).
+   Layout follows the app's own pages (pages/Requests.tsx, pages/Hardware.tsx, pages/Dashboard.tsx), in the scene's tokens. */
+
+/* ── the Requests page ─────────────────────────────────────────────── */
+.mb-keep {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-top: 14px;
+  color: var(--a-mute);
+  font-size: 12px;
+}
+.mb-keep .m-pill {
+  min-width: 26px;
+  margin-left: 0;
+  padding: 3px 8px;
+  font-weight: 500;
+}
+.mb-tl {
+  margin-top: 8px;
+  color: var(--a-mute);
+  font-size: 12px;
+}
+.mb-a {
+  text-decoration: underline;
+  text-decoration-color: var(--a-bubble);
+  text-underline-offset: 3px;
+}
+.mb-list {
+  margin-top: 14px;
+}
+
+/* a list of requests: the title and what it says under it, the figures to the right; it wraps when it is narrow */
+.mb-req {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 24px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--a-line);
+}
+.mb-req:last-child {
+  border-bottom: 0;
+}
+.mb-req__a {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+.mb-req__t {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.mb-req__m {
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--a-mute);
+  font-size: 11px;
+}
+.mb-req__n {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  min-width: 0;
+  align-items: baseline;
+  gap: 18px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.mb-u {
+  color: var(--a-mute);
+}
+
+/* ── the Hardware page ─────────────────────────────────────────────── */
+.mb-orb {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+}
+.mb-bar {
+  height: 4px;
+}
+.mb-dev {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--a-line);
+}
+.mb-dev:last-child {
+  border-bottom: 0;
+}
+.mb-dev.m-gpu {
+  padding: 10px 0;
+}
+.mb-dev__h {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.mb-dev__n {
+  font-size: 14px;
+  font-weight: 500;
+}
+.mb-dev__s {
+  color: var(--a-mute);
+  font-size: 11px;
+}
+.mb-dev__b {
+  margin-top: 8px;
+}
+.mb-figs {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0 14px;
+  margin-top: 6px;
+  color: var(--a-mute);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.mb-rows {
+  margin: 0;
+}
+.mb-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--a-line);
+  font-size: 13px;
+}
+.mb-row:last-child {
+  border-bottom: 0;
+}
+.mb-row dt {
+  color: var(--a-mute);
+}
+.mb-row dt small {
+  margin-left: 8px;
+  color: var(--a-faint);
+  font-size: 11px;
+}
+.mb-row dd {
+  margin: 0;
+  text-align: right;
+}
+.mb-row--hot {
+  margin: 0 -8px;
+  padding: 8px;
+  border-radius: 8px;
+  border-bottom-color: transparent;
+  background: var(--a-fill);
+}
+.mb-n {
+  font-variant-numeric: tabular-nums;
+}
+.mb-nm {
+  color: var(--a-faint);
+}
+
+/* ── the Dashboard's hardware block, and where the experts ran ─────── */
+.mb-gpu.m-gpu {
+  padding: 8px 0;
+}
+.mb-gpu__n {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+.mb-gpu__who {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.mb-gpu__who span {
+  color: var(--a-faint);
+}
+.mb-gpu__v {
+  flex: none;
+  color: var(--a-mute);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.mb-gpu__s {
+  margin-top: 5px;
+  color: var(--a-faint);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.m-sec .m-stack {
+  background: var(--a-fill);
+}
+.mb-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  font-size: 12px;
+}
+.mb-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mb-legend em {
+  color: var(--a-mute);
+  font-style: normal;
+}
+.mb-legend b {
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.mb-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--a-ink);
+}

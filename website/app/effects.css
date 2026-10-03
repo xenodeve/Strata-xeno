@@ -1,0 +1,800 @@
+/* Text that moves (components/text/Fx.tsx). The hidden start states exist only under html.js, so a page without scripts
+   shows finished text; with reduced motion every effect is its finished state. One easing, the site's durations. */
+
+/* SlideUpText: each word rises out of its own mask */
+.su__w {
+  display: inline-block;
+  overflow: hidden;
+  vertical-align: top;
+  /* room for ascenders and descenders, so the mask does not cut the letters */
+  padding-block: 0.14em;
+  margin-block: -0.14em;
+}
+.su__w > span {
+  display: inline-block;
+  transition: transform 760ms var(--ease);
+  transition-delay: calc(var(--d, 0ms) + var(--i, 0) * 46ms);
+}
+html.js .su:not(.is-in) .su__w > span {
+  transform: translateY(112%);
+}
+
+/* HighlightedText: a highlighter sweeps in behind the words */
+.hl {
+  --hl: color-mix(in srgb, var(--accent) 26%, transparent);
+  padding: 0 0.12em;
+  margin: 0 -0.06em;
+  border-radius: 0.14em;
+  color: inherit;
+  background: linear-gradient(var(--hl), var(--hl)) no-repeat;
+  background-size: 100% 100%;
+  background-position: left center;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  transition: background-size 900ms var(--ease) var(--d, 0ms);
+}
+.hl[data-from="right"] {
+  background-position: right center;
+}
+html.js .hl:not(.is-in) {
+  background-size: 0% 100%;
+}
+
+/* Marquee: a band that drifts sideways; the pointer or the keyboard pauses it */
+.mq {
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent);
+}
+.mq__track {
+  display: flex;
+  width: max-content;
+  animation: mq var(--dur, 40s) linear infinite;
+  will-change: transform;
+}
+.mq[data-reverse] .mq__track {
+  animation-direction: reverse;
+}
+.mq:hover .mq__track,
+.mq:focus-within .mq__track {
+  animation-play-state: paused;
+}
+.mq__set {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--gap, 14px);
+  padding-right: var(--gap, 14px);
+}
+@keyframes mq {
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* TextMarquee: one word at a time rolls through a window beside a fixed phrase */
+.tm {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 0.28em;
+  line-height: 1.25;
+}
+.tm__win {
+  display: inline-block;
+  height: 1.25em;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 18%, #000 82%, transparent);
+  mask-image: linear-gradient(180deg, transparent, #000 18%, #000 82%, transparent);
+}
+.tm__col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transition: transform 700ms var(--ease);
+}
+.tm__col[data-snap] {
+  transition: none;
+}
+.tm__item {
+  display: block;
+  height: 1.25em;
+  white-space: nowrap;
+  opacity: 0.35;
+  transition: opacity 500ms var(--ease);
+}
+.tm__item[data-on] {
+  opacity: 1;
+}
+
+/* GradientWaveText: a slow wave of colour along the letters */
+.gw {
+  --gw0: var(--ink);
+  --gw1: var(--accent);
+  background-image: linear-gradient(90deg, var(--gw0), var(--gw1), var(--gw0), var(--gw1), var(--gw0));
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: gw 7s linear infinite;
+}
+@keyframes gw {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* RandomizedText: the real text holds the place; the scramble is laid over it while it runs */
+.rt {
+  position: relative;
+}
+html.js .rt[data-p="idle"] .rt__real {
+  opacity: 0;
+}
+.rt[data-p="run"] .rt__real {
+  opacity: 0;
+}
+.rt__ov {
+  position: absolute;
+  inset: 0;
+  white-space: pre-wrap;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .su__w > span {
+    transition: none;
+  }
+  html.js .su:not(.is-in) .su__w > span {
+    transform: none;
+  }
+  .hl {
+    transition: none;
+  }
+  html.js .hl:not(.is-in) {
+    background-size: 100% 100%;
+  }
+  .mq {
+    overflow-x: auto;
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+  .mq__track {
+    animation: none;
+  }
+  .mq__set[aria-hidden="true"] {
+    display: none;
+  }
+  .gw {
+    animation: none;
+  }
+  html.js .rt[data-p="idle"] .rt__real {
+    opacity: 1;
+  }
+  .tm__col {
+    transition: none;
+  }
+}
+
+/* ── the canvases and the pixel swap (rules as supplied with the React Bits components, plus the wrappers) ── */
+.tech-text {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  touch-action: pan-y;
+  user-select: none;
+}
+.tech-text-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.warp-text {
+  position: relative;
+  display: block;
+  width: 100%;
+  min-height: 220px;
+  overflow: hidden;
+  isolation: isolate;
+  border-radius: inherit;
+}
+.warp-text canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.pixel-swap {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  isolation: isolate;
+  outline: none;
+}
+.pixel-swap:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.pixel-swap__layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.pixel-swap__layer[data-visible="false"] {
+  visibility: hidden;
+}
+.pixel-swap__grid {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+.pixel-swap__pixel {
+  position: absolute;
+  overflow: hidden;
+  opacity: 0;
+  contain: paint;
+}
+.pixel-swap__pixel-content {
+  position: absolute;
+}
+
+.tw {
+  position: relative;
+  width: 100%;
+}
+.tw--tech {
+  height: clamp(220px, 26vw, 340px);
+}
+.tw--warp {
+  height: clamp(220px, 30vw, 360px);
+}
+.tw--warp .warp-text {
+  height: 100%;
+}
+.tw__plain {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  margin: 0;
+  font-family: "Instrument Serif", Georgia, "Anuphan Variable", serif;
+  font-size: clamp(3.4rem, 11vw, 9.5rem);
+  line-height: 1;
+  letter-spacing: -0.025em;
+  text-align: center;
+}
+
+/* the tools band, the statement and the closing name */
+.tools__line {
+  margin: 0 0 clamp(28px, 4vw, 52px);
+  font-size: clamp(1.9rem, 4.4vw, 3.8rem);
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 1.1;
+  text-align: center;
+}
+html[lang="th"] .tools__line {
+  letter-spacing: 0;
+  line-height: 1.3;
+}
+.tools__line .tm {
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.3em;
+}
+.tools__line .tm__item[data-on] {
+  color: var(--accent);
+}
+.tools__strips {
+  display: grid;
+  gap: 14px;
+}
+.fxchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 0.95rem;
+  white-space: nowrap;
+}
+.fxchip--tool {
+  font-size: 0.85rem;
+}
+.fxchip__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+.statement__cap {
+  margin: 12px auto 0;
+  text-align: center;
+}
+.cta-band__hint {
+  margin: 0 auto clamp(20px, 3vw, 36px);
+  text-align: center;
+}
+
+/* the film: the Play button over the poster until the film is in memory */
+.film {
+  position: relative;
+}
+.film__play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: 0 24px 0 20px;
+  border: 1px solid rgb(255 255 255 / 0.5);
+  border-radius: 999px;
+  background: rgb(10 10 12 / 0.62);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+  transform: translate(-50%, -50%);
+  transition: background var(--t2) var(--ease), transform var(--t2) var(--ease);
+}
+.film__play:hover:not(:disabled) {
+  background: rgb(10 10 12 / 0.8);
+  transform: translate(-50%, -50%) scale(1.04);
+}
+.film__play:disabled {
+  cursor: progress;
+}
+
+
+/* ── comparison charts (components/charts/Chart.tsx) ───────────────────────────────────────────── */
+.chart {
+  margin: 0;
+  padding: 20px 22px 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--r3);
+  background: var(--surface);
+}
+.chart--compact {
+  padding: 16px 18px 14px;
+}
+.chart__top {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 16px;
+}
+.chart__title {
+  color: var(--ink-2);
+}
+.chart__dir {
+  color: var(--ink-3);
+}
+.chart__plot {
+  display: grid;
+  grid-template-columns: minmax(64px, 96px) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px 14px;
+  margin-top: 16px;
+}
+.chart__group {
+  display: contents;
+}
+.chart__glabel {
+  font-size: 0.85rem;
+  color: var(--ink-2);
+  line-height: 1.3;
+}
+.chart__bars {
+  display: grid;
+  gap: 6px;
+  padding-block: 4px;
+  /* grid lines: one at every step of the scale, and one at its end */
+  background-image: repeating-linear-gradient(90deg, var(--line) 0 1px, transparent 1px calc(100% / var(--n)));
+  border-right: 1px solid var(--line);
+}
+.chart__row {
+  position: relative;
+  height: 24px;
+}
+.chart__bar {
+  display: block;
+  height: 100%;
+  border-radius: 0 5px 5px 0;
+  transition: width 900ms var(--ease);
+}
+.chart__bar--mine,
+.chart__bar--plain {
+  background: var(--accent);
+}
+.chart__bar--theirs {
+  background: color-mix(in srgb, var(--ink) 26%, var(--surface));
+}
+.chart__val {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: opacity 420ms var(--ease);
+}
+.chart__val small {
+  font-weight: 400;
+  opacity: 0.75;
+}
+.chart__val--mine,
+.chart__val--plain {
+  color: var(--accent);
+}
+.chart__val--theirs {
+  color: var(--ink-2);
+}
+.chart__val.is-in.chart__val--mine,
+.chart__val.is-in.chart__val--plain {
+  color: #fff;
+}
+.chart__val.is-in.chart__val--theirs {
+  color: var(--ink);
+}
+.chart__delta {
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+  transition: opacity 420ms var(--ease);
+}
+.chart__axis {
+  position: relative;
+  height: 1.2em;
+  margin-top: -8px;
+  color: var(--ink-3);
+  font-size: 0.7rem;
+}
+.chart__axis span {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+}
+.chart__axis span:first-child {
+  transform: none;
+}
+.chart__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--ink-2);
+}
+.chart__sw {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 2px;
+  border-radius: 3px;
+  vertical-align: -1px;
+}
+.chart__sw--mine,
+.chart__sw--plain {
+  background: var(--accent);
+}
+.chart__sw--theirs {
+  background: color-mix(in srgb, var(--ink) 26%, var(--surface));
+}
+.chart__cap {
+  margin: 10px 0 0;
+  color: var(--ink-3);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+@media (max-width: 560px) {
+  .chart__plot {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+  /* on a phone the difference moves under its bars */
+  .chart__delta {
+    grid-column: 2;
+    justify-self: start;
+    margin-top: -6px;
+  }
+  .chart__none {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chart__bar,
+  .chart__val,
+  .chart__delta {
+    transition: none;
+  }
+}
+
+/* a chart inside a card: no second frame, just a rule above it */
+.chart--compact {
+  margin-top: 22px;
+  padding: 18px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+}
+.topic > .chart,
+.mcard > .chart {
+  margin-block: 26px;
+}
+
+/* the particle field (rule as supplied with the React Bits component, plus the wrapper) */
+.particles-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+.pfield {
+  position: absolute;
+  pointer-events: none;
+  z-index: 0;
+}
+.pfield canvas {
+  display: block;
+}
+.hero__particles {
+  inset: -14% -18% 6% -18%;
+  opacity: 0.85;
+}
+.cta-band {
+  position: relative;
+  overflow: clip;
+}
+.cta-band > .wrap {
+  position: relative;
+  z-index: 1;
+}
+.cta-band__particles {
+  inset: 0;
+  opacity: 0.55;
+}
+
+/* the aurora (rule as supplied with the React Bits component, plus the wrapper) */
+.aurora-container {
+  width: 100%;
+  height: 100%;
+}
+.afield {
+  position: absolute;
+  pointer-events: none;
+  z-index: 0;
+}
+.afield canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.statement {
+  position: relative;
+  overflow: clip;
+}
+.statement > .wrap {
+  position: relative;
+  z-index: 1;
+}
+/* the aurora fades into the page on every side, so it is a glow, not a box */
+.statement__aurora {
+  inset: 0;
+  opacity: 0.9;
+  -webkit-mask-image: radial-gradient(ellipse 62% 66% at 50% 44%, #000 28%, transparent 100%);
+  mask-image: radial-gradient(ellipse 62% 66% at 50% 44%, #000 28%, transparent 100%);
+}
+
+/* ── the band of shapes (ShapeWaves, WebGPU). Its own rules, as supplied, and the band around it ── */
+.shape-waves {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  pointer-events: none;
+  isolation: isolate;
+}
+.shape-waves__canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transition: opacity 600ms cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: none;
+}
+.shape-waves[data-ready="true"] .shape-waves__canvas {
+  opacity: 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .shape-waves__canvas {
+    transition: none;
+  }
+}
+.waves {
+  position: relative;
+  height: clamp(240px, 34vw, 420px);
+  background: #0b0b0d;
+  overflow: hidden;
+}
+.waves__still,
+.waves__gl {
+  position: absolute;
+  inset: 0;
+}
+/* what stays without WebGPU: a still band of dots with the name on it */
+.waves__still {
+  display: grid;
+  place-items: center;
+  background: radial-gradient(circle, #4a4a53 1.4px, transparent 2px) 0 0 / 13px 13px;
+  -webkit-mask-image: radial-gradient(ellipse 80% 90% at 50% 50%, #000 30%, transparent 100%);
+  mask-image: radial-gradient(ellipse 80% 90% at 50% 50%, #000 30%, transparent 100%);
+}
+.waves__word {
+  font-weight: 700;
+  font-size: clamp(2.6rem, 10vw, 7.5rem);
+  letter-spacing: -0.04em;
+  color: #0b0b0d;
+  text-shadow: 0 0 0 #0b0b0d, 0 0 44px #0b0b0d, 0 0 20px #0b0b0d;
+}
+.waves__hint {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  z-index: 2;
+  margin: 0;
+  padding: 3px 14px;
+  border-radius: 999px;
+  background: #0b0b0d;
+  color: #8d8d97;
+  transform: translateX(-50%);
+}
+
+/* ── a word made of points (components/text/ParticleText.tsx, components/home/Gather.tsx) ── */
+.particle-text__still {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  line-height: 1;
+  text-align: center;
+}
+/* with scripts the canvas is the picture and the text stays for assistive technology only */
+html.js .particle-text__still {
+  inset: auto;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.gather {
+  position: relative;
+  height: clamp(260px, 34vw, 380px);
+  background: #09090f;
+  overflow: hidden;
+}
+.gather__hint {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  z-index: 2;
+  margin: 0;
+  padding: 3px 14px;
+  border-radius: 999px;
+  background: #09090f;
+  color: #8d8d97;
+  transform: translateX(-50%);
+}
+
+/* the supplied menu takes its outline away; a keyboard still has to see where it is */
+.branched-menu button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* where the nine moods have got to: the bar follows the scroll (the story's own --f, 0 to the last mood) */
+.story__prog {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 0 auto 14px;
+  max-width: 560px;
+}
+.story__prog > i {
+  position: relative;
+  flex: 1;
+  height: 3px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--ink) 16%, transparent);
+  overflow: hidden;
+}
+.story__prog > i::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--ink);
+  transform-origin: 0 50%;
+  transform: scaleX(calc(var(--f, 0) / var(--last, 1)));
+}
+.story__prog > span {
+  flex: none;
+  color: var(--ink-2);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* the mark of another coding app (components/HarnessIcon.tsx): a small light tile, so a dark mark reads on a dark page */
+.hicon {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  border: 1px solid rgb(0 0 0 / 0.08);
+  border-radius: 6px;
+  background: #fff;
+  vertical-align: middle;
+}
+.hicon img {
+  display: block;
+  width: var(--hi);
+  height: var(--hi);
+}
+
+/* a label of the topic menu that is longer than its row is carried across it and back (the pause at each end lets it be read), where it
+   used to be cut off; with reduced motion it is shortened with an ellipsis instead. The measure is made in components/details/DetailsApp.tsx. */
+.branched-menu__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.branched-menu__text {
+  display: inline-block;
+  white-space: nowrap;
+}
+.branched-menu__label[data-marquee] {
+  -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 18px), transparent);
+  mask-image: linear-gradient(90deg, #000 calc(100% - 18px), transparent);
+}
+.branched-menu__label[data-marquee] .branched-menu__text {
+  animation: bm-carry var(--dur, 4s) ease-in-out infinite alternate;
+}
+@keyframes bm-carry {
+  0%,
+  22% {
+    transform: translateX(0);
+  }
+  78%,
+  100% {
+    transform: translateX(calc(var(--shift, 0px) * -1));
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .branched-menu__label[data-marquee] {
+    -webkit-mask-image: none;
+    mask-image: none;
+    text-overflow: ellipsis;
+  }
+  .branched-menu__label[data-marquee] .branched-menu__text {
+    display: inline;
+    animation: none;
+  }
+}
+
+/* a slash command or a skill in a line of text: bold, as in the app's messages (.skill-tag, weight 600) */
+.slash {
+  font-weight: 600;
+}

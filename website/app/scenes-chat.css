@@ -1,0 +1,794 @@
+/* scenes: chat. The chat of the app, rebuilt for a clock (components/scenes/chat.tsx, chat-parts.tsx). Sizes and spacing are the app's
+   (serve/ui/src: styles.css, prompt-bar.css, branched-menu.css, thought.css), written again in this site's own tokens: --a-ink is the app's
+   ink, and the app's ink-2 / ink-3 / line / fill / hover are that ink mixed into the surface, as styles.css mixes them. */
+
+.c {
+  --c-2: color-mix(in srgb, var(--a-ink) 62%, var(--a-surface));
+  --c-3: color-mix(in srgb, var(--a-ink) 40%, var(--a-surface));
+  --c-hover: color-mix(in srgb, var(--a-ink) 8%, transparent);
+  --c-fill: color-mix(in srgb, var(--a-ink) 12%, transparent);
+  --c-fill2: color-mix(in srgb, var(--a-ink) 18%, transparent);
+  --c-line: color-mix(in srgb, var(--a-ink) 11%, transparent);
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
+  color: var(--a-ink);
+}
+.c[data-lang="th"],
+.c[data-lang="th"] * {
+  letter-spacing: 0;
+}
+.c .num {
+  font-variant-numeric: tabular-nums;
+}
+.c-pad {
+  padding: 18px 20px;
+}
+
+/* a scene that grows as it plays keeps the room of its last frame (the last frame is laid out invisibly under the live one) */
+.c-reserve {
+  display: grid;
+}
+.c-reserve > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+.c-reserve__last {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* ── orbs: one slot; a form that changes dissolves while the new one resolves ── */
+.c-orb {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  vertical-align: middle;
+}
+.c-orb__l {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+}
+.c-sl {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--c-2);
+}
+
+/* ── the page: top bar, the list at the side, the conversation and its composer ── */
+.c-run {
+  height: 600px;
+}
+.c-split {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+  column-gap: 16px;
+  padding: 0 14px;
+}
+.c-chat {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-width: 56rem;
+  margin: 0 auto;
+}
+.c-follow {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.c-list {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 4px 24px;
+}
+.c-list > * + * {
+  margin-top: 24px;
+}
+.c-heroc {
+  margin-bottom: -24px;
+}
+.c-dock {
+  padding: 0 4px 12px;
+}
+.c-side {
+  display: none;
+  flex-direction: column;
+  gap: 16px;
+  padding-top: 8px;
+}
+@container (min-width: 780px) {
+  .c-split {
+    grid-template-columns: 250px minmax(0, 1fr);
+  }
+  .c-side {
+    display: flex;
+  }
+}
+
+/* ── the list at the side (Sidebar.tsx, branched-menu.css) ── */
+.c-side__new {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 500;
+}
+.c-side__h {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--c-3);
+}
+.c-side__plus {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  font-size: 15px;
+  font-weight: 400;
+}
+.c-bm {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  padding-left: 14px;
+  font-size: 13px;
+  line-height: 1.2;
+}
+.c-bm::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  border-radius: 1px;
+  background: linear-gradient(to bottom, var(--c-fill2) 0%, var(--c-fill2) 55%, transparent 100%);
+}
+.c-bm__mark {
+  position: absolute;
+  top: 9px;
+  left: 0;
+  z-index: 1;
+  width: 2px;
+  height: 16px;
+  border-radius: 1px;
+  background: var(--a-ink);
+}
+.c-bm__headrow {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.c-bm__head,
+.c-bm__head.a-side__p {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 9px 0;
+  border: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--a-ink);
+  font-size: 14px;
+  font-weight: 500;
+}
+.c-bm__n {
+  flex: none;
+  margin-right: 4px;
+  font-size: 11px;
+  color: var(--c-3);
+}
+.c-bm__tree {
+  position: relative;
+  height: 48px;
+  padding: 6px 0;
+}
+.c-bm__lines {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: visible;
+}
+.c-bm__base,
+.c-bm__reach {
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.c-bm__base {
+  stroke: var(--c-fill2);
+}
+.c-bm__reach {
+  stroke: var(--a-ink);
+}
+.c-bm__row {
+  display: flex;
+  align-items: center;
+  height: 36px;
+  min-width: 0;
+}
+.c-bm__item {
+  flex: 1;
+  min-width: 0;
+  padding-left: 40px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--a-ink);
+  font-weight: 500;
+}
+.c-bm__empty {
+  margin: 0;
+  padding: 4px 0 8px 40px;
+  font-size: 12px;
+  color: var(--c-3);
+}
+.c-run-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--a-accent);
+  animation: c-run-pulse 1.4s ease-in-out infinite;
+}
+.c-run-dot[data-running="asking"] {
+  background: #d98a00;
+}
+@keyframes c-run-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.1);
+  }
+}
+
+/* ── the empty chat ── */
+.c-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  max-width: 44ch;
+  margin: 0 auto;
+  padding-top: 24px;
+  text-align: center;
+}
+.c-hero__h {
+  margin: 24px 0 0;
+  font-size: 36px;
+  font-weight: 600;
+  line-height: 1.02;
+  letter-spacing: -0.04em;
+  text-wrap: balance;
+}
+.c[data-lang="th"] .c-hero__h {
+  line-height: 1.35;
+}
+.c-hero__pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  margin-top: 12px;
+  padding: 0 10px;
+  border-radius: 8px;
+  background: var(--c-fill);
+  font-size: 13px;
+  font-weight: 500;
+}
+.c-hero__lede {
+  margin-top: 12px;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--c-2);
+  letter-spacing: -0.012em;
+}
+.c-chev {
+  flex: none;
+  color: var(--c-3);
+}
+
+/* ── the user's message ── */
+.c-um {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+.c-um__b {
+  max-width: 85%;
+  padding: 10px 16px;
+  border-radius: 20px 20px 12px 20px;
+  background: var(--c-fill);
+  font-size: 15px;
+  letter-spacing: -0.011em;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.c-um__m {
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--c-3);
+}
+
+/* ── the answer: the thought, the tool cards, the text, the code ── */
+.c-am {
+  max-width: min(100%, 72ch);
+  font-size: 15px;
+  letter-spacing: -0.011em;
+}
+.c-th {
+  margin-bottom: 8px;
+}
+.c-wait {
+  display: flex;
+}
+.c-th.is-untimed .a-thought__timer {
+  display: none;
+}
+.c-tool.a-card {
+  margin: 8px 0;
+  border-color: var(--c-line);
+  border-radius: 12px;
+  background: none;
+  overflow: hidden;
+}
+.c-tool__h {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: left;
+  white-space: nowrap;
+}
+.c-tool__n {
+  flex: none;
+  font-weight: 500;
+}
+.c-tool__a {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--c-3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0;
+}
+/* the summary is text of the call (a path, a note): drawn by Code, as plain mono text in the app's grey, on one line */
+.c-tool__a .mk__code {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.c-tool__a .mk__ghost {
+  display: none;
+}
+.c-tool__s {
+  flex: none;
+  color: var(--c-2);
+}
+.c-tool__s.is-asking {
+  color: var(--a-ink);
+  font-weight: 500;
+}
+.c-tool__t {
+  flex: none;
+  color: var(--c-3);
+  font-variant-numeric: tabular-nums;
+}
+.c-ask {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid var(--c-line);
+  background: color-mix(in srgb, var(--c-hover) 40%, transparent);
+  white-space: normal;
+}
+.c-ask__q,
+.c-ask__q.a-ask__q {
+  font-size: 13px;
+  font-weight: 500;
+}
+.c-ask .a-ask__cmd {
+  margin: 0;
+  padding: 0.6em 0.75em;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  letter-spacing: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+.c-ask__why {
+  font-size: 12px;
+  color: var(--c-2);
+}
+.c-ask__b {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+}
+.c-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--c-line);
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 20px;
+}
+.c-btn--ink {
+  border-color: var(--a-ink);
+  background: var(--a-ink);
+  color: var(--a-surface);
+  font-weight: 500;
+}
+.c-ask__done,
+.c-ask__done.a-ask__q {
+  padding: 6px 12px;
+  border-top: 1px solid var(--c-line);
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--c-2);
+}
+.c-prose p {
+  margin: 0 0 0.8em;
+  font-size: 15px;
+  line-height: 1.68;
+  overflow-wrap: anywhere;
+}
+.c[data-lang="th"] .c-prose p {
+  line-height: 1.8;
+}
+.c-prose > :last-child {
+  margin-bottom: 0;
+}
+.c-prose .a-code {
+  font-size: 0.92em;
+  letter-spacing: 0;
+}
+.c-code {
+  margin: 0 0 0.75em;
+  border: 1px solid var(--mk-line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.c-code__h {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.35em 0.5em 0.35em 0.8em;
+  font-size: 12px;
+}
+.c-code__c {
+  padding: 0.15em 0.55em;
+  border-radius: 8px;
+}
+.c-code .a-codeb__p {
+  margin: 0;
+  padding: 0.8em;
+  overflow-x: auto;
+  font-size: 12.5px;
+  line-height: 1.55;
+  letter-spacing: 0;
+}
+.c-code .a-codeb__p code {
+  display: block;
+}
+/* the caret of an answer that is being written sits after its last block: here it is in the code block's own line */
+.c-code__after {
+  height: 22px;
+  padding-left: 2px;
+  font-size: 15px;
+  line-height: 22px;
+}
+
+/* ── the row under the answer ── */
+.c-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--c-3);
+}
+.c-handover {
+  position: relative;
+  display: inline-grid;
+  align-items: center;
+  justify-items: start;
+  min-height: 24px;
+}
+.c-handover > * {
+  grid-area: 1 / 1;
+}
+.c-handover__out {
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.c-foot .a-stats {
+  font-size: 12px;
+}
+.c-copy {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+}
+
+/* ── the composer (prompt-bar.css) ── */
+.c-pb {
+  position: relative;
+  width: 100%;
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--a-ink);
+  --pb-muted: color-mix(in srgb, var(--a-ink) 55%, transparent);
+}
+.c-pb__field {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 12px 10px;
+  border: 1px solid var(--c-line);
+  border-radius: 20px;
+  background: var(--a-surface);
+  box-shadow: 0 8px 32px rgb(0 0 0 / 0.07);
+}
+.c-pb__field[data-focus] {
+  border-color: color-mix(in srgb, var(--a-accent) 38%, transparent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--a-accent) 9%, transparent), 0 8px 32px rgb(0 0 0 / 0.07);
+}
+.c-pb__field::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  opacity: 0;
+  pointer-events: none;
+  background: radial-gradient(140% 120% at 0% 100%, color-mix(in srgb, var(--a-accent) 20%, transparent), transparent 62%);
+}
+.c-pb__field[data-focus][data-max]::before {
+  opacity: 1;
+}
+.c-pb__sparks {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  overflow: hidden;
+  pointer-events: none;
+}
+.c-pb__sparks i {
+  position: absolute;
+  bottom: -3px;
+  border-radius: 50%;
+  background: var(--a-accent);
+  box-shadow: 0 0 6px var(--a-accent);
+  opacity: 0;
+  animation: c-spark linear infinite;
+}
+@keyframes c-spark {
+  0% {
+    transform: translate3d(0, 0, 0);
+    opacity: 0;
+  }
+  18%,
+  78% {
+    opacity: 0.85;
+  }
+  100% {
+    transform: translate3d(var(--sway, 0px), -64px, 0);
+    opacity: 0;
+  }
+}
+.c-pb__input {
+  min-height: 24px;
+  font-size: 15px;
+  line-height: 24px;
+  letter-spacing: -0.011em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.c-pb__ph {
+  color: var(--c-3);
+}
+.c-caret {
+  display: inline-block;
+  width: 1.5px;
+  height: 19px;
+  margin-right: 1px;
+  vertical-align: -4px;
+  background: var(--a-accent);
+  animation: c-blink 1s steps(1) infinite;
+}
+@keyframes c-blink {
+  50% {
+    opacity: 0;
+  }
+}
+.c-pb__bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.c-pb__spacer {
+  flex: 1 1 auto;
+}
+.c-pb__tool,
+.c-pb__pick,
+.c-pb__send {
+  flex: none;
+}
+.c-pb__tool {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  color: color-mix(in srgb, var(--a-ink) 60%, transparent);
+}
+.c-pb__pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 9px;
+  border-radius: 9px;
+  color: color-mix(in srgb, var(--a-ink) 70%, transparent);
+  font-size: 12px;
+  font-weight: 500;
+}
+.c-pb__pick[data-max] {
+  color: var(--a-accent);
+}
+.c-pb__ring-t {
+  stroke: color-mix(in srgb, var(--a-ink) 18%, transparent);
+}
+.c-pb__ring-f {
+  stroke: currentColor;
+}
+.c-pb__send {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--a-ink) 12%, var(--a-surface));
+  color: color-mix(in srgb, var(--a-ink) 55%, var(--a-surface));
+}
+.c-pb__send[data-armed] {
+  background: var(--a-ink);
+  color: var(--a-surface);
+}
+.c-pb__glyph {
+  display: block;
+  width: 17px;
+  height: 17px;
+  transform-origin: 50% 50%;
+}
+
+/* the menu that opens above the bar (the coding mode) */
+.c-pb__menu {
+  position: absolute;
+  right: auto;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 3;
+  width: min(360px, 100%);
+  overflow: hidden;
+  border: 1px solid var(--c-line);
+  border-radius: 14px;
+  background: var(--a-surface);
+  box-shadow: 0 14px 40px -12px rgb(0 0 0 / 0.28), 0 1px 2px rgb(0 0 0 / 0.06);
+  transform-origin: bottom left;
+}
+.c-pb__menu-in {
+  padding: 14px 16px 16px;
+}
+.c-seg {
+  position: relative;
+  display: grid;
+  grid-auto-columns: 1fr;
+  grid-auto-flow: column;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 12px;
+  background: var(--c-fill);
+}
+.c-seg__pill {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: calc((100% - 8px) / 3);
+  height: 28px;
+  border-radius: 8px;
+  background: var(--a-surface);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.08);
+}
+.c-seg__b {
+  position: relative;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 28px;
+  text-align: center;
+}
+.c-seg__txt {
+  position: relative;
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--c-2);
+  overflow: hidden;
+}
+.c-seg__ghost {
+  position: absolute;
+  right: 0;
+  left: 0;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  visibility: hidden;
+  pointer-events: none;
+}
+.c-modes {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  min-height: 290px;
+}
+
+/* the listening scene: the empty chat above, the composer under it */
+.c-reserve__live {
+  display: flex;
+  flex-direction: column;
+}
+.c-lis {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+}
+.c-lis__dock {
+  margin-top: auto;
+  padding-top: 24px;
+}

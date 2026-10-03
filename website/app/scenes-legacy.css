@@ -1,0 +1,625 @@
+/* scenes: legacy - the classic app (serve/web: tokens.css, components.css, app.css), light skin, plain.
+   The classic has no entrance animation: nothing here transitions or animates except the caret blink (an endless loop in the
+   classic's own stylesheet). Its other moves (the chevron, the badges, the bars) are driven from the clock in legacy.tsx.
+   Sizes follow the classic's, scaled down a little so the screen fits the comparison window. */
+
+.cl-app {
+  /* tokens.css, light */
+  --cl-bg: #f9fafb;
+  --cl-surface: #ffffff;
+  --cl-surface-2: #f7f7f7;
+  --cl-line: #dee5ee;
+  --cl-line-soft: #eeeeee;
+  --cl-ink: #221e1f;
+  --cl-soft: #303030;
+  --cl-muted: #6f6f6f;
+  --cl-accent: #10b981;
+  --cl-accent-ink: #ffffff;
+  --cl-accent-tint: #ecfdf5;
+  --cl-accent-text: #0c8a60;
+  --cl-info: #0f97ff;
+  --cl-info-tint: #e8f4ff;
+  --cl-info-text: #0668c2;
+  --cl-warn: #e39b0b;
+  --cl-warn-tint: #fff6e0;
+  --cl-warn-text: #8a5a00;
+  --cl-danger-tint: #fdecee;
+  --cl-danger-text: #b01a2e;
+  --cl-sh-card: 0 18px 7px rgb(0 0 0 / 0.01), 0 10px 6px rgb(0 0 0 / 0.02), 0 4px 4px rgb(0 0 0 / 0.03), 0 1px 2px rgb(0 0 0 / 0.04);
+  --cl-sh-bar: 0 54px 21px rgb(0 0 0 / 0.01), 0 30px 18px rgb(0 0 0 / 0.03), 0 13px 13px rgb(0 0 0 / 0.05), 0 3px 7px rgb(0 0 0 / 0.06);
+  background: var(--cl-bg);
+  color: var(--cl-ink);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.cl-app .cl-ico {
+  flex: none;
+  display: block;
+}
+.cl-muted {
+  color: var(--cl-muted);
+}
+.cl-spacer {
+  flex: 1;
+}
+
+/* ── the header ─────────────────────────────────────────────────────── */
+.cl-header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  height: 44px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--cl-line);
+  background: var(--cl-surface);
+}
+.cl-brand {
+  font-size: 16px;
+  font-weight: 900;
+  letter-spacing: -0.01em;
+}
+.cl-tabs {
+  display: flex;
+  gap: 3px;
+  margin-left: 8px;
+  padding: 3px;
+  border: 1px solid var(--cl-line);
+  border-radius: 12px;
+  background: var(--cl-surface-2);
+}
+.cl-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  color: var(--cl-muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+}
+.cl-tab.is-on {
+  background: var(--cl-surface);
+  color: var(--cl-ink);
+  font-weight: 700;
+  box-shadow: var(--cl-sh-card);
+}
+.cl-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--cl-line);
+  border-radius: 999px;
+  background: var(--cl-surface-2);
+  color: var(--cl-soft);
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.cl-pill i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--cl-muted);
+}
+.cl-pill[data-state="generating"] i {
+  background: var(--cl-accent);
+  box-shadow: 0 0 0 3px var(--cl-accent-tint);
+}
+.cl-ibtn {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  color: var(--cl-muted);
+}
+.l-code__h .cl-ibtn {
+  width: 22px;
+  height: 22px;
+  color: var(--mk-dim);
+}
+
+/* ── the chat ───────────────────────────────────────────────────────── */
+.cl-view {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.cl-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.cl-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 22px 20px 16px;
+}
+.cl-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+  max-width: 600px;
+}
+.cl-msg--user {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+.cl-msg--asst {
+  align-self: flex-start;
+  max-width: 100%;
+}
+.cl-bubble {
+  padding: 10px 14px;
+  border-radius: 16px;
+  color: var(--cl-soft);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+.cl-msg--user .cl-bubble {
+  border-bottom-right-radius: 5px;
+  background: var(--cl-accent);
+  color: var(--cl-accent-ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.cl-msg--asst .cl-bubble {
+  width: 100%;
+  border: 1px solid var(--cl-line);
+  border-bottom-left-radius: 5px;
+  background: var(--cl-surface);
+}
+.cl-bubble > :first-child {
+  margin-top: 0;
+}
+.cl-bubble > :last-child {
+  margin-bottom: 0;
+}
+.cl-bubble p {
+  margin: 0 0 10px;
+}
+.cl-bubble .cl-ic {
+  padding: 1px 5px;
+  border-radius: 6px;
+  font-size: 0.9em;
+}
+.cl-writing {
+  color: var(--cl-muted);
+}
+/* the caret: app.css `.cursor::after`. On the answer it is the bubble's last child, so it sits on a line of its own under
+   the text; on "Writing" it follows the word. It blinks `1s steps(2)`; the page rebuilds the "Writing" line at every token,
+   which restarts the blink, so there it is steady. */
+.cl-bubble.is-cursor::after,
+.cl-writing::after {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 1.1em;
+  margin-left: 2px;
+  vertical-align: -3px;
+  border-radius: 2px;
+  background: var(--cl-accent);
+}
+.cl-bubble.is-cursor::after {
+  animation: cl-blink 1s steps(2) infinite;
+}
+@keyframes cl-blink {
+  50% {
+    opacity: 0;
+  }
+}
+.cl-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--cl-muted);
+  font-size: 11px;
+}
+.cl-msg--asst .cl-meta .cl-ibtn {
+  width: 24px;
+  height: 24px;
+}
+.cl-think {
+  width: 100%;
+  border: 1px solid var(--cl-line);
+  border-radius: 12px;
+  background: var(--cl-surface-2);
+}
+.cl-think__sum {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  color: var(--cl-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+.cl-think__body {
+  padding: 0 12px 12px;
+}
+/* the code block: `.st-code`, in Monokai Classic (monokai.css gives `.l-code`, its header and `pre` their colours) */
+.cl-bubble .cl-code {
+  margin: 10px 0;
+  border: 1px solid var(--mk-line);
+  border-radius: 12px;
+}
+.cl-code .l-code__h {
+  align-items: center;
+  padding: 4px 6px 4px 12px;
+  border-bottom: 1px solid rgb(255 255 255 / 0.06);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+}
+.cl-code pre {
+  padding: 11px 13px;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre;
+}
+
+/* ── the message box ────────────────────────────────────────────────── */
+.cl-dock {
+  flex: none;
+  padding: 0 20px 14px;
+}
+.cl-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 8px;
+  border: 1px solid var(--cl-line);
+  border-radius: 16px;
+  background: var(--cl-surface);
+  box-shadow: var(--cl-sh-bar);
+}
+.cl-ta {
+  min-height: 40px;
+  padding: 5px 6px;
+  color: #757575;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+.cl-composer__bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.cl-hint {
+  margin-right: 6px;
+  color: var(--cl-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.cl-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 12px;
+  font-size: 12.5px;
+  font-weight: 700;
+  line-height: 1;
+}
+.cl-btn--2 {
+  border: 1.5px solid var(--cl-line);
+  color: var(--cl-ink);
+}
+.cl-btn--send {
+  width: 38px;
+  padding: 0;
+  background: var(--cl-accent);
+  color: var(--cl-accent-ink);
+  box-shadow: 0 6px 16px rgb(16 185 129 / 0.24), inset 0 1px 0 rgb(255 255 255 / 0.18);
+}
+.cl-btn--send.is-off {
+  opacity: 0.45;
+}
+
+/* ── the Monitor tab ────────────────────────────────────────────────── */
+.cl-mon {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 14px 16px;
+}
+.cl-card {
+  border: 1px solid var(--cl-line);
+  border-radius: 14px;
+  background: var(--cl-surface);
+  box-shadow: var(--cl-sh-card);
+  padding: 12px 14px;
+}
+.cl-title {
+  color: var(--cl-ink);
+  font-size: 14px;
+  font-weight: 700;
+}
+.cl-state {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cl-state__h {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+.cl-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cl-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--cl-line);
+  border-radius: 999px;
+  background: var(--cl-surface-2);
+  color: var(--cl-muted);
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1;
+}
+.cl-badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.cl-badge--info {
+  border-color: transparent;
+  background: var(--cl-info-tint);
+  color: var(--cl-info-text);
+}
+.cl-badge--ok {
+  border-color: transparent;
+  background: var(--cl-accent-tint);
+  color: var(--cl-accent-text);
+}
+.cl-badge--warn {
+  border-color: transparent;
+  background: var(--cl-warn-tint);
+  color: var(--cl-warn-text);
+}
+.cl-badge--err {
+  border-color: transparent;
+  background: var(--cl-danger-tint);
+  color: var(--cl-danger-text);
+}
+.cl-state__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.cl-progress {
+  height: 6px;
+  border: 1px solid var(--cl-line-soft);
+  border-radius: 999px;
+  background: var(--cl-surface-2);
+  overflow: hidden;
+}
+.cl-progress__bar {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--cl-accent);
+}
+.cl-progress__bar--warn {
+  background: var(--cl-warn);
+}
+.cl-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.cl-m {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px 12px;
+}
+.cl-m__l {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--cl-muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+.cl-m__v {
+  font-size: 22px;
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+.cl-m__v small {
+  margin-left: 3px;
+  color: var(--cl-muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+.cl-m__s {
+  min-height: 1em;
+  margin-top: 4px;
+  color: var(--cl-muted);
+  font-size: 10px;
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+}
+.cl-speed {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cl-speed > div:last-child {
+  text-align: right;
+}
+.cl-spark {
+  display: block;
+  width: 100%;
+  height: 22px;
+  overflow: visible;
+  color: var(--cl-accent);
+}
+.cl-spark--warn {
+  color: var(--cl-warn);
+}
+.cl-spark--info {
+  color: var(--cl-info);
+}
+.cl-spark .cl-prefill {
+  color: color-mix(in srgb, var(--cl-accent) 65%, black);
+}
+.cl-row {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) minmax(0, 2.4fr);
+  gap: 10px;
+}
+.cl-ctx {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.cl-gauge {
+  position: relative;
+  width: 84px;
+  height: 84px;
+  margin: 2px auto 4px;
+}
+.cl-gauge svg {
+  width: 84px;
+  height: 84px;
+}
+.cl-gauge__track {
+  stroke: var(--cl-surface-2);
+}
+.cl-gauge__fill {
+  stroke: var(--cl-accent);
+}
+.cl-gauge__label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+}
+.cl-gauge__pct {
+  font-size: 18px;
+  font-weight: 900;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.cl-bar-row {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 2px;
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.cl-req {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.cl-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.cl-table th {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--cl-line);
+  color: var(--cl-muted);
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-align: left;
+  text-transform: uppercase;
+}
+.cl-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--cl-line-soft);
+  color: var(--cl-soft);
+}
+.cl-table .num {
+  text-align: right;
+}
+.cl-table .cl-badge {
+  height: 18px;
+  font-size: 10px;
+}
+@container (max-width: 760px) {
+  .cl-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .cl-row {
+    grid-template-columns: 1fr;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cl-bubble.is-cursor::after {
+    animation: none;
+  }
+}
+
+/* the classic's own narrow-screen rules (app.css, max-width: 640px): the header tightens, the tabs lose their icons, the pill its words */
+@container (max-width: 640px) {
+  .cl-header {
+    gap: 8px;
+    padding: 0 12px;
+  }
+  .cl-tabs {
+    margin-left: 0;
+  }
+  .cl-tab {
+    padding: 0 10px;
+  }
+  .cl-app .cl-tab .cl-ico {
+    display: none;
+  }
+  .cl-pill__t {
+    display: none;
+  }
+}
+
+/* the classic wraps its table in .table-wrap { overflow-x: auto } (app.css) */
+.cl-table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}

@@ -1,0 +1,1096 @@
+/* scenes: panels - the side panel, Settings › Permissions, the New project dialog and the Marks picker (components/scenes/panels.tsx,
+   settings.tsx). Written from what serve/ui/src draws (SidePanel.tsx, ContextPanel.tsx, PermissionsSettings.tsx, BranchedMenu.tsx +
+   branched-menu.css, NewProjectDialog.tsx, FoldersEditor.tsx, StatusMarks.tsx, App.tsx): the sizes are its Tailwind classes in px, the colours its
+   tokens (ink, ink-2, ink-3, line, fill) in the scene's own light skin. Nothing here moves by itself: the scene is a function of the clock. */
+
+/* ── the stage: the last frame is drawn once, out of sight, so the scene keeps its height ───────── */
+.sp-stage {
+  --sp-ink2: color-mix(in srgb, var(--a-ink) 62%, var(--a-surface));
+  --sp-ink3: color-mix(in srgb, var(--a-ink) 40%, var(--a-surface));
+  --sp-line: color-mix(in srgb, var(--a-ink) 11%, transparent);
+  --sp-fill: color-mix(in srgb, var(--a-ink) 12%, transparent);
+  --sp-fill2: color-mix(in srgb, var(--a-ink) 18%, transparent);
+  --sp-hover: color-mix(in srgb, var(--a-ink) 8%, transparent);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  letter-spacing: -0.01em;
+  color: var(--a-ink);
+}
+.sp-stage .num {
+  font-variant-numeric: tabular-nums;
+}
+html[lang="th"] .sp-stage * {
+  letter-spacing: 0;
+}
+.sp-stage > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+.sp-ghost {
+  visibility: hidden;
+  pointer-events: none;
+}
+.sp-live {
+  align-self: start;
+}
+.sp-live--c {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+}
+.sp-ico {
+  flex: none;
+}
+
+/* ── small parts the panels share ──────────────────────────────────────────────────────────────── */
+.sp-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  background: var(--sp-fill);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.sp-btn.is-off {
+  opacity: 0.4;
+}
+.sp-btn--quiet {
+  background: transparent;
+  color: var(--sp-ink2);
+}
+.sp-btn--ink {
+  background: var(--a-ink);
+  color: var(--a-surface);
+}
+.sp-in {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  min-width: 0;
+  padding: 0 10px;
+  border: 1px solid var(--sp-line);
+  border-radius: 8px;
+  background: var(--a-surface);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sp-in--mono {
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+}
+.sp-ph {
+  color: var(--sp-ink3);
+}
+.sp-sw {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: 32px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--sp-fill2);
+}
+.sp-sw i {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+}
+.sp-loading {
+  margin: 0;
+  padding: 24px 0;
+  color: var(--sp-ink2);
+}
+.sp-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.sp-orbslot {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  line-height: 0;
+}
+
+/* ── the side panel ────────────────────────────────────────────────────────────────────────────── */
+.sp-dock {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+/* the page: the app's bar, the chat that stays under the sheet, a 40 % black veil over all of it, and the sheet at the right edge */
+.sp-live:has(> .sp-sheetpage) {
+  align-self: stretch;
+}
+.sp-sheetpage {
+  position: relative;
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto 1fr;
+  overflow: hidden;
+  background: var(--a-bg);
+}
+.sp-sheetpage > * {
+  grid-column: 1;
+  min-width: 0;
+}
+.sp-sheetpage__nav {
+  grid-row: 1;
+}
+.sp-behind {
+  position: relative;
+  grid-row: 2;
+  overflow: hidden;
+}
+/* the chat under the sheet takes no room of its own: the page is as tall as the sheet, as a window is as tall as the screen */
+.sp-behind > .sp-bc {
+  position: absolute;
+  inset: 20px 18px 0;
+}
+.sp-veil {
+  grid-row: 1 / -1;
+  grid-column: 1;
+  position: relative;
+  z-index: 1;
+  background: rgb(0 0 0 / 0.4);
+  pointer-events: none;
+}
+.sp-sheet {
+  position: relative;
+  z-index: 2;
+  grid-row: 1 / -1;
+  grid-column: 1;
+  justify-self: end;
+  align-self: stretch;
+  width: min(92cqw, 380px);
+  padding: 12px;
+  background: var(--a-surface);
+  box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1), -2px 0 24px rgb(0 0 0 / 0.08);
+}
+.sp-tabrow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.sp-x {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  color: var(--sp-ink2);
+}
+.sp-bc {
+  font-size: 13px;
+  line-height: 1.6;
+}
+.sp-bc__ub {
+  width: fit-content;
+  max-width: 100%;
+  margin-left: auto;
+  padding: 10px 14px;
+  border-radius: 16px;
+  background: var(--a-bubble);
+  font-size: 14px;
+  line-height: 1.45;
+}
+.sp-bc__meta {
+  margin: 4px 2px 12px;
+  color: var(--a-faint);
+  font-size: 11px;
+  text-align: right;
+}
+.sp-bc__th {
+  margin-bottom: 8px;
+  color: var(--sp-ink2);
+  font-size: 13px;
+  font-weight: 500;
+}
+.sp-bc p {
+  margin: 0 0 0.8em;
+}
+.sp-bc ol {
+  margin: 0 0 0.75em;
+  padding-left: 1.4em;
+}
+.sp-bc li {
+  margin: 0.2em 0;
+}
+.sp-tabs {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+}
+.sp-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  padding: 0 6px;
+  border-radius: 8px;
+  color: var(--sp-ink2);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.sp-tab.is-on {
+  background: var(--sp-fill);
+  color: var(--a-ink);
+  font-weight: 500;
+}
+.sp-pane {
+  margin: 0 -4px;
+  padding: 0 4px 8px;
+}
+
+/* Git */
+.sp-git {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.sp-gitpath {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sp-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--sp-ink3);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sp-refresh {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  color: var(--sp-ink2);
+}
+.sp-gitview {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.sp-branchrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.sp-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: var(--sp-fill);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.sp-grp {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 2px;
+  padding: 0 6px;
+  color: var(--sp-ink3);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.sp-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  font-size: 12.5px;
+}
+.sp-file .sp-ico,
+.sp-sec__h .sp-ico,
+.sp-mfile .sp-ico,
+.sp-commit .sp-ico {
+  color: var(--sp-ink3);
+}
+.sp-st {
+  flex: none;
+  width: 16px;
+  color: #b7791f;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-align: center;
+}
+.sp-file__p {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sp-sec {
+  padding-top: 8px;
+  border-top: 1px solid var(--sp-line);
+}
+.sp-sec__h {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.sp-sec__t {
+  flex: 1;
+}
+.sp-sec__n {
+  color: var(--sp-ink3);
+  font-size: 11.5px;
+  font-weight: 400;
+}
+.sp-sec__c {
+  padding: 2px 0 4px;
+}
+.sp-commit {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 0 6px;
+  font-size: 12.5px;
+}
+.sp-commit .sp-ico {
+  margin-top: 2px;
+}
+.sp-commit > span {
+  min-width: 0;
+  flex: 1;
+}
+.sp-commit b,
+.sp-commit small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sp-commit b {
+  font-weight: 400;
+}
+.sp-commit small {
+  color: var(--sp-ink3);
+  font-size: 11.5px;
+}
+
+/* Plan */
+.sp-plan__h {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  color: var(--sp-ink2);
+  font-size: 12px;
+}
+.sp-plan__bar {
+  height: 4px;
+  margin-bottom: 8px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: var(--sp-fill);
+}
+.sp-plan__bar > div {
+  height: 100%;
+  border-radius: 99px;
+  background: var(--a-accent);
+}
+.sp-todos {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--sp-line);
+  border-radius: 12px;
+}
+.sp-todos__h {
+  margin-bottom: 6px;
+  color: var(--sp-ink2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.sp-todos ul {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sp-todos li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+}
+.sp-todos li .sp-ico {
+  margin-top: 2px;
+  color: var(--sp-ink3);
+}
+.sp-todos li.is-done {
+  color: var(--sp-ink3);
+  text-decoration: line-through;
+}
+
+/* Memory */
+.sp-mem {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.sp-mem__lede {
+  margin: 0;
+  color: var(--sp-ink2);
+  font-size: 12.5px;
+}
+.sp-msrc {
+  border: 1px solid var(--sp-line);
+  border-radius: 12px;
+}
+.sp-msrc__top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+}
+.sp-msrc__txt {
+  flex: 1;
+  min-width: 0;
+}
+.sp-msrc__t {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sp-msrc__s {
+  color: var(--sp-ink3);
+  font-size: 11.5px;
+}
+.sp-msrc ul {
+  margin: 0;
+  padding: 4px;
+  border-top: 1px solid var(--sp-line);
+  list-style: none;
+}
+.sp-msrc.is-off ul {
+  opacity: 0.6;
+}
+.sp-mfile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  font-size: 12.5px;
+}
+.sp-mfile span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Context */
+.sp-ctx__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.sp-ctx__title,
+.sp-ctx__pct {
+  font-size: 13px;
+  font-weight: 600;
+}
+.sp-ctx__fig {
+  margin: 2px 0 0;
+  color: var(--sp-ink2);
+  font-size: 12px;
+}
+.sp-ctx__bar {
+  display: flex;
+  gap: 2px;
+  height: 8px;
+  margin: 10px 0;
+  overflow: hidden;
+  border-radius: 4px;
+}
+.sp-ctx__bar span {
+  min-width: 2px;
+  border-radius: 1px;
+  background: var(--part);
+}
+.sp-ctx__list {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  font-size: 12.5px;
+  list-style: none;
+}
+.sp-ctx__list li {
+  display: grid;
+  grid-template-columns: 10px 1fr auto;
+  align-items: center;
+  gap: 8px;
+}
+.sp-ctx__list i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--part);
+}
+.sp-ctx__bar [data-part="conversation"],
+.sp-ctx__list [data-part="conversation"] {
+  --part: color-mix(in srgb, var(--a-accent) 85%, transparent);
+}
+.sp-ctx__bar [data-part="tools"],
+.sp-ctx__list [data-part="tools"] {
+  --part: color-mix(in srgb, #7c5cff 70%, transparent);
+}
+.sp-ctx__bar [data-part="system"],
+.sp-ctx__list [data-part="system"] {
+  --part: color-mix(in srgb, var(--a-ink) 45%, transparent);
+}
+.sp-ctx__bar [data-part="free"],
+.sp-ctx__list [data-part="free"] {
+  --part: color-mix(in srgb, var(--a-ink) 12%, transparent);
+}
+.sp-ctx__auto {
+  margin: 8px 0 0;
+  color: var(--sp-ink2);
+  font-size: 12px;
+}
+.sp-ctx__btn {
+  margin-top: 12px;
+}
+
+/* ── the Settings page: the title and its line, the menu, the topic ─────────────────────────────── */
+.sp-page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 20px 20px 28px;
+}
+.sp-page__head h1 {
+  margin: 0;
+  font-size: 32px;
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 1.08;
+}
+.sp-page__head p {
+  max-width: 62ch;
+  margin: 10px 0 0;
+  color: var(--sp-ink2);
+  font-size: 14.5px;
+  line-height: 1.55;
+}
+html[lang="th"] .sp-page__head h1 {
+  line-height: 1.35;
+}
+html[lang="th"] .sp-page__head p {
+  line-height: 1.7;
+}
+.sp-page__row {
+  display: flex;
+  gap: 40px;
+}
+.sp-page__menu {
+  display: none;
+  flex: none;
+  width: 200px;
+}
+@container (min-width: 700px) {
+  .sp-page__menu {
+    display: block;
+  }
+}
+.sp-page__topic {
+  flex: 1;
+  min-width: 0;
+  max-width: 580px;
+}
+
+/* the branched menu: sections that are open, a line to the topic in use, a marker beside its section */
+.sp-bm {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: fit-content;
+  max-width: 100%;
+  padding-left: 14px;
+  font-size: 13px;
+  line-height: 1.2;
+}
+.sp-bm::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  border-radius: 1px;
+  background: linear-gradient(to bottom, var(--sp-fill2) 0%, var(--sp-fill2) 55%, transparent 100%);
+}
+.sp-bm__mark {
+  position: absolute;
+  top: 9px;
+  left: 0;
+  z-index: 1;
+  width: 2px;
+  height: 16px;
+  border-radius: 1px;
+  background: var(--a-ink);
+}
+.sp-bm__head {
+  padding: 9px 0;
+  font-size: 14px;
+  font-weight: 500;
+}
+.sp-bm__tree {
+  position: relative;
+  padding: 6px 0;
+  box-sizing: border-box;
+}
+.sp-bm__lines {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: visible;
+}
+.sp-bm__base,
+.sp-bm__reach {
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.sp-bm__base {
+  stroke: var(--sp-fill2);
+}
+.sp-bm__reach {
+  stroke: var(--a-ink);
+}
+.sp-bm__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding-left: 40px;
+  color: var(--sp-ink2);
+  white-space: nowrap;
+}
+.sp-bm__item.is-on {
+  color: var(--a-ink);
+  font-weight: 500;
+}
+
+/* Permissions */
+.sp-h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+.sp-p {
+  margin: 4px 0 0;
+  color: var(--sp-ink2);
+  font-size: 13px;
+}
+.sp-p--2 {
+  margin-top: 8px;
+}
+.sp-scopes {
+  margin-top: 12px;
+}
+.sp-scope {
+  padding: 12px 0;
+  border-top: 1px solid var(--sp-line);
+}
+.sp-scope__h {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.sp-scope__h h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+.sp-scope__h span {
+  color: var(--sp-ink3);
+  font-size: 12px;
+}
+.sp-scope__cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 8px;
+}
+.sp-scope__l {
+  margin-bottom: 4px;
+  padding: 0 4px;
+  color: var(--sp-ink3);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.025em;
+  text-transform: uppercase;
+}
+.sp-scope__none {
+  margin: 0;
+  padding: 0 4px;
+  color: var(--sp-ink3);
+  font-size: 12.5px;
+}
+.sp-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sp-rules li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 8px;
+}
+.sp-rules li span {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+.sp-rules li .sp-ico {
+  margin-right: 5px;
+  color: var(--sp-ink3);
+}
+.sp-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+.sp-form .sp-in {
+  flex: 1;
+  min-width: 12rem;
+}
+.sp-seg {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 12px;
+  background: var(--sp-fill);
+}
+.sp-seg span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 8px;
+  color: var(--sp-ink2);
+  font-size: 13px;
+}
+.sp-seg .is-on {
+  background: var(--a-surface);
+  color: var(--a-ink);
+  font-weight: 500;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+}
+
+/* ── the New project dialog ────────────────────────────────────────────────────────────────────── */
+.sp-dlgbg {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  flex: 1;
+  place-items: center;
+  padding: 24px 16px;
+}
+.sp-dlgbg::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: #000;
+  opacity: var(--veil, 0);
+}
+.sp-dlg {
+  position: relative;
+  min-width: 0;
+  width: 100%;
+  max-width: 460px;
+  padding: 20px;
+  border: 1px solid var(--sp-line);
+  border-radius: 12px;
+  background: var(--a-surface);
+  box-shadow: 0 24px 64px -16px rgb(0 0 0 / 0.4);
+}
+.sp-dlg h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+.sp-dlg__p {
+  margin: 6px 0 0;
+  color: var(--sp-ink2);
+  font-size: 13px;
+  line-height: 1.625;
+}
+.sp-dlg__l {
+  margin: 16px 0 6px;
+  font-size: 13px;
+}
+.sp-dlg__l--f {
+  margin: 0 0 6px;
+}
+.sp-dlg__f {
+  margin-top: 12px;
+}
+.sp-folders-wrap {
+  margin-bottom: 8px;
+}
+.sp-folders {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sp-folder {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--sp-line);
+  border-radius: 8px;
+}
+.sp-folder .sp-ico {
+  color: var(--sp-ink3);
+}
+.sp-folder__p {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0;
+}
+.sp-folder__d {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--sp-ink3);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sp-folder__p b {
+  flex: none;
+  font-weight: 500;
+}
+.sp-tag,
+.sp-mk {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 8px;
+  color: var(--sp-ink2);
+  font-size: 11px;
+}
+.sp-tag {
+  background: var(--sp-fill);
+}
+.sp-x {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  color: var(--sp-ink3);
+}
+.sp-addrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sp-addrow .sp-in {
+  flex: 1;
+}
+.sp-dlg__b {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+/* ── the Marks picker ──────────────────────────────────────────────────────────────────────────── */
+.sp-popwrap {
+  display: flex;
+  justify-content: center;
+  padding: 16px 12px 20px;
+}
+.sp-pop {
+  width: 100%;
+  max-width: 400px;
+  max-height: 640px;
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid var(--sp-line);
+  border-radius: 16px;
+  background: var(--a-surface);
+  box-shadow: 0 14px 40px -12px rgb(0 0 0 / 0.28);
+}
+.sp-pop__lede {
+  margin: 0 0 8px;
+  padding: 0 4px;
+  color: var(--sp-ink2);
+  font-size: 12px;
+}
+.sp-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sp-opt {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid;
+  border-radius: 12px;
+}
+.sp-opt__marks {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  width: 88px;
+}
+.sp-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+}
+.sp-ring {
+  display: block;
+  width: 20px;
+  height: 20px;
+  border: 1px dashed var(--sp-line);
+  border-radius: 50%;
+}
+.sp-opt__t {
+  flex: 1;
+  min-width: 0;
+}
+.sp-opt__t b {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+}
+.sp-opt__t em {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  background: var(--sp-fill2);
+  color: color-mix(in srgb, var(--a-ink) 74%, var(--a-surface));
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 400;
+}
+.sp-opt__t small {
+  display: block;
+  color: color-mix(in srgb, var(--a-ink) 74%, var(--a-surface)); /* a little darker than the app's ink-2: the row sits on a wash, and 4.5 : 1 holds there too */
+  font-size: 12px;
+  line-height: 1.375;
+}
+.sp-radio {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--sp-line);
+  border-radius: 50%;
+}
+.sp-radio.is-on {
+  border-color: var(--a-ink);
+}
+.sp-radio.is-on::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--a-ink);
+}
+.sp-which {
+  padding-top: 16px;
+}
+.sp-which p {
+  margin: 0;
+  color: var(--sp-ink2);
+  font-size: 13px;
+}
+.sp-tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.sp-tile {
+  display: grid;
+  place-items: center;
+  width: 60px;
+  height: 60px;
+  border: 1px solid;
+  border-radius: 12px;
+}
+.sp-tile--t {
+  width: auto;
+  min-width: 84px;
+  padding: 0 12px;
+  color: var(--sp-ink2);
+  font-size: 12px;
+}
+
+/* the mark in front of the name of another app in the memory tab */
+.sp-msrc__t {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}

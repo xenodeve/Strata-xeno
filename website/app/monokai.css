@@ -1,0 +1,179 @@
+/*
+ * Monokai Classic, for every place on the site that shows code: a block, a command, a tool's output, a diff, an inline name.
+ * It keeps its own dark ground in a light page and in a dark one (code is not part of the page's theme), and it is the same
+ * palette the app itself uses for code in its dark theme (serve/ui/src/styles.css). The class names are highlight.js's.
+ */
+:root {
+  --mk-bg: #272822;
+  --mk-bg-2: #1e1f1c;
+  --mk-line: #3e3d32;
+  --mk-select: #49483e;
+  --mk-fg: #f8f8f2;
+  --mk-dim: #75715e;
+  --mk-keyword: #f92672;
+  --mk-string: #e6db74;
+  --mk-number: #ae81ff;
+  --mk-func: #a6e22e;
+  --mk-type: #66d9ef;
+  --mk-param: #fd971f;
+}
+
+/* the surfaces */
+.mk,
+.a-codeb__p,
+.a-ask__cmd,
+.l-code pre,
+.a-tool__pre {
+  background: var(--mk-bg);
+  color: var(--mk-fg);
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+  tab-size: 2;
+}
+.mk ::selection,
+.a-codeb__p ::selection,
+.a-ask__cmd ::selection {
+  background: var(--mk-select);
+}
+/* the header strip of a block, in the same family */
+.a-codeb {
+  border-color: var(--mk-line);
+  background: var(--mk-bg);
+}
+.a-codeb__h,
+.l-code__h {
+  background: var(--mk-bg-2);
+  color: var(--mk-dim);
+}
+.l-code {
+  border-color: var(--mk-line);
+  background: var(--mk-bg);
+}
+
+/* a name in a line of text (a file, a flag, a command) */
+code,
+.a-code {
+  padding: 0.08em 0.4em;
+  border-radius: 5px;
+  background: var(--mk-bg);
+  color: var(--mk-fg);
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+}
+.mk__code code,
+pre code {
+  padding: 0;
+  background: none;
+  font-size: inherit;
+}
+
+/* code written out over time: the whole block is there, invisible, so its size never changes; what is written lies on top */
+.mk__code {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: top;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.mk__ghost {
+  display: block;
+  white-space: pre-wrap;
+  visibility: hidden;
+}
+.mk__live {
+  position: absolute;
+  inset: 0;
+  display: block;
+  white-space: pre-wrap;
+}
+.mk__caret {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  margin-left: 2px;
+  border-radius: 2px;
+  background: var(--mk-dim);
+  animation: mk-blink 1s steps(2, start) infinite;
+}
+@keyframes mk-blink {
+  to {
+    visibility: hidden;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mk__caret {
+    animation: none;
+  }
+}
+
+/* the colours (highlight.js's classes, Monokai Classic's values) */
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-keyword,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-selector-tag,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-doctag,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-tag,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-name,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-selector-class,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-selector-id,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-deletion {
+  color: var(--mk-keyword);
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-string,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-template-variable,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-regexp {
+  color: var(--mk-string);
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-number,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-literal,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-symbol,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-bullet {
+  color: var(--mk-number);
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-title,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-title.function_,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-function,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-title.class_,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-attr,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-attribute,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-selector-attr,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-selector-pseudo,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-meta,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-addition {
+  color: var(--mk-func);
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-built_in,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-type,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-class .hljs-title {
+  color: var(--mk-type);
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-type,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-built_in {
+  font-style: italic;
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-params {
+  color: var(--mk-param);
+  font-style: italic;
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-comment,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-quote {
+  color: var(--mk-dim);
+  font-style: italic;
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-variable,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-property,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-subst {
+  color: var(--mk-fg);
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-section,
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-strong {
+  font-weight: 700;
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-emphasis {
+  font-style: italic;
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-addition {
+  background: color-mix(in srgb, var(--mk-func) 14%, transparent);
+}
+:is(.mk, .a-codeb__p, .a-ask__cmd, .l-code pre, .a-tool__pre) .hljs-deletion {
+  background: color-mix(in srgb, var(--mk-keyword) 14%, transparent);
+}
