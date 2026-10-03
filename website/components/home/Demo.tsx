@@ -32,6 +32,8 @@ export function Demo() {
   const [scene, setScene] = useState(SCENES[0]);
   const [up, setUp] = useState<"checking" | "up" | "down">("checking");
   const [loaded, setLoaded] = useState(false);
+  // where the page is served from: on a PC (`npm run demo`) the demo's server is that PC's own; on the site it is a small server in the cloud
+  const [where, setWhere] = useState<{ host: string; hosted: boolean } | null>(null);
   const stage = useRef<HTMLDivElement>(null);
   const [fit, setFit] = useState<{ k: number; h: number } | null>(null);
 
@@ -47,6 +49,11 @@ export function Demo() {
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const h = window.location.hostname;
+    setWhere({ host: window.location.host, hosted: !(h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h.endsWith(".local")) });
   }, []);
 
   useEffect(() => {
@@ -106,7 +113,7 @@ export function Demo() {
                 <span />
                 <span />
                 <span />
-                <em className="mono">127.0.0.1:8187/next/ · demo</em>
+                <em className="mono">{where ? where.host : "demo"}/next/ · demo</em>
               </div>
               <div ref={stage} className="demo__stage">
                 {up === "up" && (
@@ -125,7 +132,17 @@ export function Demo() {
                     <p className="demo__offtitle">
                       {up === "checking" ? <T v={{ en: "Starting the demo…", th: "กำลังเริ่ม demo…" }} /> : <T v={{ en: "The demo backend is not running.", th: "demo backend ยังไม่ได้รัน" }} />}
                     </p>
-                    {up === "down" && (
+                    {up === "down" && where?.hosted && (
+                      <p>
+                        <T
+                          v={{
+                            en: "The demo server did not answer. Reload the page in a moment; or run the same app yourself with npm run demo (see the README).",
+                            th: "เซิร์ฟเวอร์ demo ไม่ตอบ ลองโหลดหน้านี้ใหม่อีกครั้ง หรือรันแอปเดียวกันเองด้วย npm run demo (ดู README)",
+                          }}
+                        />
+                      </p>
+                    )}
+                    {up === "down" && !where?.hosted && (
                       <>
                         <p>
                           <T
@@ -146,12 +163,21 @@ export function Demo() {
 
             <div className="demo__foot">
               <p className="cap mono">
-                <T
-                  v={{
-                    en: "A script answers instead of the model; the engine's statistics are fixtures; the hardware shown is this PC's. Nothing is sent anywhere.",
-                    th: "สคริปต์ตอบแทนโมเดล สถิติของเอนจินเป็นข้อมูลตัวอย่าง ฮาร์ดแวร์ที่แสดงเป็นของเครื่องนี้ ไม่มีอะไรถูกส่งออกไปที่ไหน",
-                  }}
-                />
+                {where?.hosted ? (
+                  <T
+                    v={{
+                      en: "A script answers instead of the model; the engine's statistics are fixtures; the hardware shown is the small cloud machine running this demo, not a GPU. What you type goes to that demo server and stays in its temporary folder.",
+                      th: "สคริปต์ตอบแทนโมเดล สถิติของเอนจินเป็นข้อมูลตัวอย่าง ฮาร์ดแวร์ที่แสดงคือเครื่องคลาวด์เล็กๆ ที่รัน demo นี้ ไม่ใช่ GPU สิ่งที่พิมพ์จะส่งไปยังเซิร์ฟเวอร์ demo และอยู่ในโฟลเดอร์ชั่วคราวของมัน",
+                    }}
+                  />
+                ) : (
+                  <T
+                    v={{
+                      en: "A script answers instead of the model; the engine's statistics are fixtures; the hardware shown is this PC's. Nothing is sent anywhere.",
+                      th: "สคริปต์ตอบแทนโมเดล สถิติของเอนจินเป็นข้อมูลตัวอย่าง ฮาร์ดแวร์ที่แสดงเป็นของเครื่องนี้ ไม่มีอะไรถูกส่งออกไปที่ไหน",
+                    }}
+                  />
+                )}
               </p>
               <p className="demo__links">
                 {scene.hint && (
