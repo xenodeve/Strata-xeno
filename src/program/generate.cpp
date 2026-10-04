@@ -67,7 +67,6 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
-#include "strata/program/park_writer.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -1435,9 +1434,17 @@ struct CacheSlot {
     struct Shape { size_t ids, imgs, gdn, ple, tails, dead, block_pos; uint64_t used; };
     std::vector<Shape> shapes;
     uint64_t state_bytes = 0;
-    // #145: the checkpoints' write to `file` after a park (slot_checkpoints on a thread); joined before anything reads
-    // the slot again.  Last, so it is destroyed - and joined - before the file and the vectors it writes.
-    strata::program::ParkWriter writer;
+    // #145: the checkpoints' write to `file` after a park (slot_checkpoints on a std::async thread); waited for
+    // (`written`) before anything touches the slot again.  Last, so its destructor - which waits - runs before the file's
+    // and the vectors'.
+    std::future<bool> park;
+    bool written() { return !park.valid() || park.get(); }
+    void drop() {   // no saved state: the file (deleted on close) and the RAM of the running state and the checkpoints
+        file.reset();
+        shapes.clear();
+        running = ConvCheckpoint{};
+        std::vector<ConvCheckpoint>().swap(checks);
+    }
 };
 
 bool slot_checkpoints(CacheSlot& slot, bool reading) {
@@ -6812,6 +6819,7 @@ int main(int argc, char** argv) {
                 }
                 if (live_ok && !live.empty()) {
                     auto& saved = slots[active_slot];
+                    if (!saved.written()) saved.drop();   // never runs: an active slot was waited for when it came in
 #if defined(_WIN32)
                     wchar_t temp_dir[MAX_PATH], temp_file[MAX_PATH];
                     const DWORD count = GetTempPathW(MAX_PATH, temp_dir);
@@ -6831,26 +6839,28 @@ int main(int argc, char** argv) {
                     }
                     saved.checks = std::move(checks);
                     // #145: the checkpoints - host vectors already, nothing the next request overwrites - go to the
-                    // file on a thread: their write was 127-497 ms of every switch (swap-t40k-run.txt)
-                    saved.writer.start([&saved, slot = active_slot] {
+                    // file on a thread: their write was 127-497 ms of every switch (swap-t40k-run.txt).  Their RAM is
+                    // held until it ends, beside the incoming slot's.  STRATA_SLOT_SYNC=1: on this thread (the A/B).
+                    auto write = [&saved, slot = active_slot] {
+                        const auto t0 = Clock::now();
                         if (!slot_checkpoints(saved,false)) {
                             std::fprintf(stderr,"strata cache: slot %d: saving its checkpoints to disk failed; the "
                                                 "conversation will be read again\n",slot);
+                            saved.drop();
                             return false;
                         }
-                        std::fprintf(stderr,"strata cache: slot %d offloaded %.1f MiB of checkpoint state\n",
-                            slot,saved.state_bytes/(1024.0*1024.0));
+                        std::fprintf(stderr,"strata cache: slot %d offloaded %.1f MiB of checkpoint state in %.0f ms\n",
+                            slot,saved.state_bytes/(1024.0*1024.0),
+                            std::chrono::duration<double,std::milli>(Clock::now()-t0).count());
                         return true;
-                    });
+                    };
+                    static const bool sync_write = std::getenv("STRATA_SLOT_SYNC") != nullptr;
+                    if (sync_write) (void) write();
+                    else saved.park = std::async(std::launch::async, write);
                 }
                 live_ok = false; live.clear(); live_imgs.clear(); checks.clear();
                 auto& incoming = slots[req_slot];
-                if (!incoming.writer.join()) {   // #145: its park's write failed - nothing to restore from
-                    incoming.file.reset();
-                    incoming.shapes.clear();
-                    incoming.running = ConvCheckpoint{};
-                    std::vector<ConvCheckpoint>().swap(incoming.checks);
-                }
+                (void) incoming.written();   // #145: its park's write first (a failed one dropped the slot's state)
                 if (incoming.file) {
                     if (!slot_positional(incoming,ss,g,mtp,true) || !slot_checkpoints(incoming,true)
                         || !checkpoint_restore(incoming.running,ss,g)) {
@@ -6858,7 +6868,7 @@ int main(int argc, char** argv) {
                     }
                     live = incoming.running.ids; live_imgs = incoming.running.imgs; live_ok = true;
                     checks = std::move(incoming.checks); cvec_cached = incoming.cvec;
-                    incoming.file.reset(); incoming.running = ConvCheckpoint{};
+                    incoming.drop();
                 }
                 std::fprintf(stderr,"strata cache: slot %d -> %d restored %lld tokens in %.0f ms\n",active_slot,req_slot,
                     (long long)live.size(),std::chrono::duration<double,std::milli>(Clock::now()-switch_start).count());
