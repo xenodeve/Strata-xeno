@@ -5201,7 +5201,7 @@ int main(int argc, char** argv) {
             }
         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
-    auto lend_slots = [&](int64_t c, int64_t kv_end) -> int64_t {   // #122: kv_end as in prompt_bytes_needed
+    auto lend_slots = [&](int64_t c, int64_t kv_end = 0) -> int64_t {   // #122: kv_end as in prompt_bytes_needed
         const uint64_t need = prompt_bytes_needed(g, ss, c, kv_end);
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
@@ -5243,7 +5243,7 @@ int main(int argc, char** argv) {
         // read at 5,624 tok/s in 8192-token chunks and 6,465 in one 32768 chunk (40K -> 18K experts streamed; an
         // NVFP4 pack at 262K: 3,535 -> 5,201)
         static constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
-        auto slots_for = [&](int64_t c) { return lend_slots(c, 0); };   // #122: the chunk choice sizes for the worst case
+        auto slots_for = lend_slots;
         if (o.prefill_auto) {
             for (const int64_t c : kAutoChunks) {
                 // above 8192: only when asked for, and only when a prompt of the context can use it
@@ -7071,7 +7071,8 @@ int main(int argc, char** argv) {
             };
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
             // rounded up to 256), laid out in the last of the slots it may borrow
-            // #122: `kv_end` - where the part ends, which the KV-streaming staging pool must hold
+            // #122: `kv_end` - where the request ends, which the KV-streaming staging pool must hold (the request's, not
+            // the part's: a later part past a power-of-two step would otherwise refill and lend again mid-request)
             auto lend = [&](int64_t tokens, int64_t kv_end, std::string& e) -> bool {
                 if (lend_first < 0) {                                  // its own buffers: nothing to lend
                     sp_part_wave = sp_layout_wave;   // #35 D7: fixed lanes (a short part leaves lane 2 without a chunk)
@@ -7092,13 +7093,14 @@ int main(int argc, char** argv) {
                     if (!refill(e)) return false;
                 }
                 const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want, kv_end)));
+                // laid out elsewhere, or a staging pool that does not hold this request (#122)
+                const bool moved = first != lend_first_now || sp.stage_cells() < kv_end;
                 // #35 D7: the wave only where each lane's chunk still runs split (the review's 3,000-token request
                 // read 1,536-token chunks on one card each: 8.6 s against 3.8 s without the wave)
                 sp_part_wave = sp_wave && strata::prefill::Prefill::wave_lane_splits(want);
                 if (sp_part_wave) {   // each lane half the chunk, in its half of the lent region
                     const int64_t lane_want = strata::prefill::Prefill::wave_lane_chunk(want);
-                    if (lane_want != sp.chunk() || first != lend_first_now || !sp_layout_wave ||
-                        sp.stage_cells() < kv_end) {
+                    if (lane_want != sp.chunk() || moved || !sp_layout_wave) {
                         const uint64_t lb = strata::prefill::Prefill::wave_lane_bytes(g, ss, lane_want, kv_end);
                         uint8_t* base = (uint8_t*) xcache.device_slot(first);
                         if (2 * lb > lend_bytes(first)) { e = "the wave's lanes do not fit in the lent slots"; return false; }
@@ -7107,7 +7109,7 @@ int main(int argc, char** argv) {
                         lend_first_now = first;
                         sp_layout_wave = true;
                     }
-                } else if (want != sp.chunk() || first != lend_first_now || sp_layout_wave || sp.stage_cells() < kv_end) {
+                } else if (want != sp.chunk() || moved || sp_layout_wave) {
                     // one lane over the whole lent region (a wave's lane 2 is idle until the next wave layout)
                     if (!sp.relayout(want, xcache.device_slot(first), lend_bytes(first), e, kv_end)) return false;
                     lend_first_now = first;
@@ -7190,7 +7192,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return serve_fatal();
                 }
-                if (!win && !lend(to - at, to, err)) {
+                if (!win && !lend(to - at, n, err)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return serve_fatal();
                 }
@@ -7711,7 +7713,7 @@ int main(int argc, char** argv) {
             const int64_t request_sized = request_chunk(n_batched, chunk);
             if (k > 0 && request_sized < chunk) {                     // no bigger than this prompt segment needs
                 chunk = request_sized;
-                k = lend_slots(chunk, 0);
+                k = lend_slots(chunk);
                 if (k + 128 > xcache.slots()) k = 0;
                 if (!o.prefill_auto) o.prefill_chunk = chunk;
             }

@@ -863,7 +863,7 @@ struct Prefill::Impl {
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     strata::kernels::KvHostPools stage;
     int32_t* ident_table = nullptr;
-    int64_t stage_pages = 0;                 // #122: the pages `stage` holds (kv_stage_pages of the layout's kv_end)
+    int64_t stage_cells = INT64_MAX;         // #122: the cells `stage` holds (INT64_MAX: not streamed, nothing staged)
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
@@ -873,24 +873,22 @@ struct Prefill::Impl {
 };
 
 namespace {
-// the staging pool of a streamed session: `pages` pages of one layer (same sequence in init and bytes_needed).
-// #122: the pages for the request's end position (stage_pages_for), not every page of the context: at 262K that was
-// 264 MiB per wave lane of borrowed expert slots on every request, 0.2-0.5 s per Claude Code turn (#106)
+// the staging pool of a streamed session: one layer's pages up to the request's end `kv_end` (kv_stage_pages; 0 = every
+// page), the same sequence in init and bytes_needed; returns the cells it holds (INT64_MAX when not streamed).  #122:
+// it used to hold every page of the context - at 262K 264 MiB per wave lane of borrowed expert slots on every request,
+// 0.2-0.5 s per Claude Code turn (#106).
 // STRATA_KV_STAGE_OWN (A/B only): the staging pool gets its own allocation instead of borrowed expert slots, so a
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
 bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
-int64_t stage_pages_for(const core::SessionState& ss, const strata::kernels::QsaShapes& s, int64_t kv_end) {
+int64_t take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
+                   strata::kernels::KvHostPools& st, bool& ok, int64_t kv_end) {
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
-    if (q0.kv_mode != 1) return 0;
-    return kv_stage_pages(kv_end, std::max(core::qsa_kv_resident(), core::qsa_kv_resident_min()), q0.n_pages,
-                          s.page_size);
-}
-void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
-                strata::kernels::KvHostPools& st, bool& ok, int64_t pages) {
-    const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
-    if (q0.kv_mode != 1) return;
-    if (stage_own() && o_borrowed.count_only) return;
+    if (q0.kv_mode != 1) return INT64_MAX;
+    // the floor is the cells the layer keeps in VRAM (n_slots, set by kv_plan): a tuning choice - #122 was measured
+    // with it; a lower floor would lend less for short turns (unmeasured)
+    const int64_t pages = kv_stage_pages(kv_end, q0.n_slots * s.page_size, q0.n_pages, s.page_size);
+    if (stage_own() && o_borrowed.count_only) return pages * s.page_size;
     Alloc own;
     own.owned = o_borrowed.owned;
     Alloc& o = stage_own() ? own : o_borrowed;
@@ -907,6 +905,7 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
         st.k_pool = o.take<uint16_t>(rows * s.head_dim, ok);
         st.v_pool = o.take<uint16_t>(rows * s.head_dim, ok);
     }
+    return pages * s.page_size;
 }
 strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table) {
     strata::kernels::QsaAttnPools p;
@@ -1623,8 +1622,7 @@ bool Prefill::carve(size_t T, void* alloc, int64_t kv_end) {
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
-    m.stage_pages = stage_pages_for(ss, s, kv_end);
-    take_stage(o, ss, s, m.stage, ok, m.stage_pages);
+    m.stage_cells = take_stage(o, ss, s, m.stage, ok, kv_end);
     m.T = (int64_t) T;
     return ok;
 }
@@ -1661,11 +1659,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
-int64_t Prefill::stage_cells() const {
-    const Impl& m = *impl_;
-    if (m.ss == nullptr || m.ss->qsa_states[m.ss->qsa_primary()].kv_mode != 1) return INT64_MAX;
-    return m.stage_pages * strata::kernels::qsa_real_shapes().page_size;
-}
+int64_t Prefill::stage_cells() const { return impl_->stage_cells; }
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {
@@ -1871,7 +1865,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;
-    take_stage(o, ss, s, stage, ok, stage_pages_for(ss, s, kv_end));
+    take_stage(o, ss, s, stage, ok, kv_end);
     return o.used + (8u << 20);   // alignment slack
 }
 
@@ -1981,8 +1975,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     s.idx_dim = g.idx_key_dim;
     // #122: a streamed chunk stages [0, p0) and appends its cells after them in a pool sized for the request's end;
     // a prompt past it would write into the lent expert slots after the pool - refuse it instead
-    if (pos0 + n > stage_cells()) {
-        err = "prefill: the KV staging pool holds " + std::to_string(stage_cells()) + " cells and this prompt ends at " +
+    if (pos0 + n > m.stage_cells) {
+        err = "prefill: the KV staging pool holds " + std::to_string(m.stage_cells) + " cells and this prompt ends at " +
               std::to_string(pos0 + n) + " (lay the prompt path out for the request's end: relayout's kv_end)";
         return false;
     }
