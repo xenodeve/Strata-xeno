@@ -2,6 +2,10 @@
 
 The rules for every coding agent on this repository live in `AGENTS.md`, so Claude Code and Codex follow one file.
 
+**The goal is the lowest latency in the system and the software** (developer, 2026-10-04): rank work by the time it takes off a
+real Claude Code turn on the served D2x profile, fix root causes rather than work around them, and name the issue that removes any
+latency a change adds. In full: `AGENTS.md` → "The goal".
+
 The six rules agents miss most, all in full in `AGENTS.md`:
 
 1. **Run everything in the background,** with no window on the developer's display.
