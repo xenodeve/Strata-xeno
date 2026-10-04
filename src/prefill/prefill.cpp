@@ -439,12 +439,15 @@ struct Stager {
                 // #142: routed past it - no buffer, no copy (the issuer skips it too)
                 const bool skipped = jb.skip != nullptr && jb.skip->load(std::memory_order_relaxed);
                 const int b = j % kRing;
-                if (!skipped && j >= kRing) {
+                if (j >= kRing) {
                     timeline::Span wait_span("stager wait buffer", j, j - kRing);
-                    for (int v; (v = issued.load(std::memory_order_acquire)) <= j - kRing;) issued.wait(v);
-                    cudaEventSynchronize(dma_done[b]);
-                    // #142: the buffer's previous job may have been skipped by the issuer while a stager still copied
-                    // it (taken before its layer was routed): its bytes must be in before this job's go in
+                    if (!skipped) {
+                        for (int v; (v = issued.load(std::memory_order_acquire)) <= j - kRing;) issued.wait(v);
+                        cudaEventSynchronize(dma_done[b]);
+                    }
+                    // #142: ready[j] means every earlier job of this buffer is done writing it.  The issuer may skip a
+                    // job a stager is still copying (taken before its layer was routed), so each job - a skipped one
+                    // too, or the chain breaks across it - waits for the buffer's previous job first
                     (void) wait(j - kRing);
                 }
                 if (!skipped) {
@@ -504,12 +507,10 @@ struct Stager {
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     void issued_one(int j, cudaStream_t copy) {
         cudaEventRecord(dma_done[j % kRing], copy);
-        issued.store(j + 1, std::memory_order_release);
-        issued.notify_all();
+        skip_one(j);
     }
-    /// #142: the launching thread skipped job j (no token routes to it): the buffers after it may run ahead.  A stager
-    /// may still be copying j (taken before its layer was routed), so job j + kRing waits for j's ready flag before it
-    /// writes the buffer - without that, j's late bytes landed in a routed expert (h142b: 3 of 6 runs replied apart).
+    /// #142: the launching thread is past job j without a DMA (no token routes to it).  It does not wait for a stager
+    /// still copying j: the job that next takes j's buffer waits for j's ready flag (work).
     void skip_one(int j) {
         issued.store(j + 1, std::memory_order_release);
         issued.notify_all();
@@ -582,6 +583,23 @@ struct SplitTier {
     bool routed_only = false;
     std::unique_ptr<std::atomic<bool>[]> skip;
     size_t skip_cap = 0;
+    bool arm_skip() {   // the plan is built: every entry copied until its layer is routed; false: not one unit
+        if (unit_jobs.size() != 1) return false;   // split_routed_only never takes a wave
+        if (skip_cap < seq.size()) {
+            skip_cap = seq.size();
+            skip.reset(new std::atomic<bool>[skip_cap]);
+        }
+        for (size_t k = 0; k < seq.size(); ++k) {
+            skip[k].store(false, std::memory_order_relaxed);
+            if (seq[k].kind == 3) unit_jobs[0][(size_t) seq[k].job].skip = &skip[k];
+        }
+        return true;
+    }
+    void mark_routed(int64_t l, const int32_t* cnt) {   // the host thread has routed layer l (a one-unit plan)
+        if (!routed_only) return;
+        const size_t a = seq_start[(size_t) l], b = seq_start[(size_t) l + 1];
+        split_mark_routed(seq.data() + a, b - a, cnt, &skip[a]);
+    }
     std::atomic<size_t> consumed{0}, issued{0};
     std::atomic<bool> stop{false};
     std::thread issuer;
@@ -2316,19 +2334,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             sp.unit_first[(size_t) n_units] = sp.seq.size();
             sp.routed_only = split_routed_only(T, wave != nullptr, split_routed_max());
-            if (sp.routed_only) {   // #142 (never a wave: one unit)
-                if (sp.skip_cap < sp.seq.size()) {
-                    sp.skip_cap = sp.seq.size();
-                    sp.skip.reset(new std::atomic<bool>[sp.skip_cap]);
-                }
-                if (n_units != 1) {   // split_routed_only never takes a wave: one unit's jobs
-                    err = "prefill: a routed-only split plan with more than one unit (#142)";
-                    return false;
-                }
-                for (size_t k = 0; k < sp.seq.size(); ++k) {
-                    sp.skip[k].store(false, std::memory_order_relaxed);
-                    if (sp.seq[k].kind == 3) sp.unit_jobs[0][(size_t) sp.seq[k].job].skip = &sp.skip[k];
-                }
+            if (sp.routed_only && !sp.arm_skip()) {
+                err = "prefill: a routed-only split plan with more than one unit (#142)";
+                return false;
             }
             sp.consumed.store(0);
             SplitTier::publish(sp.consumed1, sp.lanes_expected == 2 ? 0 : SplitTier::kNever);
@@ -2989,11 +2997,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int32_t e = expert_at(l, ei, m.g->n_expert);   // #41 gate 2
                             if (m.cnt[(size_t) e] > 0) (split_l && !local_e[(size_t) e] ? order_4070 : order).push_back(e);
                         }
-                        if (split_l && m.split->xs->routed_only) {   // #142: the issuer and the stagers skip the unrouted
-                            SplitTier& x = *m.split->xs;
-                            const size_t a = x.seq_start[(size_t) l], b = x.seq_start[(size_t) l + 1];
-                            split_mark_routed(x.seq.data() + a, b - a, m.cnt.data(), &x.skip[a]);
-                        }
+                        if (split_l) m.split->xs->mark_routed(l, m.cnt.data());   // #142
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         const double tl_pre = timeline::enabled() ? timeline::now_us() : 0;

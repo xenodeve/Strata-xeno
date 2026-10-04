@@ -4,8 +4,8 @@
 // CUDA0's one-card path inside the same chunk.  Before #113 one such layer turned the whole split off, silently.
 #pragma once
 
-#include <cstddef>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -44,11 +44,10 @@ bool wave_lane_ok(int64_t lane_chunk, int64_t split_min);
 int64_t split_row_layout(const std::vector<int32_t>& cnt, const std::vector<int32_t>& at_order,
                          const std::vector<char>& local, std::vector<int32_t>& off);
 
-
-/// #142: a split chunk shorter than this skips the host experts its routing does not reach - the streamed walk (every
-/// host expert of a split layer, routed or not) pays only on a chunk that routes to nearly all of them.  2048: the
-/// split's own floor; measured below it, and on one part above (2,816 tokens, within noise) - nothing longer (#142).
-inline constexpr int64_t kSplitRoutedMaxDefault = 2048;
+/// #142: a split chunk shorter than this skips the host experts its routing does not reach.  The default is the
+/// split's default floor: measured below it (parts of 408-1,837 tokens) and on one part above (2,816 tokens, within
+/// noise); that the walk only pays on a chunk routing to nearly every expert is a hypothesis for longer ones.
+inline constexpr int64_t kSplitRoutedMaxDefault = kSplitMinDefault;
 
 /// #142: STRATA_SPLIT_ROUTED_MAX, a token count (0 = off: every chunk streams the walk); unset or not a non-negative
 /// number is the default.
