@@ -74,6 +74,7 @@ IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
@@ -1233,13 +1234,16 @@ class Service:
         self.fifo = RequestGate()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
-        self.allowed_hosts: set = set()                # names besides this PC's own that may be used as Host when there is no key (config "allowed_hosts")
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
         # matters); empty = no CORS headers at all, as before
         self.cors_origins: list[str] = []
         # #321: origins that count as Strata's own page for /settings and MCP tools, e.g. the web app reached through a
         # reverse proxy or tunnel whose Host differs ("https://strata.example.com"); never a wildcard
         self.trusted_origins: list[str] = []
+        # DNS rebinding: extra Host names this server answers to (the config's allowed_hosts, $STRATA_ALLOWED_HOSTS;
+        # "*" = any), and every name it answers to, which serve() works out from the address it listens on
+        self.allowed_hosts: list[str] = []
+        self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0, "loops_stopped": 0}  # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
@@ -1904,7 +1908,9 @@ class Service:
         elif max_new > room:
             if not self.fit_max_tokens:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
+                                 f"({self.engine.max_context}); requests are never truncated. Send a smaller "
+                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
+                                 "model's strata-<model>.json to shorten it to the room left (#545)")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
@@ -2233,6 +2239,10 @@ class Service:
                             if finish != "error" and last.get("prompt_ms") is not None:   # xeno #49 S5
                                 for line in timing_report(last, len(ids), el):
                                     print(line, flush=True)
+                            if finish == "length" and parser.state == "reasoning":   # #530
+                                print("[strata] the reply reached max tokens while still thinking, so it has no "
+                                      "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
+                                      "strata-<model>.json for every request) leaves room to answer", flush=True)
                             if os.environ.get("STRATA_DEBUG") and raw_ids:   # xeno: ascii(), never a UnicodeEncodeError
                                 print(f"[strata] raw: {ascii(self.tok.decode(raw_ids))}", flush=True)
                         self.status["busy"] = False
@@ -2743,6 +2753,47 @@ def make_handler(svc: Service):
         def log_message(self, fmt, *args):
             pass
 
+        def parse_request(self):
+            """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
+            (host_allowed).  With a key a rebinding page cannot authenticate, so the check is skipped: tunnels and
+            proxies that pass their own name on keep working."""
+            if not super().parse_request():
+                return False
+            host = self.headers.get("Host")
+            # svc.allowed_hosts again: a name the config adds after serve() worked out host_names (xeno #71)
+            if svc.api_key or host_allowed(host, svc.host_names | set(svc.allowed_hosts), "*" in svc.allowed_hosts):
+                return True
+            print(f"[strata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
+                  f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
+                  flush=True)
+            self._json(403, {"error": {"type": "forbidden", "message":
+                             f"Host {host!r} is not allowed (DNS rebinding protection). Reaching Strata under this "
+                             f"name on purpose? Add it to \"allowed_hosts\" in the config (strata-<model>.json) or to "
+                             f"the STRATA_ALLOWED_HOSTS environment variable, or set an API key (\"api_key\"), which "
+                             f"turns this check off"}})
+            return False
+
+        def _foreign_page(self) -> bool:
+            """Without an API key, a /v1 POST from a browser page of another site (any site can POST text/plain
+            there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
+            then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
+            origin = self.headers.get("Origin")
+            if svc.api_key or not origin:
+                return False
+            if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
+                                  [*svc.trusted_origins, *svc.cors_origins]):
+                print(f"[strata] refused an API request from the web page {origin!r} (no API key; add its host to "
+                      f"\"allowed_hosts\" or its origin to \"cors_origins\" in the config)", flush=True)
+                self._json(403, {"error": {"type": "forbidden", "message":
+                                 f"web pages of {origin} may not use this server without an API key; set \"api_key\", "
+                                 f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") "
+                                 f"in the config"}})
+                return True
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                self._json(415, {"error": {"message": "send application/json"}})
+                return True
+            return False
+
         def _watch_client(self, cancel: threading.Event) -> None:
             """#430 #431: cancel the request as soon as its client hangs up.  A non-streamed request writes nothing
             until it ends, and a streamed one only a keep-alive per prompt chunk (and the first write after a hang-up
@@ -2830,13 +2881,6 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
-        def _host_ok(self) -> bool:
-            """With no API key, only this PC's own names as Host (see host_allowed); with one, the key is the gate."""
-            if svc.api_key or host_allowed(self.headers.get("Host", ""), svc.allowed_hosts):
-                return True
-            self._json(421, {"error": {"message": "this name does not reach this server: use the PC's address, or list the name in the run config's allowed_hosts"}})
-            return False
-
         def _foreign_origin(self) -> bool:
             """A browser sends Origin on a cross-site POST; one that is not this server's own page is refused (403)."""
             origin = self.headers.get("Origin")
@@ -2894,8 +2938,6 @@ def make_handler(svc: Service):
             return True
 
         def do_GET(self):
-            if not self._host_ok():
-                return
             if self._ui_prefix():
                 return
             path = self.path.split("?")[0].rstrip("/")
@@ -3162,13 +3204,13 @@ def make_handler(svc: Service):
                 self._do_post()
 
         def _do_post(self):
-            if not self._host_ok():
-                return
             if self.path.startswith("/classic/"):             # the classic app under its prefix (xeno UI S1)
                 self.path = self.path[len("/classic"):]
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            if path.startswith("/v1/") and self._foreign_page():
+                return
             if path == "/settings":
                 self._settings()
                 return
@@ -3385,7 +3427,10 @@ def make_handler(svc: Service):
                 with svc.keep_lock:
                     svc.keep_prompts = n
                 return self._json(200, {"keep_prompts_left": n})
-            if path in ("/unload", "/load") and self._foreign_origin():
+            if path in ("/unload", "/load") and self._foreign_origin():   # xeno: a foreign page is 403 whatever it sends
+                return
+            # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
+            if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
                 return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
@@ -3803,6 +3848,36 @@ def warn_tight_ram(arena_mib) -> None:
               + "Close other programs, or run START-HERE --setup and pick a smaller size (Q2_0 / IQ2_XS).", flush=True)
 
 
+DESKTOP_FREE_MIB = 2048          # #560 #516: below this, an AMD card that also drives a Linux desktop can run out
+DESKTOP_RESERVE_MIB = 3072       # what kept KDE/Wayland alive beside a full expert cache in both reports
+
+
+def linux_desktop(env=None) -> bool:
+    """A graphical session on Linux (Wayland or X): its compositor, browser and apps take VRAM after the model has."""
+    env = os.environ if env is None else env
+    return os.name != "nt" and sys.platform != "darwin" and bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
+
+
+def desktop_vram_note(backend, vram_free_mib, args: list, desktop: bool) -> str:
+    """#560 #516: on Linux, when the desktop needs VRAM the AMD card does not have, amdgpu moves GPU memory (the expert
+    cache, ~24 GB) to system RAM, which the experts already fill - the OOM killer then ends the compositor.  The
+    default reserve (700 MiB) is sized for a card without a desktop.  A recommendation, nothing changes: "" when it
+    does not apply."""
+    if backend != "hip" or not desktop or not isinstance(vram_free_mib, int) or vram_free_mib >= DESKTOP_FREE_MIB:
+        return ""
+    try:
+        reserve = int(args[args.index("--vram-reserve-mib") + 1]) if "--vram-reserve-mib" in args else 700
+    except (ValueError, IndexError):
+        reserve = 700
+    if reserve >= DESKTOP_RESERVE_MIB:
+        return ""
+    return (f"[strata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
+            "desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
+            "the OOM killer ends the session), keep more VRAM free: ./setup.sh --vram-reserve-mib "
+            f"{DESKTOP_RESERVE_MIB} (remembered; the expert cache gets "
+            f"{(DESKTOP_RESERVE_MIB - reserve) / 1024:.1f} GB less, a few % of speed)")
+
+
 def lan_addresses() -> list[str]:
     """This PC's IPv4 addresses on its networks (what another device types in), without loopback/link-local."""
     import socket
@@ -3851,32 +3926,121 @@ def loading_server(host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
-def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
-    svc.start_telemetry()
-    httpd = Server((host, port), make_handler(svc))
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd
+def host_name(value) -> str:
+    """The name in a Host header (or an origin's host[:port]): "Example.com:8080" -> "example.com",
+    "[::1]:8095" -> "::1"; "" when it is malformed."""
+    v = (value or "").strip().lower()
+    if v.startswith("["):
+        name, sep, rest = v[1:].partition("]")
+        return name if sep and (not rest or (rest[:1] == ":" and rest[1:].isdigit())) else ""
+    if v.count(":") == 1:
+        v, port = v.split(":")
+        if not port.isdigit():
+            return ""
+    elif ":" in v:                                       # a bare IPv6 address (a config entry)
+        return v
+    v = v.rstrip(".")
+    return v if v and all(c.isalnum() or c in "-._" for c in v) else ""
 
 
-def host_allowed(host: str, allowed=()) -> bool:
-    """Whether the Host a request names is this PC (xeno #71). A web page on another site whose name has been re-pointed at
-    this PC (DNS rebinding) is then same-origin with the server, and its requests carry that site's name as Host. An IP
-    address cannot be re-pointed, `localhost` and a name with no dot (a machine on the LAN) cannot be a public site, `.local`
-    is mDNS; any other name has to be in the run config's `allowed_hosts`. No Host at all is no browser."""
-    h = (host or "").strip().lower()
-    if not h:
-        return True
-    if h.startswith("["):
-        name = h[1:h.find("]")] if "]" in h else h
-    else:
-        name = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
-    name = name.rstrip(".")
+def _is_ip(name: str) -> bool:
+    import ipaddress
     try:
         ipaddress.ip_address(name)
         return True
     except ValueError:
-        pass
-    return name == "localhost" or name.endswith(".localhost") or "." not in name or name.endswith(".local") or name in allowed
+        return False
+
+
+def _name_in(name: str, names) -> bool:
+    """`name` is one of `names`, or below an entry that starts with a dot (".example.com")."""
+    return name in names or any(n.startswith(".") and (name.endswith(n) or name == n[1:]) for n in names)
+
+
+def allowed_hosts_of(value, env: str = "") -> list[str]:
+    """The config's allowed_hosts (a name or a list) plus $STRATA_ALLOWED_HOSTS (comma-separated): host names, "*" or
+    ".example.com" (it and every name below it).  A scheme, port or path is dropped ("https://a.example.com:8443/"
+    -> "a.example.com"); a wrong entry stops the start (ValueError)."""
+    items = [] if value in (None, "") else [value] if isinstance(value, str) else value
+    if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
+        raise ValueError("allowed_hosts: expected a host name or a list of them")
+    out = []
+    for raw in items + [x for x in env.split(",") if x.strip()]:
+        x = raw.strip().lower()
+        if x == "*":
+            out.append(x)
+            continue
+        x = x.split("://", 1)[-1].split("/", 1)[0]
+        dot = x.startswith(".")
+        name = host_name(x[1:] if dot else x)
+        if not name:
+            raise ValueError(f"allowed_hosts: {raw!r} is not a host name like strata.example.com")
+        out.append("." + name if dot else name)
+    return list(dict.fromkeys(out))
+
+
+def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[str]:
+    """Every name this server answers to besides an IP address: localhost, the address it listens on, the config's
+    allowed_hosts and trusted_origins' hosts, and - listening beyond this PC (0.0.0.0 or a LAN address) - this PC's
+    name and LAN addresses (the LAN addresses matter for the Origin check, which takes no IP on trust)."""
+    names = set(LOOPBACK_NAMES)
+    bind = host_name(bind_host)
+    if bind and bind not in ("0.0.0.0", "::"):
+        names.add(bind)
+    if bind not in LOOPBACK_NAMES:
+        try:
+            pc = socket.gethostname().lower()
+            names.update((pc, pc + ".local"))
+        except OSError:
+            pass
+        names.update(("host.docker.internal", *lan_addresses()))
+    names.update(x for x in allowed_hosts if x != "*")
+    names.update(filter(None, (host_name(o.split("://", 1)[-1]) for o in trusted_origins)))
+    return names
+
+
+def host_allowed(host, names, any_host=False) -> bool:
+    """DNS rebinding: a web page of another site whose name its DNS points at 127.0.0.1 reaches this server as the
+    same origin, so the browser lets it read every answer.  Its requests carry that site's name in Host, so only
+    the names this server answers to pass.  An IP address passes (a page served from an IP is that IP's own page;
+    rebinding needs a name), as does "*.localhost" (browsers never ask DNS for it) and a request without a Host
+    header (HTTP/1.0 clients; browsers always send one)."""
+    if any_host or not (host or "").strip():
+        return True
+    name = host_name(host)
+    # xeno #71: also a name with no dot (a machine on the LAN: no public site has one) and an mDNS ".local" name,
+    # which the fork's own check let through before upstream's check replaced it
+    lan = bool(name) and ":" not in name and ("." not in name or name.endswith(".local"))
+    return bool(name) and (_is_ip(name) or name == "localhost" or name.endswith(".localhost") or lan
+                           or _name_in(name, names))
+
+
+def origin_allowed(origin: str, host, names, origins=()) -> bool:
+    """A browser page's Origin that may use the model without an API key: this server's own page (the Origin is the
+    request's own Host), a page on one of the names this server answers to (any port), or an origin the config lists
+    (trusted_origins, cors_origins).  Unlike the Host check no IP passes on trust: a page served from any other IP is
+    another site.  "null" (a sandboxed frame, a file:// page) does not pass: any site can send it.  An origin of another
+    scheme (chrome-extension://, moz-extension://, an Electron app's app://) does: no web site can send one."""
+    origin = (origin or "").strip().rstrip("/")
+    if origin in origins or "*" in origins:             # cors_origins ["*"]: the config lets every page in
+        return True
+    scheme, sep, rest = origin.lower().partition("://")
+    if not sep or not scheme:
+        return False
+    if scheme not in ("http", "https"):
+        return True
+    if host and rest == host.strip().lower():
+        return True
+    name = host_name(rest)
+    return bool(name) and (name in LOOPBACK_NAMES or name.endswith(".localhost") or _name_in(name, names))
+
+
+def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+    svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
+    svc.start_telemetry()
+    httpd = Server((host, port), make_handler(svc))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
 
 
 def ui_choice(cfg: dict) -> str:
@@ -4142,6 +4306,10 @@ def main() -> int:
         engine = StrataEngine(exe, args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
+        note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
+                                 linux_desktop())
+        if note:                                        # #560 #516: before --open starts a browser on that card
+            print(note, flush=True)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
@@ -4167,6 +4335,13 @@ def main() -> int:
     svc.cjk_ban = a.engine == "strata" and bool(cfg.get("cjk_guard"))   # xeno #49 S4: --ban-ids was passed
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
+    try:
+        svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), os.environ.get("STRATA_ALLOWED_HOSTS", ""))
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    if svc.allowed_hosts:
+        print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
+              else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
     if svc.api_monitor:
         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
@@ -4191,7 +4366,7 @@ def main() -> int:
     threading.Thread(target=_model_info, daemon=True).start()
     svc.ui = ui_choice(cfg)                                            # which web app "/" serves (xeno UI)
     svc.config_path, svc.mcp_config_path = a.config, a.mcp_config      # where the web app saves and reads the MCP servers (#79)
-    svc.allowed_hosts = {str(h).strip().lower().rstrip(".") for h in (cfg.get("allowed_hosts") or []) if str(h).strip()}   # xeno #71
+    # (xeno #71's own allowed_hosts parse is upstream's allowed_hosts_of above since 0.1.38)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")

@@ -27,6 +27,7 @@
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/core/peer_experts.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/split_plan.hpp"
 #include "strata/prefill/kv_stage_plan.hpp"
@@ -70,6 +71,7 @@ size_t q8_row_bytes(int64_t) { return 0; }
 void gather_q8_rows(const void*, int64_t, const int32_t*, int64_t, int64_t, void*, void*) {}
 void gather_native_group(const uint8_t* const*, int, size_t, size_t, size_t, size_t, void*, size_t, void*, size_t,
                          void*) {}
+bool gather_native_group(const GatherGroup&, size_t, size_t, size_t, size_t, void*, size_t, void*, size_t, void*) { return false; }
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
@@ -236,8 +238,13 @@ inline bool expert_id_order() {
 // fused path that cannot run
 inline bool fused_ring() {
     if (!fused::enabled() || g_split_layout || !expert_id_order()) return false;
+    if (core::peer_portable()) return false;   // multi-GPU: --peer-device keeps the MMQ path and its buffer sizes
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native) return true;
+    // xeno (merge 0.1.38): ANY layer, as before.  Upstream (220e0e8) asks for EVERY layer because its fused_layout()
+    // shrinks the MoE buffers to the fused path's needs and an uncovered layer (Unsloth UD-IQ4_XS's Q8_0 down) then ran
+    // MMQ in them and overflowed.  Here moe_bufs keeps MMQ's full size (max of the two, the 0.1.37 merge), so a mixed
+    // pack - the served Swift 1.5 IQ2_XS has three IQ1_M layers - keeps the fused kernels on its covered layers.
     static const bool any = [&lay] {
         for (const auto& f : lay.fmt)
             if (fused::native_supported(f.gu_type, f.d_type)) return true;
@@ -449,6 +456,12 @@ struct Stager {
                     // job a stager is still copying (taken before its layer was routed), so each job - a skipped one
                     // too, or the chain breaks across it - waits for the buffer's previous job first
                     (void) wait(j - kRing);
+                } else if (!skipped) {
+                    // upstream 0.1.38 (3a91b9c): a generation's first kRing jobs wait for the previous generation's
+                    // last DMA from the buffer, which nothing else waits for when a chunk ends without a sync (no MTP)
+                    // or the DMA was a ring entry the routing skipped (an event never recorded returns at once)
+                    timeline::Span wait_span("stager wait buffer", j, -1);
+                    cudaEventSynchronize(dma_done[b]);
                 }
                 if (!skipped) {
                     timeline::Span stage_span(jb.from ? "stager copy blob" : jb.src ? "stager memcpy" : "stager nvme read", j,
@@ -1482,7 +1495,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             m.grp_host = m.grp_dev = nullptr;
             m.grp_n = m.grp_tk = 0;
             void *h = nullptr, *d = nullptr;
-            if (cudaHostAlloc(&h, need * 4, cudaHostAllocMapped) == cudaSuccess &&
+            if (cudaHostAlloc(&h, need * 4, cudaHostAllocMapped | (core::peer_portable() ? cudaHostAllocPortable : 0)) == cudaSuccess &&
                 cudaHostGetDevicePointer(&d, h, 0) == cudaSuccess) {
                 m.grp_host = (int32_t*) h;
                 m.grp_dev = (int32_t*) d;
@@ -1676,9 +1689,16 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
                        std::string& err) {
     Impl& m = *impl_;
     static const bool off = [] { const char* v = std::getenv("STRATA_MTP_BATCH"); return v != nullptr && v[0] == '0'; }();
+    // A ring (KV streaming: the drafter's window, page p in slot p % n_slots over a host copy) takes the same appends
+    // with its own page table and host copy, as a streamed main layer does; the cells written are those the window can
+    // still reach (r0 below), which the ring holds, so no two of them share a slot.  STRATA_MTP_BATCH_RING=0: the
+    // drafter's own pass for a ring (the A/B).  xeno (merge 0.1.38): OFF by default here - with --kv-resident (the D2x
+    // profile, #122/#126) the drafter's K/V is a ring and this moves its prompt-time appends onto the batched path, a
+    // served-path change no same-session ABBA has measured yet; STRATA_MTP_BATCH_RING=1 is upstream's default (the arm)
+    static const bool ring_ok = [] { const char* v = std::getenv("STRATA_MTP_BATCH_RING"); return v != nullptr && v[0] == '1'; }();
     core::QsaState& st = mtp.kv_state_rw();
-    if (off || n <= 0 || m.g == nullptr || m.region == nullptr || st.kv_mode != 0 || st.kv_hybrid ||
-        mtp.device() != m.device)
+    if (off || n <= 0 || m.g == nullptr || m.region == nullptr || (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok)) ||
+        st.kv_hybrid || mtp.device() != m.device)
         return false;
     const auto t0 = Clock::now();
     const core::ModelGeometry& g = *m.g;
@@ -1711,7 +1731,9 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     const bool q8 = !f16_only && mmq::built() && mmq::fits(kQ8_0, Nn) && mmq::fits(kQ8_0, KV);   // #420
     const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn) + 64 +
                              (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);
-    const int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
+    int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
+    if (st.kv_mode == 2)   // a ring: one batch's cells must not share a slot (a batch can straddle one page more)
+        B = std::min<int64_t>(B, ((st.n_slots - 1) * strata::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
     if (B < 64) return false;
     uint8_t* q = m.region;
     auto carve = [&](size_t bytes) { void* p = q; q += (bytes + 255) & ~(size_t) 255; return p; };
@@ -1736,7 +1758,12 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     int32_t* ident = q8 ? (int32_t*) carve((size_t) B * g.hc * 4) : nullptr;
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
     if ((uint64_t) (q - m.region) > m.region_bytes) return false;
+    static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
+    if (timing) cudaStreamSynchronize(m.cs);
+    const auto ti0 = Clock::now();
     if (!mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
+    const double ms_idle = ms_since(ti0);
+    const auto tl0 = Clock::now();
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
@@ -1816,8 +1843,22 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         return false;
     }
     mtp.ms_prefill += ms_since(t0);
+    if (timing)
+        std::fprintf(stderr, "strata draft kv: %lld cells from %lld (first needed %lld), batch %lld: drafter idle %.1f ms, "
+                     "the batches %.1f ms, all %.1f ms\n", (long long) n, (long long) cell0, (long long) (cell0 + r0),
+                     (long long) B, ms_idle, ms_since(tl0), ms_since(t0));
     return true;
 }
+bool Prefill::set_peer(core::PeerExperts* peer, int64_t, std::string& err) {
+    // xeno (merge 0.1.38): upstream's peer share of the prompt path (PeerPrefill: the peer's rows of each chunk, its
+    // ring and compact buffers) is not ported into the fork's prompt path (the expert split #35, the wave, the copy
+    // issuer, the expert order #41).  --peer-device keeps its decode tier; the prompt path stays on the primary, as
+    // upstream's --peer-prefill-rows 0 (generate.cpp prints why and goes on)
+    if (peer == nullptr || !peer->valid()) return true;
+    err = "the fork's prompt path does not run upstream's peer share of the prompt (merge 0.1.38)";
+    return false;
+}
+
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_split_layout(bool on) { g_split_layout = on; }
 bool Prefill::split_layout_full() { return strata::prefill::split_layout_full(); }
@@ -2146,17 +2187,29 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             const char* v = std::getenv("STRATA_PREFILL_PLE_AHEAD");
             return v == nullptr || std::atoi(v) != 0;
         }();
+        // upstream 0.1.38 (ple_land): taken once per chunk - at layer 1, or at the end of a stage that ends before it
+        bool ple_pending = ple_on;
         auto ple_take = [&]() -> bool {
+            if (!ple_pending) return true;
+            ple_pending = false;
             const auto tp = Clock::now();
             timeline::Span ple_span("ple rows (host)", c0);
             if (!ple_next.get()) {
                 err = ple_next_err;
                 return false;
             }
-            cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs);
-            cudaEventRecord(m.ple_copied[ple_buf], m.cs);
+            if (cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs) !=
+                    cudaSuccess ||
+                cudaEventRecord(m.ple_copied[ple_buf], m.cs) != cudaSuccess) {   // upstream 0.1.38 (4f7b3e8): checked
+                err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
             if (c0 + stride < n) {
-                cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
+                // the other buffer's upload (a chunk ago) is done before the SSD thread refills it
+                if (cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]) != cudaSuccess) {
+                    err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
                 ple_next = ple_read(c0 + stride, ple_buf ^ 1);
             }
             ple_buf ^= 1;
@@ -2515,7 +2568,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 timeline::Span ws("wave wait", l, chunk_i);
                 if (!wave->wait_attn(chunk_i - 1, l, m.cs)) { err = "prefill: the other wave lane failed"; return false; }
             }
-            if (l == 1 && ple_on && ple_ahead_on && !ple_take()) return false;   // this chunk's PLE rows, uploaded
+            // this chunk's PLE rows, uploaded (upstream 0.1.38: at the stage's first layer from 1 on)
+            if (l == std::max<int64_t>(LB, 1) && ple_on && ple_ahead_on && !ple_take()) return false;
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
@@ -3417,6 +3471,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
         }
+        if (!ple_take()) return false;   // upstream 0.1.38: a stage that ends before layer 1 - the rows land anyway, the next gather starts
         if (issuer.joinable()) {   // (xeno) issue_one counts the stream's stats itself, on whichever thread issues
             issuer_stop.store(true);
             issuer.join();
