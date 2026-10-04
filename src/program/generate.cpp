@@ -943,6 +943,13 @@ uint64_t prompt_bytes_needed(const strata::core::ModelGeometry& g, const strata:
     if (!g_prefill_wave) return strata::prefill::Prefill::bytes_needed(g, ss, chunk, kv_end);
     return strata::prefill::Prefill::wave_bytes_needed(g, ss, chunk, kv_end);
 }
+/// #139: the refill's tail reader issues from one thread on Windows (DirectFile::open); on POSIX the issuing threads
+/// are the queue depth (one blocking pread each), so the default stays.  Measured on the PM9A1 only.
+#if defined(_WIN32)
+constexpr int kTailIssuers = 1;
+#else
+constexpr int kTailIssuers = 0;
+#endif
 /// the tail file's slot stride, also the refill's bounce stride: the largest blob, rounded up to 4 KiB
 uint64_t tail_stride() { return ((uint64_t) strata::kernels::cpu::expert_layout().max_blob + 4095) / 4096 * 4096; }
 
@@ -981,7 +988,7 @@ bool setup_tail_file(TailFile& t, strata::core::ArenaExpertSource& arena,
         return good;
     };
     t.path = path;
-    if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) == size && t.file.open(path, err)) {
+    if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) == size && t.file.open(path, err, kTailIssuers)) {
         if (spot_check()) { t.ok = true; return true; }
         t.file.close();
         std::fprintf(stderr, "strata generate: tail file %s failed its check; rebuilding\n", path.c_str());
@@ -1038,7 +1045,7 @@ bool setup_tail_file(TailFile& t, strata::core::ArenaExpertSource& arena,
     if (ec) { err = "renaming the tail file: " + ec.message(); return false; }
     std::fprintf(stderr, "strata generate: tail file %s built: %d slots, %.2f GB in %.1f s\n", path.c_str(), n,
                  (double) size / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    if (!t.file.open(path, err) || !spot_check()) { err = "the new tail file failed its check"; return false; }
+    if (!t.file.open(path, err, kTailIssuers) || !spot_check()) { err = "the new tail file failed its check"; return false; }
     t.ok = true;
     return true;
 }
@@ -4330,7 +4337,8 @@ int main(int argc, char** argv) {
                 thread_local strata::platform::DirectFile f;
                 thread_local uint8_t* bounce = nullptr;
                 std::string e2;
-                if (!f.is_open() && !f.open(g_tail.path, e2)) return false;
+                // one read in flight per stager thread (read_slot): one issuer, not a pool of idle ones (#139)
+                if (!f.is_open() && !f.open(g_tail.path, e2, 1)) return false;
                 if (bounce == nullptr) bounce = (uint8_t*) strata::platform::DirectFile::alloc_aligned((size_t) g_tail.stride);
                 if (bounce == nullptr || !g_tail.read_slot(f, slot, bounce, e2)) return false;
                 std::memcpy(dst, bounce, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
