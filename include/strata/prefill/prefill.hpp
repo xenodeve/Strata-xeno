@@ -82,8 +82,13 @@ public:
     void set_peer_tier(const int32_t* res, std::function<const void*(int32_t)> slot_ptr, int device);
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
-    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+    /// #122: `kv_end` - the request's end position, which sizes the KV-streaming staging pool (kv_stage_plan.hpp);
+    /// 0 = the worst case, every page of the context.
+    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, int64_t kv_end = 0);
     int64_t chunk() const;
+    /// #122: the cells the KV-streaming staging pool of this layout holds (INT64_MAX when the session is not
+    /// streamed): a prompt must end at or before them.
+    int64_t stage_cells() const;
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
@@ -103,17 +108,21 @@ public:
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
 
-    /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
-    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
+    /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).  #122: `kv_end`
+    /// as in relayout (0 = the worst case: boot-time sizing, the chunk choice and the lendable tail).
+    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                 int64_t kv_end = 0);
     /// #35 D7: a wave lane's chunk for a prompt-path chunk of `chunk` tokens (half, rounded up to 256), and the device
     /// bytes both lanes need - the one sizing rule for the lend, the layouts and the relayouts
     static int64_t wave_lane_chunk(int64_t chunk) { return chunk / 2 < 256 ? 256 : (chunk / 2 + 255) / 256 * 256; }
-    static uint64_t wave_bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
-        return 2 * wave_lane_bytes(g, ss, wave_lane_chunk(chunk));
+    static uint64_t wave_bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                      int64_t kv_end = 0) {
+        return 2 * wave_lane_bytes(g, ss, wave_lane_chunk(chunk), kv_end);
     }
     /// one lane's share of a lent region for chunks of `lane_chunk` tokens (4 KiB aligned: lane 2's starts after it)
-    static uint64_t wave_lane_bytes(const core::ModelGeometry& g, const core::SessionState& ss, int64_t lane_chunk) {
-        return (bytes_needed(g, ss, lane_chunk) + 4095) / 4096 * 4096;
+    static uint64_t wave_lane_bytes(const core::ModelGeometry& g, const core::SessionState& ss, int64_t lane_chunk,
+                                    int64_t kv_end = 0) {
+        return (bytes_needed(g, ss, lane_chunk, kv_end) + 4095) / 4096 * 4096;
     }
     /// whether a wave over prompt-path chunks of `chunk` tokens still runs each lane's chunk split
     static bool wave_lane_splits(int64_t chunk);
@@ -169,7 +178,7 @@ private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
-    bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+    bool carve(std::size_t T, void* alloc, int64_t kv_end);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
     std::unique_ptr<Impl> impl_;
