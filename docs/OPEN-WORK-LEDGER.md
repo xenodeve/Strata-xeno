@@ -1,5 +1,17 @@
 # Open work
 
+## Review follow-ups — 2026-10-04
+
+Codebase review of `ad28ddb` against upstream v0.1.38: [report](reports/2026-10-04-codebase-review-vs-upstream.md), branch `docs/2026-10-04-codebase-review`. Report only; engine/server/config unchanged. GitHub remains the source of state for the follow-ups.
+
+| Area | Tracker |
+|---|---|
+| Server Origin policy / coding-tool Git scope | #153; additional security evidence in #110 |
+| Grouped gather / GGUF role geometry / split configuration | #154 / #155 / #156 |
+| Paired primary transitions / Q2 predicate names / secondary completion | #157 / #158 / #159 |
+| Capacity-mode timeline job arguments | #160 (source traced; runtime reproduction pending) |
+| Existing latency/determinism work | #136 / #40 / #61 / #143; drafter #149 / #152 stays with its owner |
+
 Strata-xeno PRD: xenodeve/Qwen3.8-Flash-Next-Tuning#1. Engine implementation and measurement issues are paired. The approved 2026-09-27 handoff is the phase scope.
 
 | Phase | Engine | Measurement | Current state |
