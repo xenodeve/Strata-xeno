@@ -11,6 +11,7 @@
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/direct_file.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -128,7 +129,9 @@ int selftest(const std::string& dir, uint32_t rb) {
             CHECK(rd.cache_size() <= rd.cache_capacity(), "row cache exceeded its bound");
         }
     }
-    // fault injection: a 3 ms delay must be observed, and must not change the bytes
+    // fault injection: no row read completes sooner than the delay after its issue, and the bytes are unchanged.
+    // The contract is checked per read; whether a read was held back depends on how late it already was (#140:
+    // under ctest -j 4 every read was processed after 3 ms, so "a read was held back" failed with a working injector)
     for (bool thr : {false, true}) {
         ng::PleReader rd;
         std::string err;
@@ -136,10 +139,31 @@ int selftest(const std::string& dir, uint32_t rb) {
         rd.set_injected_delay_us(3000);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
-        const double t0 = now_us();
         check_rows(rd, rows, N, rb, "delayed");
-        CHECK(now_us() - t0 >= 3000, "injected delay not observed (%.0f us)", now_us() - t0);
-        CHECK(rd.stats().late_injected > 0, "no read was held back");
+        const ng::ReaderStats st = rd.snapshot();
+        const float fastest = st.read_us.empty() ? 0.f : *std::min_element(st.read_us.begin(), st.read_us.end());
+        CHECK(!st.read_us.empty() && fastest >= 3000.f, "a read completed %.0f us after its issue, inside the delay",
+              fastest);
+    }
+    // close() with completions the injector holds: a ticket never collected, whose reads another ticket's drain
+    // took from the port. They never come back through the port, so close() must free their slots itself (a hang
+    // otherwise; ctest's TIMEOUT bounds it). Delay 20 ms: b is collected at ~20 ms, when a's reads, issued 10 ms
+    // later and done within the 5 ms nap, are ~10 ms old and still held.
+    {
+        ng::PleReader rd;
+        std::string err;
+        CHECK(rd.open(path, HEADER, N, 64, 0, err, false, rb), "open: %s", err.c_str());
+        rd.set_injected_delay_us(20000);
+        std::vector<uint32_t> a(16), b(16);
+        for (auto& r : a) r = rng() % N;
+        for (auto& r : b) r = rng() % N;
+        std::vector<uint8_t> oa(16 * rb), ob(16 * rb);
+        const auto tb = rd.issue(b.data(), 16, ob.data());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        rd.issue(a.data(), 16, oa.data());
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK(rd.collect(tb, err), "held close: %s", err.c_str());
+        rd.close();
     }
     // keep-alive: while rows are asked for, a page goes out after `period` without a read; it stops once the
     // window after the last issue has passed, starts again with the next issue (even one the row cache serves),
