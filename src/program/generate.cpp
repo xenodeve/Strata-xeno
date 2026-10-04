@@ -67,6 +67,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/park_writer.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -1434,6 +1435,9 @@ struct CacheSlot {
     struct Shape { size_t ids, imgs, gdn, ple, tails, dead, block_pos; uint64_t used; };
     std::vector<Shape> shapes;
     uint64_t state_bytes = 0;
+    // #145: the checkpoints' write to `file` after a park (slot_checkpoints on a thread); joined before anything reads
+    // the slot again.  Last, so it is destroyed - and joined - before the file and the vectors it writes.
+    strata::program::ParkWriter writer;
 };
 
 bool slot_checkpoints(CacheSlot& slot, bool reading) {
@@ -6826,14 +6830,27 @@ int main(int argc, char** argv) {
                         std::printf("ERR saving conversation cache slot failed\n"); return serve_fatal();
                     }
                     saved.checks = std::move(checks);
-                    if (!slot_checkpoints(saved,false)) {
-                        std::printf("ERR saving cache checkpoints to disk failed\n"); return serve_fatal();
-                    }
-                    std::fprintf(stderr,"strata cache: slot %d offloaded %.1f MiB of checkpoint state\n",
-                        active_slot,saved.state_bytes/(1024.0*1024.0));
+                    // #145: the checkpoints - host vectors already, nothing the next request overwrites - go to the
+                    // file on a thread: their write was 127-497 ms of every switch (swap-t40k-run.txt)
+                    saved.writer.start([&saved, slot = active_slot] {
+                        if (!slot_checkpoints(saved,false)) {
+                            std::fprintf(stderr,"strata cache: slot %d: saving its checkpoints to disk failed; the "
+                                                "conversation will be read again\n",slot);
+                            return false;
+                        }
+                        std::fprintf(stderr,"strata cache: slot %d offloaded %.1f MiB of checkpoint state\n",
+                            slot,saved.state_bytes/(1024.0*1024.0));
+                        return true;
+                    });
                 }
                 live_ok = false; live.clear(); live_imgs.clear(); checks.clear();
                 auto& incoming = slots[req_slot];
+                if (!incoming.writer.join()) {   // #145: its park's write failed - nothing to restore from
+                    incoming.file.reset();
+                    incoming.shapes.clear();
+                    incoming.running = ConvCheckpoint{};
+                    std::vector<ConvCheckpoint>().swap(incoming.checks);
+                }
                 if (incoming.file) {
                     if (!slot_positional(incoming,ss,g,mtp,true) || !slot_checkpoints(incoming,true)
                         || !checkpoint_restore(incoming.running,ss,g)) {
