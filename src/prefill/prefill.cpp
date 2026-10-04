@@ -885,9 +885,7 @@ int64_t take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata
                    strata::kernels::KvHostPools& st, bool& ok, int64_t kv_end) {
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
     if (q0.kv_mode != 1) return INT64_MAX;
-    // the floor is the cells the layer keeps in VRAM (n_slots, set by kv_plan): a tuning choice - #122 was measured
-    // with it; a lower floor would lend less for short turns (unmeasured)
-    const int64_t pages = kv_stage_pages(kv_end, q0.n_slots * s.page_size, q0.n_pages, s.page_size);
+    const int64_t pages = kv_stage_pages(kv_end, q0.n_pages, s.page_size);
     if (stage_own() && o_borrowed.count_only) return pages * s.page_size;
     Alloc own;
     own.owned = o_borrowed.owned;
