@@ -27,10 +27,13 @@ public:
     DirectFile(const DirectFile&) = delete;
     DirectFile& operator=(const DirectFile&) = delete;
 
-    bool open(const std::string& path, std::string& err);
+    /// `issuers`: the threads that issue the reads when STRATA_IO_THREADS is not set (it overrides every file);
+    /// <= 0 = the platform default.  #139: a reader of a few large contiguous pieces asks for 1 (measured: #139).
+    bool open(const std::string& path, std::string& err, int issuers = 0);
     void close();
     bool is_open() const;
     uint64_t size() const;
+    int issuers() const;   ///< the open file's issuing threads
     static constexpr uint32_t alignment() { return 4096; }
 
     /// Queue one read. Returns false (and sets `err`) if the request could not be queued; a queued request

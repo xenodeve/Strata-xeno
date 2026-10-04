@@ -57,11 +57,12 @@ struct Pending {
     uint64_t tag;
 };
 
-/// The number of issuing threads: STRATA_IO_THREADS, else 4 (Windows: overlapped submits) / 16 (Linux: each
-/// thread does one blocking pread, so the thread count is the queue depth).
-int io_threads(int dflt) {
+/// The number of issuing threads: STRATA_IO_THREADS (the operator's override, also #139's A/B lever), else the
+/// caller's `asked` (> 0), else 4 (Windows: overlapped submits) / 16 (Linux: each thread does one blocking pread, so
+/// the thread count is the queue depth).
+int io_threads(int asked, int dflt) {
     const char* v = std::getenv("STRATA_IO_THREADS");
-    const int n = v ? std::atoi(v) : dflt;
+    const int n = v ? std::atoi(v) : asked > 0 ? asked : dflt;
     return std::clamp(n, 1, 64);
 }
 }  // namespace
@@ -155,7 +156,7 @@ DirectFile::~DirectFile() {
     delete impl_;
 }
 
-bool DirectFile::open(const std::string& path, std::string& err) {
+bool DirectFile::open(const std::string& path, std::string& err, int issuers) {
     close();
     const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
     std::wstring wpath((size_t) (wlen > 0 ? wlen : 1), L'\0');
@@ -183,7 +184,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     }
     // Completions of reads that finish synchronously are still queued to the port, so every issued read
     // produces exactly one packet; `wait` is the only completion path.
-    const int n = io_threads(4);
+    const int n = io_threads(issuers, 4);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }
@@ -201,6 +202,7 @@ void DirectFile::close() {
 
 bool DirectFile::is_open() const { return impl_->file != INVALID_HANDLE_VALUE; }
 uint64_t DirectFile::size() const { return impl_->size; }
+int DirectFile::issuers() const { return (int) impl_->pool.size(); }
 
 bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {
     if (!is_open()) { err = "DirectFile: not open"; return false; }
@@ -303,14 +305,14 @@ struct DirectFile::Impl {
 DirectFile::DirectFile() : impl_(new Impl) {}
 DirectFile::~DirectFile() { close(); delete impl_; }
 
-bool DirectFile::open(const std::string& path, std::string& err) {
+bool DirectFile::open(const std::string& path, std::string& err, int issuers) {
     close();
     impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
     if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
-    const int n = io_threads(16);
+    const int n = io_threads(issuers, 16);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }
@@ -326,6 +328,7 @@ void DirectFile::close() {
 
 bool DirectFile::is_open() const { return impl_->fd >= 0; }
 uint64_t DirectFile::size() const { return impl_->size; }
+int DirectFile::issuers() const { return (int) impl_->pool.size(); }
 
 bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {
     if (offset % alignment() || length % alignment() || ((uintptr_t) buffer) % alignment() || length == 0) {
