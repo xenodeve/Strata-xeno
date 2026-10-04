@@ -5,6 +5,19 @@ normal PC: one NVIDIA or AMD graphics card plus system RAM, on Windows or Linux.
 (`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
 one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
+## The goal: the lowest latency in the system and the software (developer, 2026-10-04)
+
+"The goal is to reduce latency in the system and the software as much as possible." Every change is judged by it.
+
+- **Rank work by the latency it removes from a real turn**: the served D2x profile (below) in Claude Code's request
+  shape (a long cached prefix, then short parts), prompt read and decode both, measured in one session (ABBA) - not
+  by a kernel's speed or a synthetic tok/s alone.
+- **Fix the root cause, never a workaround** ("fix the cause, prevent tech debt"): find the mechanism with a timeline
+  first (below), then change it where it lives. A switch that hides a cost, or a constant tuned around one, is debt.
+- **A change that adds latency anywhere says so and names the issue that removes it.** Example: KV streaming
+  (`--kv-resident`, #126) bought decode +16-22 % and still costs each Claude Code part +110-230 ms through the split's
+  x4 relay of CUDA0-resident experts, which #133 removes.
+
 ## Installing Strata for a user
 
 Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**: check the PC, pick the model by RAM, run setup non-interactively,
@@ -259,14 +272,15 @@ The web app (`serve/ui/`) must never leave the user guessing whether the model i
 ## Which server is the main one (developer, 2026-10-03)
 
 - **D2x is the main serving profile** (`strata-flash-next-d2x.json`, key 3 of `strata-hub.bat`): Swift 1.5 IQ2_XS with dynamic
-  experts only (no NVMe tier), context 262,144 since 2026-10-03. Build, test and measure for it first, and default to it when a
-  task needs "the server".
+  experts only (no NVMe tier), context 262,144 since 2026-10-03, KV streaming (`--kv-resident 65536`, #126) since 2026-10-04.
+  Build, test and measure for it first, and default to it when a task needs "the server".
 - **Capacity mode is optional** (`strata-swift-capacity.json`, keys 1 and 2: the NVMe tier for experts past RAM, `--ram-cache-gib`).
   It stays supported and tested, but it is something the developer chooses to run, not what a change is judged on.
 - **The RAM budget for Strata's private commit is 42 GB** (the developer raised it from 40 GB on 2026-10-03). It is a budget the
   developer sets, not a flag: no config or launcher enforces it, so a run is judged against it by measuring the commit.
-- D2x's RAM commit at 262k has not been measured yet (it may land near that budget); a measurement of it needs both GPUs and is
-  the engine session's job. Do not edit these configs, the launchers or `strata-hub.bat` without telling the developer.
+- D2x's private commit at 262k is measured (the boot line `private commit A -> B GiB`): 42.46 GiB without KV streaming, 43.27 GiB
+  with it (2026-10-04, #106 / #126) - above the 42 GB budget; the developer kept D2x at that size. Do not edit these configs,
+  the launchers or `strata-hub.bat` without telling the developer.
 
 ## Other standing rules
 
