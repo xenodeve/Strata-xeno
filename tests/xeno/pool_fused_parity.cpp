@@ -20,7 +20,7 @@ namespace cpu = strata::kernels::cpu;
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: xeno_pool_fused_parity <gguf> [layer]\n"); return 2; }
     constexpr int H = cpu::H, FF = cpu::FF;
-    const int L = argc > 2 ? std::atoi(argv[2]) : 20;
+    const int L = argc > 2 ? std::atoi(argv[2]) : 5;   // the IQ2_XS first shard holds layers 0-12
     strata::GgufFile gguf(argv[1]);
     const strata::TensorInfo *gate = nullptr, *up = nullptr, *down = nullptr;
     for (const auto& ti : gguf.tensors()) {
