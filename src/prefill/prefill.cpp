@@ -1692,10 +1692,9 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     // A ring (KV streaming: the drafter's window, page p in slot p % n_slots over a host copy) takes the same appends
     // with its own page table and host copy, as a streamed main layer does; the cells written are those the window can
     // still reach (r0 below), which the ring holds, so no two of them share a slot.  STRATA_MTP_BATCH_RING=0: the
-    // drafter's own pass for a ring (the A/B).  xeno (merge 0.1.38): OFF by default here - with --kv-resident (the D2x
-    // profile, #122/#126) the drafter's K/V is a ring and this moves its prompt-time appends onto the batched path, a
-    // served-path change no same-session ABBA has measured yet; STRATA_MTP_BATCH_RING=1 is upstream's default (the arm)
-    static const bool ring_ok = [] { const char* v = std::getenv("STRATA_MTP_BATCH_RING"); return v != nullptr && v[0] == '1'; }();
+    // drafter's own pass for a ring (the A/B).  xeno #152: on by default, as upstream - with --kv-resident (D2x) the
+    // drafter's own pass costs several times this one per chunk; the measurements and the decision are in #152
+    static const bool ring_ok = [] { const char* v = std::getenv("STRATA_MTP_BATCH_RING"); return v == nullptr || v[0] != '0'; }();
     core::QsaState& st = mtp.kv_state_rw();
     if (off || n <= 0 || m.g == nullptr || m.region == nullptr || (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok)) ||
         st.kv_hybrid || mtp.device() != m.device)
