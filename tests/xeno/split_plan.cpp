@@ -4,6 +4,7 @@
 #include "strata/prefill/split_plan.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -95,15 +96,13 @@ int main() {
         expect(!split_routed_only(399, false, 0), "off: the walk");
 
         using strata::prefill::split_mark_routed;
-        using strata::prefill::kNeedCopy;
-        using strata::prefill::kNeedSkip;
+        struct Entry { int32_t l, e; };   // the plan's entries carry the expert in `e`
         const std::vector<int32_t> cnt = {0, 0, 0, 0, 0, 2, 0, 0, 0, 1};
-        const std::vector<int32_t> entry_e = {5, 7, 9, 0};   // a layer's plan entries: the experts, in plan order
-        std::atomic<uint8_t> need[4];
-        for (auto& n : need) n.store(0);
-        split_mark_routed(entry_e.data(), entry_e.size(), cnt.data(), need);
-        expect(need[0].load() == kNeedCopy && need[1].load() == kNeedSkip && need[2].load() == kNeedCopy &&
-                   need[3].load() == kNeedSkip,
+        const Entry entry[4] = {{3, 5}, {3, 7}, {3, 9}, {3, 0}};   // a layer's plan entries, in plan order
+        std::atomic<bool> skip[4];
+        for (auto& f : skip) f.store(false);
+        split_mark_routed(entry, 4, cnt.data(), skip);
+        expect(!skip[0].load() && skip[1].load() && !skip[2].load() && skip[3].load(),
                "routed entries copy, the others skip");
     }
 
