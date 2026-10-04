@@ -59,6 +59,22 @@ int main() {
     expect(!wave_lane_ok(1024, 1024), "floor 1024, lanes of 1024: no wave (one lane runs split)");
     expect(!wave_lane_ok(1024, 512) && !wave_lane_ok(1500, 2048), "lanes below 2048: no wave");
 
+    // #133: each card's experts are one contiguous row block - the 4070's first, CUDA0's last, walk order kept inside
+    {
+        using strata::prefill::split_row_layout;
+        const std::vector<int32_t> cnt = {3, 0, 2, 5, 1, 4};        // rows per expert
+        const std::vector<int32_t> at = {5, 4, 3, 2, 1, 0};         // a reversed walk order
+        const std::vector<char> local = {1, 0, 0, 1, 1, 0};         // CUDA0 holds 0, 3, 4
+        std::vector<int32_t> off;
+        const int64_t lf = split_row_layout(cnt, at, local, off);
+        // remote in walk order: 5 (4 rows), 2 (2), 1 (0) -> 0, 4, 6; local: 4 (1), 3 (5), 0 (3) -> 6, 7, 12
+        expect(off == std::vector<int32_t>({12, 6, 4, 7, 6, 0, 15}), "row offsets: remote block, then local block");
+        expect(lf == 6, "the local block starts after the 4070's rows");
+        const std::vector<char> none(6, 0), all(6, 1);
+        expect(split_row_layout(cnt, at, none, off) == 15 && off[6] == 15, "nothing local: the block starts at the end");
+        expect(split_row_layout(cnt, at, all, off) == 0 && off[5] == 0, "all local: the block starts at row 0");
+    }
+
     if (bad == 0) std::printf("split_plan: all cases pass\n");
     return bad == 0 ? 0 : 1;
 }

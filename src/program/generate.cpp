@@ -2765,6 +2765,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: the split runs from %lld-token chunks (STRATA_PREFILL_SPLIT_MIN)\n",
                              (long long) fl);
         }
+        // #133: each card sums only its own experts, and #41's Dm frontier commits a token once all ten of its ranks
+        // arrive - so the split refuses it until it learns to skip the other card's ranks (#137)
+        if (const char* fv = std::getenv("STRATA_DM_FRONTIER"); fv != nullptr && fv[0] == '1') {
+            std::fprintf(stderr, "strata generate: STRATA_DM_FRONTIER=1 does not run with the expert split since #133 "
+                                 "(each card sums only its own experts; #137) - unset it\n");
+            return 1;
+        }
         if (g_prefill_wave && !strata::prefill::Prefill::split_wave_ok()) {
             g_prefill_wave = false;
             std::fprintf(stderr, "strata generate: STRATA_PREFILL_WAVE is off: the wave needs the expert split\n");

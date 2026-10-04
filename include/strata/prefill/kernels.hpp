@@ -68,8 +68,15 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 /// #35 D1: moe_combine in two halves on two cards: the routed sum (the same fmaf chain over k = 0..9) where the
 /// expert rows are, then bo += shared * sigmoid(sg) where the shared expert ran.  Together byte-identical to
 /// moe_combine (xeno_combine_split_parity).  moe_shared_finish runs in place: bo holds the routed sum on entry.
-void moe_routed_sum(const float* D, const int32_t* slot, const float* w, float* s, int64_t T, void* stream);
+/// #133: only the pairs whose row is in [lo, hi) - a split layer's rows hold the 4070's experts first and CUDA0's last.
+void moe_routed_sum(const float* D, const int32_t* slot, const float* w, float* s, int64_t T, void* stream,
+                    int32_t lo = 0, int32_t hi = INT32_MAX);
 void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream);
+/// #133: bo = bo + sum over the pairs whose row is at or past `lo` (CUDA0's block) of w * D[slot] + shared *
+/// sigmoid(sg), where bo holds the 4070's routed partial (its rows below `lo`) on entry.  With no row past `lo` it
+/// writes moe_shared_finish's bytes (xeno_combine_partial_parity).
+void moe_split_finish(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                      float* bo, int64_t T, int32_t lo, void* stream);
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
 

@@ -1000,6 +1000,11 @@ if(STRATA_NATIVE_EXPERTS)
       add_executable(xeno_combine_split_parity tests/xeno/combine_split_parity.cu)
       target_link_libraries(xeno_combine_split_parity PRIVATE strata_prefill CUDA::cudart)
       add_test(NAME xeno_combine_split_parity COMMAND xeno_combine_split_parity)
+      # #133: each card sums only its own rows (the 4070's below CUDA0's block), the 5060 finishes onto the 4070's
+      add_executable(xeno_combine_partial_parity tests/xeno/combine_partial_parity.cu)
+      target_link_libraries(xeno_combine_partial_parity PRIVATE strata_prefill CUDA::cudart)
+      add_test(NAME xeno_combine_partial_parity COMMAND xeno_combine_partial_parity)
+      set_tests_properties(xeno_combine_partial_parity PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1,0")
       # #41 gate 3: a Dm frontier writes moe_routed_sum's bytes
       add_executable(xeno_frontier_combine_parity tests/xeno/frontier_combine_parity.cu)
       target_link_libraries(xeno_frontier_combine_parity PRIVATE strata_prefill CUDA::cudart)
