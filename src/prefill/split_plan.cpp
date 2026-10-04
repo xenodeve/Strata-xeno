@@ -45,4 +45,21 @@ int64_t split_row_layout(const std::vector<int32_t>& cnt, const std::vector<int3
 
 bool wave_lane_ok(int64_t lane_chunk, int64_t split_min) { return lane_chunk >= std::max(split_min, kSplitMinDefault); }
 
+
+int64_t split_routed_max_from(const char* env) {
+    if (env == nullptr || *env == '\0') return kSplitRoutedMaxDefault;
+    char* end = nullptr;
+    const long long v = std::strtoll(env, &end, 10);
+    return (end != nullptr && *end == '\0' && v >= 0) ? (int64_t) v : kSplitRoutedMaxDefault;
+}
+
+bool split_routed_only(int64_t T, bool wave, int64_t routed_max) { return !wave && routed_max > 0 && T < routed_max; }
+
+void split_mark_routed(const int32_t* entry_e, size_t n, const int32_t* cnt, std::atomic<uint8_t>* need) {
+    for (size_t i = 0; i < n; ++i) {
+        need[i].store(cnt[entry_e[i]] > 0 ? kNeedCopy : kNeedSkip, std::memory_order_release);
+        need[i].notify_all();
+    }
+}
+
 }  // namespace strata::prefill

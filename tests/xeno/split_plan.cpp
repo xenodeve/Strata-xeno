@@ -3,6 +3,7 @@
 // every expert twice (#112: 66 GB per 8K prompt, ~525 tok/s instead of ~870).
 #include "strata/prefill/split_plan.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <vector>
 
@@ -73,6 +74,37 @@ int main() {
         const std::vector<char> none(6, 0), all(6, 1);
         expect(split_row_layout(cnt, at, none, off) == 15 && off[6] == 15, "nothing local: the block starts at the end");
         expect(split_row_layout(cnt, at, all, off) == 0 && off[5] == 0, "all local: the block starts at row 0");
+    }
+
+    // #142: a short split chunk copies only the host experts its routing reaches (a plan entry is copied or skipped
+    // once its layer is routed); 13.3K copies per Claude Code part against 5.4-7.6K routed host experts
+    {
+        using strata::prefill::split_routed_max_from;
+        using strata::prefill::split_routed_only;
+        using strata::prefill::kSplitRoutedMaxDefault;
+        expect(split_routed_max_from(nullptr) == kSplitRoutedMaxDefault && split_routed_max_from("") == kSplitRoutedMaxDefault,
+               "unset: the default");
+        expect(split_routed_max_from("0") == 0, "0: off (every chunk streams the walk, as before)");
+        expect(split_routed_max_from("4096") == 4096, "4096: chunks below 4,096 tokens");
+        expect(split_routed_max_from("abc") == kSplitRoutedMaxDefault && split_routed_max_from("-5") == kSplitRoutedMaxDefault &&
+                   split_routed_max_from("12x") == kSplitRoutedMaxDefault,
+               "not a non-negative number: the default");
+        expect(split_routed_only(399, false, 2048) && split_routed_only(2047, false, 2048), "below the limit: routed only");
+        expect(!split_routed_only(2048, false, 2048), "at the limit: the walk");
+        expect(!split_routed_only(399, true, 2048), "a wave: the walk (both lanes read one plan)");
+        expect(!split_routed_only(399, false, 0), "off: the walk");
+
+        using strata::prefill::split_mark_routed;
+        using strata::prefill::kNeedCopy;
+        using strata::prefill::kNeedSkip;
+        const std::vector<int32_t> cnt = {0, 0, 0, 0, 0, 2, 0, 0, 0, 1};
+        const std::vector<int32_t> entry_e = {5, 7, 9, 0};   // a layer's plan entries: the experts, in plan order
+        std::atomic<uint8_t> need[4];
+        for (auto& n : need) n.store(0);
+        split_mark_routed(entry_e.data(), entry_e.size(), cnt.data(), need);
+        expect(need[0].load() == kNeedCopy && need[1].load() == kNeedSkip && need[2].load() == kNeedCopy &&
+                   need[3].load() == kNeedSkip,
+               "routed entries copy, the others skip");
     }
 
     if (bad == 0) std::printf("split_plan: all cases pass\n");
