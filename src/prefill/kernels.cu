@@ -538,15 +538,17 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
 // the routed sum of token t's column d: one fmaf chain in k order.  moe_combine and the split's moe_routed_sum share it,
-// so the two cards' halves (#35 D1) add in the same order by construction.  #133: a pair with slot -1 belongs to the
-// other card (its row was never computed here) and is skipped - before its row is read
+// so the two cards' halves (#35 D1) add in the same order by construction.  #133: only the pairs whose row is in
+// [lo, hi) - a split layer's rows hold the 4070's experts first and CUDA0's last, and a row of the other card's was
+// never computed here, so it is skipped before it is read
 __device__ __forceinline__ float routed_sum(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
-                                            const float* __restrict__ w, int64_t t, int64_t d) {
+                                            const float* __restrict__ w, int64_t t, int64_t d,
+                                            int32_t lo = 0, int32_t hi = INT32_MAX) {
     float s = 0.0f;
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
         const int32_t sl = slot[t * 10 + k];
-        if (sl >= 0) s = fmaf(w[t * 10 + k], Dm[(int64_t) sl * N + d], s);
+        if (sl >= lo && sl < hi) s = fmaf(w[t * 10 + k], Dm[(int64_t) sl * N + d], s);
     }
     return s;
 }
@@ -811,19 +813,20 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     check("gather_rows16");
 }
 __global__ void moe_routed_sum_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
-                                      const float* __restrict__ w, float* __restrict__ out, int64_t T) {
+                                      const float* __restrict__ w, float* __restrict__ out, int64_t T, int32_t lo,
+                                      int32_t hi) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
-    out[i] = routed_sum(Dm, slot, w, i / N, i % N);
+    out[i] = routed_sum(Dm, slot, w, i / N, i % N, lo, hi);
 }
-// #133: the other card's routed partial (in bo) + this card's pairs + the shared term; written as moe_shared_finish's
-// expression on (bo + local), so with no local pair (local == 0.0f) the bytes are moe_shared_finish's
+// #133: the 4070's routed partial (in bo) + CUDA0's pairs (rows from lo) + the shared term; written as
+// moe_shared_finish's expression on (bo + local), so with no local pair (local == 0.0f) the bytes are moe_shared_finish's
 __global__ void moe_split_finish_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                         const float* __restrict__ w, const float* __restrict__ shared,
-                                        const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
+                                        const float* __restrict__ sg, float* __restrict__ bo, int64_t T, int32_t lo) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
-    const float s = bo[i] + routed_sum(Dm, slot, w, i / N, i % N);
+    const float s = bo[i] + routed_sum(Dm, slot, w, i / N, i % N, lo);
     bo[i] = s + shared[i] * sigm(sg[i / N]);
 }
 __global__ void moe_shared_finish_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
@@ -833,13 +836,14 @@ __global__ void moe_shared_finish_kernel(const float* __restrict__ shared, const
     const float s = bo[i];
     bo[i] = s + shared[i] * sigm(sg[i / N]);
 }
-void moe_routed_sum(const float* Dm, const int32_t* slot, const float* w, float* s, int64_t T, void* stream) {
-    moe_routed_sum_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, s, T);
+void moe_routed_sum(const float* Dm, const int32_t* slot, const float* w, float* s, int64_t T, void* stream, int32_t lo,
+                    int32_t hi) {
+    moe_routed_sum_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, s, T, lo, hi);
     check("moe_routed_sum");
 }
 void moe_split_finish(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
-                      float* bo, int64_t T, void* stream) {
-    moe_split_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
+                      float* bo, int64_t T, int32_t lo, void* stream) {
+    moe_split_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, lo);
     check("moe_split_finish");
 }
 void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream) {

@@ -74,19 +74,6 @@ int main() {
         expect(split_row_layout(cnt, at, none, off) == 15 && off[6] == 15, "nothing local: the block starts at the end");
         expect(split_row_layout(cnt, at, all, off) == 0 && off[5] == 0, "all local: the block starts at row 0");
     }
-    {
-        using strata::prefill::split_mask_slots;
-        const std::vector<int32_t> ids = {0, 3, 5, 1, 4, 2}, slot = {10, 11, 12, 13, 14, 15};
-        const std::vector<char> local = {1, 0, 0, 1, 1, 0};
-        std::vector<int32_t> peer(6), mine(6);
-        split_mask_slots(ids.data(), slot.data(), 6, local, false, peer.data());
-        split_mask_slots(ids.data(), slot.data(), 6, local, true, mine.data());
-        expect(peer == std::vector<int32_t>({-1, -1, 12, 13, -1, 15}), "the 4070's copy drops CUDA0's pairs");
-        expect(mine == std::vector<int32_t>({10, 11, -1, -1, 14, -1}), "CUDA0's copy drops the 4070's pairs");
-        bool one_owner = true;
-        for (size_t i = 0; i < 6; ++i) one_owner = one_owner && ((peer[i] >= 0) != (mine[i] >= 0));
-        expect(one_owner, "every pair has exactly one owner");
-    }
 
     if (bad == 0) std::printf("split_plan: all cases pass\n");
     return bad == 0 ? 0 : 1;

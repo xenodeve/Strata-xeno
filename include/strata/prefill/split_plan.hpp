@@ -39,13 +39,8 @@ bool wave_lane_ok(int64_t lane_chunk, int64_t split_min);
 /// #133: a split layer's routed rows, grouped by expert: the experts the 4070 computes first, then the ones CUDA0
 /// computes from its own cache (`local[e]`), each block in `at_order` (the layer's expert walk order), so each card's
 /// experts are one contiguous row range.  `off[e]` is expert e's first row and `off[n]` the total; returns the row the
-/// local block starts at.  `cnt[e]`: expert e's rows.
+/// local block starts at - a (token, k) pair is CUDA0's exactly when its row is at or past it.  `cnt[e]`: expert e's rows.
 int64_t split_row_layout(const std::vector<int32_t>& cnt, const std::vector<int32_t>& at_order,
                          const std::vector<char>& local, std::vector<int32_t>& off);
-
-/// #133: one card's copy of the (token, k) -> row table: a pair whose expert the other card computes gets -1, which
-/// the routed sums skip.  `keep_local`: this is CUDA0's copy (keeps the local experts' pairs).
-void split_mask_slots(const int32_t* ids, const int32_t* slot, int64_t n, const std::vector<char>& local,
-                      bool keep_local, int32_t* out);
 
 }  // namespace strata::prefill

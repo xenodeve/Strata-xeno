@@ -42,10 +42,6 @@ int64_t split_row_layout(const std::vector<int32_t>& cnt, const std::vector<int3
     off[cnt.size()] = row;
     return local_first;
 }
-void split_mask_slots(const int32_t* ids, const int32_t* slot, int64_t n, const std::vector<char>& local,
-                      bool keep_local, int32_t* out) {
-    for (int64_t i = 0; i < n; ++i) out[i] = (local[(size_t) ids[i]] != 0) == keep_local ? slot[i] : -1;
-}
 
 bool wave_lane_ok(int64_t lane_chunk, int64_t split_min) { return lane_chunk >= std::max(split_min, kSplitMinDefault); }
 
