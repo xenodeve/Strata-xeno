@@ -103,6 +103,12 @@ alternative to the CUDA1-3 caches above, not a third tier beside them.
   the peer computes; -1 is half of chunk x top-k, 0 keeps prompt rows on the
   primary.
 
+  **Strata-xeno:** the fork does not run the peer's share of the prompt path
+  (merge 0.1.38, `docs/reports/2026-10-04-merge-upstream-0.1.38.md`): the prompt
+  path stays on the primary whatever this flag says, as with 0. The fork also
+  refuses `--peer-device` with its own second-GPU tier (`--secondary-expert-mib`,
+  `--exclusive-secondary-experts`) and with `STRATA_PREFILL_EXPERT_SPLIT=1`.
+
 `--peer-device` requires `--expert-profile` and an enabled expert cache, and
 the device must be visible; it refuses otherwise. It also refuses
 `--layer-split` (a different second-GPU mode: use one or the other) and

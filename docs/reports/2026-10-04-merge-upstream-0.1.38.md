@@ -13,7 +13,7 @@ the served config, the same-session ABBA against `main` (prefill 8K/32K, the Cla
 ## 1. What moved
 
 - Upstream since v0.1.37 (`db4f91a`): 56 commits, 53 files, +5,023/-304.
-- The fork since the same base: 390 non-merge commits. 26 files changed on both sides; 15 conflicted (67 diff3 hunks):
+- The fork since the same base: 390 non-merge commits. 26 files changed on both sides; 15 conflicted, 72 hunks in diff3 style (the issue's 67 counts the default style, where `prefill.cpp` has 26):
 
 | file | hunks | what collided |
 |---|---|---|
@@ -70,6 +70,9 @@ The rest:
   sites (serve and generate) read the flag too.
 - **Server security for a server with no API key:** the Host check on every request (DNS rebinding), the Origin check
   on `/v1/*`, JSON-only `/load` and `/unload`. Combined with the fork's #71 check (§3).
+- **#496 a small card's automatic reserve** (`vram_reserve_given`): only inside `--expert-cache auto` when the cache
+  would fall below what the prompt path needs; D2x passes `--expert-cache 8000`, so not reached. **#542** MMQ's device
+  facts from `cudaDeviceGetAttribute`: the same values in a matched build (CUDA 13.3 here).
 - **Small ones, taken as upstream has them:** Q5_0 experts on the GPU (#473), IQ4_XS on AVX-2 (#415), #496 small-card
   reserve, #542 MMQ device facts, #545/#530 server messages, `STRATA_GR_DOWN_MAX4` (opt-in), active QSA top-k on Turing
   (`STRATA_TOPK_*`), the HIP MTP prompt-pass default, `STRATA_NO_LARGEPAGES` on Linux, setup and docs.
@@ -194,8 +197,8 @@ is now **403** (was 421 in the fork); `test_server.py`'s three assertions say so
 ## 6. What moved: commits and the exe
 
 - Base: `main` `2fefaae`; upstream tag `v0.1.38` (`99f3dbd`); branch `xeno/129-merge-0.1.38`.
-- The merge commit is the commit that adds this report (`git log --merges -1` on the branch); fixes after it, if any,
-  are separate commits.
+- The merge commit: `3933ed5` (parents `2fefaae`, `99f3dbd`); it adds this report. The commit after it corrects this
+  report and notes the fork's peer limits in `docs/SECOND_GPU.md` (no code).
 - Engine: `C:\Strata-expuild-138\strata.exe`, sha256 `beea3e729c886033b5ecf08adc58c518d5d84bb3871870ba3fac4dd2280b031c`
   (74,470,400 B, built from the merge's tree).
 
@@ -206,7 +209,9 @@ is now **403** (was 421 in the fork); `test_server.py`'s three assertions say so
   `STRATA_MTP_BATCH_RING=1`, `STRATA_GROUPED_V1=1` (against the default fused pass).
 - #61 under #463: n/a on the paired swaps (§2); the fork follow-up is to wait for stage 3's copies (or to make the
   GPU and CPU expert products round alike).
-- Upstream's peer share of the prompt path is not in the fork (§2).
+- Upstream's peer share of the prompt path is not in the fork (§2). `docs/SECOND_GPU.md` (upstream's) says so under `--peer-prefill-rows`.
+- Not run on this merge: `/simplify`, `/code-review`, `/scrutinize`; the #129 comment linking this report.
+- `tools/test_setup_draft_vocab.py` fails on `main` too (`KeyError: 'cjk'`): a follow-up.
 
 ## 8. The classic web app
 
