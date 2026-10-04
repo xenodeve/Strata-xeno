@@ -128,6 +128,11 @@ inline int64_t stream_all_min() {
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) 1024; }();
     return v;
 }
+// #142: STRATA_SPLIT_ROUTED_MAX - a split chunk below it copies only its routed host experts (0: never)
+inline int64_t split_routed_max() {
+    static const int64_t v = split_routed_max_from(std::getenv("STRATA_SPLIT_ROUTED_MAX"));
+    return v;
+}
 double g_pinned_share = 1.0;
 bool g_split_layout = false;   // #35 D6 (Prefill::set_split_layout)
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
@@ -339,7 +344,12 @@ struct Stager {
     // `from` set: the blob is copied by the source itself (CS-T: a GGUF read in place assembles it from its three
     // role slices; a pointer to it would not live as long as the queue).  Else `src` set: a memcpy from it.  Neither
     // (#11): (l, e) is on NVMe - read from the pack through `xsrc`, never admitted.
-    struct Job { const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = -1, e = -1; };
+    // #142 `skip` set: the job is skipped once its layer's routing says no token routes to the expert (copied while
+    // the layer is not routed yet)
+    struct Job {
+        const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = -1, e = -1;
+        const std::atomic<bool>* skip = nullptr;
+    };
     core::ExpertSource* xsrc = nullptr;   // #11: the NVMe tier's experts are read, never admitted
     std::vector<uint8_t*> buf;
     std::vector<char> pinned;
@@ -425,28 +435,38 @@ struct Stager {
                 active.fetch_add(1, std::memory_order_acq_rel);
                 const int j = claim(seen);
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
+                const Job& jb = jobs[(size_t) j];
+                // #142: routed past it - no buffer, no copy (the issuer skips it too)
+                const bool skipped = jb.skip != nullptr && jb.skip->load(std::memory_order_relaxed);
                 const int b = j % kRing;
                 if (j >= kRing) {
                     timeline::Span wait_span("stager wait buffer", j, j - kRing);
-                    for (int v; (v = issued.load(std::memory_order_acquire)) <= j - kRing;) issued.wait(v);
-                    cudaEventSynchronize(dma_done[b]);
-                }
-                const Job& jb = jobs[(size_t) j];
-                timeline::Span stage_span(jb.from ? "stager copy blob" : jb.src ? "stager memcpy" : "stager nvme read", j,
-                                          jb.l);
-                if (jb.from) {   // CS-T: the source assembles the blob into the buffer
-                    if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
-                        std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e,
-                                     jb.l);
-                        std::abort();
+                    if (!skipped) {
+                        for (int v; (v = issued.load(std::memory_order_acquire)) <= j - kRing;) issued.wait(v);
+                        cudaEventSynchronize(dma_done[b]);
                     }
-                } else if (jb.src) {
-                    std::memcpy(buf[b], jb.src, jb.bytes);
-                } else {
-                    std::string re;
-                    if (!xsrc || !xsrc->read_into(jb.l, jb.e, buf[b], re)) {
-                        std::fprintf(stderr, "prefill: NVMe read of (%d,%d) failed: %s\n", jb.l, jb.e, re.c_str());
-                        std::abort();   // never stale expert data
+                    // #142: ready[j] means every earlier job of this buffer is done writing it.  The issuer may skip a
+                    // job a stager is still copying (taken before its layer was routed), so each job - a skipped one
+                    // too, or the chain breaks across it - waits for the buffer's previous job first
+                    (void) wait(j - kRing);
+                }
+                if (!skipped) {
+                    timeline::Span stage_span(jb.from ? "stager copy blob" : jb.src ? "stager memcpy" : "stager nvme read", j,
+                                              jb.l);
+                    if (jb.from) {   // CS-T: the source assembles the blob into the buffer
+                        if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
+                            std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e,
+                                         jb.l);
+                            std::abort();
+                        }
+                    } else if (jb.src) {
+                        std::memcpy(buf[b], jb.src, jb.bytes);
+                    } else {
+                        std::string re;
+                        if (!xsrc || !xsrc->read_into(jb.l, jb.e, buf[b], re)) {
+                            std::fprintf(stderr, "prefill: NVMe read of (%d,%d) failed: %s\n", jb.l, jb.e, re.c_str());
+                            std::abort();   // never stale expert data
+                        }
                     }
                 }
                 ready[(size_t) j].store(1, std::memory_order_release);
@@ -487,6 +507,11 @@ struct Stager {
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     void issued_one(int j, cudaStream_t copy) {
         cudaEventRecord(dma_done[j % kRing], copy);
+        skip_one(j);
+    }
+    /// #142: the launching thread is past job j without a DMA (no token routes to it).  It does not wait for a stager
+    /// still copying j: the job that next takes j's buffer waits for j's ready flag (work).
+    void skip_one(int j) {
         issued.store(j + 1, std::memory_order_release);
         issued.notify_all();
     }
@@ -551,6 +576,30 @@ struct SplitTier {
     struct Entry { int32_t l, e; int job; uint8_t kind; };   // kind: 2 pinned host, 3 staged (#133: no 1, CUDA0's own)
     std::vector<Entry> seq;
     std::vector<size_t> seq_start;                           // per layer, and one past the last
+    // #142: a chunk below STRATA_SPLIT_ROUTED_MAX skips the entries its routing does not reach - once the host thread
+    // has routed a layer (split_mark_routed), an entry not yet staged or issued is skipped if no token routes to it.
+    // Nothing waits for the routing: an entry whose layer is not routed yet is copied, as the walk does (its lookahead
+    // is kept), and the consumer reads only routed entries, so a copy that turns out unneeded is never read
+    bool routed_only = false;
+    std::unique_ptr<std::atomic<bool>[]> skip;
+    size_t skip_cap = 0;
+    bool arm_skip() {   // the plan is built: every entry copied until its layer is routed; false: not one unit
+        if (unit_jobs.size() != 1) return false;   // split_routed_only never takes a wave
+        if (skip_cap < seq.size()) {
+            skip_cap = seq.size();
+            skip.reset(new std::atomic<bool>[skip_cap]);
+        }
+        for (size_t k = 0; k < seq.size(); ++k) {
+            skip[k].store(false, std::memory_order_relaxed);
+            if (seq[k].kind == 3) unit_jobs[0][(size_t) seq[k].job].skip = &skip[k];
+        }
+        return true;
+    }
+    void mark_routed(int64_t l, const int32_t* cnt) {   // the host thread has routed layer l (a one-unit plan)
+        if (!routed_only) return;
+        const size_t a = seq_start[(size_t) l], b = seq_start[(size_t) l + 1];
+        split_mark_routed(seq.data() + a, b - a, cnt, &skip[a]);
+    }
     std::atomic<size_t> consumed{0}, issued{0};
     std::atomic<bool> stop{false};
     std::thread issuer;
@@ -591,6 +640,7 @@ struct SplitTier {
     }
     // per chunk: the 4070's experts by source (its slots, host) and the ones CUDA0 computes from its cache (#133)
     int64_t last_l = -1, n_own = 0, n_local = 0, n_host = 0;
+    int64_t n_copied = 0, n_skipped = 0;   // #142: the issuer's host copies and skipped entries (read after its join)
     // #133: split_send's sub-products for split_run (row ranges cut at R within a group; boff into hbounds)
     struct Sub { int grp; int64_t r0, nr, maxr; int q0, n; int64_t boff; };
     std::vector<Sub> subs;
@@ -612,8 +662,11 @@ struct SplitTier {
     void report() {
         if (n_own + n_local + n_host == 0) return;
         std::fprintf(stderr, "strata prefill: expert_split: %lld experts from the 4070's slots, %lld on the 5060 from "
-                             "its cache, %lld from host\n", (long long) n_own, (long long) n_local, (long long) n_host);
+                             "its cache, %lld from host (%lld host copies, %lld skipped: routed only, #142)\n",
+                     (long long) n_own, (long long) n_local, (long long) n_host, (long long) n_copied,
+                     (long long) n_skipped);
         n_own = n_local = n_host = 0;
+        n_copied = n_skipped = 0;
     }
     ~SplitTier() {
         if (dev < 0) return;
@@ -2280,6 +2333,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 sp.seq_start[(size_t) (u * (g.n_layers + 1) + g.n_layers)] = sp.seq.size();
             }
             sp.unit_first[(size_t) n_units] = sp.seq.size();
+            sp.routed_only = split_routed_only(T, wave != nullptr, split_routed_max());
+            if (sp.routed_only && !sp.arm_skip()) {
+                err = "prefill: a routed-only split plan with more than one unit (#142)";
+                return false;
+            }
             sp.consumed.store(0);
             SplitTier::publish(sp.consumed1, sp.lanes_expected == 2 ? 0 : SplitTier::kNever);
             sp.lanes_done.store(0);
@@ -2298,12 +2356,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         ++u;
                         t.stager->start(std::move(t.unit_jobs[u]));
                     }
+                    // #142: routed past it (never waited for): no slot, no copy
+                    if (t.routed_only && t.skip[k].load(std::memory_order_relaxed)) {
+                        ++t.n_skipped;
+                        if (t.seq[k].kind == 3) t.stager->skip_one(t.seq[k].job);
+                        // no wake: the consumer waits only for copied (routed) entries, each published below
+                        t.issued.store(k + 1, std::memory_order_release);
+                        continue;
+                    }
                     if (k >= (size_t) t.RING && (!SplitTier::wait_above(t.consumed, k - (size_t) t.RING, t.stop) ||
                                                  !SplitTier::wait_above(t.consumed1, k - (size_t) t.RING, t.stop)))
                         return;
                     if (t.stop.load(std::memory_order_relaxed) || t.aborted.load(std::memory_order_acquire)) return;
                     const SplitTier::Entry& en = t.seq[k];
                     timeline::Span issue_span("split issue host", (int64_t) k, en.l);
+                    ++t.n_copied;
                     const int rs = (int) (k % t.RING);
                     const size_t bb = (size_t) lay0.blob_bytes(en.l);
                     uint8_t* dst = t.ring + (size_t) rs * t.blob;
@@ -2930,6 +2997,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int32_t e = expert_at(l, ei, m.g->n_expert);   // #41 gate 2
                             if (m.cnt[(size_t) e] > 0) (split_l && !local_e[(size_t) e] ? order_4070 : order).push_back(e);
                         }
+                        if (split_l) m.split->xs->mark_routed(l, m.cnt.data());   // #142
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         const double tl_pre = timeline::enabled() ? timeline::now_us() : 0;
