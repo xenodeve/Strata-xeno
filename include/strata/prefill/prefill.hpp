@@ -149,9 +149,9 @@ public:
 
     const PrefillStats& stats() const { return stats_; }
 
-    /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
-    /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
-    /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
+    /// upstream's peer share of the prompt path (the peer's experts computed THERE for every chunk).  Not ported to
+    /// this fork's split / wave walk (#129): it declines with a message, and the prompt path stays on the primary, as
+    /// upstream's `--peer-prefill-rows 0`.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
 
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,

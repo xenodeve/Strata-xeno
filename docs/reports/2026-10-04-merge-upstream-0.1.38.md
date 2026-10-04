@@ -6,9 +6,11 @@ v0.1.37, #103, and everything up to #147) on `xeno/129-merge-0.1.38`, worktree `
 `C:\Strata-exp\merge-138-record\` (the three sides of `prefill.cpp`, the per-hunk resolutions, the scripts that
 removed the unported peer prompt path, the build, ctest and pytest logs).
 
-**Speed is not measured here.** No figure below is a speed claim. The greedy parity runs, the decode-cluster parity on
-the served config, the same-session ABBA against `main` (prefill 8K/32K, the Claude Code shape sm119, decode) and the
-#61 re-check are pending; the orchestrator runs them on the exe this merge built.
+**Verdict.** The main model's prompt state is byte-identical to `main`'s on the served D2x config. Generate-mode outputs
+and decode speed are equal. The Claude Code shape reads prompts at the same speed or slightly faster. **One open
+difference:** the MTP drafter's prompt-time K/V differs at a few cells with identical inputs, so in serve mode draft
+acceptance and 1 of 6 greedy replies differ (#149, §5a). The merge goes to `main`; the deployed D2x stays on
+`run-main-2fefaae` until #149 is resolved, because nothing measured here is faster.
 
 ## 1. What moved
 
@@ -39,11 +41,11 @@ IQ2_XS, `--exclusive-primary-experts`, paired adaptive swaps, the 4070 tier, spl
 | item | reaches D2x | on | why |
 |---|---|---|---|
 | #372 grouped expert gather (one launch, one wait, one event per MMQ group) | yes, as the fork's own #29 | yes (fork #29) | the fork's streamed walk already gathers an MMQ group in one launch after one wait and releases its slots together, under the same switch `STRATA_PREFILL_GROUP_GATHER` (default on). Upstream's version (`used_of`, the `flush` in `compute`) was not taken: two mechanisms for one job in one walk. Upstream's `gather_native_group(const GatherGroup&, ...)` overload is kept beside the fork's (§3) but nothing calls it |
-| #374 the first chunk's PLE rows beside layer 0, 256 at a time | read-ahead: yes, as the fork's own #31; queue depth: no | read-ahead yes (fork #31); `--ple-inflight` stays 64 | the fork's #31 already reads the first chunk's rows on a thread while the embeddings and layer 0 run (`STRATA_PREFILL_PLE_AHEAD`). Ported from upstream: the take is idempotent per chunk, taken at the stage's first layer from 1 on and at the end of a stage that ends before layer 1 (upstream's `ple_land` rule), and 4f7b3e8's checked upload. **Left off:** upstream's `--ple-inflight` default 256 (it moves the served SSD queue depth); `--ple-inflight 256` is the ABBA arm |
+| #374 the first chunk's PLE rows beside layer 0, 256 at a time | read-ahead: yes, as the fork's own #31; queue depth: no | read-ahead yes (fork #31); `--ple-inflight` stays 64 | the fork's #31 already reads the first chunk's rows on a thread while the embeddings and layer 0 run (`STRATA_PREFILL_PLE_AHEAD`). Ported from upstream: the take is idempotent per chunk, taken at the stage's first layer from 1 on (upstream's `ple_land` rule; its second site, the end of a stage that ends before layer 1, is ported too but cannot run: `ple_on` needs `LB <= 1 < LE`, as upstream's does), and 4f7b3e8's checked upload. **Left off:** upstream's `--ple-inflight` default 256 (it moves the served SSD queue depth); `--ple-inflight 256` is the ABBA arm |
 | #413 DeltaNet recurrence, three value heads per thread | yes (prompt path, sm_80+: the 5060 Ti) | yes, as upstream | same bits by upstream's construction; `gdn_rec_parity` (new) checks it on this machine (§5). `STRATA_GDN_KEYHEAD=0` is upstream's A/B |
 | #452 QSA prompt attention, Q4_0 mode 4 (sm_80+) | no | n/a | only with `--kv q4_0`; D2x runs `--kv int8` |
 | #463 greedy independent of the adaptive tier's copy timing | no | yes where it applies | `apply_pending(!adapt_nowait())` waits for the non-paired adaptive swaps' copies. D2x runs the **paired** swaps (`--exclusive-primary-experts --adapt-swaps 8`), which keep no `pending`: their stage 3 still publishes residency on a non-blocking `cudaEventQuery`, the same timing dependence #463 removed. So #463 does not reach D2x, and #61's re-check under #463 is n/a on D2x; adding the wait to stage 3 is a fork follow-up, not merge work. `STRATA_ADAPT_NOWAIT=1` is the A/B; `STRATA_TRACE_ADAPT` traces the non-paired path |
-| #363 fewer launches in the verify window | the fused pass: yes; the group stride: no | yes | `native_expert_grouped` now runs SwiGLU and the q8_1 quantization as one pass over the call's own entries (bitwise, per upstream) for every caller without `x_scales`: CUDA0's VRAM call, the 4070's `SecondaryRunner`, `remote_experts`. The group stride (`kPcieGroupRows`) applies to the PCIe call only, which the fork skips at `--pcie-frac 0` (`pcie_share_`). The fork's Q2_0 CPU-order path (`x_scales`) keeps its two kernels and one block row per group. `STRATA_GROUPED_V1=1` restores the old launches |
+| #363 fewer launches in the verify window | the fused pass: yes; the group stride: no | yes | `native_expert_grouped` now runs SwiGLU and the q8_1 quantization as one pass over the call's own entries (bitwise, per upstream) unless the call is the Q2_0 CPU-order path (`cpu_order = x_scales && (gu or down is Q2_0)`, `iq_kernels.cu`). Today only `verify.cpp`'s PCIe call passes `x_scales`, and only on Q2_0 layers, so every other caller takes the fused pass: CUDA0's VRAM call, the 4070's `SecondaryRunner`, `remote_experts`. The group stride (`kPcieGroupRows`) applies to the PCIe call only, which the fork skips at `--pcie-frac 0` (`pcie_share_`). The fork's Q2_0 CPU-order path (`x_scales`) keeps its two kernels and one block row per group. `STRATA_GROUPED_V1=1` restores the old launches |
 
 The rest:
 
@@ -91,7 +93,7 @@ unported ones.
   read-ahead, the compact MMQ sub-products, the stream entries' 4070 / pack tiers, the timeline spans.
 - **Ported from upstream:** 3a91b9c (a stager buffer's first job of a generation waits for the previous generation's
   last DMA from it; skipped jobs do not wait); 4f7b3e8 (the PLE upload and its event checked); #374's `ple_land` rule
-  folded into the fork's `ple_take` (taken once per chunk, at `max(LB, 1)`, and at the end of a stage); ba790d6's
+  folded into the fork's `ple_take` (taken once per chunk, at `max(LB, 1)`; the end-of-stage site is unreachable, §2); ba790d6's
   ring path in `draft_kv` (off by default, §2) and `STRATA_DRAFT_TIMING`; 734273a's `peer_portable()` guard in
   `fused_ring()`; the `cudaHostAllocPortable` flag with a peer; the stub of upstream's `gather_native_group` overload.
 - **Not taken:** #372's `used_of` / `group_gather` / `flush` (the fork's #29 is the same mechanism); `PeerPrefill`,
@@ -190,27 +192,90 @@ is now **403** (was 421 in the fork); `test_server.py`'s three assertions say so
   1 skipped, 1 failed: `test_setup_draft_vocab.py::SmallCardNote::test_sizes_follow_the_shipped_subsets` (`KeyError:
   'cjk'`, the fork's `DRAFT_VOCABS` has no `cjk` subset since #55 W7). It fails the same way on the pre-merge `main`
   (`git archive HEAD`, the same command): not this merge's; a follow-up.
-- **Not run here (pending, the orchestrator):** greedy raw-token parity against `main` on the D2x config, the
-  same-session ABBA (prefill 8K/32K, the Claude Code shape sm119, decode) and #61 under #463. No engine was started on
-  the GPUs beyond ctest.
+- **ctest re-run by the orchestrator:** 105/107, the same two known failures.
+
+## 5a. Parity and speed on the served config (same session, `merge-138-record/`)
+
+Arms: `main` = `run-main-2fefaae` (sha256 `72e58896…`, the deployed exe) against the merge = `run-138a` (`beea3e72…`),
+on `strata-flash-next-d2x.json`.
+
+- **Main-model state** (`sh138.py`: `STRATA_STATE_HASH`, `max_tokens=1`, a 9,932-token prefix and six parts of
+  408-2,816 tokens that branch from it, boots base / new / new / base; `sh138-run.txt`): gdn, ple, tail, pooled, kv,
+  stale and dead are **identical in all 28 fingerprints**.
+- **The drafter's K/V (`mtp=`) differs, deterministically per exe** (#149). The cause is not yet traced; this is what
+  is known so far:
+  - the drafter's inputs are identical: 156 final residual rows of the prefix are byte-identical
+    (`STRATA_PREFILL_DUMP_R`, `sh138e-run.txt`), and both exes take `DRAFT_PREFILL path=token mode=2` with the same
+    cell counts (`sh138c-run.txt`);
+  - 30 of 2,483 pages of the drafter's prompt K/V differ, all in the first 8,192-token chunk (`sh138d-run.txt`, an
+    uncommitted per-page hash);
+  - `STRATA_GROUPED_V1=1` does not restore it (`sh138b-run.txt`).
+- **The Claude Code shape** (`smkv.py`, base / new / new / base; `ab138-run.txt`): prompt read ms, `main` → merge.
+  Each pair is in one round.
+
+  | part | round 1: base-0 → new-1 | round 2: new-2 vs base-3 |
+  |---|---|---|
+  | 9,932 prefix | 9,554 → 9,547 | 8,616 vs 8,516 |
+  | 408 | 1,630 → 1,604 | 1,382 vs 1,387 |
+  | 744 | 1,920 → 1,877 | 1,688 vs 1,644 |
+  | 944 | 1,873 → 1,795 | 1,654 vs 1,629 |
+  | 1,406 | 2,223 → 2,173 | 1,968 vs 1,945 |
+  | 1,837 | 2,526 → 2,439 | 2,236 vs 2,246 |
+  | 2,816 | 3,257 → 3,256 | 2,978 vs 3,021 |
+
+  - **Neutral to slightly faster.** Round 1 is −26 to −87 ms; round 2 is −10 to +44 ms.
+  - Replies are identical except the 2,816-token part, which differs between the exes and not between boots.
+  - Draft acceptance moves both ways: 1,406-token part 15/16 → 12/15; 2,816-token part 14/21 → 15/20; the 400-token
+    decode 229/284 → 236/308.
+- **Decode, generate mode** (`pool_ab.py`, V F F V, 256 tokens, V = merge, F = `main`; `dec138-ab.out`): outputs
+  identical on all three prompts. tok/s V / F:
+
+  | prompt | merge (V) | `main` (F) |
+  |---|---|---|
+  | n0-thai-net | 71.2 | 71.5 |
+  | n0-py-async | 90.0 | 90.9 |
+  | n0-long8k | 78.5 | 78.2 |
+
+  The script's last column (`down`, 0 on IQ2_XS) divided by zero after the tok/s lines.
+- **Not measured:** prefill at 32K, `--ple-inflight 256` and `STRATA_MTP_BATCH_RING=1` as arms.
 
 ## 6. What moved: commits and the exe
 
 - Base: `main` `2fefaae`; upstream tag `v0.1.38` (`99f3dbd`); branch `xeno/129-merge-0.1.38`.
 - The merge commit: `3933ed5` (parents `2fefaae`, `99f3dbd`); it adds this report. The commit after it corrects this
   report and notes the fork's peer limits in `docs/SECOND_GPU.md` (no code).
-- Engine: `C:\Strata-expuild-138\strata.exe`, sha256 `beea3e729c886033b5ecf08adc58c518d5d84bb3871870ba3fac4dd2280b031c`
-  (74,470,400 B, built from the merge's tree).
+- Engine measured in §5a: `run-138a\strata.exe`, sha256 `beea3e729c886033b5ecf08adc58c518d5d84bb3871870ba3fac4dd2280b031c`
+  (74,470,400 B, built from the merge's tree, `3933ed5`). The review-fix commit changes only `--help` text and comments.
+  Its exe is recorded in the PR.
+
+## 6a. Bugs the merge introduced
+
+- **None found in the code.** The two-axis review (standards and spec, agents) traced every resolution against both
+  parents (§3).
+- **Fixed after review:**
+  - `--peer-device` and `--peer-prefill-rows` in `--help`, and `Prefill::set_peer`'s header comment, described upstream's
+    peer prompt path, which the fork does not have;
+  - this report's §6 path held a literal backspace byte;
+  - two descriptions in §2 were wrong: the fused pass's gate, and an end-of-stage `ple_take` that cannot run.
+- **Open:** the drafter's prompt K/V difference (#149, §5a). It does not change the main model, and it is not yet
+  traced to a change.
+- **Review smells left as they are**, to keep the next merge small:
+  - upstream's unused `gather_native_group(const GatherGroup&, ...)` overload;
+  - `_foreign_origin` beside `_own_page`; it ignores `trusted_origins` on `/load` and `/unload`, as the fork did before;
+  - a third parse of `STRATA_PREFILL_EXPERT_SPLIT`;
+  - the unbuffered reader's unused `skip`;
+  - the literal 42s in `iq_kernels.cu`;
+  - `set_peer` beside `set_peer_tier`.
 
 ## 7. What is left
 
-- Parity and ABBA (pending, the orchestrator): greedy ABBA against `main` on D2x, the decode-cluster parity, prefill
-  8K/32K, the Claude Code shape (sm119), decode. Candidates for the ABBA arms: `--ple-inflight 256`,
-  `STRATA_MTP_BATCH_RING=1`, `STRATA_GROUPED_V1=1` (against the default fused pass).
+- #149: the drafter's prompt K/V difference. The D2x deploy waits on it.
+- Not yet measured as arms: prefill at 32K, `--ple-inflight 256`, `STRATA_MTP_BATCH_RING=1`.
 - #61 under #463: n/a on the paired swaps (§2); the fork follow-up is to wait for stage 3's copies (or to make the
   GPU and CPU expert products round alike).
 - Upstream's peer share of the prompt path is not in the fork (§2). `docs/SECOND_GPU.md` (upstream's) says so under `--peer-prefill-rows`.
-- Not run on this merge: `/simplify`, `/code-review`, `/scrutinize`; the #129 comment linking this report.
+- Gates on this merge: `/code-review` ran (two axes), and its findings were fixed or listed in §6a. `/simplify` was not
+  run: the diff is upstream's code plus conflict resolutions, not new design. `/scrutinize` is recorded in the PR.
 - `tools/test_setup_draft_vocab.py` fails on `main` too (`KeyError: 'cjk'`): a follow-up.
 
 ## 8. The classic web app
