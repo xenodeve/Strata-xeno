@@ -168,6 +168,10 @@ public:
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
+    /// #147: run_split_multi_native in one phase - each expert's down rows start once its own gate/up rows are done
+    /// (the worker that finishes them quantizes the SwiGLU output) - instead of two phases with a barrier and a
+    /// host quantize between them.  Bit-identical either way.  On by default; STRATA_POOL_FUSED=0 turns it off.
+    void set_fused(bool on) { fused_ = on; }
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -286,6 +290,15 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
+    // #147: the one-phase native path (mode 7): tasks [0, ftasks_gu_) are gate/up row ranges over fgu_rows_, the
+    // rest down row ranges over fd_rows_; gu_left_[e] counts expert e's unfinished gate/up tasks, ready_[e] is set
+    // once its SwiGLU output is quantized
+    bool fused_ = true;
+    int ftasks_gu_ = 0, ftasks_d_ = 0;
+    int64_t fgu_rows_ = 0, fd_rows_ = 0;
+    std::unique_ptr<std::atomic<int>[]> gu_left_, ready_;
+    void native_rows(int mode, int64_t g0, int64_t g1);   // mode 5: gate/up rows, 6: down rows
+    void native_quant(int e);                             // expert e's SwiGLU output, for its down rows
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
 };
