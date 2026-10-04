@@ -73,12 +73,24 @@ size_t q8_row_bytes(int64_t cols);
 /// layout: byte-identical to quantize() of the gathered float rows (xeno_q8_row_gather).
 void gather_q8_rows(const void* src, int64_t src_rows, const int32_t* rows, int64_t n, int64_t cols, void* dst,
                     void* stream);
-/// #29: up to kGatherGroupMax GGUF-native expert blobs (gate at blob, up at blob + up_off, down at blob + down_off) into
-/// consecutive group slots in ONE launch: expert i's gate then up rows at gu_dst + i * gu_stride, its down at
-/// d_dst + i * d_stride.  Byte-identical to gather_native per expert (xeno_gather_group_parity).
+/// The most experts one group gather takes (both overloads below: the fork's #29 and upstream's #372).
 constexpr int kGatherGroupMax = 16;
+/// xeno #29: up to kGatherGroupMax GGUF-native expert blobs (gate at blob, up at blob + up_off, down at
+/// blob + down_off) into consecutive group slots in ONE launch: expert i's gate then up rows at gu_dst + i * gu_stride,
+/// its down at d_dst + i * d_stride.  Byte-identical to gather_native per expert (xeno_gather_group_parity); more than
+/// kGatherGroupMax or an unaligned pointer falls back to gather_native per expert inside the call.
 void gather_native_group(const uint8_t* const* blobs, int n, size_t up_off, size_t down_off, size_t gu_half_bytes,
                          size_t d_bytes, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream);
+/// upstream #372: gather_native for an MMQ group's experts [first, n) in ONE launch: expert q's blob (`blob[q]`; gate
+/// at +0, up at +up_off, down at +down_off) to gu_dst + q * gu_stride and d_dst + q * d_stride - the same bytes as one
+/// gather_native each.  Every pointer, offset and size 16-byte aligned (false otherwise: nothing launched, gather one
+/// at a time).  Note the argument order differs from the #29 overload (gu_half_bytes before down_off).
+struct GatherGroup {
+    const uint8_t* blob[kGatherGroupMax] = {};
+    int first = 0, n = 0;
+};
+bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
+                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream);
 /// A Strata-pack Q2_0 expert blob (codes and fp16 scales in separate planes, gate/up rows interleaved) into GGUF
 /// Q2_0 blocks: gate/up [1280, 2560] at `gu_dst` (rows stay interleaved), down [2560, 640] at `d_dst`.  Same values.
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
