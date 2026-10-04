@@ -392,6 +392,8 @@ void PleReader::close() {
     // Outstanding reads must finish before their buffers are released (caller-thread mode, or a worker that
     // stopped on an error).
     if (m.file.is_open()) {
+        // completions the injector still holds have left the port already: their reads are done, their slots free
+        for (const Completion& c : m.delayed) m.free_slots.push_back((uint32_t) c.tag);
         while (m.free_slots.size() < m.max_inflight) {
             Completion c[64];
             const int n = m.file.wait(c, 64, -1);
