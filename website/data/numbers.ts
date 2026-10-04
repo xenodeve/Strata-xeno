@@ -28,7 +28,7 @@ export const MEASURED: Measured[] = [
       { k: { en: "Model", th: "โมเดล" }, v: { en: "Q2_0 pack; greedy 256-token decode runs plus an 8K prompt; upstream's setup used a 16,384-token context limit.", th: "pack แบบ Q2_0; decode แบบ greedy 256 โทเคน และ prompt 8K; setup ของ upstream ใช้ context สูงสุด 16,384 โทเคน" } },
       { k: { en: "Compared with", th: "เทียบกับ" }, v: { en: "Upstream Strata v0.1.26, as its own setup chooses it, in the same session (2026-09-30), two runs per arm. Code decode speed was equal (82–89 vs 84–87 tok/s).", th: "Strata upstream v0.1.26 ตามที่ setup ของมันเลือกเอง ในเซสชันเดียวกัน (2026-09-30) สองรอบต่อฝั่ง ความเร็ว decode ของโค้ดเท่ากัน (82–89 เทียบ 84–87 tok/s)" } },
       { k: { en: "What it is", th: "คืออะไร" }, v: { en: "The whole dynamic-experts package together, not one mechanism. RAM saved is the size of the experts the GPUs hold, so it depends on how much VRAM is free.", th: "ผลรวมของชุด dynamic experts ทั้งหมด ไม่ใช่กลไกเดียว RAM ที่ประหยัดเท่ากับขนาด expert ที่ GPU ถือ จึงขึ้นกับว่ามี VRAM ว่างเท่าไร" } },
-      { k: { en: "Not measured", th: "ยังไม่ได้วัด" }, v: { en: "The current IQ2_XS model, upstream v0.1.37 / v0.1.38, or upstream's own low-RAM modes.", th: "โมเดล IQ2_XS ปัจจุบัน, upstream v0.1.37 / v0.1.38 หรือโหมด low-RAM ของ upstream เอง" } },
+      { k: { en: "Not measured", th: "ยังไม่ได้วัด" }, v: { en: "This Q2_0 run does not cover the IQ2_XS model or later upstream versions: IQ2_XS against v0.1.38 is its own card (vs v0.1.38: RAM). Upstream's own low-RAM modes are not measured.", th: "การรัน Q2_0 นี้ไม่ครอบคลุมโมเดล IQ2_XS หรือ upstream รุ่นหลัง: IQ2_XS เทียบ v0.1.38 อยู่ในการ์ดของมันเอง (เทียบ v0.1.38: RAM) ยังไม่ได้วัดโหมด low-RAM ของ upstream เอง" } },
     ],
     source: [
       { label: "Issue #45", href: issue(45) },
@@ -55,6 +55,63 @@ export const MEASURED: Measured[] = [
       { label: "PR #114", href: pr(114) },
     ],
   },
+  {
+    id: "v038-prompt",
+    label: { en: "Reading the prompt, against upstream v0.1.38", th: "การอ่าน prompt เทียบกับ upstream v0.1.38" },
+    figures: [
+      { value: "11.1", unit: "s", caption: { en: "Strata-xeno, six follow-up turns", th: "Strata-xeno หก turn ต่อเนื่อง" } },
+      { value: "13.2", unit: "s", caption: { en: "upstream v0.1.38, its fastest form here (layer split)", th: "upstream v0.1.38 แบบที่เร็วที่สุดที่นี่ (layer split)" } },
+    ],
+    conditions: [
+      { k: { en: "What was measured", th: "สิ่งที่วัด" }, v: { en: "Time to read the new part of each turn, as the server logs it; the six turns together, and the first 9,932-token prompt on its own. Mean of two runs.", th: "เวลาอ่านส่วนใหม่ของแต่ละ turn ตามที่เซิร์ฟเวอร์บันทึก รวมหก turn และ prompt แรก 9,932 โทเคนแยกต่างหาก ค่าเฉลี่ยสองรอบ" } },
+      { k: { en: "Arms", th: "ฝั่งที่เทียบ" }, v: { en: "Strata-xeno as served (D2x: the 4070 as an expert tier and a split of the prompt path). Upstream v0.1.38, a pristine build, with the flags its own setup.py writes for this model (profile, expert cache auto, prefill auto, spec 4, int8 KV, 262,144-token context with KV streaming at 32,768) in three forms: one GPU; the second GPU as its peer expert tier (no P2P between these cards, so its prompt path stays on the primary; STRATA_ARENA_PIN_GIB=8, without which the peer failed to start); its layer split, with 2,560 MiB of VRAM kept free to protect the display card (its default is 700, on both cards). Dynamic experts (upstream: the adaptive tier) on in every arm. Same pack, same draft layer.", th: "Strata-xeno ตามที่ serve อยู่ (D2x: 4070 เป็นชั้น expert และแบ่งงานอ่าน prompt) เทียบกับ upstream v0.1.38 ที่ build ใหม่โดยไม่แก้ ใช้ flag ที่ setup.py ของมันเขียนให้โมเดลนี้ (profile, expert cache auto, prefill auto, spec 4, KV int8, context 262,144 โทเคนพร้อม KV streaming ที่ 32,768) สามแบบ: GPU เดียว; GPU ที่สองเป็นชั้น expert แบบ peer (การ์ดคู่นี้ไม่มี P2P การอ่าน prompt จึงอยู่บนการ์ดหลัก; STRATA_ARENA_PIN_GIB=8 ถ้าไม่ตั้ง peer เริ่มไม่ขึ้น); และ layer split ที่กัน VRAM ว่างไว้ 2,560 MiB เพื่อรักษาการ์ดจอ (ค่าเริ่มต้นของมันคือ 700 และใช้กับทั้งสองการ์ด) เปิด dynamic experts (upstream: adaptive tier) ทุกฝั่ง pack และ draft layer เดียวกัน" } },
+      { k: { en: "Session", th: "เซสชัน" }, v: { en: "One session on 2026-10-04, the arms in the order base, layer split, peer, one GPU, then back; two runs per arm. Claude Code request shape: a 9,932-token conversation, then six turns that each add 408–2,816 tokens.", th: "เซสชันเดียว 2026-10-04 สลับลำดับ base, layer split, peer, GPU เดียว แล้วย้อนกลับ สองรอบต่อฝั่ง รูปแบบ request ของ Claude Code: บทสนทนา 9,932 โทเคน แล้วหก turn ที่เพิ่ม 408–2,816 โทเคนต่อครั้ง" } },
+      { k: { en: "Model", th: "โมเดล" }, v: { en: "Swift 1.5 Qwen3.8 Flash-Next IQ2_XS, serve mode.", th: "Swift 1.5 Qwen3.8 Flash-Next IQ2_XS โหมด serve" } },
+      { k: { en: "Machine", th: "เครื่อง" }, v: { en: "Intel Core i5-13500, 48 GB DDR5, RTX 5060 Ti 16 GB (×4) + RTX 4070 SUPER 12 GB (×16, the display), Windows 11.", th: "Intel Core i5-13500, DDR5 48 GB, RTX 5060 Ti 16 GB (×4) + RTX 4070 SUPER 12 GB (×16 การ์ดจอ), Windows 11" } },
+      { k: { en: "Same run, other side", th: "ในการรันเดียวกัน อีกด้าน" }, v: { en: "On the long first prompt upstream's layer split tied (7.96 vs 8.01 s). Its peer and one-GPU forms took about twice as long on everything.", th: "กับ prompt แรกที่ยาว layer split ของ upstream เสมอกัน (7.96 เทียบ 8.01 วินาที) ส่วนแบบ peer และแบบ GPU เดียวใช้เวลาราวสองเท่าในทุกส่วน" } },
+    ],
+    source: [
+      { label: "Issue #163", href: issue(163) },
+      { label: "Issue #136", href: issue(136) },
+    ],
+  },
+  {
+    id: "v038-decode",
+    label: { en: "Decode speed, against upstream v0.1.38", th: "ความเร็ว decode เทียบกับ upstream v0.1.38" },
+    figures: [
+      { value: "71.7", unit: "tok/s", caption: { en: "Strata-xeno, six 200-token replies", th: "Strata-xeno คำตอบ 200 โทเคนหกครั้ง" } },
+      { value: "72.3", unit: "tok/s", caption: { en: "upstream v0.1.38 with its peer tier (a tie)", th: "upstream v0.1.38 กับชั้น peer (เสมอกัน)" } },
+    ],
+    conditions: [
+      { k: { en: "What was measured", th: "สิ่งที่วัด" }, v: { en: "Tokens per second while writing: the six 200-token replies of the Claude Code turns together, and a separate 400-token answer to a short prompt. Mean of two runs.", th: "โทเคนต่อวินาทีขณะเขียนคำตอบ: คำตอบ 200 โทเคนของหก turn รวมกัน และคำตอบ 400 โทเคนต่อ prompt สั้นแยกต่างหาก ค่าเฉลี่ยสองรอบ" } },
+      { k: { en: "Arms", th: "ฝั่งที่เทียบ" }, v: { en: "Strata-xeno as served (D2x: the 4070 as an expert tier and a split of the prompt path). Upstream v0.1.38, a pristine build, with the flags its own setup.py writes for this model (profile, expert cache auto, prefill auto, spec 4, int8 KV, 262,144-token context with KV streaming at 32,768) in three forms: one GPU; the second GPU as its peer expert tier (no P2P between these cards, so its prompt path stays on the primary; STRATA_ARENA_PIN_GIB=8, without which the peer failed to start); its layer split, with 2,560 MiB of VRAM kept free to protect the display card (its default is 700, on both cards). Dynamic experts (upstream: the adaptive tier) on in every arm. Same pack, same draft layer.", th: "Strata-xeno ตามที่ serve อยู่ (D2x: 4070 เป็นชั้น expert และแบ่งงานอ่าน prompt) เทียบกับ upstream v0.1.38 ที่ build ใหม่โดยไม่แก้ ใช้ flag ที่ setup.py ของมันเขียนให้โมเดลนี้ (profile, expert cache auto, prefill auto, spec 4, KV int8, context 262,144 โทเคนพร้อม KV streaming ที่ 32,768) สามแบบ: GPU เดียว; GPU ที่สองเป็นชั้น expert แบบ peer (การ์ดคู่นี้ไม่มี P2P การอ่าน prompt จึงอยู่บนการ์ดหลัก; STRATA_ARENA_PIN_GIB=8 ถ้าไม่ตั้ง peer เริ่มไม่ขึ้น); และ layer split ที่กัน VRAM ว่างไว้ 2,560 MiB เพื่อรักษาการ์ดจอ (ค่าเริ่มต้นของมันคือ 700 และใช้กับทั้งสองการ์ด) เปิด dynamic experts (upstream: adaptive tier) ทุกฝั่ง pack และ draft layer เดียวกัน" } },
+      { k: { en: "Session", th: "เซสชัน" }, v: { en: "One session on 2026-10-04, the arms in the order base, layer split, peer, one GPU, then back; two runs per arm. Claude Code request shape: a 9,932-token conversation, then six turns that each add 408–2,816 tokens.", th: "เซสชันเดียว 2026-10-04 สลับลำดับ base, layer split, peer, GPU เดียว แล้วย้อนกลับ สองรอบต่อฝั่ง รูปแบบ request ของ Claude Code: บทสนทนา 9,932 โทเคน แล้วหก turn ที่เพิ่ม 408–2,816 โทเคนต่อครั้ง" } },
+      { k: { en: "Machine", th: "เครื่อง" }, v: { en: "Intel Core i5-13500, 48 GB DDR5, RTX 5060 Ti 16 GB (×4) + RTX 4070 SUPER 12 GB (×16, the display), Windows 11.", th: "Intel Core i5-13500, DDR5 48 GB, RTX 5060 Ti 16 GB (×4) + RTX 4070 SUPER 12 GB (×16 การ์ดจอ), Windows 11" } },
+      { k: { en: "Read it as", th: "อ่านอย่างไร" }, v: { en: "A tie with upstream's peer tier on the turns (73.8 / 70.7 vs 71.7 / 71.7); ahead of its layer split and one-GPU forms by 10–20 %. Greedy, speculative decoding with the MTP draft layer in every arm.", th: "เสมอกับชั้น peer ของ upstream ใน turn (73.8 / 70.7 เทียบ 71.7 / 71.7) และเร็วกว่าแบบ layer split และ GPU เดียว 10–20 % ทุกฝั่งเป็น greedy พร้อม speculative decoding ด้วย MTP draft layer" } },
+    ],
+    source: [
+      { label: "Issue #163", href: issue(163) },
+      { label: "Issue #136", href: issue(136) },
+    ],
+  },
+  {
+    id: "v038-ram",
+    label: { en: "RAM, against upstream v0.1.38", th: "RAM เทียบกับ upstream v0.1.38" },
+    figures: [
+      { value: "23.7", unit: "GiB", caption: { en: "Strata-xeno; 15.3 GB of RAM still free", th: "Strata-xeno; RAM ยังว่าง 15.3 GB" } },
+      { value: "36.9–39.8", unit: "GiB", caption: { en: "upstream v0.1.38; free RAM down to 0.01–0.6 GB", th: "upstream v0.1.38; RAM ว่างเหลือ 0.01–0.6 GB" } },
+    ],
+    conditions: [
+      { k: { en: "What was measured", th: "สิ่งที่วัด" }, v: { en: "The server process's working set (resident RAM) at its sampled peak, with the system's free RAM, commit and hard page-ins, every 10 seconds through load, prompt and decode. One run per arm, 4–7 samples each, so the peaks are approximate.", th: "working set ของโปรเซสเซิร์ฟเวอร์ (RAM ที่ใช้อยู่จริง) ที่จุดสูงสุดที่เก็บได้ พร้อม RAM ว่าง commit และ hard page-in ของระบบ ทุก 10 วินาทีตลอดการโหลด การอ่าน prompt และ decode หนึ่งรอบต่อฝั่ง ฝั่งละ 4–7 จุด ค่าสูงสุดจึงเป็นค่าประมาณ" } },
+      { k: { en: "Arms", th: "ฝั่งที่เทียบ" }, v: { en: "Strata-xeno as served (D2x: the 4070 as an expert tier and a split of the prompt path). Upstream v0.1.38, a pristine build, with the flags its own setup.py writes for this model (profile, expert cache auto, prefill auto, spec 4, int8 KV, 262,144-token context with KV streaming at 32,768) in three forms: one GPU; the second GPU as its peer expert tier (no P2P between these cards, so its prompt path stays on the primary; STRATA_ARENA_PIN_GIB=8, without which the peer failed to start); its layer split, with 2,560 MiB of VRAM kept free to protect the display card (its default is 700, on both cards). Dynamic experts (upstream: the adaptive tier) on in every arm. Same pack, same draft layer.", th: "Strata-xeno ตามที่ serve อยู่ (D2x: 4070 เป็นชั้น expert และแบ่งงานอ่าน prompt) เทียบกับ upstream v0.1.38 ที่ build ใหม่โดยไม่แก้ ใช้ flag ที่ setup.py ของมันเขียนให้โมเดลนี้ (profile, expert cache auto, prefill auto, spec 4, KV int8, context 262,144 โทเคนพร้อม KV streaming ที่ 32,768) สามแบบ: GPU เดียว; GPU ที่สองเป็นชั้น expert แบบ peer (การ์ดคู่นี้ไม่มี P2P การอ่าน prompt จึงอยู่บนการ์ดหลัก; STRATA_ARENA_PIN_GIB=8 ถ้าไม่ตั้ง peer เริ่มไม่ขึ้น); และ layer split ที่กัน VRAM ว่างไว้ 2,560 MiB เพื่อรักษาการ์ดจอ (ค่าเริ่มต้นของมันคือ 700 และใช้กับทั้งสองการ์ด) เปิด dynamic experts (upstream: adaptive tier) ทุกฝั่ง pack และ draft layer เดียวกัน" } },
+      { k: { en: "Machine", th: "เครื่อง" }, v: { en: "Intel Core i5-13500, 48 GB DDR5, RTX 5060 Ti 16 GB (×4) + RTX 4070 SUPER 12 GB (×16, the display), Windows 11.", th: "Intel Core i5-13500, DDR5 48 GB, RTX 5060 Ti 16 GB (×4) + RTX 4070 SUPER 12 GB (×16 การ์ดจอ), Windows 11" } },
+      { k: { en: "What it means", th: "หมายความว่าอะไร" }, v: { en: "Upstream keeps every expert in RAM and lists this model at 48 GB, exactly this PC: free RAM ran out and the system paged from disk while serving (median 2,245–3,179 page-ins a second against Strata-xeno's 116). Dynamic experts hold part of them on the GPUs instead.", th: "upstream เก็บ expert ทุกตัวไว้ใน RAM และระบุโมเดลนี้ไว้ที่ 48 GB พอดีกับพีซีเครื่องนี้ RAM ว่างจึงหมดและระบบต้องอ่านหน้าจาก disk ระหว่าง serve (median 2,245–3,179 ครั้งต่อวินาที เทียบกับ 116 ของ Strata-xeno) ส่วน dynamic experts ให้ GPU ถือ expert ส่วนหนึ่งแทน" } },
+    ],
+    source: [
+      { label: "Issue #163", href: issue(163) },
+      { label: "Issue #136", href: issue(136) },
+    ],
+  },
 ];
 
 export type Count = { value: string; label: L; method: string };
@@ -73,7 +130,7 @@ export const COUNTS: Count[] = [
  * The comparison charts. Every bar is a figure that is written out above, with the conditions it was measured under; the
  * differences are plain subtraction of two of those figures. A scale always starts at zero.
  */
-export type ChartId = "ram" | "decode" | "capacity";
+export type ChartId = "ram" | "decode" | "capacity" | "v038-prompt" | "v038-decode" | "v038-ram";
 
 export const CHARTS: Record<ChartId, ChartSpec> = {
   ram: {
@@ -122,6 +179,79 @@ export const CHARTS: Record<ChartId, ChartSpec> = {
     caption: {
       en: "IQ2_XS, serve mode, 262,144-token context, a 400-token answer; same script, same session (2026-10-03), one PC. Decode only, not prompt reading.",
       th: "IQ2_XS โหมด serve context 262,144 โทเคน คำตอบ 400 โทเคน สคริปต์เดียวกัน เซสชันเดียวกัน (2026-10-03) พีซีเครื่องเดียว เฉพาะ decode ไม่ใช่การอ่าน prompt",
+    },
+  },
+  "v038-prompt": {
+    id: "v038-prompt",
+    title: { en: "Reading the prompt (seconds, mean of two runs)", th: "การอ่าน prompt (วินาที ค่าเฉลี่ยสองรอบ)" },
+    unit: "s",
+    better: "lower",
+    groups: [
+      { en: "First prompt, 9,932 tokens", th: "prompt แรก 9,932 โทเคน" },
+      { en: "Six follow-up turns, together", th: "หก turn ต่อเนื่องรวมกัน" },
+    ],
+    series: [
+      { name: { en: "Strata-xeno", th: "Strata-xeno" }, tone: "mine", values: [8.01, 11.06] },
+      { name: { en: "upstream v0.1.38, layer split", th: "upstream v0.1.38 layer split" }, tone: "theirs", values: [7.96, 13.18] },
+      { name: { en: "upstream v0.1.38, peer tier", th: "upstream v0.1.38 ชั้น peer" }, tone: "theirs", values: [13.87, 23.82] },
+      { name: { en: "upstream v0.1.38, one GPU", th: "upstream v0.1.38 GPU เดียว" }, tone: "theirs", values: [13.1, 23.67] },
+    ],
+    max: 25,
+    step: 5,
+    digits: 1,
+    deltas: [
+      { en: "a tie with the layer split", th: "เสมอกับ layer split" },
+      { en: "2.1 s less than the fastest upstream", th: "น้อยกว่า upstream ที่เร็วที่สุด 2.1 วินาที" },
+    ],
+    caption: {
+      en: "Swift 1.5 IQ2_XS, serve mode, Claude Code request shape; same session (2026-10-04), two runs per arm, one PC; dynamic experts on in every arm.",
+      th: "Swift 1.5 IQ2_XS โหมด serve รูปแบบ request ของ Claude Code เซสชันเดียวกัน (2026-10-04) สองรอบต่อฝั่ง พีซีเครื่องเดียว เปิด dynamic experts ทุกฝั่ง",
+    },
+  },
+  "v038-decode": {
+    id: "v038-decode",
+    title: { en: "Decode speed (tok/s, mean of two runs)", th: "ความเร็ว decode (tok/s ค่าเฉลี่ยสองรอบ)" },
+    unit: "tok/s",
+    better: "higher",
+    groups: [
+      { en: "Six 200-token replies", th: "คำตอบ 200 โทเคนหกครั้ง" },
+      { en: "A 400-token answer", th: "คำตอบ 400 โทเคน" },
+    ],
+    series: [
+      { name: { en: "Strata-xeno", th: "Strata-xeno" }, tone: "mine", values: [71.7, 75.2] },
+      { name: { en: "upstream v0.1.38, layer split", th: "upstream v0.1.38 layer split" }, tone: "theirs", values: [63.1, 60.6] },
+      { name: { en: "upstream v0.1.38, peer tier", th: "upstream v0.1.38 ชั้น peer" }, tone: "theirs", values: [72.3, 67.0] },
+      { name: { en: "upstream v0.1.38, one GPU", th: "upstream v0.1.38 GPU เดียว" }, tone: "theirs", values: [57.8, 52.4] },
+    ],
+    max: 80,
+    step: 20,
+    deltas: [
+      { en: "a tie with the peer tier", th: "เสมอกับชั้น peer" },
+      { en: "+8.2 tok/s over the fastest upstream", th: "+8.2 tok/s เหนือ upstream ที่เร็วที่สุด" },
+    ],
+    caption: {
+      en: "Swift 1.5 IQ2_XS, serve mode, greedy with the MTP draft layer; same session (2026-10-04), two runs per arm, one PC; dynamic experts on in every arm.",
+      th: "Swift 1.5 IQ2_XS โหมด serve greedy พร้อม MTP draft layer เซสชันเดียวกัน (2026-10-04) สองรอบต่อฝั่ง พีซีเครื่องเดียว เปิด dynamic experts ทุกฝั่ง",
+    },
+  },
+  "v038-ram": {
+    id: "v038-ram",
+    title: { en: "RAM in use while serving (GiB, sampled peak)", th: "RAM ที่ใช้ขณะ serve (GiB จุดสูงสุดที่เก็บได้)" },
+    unit: "GiB",
+    better: "lower",
+    groups: [{ en: "Working set of the server process", th: "working set ของโปรเซสเซิร์ฟเวอร์" }],
+    series: [
+      { name: { en: "Strata-xeno", th: "Strata-xeno" }, tone: "mine", values: [23.7] },
+      { name: { en: "upstream v0.1.38, layer split", th: "upstream v0.1.38 layer split" }, tone: "theirs", values: [37.5] },
+      { name: { en: "upstream v0.1.38, peer tier", th: "upstream v0.1.38 ชั้น peer" }, tone: "theirs", values: [39.8] },
+      { name: { en: "upstream v0.1.38, one GPU", th: "upstream v0.1.38 GPU เดียว" }, tone: "theirs", values: [36.9] },
+    ],
+    max: 40,
+    step: 10,
+    deltas: [{ en: "13.2 GiB less than the least upstream", th: "น้อยกว่า upstream ที่ใช้น้อยที่สุด 13.2 GiB" }],
+    caption: {
+      en: "One run per arm, sampled every 10 s (4–7 samples), so the peaks are approximate. 48 GB PC: upstream ran it out of free RAM and paged from disk; Strata-xeno left 15.3 GB free.",
+      th: "หนึ่งรอบต่อฝั่ง เก็บทุก 10 วินาที (4–7 จุด) ค่าสูงสุดจึงเป็นค่าประมาณ พีซี 48 GB: upstream ทำให้ RAM ว่างหมดและต้องอ่านหน้าจาก disk ส่วน Strata-xeno เหลือ RAM ว่าง 15.3 GB",
     },
   },
   capacity: {
