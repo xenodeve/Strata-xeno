@@ -61,6 +61,9 @@ export const GROUPS: Group[] = [
     id: "numbers",
     label: { en: "Numbers", th: "ตัวเลข" },
     topics: [
+      { id: "v038-prompt", icon: "timer", label: { en: "vs v0.1.38: prompt", th: "เทียบ v0.1.38: prompt" }, kind: "measured" },
+      { id: "v038-decode", icon: "bolt", label: { en: "vs v0.1.38: decode", th: "เทียบ v0.1.38: decode" }, kind: "measured" },
+      { id: "v038-ram", icon: "bars", label: { en: "vs v0.1.38: RAM", th: "เทียบ v0.1.38: RAM" }, kind: "measured" },
       { id: "ram", icon: "bars", label: { en: "RAM", th: "RAM" }, kind: "measured" },
       { id: "decode", icon: "bolt", label: { en: "Decode speed", th: "ความเร็ว decode" }, kind: "measured" },
       { id: "counts", icon: "list", label: { en: "Counted", th: "นับจากโค้ด" }, kind: "counts" },

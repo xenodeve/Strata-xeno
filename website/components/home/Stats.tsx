@@ -42,18 +42,18 @@ type Stat = {
 
 const STATS: Stat[] = [
   {
-    id: "ram",
-    label: { en: "RAM, two GPUs · lower is better", th: "RAM, สอง GPU · ยิ่งต่ำยิ่งดี" },
-    mine: { value: 16.5, unit: "GiB", tag: { en: "Strata-xeno", th: "Strata-xeno" } },
-    theirs: { value: 35.3, tag: { en: "upstream v0.1.26", th: "upstream v0.1.26" } },
-    href: "/details#ram",
+    id: "v038-prompt",
+    label: { en: "Six Claude Code turns, reading · lower is better", th: "หก turn ของ Claude Code การอ่าน · ยิ่งต่ำยิ่งดี" },
+    mine: { value: 11.1, unit: "s", tag: { en: "Strata-xeno", th: "Strata-xeno" } },
+    theirs: { value: 13.2, tag: { en: "upstream v0.1.38, layer split", th: "upstream v0.1.38 layer split" } },
+    href: "/details#v038-prompt",
   },
   {
-    id: "decode",
-    label: { en: "Decode speed", th: "ความเร็ว decode" },
-    mine: { value: 59.0, unit: "tok/s", tag: { en: "Strata-xeno", th: "Strata-xeno" } },
-    theirs: { value: 41.0, tag: { en: "upstream v0.1.37", th: "upstream v0.1.37" } },
-    href: "/details#decode",
+    id: "v038-ram",
+    label: { en: "RAM while serving · lower is better", th: "RAM ขณะ serve · ยิ่งต่ำยิ่งดี" },
+    mine: { value: 23.7, unit: "GiB", tag: { en: "Strata-xeno", th: "Strata-xeno" } },
+    theirs: { value: 36.9, tag: { en: "upstream v0.1.38, least", th: "upstream v0.1.38 ที่น้อยที่สุด" } },
+    href: "/details#v038-ram",
   },
 ];
 
