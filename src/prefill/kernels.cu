@@ -537,8 +537,9 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     const int64_t r = i / per, j = i % per;
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
-// the routed sum of token t's column d: one fmaf chain in k order.  moe_combine and the split's moe_routed_sum share it,
-// so the two cards' halves (#35 D1) add in the same order by construction.  #133: only the pairs whose row is in
+// the routed sum of token t's column d: one fmaf chain in k order, shared by moe_combine and the split's sums.  With
+// nothing on CUDA0 the split adds in moe_combine's order (#35 D1); #133 splits the chain into the two cards' partials
+// (rounding-level differences, xeno_combine_partial_parity).  #133: only the pairs whose row is in
 // [lo, hi) - a split layer's rows hold the 4070's experts first and CUDA0's last, and a row of the other card's was
 // never computed here, so it is skipped before it is read
 __device__ __forceinline__ float routed_sum(const float* __restrict__ Dm, const int32_t* __restrict__ slot,

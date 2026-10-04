@@ -1000,7 +1000,7 @@ if(STRATA_NATIVE_EXPERTS)
       add_executable(xeno_combine_split_parity tests/xeno/combine_split_parity.cu)
       target_link_libraries(xeno_combine_split_parity PRIVATE strata_prefill CUDA::cudart)
       add_test(NAME xeno_combine_split_parity COMMAND xeno_combine_split_parity)
-      # #133: each card sums only the pairs it owns (slot -1 elsewhere), the 5060 finishes onto the 4070's partial
+      # #133: each card sums only its own rows (the 4070's below CUDA0's block), the 5060 finishes onto the 4070's
       add_executable(xeno_combine_partial_parity tests/xeno/combine_partial_parity.cu)
       target_link_libraries(xeno_combine_partial_parity PRIVATE strata_prefill CUDA::cudart)
       add_test(NAME xeno_combine_partial_parity COMMAND xeno_combine_partial_parity)

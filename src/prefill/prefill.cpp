@@ -662,13 +662,6 @@ struct SplitTier {
         hrows = (int32_t*) h_alloc((size_t) TK * 4);
         hslot = (int32_t*) h_alloc((size_t) TK * 4);
         hbounds = (int32_t*) h_alloc((size_t) hbounds_cap * 4);
-        // #41's Dm frontier (STRATA_DM_FRONTIER=1) commits a token once all ten of its ranks arrive; since #133 each card
-        // sums only its own experts, so the split refuses it until it learns to skip the other card's ranks (#137)
-        if (const char* fv = std::getenv("STRATA_DM_FRONTIER"); fv != nullptr && fv[0] == '1') {
-            err = "STRATA_DM_FRONTIER=1 is not supported with the split since #133 (each card sums only its own "
-                  "experts; #137)";
-            return false;
-        }
         Dev g(dev);
         size_t f0 = 0, tot = 0;
         cudaMemGetInfo(&f0, &tot);
@@ -1185,7 +1178,11 @@ bool split_run(Impl& m, int64_t l, int64_t T, size_t unit, const std::vector<int
                 const int64_t k = entry_of[(size_t) order[i]];
                 if (k >= 0 && k_first >= 0 && k - k_first + 2 > xs.RING) flush();
                 if (k < 0) {
-                    blobs[pn] = (const uint8_t*) m.peer_ptr(m.peer_res[(size_t) l * NE + order[i]]);
+                    // not in the stream plan: the 4070's own (#133: the plan and this layer's grouping read the same
+                    // cuda0_owns; an expert neither card holds here means the residency moved under the plan)
+                    const int32_t ps = m.peer_res[(size_t) l * NE + order[i]];
+                    if (ps < 0) { err = "prefill: expert_split: an expert is in neither the 4070's slots nor the plan"; return false; }
+                    blobs[pn] = (const uint8_t*) m.peer_ptr(ps);
                 } else {
                     if (k_first < 0) k_first = k;
                     // the entries before k that this layer does not route are released now
@@ -2168,6 +2165,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                   "STRATA_PREFILL_WAVE";
             return false;
         }
+        // #133 (scrutiny): a full split keeps only a short one-card ring (ring_cap), so a chunk the split should take but
+        // cannot (the 4070 out of memory) would crawl through the per-expert path under the split's name - fail it, as
+        // the moe_tokens check did before #133.  A partial split's one-card path holds the chunk and runs it
+        if (split_on && !m.split && split_layout_full() && (int64_t) T >= split_min()) {
+            err = "prefill: the expert split did not start (see the expert_split line above) and this " +
+                  std::to_string(T) + "-token chunk cannot run on one card in the split layout; restart without "
+                  "STRATA_PREFILL_EXPERT_SPLIT";
+            return false;
+        }
         const bool split_base = split_on && m.split != nullptr;   // #35 D7: the wave's lane 1 plans with full chunks
         split_on = split_base && T >= split_min();   // every candidate expert streams: big chunks only
         // peer: a 4070 slot or -1; pack: #11, its job reads the pack (blob is null for that and for a CS-T transient one)
@@ -2864,8 +2870,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
                         }
-                        // #133: a split layer's experts CUDA0 computes from its cache (local) and the 4070's, each one
-                        // contiguous row block: the 4070's first, CUDA0's last
                         // each expert's first row, in expert_at order (#41 gate 2; id order by default); #133: a split
                         // layer's CUDA0-held experts (local_e) as one block after the 4070's
                         std::vector<char> local_e((size_t) m.g->n_expert, 0);
