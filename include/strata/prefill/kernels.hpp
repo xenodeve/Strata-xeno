@@ -70,6 +70,11 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 /// moe_combine (xeno_combine_split_parity).  moe_shared_finish runs in place: bo holds the routed sum on entry.
 void moe_routed_sum(const float* D, const int32_t* slot, const float* w, float* s, int64_t T, void* stream);
 void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream);
+/// #133: bo = bo + sum over this card's pairs of w * D[slot] + shared * sigmoid(sg), where bo holds the other card's
+/// routed partial on entry and a pair this card does not own has slot -1 (moe_routed_sum skips those too).  When
+/// every slot is -1 it writes moe_shared_finish's bytes (xeno_combine_partial_parity).
+void moe_split_finish(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                      float* bo, int64_t T, void* stream);
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
 

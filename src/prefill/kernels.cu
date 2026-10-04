@@ -538,12 +538,16 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
 // the routed sum of token t's column d: one fmaf chain in k order.  moe_combine and the split's moe_routed_sum share it,
-// so the two cards' halves (#35 D1) add in the same order by construction
+// so the two cards' halves (#35 D1) add in the same order by construction.  #133: a pair with slot -1 belongs to the
+// other card (its row was never computed here) and is skipped - before its row is read
 __device__ __forceinline__ float routed_sum(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                             const float* __restrict__ w, int64_t t, int64_t d) {
     float s = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    for (int k = 0; k < 10; ++k) {
+        const int32_t sl = slot[t * 10 + k];
+        if (sl >= 0) s = fmaf(w[t * 10 + k], Dm[(int64_t) sl * N + d], s);
+    }
     return s;
 }
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
@@ -812,6 +816,16 @@ __global__ void moe_routed_sum_kernel(const float* __restrict__ Dm, const int32_
     if (i >= T * N) return;
     out[i] = routed_sum(Dm, slot, w, i / N, i % N);
 }
+// #133: the other card's routed partial (in bo) + this card's pairs + the shared term; written as moe_shared_finish's
+// expression on (bo + local), so with no local pair (local == 0.0f) the bytes are moe_shared_finish's
+__global__ void moe_split_finish_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                        const float* __restrict__ w, const float* __restrict__ shared,
+                                        const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const float s = bo[i] + routed_sum(Dm, slot, w, i / N, i % N);
+    bo[i] = s + shared[i] * sigm(sg[i / N]);
+}
 __global__ void moe_shared_finish_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
                                          float* __restrict__ bo, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -822,6 +836,11 @@ __global__ void moe_shared_finish_kernel(const float* __restrict__ shared, const
 void moe_routed_sum(const float* Dm, const int32_t* slot, const float* w, float* s, int64_t T, void* stream) {
     moe_routed_sum_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, s, T);
     check("moe_routed_sum");
+}
+void moe_split_finish(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                      float* bo, int64_t T, void* stream) {
+    moe_split_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
+    check("moe_split_finish");
 }
 void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
     moe_shared_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(shared, sg, bo, T);
