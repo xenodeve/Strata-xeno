@@ -30,6 +30,7 @@
 #include "strata/prefill/frontier.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/split_plan.hpp"
+#include "strata/prefill/kv_stage_plan.hpp"
 #include "strata/timeline.hpp"
 #include "strata/timeline_gpu.hpp"
 
@@ -862,6 +863,7 @@ struct Prefill::Impl {
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     strata::kernels::KvHostPools stage;
     int32_t* ident_table = nullptr;
+    int64_t stage_cells = INT64_MAX;         // #122: the cells `stage` holds (INT64_MAX: not streamed, nothing staged)
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
@@ -871,20 +873,24 @@ struct Prefill::Impl {
 };
 
 namespace {
-// the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed)
+// the staging pool of a streamed session: one layer's pages up to the request's end `kv_end` (kv_stage_pages; 0 = every
+// page), the same sequence in init and bytes_needed; returns the cells it holds (INT64_MAX when not streamed).  #122:
+// it used to hold every page of the context - at 262K 264 MiB per wave lane of borrowed expert slots on every request,
+// 0.2-0.5 s per Claude Code turn (#106).
 // STRATA_KV_STAGE_OWN (A/B only): the staging pool gets its own allocation instead of borrowed expert slots, so a
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
 bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
-void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
-                strata::kernels::KvHostPools& st, bool& ok) {
+int64_t take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
+                   strata::kernels::KvHostPools& st, bool& ok, int64_t kv_end) {
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
-    if (q0.kv_mode != 1) return;
-    if (stage_own() && o_borrowed.count_only) return;
+    if (q0.kv_mode != 1) return INT64_MAX;
+    const int64_t pages = kv_stage_pages(kv_end, q0.n_pages, s.page_size);
+    if (stage_own() && o_borrowed.count_only) return pages * s.page_size;
     Alloc own;
     own.owned = o_borrowed.owned;
     Alloc& o = stage_own() ? own : o_borrowed;
-    const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
+    const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
     if (q0.kv_q4) {
         st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
         st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
@@ -897,6 +903,7 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
         st.k_pool = o.take<uint16_t>(rows * s.head_dim, ok);
         st.v_pool = o.take<uint16_t>(rows * s.head_dim, ok);
     }
+    return pages * s.page_size;
 }
 strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table) {
     strata::kernels::QsaAttnPools p;
@@ -1518,7 +1525,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
     }
-    if (!carve(T, &o)) {
+    if (!carve(T, &o, 0)) {   // #122: the worst case (a relayout sizes the stage for a request's end)
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
     }
@@ -1529,7 +1536,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
 
 // Every device buffer of a chunk of T tokens, from the Alloc `alloc` (after the GEMM scratch and workspace): `init`
 // once, and `relayout` for a request's own chunk.  The order is `bytes_needed`'s.
-bool Prefill::carve(size_t T, void* alloc) {
+bool Prefill::carve(size_t T, void* alloc, int64_t kv_end) {
     Impl& m = *impl_;
     Alloc& o = *static_cast<Alloc*>(alloc);
     const core::ModelGeometry& g = *m.g;
@@ -1613,7 +1620,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
-    take_stage(o, ss, s, m.stage, ok);
+    m.stage_cells = take_stage(o, ss, s, m.stage, ok, kv_end);
     m.T = (int64_t) T;
     return ok;
 }
@@ -1624,7 +1631,7 @@ void Prefill::set_peer_tier(const int32_t* res, std::function<const void*(int32_
     impl_->peer_dev = device;
 }
 
-bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
+bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, int64_t kv_end) {
     Impl& m = *impl_;
     if (!m.borrowed || borrow == nullptr || chunk <= 0 || chunk > m.T_max) {
         err = "prefill: relayout needs borrowed buffers and a chunk of at most " + std::to_string(m.T_max);
@@ -1642,7 +1649,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     void* ws = o.take<uint8_t>(GEMM_WS, ok);
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS);
-    if (!ok || !carve((size_t) chunk, &o)) {
+    if (!ok || !carve((size_t) chunk, &o, kv_end)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
     }
@@ -1650,6 +1657,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+int64_t Prefill::stage_cells() const { return impl_->stage_cells; }
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {
@@ -1805,7 +1813,8 @@ std::vector<int> Prefill::split_one_card_layers() { return the_split_plan().one_
 void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                               int64_t kv_end) {
     // the same allocation sequence as `init`, counted
     const size_t T = (size_t) chunk;
     bool ok = true;
@@ -1854,7 +1863,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;
-    take_stage(o, ss, s, stage, ok);
+    take_stage(o, ss, s, stage, ok, kv_end);
     return o.used + (8u << 20);   // alignment slack
 }
 
@@ -1962,6 +1971,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
+    // #122: a streamed chunk stages [0, p0) and appends its cells after them in a pool sized for the request's end;
+    // a prompt past it would write into the lent expert slots after the pool - refuse it instead
+    if (pos0 + n > m.stage_cells) {
+        err = "prefill: the KV staging pool holds " + std::to_string(m.stage_cells) + " cells and this prompt ends at " +
+              std::to_string(pos0 + n) + " (lay the prompt path out for the request's end: relayout's kv_end)";
+        return false;
+    }
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
