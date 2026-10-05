@@ -21,12 +21,20 @@ THINK_REPEATS = 8
 # 64-character opening); only prose units count
 PROSE_UNIT = re.compile(r"^[^<>{}|`]+$")
 # #199: a thinking that re-plans the same answer in cycles too long for THINK_WINDOW (12 cycles of ~8,400 characters,
-# 32,768 tokens and no answer): prose lines of CYCLE_LINE+ characters outside code fences, and once CYCLE_LINES
-# distinct ones have each come CYCLE_REPEATS times the thinking is cycling - the server then closes it (not a stop)
+# 32,768 tokens and no answer).  Prose lines (PROSE_UNIT, and no ';' or ' = ': not code) of CYCLE_LINE+ characters
+# outside code fences; a line counts again only CYCLE_GAP+ characters after it last came (a short re-check of a list
+# is not a cycle; a short cycle is THINK_WINDOW's), and once CYCLE_LINES distinct ones have each come CYCLE_REPEATS
+# times the thinking is cycling - the server then closes it (not a stop)
 CYCLE_LINE = 40
 CYCLE_REPEATS = 3
 CYCLE_LINES = 4
+CYCLE_GAP = 2048
 CYCLE_MAX_LINE = 512   # a longer line is not a plan line: not collected
+
+
+def _plan_line(line):
+    return (CYCLE_LINE <= len(line) <= CYCLE_MAX_LINE and PROSE_UNIT.match(line) is not None and ";" not in line
+            and " = " not in line)
 
 
 class LoopGuard:
@@ -50,7 +58,9 @@ class LoopGuard:
         self.close_reason = None  # #199: the thinking is cycling - close it (the request goes on)
         self.think_line = ""      # the thinking's unfinished line
         self.in_fence = False
+        self.think_pos = 0        # characters of the thinking's finished lines
         self.line_counts = Counter()
+        self.line_at = {}         # where each counted line last came
         self.cycling_lines = 0
 
     def _think_lines(self, chunk):
@@ -63,13 +73,18 @@ class LoopGuard:
             return
         lines = (self.think_line + chunk).split("\n")
         self.think_line = lines.pop()
-        for line in lines:
-            line = line.strip()
-            if line.startswith("```"):
-                self.in_fence = not self.in_fence
+        for raw in lines:
+            self.think_pos += len(raw) + 1
+            line = raw.strip()
+            if "```" in line:                           # a fence opens or closes here, at the start or mid-line
+                self.in_fence ^= line.count("```") % 2 == 1
                 continue
-            if self.in_fence or not CYCLE_LINE <= len(line) <= CYCLE_MAX_LINE:
+            if self.in_fence or not _plan_line(line):
                 continue
+            last = self.line_at.get(line)
+            if last is not None and self.think_pos - last < CYCLE_GAP:
+                continue                                # too soon to be the next cycle
+            self.line_at[line] = self.think_pos
             self.line_counts[line] += 1
             if self.line_counts[line] == CYCLE_REPEATS:
                 self.cycling_lines += 1
