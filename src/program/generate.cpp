@@ -6760,25 +6760,20 @@ int main(int argc, char** argv) {
             // #185: nothing the watchdog runs after a stall may keep the engine alive - the report loads dbghelp, the
             // release calls CUDA and abort exits through ExitProcess, and a thread stuck under the loader lock blocks
             // all three forever.  So a second thread, started now (a thread created after the stall would itself wait
-            // for that lock before running), ends the process with TerminateProcess, which takes no lock, 20 s after
-            // the watchdog arms it.  It prints nothing: the stall's own line is already in the log.
-            static std::atomic<int64_t> kill_at_ms{0};   // steady-clock ms; 0 = not armed
-            const auto steady_ms = [] {
-                return (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
-            };
+            // for that lock before running), sleeps on an event and ends the process with TerminateProcess, which takes
+            // no lock, 20 s after the watchdog sets it.  It prints nothing: the stall's own line is already in the log.
+            void* stalled = nullptr;   // the deadline thread's event (Windows)
 #if defined(_WIN32)
-            if (limit > 0)
-                std::thread([steady_ms] {
-                    for (;;) {
-                        std::this_thread::sleep_for(std::chrono::seconds(1));
-                        const int64_t at = kill_at_ms.load();
-                        if (at != 0 && steady_ms() >= at) TerminateProcess(GetCurrentProcess(), 3);
-                    }
+            if (limit > 0) stalled = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (stalled)
+                std::thread([stalled] {
+                    WaitForSingleObject(stalled, INFINITE);
+                    Sleep(20000);
+                    TerminateProcess(GetCurrentProcess(), 3);
                 }).detach();
 #endif
             if (limit > 0)
-                std::thread([limit, steady_ms] {
+                std::thread([limit, stalled] {
                     strata::core::Progress& p = strata::core::progress();
                     uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                     auto since = std::chrono::steady_clock::now();
@@ -6791,7 +6786,11 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
                                              "the engine so the server starts it again (issue #29)\n",
                                      limit, stage_text().c_str());
-                        kill_at_ms.store(steady_ms() + 20000);   // #185: the deadline thread above ends it from here
+#if defined(_WIN32)
+                        if (stalled) SetEvent(stalled);   // #185: the deadline thread above ends it from here
+#else
+                        (void) stalled;
+#endif
                         stall_report(stderr, p.ticks.load() - ticks_at);
                         strata::core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
                         std::fflush(stderr);
