@@ -28,6 +28,11 @@ __device__ __forceinline__ float warp_max(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 }
+__device__ __forceinline__ float warp_min(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fminf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
 __device__ __forceinline__ uint16_t bf(float f) {
     uint32_t u = __float_as_uint(f);
     u += 0x7fffu + ((u >> 16) & 1u);
@@ -990,7 +995,7 @@ __device__ __forceinline__ float get_partial(const float* p, int64_t i) { return
 __device__ __forceinline__ float get_partial(const uint16_t* p, int64_t i) { return __uint_as_float((uint32_t) p[i] << 16); }
 struct Q8Partial { const uint8_t* q; const float* mn; const float* step; };   // #183: the Q8 wire, viewed
 __device__ __forceinline__ float get_partial(const Q8Partial& p, int64_t i) {
-    const int64_t gi = (i / N) * (N / (int) kSplitQ8Group) + (i % N) / (int) kSplitQ8Group;
+    const int64_t gi = i / (int64_t) kSplitQ8Group;   // the (token, group) of value i: N is a multiple of the group
     return __fmaf_rn((float) p.q[i], p.step[gi], p.mn[gi]);
 }
 template <class P>
@@ -1045,7 +1050,7 @@ void moe_split_finish_bf16(const float* Dm, const int32_t* slot, const float* w,
 // #183: the routed partial as Q8 - one block per (token, group of kSplitQ8Group): each thread computes its value, the
 // block reduces the group's minimum and maximum, and writes the code round((v - min) / step), step = (max - min) / 255
 constexpr int Q8G = (int) kSplitQ8Group, Q8_GROUPS = N / Q8G;
-static_assert(N % Q8G == 0 && Q8G == 128, "one 128-thread block per group");
+static_assert(N % Q8G == 0 && Q8G % 32 == 0 && Q8G <= 1024, "one block of whole warps per group");
 size_t split_q8_bytes(int64_t T) { return (size_t) (T * N) + (size_t) (T * Q8_GROUPS) * 8; }
 __global__ void moe_routed_sum_q8_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                          const float* __restrict__ w, uint8_t* __restrict__ wire, int64_t T, int32_t lo,
@@ -1053,11 +1058,7 @@ __global__ void moe_routed_sum_q8_kernel(const float* __restrict__ Dm, const int
     __shared__ float smin[Q8G / 32], smax[Q8G / 32];
     const int64_t t = blockIdx.x / Q8_GROUPS, g = blockIdx.x % Q8_GROUPS, n = g * Q8G + threadIdx.x;
     const float v = routed_sum(Dm, slot, w, t, n, lo, hi);
-    float a = v, b = v;
-    for (int o = 16; o > 0; o >>= 1) {
-        a = fminf(a, __shfl_xor_sync(0xffffffffu, a, o));
-        b = fmaxf(b, __shfl_xor_sync(0xffffffffu, b, o));
-    }
+    const float a = warp_min(v), b = warp_max(v);
     if ((threadIdx.x & 31) == 0) { smin[threadIdx.x >> 5] = a; smax[threadIdx.x >> 5] = b; }
     // #183: the barrier for smin / smax, and whether the group holds a NaN - min / max skip it and the clamp would
     // send code 0, a plausible value; a NaN step makes the whole group arrive as NaN instead
@@ -1069,8 +1070,8 @@ __global__ void moe_routed_sum_q8_kernel(const float* __restrict__ Dm, const int
     wire[t * N + n] = (uint8_t) fminf(fmaxf(q, 0.0f), 255.0f);
     if (threadIdx.x == 0) {
         float* mins = (float*) (wire + T * N);
-        mins[t * Q8_GROUPS + g] = mn;
-        mins[T * Q8_GROUPS + t * Q8_GROUPS + g] = step;
+        mins[blockIdx.x] = mn;                  // blockIdx.x = t * Q8_GROUPS + g
+        mins[T * Q8_GROUPS + blockIdx.x] = step;
     }
 }
 void moe_routed_sum_q8(const float* Dm, const int32_t* slot, const float* w, uint8_t* wire, int64_t T, void* stream,
