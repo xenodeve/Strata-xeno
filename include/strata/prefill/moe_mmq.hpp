@@ -16,7 +16,7 @@ bool built();
 /// prompt does not pay it (#30).  Safe to call more than once.
 void warm();
 /// MMQ covers this ggml type (the i-quants and Q2_0 the packs use, Q8_0, and in a CUDA build with STRATA_MMQ_KQUANTS
-/// the Q4_K / Q5_K / Q5_1 of Unsloth's UD-Q4_K_XL; IQ1_M with #169's tile and STRATA_MMQ_IQ1M=1).
+/// the Q4_K / Q5_K / Q5_1 of Unsloth's UD-Q4_K_XL; IQ1_M with #169's tile unless STRATA_MMQ_IQ1M=0).
 bool supported(int ggml_type);
 /// #420: `supported`, and on every visible GPU llama.cpp's MMQ has a tile for this type and a weight matrix of
 /// `w_rows` rows that fits the card's shared memory - the same test its tile choice makes, which aborts the process

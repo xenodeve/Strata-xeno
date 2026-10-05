@@ -867,7 +867,7 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads strata_timeline
 # The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ
 # weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
 # with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
-option(STRATA_MMQ_IQ1M_PATCH "the IQ1_M MMQ tile from third_party/ggml/patches (#169; STRATA_MMQ_IQ1M=1 runs it)" ON)
+option(STRATA_MMQ_IQ1M_PATCH "the IQ1_M MMQ tile from third_party/ggml/patches (#169; STRATA_MMQ_IQ1M=0 turns it off)" ON)
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
@@ -1182,7 +1182,7 @@ if(STRATA_NATIVE_EXPERTS)
       add_executable(prefill_mmq_iq1m_test tests/cuda/prefill_mmq_iq1m_test.cpp)
       target_link_libraries(prefill_mmq_iq1m_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_mmq_iq1m_test COMMAND prefill_mmq_iq1m_test)
-      set_tests_properties(prefill_mmq_iq1m_test PROPERTIES TIMEOUT 120 ENVIRONMENT STRATA_MMQ_IQ1M=1)
+      set_tests_properties(prefill_mmq_iq1m_test PROPERTIES TIMEOUT 120)
     endif()
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses

@@ -8,8 +8,7 @@
 //     (q8_1, one scale per 32 values: d = amax / 127, q = round(x * 127 / amax)), in double.  IQ1_M is
 //     d16 * (8 g - 8 +- 1) / 8 with integer codes, so the tile holds the weights exactly and only the float sums differ;
 //   - screen: the same weights times the float activations (the bound tests/cuda/prefill_mmq_kquant_test.cpp uses).
-// Several experts per product, permuted rows, an all-zero row; on every visible card.  MMQ takes IQ1_M only with
-// STRATA_MMQ_IQ1M=1 (CMakeLists.txt sets it for this test).
+// Several experts per product, permuted rows, an all-zero row; on every visible card (not with STRATA_MMQ_IQ1M=0).
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "ggml.h"

@@ -121,9 +121,10 @@ bool supported(int t) {
             return true;
 #ifdef STRATA_MMQ_IQ1M_TILE
         case GGML_TYPE_IQ1_M: {
-            // #169: llama.cpp's MMQ with third_party/ggml/patches' IQ1_M tile, opt-in (STRATA_MMQ_IQ1M=1): it rounds the
-            // activations of the IQ1_M layers to q8_1 as MMQ does everywhere else, so greedy outputs move (#61 class)
-            static const bool on = [] { const char* v = std::getenv("STRATA_MMQ_IQ1M"); return v != nullptr && v[0] == '1'; }();
+            // #169: llama.cpp's MMQ with third_party/ggml/patches' IQ1_M tile. It rounds the IQ1_M layers' activations
+            // to q8_1 as MMQ does everywhere else, so greedy outputs move (#61 class): on by default since the developer
+            // accepted that (2026-10-05); STRATA_MMQ_IQ1M=0 keeps the FP16 path
+            static const bool on = [] { const char* v = std::getenv("STRATA_MMQ_IQ1M"); return v == nullptr || v[0] != '0'; }();
             return on;
         }
 #endif
