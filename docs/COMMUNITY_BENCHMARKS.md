@@ -15,9 +15,6 @@ and their limits. Report what you actually measured and label estimates separate
 - [2026-09-30: RTX 5090, Core Ultra 9 285K, 64 GB RAM](../bench/results/2026-09-30-community-rtx-5090/README.md):
   Strata 0.1.29, original Flash-Next IQ2_XS, 131,072-token context; three runs
   each at 4,096, 32,768, and 128,000 prompt tokens, plus six recall checks.
-- [2026-10-04: RTX 5060 Ti (x4) + RTX 4070 SUPER, Core i5-13500, 48 GB RAM](../bench/results/2026-10-04-speed-xeno-vs-upstream-0138/README.md):
-  Strata-xeno's served two-GPU config against upstream 0.1.38 with its own settings (layer split, peer, one GPU),
-  Swift 1.5 IQ2_XS, prompt and output speed at 1K-128K, two runs per arm in one session.
 
 ## What to record
 

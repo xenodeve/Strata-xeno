@@ -2,7 +2,7 @@
 
 Intel Core i5-13500, 48 GB DDR5-7000, RTX 5060 Ti 16 GB (PCIe 4.0 x4 through the chipset) + RTX 4070 SUPER 12 GB
 (PCIe 4.0 x16, the display card), NVIDIA driver 616.92, Windows 11. Swift 1.5 Qwen3.8 Flash-Next IQ2_XS with the same pack and MTP draft layer in every arm
-(#165). Every run: [`matrix.json`](matrix.json), with each arm's exe, sha256, flags and environment.
+([#165](https://github.com/xenodeve/Strata-xeno/issues/165)). Every run: [`matrix.json`](matrix.json), with each arm's exe, sha256, flags and environment.
 
 **Method.** Upstream's speed tables (`2026-09-29-speed-0126`) use one-shot `strata generate`. Upstream's layer split
 only runs with `--serve`, so these runs use serve mode instead:
@@ -65,14 +65,16 @@ Two runs per arm, in the order D2x, layer split, peer, peer, layer split, D2x at
 **Strata-xeno leads output at every length**, by 30-45 % over upstream's faster form there (+ peer) and 61-82 % over
 its layer split. **It also leads prompt reading at 1K-4K**, by 33-47 % over the layer split.
 
-**Upstream's layer split reads long prompts faster:** by 6.6 / 12.9 / 12.1 % at 32K / 64K / 128K.
+**Upstream's layer split reads long prompts faster:** by 6.6 / 12.9 / 12.1 % at 32K / 64K / 128K. At each of those
+lengths both of its runs are faster than both D2x runs.
 
 A likely reason, not measured: the D2x prompt path splits the experts across the two cards and the 5060 Ti reads its
 share over the x4 link, while the layer split gives each card whole layers.
 
 The two runs of a cell differ by a median of 2.7 % for prompts and 5.0 % for output, and by up to 18 % (upstream +
-peer, 4K prompt). Output moves with the share of accepted drafts (above). The output lead is far outside that spread;
-the 6.6 % prompt gap at 32K is not.
+peer, 4K prompt). Output moves with the share of accepted drafts (above). The output lead is far outside that spread.
+The 32K-128K prompt gaps (6.6-12.9 %) are below the repo's 13.6 % noise gate. They stand only because these runs are
+paired in one session and every pair agrees.
 
 ## B. Strata-xeno's exe with upstream's flags and dynamic experts (another session, 22:02-22:41)
 
@@ -122,7 +124,7 @@ From the fork's `request metrics` line in each run's log; upstream's exe does no
   where D2x reads 416-1,536; at 32K and above, 983-1,078 against 1,469-1,536. D2x's own settings are what make the
   prompt path fast; dynamic experts alone are not.
 - **Output is mixed.** At 1K-4K the fx arms write 37-48 tokens/s, where D2x writes 69-73. At 32K-128K the peer form
-  writes 58-67, level with or above D2x's 58-63. The two runs of a cell differ by a median of 5.6 % and by up to 45 %
+  writes 58-67, level with or above D2x's 58-63. The two runs of a cell differ by a median of about 5 % and by up to 45 %
   (layer split at 32K: 64.7 against 44.6), so these cells are loose.
 - **The D2x row is not in this session.** It is session A's figure, so a comparison between it and these rows crosses
   sessions. This project measures prefill drifting between sessions on the same exe.
@@ -131,10 +133,10 @@ From the fork's `request metrics` line in each run's log; upstream's exe does no
 
 The order was 4070, 5060 Ti, 5060 Ti, 4070. Every run is shown, because the 4070's two 1K runs differ by half.
 
-| | 1K prompt | 4K prompt | 1K output | 4K output |
-| --- | --- | --- | --- | --- |
-| upstream on the 4070 SUPER (x16) | 432 / 278 | 772 / 909 | 33.4 / 38.0 | 32.2 / 28.3 |
-| upstream on the 5060 Ti (x4) | 200 / 195 | 601 / 639 | 37.7 / 37.6 | 35.9 / 33.0 |
+| | 1K prompt | 4K prompt | 1K output | 4K output | draft acceptance 1K / 4K |
+| --- | --- | --- | --- | --- | --- |
+| upstream on the 4070 SUPER (x16) | 432 / 278 | 772 / 909 | 33.4 / 38.0 | 32.2 / 28.3 | 0.97, 0.84 / 0.68, 0.83 |
+| upstream on the 5060 Ti (x4) | 200 / 195 | 601 / 639 | 37.7 / 37.6 | 35.9 / 33.0 | 0.86, 0.87 / 0.74, 0.76 |
 
 **Not a clean link comparison.** The 4070 arm carries `--vram-reserve-mib 2560` (the display card's headroom), and the
 5060 Ti arm runs upstream's default of 700. The cards hold 12 GB and 16 GB.
@@ -160,7 +162,7 @@ below the 5070's figures at every length.
 The likely causes fall into three groups by how well they are supported:
 
 - **Measured: upstream's settings run this PC out of RAM.** It keeps every expert in RAM, and its docs list IQ2_XS at
-  48 GB, which is exactly this machine. In the Claude Code session of the same day (#163, `memwatch2.csv`):
+  48 GB, which is exactly this machine. In the Claude Code session of the same day ([#163](https://github.com/xenodeve/Strata-xeno/issues/163), `memwatch2.csv`):
   - free RAM fell to 0.01-0.6 GB in every upstream form;
   - the system paged from disk at a median of 2,245-3,179 hard page-ins a second;
   - D2x, which holds part of the experts on the GPUs, kept 15.3 GB free and paged at a median of 116 a second.
@@ -173,7 +175,7 @@ The likely causes fall into three groups by how well they are supported:
 
   Nothing here measures either one on its own.
 
-## The Claude Code request shape, same day (#163)
+## The Claude Code request shape, same day ([#163](https://github.com/xenodeve/Strata-xeno/issues/163))
 
 The prompt and output speed of real agent turns, from one session (base, layer split, peer, one GPU, then back). The
 arms are D2x and upstream's three forms above; the upstream one-GPU arm is on the 5060 Ti. The scripts are `smkv.py`,

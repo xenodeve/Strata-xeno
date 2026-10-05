@@ -20,7 +20,7 @@ answers. The fork changes:
 - what the server does for Claude Code;
 - the web app.
 
-Every number below is measured on the fork's own PC, with the conditions next to it.
+Every speed figure below is measured on the fork's own PC, with the conditions next to it.
 
 ## How fast is it?
 
@@ -51,12 +51,14 @@ the display card), on Windows 11.
 
 - **Answers are 30-45 % faster at every length** than upstream's fastest form here.
 - **Short prompts are read 33-47 % faster.** Short prompts are what an agent sends after its first turn.
-- **Upstream's layer split reads long prompts (32K and up) 6.6-12.9 % faster.** That is where the fork is still
-  behind.
-- **In Claude Code's own request shape** (#163), the fork reads six follow-up turns in 11.1 s against upstream's best
+- **Upstream's layer split reads long prompts (32K and up) 6.6-12.9 % faster,** in both runs at every one of those
+  lengths. That is where the fork is still behind.
+- **In Claude Code's own request shape** ([#163](https://github.com/xenodeve/Strata-xeno/issues/163)), the fork reads six follow-up turns in 11.1 s against upstream's best
   13.2 s, and answers at 71.7 tokens/s against 72.3 (a tie with the peer tier).
-- **It needs less RAM.** It uses 23.7 GiB and leaves 15.3 GB free. Upstream's settings, which keep every expert in
-  RAM, used 36.9-39.8 GiB and ran this 48 GB PC out of free RAM.
+- **It needs less RAM.** In that session the fork's server peaked at a 23.7 GiB working set, and upstream's
+  at 36.9-39.8 GiB. Upstream's settings keep every expert in RAM, and they ran this 48 GB PC out of free RAM: the
+  lowest free RAM was 0.01-0.6 GB, against the fork's 15.3 GB. That was one run per arm, sampled every 10 s, so the
+  peaks are approximate.
 
 Every run, the flags of each arm, draft acceptance and what was not measured:
 [bench/results/2026-10-04-speed-xeno-vs-upstream-0138](bench/results/2026-10-04-speed-xeno-vs-upstream-0138/README.md).
@@ -66,7 +68,7 @@ Earlier comparisons and every lever tried: [docs/reports/](docs/reports/).
 
 **Engine** (C++/CUDA):
 - **Dynamic experts.** An expert a GPU owns has no copy in RAM, and the model starts by placing experts on the cards
-  first. That is where the RAM saving comes from.
+  first. That is the likely source of the RAM saving; no run isolates it.
 - **A second-GPU expert tier.** The second card holds its own experts and runs them during decode, one CUDA graph per
   layer. It swaps experts in pairs and keeps a free-VRAM floor so the display card stays usable.
 - **Prompt reading on two cards:** an expert split and a two-lane wave. The second card computes the experts it owns
@@ -177,7 +179,7 @@ Where to report a problem:
 ## For developers and coding agents
 
 - **[AGENTS.md](AGENTS.md):** the rules. Lowest latency first, root causes, a measured win before anything becomes a
-  default, and PRD → issue → PR.
+  default, and an issue for every PR.
 - **[docs/BLUEPRINT.md](docs/BLUEPRINT.md):** how the engine and the server fit together, and every configuration
   surface.
 - **[docs/reports/](docs/reports/):** every finding, and a report per upstream merge.
