@@ -2,7 +2,7 @@
 // kSplitQ8Group values, each as uint8 codes plus the group's fp32 minimum and step (asymmetric).  The 4070's
 // moe_routed_sum_q8 must keep every value within half a step of moe_routed_sum's, with the group's exact minimum, and
 // the 5060's moe_split_finish_q8 must write exactly moe_split_finish on the dequantized partial (min + q * step, one
-// fma).  A constant group (step 0) must come back exactly.  Runs on the current device.
+// fma).  A constant group (step 0) must come back exactly, and a group holding a NaN must arrive as NaN.  Runs on the current device.
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>

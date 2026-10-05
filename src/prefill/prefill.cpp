@@ -153,13 +153,14 @@ BoWire split_bo_wire() {
         if (e != nullptr && *e != 0 && std::strcmp(e, "fp32") != 0)
             std::fprintf(stderr, "strata prefill: STRATA_SPLIT_BO=%s is not bf16, q8 or fp32 - ignored\n",
                          e);
+        if (e != nullptr && *e != 0) return BoWire::F32;   // fp32, or an unknown value: the old alias does not override it
         const char* b = std::getenv("STRATA_SPLIT_BO_BF16");
         return b != nullptr && std::atoi(b) != 0 ? BoWire::BF16 : BoWire::F32;
     }();
     return v;
 }
-// a lane's wire: the switch's format in the split layout, fp32 outside it (init's carve and bytes_needed take it in
-// the same place, and the lane keeps it beside its receive buffer)
+// a lane's wire: the switch's format in the split layout, fp32 outside it.  carve() and bytes_needed() both take the
+// receive buffer for it right after bo; the lane keeps it (Impl::bo_fmt) beside that buffer
 BoWire lane_bo_wire() { return g_split_layout ? split_bo_wire() : BoWire::F32; }
 // the bytes of the 4070's routed partial on the wire in format f
 size_t bo_wire_bytes(BoWire f, int64_t T) {
@@ -1935,7 +1936,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     f(T * HC);
     o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
-    if (lane_bo_wire() != BoWire::F32) o.take<uint8_t>(bo_wire_bytes(lane_bo_wire(), T), ok);   // #181 / #183: bo_wire
+    if (const BoWire f = lane_bo_wire(); f != BoWire::F32) o.take<uint8_t>(bo_wire_bytes(f, T), ok);   // #181 / #183: bo_wire
     if (bf16x2_hc()) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) o.take<uint16_t>(T * N, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);

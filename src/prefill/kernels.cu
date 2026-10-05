@@ -1069,9 +1069,9 @@ __global__ void moe_routed_sum_q8_kernel(const float* __restrict__ Dm, const int
     const float q = step > 0.0f ? rintf((v - mn) / step) : 0.0f;
     wire[t * N + n] = (uint8_t) fminf(fmaxf(q, 0.0f), 255.0f);
     if (threadIdx.x == 0) {
-        float* mins = (float*) (wire + T * N);
-        mins[blockIdx.x] = mn;                  // blockIdx.x = t * Q8_GROUPS + g
-        mins[T * Q8_GROUPS + blockIdx.x] = step;
+        float* meta = (float*) (wire + T * N);   // after the codes: T * Q8_GROUPS minimums, then as many steps
+        meta[blockIdx.x] = mn;                    // blockIdx.x = t * Q8_GROUPS + g
+        meta[T * Q8_GROUPS + blockIdx.x] = step;
     }
 }
 void moe_routed_sum_q8(const float* Dm, const int32_t* slot, const float* w, uint8_t* wire, int64_t T, void* stream,
@@ -1081,8 +1081,8 @@ void moe_routed_sum_q8(const float* Dm, const int32_t* slot, const float* w, uin
 }
 void moe_split_finish_q8(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
                          const uint8_t* wire, float* bo, int64_t T, int32_t lo, void* stream) {
-    const float* mins = (const float*) (wire + T * N);
-    const Q8Partial part{wire, mins, mins + T * Q8_GROUPS};
+    const float* meta = (const float*) (wire + T * N);   // the minimums, then the steps
+    const Q8Partial part{wire, meta, meta + T * Q8_GROUPS};
     moe_split_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, part, bo, T, lo);
     check("moe_split_finish_q8");
 }
