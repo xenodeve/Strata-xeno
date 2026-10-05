@@ -2347,6 +2347,19 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(len(eng.prompts), 2)
         self.assertEqual(text, "the answer")
 
+    def test_a_thinking_that_cycles_is_closed_and_the_answer_follows(self):
+        # #199: 12 cycles of re-planning one file ran a request to max_tokens with no answer (32,768 tokens); the
+        # loop guard's cycle rule closes the thinking with REASONING_WRAP_UP and the model answers from there
+        cycle = ("Let me write the code carefully. It'll be long, aim for a well-structured single file.\n"
+                 "Sky: use a large sphere with a gradient shader, or set the background colour by time of day.\n"
+                 "Camera presets: animate the camera to the target with a lerp each frame for smoothness.\n"
+                 "Walls: fill w x h x w with the wood colour, leaving openings for the windows and the doors.\n")
+        _, eng, thinking, text = self.run_request([cycle * 8, "the answer"], {"stream": True})
+        self.assertEqual(text, "the answer")
+        self.assertEqual(len(eng.prompts), 2)           # the answer continues the closed prompt
+        self.assertIn("I have thought about this long enough", thinking)
+        self.assertEqual(thinking.count("Let me write the code carefully"), 3)   # closed in the third cycle
+
     def test_a_streamed_request_without_a_budget_thinks_freely(self):
         _, eng, thinking, text = self.run_request([THINK[:1500] + "</think>\n\nok"], {"stream": True})
         self.assertEqual(thinking.strip(), THINK[:1500])

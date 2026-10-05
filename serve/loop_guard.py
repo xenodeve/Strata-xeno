@@ -19,6 +19,12 @@ THINK_REPEATS = 8
 # markup drafted inside thinking repeats legitimately (both-r2: six section headers share a
 # 64-character opening); only prose units count
 PROSE_UNIT = re.compile(r"^[^<>{}|`]+$")
+# #199: a thinking that re-plans the same answer in cycles too long for THINK_WINDOW (12 cycles of ~8,400 characters,
+# 32,768 tokens and no answer): prose lines of CYCLE_LINE+ characters outside code fences, and once CYCLE_LINES
+# distinct ones have each come CYCLE_REPEATS times the thinking is cycling - the server then closes it (not a stop)
+CYCLE_LINE = 40
+CYCLE_REPEATS = 3
+CYCLE_LINES = 3
 
 
 class LoopGuard:
@@ -39,6 +45,30 @@ class LoopGuard:
         self.non_thai_run = 0     # issue #86: consecutive non-Thai, non-space characters
         self.n_chars = 0
         self.reason = None
+        self.close_reason = None  # #199: the thinking is cycling - close it (the request goes on)
+        self.think_line = ""      # the thinking's unfinished line
+        self.in_fence = False
+        self.line_counts = {}
+        self.cycling_lines = 0
+
+    def _think_lines(self, chunk):
+        """#199: count the thinking's long prose lines; set close_reason in the cycle that repeats a set of them."""
+        lines = (self.think_line + chunk).split("\n")
+        self.think_line = lines.pop()
+        for line in lines:
+            line = line.strip()
+            if line.startswith("```"):
+                self.in_fence = not self.in_fence
+                continue
+            if self.in_fence or len(line) < CYCLE_LINE:
+                continue
+            n = self.line_counts.get(line, 0) + 1
+            self.line_counts[line] = n
+            if n == CYCLE_REPEATS:
+                self.cycling_lines += 1
+                if self.cycling_lines >= CYCLE_LINES and self.close_reason is None:
+                    self.close_reason = (f"thinking repeats {self.cycling_lines} lines {CYCLE_REPEATS} times each "
+                                         f"(a cycle, {self.n_chars} characters in)")
 
     def feed(self, chunk, in_think = False):
         """Return True once, when the generated text has become a loop. `in_think`
@@ -66,6 +96,7 @@ class LoopGuard:
                            f"in the last {self.thai_micro_window}")
             return True
         if in_think:
+            self._think_lines(chunk)
             self.think_tail = (self.think_tail + chunk)[-self.think_window:]
             if len(self.think_tail) >= self.think_window:
                 unit = self.think_tail[-self.think_unit:]
