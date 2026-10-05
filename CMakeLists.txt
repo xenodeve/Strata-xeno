@@ -368,9 +368,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_secondary_compute STATIC src/core/secondary_runner.cpp src/core/end_engine.cpp)
+  add_library(strata_secondary_compute STATIC src/core/secondary_runner.cpp)
   target_include_directories(strata_secondary_compute PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_secondary_compute PUBLIC strata_secondary strata_kernels CUDA::cudart)
+  target_link_libraries(strata_secondary_compute PUBLIC strata_secondary strata_kernels strata_kernels_cpu CUDA::cudart)
 
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
@@ -845,7 +845,7 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
 endif()
 
-add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp src/core/end_engine.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
@@ -972,6 +972,7 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(xeno_end_engine tests/xeno/end_engine.cpp src/core/end_engine.cpp)
     target_include_directories(xeno_end_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME xeno_end_engine COMMAND xeno_end_engine)   # #203
+    set_tests_properties(xeno_end_engine PROPERTIES SKIP_RETURN_CODE 77)   # Windows' hazards only
     add_executable(xeno_pool_spin tests/xeno/pool_spin.cpp)
     target_link_libraries(xeno_pool_spin PRIVATE strata_kernels_cpu)
     add_executable(xeno_pool_rest tests/xeno/pool_rest.cpp)
