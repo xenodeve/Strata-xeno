@@ -2,6 +2,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/timeline.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/end_engine.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -527,9 +528,7 @@ void ExpertPool::wait_parked(const char* what) {
             std::fprintf(stderr, "strata: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
                                  "so the server can start it again (issue #29)\n",
                          what, parked_.load(), n_);
-            strata::core::release_gpu_waits(stderr);   // #267: the GPU may be spinning on this layer's flag
-            std::fflush(stderr);
-            std::abort();
+            strata::core::end_engine(3, nullptr);   // #267 release, then TerminateProcess (#203)
         }
     }
 }
@@ -550,9 +549,7 @@ void ExpertPool::wait_done(int n) {
             std::fprintf(stderr, "strata: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
                                  "stopping the engine so the server can start it again (issue #29)\n",
                          d, n, parked_.load(), n_);
-            strata::core::release_gpu_waits(stderr);   // #267
-            std::fflush(stderr);
-            std::abort();
+            strata::core::end_engine(3, nullptr);   // #267 release, then TerminateProcess (#203)
         }
     }
 }
@@ -676,9 +673,7 @@ void ExpertPool::wait_quantized(int e) {
             std::fprintf(stderr, "strata: the CPU expert pool stalled: expert %d of a one-phase batch still has %d "
                                  "gate/up tasks - stopping the engine so the server can start it again (#147, #29)\n",
                          e, left);
-            strata::core::release_gpu_waits(stderr);   // #267
-            std::fflush(stderr);
-            std::abort();
+            strata::core::end_engine(3, nullptr);   // #267 release, then TerminateProcess (#203)
         }
     }
 }

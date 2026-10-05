@@ -1,5 +1,6 @@
 #include <chrono>
 #include "strata/core/secondary_runner.hpp"
+#include "strata/core/end_engine.hpp"
 #include "strata/core/secondary_budget.hpp"
 #include "strata/core/secondary_vram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -497,11 +498,17 @@ bool SecondaryRunner::start_monitor(int interval_ms, std::string& err,
         monitor_ = std::thread([this, interval_ms, reader, on_breach, context] {
             const cudaError_t selected = cudaSetDevice(1);
             if (selected != cudaSuccess) {
-                std::fprintf(stderr, "secondary monitor cannot select display GPU: %s\n",
-                             cudaGetErrorString(selected));
-                std::fflush(stderr);
-                std::_Exit(3);
+                const std::string why = std::string("strata: the secondary monitor cannot select the display GPU (") +
+                                        cudaGetErrorString(selected) + ") - ending the engine (#203)";
+                strata::core::end_engine(3, why.c_str());
             }
+            // #203 fault injection: the monitor sees a breach this many seconds after it starts (the engine must
+            // then end at once, not hang in its exit)
+            static const double inject_s = [] {
+                const char* v = std::getenv("STRATA_TEST_SECONDARY_BREACH_S");
+                return v != nullptr ? std::atof(v) : -1.0;
+            }();
+            const auto started = std::chrono::steady_clock::now();
             while (!monitor_stop_.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
                 if (monitor_stop_.load()) break;
@@ -514,6 +521,11 @@ bool SecondaryRunner::start_monitor(int interval_ms, std::string& err,
                         problem = "injected display free " + std::to_string(lower) + " B below configured floor";
                 } else {
                     safe = check_display_free(free_floor_bytes_, problem, &lower);
+                    if (safe && inject_s >= 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                                               started).count() >= inject_s) {
+                        safe = false;
+                        problem = "injected breach (STRATA_TEST_SECONDARY_BREACH_S)";
+                    }
                 }
                 record_free(lower);
                 if (!safe) {
@@ -522,10 +534,9 @@ bool SecondaryRunner::start_monitor(int interval_ms, std::string& err,
                         monitor_stop_.store(true);
                         break;
                     }
-                    std::fprintf(stderr, "secondary display VRAM reserve failed: %s; terminating to release tier\n",
-                                 problem.c_str());
-                    std::fflush(stderr);
-                    std::_Exit(3);
+                    const std::string why = "strata: secondary display VRAM reserve failed: " + problem +
+                                            " - ending the engine to release the tier (#203)";
+                    strata::core::end_engine(3, why.c_str());
                 }
                 ++free_checks_;
             }

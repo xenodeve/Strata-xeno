@@ -72,6 +72,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/end_engine.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/emulate.hpp"
 #ifndef NOMINMAX
@@ -1763,6 +1764,7 @@ struct ExitTrace {
 
 int main(int argc, char** argv) {
     strata::platform::install_crash_report();   // #62 crash: where a crashed engine was, in its log
+    strata::core::start_end_engine_deadline(20000);   // #203: before any failure path can need it (#185)
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -6757,23 +6759,11 @@ int main(int argc, char** argv) {
         {
             const char* ws = std::getenv("STRATA_WATCHDOG_S");
             const int limit = ws ? std::atoi(ws) : 60;   // one step (a prompt layer, a verify window) takes seconds
-            // #185: nothing the watchdog runs after a stall may keep the engine alive - the report loads dbghelp, the
-            // release calls CUDA and abort exits through ExitProcess, and a thread stuck under the loader lock blocks
-            // all three forever.  So a second thread, started now (a thread created after the stall would itself wait
-            // for that lock before running), sleeps on an event and ends the process with TerminateProcess, which takes
-            // no lock, 20 s after the watchdog sets it.  It prints nothing: the stall's own line is already in the log.
-            void* stalled = nullptr;   // the deadline thread's event (Windows)
-#if defined(_WIN32)
-            if (limit > 0) stalled = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            if (stalled)
-                std::thread([stalled] {
-                    WaitForSingleObject(stalled, INFINITE);
-                    Sleep(20000);
-                    TerminateProcess(GetCurrentProcess(), 3);
-                }).detach();
-#endif
+            // #185 / #203: nothing the watchdog runs after a stall may keep the engine alive - the report loads
+            // dbghelp and the release calls CUDA, and a thread stuck under the loader lock blocks both forever; the
+            // deadline started at main's top (start_end_engine_deadline) ends the process 20 s after it is armed
             if (limit > 0)
-                std::thread([limit, stalled] {
+                std::thread([limit] {
                     strata::core::Progress& p = strata::core::progress();
                     uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                     auto since = std::chrono::steady_clock::now();
@@ -6783,18 +6773,12 @@ int main(int argc, char** argv) {
                         const uint64_t b = p.beats.load();
                         if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; continue; }
                         if (now - since < std::chrono::seconds(limit)) continue;
-#if defined(_WIN32)
-                        if (stalled) SetEvent(stalled);   // #185: first - the deadline thread above ends it from here
-#else
-                        (void) stalled;
-#endif
+                        strata::core::arm_end_engine();   // first: the report below may block (#185)
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
                                              "the engine so the server starts it again (issue #29)\n",
                                      limit, stage_text().c_str());
                         stall_report(stderr, p.ticks.load() - ticks_at);
-                        strata::core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
-                        std::fflush(stderr);
-                        std::abort();
+                        strata::core::end_engine(3, nullptr);   // #267 release, then TerminateProcess (#203)
                     }
                 }).detach();
         }
@@ -6832,7 +6816,10 @@ int main(int argc, char** argv) {
         std::vector<const float*> row_ptr;
         // xeno #53: a fatal ERR ends the engine at once.  Returning ran the destructors, and that teardown can hang
         // (#45's exit hang): the process stayed alive, the server saw no exit and every later request hung.
-        auto serve_fatal = []() -> int { std::fflush(stdout); std::fflush(stderr); std::_Exit(1); };
+        auto serve_fatal = []() -> int {   // #203: the GPU's waits released, no ExitProcess
+            std::fflush(stdout);
+            strata::core::end_engine(1, "strata: a fatal serve error (the ERR line above) - ending the engine (#203)");
+        };
         while (next_line(line)) {
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
