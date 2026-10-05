@@ -72,6 +72,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/end_engine.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/emulate.hpp"
 #ifndef NOMINMAX
@@ -6765,6 +6766,11 @@ int main(int argc, char** argv) {
             void* stalled = nullptr;   // the deadline thread's event (Windows)
 #if defined(_WIN32)
             if (limit > 0) stalled = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (stalled) {
+                static void* armed_event = nullptr;   // #203: every end_engine() path arms the same deadline
+                armed_event = stalled;
+                strata::core::set_end_engine_arm([] { SetEvent(armed_event); });
+            }
             if (stalled)
                 std::thread([stalled] {
                     WaitForSingleObject(stalled, INFINITE);
@@ -6792,9 +6798,7 @@ int main(int argc, char** argv) {
                                              "the engine so the server starts it again (issue #29)\n",
                                      limit, stage_text().c_str());
                         stall_report(stderr, p.ticks.load() - ticks_at);
-                        strata::core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
-                        std::fflush(stderr);
-                        std::abort();
+                        strata::core::end_engine(3, nullptr);   // #267 release, then TerminateProcess (#203)
                     }
                 }).detach();
         }

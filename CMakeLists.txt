@@ -368,7 +368,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_secondary_compute STATIC src/core/secondary_runner.cpp)
+  add_library(strata_secondary_compute STATIC src/core/secondary_runner.cpp src/core/end_engine.cpp)
   target_include_directories(strata_secondary_compute PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_secondary_compute PUBLIC strata_secondary strata_kernels CUDA::cudart)
 
@@ -969,6 +969,9 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(xeno_direct_file_thread_exit tests/xeno/direct_file_thread_exit.cpp src/platform/direct_file.cpp)
     target_include_directories(xeno_direct_file_thread_exit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME xeno_direct_file_thread_exit COMMAND xeno_direct_file_thread_exit)   # #185
+    add_executable(xeno_end_engine tests/xeno/end_engine.cpp src/core/end_engine.cpp)
+    target_include_directories(xeno_end_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME xeno_end_engine COMMAND xeno_end_engine)   # #203
     add_executable(xeno_pool_spin tests/xeno/pool_spin.cpp)
     target_link_libraries(xeno_pool_spin PRIVATE strata_kernels_cpu)
     add_executable(xeno_pool_rest tests/xeno/pool_rest.cpp)
