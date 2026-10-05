@@ -5,6 +5,7 @@ reasoning/content text and cancels the engine request after a match. Short Thai
 loops trip within 64 Thai-script characters; general loops use 512 characters.
 """
 import re
+from collections import Counter
 
 WINDOW = 512
 MAX_DISTINCT = 2
@@ -24,7 +25,8 @@ PROSE_UNIT = re.compile(r"^[^<>{}|`]+$")
 # distinct ones have each come CYCLE_REPEATS times the thinking is cycling - the server then closes it (not a stop)
 CYCLE_LINE = 40
 CYCLE_REPEATS = 3
-CYCLE_LINES = 3
+CYCLE_LINES = 4
+CYCLE_MAX_LINE = 512   # a longer line is not a plan line: not collected
 
 
 class LoopGuard:
@@ -48,11 +50,17 @@ class LoopGuard:
         self.close_reason = None  # #199: the thinking is cycling - close it (the request goes on)
         self.think_line = ""      # the thinking's unfinished line
         self.in_fence = False
-        self.line_counts = {}
+        self.line_counts = Counter()
         self.cycling_lines = 0
 
     def _think_lines(self, chunk):
         """#199: count the thinking's long prose lines; set close_reason in the cycle that repeats a set of them."""
+        if self.close_reason:
+            return
+        if "\n" not in chunk:                           # most tokens: no line ends here
+            if len(self.think_line) <= CYCLE_MAX_LINE:
+                self.think_line += chunk
+            return
         lines = (self.think_line + chunk).split("\n")
         self.think_line = lines.pop()
         for line in lines:
@@ -60,15 +68,15 @@ class LoopGuard:
             if line.startswith("```"):
                 self.in_fence = not self.in_fence
                 continue
-            if self.in_fence or len(line) < CYCLE_LINE:
+            if self.in_fence or not CYCLE_LINE <= len(line) <= CYCLE_MAX_LINE:
                 continue
-            n = self.line_counts.get(line, 0) + 1
-            self.line_counts[line] = n
-            if n == CYCLE_REPEATS:
+            self.line_counts[line] += 1
+            if self.line_counts[line] == CYCLE_REPEATS:
                 self.cycling_lines += 1
-                if self.cycling_lines >= CYCLE_LINES and self.close_reason is None:
-                    self.close_reason = (f"thinking repeats {self.cycling_lines} lines {CYCLE_REPEATS} times each "
+                if self.cycling_lines == CYCLE_LINES:
+                    self.close_reason = (f"thinking repeats {CYCLE_LINES} lines {CYCLE_REPEATS} times each "
                                          f"(a cycle, {self.n_chars} characters in)")
+                    return
 
     def feed(self, chunk, in_think = False):
         """Return True once, when the generated text has become a loop. `in_think`
