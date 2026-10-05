@@ -119,6 +119,14 @@ bool supported(int t) {
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // Unsloth's UD-Q4_K_XL experts (CUDA)
 #endif
             return true;
+#ifdef STRATA_MMQ_IQ1M_TILE
+        case GGML_TYPE_IQ1_M: {
+            // #169: llama.cpp's MMQ with third_party/ggml/patches' IQ1_M tile, opt-in (STRATA_MMQ_IQ1M=1): it rounds the
+            // activations of the IQ1_M layers to q8_1 as MMQ does everywhere else, so greedy outputs move (#61 class)
+            static const bool on = [] { const char* v = std::getenv("STRATA_MMQ_IQ1M"); return v != nullptr && v[0] == '1'; }();
+            return on;
+        }
+#endif
         default:
             return false;
     }
@@ -230,6 +238,9 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
         case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
         case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+#ifdef STRATA_MMQ_IQ1M_TILE
+        case GGML_TYPE_IQ1_M: mul_mat_q_case<GGML_TYPE_IQ1_M>(ctx, a, s); break;
+#endif
 #ifdef STRATA_MMQ_KQUANTS
         case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;

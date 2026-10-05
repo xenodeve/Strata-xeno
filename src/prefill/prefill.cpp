@@ -1376,7 +1376,8 @@ const MmqPlan& mmq_plan() {
     return plan;
 }
 // #35 D6 / #113: the split runs per layer - a layer on MMQ hands its routed experts to the peer card, a layer that
-// is not (IQ1_M: no MMQ tile) runs the chunk on this card.  Before #113 one such layer turned the whole split off.
+// is not runs the chunk on this card (IQ1_M unless #169's tile runs it, STRATA_MMQ_IQ1M=1).  Before #113 one such
+// layer turned the whole split off.
 const SplitPlan& the_split_plan() {
     static const SplitPlan p = split_plan(strata::kernels::cpu::expert_layout().native, mmq_plan().layer);
     return p;
@@ -2902,7 +2903,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // order - and where the MMQ buffers exist: they hold the fused path's own (the per-token int8
                     // activations in Xq, the int8 H in H, the grouping tables in GU).  Chunks below stream_all_min()
                     // keep MMQ; without the variable nothing here runs.  A native pack's layer takes the native kernels
-                    // (moe_fused_iq.hpp) where they cover its two formats, else MMQ (or the FP16 path: IQ1_M).
+                    // (moe_fused_iq.hpp) where they cover its two formats, else MMQ (or the FP16 path: a format MMQ lacks).
                     // xeno: only into buffers carve sized for it (m.fused_bufs: fused_layout, whose fused_ring() holds
                     // the fork's gates), and never a split chunk
                     const bool fused_ok = m.fused_bufs && use_mmq && stream_all && !split_l;
