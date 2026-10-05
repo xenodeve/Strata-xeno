@@ -1,7 +1,7 @@
 // strata/prefill/split_plan.hpp - #113: which layers of a prompt chunk the expert split (#35,
 // STRATA_PREFILL_EXPERT_SPLIT=1) sends to the 4070.  The split runs a layer's routed experts there through MMQ, so a
 // layer whose expert formats MMQ has no tile for stays on CUDA0's one-card path inside the same chunk (IQ1_M with
-// STRATA_MMQ_IQ1M=0 or a build without #169's tile).  Before #113 one such layer turned the whole split off, silently.
+// without STRATA_MMQ_IQ1M=1 or #169's tile).  Before #113 one such layer turned the whole split off, silently.
 #pragma once
 
 #include <atomic>

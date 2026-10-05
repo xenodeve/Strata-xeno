@@ -1376,7 +1376,7 @@ const MmqPlan& mmq_plan() {
     return plan;
 }
 // #35 D6 / #113: the split runs per layer - a layer on MMQ hands its routed experts to the peer card, a layer that
-// is not runs the chunk on this card (IQ1_M before #169's tile, or with STRATA_MMQ_IQ1M=0).  Before #113 one such
+// is not runs the chunk on this card (IQ1_M unless #169's tile runs it, STRATA_MMQ_IQ1M=1).  Before #113 one such
 // layer turned the whole split off.
 const SplitPlan& the_split_plan() {
     static const SplitPlan p = split_plan(strata::kernels::cpu::expert_layout().native, mmq_plan().layer);

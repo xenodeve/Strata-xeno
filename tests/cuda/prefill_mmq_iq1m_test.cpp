@@ -8,7 +8,8 @@
 //     (q8_1, one scale per 32 values: d = amax / 127, q = round(x * 127 / amax)), in double.  IQ1_M is
 //     d16 * (8 g - 8 +- 1) / 8 with integer codes, so the tile holds the weights exactly and only the float sums differ;
 //   - screen: the same weights times the float activations (the bound tests/cuda/prefill_mmq_kquant_test.cpp uses).
-// Several experts per product, permuted rows, an all-zero row.
+// Several experts per product, permuted rows, an all-zero row; on every visible card.  MMQ takes IQ1_M only with
+// STRATA_MMQ_IQ1M=1 (CMakeLists.txt sets it for this test).
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
@@ -187,7 +188,7 @@ void product(mmq::Context& ctx, cudaStream_t s, const std::string& name, int64_t
                 zero_max = std::max(zero_max, (double) std::fabs(got[(size_t) dst[(size_t) r] * (size_t) out_rows + (size_t) o]));
     const double rms = std::sqrt(ref2 / (double) got.size());
     const double rel_exact = std::sqrt(e2 / (double) got.size()) / rms, rel_screen = std::sqrt(s2 / (double) got.size()) / rms;
-    std::printf("%-26s rows %2d experts %d  ref_rms %.4g  rel_l2 exact %.2e  max/rms %.2e  screen %.5f  zero row %.3g\n",
+    std::printf("%-32s rows %2d experts %d  ref_rms %.4g  rel_l2 exact %.2e  max/rms %.2e  screen %.5f  zero row %.3g\n",
                 name.c_str(), rows, n, rms, rel_exact, max_exact / rms, rel_screen, zero_max);
     if (rel_exact > 1e-5 || max_exact / rms > 1e-4) throw std::runtime_error(name + ": not the IQ1_M weights");
     if (rel_screen > 0.04 || zero_max > std::max(1e-5, 1e-4 * rms)) throw std::runtime_error(name + ": outside the screen");
@@ -197,18 +198,24 @@ void product(mmq::Context& ctx, cudaStream_t s, const std::string& name, int64_t
 int main() {
     try {
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
-        cudaStream_t s = nullptr;
-        ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
-        {
-            mmq::Context ctx;
-            const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}, {40, 9}};
-            int trial = 0;
-            for (const auto& counts : batches) {
-                product(ctx, s, "IQ1_M gate/up-" + std::to_string(trial), 1280, 2560, counts, trial);
-                ++trial;
+        int devices = 0;
+        ck(cudaGetDeviceCount(&devices), "devices");
+        for (int dev = 0; dev < devices; ++dev) {   // every visible card: the tile per architecture (sm_89, sm_120 here)
+            ck(cudaSetDevice(dev), "set device");
+            cudaStream_t s = nullptr;
+            ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+            {
+                mmq::Context ctx;
+                const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}, {40, 9}};
+                int trial = 0;
+                for (const auto& counts : batches) {
+                    product(ctx, s, "GPU " + std::to_string(dev) + " IQ1_M gate/up-" + std::to_string(trial), 1280, 2560,
+                            counts, trial);
+                    ++trial;
+                }
             }
+            ck(cudaStreamDestroy(s), "destroy");
         }
-        ck(cudaStreamDestroy(s), "destroy");
         std::printf("prefill MMQ IQ1_M test passed\n");
         return 0;
     } catch (const std::exception& e) {

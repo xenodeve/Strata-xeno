@@ -867,7 +867,7 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads strata_timeline
 # The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ
 # weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
 # with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
-option(STRATA_MMQ_IQ1M "IQ1_M experts on MMQ through third_party/ggml/patches (#169)" ON)
+option(STRATA_MMQ_IQ1M_PATCH "the IQ1_M MMQ tile from third_party/ggml/patches (#169; STRATA_MMQ_IQ1M=1 runs it)" ON)
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
@@ -906,11 +906,11 @@ if(STRATA_NATIVE_EXPERTS)
       FetchContent_Populate(strata_llamacpp)
     endif()
     # #169: llama.cpp's MMQ has no IQ1_M tile; the checkout this build fetched gets ours. Unless it is exactly the
-    # current patch already, the patched files are reset to the pinned commit first (so an edited patch never meets
-    # its previous version). A checkout someone else owns (FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP, or STRATA_GGML_DIR
-    # above) is left as it is: MMQ takes IQ1_M only if it already has the tile.
+    # current patch already, its ggml/src/ggml-cuda is reset to the pinned commit first (so an edited patch never
+    # meets its previous version). A checkout someone else owns (FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP, or
+    # STRATA_GGML_DIR above) is left as it is: MMQ takes IQ1_M only if it already has the tile.
     set(_strata_iq1m_patch ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/patches/0001-mmq-iq1_m.patch)
-    if(STRATA_MMQ_IQ1M AND NOT FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP)
+    if(STRATA_MMQ_IQ1M_PATCH AND NOT FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP)
       set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_strata_iq1m_patch})
       find_package(Git REQUIRED)
       execute_process(COMMAND ${GIT_EXECUTABLE} apply --reverse --check ${_strata_iq1m_patch}
@@ -924,7 +924,7 @@ if(STRATA_NATIVE_EXPERTS)
                         WORKING_DIRECTORY ${strata_llamacpp_SOURCE_DIR} RESULT_VARIABLE _strata_iq1m_rc)
         if(NOT _strata_iq1m_rc EQUAL 0)
           message(FATAL_ERROR "third_party/ggml/patches/0001-mmq-iq1_m.patch does not apply to the pinned llama.cpp "
-                              "(#169). Refresh the patch, or configure with -DSTRATA_MMQ_IQ1M=OFF (IQ1_M experts then "
+                              "(#169). Refresh the patch, or configure with -DSTRATA_MMQ_IQ1M_PATCH=OFF (IQ1_M experts then "
                               "take the FP16 path).")
         endif()
       endif()
@@ -1133,7 +1133,7 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     # #169: IQ1_M on MMQ when the checkout has the tile (third_party/ggml/patches, applied above)
     set(_strata_iq1m_tile OFF)
-    if(STRATA_MMQ_IQ1M AND EXISTS ${_strata_mmq}/template-instances/mmq-instance-iq1_m.cu)
+    if(STRATA_MMQ_IQ1M_PATCH AND EXISTS ${_strata_mmq}/template-instances/mmq-instance-iq1_m.cu)
       set(_strata_iq1m_tile ON)
       list(APPEND _strata_mmq_cuda_types iq1_m)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_IQ1M_TILE=1)
@@ -1182,7 +1182,7 @@ if(STRATA_NATIVE_EXPERTS)
       add_executable(prefill_mmq_iq1m_test tests/cuda/prefill_mmq_iq1m_test.cpp)
       target_link_libraries(prefill_mmq_iq1m_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_mmq_iq1m_test COMMAND prefill_mmq_iq1m_test)
-      set_tests_properties(prefill_mmq_iq1m_test PROPERTIES TIMEOUT 120)
+      set_tests_properties(prefill_mmq_iq1m_test PROPERTIES TIMEOUT 120 ENVIRONMENT STRATA_MMQ_IQ1M=1)
     endif()
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
