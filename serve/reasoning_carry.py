@@ -2,27 +2,39 @@
 
 A reply that ran out of tokens while still thinking (no `</think>` written) loses that thinking on the next turn
 when the client drops the cut assistant message - deepseek-harness does: its next request ("continue") was 7 tokens
-longer, not 32,768, and the model planned the same 80K characters again from zero.  The server remembers the cut
-reply (the latest one) and, when the next request is the same conversation plus one new user message, carries it:
+longer, not 32,768, and the model planned the same 80K characters again from zero.  After every reply of a request
+that asked for a carry, the server settles its conversation: a reply cut while thinking is kept (keyed by the client's
+messages), any other end forgets it.  When the next request is that conversation plus one new user message (the cut
+reply dropped, or sent back as an empty assistant message), the kept reply is carried:
 
-- "history": the cut reply is put back as an assistant message with its reasoning_content - the chat template
-  renders it (preserve_thinking), the model reads its own thinking, then the new message;
+- "history": the messages the cut reply was rendered from, then the cut reply as an assistant message with its
+  reasoning_content (the chat template renders it, preserve_thinking), then the new message - so a chain of cuts
+  keeps every thinking of it;
 - "resume": generation goes on from the cut prompt + the tokens written, inside the open thinking - the new
   message is not shown to the model (meant for a bare "continue").
 
-A finished thinking is never remembered, and a request whose assistant message carries anything is not touched.
+A client's own assistant message (content, reasoning or tool calls) is never touched.
 """
-import copy
+import hashlib
+import json
+import threading
+from collections import OrderedDict
 
 MODES = ("off", "history", "resume")
+KEEP = 8                    # conversations kept at once (the main one, its subagents); the oldest goes first
 
 
 def mode_of(req, default):
     """The request's reasoning_carry, else the config's; ValueError (a 400) for an unknown one."""
-    mode = (req or {}).get("reasoning_carry", default) if isinstance(req, dict) else default
+    mode = req.get("reasoning_carry", default) if isinstance(req, dict) else default
     if mode not in MODES:
         raise ValueError(f"reasoning_carry={mode!r}: expected one of {', '.join(MODES)}")
     return mode
+
+
+def key_of(messages):
+    """A conversation's key: its template messages, canonical."""
+    return hashlib.sha1(json.dumps(messages, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
 
 
 def _empty_assistant(m):
@@ -31,46 +43,44 @@ def _empty_assistant(m):
 
 
 class Carry:
-    def __init__(self):
-        self.entry = None           # the latest cut reply: messages, prompt ids, written ids, reasoning text
+    def __init__(self, keep=KEEP):
+        self.entries = OrderedDict()                # key -> the cut reply: rendered messages, prompt, written, reasoning
+        self.keep = keep
+        self.lock = threading.Lock()
 
-    def remember(self, messages, prompt_ids, written_ids, reasoning):
-        self.entry = {"messages": copy.deepcopy(messages), "prompt": list(prompt_ids), "written": list(written_ids),
-                      "reasoning": reasoning}
+    def settle(self, key, cut=None):
+        """After a reply: `cut` = (rendered messages, prompt ids, written ids, reasoning) when it ran out of tokens
+        while thinking - kept for this conversation; None (any other end) - this conversation's is forgotten."""
+        with self.lock:
+            if cut is None:
+                self.entries.pop(key, None)
+                return
+            rendered, prompt, written, reasoning = cut
+            self.entries[key] = {"rendered": list(rendered), "prompt": list(prompt), "written": list(written),
+                                 "reasoning": reasoning}
+            self.entries.move_to_end(key)
+            while len(self.entries) > self.keep:
+                self.entries.popitem(last=False)
 
-    def forget(self):
-        self.entry = None
-
-    def _match(self, messages):
-        """-> (entry, the index of the new user message, whether an empty assistant sits before it) or None."""
-        e = self.entry
-        if e is None:
+    def _take(self, messages):
+        """The kept cut reply this request continues (used once), or None."""
+        if not messages or messages[-1].get("role") != "user":
             return None
-        n = len(e["messages"])
-        if len(messages) <= n or messages[:n] != e["messages"]:
-            return None
-        rest = messages[n:]
-        if len(rest) == 1 and rest[0].get("role") == "user":
-            return e, n, False
-        if len(rest) == 2 and _empty_assistant(rest[0]) and rest[1].get("role") == "user":
-            return e, n + 1, True
-        return None
+        before = messages[:-1]
+        if before and _empty_assistant(before[-1]):
+            before = before[:-1]
+        with self.lock:
+            return self.entries.pop(key_of(before), None)
 
     def history(self, messages):
-        """The messages with the cut reply's thinking before the new user message, or None (used once)."""
-        m = self._match(messages)
-        if m is None:
+        """The messages to render: the cut reply's own, its thinking, the new message - or None."""
+        e = self._take(messages)
+        if e is None:
             return None
-        e, at, filled = m
-        self.entry = None
         reply = {"role": "assistant", "content": "", "reasoning_content": e["reasoning"]}
-        return list(messages[:at - 1]) + [reply] + list(messages[at:]) if filled else \
-            list(messages[:at]) + [reply] + list(messages[at:])
+        return e["rendered"] + [reply, messages[-1]], len(e["written"])
 
     def resume(self, messages):
-        """The ids to generate on from (the cut prompt + what it wrote), or None (used once)."""
-        m = self._match(messages)
-        if m is None:
-            return None
-        self.entry = None
-        return m[0]["prompt"] + m[0]["written"]
+        """The ids to generate on from (the cut prompt + what it wrote), or None."""
+        e = self._take(messages)
+        return None if e is None else e["prompt"] + e["written"]

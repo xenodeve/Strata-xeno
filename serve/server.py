@@ -1852,36 +1852,55 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def carry_in(self, req, messages):
-        """#200: -> (messages, ids to resume from or None, the request with "_carry" set).  The request's (else the
-        config's) reasoning_carry: "history" puts the latest cut reply's thinking back before the new user message,
-        "resume" returns the cut prompt + what it wrote to generate on from; either only when the request is that
-        conversation plus one new user message (serve/reasoning_carry.py).  A ValueError (a 400) for a bad mode."""
+    def prepare_carried(self, req, messages, tools, kwargs, max_new, priority):
+        """#200: prepare() with the request's (else the config's) reasoning_carry -> (messages rendered, req, ids,
+        thinking, max_new).  "history" renders the kept cut reply's messages, its thinking and the new message;
+        "resume" generates on from the cut prompt + what it wrote, inside the open thinking (the new message is not
+        shown; the request's own render is skipped); either only when the request is that conversation plus one new
+        user message (serve/reasoning_carry.py).  Every carrying request's reply settles its conversation in run()
+        ("_carry").  Not for a request without thinking, or one running the web app's tools / MCP."""
         mode = reasoning_carry.mode_of(req, self.reasoning_carry)
-        if mode == "off":
-            return messages, None, req
-        req = {**req, "_carry": messages}               # what run() remembers if this reply is cut while thinking
+        if mode == "off" or kwargs.get("enable_thinking", True) is False or req.get("strata_agent") \
+                or req.get("strata_mcp"):
+            return (messages, req, *self.prepare(messages, tools, kwargs, max_new, priority))
+        key = reasoning_carry.key_of(messages)
+        rendered, resume = messages, None
         if mode == "history":
             carried = self.carry.history(messages)
             if carried is not None:
-                print("[strata] reasoning carry (history): the cut reply's thinking goes back before the new message",
-                      flush=True)
-                return carried, None, req
-        elif not images_of(messages):                  # resume: the cut prompt's own ids (no image embeddings)
-            ids = self.carry.resume(messages)
-            if ids is not None:
-                print(f"[strata] reasoning carry (resume): generating on from the cut reply ({len(ids)} tokens); the "
-                      "new message is not shown to the model", flush=True)
-                return messages, ids, req
-        return messages, None, req
+                rendered, n = carried
+                print(f"[strata] reasoning carry (history): the cut reply's thinking ({n} tokens) goes back before "
+                      "the new message", flush=True)
+        elif not images_of(messages):
+            resume = self.carry.resume(messages)
+        if resume is not None:
+            self.embeddings.path = None
+            ids, thinking, max_new = resume, True, self._fit(resume, max_new)
+            print(f"[strata] reasoning carry (resume): generating on from the cut reply ({len(ids)} tokens); the new "
+                  "message is not shown to the model", flush=True)
+        else:
+            ids, thinking, max_new = self.prepare(rendered, tools, kwargs, max_new, priority)
+        return rendered, {**req, "_carry": {"key": key, "rendered": rendered, "ids": ids}}, ids, thinking, max_new
 
-    def resumed(self, ids, max_new):
-        """#200 resume: (ids, thinking, max_new) for the carried ids - inside the open thinking, the room re-checked."""
+    def _fit(self, ids, max_new):
+        """The max_new a prompt of `ids` gets: "unlimited" (<= 0) is the rest of the context; never truncated unless
+        the config's fit_max_tokens (#545); EngineStarting while the engine has no context size (#344)."""
+        if self.engine.max_context <= 0:                # #344: (re)starting, not a prompt that is too long
+            raise EngineStarting("the engine is starting (a minute or two); try again shortly")
         room = self.engine.max_context - CTX_SLACK - len(ids)
-        if room < 1:
-            raise ValueError(f"the carried thinking ({len(ids)} tokens) leaves no room to answer in the context "
-                             f"({self.engine.max_context})")
-        return ids, True, min(max_new, room) if max_new and max_new > 0 else room
+        if max_new <= 0 or (self.fit_max_tokens and room < 1):
+            if room < 1:
+                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                                 f"({self.engine.max_context}); requests are never truncated")
+            return room
+        if max_new > room:
+            if not self.fit_max_tokens:
+                raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                                 f"({self.engine.max_context}); requests are never truncated. Send a smaller "
+                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
+                                 "model's strata-<model>.json to shorten it to the room left (#545)")
+            return max(1, room)             # --fit-max-tokens: a shorter completion beats a 400
+        return max_new
 
     def prepare(self, messages, tools, kwargs, max_new=None, priority: int = 1):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
@@ -1931,21 +1950,7 @@ class Service:
             self.embeddings.path = combined
         if max_new is None:                  # count only (POST /v1/messages/count_tokens): no room check
             return ids, kwargs.get("enable_thinking", True) is not False, None
-        if self.engine.max_context <= 0:                # #344: (re)starting, not a prompt that is too long
-            raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-        room = self.engine.max_context - CTX_SLACK - len(ids)
-        if max_new <= 0 or (self.fit_max_tokens and room < 1):
-            if room < 1:
-                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
-            max_new = room
-        elif max_new > room:
-            if not self.fit_max_tokens:
-                raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({self.engine.max_context}); requests are never truncated. Send a smaller "
-                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's strata-<model>.json to shorten it to the room left (#545)")
-            max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
+        max_new = self._fit(ids, max_new)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     def _engine(self, ids, max_new, sampling, cancel, emb):
@@ -2078,6 +2083,7 @@ class Service:
         stop_filter = StopSequenceFilter(sampling["stop_sequences"]) if sampling.get("stop_sequences") else None
         matched_sequence = None
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        carry = (sampling or {}).get("_carry")         # #200: this request settles its conversation
         reasoning_text = []                             # #200: this reply's thinking, if it is cut
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         stop_detail = None
@@ -2147,7 +2153,7 @@ class Service:
                             self._note(n, evs)
                             last_print = self._progress(last_print)
                             for ev in evs:
-                                if ev.kind == "reasoning":
+                                if carry is not None and ev.kind == "reasoning":
                                     reasoning_text.append(ev.text)   # #200: what a cut reply carries
                                 if ev.kind in ("reasoning", "content") and guard.feed(
                                         ev.text, in_think=ev.kind == "reasoning"):
@@ -2181,11 +2187,13 @@ class Service:
                         # the loop guard and a stop sequence cancel the engine themselves; only a client cancel is one
                         if cancel.is_set() and not matched_sequence and not guard.reason:
                             finish = "stop" if getattr(cancel, "server_stop", False) else "cancel"
-                        # #200: cut at max_tokens while still thinking (not by a loop stop or a close): remembered
-                        carry_msgs = (sampling or {}).get("_carry")
-                        if carry_msgs is not None and finish == "length" and state["thinking"] \
-                                and stop_detail is None and not state["close"]:
-                            self.carry.remember(carry_msgs, ids, raw_ids, "".join(reasoning_text))
+                        # #200: a reply of its own prompt settles its conversation: cut at max_tokens while still
+                        # thinking (not by a loop stop or a close) - kept; any other end - forgotten
+                        if carry is not None and carry["ids"] is ids:
+                            cut = finish == "length" and state["thinking"] and stop_detail is None \
+                                and not state["close"]
+                            self.carry.settle(carry["key"], (carry["rendered"], ids, raw_ids,
+                                                             "".join(reasoning_text)) if cut else None)
                     except EngineDied as e:
                         finish = "error"
                         self._say_died(e)
@@ -3739,10 +3747,8 @@ def make_handler(svc: Service):
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            messages, resume_ids, req = svc.carry_in(req, messages)     # #200
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
-            if resume_ids is not None:
-                ids, thinking, max_new = svc.resumed(resume_ids, max_new)
+            messages, req, ids, thinking, max_new = svc.prepare_carried(          # #200
+                req, messages, tools, kw, max_new, 0 if req.get("stream") else 1)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
             req = {**req, "_meta": svc.meta_for("openai", messages, tools, self.headers.get("User-Agent"))}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -3821,10 +3827,8 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             think_budget.side_effort(req, kw)                         # xeno #49 S3: before the template renders
-            messages, resume_ids, req = svc.carry_in(req, messages)     # #200
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
-            if resume_ids is not None:
-                ids, thinking, max_new = svc.resumed(resume_ids, max_new)
+            messages, req, ids, thinking, max_new = svc.prepare_carried(          # #200
+                req, messages, tools, kw, max_new, 0 if req.get("stream") else 1)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
             req = {**req, "_meta": svc.meta_for("anthropic", messages, tools, self.headers.get("User-Agent"))}
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
