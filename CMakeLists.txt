@@ -867,6 +867,7 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads strata_timeline
 # The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ
 # weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
 # with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
+option(STRATA_MMQ_IQ1M "IQ1_M experts on MMQ through third_party/ggml/patches (#169)" ON)
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
@@ -904,19 +905,27 @@ if(STRATA_NATIVE_EXPERTS)
     if(NOT strata_llamacpp_POPULATED)
       FetchContent_Populate(strata_llamacpp)
     endif()
-    # #169: llama.cpp's MMQ has no IQ1_M tile; the pinned checkout gets ours (skipped once applied). A STRATA_GGML_DIR
-    # checkout is left as it is: without the tile, IQ1_M experts stay on the FP16 path
-    find_package(Git QUIET)
+    # #169: llama.cpp's MMQ has no IQ1_M tile; the checkout this build fetched gets ours. Unless it is exactly the
+    # current patch already, the patched files are reset to the pinned commit first (so an edited patch never meets
+    # its previous version). A checkout someone else owns (FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP, or STRATA_GGML_DIR
+    # above) is left as it is: MMQ takes IQ1_M only if it already has the tile.
     set(_strata_iq1m_patch ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/patches/0001-mmq-iq1_m.patch)
-    if(GIT_FOUND)
+    if(STRATA_MMQ_IQ1M AND NOT FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP)
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_strata_iq1m_patch})
+      find_package(Git REQUIRED)
       execute_process(COMMAND ${GIT_EXECUTABLE} apply --reverse --check ${_strata_iq1m_patch}
                       WORKING_DIRECTORY ${strata_llamacpp_SOURCE_DIR} RESULT_VARIABLE _strata_iq1m_applied
                       OUTPUT_QUIET ERROR_QUIET)
       if(NOT _strata_iq1m_applied EQUAL 0)
+        execute_process(COMMAND ${GIT_EXECUTABLE} checkout -- ggml/src/ggml-cuda
+                        WORKING_DIRECTORY ${strata_llamacpp_SOURCE_DIR})
+        file(REMOVE ${strata_llamacpp_SOURCE_DIR}/ggml/src/ggml-cuda/template-instances/mmq-instance-iq1_m.cu)
         execute_process(COMMAND ${GIT_EXECUTABLE} apply ${_strata_iq1m_patch}
                         WORKING_DIRECTORY ${strata_llamacpp_SOURCE_DIR} RESULT_VARIABLE _strata_iq1m_rc)
         if(NOT _strata_iq1m_rc EQUAL 0)
-          message(WARNING "the IQ1_M MMQ patch did not apply: IQ1_M experts stay on the FP16 path (#169)")
+          message(FATAL_ERROR "third_party/ggml/patches/0001-mmq-iq1_m.patch does not apply to the pinned llama.cpp "
+                              "(#169). Refresh the patch, or configure with -DSTRATA_MMQ_IQ1M=OFF (IQ1_M experts then "
+                              "take the FP16 path).")
         endif()
       endif()
     endif()
@@ -1115,20 +1124,21 @@ if(STRATA_NATIVE_EXPERTS)
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
-    # #169: IQ1_M on MMQ when the checkout has the tile (third_party/ggml/patches, applied above)
-    file(STRINGS ${_strata_mmq}/mmq-load-tiles.cuh _strata_iq1m_tile REGEX "ggml_cuda_mmq_load_tiles_iq1_m")
-    if(_strata_iq1m_tile)
-      target_sources(strata_mmq PRIVATE src/prefill/mmq_instance_iq1_m.cu)
-      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_IQ1M=1)
-    else()
-      message(STATUS "llama.cpp's MMQ has no IQ1_M tile here: IQ1_M experts stay on the FP16 path (#169)")
-    endif()
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1, the experts of Unsloth's UD-Q4_K_XL (docs/UNSLOTH_Q4.md; the dispatch
     # follows eddoursul/Strata 7706c1b)
     set(_strata_mmq_cuda_types ${_strata_mmq_types})
     if(STRATA_MMQ_KQUANTS)
       list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1)
+    endif()
+    # #169: IQ1_M on MMQ when the checkout has the tile (third_party/ggml/patches, applied above)
+    set(_strata_iq1m_tile OFF)
+    if(STRATA_MMQ_IQ1M AND EXISTS ${_strata_mmq}/template-instances/mmq-instance-iq1_m.cu)
+      set(_strata_iq1m_tile ON)
+      list(APPEND _strata_mmq_cuda_types iq1_m)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_IQ1M_TILE=1)
+    else()
+      message(STATUS "llama.cpp's MMQ has no IQ1_M tile here: IQ1_M experts take the FP16 path (#169)")
     endif()
     foreach(_t IN LISTS _strata_mmq_cuda_types)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)

@@ -171,14 +171,10 @@ void product(mmq::Context& ctx, cudaStream_t s, const std::string& name, int64_t
     size_t bad = 0, first_bad = 0;
     for (size_t i = 0; i < got.size(); ++i)
         if (!std::isfinite(got[i]) && bad++ == 0) first_bad = i;
-    if (bad) {
-        const int64_t row = (int64_t) (first_bad / (size_t) out_rows);
-        int e = 0;
-        for (int r = 0; r < rows; ++r) if (dst[(size_t) r] == row) for (e = 0; bounds[(size_t) e + 1] <= r; ++e) {}
+    if (bad)
         throw std::runtime_error(name + ": " + std::to_string(bad) + " unwritten or non-finite outputs, the first at dst row " +
-                                 std::to_string(row) + " column " + std::to_string(first_bad % (size_t) out_rows) +
-                                 " (expert " + std::to_string(e) + ")");
-    }
+                                 std::to_string(first_bad / (size_t) out_rows) + " column " +
+                                 std::to_string(first_bad % (size_t) out_rows));
     for (size_t i = 0; i < got.size(); ++i) {
         e2 += (got[i] - exact[i]) * (got[i] - exact[i]);
         s2 += (got[i] - screen[i]) * (got[i] - screen[i]);
