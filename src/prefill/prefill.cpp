@@ -50,6 +50,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -1111,17 +1112,18 @@ bool split_send(Impl& m, int64_t l, int64_t T, int64_t chunk_i, const std::vecto
         cudaEventSynchronize(sp.ev_gatesread);
     }
     sp.resolve(false);
-    cudaEvent_t tr0 = sp.clk_relay.record(m.relay);
+    // #178: one mark chain, so the event between the two spans is recycled once, after its last use (two span() calls
+    // sharing it put it into the free list twice, and record() then handed it to two spans)
+    sp.clk_relay.mark(sp.tl_relay, "activations down", m.relay, l);
     cudaMemcpyAsync(sp.hx, m.Xtok, xbytes, cudaMemcpyDeviceToHost, m.relay);
     cudaEventRecord(sp.ev_x, m.relay);
     if (m.wave) m.wave->publish_attn(chunk_i, l, m.cs);   // #35 D7: handed off: the next chunk may take this card
-    cudaEvent_t tr1 = sp.clk_relay.record(m.relay);
-    sp.clk_relay.span(sp.tl_relay, "activations down", tr0, tr1, l);
     // the routed sum's gates: needed only at the end, so they cross while the experts run (#35 D1: the shared
     // output and its gate stay on the 5060, which finishes bo itself)
+    sp.clk_relay.mark(sp.tl_relay, "gates down", m.relay, l);
     cudaMemcpyAsync(sp.hw, m.w, (size_t) TK * 4, cudaMemcpyDeviceToHost, m.relay);
     cudaEventRecord(sp.ev_gates, m.relay);
-    sp.clk_relay.span(sp.tl_relay, "gates down", tr1, sp.clk_relay.record(m.relay), l);
+    sp.clk_relay.mark(sp.tl_relay, nullptr, m.relay);
     // 2. the host tables (rows by expert, (t, k) -> row) and the sub-products: row ranges cut at R within a group
     std::vector<SplitTier::Sub>& subs = sp.subs;
     subs.clear();
@@ -2417,12 +2419,20 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         t.issued.store(k + 1, std::memory_order_release);
                         continue;
                     }
-                    if (k >= (size_t) t.RING && (!SplitTier::wait_above(t.consumed, k - (size_t) t.RING, t.stop) ||
-                                                 !SplitTier::wait_above(t.consumed1, k - (size_t) t.RING, t.stop)))
-                        return;
+                    if (k >= (size_t) t.RING) {
+                        const size_t free_at = k - (size_t) t.RING;   // both lanes must have gathered this slot
+                        // #178: a wait for a full ring is a span of its own (it was "(no span)" in a trace)
+                        const bool full = t.consumed.load(std::memory_order_acquire) <= free_at ||
+                                          t.consumed1.load(std::memory_order_acquire) <= free_at;
+                        std::optional<timeline::Span> full_span;
+                        if (full) full_span.emplace("split ring full", (int64_t) k, t.seq[k].l);
+                        if (!SplitTier::wait_above(t.consumed, free_at, t.stop) ||
+                            !SplitTier::wait_above(t.consumed1, free_at, t.stop))
+                            return;
+                    }
                     if (t.stop.load(std::memory_order_relaxed) || t.aborted.load(std::memory_order_acquire)) return;
                     const SplitTier::Entry& en = t.seq[k];
-                    timeline::Span issue_span("split issue host", (int64_t) k, en.l);
+                    timeline::Span issue_span("split issue host", en.l, en.e);   // #178: its copy's (layer, expert)
                     ++t.n_copied;
                     const int rs = (int) (k % t.RING);
                     const size_t bb = (size_t) lay0.blob_bytes(en.l);

@@ -207,11 +207,23 @@ GAP_KINDS = ("not issued yet (host)", "in the issue call", "issued, not started 
 
 def prefill_report(tl: Timeline, top: int = 15) -> list[dict]:
     copy_lanes = tl.lanes_like("copy engine")
-    compute_lanes = tl.lanes_like("compute (prefill)")
-    issues = tl.find("copy issue")
-    issue_t0 = [s.t0 for s in issues]
+    # #178: CUDA0's compute lanes of the prompt path, one per wave lane ("gpu0 compute (prefill)", "... (prefill, lane 2)";
+    # the 4070's "(prefill split...)" lanes are not CUDA0's).  A run takes the lane of its own wave lane: the run on a
+    # "prompt wave lane" thread is lane 2.  (Matching "compute (prefill)" alone dropped lane 2 and gave its run lane 1's.)
+    gpu0_compute = [ln for ln in tl.lanes_like("compute (prefill") if "split" not in ln]
+    compute_of = {second: [ln for ln in gpu0_compute if ("lane 2" in ln) == second] for second in (False, True)}
+    # #178: each copy matches its own issuer's span - the 4070 split issuer's "split issue host", the others' "copy
+    # issue" - and the two kinds carry their keys in a different order: normalised once by copy_key
+    split_lanes = {ln for ln in copy_lanes if "split" in ln}
+    issues_of = {kind: tl.find(kind) for kind in ("copy issue", "split issue host")}
+    issue_t0_of = {kind: [s.t0 for s in v] for kind, v in issues_of.items()}
+
+    def copy_key(c: Span) -> tuple[int, int]:   # (entry, layer): split copies and their issues carry (layer, expert)
+        return (c.b, c.a) if c.lane in split_lanes or c.name == "split issue host" else (c.a, c.b)
+
     out = []
     for run in tl.find("prefill run"):
+        compute_lanes = compute_of["wave lane" in run.lane]
         copies = sorted((s for ln in copy_lanes for s in tl.overlapping(ln, run.t0, run.t1)
                          if s.name.startswith("copy ")), key=lambda s: s.t0)
         r: dict = {"t0_ms": run.t0, "wall_ms": run.dur, "tokens": run.a, "copies": len(copies),
@@ -223,9 +235,11 @@ def prefill_report(tl: Timeline, top: int = 15) -> list[dict]:
         top_gaps, latency = [], []
 
         def issue_of(c: Span):
+            kind = "split issue host" if c.lane in split_lanes else "copy issue"
+            issues, issue_t0 = issues_of[kind], issue_t0_of[kind]
             i = bisect.bisect_right(issue_t0, c.t0 + EPS) - 1
             while i >= 0 and issues[i].t0 >= run.t0 - EPS:
-                if issues[i].a == c.a and issues[i].b == c.b:   # entry and layer (entries restart per layer)
+                if copy_key(issues[i]) == copy_key(c):   # entry and layer (entries restart per layer)
                     return issues[i]
                 i -= 1
             return None
@@ -252,7 +266,8 @@ def prefill_report(tl: Timeline, top: int = 15) -> list[dict]:
                 add(gaps, parts)
                 main_cause = max(why.items(), key=lambda kv: kv[1])[0] if why else None
                 kind = max(parts.items(), key=lambda kv: kv[1])[0]
-                top_gaps.append({"ms": g1 - g0, "t_ms": g0 - run.t0, "entry": c.a, "layer": c.b,
+                entry, layer = copy_key(c)
+                top_gaps.append({"ms": g1 - g0, "t_ms": g0 - run.t0, "entry": entry, "layer": layer,
                                  "cause": main_cause if kind == GAP_KINDS[0] and main_cause else kind,
                                  "parts": parts})
             prev_end = c.t1 if prev_end is None else max(prev_end, c.t1)
@@ -284,7 +299,7 @@ def prefill_report(tl: Timeline, top: int = 15) -> list[dict]:
         r["copy_by_phase"] = {k: {"n": len(v), "ms": sum(v), "p50": pct(v, 0.5)} for k, v in by.items()}
         per_layer: dict[int, list] = defaultdict(list)
         for c in copies:
-            per_layer[c.b].append(c)
+            per_layer[copy_key(c)[1]].append(c)
         r["layer_copy_ms"] = {l: union_ms(v, run.t0, run.t1) for l, v in sorted(per_layer.items())}
         r["host_ms"] = dict(tl.innermost(run.lane, run.t0, run.t1))
         out.append(r)

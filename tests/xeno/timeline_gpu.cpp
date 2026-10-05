@@ -104,6 +104,24 @@ int main() {
         std::printf("spans: small %.1f us, large %.1f us, medium %.1f us; copy %.1f us\n", ch[0].dur, ch[1].dur,
                     ch[2].dur, cp.empty() ? 0.0 : cp[0].dur);
     }
+    {   // #178: split_send's two relay spans share the event between them.  As two span() calls it was recycled twice
+        // and record() handed it to two spans; as a mark chain it is recycled once, after its last use - also when a
+        // resolve(false) lands between the two spans' completions (the second one still pending)
+        void* big = nullptr;
+        cudaMalloc(&big, 256 * mb);
+        clk.mark(copy, "first", c);
+        cudaMemsetAsync(big, 5, 1 * mb, c);
+        clk.mark(copy, "second", c);
+        cudaMemsetAsync(big, 6, 256 * mb, c);   // long: the second span is still running at the first resolve
+        clk.mark(copy, nullptr, c);
+        clk.resolve(false);
+        cudaEvent_t x = clk.record(s), y = clk.record(s), z = clk.record(s);
+        CHECK(x != y && y != z && x != z, "no event handed out twice (%p %p %p)", (void*) x, (void*) y, (void*) z);
+        cudaStreamSynchronize(c);
+        cudaStreamSynchronize(s);
+        clk.resolve(true);
+        cudaFree(big);
+    }
     cudaFree(buf);
     std::remove(path);
     if (fails == 0) std::printf("timeline_gpu: ok\n");
