@@ -87,6 +87,16 @@ void moe_routed_sum_bf16(const float* D, const int32_t* slot, const float* w, ui
 /// the widened partial
 void moe_split_finish_bf16(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
                            const uint16_t* bo16, float* bo, int64_t T, int32_t lo, void* stream);
+/// #183 (STRATA_SPLIT_BO=q8): the routed partial as Q8 - per token, groups of kSplitQ8Group values as uint8 codes plus the
+/// group's fp32 minimum and step (asymmetric: value = min + code * step).  Wire layout: T*N codes, then T*G minimums,
+/// then T*G steps (G = N / kSplitQ8Group); split_q8_bytes(T) bytes in all
+constexpr int64_t kSplitQ8Group = 128;
+size_t split_q8_bytes(int64_t T);
+void moe_routed_sum_q8(const float* D, const int32_t* slot, const float* w, uint8_t* wire, int64_t T, void* stream,
+                       int32_t lo = 0, int32_t hi = INT32_MAX);
+/// #183: moe_split_finish with the 4070's partial arriving as Q8 - exactly moe_split_finish on the dequantized partial
+void moe_split_finish_q8(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                         const uint8_t* wire, float* bo, int64_t T, int32_t lo, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).
