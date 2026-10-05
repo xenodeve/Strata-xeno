@@ -2166,7 +2166,21 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     const auto pool_start = std::chrono::steady_clock::now();
+    // #173 DIAGNOSTIC (not for merge): STRATA_DIAG_SKIP_CPU=1 zeroes the CPU's rows instead of computing them, so a
+    // round's time without the CPU experts can be read; outputs are WRONG under it
+    static const bool diag_skip_cpu = std::getenv("STRATA_DIAG_SKIP_CPU") != nullptr;
+    if (diag_skip_cpu) {
+        for (int q = 0; q < njobs; ++q)
+            for (int t = 0; t < d.jobs_multi[(size_t) q].nt; ++t)
+                std::memset(d.jobs_multi[(size_t) q].out[t], 0, (size_t) H * sizeof(float));
+    } else
     run_jobs(0, njobs);
+    // #173 DIAGNOSTIC: STRATA_DIAG_CPU_DELAY_US=N spins N us after the pool on layers with CPU work (outputs exact)
+    static const int diag_delay_us = [] { const char* v = std::getenv("STRATA_DIAG_CPU_DELAY_US"); return v ? std::atoi(v) : 0; }();
+    if (diag_delay_us > 0 && njobs > 0) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(diag_delay_us);
+        while (std::chrono::steady_clock::now() < until) {}
+    }
     const auto pool_end = std::chrono::steady_clock::now();
     if (nvme_pending) {   // #95: the reads have had the resident run to land; publish them, then run their jobs
         std::string ne;
