@@ -9,3 +9,6 @@ tools/hooks/* text eol=lf
 
 # copies of real packs' native_experts.txt, parsed byte for byte by tests/core/expert_layout_test.cpp
 tests/data/native_experts/** -text
+
+# #169: applied by git apply to the fetched llama.cpp checkout - its bytes must not be converted
+third_party/ggml/patches/*.patch -text

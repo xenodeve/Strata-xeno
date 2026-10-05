@@ -9,7 +9,7 @@
 // int8 per 32 values in their natural order here (quantize_act_native), not the Q2_0 path's permuted one.
 //
 // Covered: gate/up IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS; down Q2_0, IQ4_NL - every layer of the IQ2_XS,
-// IQ3_XXS and IQ3_S packs but the IQ1_M ones (which MMQ does not cover either).  Other layers keep MMQ.
+// IQ3_XXS and IQ3_S packs but the IQ1_M ones (which take MMQ since #169).  Other layers keep MMQ.
 #pragma once
 
 #include "strata/prefill/moe_fused.hpp"

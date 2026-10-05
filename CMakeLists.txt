@@ -904,6 +904,22 @@ if(STRATA_NATIVE_EXPERTS)
     if(NOT strata_llamacpp_POPULATED)
       FetchContent_Populate(strata_llamacpp)
     endif()
+    # #169: llama.cpp's MMQ has no IQ1_M tile; the pinned checkout gets ours (skipped once applied). A STRATA_GGML_DIR
+    # checkout is left as it is: without the tile, IQ1_M experts stay on the FP16 path
+    find_package(Git QUIET)
+    set(_strata_iq1m_patch ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/patches/0001-mmq-iq1_m.patch)
+    if(GIT_FOUND)
+      execute_process(COMMAND ${GIT_EXECUTABLE} apply --reverse --check ${_strata_iq1m_patch}
+                      WORKING_DIRECTORY ${strata_llamacpp_SOURCE_DIR} RESULT_VARIABLE _strata_iq1m_applied
+                      OUTPUT_QUIET ERROR_QUIET)
+      if(NOT _strata_iq1m_applied EQUAL 0)
+        execute_process(COMMAND ${GIT_EXECUTABLE} apply ${_strata_iq1m_patch}
+                        WORKING_DIRECTORY ${strata_llamacpp_SOURCE_DIR} RESULT_VARIABLE _strata_iq1m_rc)
+        if(NOT _strata_iq1m_rc EQUAL 0)
+          message(WARNING "the IQ1_M MMQ patch did not apply: IQ1_M experts stay on the FP16 path (#169)")
+        endif()
+      endif()
+    endif()
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
@@ -1099,6 +1115,14 @@ if(STRATA_NATIVE_EXPERTS)
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    # #169: IQ1_M on MMQ when the checkout has the tile (third_party/ggml/patches, applied above)
+    file(STRINGS ${_strata_mmq}/mmq-load-tiles.cuh _strata_iq1m_tile REGEX "ggml_cuda_mmq_load_tiles_iq1_m")
+    if(_strata_iq1m_tile)
+      target_sources(strata_mmq PRIVATE src/prefill/mmq_instance_iq1_m.cu)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_IQ1M=1)
+    else()
+      message(STATUS "llama.cpp's MMQ has no IQ1_M tile here: IQ1_M experts stay on the FP16 path (#169)")
+    endif()
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1, the experts of Unsloth's UD-Q4_K_XL (docs/UNSLOTH_Q4.md; the dispatch
     # follows eddoursul/Strata 7706c1b)
@@ -1142,6 +1166,13 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(prefill_mmq_kquant_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_mmq_kquant_test COMMAND prefill_mmq_kquant_test)
       set_tests_properties(prefill_mmq_kquant_test PROPERTIES TIMEOUT 120)
+    endif()
+    if(STRATA_BUILD_TESTS AND _strata_iq1m_tile)
+      # #169: IQ1_M gate/up through MMQ against ggml's IQ1_M dequantization, exactly (synthetic, a few seconds)
+      add_executable(prefill_mmq_iq1m_test tests/cuda/prefill_mmq_iq1m_test.cpp)
+      target_link_libraries(prefill_mmq_iq1m_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_mmq_iq1m_test COMMAND prefill_mmq_iq1m_test)
+      set_tests_properties(prefill_mmq_iq1m_test PROPERTIES TIMEOUT 120)
     endif()
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
