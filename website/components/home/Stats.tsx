@@ -38,6 +38,8 @@ type Stat = {
   mine: { value: number; unit: string; tag: L };
   theirs: { value: number; tag: L };
   href: string;
+  /** Spans the whole row: a chart with several groups needs the width. */
+  wide?: boolean;
 };
 
 const STATS: Stat[] = [
@@ -55,6 +57,14 @@ const STATS: Stat[] = [
     theirs: { value: 36.9, tag: { en: "upstream v0.1.38, least", th: "upstream v0.1.38 ที่น้อยที่สุด" } },
     href: "/details#v038-ram",
   },
+  {
+    id: "v038-len-decode",
+    label: { en: "Writing the answer after a 128K prompt · higher is better", th: "การเขียนคำตอบหลัง prompt 128K · ยิ่งสูงยิ่งดี" },
+    mine: { value: 62.8, unit: "tok/s", tag: { en: "Strata-xeno", th: "Strata-xeno" } },
+    theirs: { value: 46.9, tag: { en: "upstream v0.1.38, fastest (peer tier)", th: "upstream v0.1.38 ที่เร็วที่สุด (ชั้น peer)" } },
+    href: "/details#v038-len-decode",
+    wide: true,
+  },
 ];
 
 function StatCard({ s, k }: { s: Stat; k: number }) {
@@ -62,7 +72,7 @@ function StatCard({ s, k }: { s: Stat; k: number }) {
   const mine = useCountUp(s.mine.value, seen);
   const theirs = useCountUp(s.theirs.value, seen);
   return (
-    <Reveal i={k} className="stat">
+    <Reveal i={k} className={s.wide ? "stat stat--wide" : "stat"}>
       <div ref={ref}>
         <p className="mono stat__label">
           <T v={s.label} />
@@ -98,7 +108,7 @@ export function Stats() {
       <div className="wrap">
         <Reveal as="header" className="shead shead--center">
           <h2 id="numbers-title" className="h2">
-            <SlideUpText v={{ en: "Two numbers,", th: "สองตัวเลข" }} />{" "}
+            <SlideUpText v={{ en: "Three numbers,", th: "สามตัวเลข" }} />{" "}
             <HighlightedText delay={400}>
               <SlideUpText v={{ en: "with their conditions.", th: "พร้อมเงื่อนไข" }} delay={120} />
             </HighlightedText>

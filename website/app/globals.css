@@ -1113,6 +1113,9 @@ html[lang="th"] .slide__title {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--gutter);
 }
+.stat--wide {
+  grid-column: 1 / -1;
+}
 .stat {
   padding: clamp(24px, 4vw, 48px);
   border: 1px solid var(--line);
