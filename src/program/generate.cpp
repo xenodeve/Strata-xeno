@@ -5430,8 +5430,11 @@ int main(int argc, char** argv) {
             }
         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
-    auto lend_slots = [&](int64_t c, int64_t kv_end = 0) -> int64_t {   // #122: kv_end as in prompt_bytes_needed
-        const uint64_t need = prompt_bytes_needed(g, ss, c, kv_end);
+    // #172: `wave` - the loan holds both wave lanes; false: one lane of `c` tokens, as a part below the wave's lane
+    // floor runs (sized for two lanes, a 461-2,559-token Claude Code turn lent and refilled 28-66 % more slots, #172)
+    auto lend_slots = [&](int64_t c, int64_t kv_end = 0, bool wave = true) -> int64_t {   // #122: kv_end as in relayout
+        const uint64_t need = wave ? prompt_bytes_needed(g, ss, c, kv_end)
+                                   : strata::prefill::Prefill::bytes_needed(g, ss, c, kv_end);
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
@@ -7369,12 +7372,20 @@ int main(int argc, char** argv) {
                     }
                     if (!refill(e)) return false;
                 }
-                const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want, kv_end)));
+                // #35 D7: the wave only where each lane's chunk still runs split (the review's 3,000-token request
+                // read 1,536-token chunks on one card each: 8.6 s against 3.8 s without the wave).  #172: decided
+                // before the loan, which is sized for the layout this part runs.  It keeps more experts resident on
+                // CUDA0 for a short part, so CUDA0 computes more of them itself: the FP32 sum order and with it the
+                // greedy output move (#61 class); STRATA_LEND_BOTH_LANES=1 sizes every loan for two lanes as before
+                static const bool both_lanes = [] {
+                    const char* v = std::getenv("STRATA_LEND_BOTH_LANES");
+                    return v != nullptr && v[0] == '1';
+                }();
+                sp_part_wave = sp_wave && strata::prefill::Prefill::wave_lane_splits(want);
+                const int32_t first = std::max<int32_t>(
+                    lend_first, (int32_t) (xcache.slots() - lend_slots(want, kv_end, sp_part_wave || both_lanes)));
                 // laid out elsewhere, or a staging pool that does not hold this request (#122)
                 const bool layout_stale = first != lend_first_now || lent_stage_cells() < kv_end;
-                // #35 D7: the wave only where each lane's chunk still runs split (the review's 3,000-token request
-                // read 1,536-token chunks on one card each: 8.6 s against 3.8 s without the wave)
-                sp_part_wave = sp_wave && strata::prefill::Prefill::wave_lane_splits(want);
                 if (sp_part_wave) {   // each lane half the chunk, in its half of the lent region
                     const int64_t lane_want = strata::prefill::Prefill::wave_lane_chunk(want);
                     if (lane_want != sp.chunk() || layout_stale || !sp_layout_wave) {
