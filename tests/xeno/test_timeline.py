@@ -241,3 +241,33 @@ def test_one_layer_is_laid_out_across_every_lane(tmp_path):
         ("gpu1 copy engine (prefill split)", "copy staged"), ("gpu0 compute (prefill)", "gather"),
         ("gpu1 compute (prefill split)", "wait copies"), ("gpu1 compute (prefill split)", "products")]
     assert (w[0]["t0"], w[0]["t1"], w[0]["busy"], w[0]["n"]) == (pytest.approx(10), pytest.approx(121), pytest.approx(5), 3)
+
+
+def wave_trace():
+    """#178: two wave lanes reading at once (lane 1 on "main", lane 2 on "prompt wave lane 2", the engine's names), each with its own CUDA0
+    compute lane, and the split issuer feeding the 4070's copy engine; its own lanes, not LANES."""
+    lanes = {1: "main", 2: "prompt wave lane 2", 3: "prefill split issuer", 10: "gpu0 compute (prefill)",
+             11: "gpu0 compute (prefill, lane 2)", 12: "gpu1 copy engine (prefill split)"}
+    meta = [{"ph": "M", "pid": PID, "tid": t, "name": "thread_name", "args": {"name": n}} for t, n in lanes.items()]
+    return timeline.Timeline(meta + [
+        X(1, "prefill run", 0, 100, 4096), X(2, "prefill run", 0, 100, 4096),
+        X(10, "gdn", 0, 30, 0), X(10, "wait host", 30, 100, 0),
+        X(11, "combine", 0, 60, 0), X(11, "gather", 60, 100, 0),
+        # the split issuer issues expert 7 of layer 0 and its copy starts 2 ms later; then expert 9 (layer, expert)
+        X(3, "split issue host", 10, 11, 0, 7), X(12, "copy staged", 13, 15, 0, 7),
+        X(3, "split issue host", 20, 21, 0, 9), X(12, "copy staged", 30, 32, 0, 9),
+    ])
+
+
+def test_each_wave_lane_run_reports_its_own_compute_lane():
+    runs = timeline.prefill_report(wave_trace())
+    assert {frozenset(r["phase_ms"]) for r in runs} == {frozenset({"gdn", "wait host"}), frozenset({"combine", "gather"})}
+
+
+def test_split_copies_are_matched_to_the_split_issuer():
+    r = timeline.prefill_report(wave_trace())[0]
+    assert "unmatched" not in r["copy_gaps"], r["copy_gaps"]
+    # issue end -> copy start: 13 - 11 = 2 ms and 30 - 21 = 9 ms
+    assert r["issue_to_start_ms"]["n"] == 2 and r["issue_to_start_ms"]["max"] == pytest.approx(9.0), r["issue_to_start_ms"]
+    assert r["layer_copy_ms"] == {0: pytest.approx(4.0)}   # both copies on layer 0, keyed by layer, not by expert
+

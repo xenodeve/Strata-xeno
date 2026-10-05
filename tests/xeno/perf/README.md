@@ -55,13 +55,14 @@ python tests/xeno/perf/timeline.py run.json         # + --json summary.json, --p
 | `gpu0 compute (prefill)` | device time of every prompt-path phase, per layer. These are the `STRATA_PREFILL_TIMING` marks: a gap in which the stream waits is charged to the phase that waited. |
 | `gpu0 copy engine (prefill)` | the device time of every expert copy (`copy pinned` / `copy staged` / `copy peer`), with its entry index and layer. |
 | `gpu1 4070 experts` | the 4070's share of each decode layer (device time). |
+| `prefill split issuer`, `gpu1 copy engine (prefill split)`, `gpu0 relay (prefill split[, lane 2])` | the expert split's stream to the 4070 (#178): `split issue host` and its copy (`copy staged` / `copy pinned`) both carry (layer, expert), unlike the other copies' (entry, layer); `split ring full` is the issuer waiting for both wave lanes to free a ring slot. The relay lanes hold `activations down`, `gates down` and `output up`. |
 | `prefill copy issuer`, `prefill stager N`, `pool worker N`, `4070 launcher`, `adapt`, `ple read-ahead` | the helper threads: issuer waits, stager memcpy and buffer waits, each worker's `wake` (from the publish) and `drain`, and the 4070 enqueue. |
 | `server ...` | `http request`, `template+tokenize`, `queue wait`, `engine request`, `first token`. |
 
 The report covers:
 
 - **Prompt path:**
-  - GPU time by phase and by layer.
+  - GPU time by phase and by layer, for the compute lane of the run's own wave lane (`... lane 2` for the run on `prompt wave lane 2`).
   - The host thread's budget.
   - The copy engine's busy time, with every idle gap split into three kinds: `not issued yet (host)` (plus what the issuing thread was doing instead), `in the issue call`, and `issued, not started (device)`.
   - Copy durations by the compute phase that runs at the same time.
