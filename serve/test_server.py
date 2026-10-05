@@ -2289,6 +2289,7 @@ class ThinkingBudget(unittest.TestCase):
         tok = ByteTokenizer()
         eng = PromptLog(tok, scripts, max_context=max_context)
         svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc = svc
         httpd = serve(svc, port=0)
         try:
             body = {"model": "m", "max_tokens": 4000, "messages": [{"role": "user", "content": "hi"}], **body}
@@ -2346,6 +2347,25 @@ class ThinkingBudget(unittest.TestCase):
                                            "thinking": {"type": "enabled", "budget_tokens": 31999}}, max_context=6000)
         self.assertEqual(len(eng.prompts), 2)
         self.assertEqual(text, "the answer")
+
+    def test_a_thinking_that_cycles_is_closed_and_the_answer_follows(self):
+        # #199: 12 cycles of re-planning one file ran a request to max_tokens with no answer (32,768 tokens); the
+        # loop guard's cycle rule closes the thinking with REASONING_WRAP_UP and the model answers from there
+        plan = ("Let me write the code carefully. It'll be long, aim for a well-structured single file.\n"
+                "Sky: use a large sphere with a gradient shader, or set the background colour by time of day.\n"
+                "Camera presets: animate the camera to the target with a lerp each frame for smoothness.\n"
+                "Walls: fill w x h x w with the wood colour, leaving openings for the windows and the doors.\n")
+        parts = ["railing", "lantern", "bridge", "koi pond", "stone path", "maple", "bamboo", "torii", "moss", "bell"]
+        draft = lambda r: "".join(f"Draft {r}.{i}: move the {parts[(i * 7 + r) % 10]} by {(i * 13 + r) % 9} voxels "
+                                  f"toward the {parts[(i * 3 + r) % 10]} of tier {i % 5}.\n" for i in range(36))
+        thought = "".join(plan + draft(r) for r in range(8))   # each cycle ~2,600 characters apart
+        _, eng, thinking, text = self.run_request([thought, "the answer"], {"stream": True, "max_tokens": 30000},
+                                                  max_context=65536)
+        self.assertEqual(text, "the answer")
+        self.assertEqual(len(eng.prompts), 2)           # the answer continues the closed prompt
+        self.assertIn("I have thought about this long enough", thinking)
+        self.assertEqual(thinking.count("Let me write the code carefully"), 3)   # closed in the third cycle
+        self.assertEqual(self.svc.status["thinking_cycles_closed"], 1)
 
     def test_a_streamed_request_without_a_budget_thinks_freely(self):
         _, eng, thinking, text = self.run_request([THINK[:1500] + "</think>\n\nok"], {"stream": True})

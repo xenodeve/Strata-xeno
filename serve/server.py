@@ -1244,7 +1244,7 @@ class Service:
         # "*" = any), and every name it answers to, which serve() works out from the address it listens on
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
-        self.status = {"busy": False, "queued": 0, "loops_stopped": 0}  # GET /status: what the model is doing right now
+        self.status = {"busy": False, "queued": 0, "loops_stopped": 0, "thinking_cycles_closed": 0}  # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
         # so it is off unless the config's "api_monitor" (or --api-monitor) turns it on
@@ -1919,13 +1919,15 @@ class Service:
             self.engine.generate(ids, max_new, sampling, cancel)
 
     def _generate(self, ids, max_new, sampling, cancel, emb, state):
-        """The engine's tokens, with the thinking budget.  Two sources set one, and the smaller cuts: xeno #49 S3's
+        """The engine's tokens, with the thinking cut.  A budget comes from two sources, and the smaller cuts: xeno #49 S3's
         `_think_budget` (Anthropic's thinking.budget_tokens and side requests, serve/think_budget.py; closed with its
         CLOSE) and #123's reasoning_budget_tokens (state["budget"], opt-in; closed with REASONING_WRAP_UP).  Once that
         many reasoning tokens are out (state["thought"]) while state["thinking"] holds, at a clean point
         (state["clean"](): no tag held back, no character split across tokens - #123), stop the engine, yield the
         close's tokens as if the model wrote them and continue from (prompt + written + close), which reuses the
-        engine's cached prefix.  No room left to answer after the close: the request ends there ("length", #123)."""
+        engine's cached prefix.  No room left to answer after the close: the request ends there ("length", #123).
+        #199: the loop guard's cycle rule cuts the same way, at any length (state["close"], set by run()), so a
+        thinking request is watched even without a budget."""
         opening = (sampling or {}).get("_opening")      # xeno (serve/forced_opening.py): written for the model,
         if opening:                                     # which continues from it
             head = self.tok.encode(opening)
@@ -1936,7 +1938,7 @@ class Service:
         if own and (not budget or own <= budget):
             budget, close_text = own, think_budget.CLOSE
         gen = self._engine(ids, max_new, sampling, cancel, emb)
-        if not budget:
+        if not budget and not state["thinking"]:        # nothing to cut: no budget, and not thinking (#199)
             yield from gen
             return
         written = []
@@ -1945,7 +1947,8 @@ class Service:
                 yield t
                 if t is not None:
                     written.append(t)
-                    if state["thinking"] and state["thought"] >= budget and state["clean"]():
+                    due = state["close"] or (budget and state["thought"] >= budget)   # #199: or a cycle
+                    if state["thinking"] and due and state["clean"]():
                         break
             else:
                 return
@@ -1965,8 +1968,12 @@ class Service:
             return                                      # #123: no room left to answer: "length", as without a budget
         first = dict(getattr(self.engine, "last", None) or {})
         if close:
-            print(f"[strata] thinking budget reached ({state['thought']} of {budget} tokens): closing the thinking "
-                  "block", flush=True)
+            why = (f"thinking cycle ({state['close']})" if state["close"] else
+                   f"thinking budget reached ({state['thought']} of {budget} tokens)")
+            print(f"[strata] {why}: closing the thinking block", flush=True)
+            if state["close"]:
+                with self.status_lock:
+                    self.status["thinking_cycles_closed"] += 1   # #199: counted when the close is written
         yield from close
         rest = max(1, max_new - len(written) - len(close)) if max_new else max_new
         try:
@@ -2074,7 +2081,7 @@ class Service:
                     t_engine = timeline.now_us()
                     # still inside the thinking block, and the reasoning tokens so far: the thinking budget's cut
                     # (_generate); `clean` is asked only at the budget (#123: no tag held back, no split character)
-                    state = {"thinking": thinking, "budget": budget, "thought": 0,
+                    state = {"thinking": thinking, "budget": budget, "thought": 0, "close": None,
                              "clean": lambda: not parser.buf and not detok.pending()}
                     if hasattr(self.engine, "last"):
                         self.engine.last = {}              # this request's DONE only, never the previous one's
@@ -2131,6 +2138,9 @@ class Service:
                                 yield "event", ev
                             if guard.reason or matched_sequence:
                                 break
+                            # #199: the thinking is cycling - _generate closes it at the next clean point (once)
+                            if guard.close_reason and state["thinking"] and not state["close"]:
+                                state["close"] = guard.close_reason
                         # the loop guard and a stop sequence cancel the engine themselves; only a client cancel is one
                         if cancel.is_set() and not matched_sequence and not guard.reason:
                             finish = "stop" if getattr(cancel, "server_stop", False) else "cancel"
@@ -3153,7 +3163,9 @@ def make_handler(svc: Service):
                 self._json(200 if alive else 503, {"status": "ok" if alive else "engine_exited",
                                      "max_context": svc.engine.max_context, "model": svc.model,
                                      "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                     "loops_stopped": svc.status["loops_stopped"], "loaded": svc.loaded(),
+                                     "loops_stopped": svc.status["loops_stopped"],
+                                     "thinking_cycles_closed": svc.status["thinking_cycles_closed"],   # #199
+                                     "loaded": svc.loaded(),
                                      "degraded": bool(getattr(svc.engine, "degraded", False)), "service": "strata"})
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
