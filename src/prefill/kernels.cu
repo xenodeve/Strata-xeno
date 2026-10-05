@@ -1059,10 +1059,12 @@ __global__ void moe_routed_sum_q8_kernel(const float* __restrict__ Dm, const int
         b = fmaxf(b, __shfl_xor_sync(0xffffffffu, b, o));
     }
     if ((threadIdx.x & 31) == 0) { smin[threadIdx.x >> 5] = a; smax[threadIdx.x >> 5] = b; }
-    __syncthreads();
+    // #183: the barrier for smin / smax, and whether the group holds a NaN - min / max skip it and the clamp would
+    // send code 0, a plausible value; a NaN step makes the whole group arrive as NaN instead
+    const bool has_nan = __syncthreads_or(isnan(v)) != 0;
     float mn = smin[0], mx = smax[0];
     for (int k = 1; k < Q8G / 32; ++k) { mn = fminf(mn, smin[k]); mx = fmaxf(mx, smax[k]); }
-    const float step = (mx - mn) / 255.0f;
+    const float step = has_nan ? __int_as_float(0x7fc00000) : (mx - mn) / 255.0f;
     const float q = step > 0.0f ? rintf((v - mn) / step) : 0.0f;
     wire[t * N + n] = (uint8_t) fminf(fmaxf(q, 0.0f), 255.0f);
     if (threadIdx.x == 0) {

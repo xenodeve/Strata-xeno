@@ -94,9 +94,11 @@ int main() {
                 off, worst, off == 0 ? "PASS" : "FAIL");
     bad += off != 0;
     // 4. a NaN in the partial crosses as a NaN (the add-and-shift rounding turned 0x7FFFFFFF into -0, a plausible
-    //    value that hid it from STRATA_DBG_NAN): token 1's first pair reads a row of NaN, so all its values are NaN
+    //    value that hid it from STRATA_DBG_NAN): one of token 1's pairs on this card reads a row of NaN, so all its values are NaN
     {
-        const size_t row = (size_t) slot[(size_t) K];   // pair (token 1, k 0) - below R, so on this card
+        size_t row = 0;   // a row of token 1 that this card sums (routed_sum takes the rows in [lo, hi))
+        for (int64_t k = 0; k < K; ++k)
+            if (slot[(size_t) (K + k)] < R) { row = (size_t) slot[(size_t) (K + k)]; break; }
         std::vector<float> Dn = Dm;
         std::fill(Dn.begin() + (ptrdiff_t) (row * N), Dn.begin() + (ptrdiff_t) ((row + 1) * N), std::nanf(""));
         cudaMemcpy(dD, Dn.data(), Dn.size() * 4, cudaMemcpyHostToDevice);

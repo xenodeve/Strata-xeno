@@ -92,6 +92,32 @@ int main() {
     std::printf("moe_split_finish_q8 vs moe_split_finish(dequantized): %zu of %zu differ - %s\n", d2, fin.size(),
                 d2 == 0 ? "PASS" : "FAIL");
     bad += d2 != 0;
+    // a NaN in the partial must arrive as a NaN, not as a plausible value: in a group where the others are finite the
+    // min / max skip it and the clamp sent code 0 - the group's minimum.  One of token 1's pairs on this card reads one
+    // NaN, at column 5: that value must dequantize to NaN (its whole group does: the step is NaN), the other groups not
+    {
+        size_t row = 0;   // a row of token 1 that this card sums (routed_sum takes the rows in [lo, hi))
+        for (int64_t k = 0; k < K; ++k)
+            if (slot[(size_t) (K + k)] < R) { row = (size_t) slot[(size_t) (K + k)]; break; }
+        std::vector<float> Dn = Dm;
+        Dn[row * N + 5] = std::nanf("");
+        cudaMemcpy(dD, Dn.data(), Dn.size() * 4, cudaMemcpyHostToDevice);
+        strata::prefill::moe_routed_sum(dD, dslot, dw, ds, T, nullptr, 0, R);
+        strata::prefill::moe_routed_sum_q8(dD, dslot, dw, dwire, T, nullptr, 0, R);
+        down(sum, ds);
+        down(wire, dwire);
+        size_t nan32 = 0, nan_in = 0, nan_out = 0;
+        for (int64_t n = 0; n < N; ++n) {
+            const int64_t gi = G + n / strata::prefill::kSplitQ8Group;   // token 1's group of n
+            nan32 += std::isnan(sum[(size_t) (N + n)]);
+            const bool nq = std::isnan(std::fmaf((float) q[N + n], st[gi], mn[gi]));
+            (n < strata::prefill::kSplitQ8Group ? nan_in : nan_out) += nq;
+        }
+        const bool ok = nan32 == 1 && nan_in == (size_t) strata::prefill::kSplitQ8Group && nan_out == 0;
+        std::printf("one NaN in token 1's first group: fp32 %zu NaN; q8 %zu of its group NaN, %zu elsewhere - %s\n",
+                    nan32, nan_in, nan_out, ok ? "PASS" : "FAIL");
+        bad += !ok;
+    }
     std::printf("wire %zu bytes for %lld tokens (fp32 %lld, bf16 %lld)\n", wire_bytes, (long long) T,
                 (long long) (T * N * 4), (long long) (T * N * 2));
     for (void* p : {(void*) dD, (void*) dw, (void*) dsh, (void*) dsg, (void*) dslot, (void*) ds, (void*) dbo, (void*) dwire})
