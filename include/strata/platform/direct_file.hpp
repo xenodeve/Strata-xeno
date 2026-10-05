@@ -53,6 +53,7 @@ public:
     /// LdrShutdownThread with the Windows loader lock held, and close() joins the issuing threads, whose own exit
     /// needs that lock.  A thread that ends before the process calls release_this_thread() on its way out (it closes
     /// the handle and frees the buffer in an ordinary scope); one that does not keeps them to the process's end.
+    /// One handle per thread, whatever it is opened on: a thread that reads two files needs its own DirectFiles.
     static DirectFile& for_this_thread();
     static void* buffer_for_this_thread(size_t bytes);   ///< aligned, at least `bytes`, kept between calls
     static void release_this_thread();

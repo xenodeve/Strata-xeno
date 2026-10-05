@@ -6783,14 +6783,14 @@ int main(int argc, char** argv) {
                         const uint64_t b = p.beats.load();
                         if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; continue; }
                         if (now - since < std::chrono::seconds(limit)) continue;
-                        std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
-                                             "the engine so the server starts it again (issue #29)\n",
-                                     limit, stage_text().c_str());
 #if defined(_WIN32)
-                        if (stalled) SetEvent(stalled);   // #185: the deadline thread above ends it from here
+                        if (stalled) SetEvent(stalled);   // #185: first - the deadline thread above ends it from here
 #else
                         (void) stalled;
 #endif
+                        std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
+                                             "the engine so the server starts it again (issue #29)\n",
+                                     limit, stage_text().c_str());
                         stall_report(stderr, p.ticks.load() - ticks_at);
                         strata::core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
                         std::fflush(stderr);
