@@ -2440,7 +2440,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             hb = t.stager->wait(en.job);
                         }
                         c0 = t.clk_c.record(t.c);
-                        cudaMemcpyAsync(dst, hb, bb, cudaMemcpyHostToDevice, t.c);
+                        // #174 DIAGNOSTIC (not for merge): STRATA_DIAG_SKIP_COPY=N drops the DMA of every Nth staged
+                        // host expert (N=1: all), so a read's time without that part of the x16 stream can be read;
+                        // the products then use stale slot bytes - outputs are WRONG under it
+                        static const int diag_skip_copy = [] { const char* v = std::getenv("STRATA_DIAG_SKIP_COPY"); return v ? std::atoi(v) : 0; }();
+                        if (diag_skip_copy <= 0 || k % (size_t) diag_skip_copy != 0)
+                            cudaMemcpyAsync(dst, hb, bb, cudaMemcpyHostToDevice, t.c);
                         t.stager->issued_one(en.job, t.c);
                     }
                     cudaEventRecord(t.copied[rs], t.c);
