@@ -3,6 +3,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/platform/direct_file.hpp"
 
 #include "strata/core/layout.hpp"
 #include "strata/core/native_head.hpp"
@@ -459,6 +460,10 @@ struct Stager {
                 std::unique_lock<std::mutex> lk(mu);
                 cv.wait(lk, [&] { return quit || gen != seen; });
                 if (quit) {
+                    lk.unlock();
+                    // #185: this thread's tail reader handle and buffer (the source's read_into), closed here: at the
+                    // thread's exit their close would run under the loader lock and never return
+                    strata::platform::DirectFile::release_this_thread();
                     if (std::getenv("STRATA_EXIT_TRACE")) { std::fprintf(stderr, "exit trace: stager %d returns\n", id); std::fflush(stderr); }
                     return;
                 }
