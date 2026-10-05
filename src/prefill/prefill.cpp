@@ -139,15 +139,38 @@ inline int64_t split_routed_max() {
 }
 double g_pinned_share = 1.0;
 bool g_split_layout = false;   // #35 D6 (Prefill::set_split_layout)
-// #181, opt-in (it moves outputs): STRATA_SPLIT_BO_BF16=1 returns the expert split's routed sum to the 5060 as bf16 -
-// half the bytes over the x4, where the fp32 copy held 17 % of a 36K read (#179).  The routed partial is rounded to
-// bf16 once (moe_routed_sum_bf16); everything else is unchanged (xeno_combine_bf16_parity)
-bool split_bo_bf16() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_SPLIT_BO_BF16"); return e != nullptr && std::atoi(e) != 0; }();
+// #181 / #183, opt-in (they move outputs): the format the expert split's routed partial crosses the x4 in, back to the
+// 5060.  fp32 by default; STRATA_SPLIT_BO=bf16 (or STRATA_SPLIT_BO_BF16=1) halves the bytes (xeno_combine_bf16_parity),
+// STRATA_SPLIT_BO=q8 sends uint8 codes per 128-value group with the group's minimum and step (xeno_combine_q8_parity).
+// The fp32 copy held 17 % of a 36K read (#179)
+enum class BoWire { F32, BF16, Q8 };
+BoWire split_bo_wire() {
+    static const BoWire v = [] {
+        const char* e = std::getenv("STRATA_SPLIT_BO");
+        if (e != nullptr && std::strcmp(e, "q8") == 0) return BoWire::Q8;
+        if (e != nullptr && std::strcmp(e, "bf16") == 0) return BoWire::BF16;
+        // an unknown value is said, not ignored in silence: a run meant as q8 would report fp32's numbers
+        if (e != nullptr && *e != 0 && std::strcmp(e, "fp32") != 0)
+            std::fprintf(stderr, "strata prefill: STRATA_SPLIT_BO=%s is not bf16, q8 or fp32 - ignored\n",
+                         e);
+        if (e != nullptr && *e != 0) return BoWire::F32;   // fp32, or an unknown value: the old alias does not override it
+        const char* b = std::getenv("STRATA_SPLIT_BO_BF16");
+        return b != nullptr && std::atoi(b) != 0 ? BoWire::BF16 : BoWire::F32;
+    }();
     return v;
 }
-// the one predicate for the 5060's bf16 receive buffer (init's carve and bytes_needed take it in the same place)
-bool want_bo16() { return g_split_layout && split_bo_bf16(); }
+// a lane's wire: the switch's format in the split layout, fp32 outside it.  carve() and bytes_needed() both take the
+// receive buffer for it right after bo; the lane keeps it (Impl::bo_fmt) beside that buffer
+BoWire lane_bo_wire() { return g_split_layout ? split_bo_wire() : BoWire::F32; }
+// the bytes of the 4070's routed partial on the wire in format f
+size_t bo_wire_bytes(BoWire f, int64_t T) {
+    switch (f) {
+        case BoWire::F32: return (size_t) (T * N) * 4;
+        case BoWire::BF16: return (size_t) (T * N) * 2;
+        case BoWire::Q8: return split_q8_bytes(T);
+    }
+    return 0;
+}
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
@@ -829,7 +852,8 @@ struct Prefill::Impl {
     uint16_t *mixed_bf = nullptr, *mixed_h = nullptr;
     uint16_t *xn16_lo = nullptr, *lo16_lo = nullptr, *mixed_bf_lo = nullptr;   // bf16x2(): the BF16 GEMMs' low parts
     float* bo = nullptr;
-    uint16_t* bo16 = nullptr;   // #181: the 4070's routed partial as it arrives in bf16 (split_bo_bf16 only)
+    uint8_t* bo_wire = nullptr;   // #181 / #183: the 4070's routed partial as it arrives in a narrow format (bf16 / q8)
+    BoWire bo_fmt = BoWire::F32;  // the lane's wire (lane_bo_wire at its carve); fp32 crosses into bo itself
     // GDN
     float *qkv = nullptr, *z = nullptr, *ab = nullptr, *gate = nullptr, *beta = nullptr, *hbuf = nullptr, *y = nullptr;
     uint16_t* y_h = nullptr;
@@ -1103,9 +1127,9 @@ template <class Impl>
 bool cuda0_owns(const Impl& m, int64_t l, int32_t e) {
     return m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
 }
-// #181: the bytes of the 4070's routed partial on the wire - bf16 when the lane has its receive buffer, else fp32
+// #181 / #183: the bytes of the 4070's routed partial on the lane's wire
 template <class Impl>
-size_t partial_bytes(const Impl& m, int64_t T) { return (size_t) (T * N) * (m.bo16 != nullptr ? 2 : 4); }
+size_t partial_bytes(const Impl& m, int64_t T) { return bo_wire_bytes(m.bo_fmt, T); }
 
 /// #32 S4: this MoE layer's routed experts and combine on the 4070 (SplitTier), in two calls (#133): split_send queues
 /// the inputs, the gates and the tables, then the caller
@@ -1306,10 +1330,13 @@ bool split_run(Impl& m, int64_t l, int64_t T, size_t unit, const std::vector<int
         if (my_consumed.load(std::memory_order_acquire) < end) SplitTier::publish(my_consumed, end);
     }
     // 5. the routed sum of the 4070's rows (below CUDA0's block, #133); the output down to host and up into the 5060's bo
-    // #181: with the lane's bf16 receive buffer (m.bo16), the partial is written as bf16 into the first half of bo's
-    // own fp32 buffer (T*N*4 bytes, so it fits) and crosses at half the bytes
-    if (m.bo16 != nullptr) moe_routed_sum_bf16(sp.dm, sp.slot, sp.w, (uint16_t*) sp.bo, T, sp.s, 0, local_first);
-    else moe_routed_sum(sp.dm, sp.slot, sp.w, sp.bo, T, sp.s, 0, local_first);
+    // #181 / #183: with the lane's receive buffer (m.bo_wire), the partial is written in the narrow format into the
+    // front of bo's own fp32 buffer (T*N*4 bytes: bf16 and q8 both fit) and crosses in fewer bytes
+    switch (m.bo_fmt) {
+        case BoWire::F32: moe_routed_sum(sp.dm, sp.slot, sp.w, sp.bo, T, sp.s, 0, local_first); break;
+        case BoWire::BF16: moe_routed_sum_bf16(sp.dm, sp.slot, sp.w, (uint16_t*) sp.bo, T, sp.s, 0, local_first); break;
+        case BoWire::Q8: moe_routed_sum_q8(sp.dm, sp.slot, sp.w, (uint8_t*) sp.bo, T, sp.s, 0, local_first); break;
+    }
     cudaEventSynchronize(sp.ev_done);   // the 5060 has uploaded the previous layer's output from hbo
     sp.clk_s.mark(sp.tl_s, "output down", sp.s, l);
     cudaMemcpyAsync(sp.hbo, sp.bo, partial_bytes(m, T), cudaMemcpyDeviceToHost, sp.s);
@@ -1332,7 +1359,7 @@ bool split_output_up(Impl& m, int64_t l, int64_t T, std::string& err) {
         cudaEventSynchronize(sp.ev_bo);
     }
     cudaEvent_t o0 = sp.clk_relay.record(m.relay);
-    void* dst = m.bo16 != nullptr ? (void*) m.bo16 : (void*) m.bo;   // #181: the bf16 receive buffer when the lane has one
+    void* dst = m.bo_fmt != BoWire::F32 ? (void*) m.bo_wire : (void*) m.bo;   // #181 / #183: a narrow wire's own buffer
     cudaMemcpyAsync(dst, sp.hbo, partial_bytes(m, T), cudaMemcpyHostToDevice, m.relay);
     cudaEventRecord(sp.ev_done, m.relay);
     sp.clk_relay.span(sp.tl_relay, "output up", o0, sp.clk_relay.record(m.relay), l);
@@ -1603,7 +1630,8 @@ bool Prefill::carve(size_t T, void* alloc, int64_t kv_end) {
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok); m.bo = o.take<float>(T * N, ok);
-    if (want_bo16()) m.bo16 = o.take<uint16_t>(T * N, ok);   // #181
+    m.bo_fmt = lane_bo_wire();   // #181 / #183: a narrow wire's receive buffer
+    m.bo_wire = m.bo_fmt != BoWire::F32 ? o.take<uint8_t>(bo_wire_bytes(m.bo_fmt, T), ok) : nullptr;
     if (bf16x2_hc()) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
@@ -1908,7 +1936,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     f(T * HC);
     o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
-    if (want_bo16()) o.take<uint16_t>(T * N, ok);   // #181: bo16 (init's order)
+    if (const BoWire f = lane_bo_wire(); f != BoWire::F32) o.take<uint8_t>(bo_wire_bytes(f, T), ok);   // #181 / #183: bo_wire
     if (bf16x2_hc()) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) o.take<uint16_t>(T * N, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
@@ -3450,11 +3478,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (!split_output_up(m, l, T, err)) return false;
                         cudaStreamWaitEvent(m.cs, m.split->ev_done, 0);   // same card: the 4070's routed sum is in bo
                         // #133: + CUDA0's own experts' routed sum + the shared expert
-                        if (m.bo16 != nullptr)   // #181: the partial arrived as bf16
-                            moe_split_finish_bf16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo16, m.bo, T, local_first,
-                                                  m.cs);
-                        else
-                            moe_split_finish(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, local_first, m.cs);
+                        switch (m.bo_fmt) {   // #181 / #183: the wire the partial arrived in
+                            case BoWire::F32:
+                                moe_split_finish(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, local_first, m.cs);
+                                break;
+                            case BoWire::BF16:
+                                moe_split_finish_bf16(m.Dm, m.slot_dev, m.w, m.shared, m.sg,
+                                                      (const uint16_t*) m.bo_wire, m.bo, T, local_first, m.cs);
+                                break;
+                            case BoWire::Q8:
+                                moe_split_finish_q8(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo_wire, m.bo, T,
+                                                    local_first, m.cs);
+                                break;
+                        }
                     } else {
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     }

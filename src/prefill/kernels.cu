@@ -28,6 +28,11 @@ __device__ __forceinline__ float warp_max(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 }
+__device__ __forceinline__ float warp_min(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fminf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
 __device__ __forceinline__ uint16_t bf(float f) {
     uint32_t u = __float_as_uint(f);
     u += 0x7fffu + ((u >> 16) & 1u);
@@ -988,6 +993,11 @@ __device__ __forceinline__ void put_partial(float* p, int64_t i, float v) { p[i]
 __device__ __forceinline__ void put_partial(uint16_t* p, int64_t i, float v) { p[i] = strata::kernels::bf16_from_f32(v); }
 __device__ __forceinline__ float get_partial(const float* p, int64_t i) { return p[i]; }
 __device__ __forceinline__ float get_partial(const uint16_t* p, int64_t i) { return __uint_as_float((uint32_t) p[i] << 16); }
+struct Q8Partial { const uint8_t* q; const float* mn; const float* step; };   // #183: the Q8 wire, viewed
+__device__ __forceinline__ float get_partial(const Q8Partial& p, int64_t i) {
+    const int64_t gi = i / (int64_t) kSplitQ8Group;   // the (token, group) of value i: N is a multiple of the group
+    return __fmaf_rn((float) p.q[i], p.step[gi], p.mn[gi]);
+}
 template <class P>
 __global__ void moe_routed_sum_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                       const float* __restrict__ w, P* __restrict__ out, int64_t T, int32_t lo,
@@ -998,11 +1008,11 @@ __global__ void moe_routed_sum_kernel(const float* __restrict__ Dm, const int32_
 }
 // #133: the 4070's routed partial (in bo) + CUDA0's pairs (rows from lo) + the shared term; written as
 // moe_shared_finish's expression on (bo + local), so with no local pair (local == 0.0f) the bytes are moe_shared_finish's
-// #181: `part` is the 4070's partial - bo itself (fp32, in place) or the bf16 copy it arrived as
+// #181 / #183: `part` is the 4070's partial - bo itself (fp32, in place), or the bf16 or Q8 wire it arrived as
 template <class P>
 __global__ void moe_split_finish_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                         const float* __restrict__ w, const float* __restrict__ shared,
-                                        const float* __restrict__ sg, const P* part, float* bo, int64_t T, int32_t lo) {
+                                        const float* __restrict__ sg, P part, float* bo, int64_t T, int32_t lo) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const float s = get_partial(part, i) + routed_sum(Dm, slot, w, i / N, i % N, lo);
@@ -1036,6 +1046,45 @@ void moe_split_finish_bf16(const float* Dm, const int32_t* slot, const float* w,
     moe_split_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo16, bo, T,
                                                                                     lo);
     check("moe_split_finish_bf16");
+}
+// #183: the routed partial as Q8 - one block per (token, group of kSplitQ8Group): each thread computes its value, the
+// block reduces the group's minimum and maximum, and writes the code round((v - min) / step), step = (max - min) / 255
+constexpr int Q8G = (int) kSplitQ8Group, Q8_GROUPS = N / Q8G;
+static_assert(N % Q8G == 0 && Q8G % 32 == 0 && Q8G <= 1024, "one block of whole warps per group");
+size_t split_q8_bytes(int64_t T) { return (size_t) (T * N) + (size_t) (T * Q8_GROUPS) * 8; }
+__global__ void moe_routed_sum_q8_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                         const float* __restrict__ w, uint8_t* __restrict__ wire, int64_t T, int32_t lo,
+                                         int32_t hi) {
+    __shared__ float smin[Q8G / 32], smax[Q8G / 32];
+    const int64_t t = blockIdx.x / Q8_GROUPS, g = blockIdx.x % Q8_GROUPS, n = g * Q8G + threadIdx.x;
+    const float v = routed_sum(Dm, slot, w, t, n, lo, hi);
+    const float a = warp_min(v), b = warp_max(v);
+    if ((threadIdx.x & 31) == 0) { smin[threadIdx.x >> 5] = a; smax[threadIdx.x >> 5] = b; }
+    // #183: the barrier for smin / smax, and whether the group holds a NaN - min / max skip it and the clamp would
+    // send code 0, a plausible value; a NaN step makes the whole group arrive as NaN instead
+    const bool has_nan = __syncthreads_or(isnan(v)) != 0;
+    float mn = smin[0], mx = smax[0];
+    for (int k = 1; k < Q8G / 32; ++k) { mn = fminf(mn, smin[k]); mx = fmaxf(mx, smax[k]); }
+    const float step = has_nan ? __int_as_float(0x7fc00000) : (mx - mn) / 255.0f;
+    const float q = step > 0.0f ? rintf((v - mn) / step) : 0.0f;
+    wire[t * N + n] = (uint8_t) fminf(fmaxf(q, 0.0f), 255.0f);
+    if (threadIdx.x == 0) {
+        float* meta = (float*) (wire + T * N);   // after the codes: T * Q8_GROUPS minimums, then as many steps
+        meta[blockIdx.x] = mn;                    // blockIdx.x = t * Q8_GROUPS + g
+        meta[T * Q8_GROUPS + blockIdx.x] = step;
+    }
+}
+void moe_routed_sum_q8(const float* Dm, const int32_t* slot, const float* w, uint8_t* wire, int64_t T, void* stream,
+                       int32_t lo, int32_t hi) {
+    moe_routed_sum_q8_kernel<<<(unsigned) (T * Q8_GROUPS), Q8G, 0, (cudaStream_t) stream>>>(Dm, slot, w, wire, T, lo, hi);
+    check("moe_routed_sum_q8");
+}
+void moe_split_finish_q8(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                         const uint8_t* wire, float* bo, int64_t T, int32_t lo, void* stream) {
+    const float* meta = (const float*) (wire + T * N);   // the minimums, then the steps
+    const Q8Partial part{wire, meta, meta + T * Q8_GROUPS};
+    moe_split_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, part, bo, T, lo);
+    check("moe_split_finish_q8");
 }
 void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
     moe_shared_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(shared, sg, bo, T);
