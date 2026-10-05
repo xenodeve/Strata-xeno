@@ -1055,10 +1055,11 @@ if(STRATA_NATIVE_EXPERTS)
       add_executable(xeno_combine_partial_parity tests/xeno/combine_partial_parity.cu)
       target_link_libraries(xeno_combine_partial_parity PRIVATE strata_prefill CUDA::cudart)
       add_test(NAME xeno_combine_partial_parity COMMAND xeno_combine_partial_parity)
-      add_executable(xeno_combine_bf16_parity tests/xeno/combine_bf16_parity.cu)   # #181
+      set_tests_properties(xeno_combine_partial_parity PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1,0")
+      # #181: the split's routed partial as bf16 (one card)
+      add_executable(xeno_combine_bf16_parity tests/xeno/combine_bf16_parity.cu)
       target_link_libraries(xeno_combine_bf16_parity PRIVATE strata_prefill CUDA::cudart)
       add_test(NAME xeno_combine_bf16_parity COMMAND xeno_combine_bf16_parity)
-      set_tests_properties(xeno_combine_partial_parity PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=1,0")
       # #41 gate 3: a Dm frontier writes moe_routed_sum's bytes
       add_executable(xeno_frontier_combine_parity tests/xeno/frontier_combine_parity.cu)
       target_link_libraries(xeno_frontier_combine_parity PRIVATE strata_prefill CUDA::cudart)
