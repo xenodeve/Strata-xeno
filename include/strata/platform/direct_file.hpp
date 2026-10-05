@@ -48,6 +48,15 @@ public:
     static constexpr uint64_t WAKE_TAG = ~0ull;
     void wake();
 
+    /// #185: this thread's own handle and aligned buffer, for a reader called from threads that come and go (a
+    /// prompt tier's stager).  A thread's exit never destroys them: a thread_local's destructor runs inside
+    /// LdrShutdownThread with the Windows loader lock held, and close() joins the issuing threads, whose own exit
+    /// needs that lock.  A thread that ends before the process calls release_this_thread() on its way out (it closes
+    /// the handle and frees the buffer in an ordinary scope); one that does not keeps them to the process's end.
+    static DirectFile& for_this_thread();
+    static void* buffer_for_this_thread(size_t bytes);   ///< aligned, at least `bytes`, kept between calls
+    static void release_this_thread();
+
     /// Allocation helpers for aligned read buffers (page-aligned, never touched by the cache manager).
     static void* alloc_aligned(size_t bytes);
     static void free_aligned(void* p);
