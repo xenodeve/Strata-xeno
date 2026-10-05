@@ -1103,16 +1103,16 @@ template <class Impl>
 bool cuda0_owns(const Impl& m, int64_t l, int32_t e) {
     return m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
 }
+// #181: the bytes of the 4070's routed partial on the wire - bf16 when the lane has its receive buffer, else fp32
+template <class Impl>
+size_t partial_bytes(const Impl& m, int64_t T) { return (size_t) (T * N) * (m.bo16 != nullptr ? 2 : 4); }
+
 /// #32 S4: this MoE layer's routed experts and combine on the 4070 (SplitTier), in two calls (#133): split_send queues
 /// the inputs, the gates and the tables, then the caller
 /// queues CUDA0's own experts and the shared expert on its compute stream, then split_run dispatches the 4070's (its
 /// rows are the ones below `local_first`) -
 /// blocking on the host experts, which the 4070's stager copies to pinned buffers as the loop reaches them.  On
 /// return the 5060's compute stream only has to wait for ev_done before it reads bo.  `order`: the 4070's experts.
-// #181: the bytes of the 4070's routed partial on the wire - bf16 when the lane has its receive buffer, else fp32
-template <class Impl>
-size_t partial_bytes(const Impl& m, int64_t T) { return (size_t) (T * N) * (m.bo16 != nullptr ? 2 : 4); }
-
 template <class Impl>   // Prefill::Impl (private: deduced, not named)
 bool split_send(Impl& m, int64_t l, int64_t T, int64_t chunk_i, const std::vector<int32_t>& order,
                 std::string& err) {

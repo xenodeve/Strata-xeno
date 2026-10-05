@@ -1,7 +1,8 @@
 // #181: the expert split's routed sum crosses the x4 as bf16 (STRATA_SPLIT_BO_BF16=1).  The 4070's
 // moe_routed_sum_bf16 must write exactly bf16-RNE(moe_routed_sum), and the 5060's moe_split_finish_bf16 must write exactly
 // moe_split_finish on the widened values - so the only change to the layer's output is that one rounding, which must
-// stay within bf16's half-ulp of the fp32 path.  Runs on the current device.
+// stay within half a bf16 ulp of the routed partial (relative 2^-8) of the fp32 path.  A NaN partial
+// must cross as a NaN.  Runs on the current device.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/prefill/kernels.hpp"
 
@@ -76,7 +77,7 @@ int main() {
     std::printf("moe_split_finish_bf16 vs moe_split_finish(widened): %zu of %zu differ - %s\n", d2, fin16.size(),
                 d2 == 0 ? "PASS" : "FAIL");
     bad += d2 != 0;
-    // 3. against the fp32 path: the only change is the routed partial's rounding (bf16: relative 2^-9)
+    // 3. against the fp32 path: the only change is the routed partial's rounding (half a bf16 ulp: relative 2^-8)
     cudaMemcpy(dbo, sum.data(), sum.size() * 4, cudaMemcpyHostToDevice);
     strata::prefill::moe_split_finish(dD, dslot, dw, dsh, dsg, dbo, T, R, nullptr);
     std::vector<float> exact((size_t) (T * N));
@@ -84,14 +85,34 @@ int main() {
     size_t off = 0;
     double worst = 0.0;
     for (size_t i = 0; i < exact.size(); ++i) {
-        const double bound = std::ldexp(std::abs((double) sum[i]), -8) + 1e-6;   // one bf16 ulp of the partial
+        const double bound = std::ldexp(std::abs((double) sum[i]), -8) + 1e-6;   // half a bf16 ulp of the partial
         const double e = std::abs((double) fin16[i] - (double) exact[i]);
         worst = std::max(worst, e / (std::abs((double) sum[i]) + 1e-30));
         off += !(e <= bound);
     }
-    std::printf("bf16 path vs fp32 path: %zu beyond one bf16 ulp of the routed partial (worst %.2e relative) - %s\n",
+    std::printf("bf16 path vs fp32 path: %zu beyond half a bf16 ulp of the routed partial (worst %.2e relative) - %s\n",
                 off, worst, off == 0 ? "PASS" : "FAIL");
     bad += off != 0;
+    // 4. a NaN in the partial crosses as a NaN (the add-and-shift rounding turned 0x7FFFFFFF into -0, a plausible
+    //    value that hid it from STRATA_DBG_NAN): token 1's first pair reads a row of NaN, so all its values are NaN
+    {
+        const size_t row = (size_t) slot[(size_t) K];   // pair (token 1, k 0) - below R, so on this card
+        std::vector<float> Dn = Dm;
+        std::fill(Dn.begin() + (ptrdiff_t) (row * N), Dn.begin() + (ptrdiff_t) ((row + 1) * N), std::nanf(""));
+        cudaMemcpy(dD, Dn.data(), Dn.size() * 4, cudaMemcpyHostToDevice);
+        strata::prefill::moe_routed_sum(dD, dslot, dw, ds, T, nullptr, 0, R);
+        strata::prefill::moe_routed_sum_bf16(dD, dslot, dw, ds16, T, nullptr, 0, R);
+        down(sum, ds);
+        down(sum16, ds16);
+        size_t nan32 = 0, nan16 = 0;
+        for (int64_t n = 0; n < N; ++n) {
+            nan32 += std::isnan(sum[(size_t) (N + n)]);
+            nan16 += std::isnan(strata::kernels::f32_from_bf16(sum16[(size_t) (N + n)]));
+        }
+        std::printf("a NaN partial (token 1): fp32 %zu of %lld NaN, bf16 %zu NaN - %s\n", nan32, (long long) N, nan16,
+                    nan32 == (size_t) N && nan16 == (size_t) N ? "PASS" : "FAIL");
+        bad += !(nan32 == (size_t) N && nan16 == (size_t) N);
+    }
     for (void* p : {(void*) dD, (void*) dw, (void*) dsh, (void*) dsg, (void*) dslot, (void*) ds, (void*) dbo, (void*) ds16})
         cudaFree(p);
     const cudaError_t e = cudaGetLastError();

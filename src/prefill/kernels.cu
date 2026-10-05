@@ -1,4 +1,5 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -983,7 +984,8 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 }
 // #181: the split's routed partial travels as fp32 or, with STRATA_SPLIT_BO_BF16, as bf16 (round to nearest even)
 __device__ __forceinline__ void put_partial(float* p, int64_t i, float v) { p[i] = v; }
-__device__ __forceinline__ void put_partial(uint16_t* p, int64_t i, float v) { p[i] = bf(v); }
+// the shared RNE conversion, not bf(): a NaN must cross as a NaN (bf() carries it into -0 or inf)
+__device__ __forceinline__ void put_partial(uint16_t* p, int64_t i, float v) { p[i] = strata::kernels::bf16_from_f32(v); }
 __device__ __forceinline__ float get_partial(const float* p, int64_t i) { return p[i]; }
 __device__ __forceinline__ float get_partial(const uint16_t* p, int64_t i) { return __uint_as_float((uint32_t) p[i] << 16); }
 template <class P>
