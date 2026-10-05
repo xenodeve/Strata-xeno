@@ -79,6 +79,14 @@ void moe_split_finish(const float* D, const int32_t* slot, const float* w, const
                       float* bo, int64_t T, int32_t lo, void* stream);
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
+/// #181 (STRATA_SPLIT_BO_BF16): the routed sum written as bf16, round to nearest even - exactly bf16(moe_routed_sum),
+/// half the bytes over the x4
+void moe_routed_sum_bf16(const float* D, const int32_t* slot, const float* w, uint16_t* s16, int64_t T, void* stream,
+                         int32_t lo = 0, int32_t hi = INT32_MAX);
+/// #181: moe_split_finish with the 4070's partial arriving as bf16 (bo16), written to bo - exactly moe_split_finish on
+/// the widened partial
+void moe_split_finish_bf16(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                           const uint16_t* bo16, float* bo, int64_t T, int32_t lo, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).
