@@ -27,6 +27,7 @@ const SPEED_BY_LENGTH_SESSION = {
     th: "เซสชันเดียว 2026-10-04 โหมด serve บูตเซิร์ฟเวอร์ใหม่ทุกรอบ ทุกความยาวสลับลำดับ Strata-xeno, layer split, peer, peer, layer split, Strata-xeno โมเดล Swift 1.5 Qwen3.8 Flash-Next IQ2_XS เครื่อง Intel Core i5-13500, DDR5 48 GB, RTX 5060 Ti 16 GB (PCIe 4.0 x4) + RTX 4070 SUPER 12 GB (x16 การ์ดจอ), Windows 11",
   },
 };
+const LENGTH_GROUPS: L[] = ["1K", "4K", "32K", "64K", "128K"].map((n) => ({ en: n, th: n }));
 const SPEED_BY_LENGTH_SOURCE = [
   { label: "Issue #165", href: issue(165) },
   { label: "bench/results/2026-10-04-speed-xeno-vs-upstream-0138", href: `${LINKS.fork}/tree/main/bench/results/2026-10-04-speed-xeno-vs-upstream-0138` },
@@ -145,7 +146,7 @@ export const MEASURED: Measured[] = [
       { k: { en: "What was measured", th: "สิ่งที่วัด" }, v: { en: "Prompt tokens read per second, as the server logs it, for one code-agent prompt per length (1,064 / 4,136 / 32,808 / 65,575 / 131,112 tokens of C++ and CUDA source with a task). Mean of two runs.", th: "จำนวนโทเคน prompt ที่อ่านได้ต่อวินาทีตามที่เซิร์ฟเวอร์บันทึก prompt แบบ code-agent หนึ่งชุดต่อความยาว (1,064 / 4,136 / 32,808 / 65,575 / 131,112 โทเคน เป็นซอร์ส C++ และ CUDA พร้อมงานที่สั่ง) ค่าเฉลี่ยสองรอบ" } },
       SPEED_BY_LENGTH_ARMS,
       SPEED_BY_LENGTH_SESSION,
-      { k: { en: "Read it as", th: "อ่านอย่างไร" }, v: { en: "Strata-xeno reads 1K–4K prompts 33–47 % faster than upstream's fastest form. From 32K up, upstream's layer split reads 6.6–12.9 % faster (1,566 / 1,734 / 1,690 against 1,469 / 1,536 / 1,508 tok/s). The two runs of a cell differ by a median of 2.7 %.", th: "Strata-xeno อ่าน prompt 1K–4K เร็วกว่าแบบที่เร็วที่สุดของ upstream 33–47 % ตั้งแต่ 32K ขึ้นไป layer split ของ upstream อ่านเร็วกว่า 6.6–12.9 % (1,566 / 1,734 / 1,690 เทียบกับ 1,469 / 1,536 / 1,508 tok/s) สองรอบของช่องเดียวกันต่างกันโดย median 2.7 %" } },
+      { k: { en: "Read it as", th: "อ่านอย่างไร" }, v: { en: "Strata-xeno reads 1K–4K prompts 33–47 % faster than upstream's fastest form. From 32K up, upstream's layer split reads 6.6–12.9 % faster. The two runs of a cell differ by a median of 2.7 %.", th: "Strata-xeno อ่าน prompt 1K–4K เร็วกว่าแบบที่เร็วที่สุดของ upstream 33–47 % ตั้งแต่ 32K ขึ้นไป layer split ของ upstream อ่านเร็วกว่า 6.6–12.9 % สองรอบของช่องเดียวกันต่างกันโดย median 2.7 %" } },
       { k: { en: "Upstream's own figures", th: "ตัวเลขของ upstream เอง" }, v: { en: "Upstream's table for this model on an RTX 5070 (PCIe 5.0 x16), Ryzen 5 7600, 64 GB is 534 / 1,256 / 2,092 / 1,754 / 1,752 tok/s. Another machine and one-shot runs, so it is context, not a pairing.", th: "ตารางของ upstream สำหรับโมเดลนี้บน RTX 5070 (PCIe 5.0 x16), Ryzen 5 7600, 64 GB คือ 534 / 1,256 / 2,092 / 1,754 / 1,752 tok/s เป็นเครื่องอื่นและรันแบบ one-shot จึงใช้เป็นบริบท ไม่ใช่การเทียบคู่" } },
     ],
     source: SPEED_BY_LENGTH_SOURCE,
@@ -323,13 +324,7 @@ export const CHARTS: Record<ChartId, ChartSpec> = {
     title: { en: "Reading the prompt, by prompt length (tok/s, mean of two runs)", th: "การอ่าน prompt ตามความยาว prompt (tok/s ค่าเฉลี่ยสองรอบ)" },
     unit: "tok/s",
     better: "higher",
-    groups: [
-      { en: "1K", th: "1K" },
-      { en: "4K", th: "4K" },
-      { en: "32K", th: "32K" },
-      { en: "64K", th: "64K" },
-      { en: "128K", th: "128K" },
-    ],
+    groups: LENGTH_GROUPS,
     series: [
       { name: { en: "Strata-xeno", th: "Strata-xeno" }, tone: "mine", values: [416.1, 1021.2, 1469.4, 1536.0, 1508.3] },
       { name: { en: "upstream v0.1.38, layer split", th: "upstream v0.1.38 layer split" }, tone: "theirs", values: [283.8, 767.7, 1565.8, 1733.6, 1690.1] },
@@ -355,13 +350,7 @@ export const CHARTS: Record<ChartId, ChartSpec> = {
     title: { en: "Decode speed, by prompt length (tok/s, mean of two runs)", th: "ความเร็ว decode ตามความยาว prompt (tok/s ค่าเฉลี่ยสองรอบ)" },
     unit: "tok/s",
     better: "higher",
-    groups: [
-      { en: "1K", th: "1K" },
-      { en: "4K", th: "4K" },
-      { en: "32K", th: "32K" },
-      { en: "64K", th: "64K" },
-      { en: "128K", th: "128K" },
-    ],
+    groups: LENGTH_GROUPS,
     series: [
       { name: { en: "Strata-xeno", th: "Strata-xeno" }, tone: "mine", values: [69.2, 72.7, 63.2, 58.0, 62.8] },
       { name: { en: "upstream v0.1.38, layer split", th: "upstream v0.1.38 layer split" }, tone: "theirs", values: [40.4, 40.0, 39.3, 34.8, 37.8] },

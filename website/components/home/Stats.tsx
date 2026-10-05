@@ -33,13 +33,11 @@ function useCountUp(to: number, run: boolean, ms = 1100, decimals = 1) {
 }
 
 type Stat = {
-  id: string;
+  id: ChartId;
   label: L;
   mine: { value: number; unit: string; tag: L };
   theirs: { value: number; tag: L };
   href: string;
-  /** Spans the whole row: a chart with several groups needs the width. */
-  wide?: boolean;
 };
 
 const STATS: Stat[] = [
@@ -63,7 +61,6 @@ const STATS: Stat[] = [
     mine: { value: 62.8, unit: "tok/s", tag: { en: "Strata-xeno", th: "Strata-xeno" } },
     theirs: { value: 46.9, tag: { en: "upstream v0.1.38, fastest (peer tier)", th: "upstream v0.1.38 ที่เร็วที่สุด (ชั้น peer)" } },
     href: "/details#v038-len-decode",
-    wide: true,
   },
 ];
 
@@ -72,7 +69,7 @@ function StatCard({ s, k }: { s: Stat; k: number }) {
   const mine = useCountUp(s.mine.value, seen);
   const theirs = useCountUp(s.theirs.value, seen);
   return (
-    <Reveal i={k} className={s.wide ? "stat stat--wide" : "stat"}>
+    <Reveal i={k} className={CHARTS[s.id].groups.length > 2 ? "stat stat--wide" : "stat"}>
       <div ref={ref}>
         <p className="mono stat__label">
           <T v={s.label} />
@@ -93,7 +90,7 @@ function StatCard({ s, k }: { s: Stat; k: number }) {
             </small>
           </div>
         </div>
-        <Chart spec={CHARTS[s.id as ChartId]} compact />
+        <Chart spec={CHARTS[s.id]} compact />
         <Link className="stat__link" href={s.href}>
           <T v={{ en: "Full conditions", th: "เงื่อนไขทั้งหมด" }} /> <span aria-hidden="true">→</span>
         </Link>
@@ -108,7 +105,7 @@ export function Stats() {
       <div className="wrap">
         <Reveal as="header" className="shead shead--center">
           <h2 id="numbers-title" className="h2">
-            <SlideUpText v={{ en: "Three numbers,", th: "สามตัวเลข" }} />{" "}
+            <SlideUpText v={{ en: "The numbers,", th: "ตัวเลข" }} />{" "}
             <HighlightedText delay={400}>
               <SlideUpText v={{ en: "with their conditions.", th: "พร้อมเงื่อนไข" }} delay={120} />
             </HighlightedText>

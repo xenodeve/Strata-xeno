@@ -65,13 +65,7 @@ Two runs per arm, in the order D2x, layer split, peer, peer, layer split, D2x at
 **Strata-xeno leads output at every length**, by 30-45 % over upstream's faster form there (+ peer) and 61-82 % over
 its layer split. **It also leads prompt reading at 1K-4K**, by 33-47 % over the layer split.
 
-**Upstream's layer split reads long prompts faster:**
-
-| | 32K | 64K | 128K |
-| --- | ---: | ---: | ---: |
-| upstream, layer split | 1,566 | 1,734 | 1,690 |
-| Strata-xeno D2x | 1,469 | 1,536 | 1,508 |
-| upstream ahead by | 6.6 % | 12.9 % | 12.1 % |
+**Upstream's layer split reads long prompts faster:** by 6.6 / 12.9 / 12.1 % at 32K / 64K / 128K.
 
 A likely reason, not measured: the D2x prompt path splits the experts across the two cards and the 5060 Ti reads its
 share over the x4 link, while the layer split gives each card whole layers.
