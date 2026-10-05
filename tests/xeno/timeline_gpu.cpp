@@ -120,6 +120,12 @@ int main() {
         cudaStreamSynchronize(c);
         cudaStreamSynchronize(s);
         clk.resolve(true);
+        // and once both spans are resolved: the free list holds each event once (two span() calls sharing the middle
+        // event failed exactly here, with the same event returned twice)
+        cudaEvent_t p = clk.record(s), q = clk.record(s), r = clk.record(s), u = clk.record(s);
+        CHECK(p != q && p != r && p != u && q != r && q != u && r != u, "no event handed out twice after a full resolve");
+        cudaStreamSynchronize(s);
+        clk.resolve(true);
         cudaFree(big);
     }
     cudaFree(buf);

@@ -209,7 +209,8 @@ def prefill_report(tl: Timeline, top: int = 15) -> list[dict]:
     copy_lanes = tl.lanes_like("copy engine")
     # #178: CUDA0's compute lanes of the prompt path, one per wave lane ("gpu0 compute (prefill)", "... (prefill, lane 2)";
     # the 4070's "(prefill split...)" lanes are not CUDA0's).  A run takes the lane of its own wave lane: the run on a
-    # "prompt wave lane" thread is lane 2.  (Matching "compute (prefill)" alone dropped lane 2 and gave its run lane 1's.)
+    # "prompt wave lane 2" thread is lane 2 - both carry the engine's lane tag "lane 2" (prefill.cpp: name_thread and
+    # lane_tag).  (Matching "compute (prefill)" alone dropped lane 2 and gave its run lane 1's.)
     gpu0_compute = [ln for ln in tl.lanes_like("compute (prefill") if "split" not in ln]
     compute_of = {second: [ln for ln in gpu0_compute if ("lane 2" in ln) == second] for second in (False, True)}
     # #178: each copy matches its own issuer's span - the 4070 split issuer's "split issue host", the others' "copy
@@ -223,7 +224,7 @@ def prefill_report(tl: Timeline, top: int = 15) -> list[dict]:
 
     out = []
     for run in tl.find("prefill run"):
-        compute_lanes = compute_of["wave lane" in run.lane]
+        compute_lanes = compute_of["lane 2" in run.lane]
         copies = sorted((s for ln in copy_lanes for s in tl.overlapping(ln, run.t0, run.t1)
                          if s.name.startswith("copy ")), key=lambda s: s.t0)
         r: dict = {"t0_ms": run.t0, "wall_ms": run.dur, "tokens": run.a, "copies": len(copies),
