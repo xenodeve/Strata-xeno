@@ -981,21 +981,29 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
     check("gather_rows16");
 }
+// #181: the split's routed partial travels as fp32 or, with STRATA_SPLIT_BO_BF16, as bf16 (round to nearest even)
+__device__ __forceinline__ void put_partial(float* p, int64_t i, float v) { p[i] = v; }
+__device__ __forceinline__ void put_partial(uint16_t* p, int64_t i, float v) { p[i] = bf(v); }
+__device__ __forceinline__ float get_partial(const float* p, int64_t i) { return p[i]; }
+__device__ __forceinline__ float get_partial(const uint16_t* p, int64_t i) { return __uint_as_float((uint32_t) p[i] << 16); }
+template <class P>
 __global__ void moe_routed_sum_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
-                                      const float* __restrict__ w, float* __restrict__ out, int64_t T, int32_t lo,
+                                      const float* __restrict__ w, P* __restrict__ out, int64_t T, int32_t lo,
                                       int32_t hi) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
-    out[i] = routed_sum(Dm, slot, w, i / N, i % N, lo, hi);
+    put_partial(out, i, routed_sum(Dm, slot, w, i / N, i % N, lo, hi));
 }
 // #133: the 4070's routed partial (in bo) + CUDA0's pairs (rows from lo) + the shared term; written as
 // moe_shared_finish's expression on (bo + local), so with no local pair (local == 0.0f) the bytes are moe_shared_finish's
+// #181: `part` is the 4070's partial - bo itself (fp32, in place) or the bf16 copy it arrived as
+template <class P>
 __global__ void moe_split_finish_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                         const float* __restrict__ w, const float* __restrict__ shared,
-                                        const float* __restrict__ sg, float* __restrict__ bo, int64_t T, int32_t lo) {
+                                        const float* __restrict__ sg, const P* part, float* bo, int64_t T, int32_t lo) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
-    const float s = bo[i] + routed_sum(Dm, slot, w, i / N, i % N, lo);
+    const float s = get_partial(part, i) + routed_sum(Dm, slot, w, i / N, i % N, lo);
     bo[i] = s + shared[i] * sigm(sg[i / N]);
 }
 __global__ void moe_shared_finish_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
@@ -1010,10 +1018,22 @@ void moe_routed_sum(const float* Dm, const int32_t* slot, const float* w, float*
     moe_routed_sum_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, s, T, lo, hi);
     check("moe_routed_sum");
 }
+void moe_routed_sum_bf16(const float* Dm, const int32_t* slot, const float* w, uint16_t* s16, int64_t T, void* stream,
+                         int32_t lo, int32_t hi) {
+    moe_routed_sum_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, s16, T, lo, hi);
+    check("moe_routed_sum_bf16");
+}
 void moe_split_finish(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
                       float* bo, int64_t T, int32_t lo, void* stream) {
-    moe_split_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, lo);
+    moe_split_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg,
+                                                                                    (const float*) bo, bo, T, lo);
     check("moe_split_finish");
+}
+void moe_split_finish_bf16(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                           const uint16_t* bo16, float* bo, int64_t T, int32_t lo, void* stream) {
+    moe_split_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo16, bo, T,
+                                                                                    lo);
+    check("moe_split_finish_bf16");
 }
 void moe_shared_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
     moe_shared_finish_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(shared, sg, bo, T);
