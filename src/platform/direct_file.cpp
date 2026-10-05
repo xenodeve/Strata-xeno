@@ -365,4 +365,30 @@ int DirectFile::wait(Completion* out, int max, int timeout_ms) {
 }
 #endif
 
+namespace {
+// #185: trivially destructible on purpose - no destructor runs at thread exit (see for_this_thread)
+struct ThreadReader { DirectFile* file; void* buf; size_t bytes; };
+thread_local ThreadReader t_reader{nullptr, nullptr, 0};
+}  // namespace
+
+DirectFile& DirectFile::for_this_thread() {
+    if (t_reader.file == nullptr) t_reader.file = new DirectFile();
+    return *t_reader.file;
+}
+
+void* DirectFile::buffer_for_this_thread(size_t bytes) {
+    if (t_reader.bytes < bytes) {
+        free_aligned(t_reader.buf);
+        t_reader.buf = alloc_aligned(bytes);
+        t_reader.bytes = t_reader.buf != nullptr ? bytes : 0;
+    }
+    return t_reader.buf;
+}
+
+void DirectFile::release_this_thread() {
+    delete t_reader.file;   // close() joins its issuing threads here, on the live thread, not under the loader lock
+    free_aligned(t_reader.buf);
+    t_reader = ThreadReader{nullptr, nullptr, 0};
+}
+
 }  // namespace strata::platform

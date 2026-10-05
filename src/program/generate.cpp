@@ -4519,7 +4519,8 @@ int main(int argc, char** argv) {
         const bool have_tail = setup_tail_file(g_tail, arena_src, at_slot, excl_keep_from, o.pack, o.native_preset, te);
         if (have_tail) {
             // the prompt path's stager reads a lent tail expert from the file too: one aligned read per expert, per
-            // stager thread its own handle and bounce (the stager's threads live for the process)
+            // stager thread its own handle and bounce (DirectFile::for_this_thread; #185: a stager thread ends with
+            // its prompt tier and releases them on its way out)
             g_tail.slot_of_pair.assign((size_t) (g.n_layers * g.n_expert), -1);
             for (size_t k = 0; k < at_slot.size(); ++k)
                 if (at_slot[k].first >= 0)
@@ -4529,12 +4530,11 @@ int main(int argc, char** argv) {
             arena_src.set_tail_reader([ne](int64_t l, int64_t e, uint8_t* dst) -> bool {
                 const int32_t slot = g_tail.slot_of_pair[(size_t) (l * ne + e)];
                 if (slot < 0) return false;
-                thread_local strata::platform::DirectFile f;
-                thread_local uint8_t* bounce = nullptr;
+                strata::platform::DirectFile& f = strata::platform::DirectFile::for_this_thread();
                 std::string e2;
                 // one read in flight per stager thread (read_slot): one issuer, not a pool of idle ones (#139)
                 if (!f.is_open() && !f.open(g_tail.path, e2, 1)) return false;
-                if (bounce == nullptr) bounce = (uint8_t*) strata::platform::DirectFile::alloc_aligned((size_t) g_tail.stride);
+                auto* bounce = (uint8_t*) strata::platform::DirectFile::buffer_for_this_thread((size_t) g_tail.stride);
                 if (bounce == nullptr || !g_tail.read_slot(f, slot, bounce, e2)) return false;
                 std::memcpy(dst, bounce, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
                 return true;
@@ -6757,8 +6757,23 @@ int main(int argc, char** argv) {
         {
             const char* ws = std::getenv("STRATA_WATCHDOG_S");
             const int limit = ws ? std::atoi(ws) : 60;   // one step (a prompt layer, a verify window) takes seconds
+            // #185: nothing the watchdog runs after a stall may keep the engine alive - the report loads dbghelp, the
+            // release calls CUDA and abort exits through ExitProcess, and a thread stuck under the loader lock blocks
+            // all three forever.  So a second thread, started now (a thread created after the stall would itself wait
+            // for that lock before running), sleeps on an event and ends the process with TerminateProcess, which takes
+            // no lock, 20 s after the watchdog sets it.  It prints nothing: the stall's own line is already in the log.
+            void* stalled = nullptr;   // the deadline thread's event (Windows)
+#if defined(_WIN32)
+            if (limit > 0) stalled = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (stalled)
+                std::thread([stalled] {
+                    WaitForSingleObject(stalled, INFINITE);
+                    Sleep(20000);
+                    TerminateProcess(GetCurrentProcess(), 3);
+                }).detach();
+#endif
             if (limit > 0)
-                std::thread([limit] {
+                std::thread([limit, stalled] {
                     strata::core::Progress& p = strata::core::progress();
                     uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                     auto since = std::chrono::steady_clock::now();
@@ -6768,6 +6783,11 @@ int main(int argc, char** argv) {
                         const uint64_t b = p.beats.load();
                         if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; continue; }
                         if (now - since < std::chrono::seconds(limit)) continue;
+#if defined(_WIN32)
+                        if (stalled) SetEvent(stalled);   // #185: first - the deadline thread above ends it from here
+#else
+                        (void) stalled;
+#endif
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
                                              "the engine so the server starts it again (issue #29)\n",
                                      limit, stage_text().c_str());
