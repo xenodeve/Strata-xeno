@@ -246,6 +246,9 @@ blueprint and checkpoint:
 - **What is left:** refused combinations, opt-in features not measured, follow-up issues.
 - **The classic web app:** what changed in upstream's own web app (`serve/web/`, kept untouched and served at `/classic/`) and
   needs porting to the new one (`serve/ui/`), or "nothing changed" (xeno #67).
+- **The README:** `README.md` is the fork's own (#166). On a conflict keep ours, and carry upstream's user-facing
+  changes into it by hand: a new requirement, an install step, a model, a fixed problem. Do not carry upstream's speed
+  figures; that machine is not this one. Bump "last merged" to the new version, or say "README unchanged".
 
 Link the report from the merge's tracking issue and from `docs/BLUEPRINT.md`'s revision log, and commit it on the merge
 branch. A merge without this report is not finished.

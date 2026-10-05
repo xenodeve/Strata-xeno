@@ -1,185 +1,199 @@
-<h1 align="center">Strata</h1>
+<h1 align="center">Strata-xeno</h1>
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+<p align="center"><b>A fork of <a href="https://github.com/Niko1221/Strata">Strata</a> tuned for two graphics cards and
+for coding agents like Claude Code</b><br>
+Qwen3.8-Flash-Next (125B parameters) on a gaming PC · NVIDIA · Windows · free and open source</p>
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+<p align="center"><a href="https://strata-xeno-website.vercel.app">Website</a> ·
+<a href="bench/results/2026-10-04-speed-xeno-vs-upstream-0138/README.md">Benchmarks</a> ·
+<a href="docs/BLUEPRINT.md">Blueprint</a> · <a href="https://github.com/Niko1221/Strata">Upstream Strata</a></p>
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
-normally needs a server - on a normal PC. It chats, writes code, reads pictures and works with your apps and coding
-agents, and nothing leaves your PC.
+**Strata is [Niko1221](https://github.com/Niko1221/Strata)'s work.** It runs
+[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), a large mixture-of-experts model that normally
+needs a server, on one graphics card plus system RAM.
+
+**Strata-xeno** follows upstream (last merged: v0.1.38) and changes it for one goal: **the lowest latency in a real
+coding-agent turn** on a PC with two cards. Those turns are a long cached conversation, then short new parts and
+answers. The fork changes:
+- how the experts are spread over the GPUs and RAM;
+- how prompts are read across two cards;
+- what the server does for Claude Code;
+- the web app.
+
+Every speed figure below is measured on the fork's own PC, with the conditions next to it.
 
 ## How fast is it?
 
-Measured on two ordinary gaming PCs. "Writes answers" is how fast the reply appears in a short chat; "reads your
-prompt" is how fast it takes in what you send (a 32K-token document, code or chat history). A token is about ¾ of a
-word, so 60 tokens per second is faster than you can read.
+Measured against **upstream v0.1.38 run with its own settings**: the flags its `setup.py` writes, in its two two-GPU
+forms. The setup:
+- one PC, one session, two runs per arm in alternating order;
+- Swift 1.5 IQ2_XS;
+- one code-agent prompt per length, 256 output tokens, greedy, with the MTP draft layer.
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+The PC is an Intel Core i5-13500 with 48 GB DDR5, an RTX 5060 Ti 16 GB (PCIe 4.0 x4) and an RTX 4070 SUPER 12 GB (x16,
+the display card), on Windows 11.
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
+**Reads your prompt** (tokens/s)
 
-</td><td>
+| | 1K | 4K | 32K | 64K | 128K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **Strata-xeno** | **416** | **1,021** | 1,469 | 1,536 | 1,508 |
+| upstream v0.1.38, layer split | 284 | 768 | **1,566** | **1,734** | **1,690** |
+| upstream v0.1.38, peer tier | 212 | 605 | 1,055 | 1,073 | 1,048 |
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
+**Writes answers** (tokens/s)
 
-</td></tr>
-</table>
+| | 1K | 4K | 32K | 64K | 128K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **Strata-xeno** | **69.2** | **72.7** | **63.2** | **58.0** | **62.8** |
+| upstream v0.1.38, layer split | 40.4 | 40.0 | 39.3 | 34.8 | 37.8 |
+| upstream v0.1.38, peer tier | 53.2 | 50.0 | 46.1 | 44.2 | 46.9 |
 
-A card with more VRAM is faster: an RTX 3090 (24 GB) should write roughly 100-140 tokens per second. Long chats,
-other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size), [community results](docs/COMMUNITY_BENCHMARKS.md).
+- **Answers are 30-45 % faster at every length** than upstream's fastest form here.
+- **Short prompts are read 33-47 % faster.** Short prompts are what an agent sends after its first turn.
+- **Upstream's layer split reads long prompts (32K and up) 6.6-12.9 % faster,** in both runs at every one of those
+  lengths. That is where the fork is still behind.
+- **In Claude Code's own request shape** ([#163](https://github.com/xenodeve/Strata-xeno/issues/163)), the fork reads six follow-up turns in 11.1 s against upstream's best
+  13.2 s, and answers at 71.7 tokens/s against 72.3 (a tie with the peer tier).
+- **It needs less RAM.** In that session the fork's server peaked at a 23.7 GiB working set, and upstream's
+  at 36.9-39.8 GiB. Upstream's settings keep every expert in RAM, and they ran this 48 GB PC out of free RAM: the
+  lowest free RAM was 0.01-0.6 GB, against the fork's 15.3 GB. That was one run per arm, sampled every 10 s, so the
+  peaks are approximate.
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
+Every run, the flags of each arm, draft acceptance and what was not measured:
+[bench/results/2026-10-04-speed-xeno-vs-upstream-0138](bench/results/2026-10-04-speed-xeno-vs-upstream-0138/README.md).
+Earlier comparisons and every lever tried: [docs/reports/](docs/reports/).
+
+## What it adds over upstream
+
+**Engine** (C++/CUDA):
+- **Dynamic experts.** An expert a GPU owns has no copy in RAM, and the model starts by placing experts on the cards
+  first. That is the likely source of the RAM saving; no run isolates it.
+- **A second-GPU expert tier.** The second card holds its own experts and runs them during decode, one CUDA graph per
+  layer. It swaps experts in pairs and keeps a free-VRAM floor so the display card stays usable.
+- **Prompt reading on two cards:** an expert split and a two-lane wave. The second card computes the experts it owns
+  while the first runs the rest.
+- **The engine's own speed work:**
+  - KV streaming tuned for depth;
+  - short prompt parts read through the decode path;
+  - checkpoints written off the critical path;
+  - a CPU pool that rests between rounds;
+  - AVX-VNNI CPU kernels for Q2_0 experts.
+- **Capacity mode** for models larger than RAM: a bounded RAM cache with the NVMe behind it.
+- **Thai in the draft vocabulary,** so Thai answers are drafted ahead too.
+
+**Server and app** (Python, React):
+- **For Claude Code:**
+  - Anthropic Messages API additions;
+  - request priority, and a separate cache slot for side requests, so they do not evict the main conversation's
+    cache;
+  - a loop guard and a thinking budget.
+- **A new web app at `/`:** Chat, Dashboard, Live, Requests, Hardware and Settings, with a full Thai interface. The
+  classic app stays at `/classic/`.
+- **Agent tooling:**
+  - coding tools named as in Claude Code, with its permission rules, hooks, sub-agents and rewind;
+  - projects with several folders;
+  - MCP and skills imported from your other coding apps.
+
+**Measurement:**
+- `STRATA_TIMELINE` records the whole pipeline in one run;
+- an ABBA runner pairs arms in one session;
+- a blueprint of the system is checked at commit time.
+
+The full list, each item with its code and tests: [the website's register](https://strata-xeno-website.vercel.app/details).
 
 ## What you need
 
-| | |
-| --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series - with **12 GB of VRAM or more** |
-| **RAM** | 32 GB or more - how much decides [which model](#which-model-should-i-pick) fits; 64 GB runs every size |
-| **Disk** | about 80 GB free, on an SSD if you can (the first start is much faster) |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD |
+The fork is developed and measured on **NVIDIA, Windows 11, two cards**. Upstream's requirements are the floor:
+- an RTX 20-50 series card with 12 GB of VRAM or more;
+- 48 GB of RAM for IQ2_XS;
+- about 80 GB of free disk on an SSD.
 
-Everything else is installed for you. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+Full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+
+One card works. The second-GPU tier and the two-card prompt path need a second NVIDIA card.
+
+AMD and Linux support comes from upstream's code. The fork has not built, measured or tested it.
 
 ## Install
 
-### Let your AI set it up
-
-Use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
-
 ```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+git clone https://github.com/xenodeve/Strata-xeno
+cd Strata-xeno
+START-HERE.bat --build        (Linux: ./setup.sh --build)
 ```
 
-It checks your graphics card, RAM and disk, picks the model that fits, installs it, starts it and tells you how to
-connect your apps. AI tools can also install, start and stop Strata themselves through its
-[MCP server](docs/MCP_SERVER.md).
+**`--build` matters.** Without it, setup downloads **upstream's** ready-made engine
+(`PREBUILT_URL` in `setup.py`), which has none of the fork's engine changes. You would get the fork's server and app
+on upstream's engine. With `--build`:
+- setup installs the build tools if they are missing (Visual Studio Build Tools + CUDA Toolkit on Windows; it asks
+  first);
+- it compiles the engine from this checkout, which takes 20-40 minutes once.
 
-### Or do it yourself
+The fork itself is built with VS2022, CUDA 13.3 and Ninja ([docs/BLUEPRINT.md](docs/BLUEPRINT.md)). The `--build`
+path through setup has not been run end to end on a fresh PC for the fork.
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
+Setup asks which model to use and writes `strata-<model>.json`. **The two-card profile is not written by setup.** The
+fork's served configuration ("D2x") adds flags to that file's `args`, among them:
+- `--secondary-expert-mib 6400`, `--exclusive-primary-experts`;
+- `--adapt-swaps 8 --adapt-every 1`, `--pcie-frac 0`;
+- `--short-read 256`, `--kv-resident 65536`.
 
-The same steps for NVIDIA and AMD: the installer finds your card and sets up the right engine for it. It asks which
-model, which size, how much context (how much text it keeps in mind) and whether it should read pictures - press
-Enter each time for the recommended answer. Then it downloads the model (~70 GB; you can stop and it continues where
-it left off) and starts it. Your browser opens the Strata app at `http://127.0.0.1:8080`.
+It also sets these in the environment:
+- `STRATA_PREFILL_EXPERT_SPLIT=1`, `STRATA_PREFILL_WAVE=1`, `STRATA_PREFILL_SPLIT_MIN=256`;
+- `CUDA_VISIBLE_DEVICES`, with the primary card as device 0.
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time): Strata
-> loads 35-55 GB into your RAM and locks part of it for the graphics card. That's normal - wait, and don't close the
-> window. The window tells you what it is doing.
+Do not list both cards in the config's `gpu` field: that makes the server add `--layer-split`. Every flag of the
+measured profile is in the [benchmark's matrix](bench/results/2026-10-04-speed-xeno-vs-upstream-0138/matrix.json)
+(arm `d2x`).
 
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again: it starts right away, nothing is downloaded twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option:
-[docs/INSTALL.md](docs/INSTALL.md).
-
-## Which model should I pick?
-
-The installer recommends one for your RAM. The same model comes in sizes that are compressed more or less: smaller
-is faster, larger is a bit smarter.
-
-| Your RAM | Take | Why |
-| --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best, and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's 4-bit (experimental) | room for the largest sizes with everything else open |
-
-- **[Coder](docs/MODELS.md#coder)** - a coding version with half of the experts removed: 91% of the full model's
-  SWE-bench Verified score (by its authors), fits 32 GB of RAM. Weaker outside code, including Chinese and other
-  CJK text (#438): for those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15)** - a fine-tune that thinks much shorter before it answers, so you get the
-  answer sooner, at about the same quality.
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental) - the closest to the full
-  model, but most of it is read from the SSD while it answers: 7-8.5 tokens/s on a 64 GB PC.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** - a manual setup, not in the
-  installer's menu.
-
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). You can add another model later with
-`SETUP.bat` (Linux: `./setup.sh --setup`).
+Models, sizes and what fits in how much RAM are unchanged from upstream: [docs/MODELS.md](docs/MODELS.md).
 
 ## Using it
 
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
+- **In the browser:** `http://127.0.0.1:8080` opens the web app.
+- **Claude Code:** `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`. Other apps that use Anthropic's API:
+  `http://127.0.0.1:8080/v1/messages`.
+- **OpenAI-compatible apps:** base URL `http://127.0.0.1:8080/v1`, any API key and any model name.
+- **Thinking:** off, low, medium or high, in the chat menu or as your app's "reasoning effort".
+- **From another device:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always use a key.
+- **It answers one request at a time.** A conversation's first prompt is read in full; follow-ups reuse the cached
+  part.
 
-- **In the browser:** `http://127.0.0.1:8080` - **Chat**, a live **Monitor** of the model and your GPU/CPU/RAM, and
-  **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with base URL **`http://127.0.0.1:8080/v1`**,
-  any API key and any model name. Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-  `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or your app's "reasoning effort". Off is
-  fastest; high is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup, then click **Picture** in the chat, or attach them in your app
-  (AMD cards: on Linux through the processor, not on Windows yet).
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>` - always with a key.
-- **Good to know:** it answers one request at a time. The first message of a chat is read in full (about 1 minute
-  per 30,000 tokens); follow-ups start in seconds.
-
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
+More: [the API and every setting](docs/DETAILS.md#using-it), [where chats are stored](docs/INSTALL.md#where-things-are-stored).
 
 ## Something went wrong?
 
-- **My PC froze the first time Strata started.** Normal while it loads the model: wait, don't close the window.
-  Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again: it continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or "the engine stopped unexpectedly".** Not enough free RAM:
-  close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running - look for its window.
+- **The PC freezes while the model loads.** That is normal for 1-3 minutes, longest the first time.
+- **It is very slow and the disk light keeps blinking.** Not enough free RAM. Close other programs, or pick a smaller
+  size.
+- **Port 8080 is already in use.** Strata is already running.
 
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder.
+More: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
-## How does it work?
+Where to report a problem:
+- **The fork's code** (the server, the app, the two-card engine paths): [this repository's
+  issues](https://github.com/xenodeve/Strata-xeno/issues).
+- **Something that also happens on upstream Strata:** [upstream's issues](https://github.com/Niko1221/Strata/issues).
 
-Models like this one normally run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes it fit by **sharing the work across your whole PC** - like a kitchen, where the things you use
-all the time stay on the counter and the rest waits in the pantry.
+## For developers and coding agents
 
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
-
-- **The model is a team of 24,576 small specialists ("experts"),** and each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are asked most often; **your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
-
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
-
-- **Guess, then check:** a small helper guesses the next few words and the big model checks them all at once, so
-  you get the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time): over 1,000 tokens per second.
-
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers: [the
-details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+- **[AGENTS.md](AGENTS.md):** the rules. Lowest latency first, root causes, a measured win before anything becomes a
+  default, and an issue for every PR.
+- **[docs/BLUEPRINT.md](docs/BLUEPRINT.md):** how the engine and the server fit together, and every configuration
+  surface.
+- **[docs/reports/](docs/reports/):** every finding, and a report per upstream merge.
+- **[bench/results/](bench/results/):** measurements with their raw rows.
+- **How the engine works** (upstream's): [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md),
+  [docs/DETAILS.md](docs/DETAILS.md) and [the paper](docs/paper/Strata-Paper.pdf).
 
 ## Credits and license
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team, compressed by
-[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5) and Unsloth;
-Strata is built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE); a few
-parts and every model carry their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
+**Strata** is the work of [Niko1221](https://github.com/Niko1221/Strata) and its contributors, under the
+[MIT License](LICENSE); Strata-xeno is a fork of it under the same license. If Strata runs well for you, you can
+support its author: [buymeacoffee.com/strataengine](https://buymeacoffee.com/strataengine).
 
-## Support Strata
-
-Strata is free and open source. If it is useful to you, you can support its development:
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It is compressed by
+[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5) and Unsloth.
+Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). A few parts and every model carry
+their own licenses: [which ones](docs/HOW_IT_WORKS.md#license).

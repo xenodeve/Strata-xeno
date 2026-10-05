@@ -1,6 +1,6 @@
 import type { ChartSpec } from "@/components/charts/Chart";
 import type { L } from "@/lib/i18n";
-import { issue, pr } from "./sources";
+import { issue, LINKS, pr } from "./sources";
 
 export type Measured = {
   id: string;
@@ -11,6 +11,27 @@ export type Measured = {
   conditions: { k: L; v: L }[];
   source: { label: string; href: string }[];
 };
+
+/** The arms and the session of the two speed-by-length cards (#165), written once. */
+const SPEED_BY_LENGTH_ARMS = {
+  k: { en: "Arms", th: "ฝั่งที่เทียบ" },
+  v: {
+    en: "Strata-xeno as served (D2x: the 4070 as an expert tier and a split of the prompt path). Upstream v0.1.38, a pristine build, with the flags its own setup.py writes for this model (profile, expert cache auto, prefill auto, spec 4, int8 KV, 262,144-token context with KV streaming at 32,768) in its two two-GPU forms: its layer split, with 2,560 MiB of VRAM kept free to protect the display card; and the second GPU as its peer expert tier (no P2P between these cards, so its prompt path stays on the primary; STRATA_ARENA_PIN_GIB=8, without which the peer failed to start). Same pack, same draft layer. No layer or expert is read from the SSD in Strata-xeno's runs (every log: nvme loads 0).",
+    th: "Strata-xeno ตามที่ serve อยู่ (D2x: 4070 เป็นชั้น expert และแบ่งงานอ่าน prompt) เทียบกับ upstream v0.1.38 ที่ build ใหม่โดยไม่แก้ ใช้ flag ที่ setup.py ของมันเขียนให้โมเดลนี้ (profile, expert cache auto, prefill auto, spec 4, KV int8, context 262,144 โทเคนพร้อม KV streaming ที่ 32,768) ในสองแบบที่ใช้สอง GPU: layer split ที่กัน VRAM ว่างไว้ 2,560 MiB เพื่อรักษาการ์ดจอ และ GPU ที่สองเป็นชั้น expert แบบ peer (การ์ดคู่นี้ไม่มี P2P การอ่าน prompt จึงอยู่บนการ์ดหลัก; STRATA_ARENA_PIN_GIB=8 ถ้าไม่ตั้ง peer เริ่มไม่ขึ้น) pack และ draft layer เดียวกัน ในการรันของ Strata-xeno ไม่มี layer หรือ expert ใดถูกอ่านจาก SSD (ทุก log: nvme loads 0)",
+  },
+};
+const SPEED_BY_LENGTH_SESSION = {
+  k: { en: "Session", th: "เซสชัน" },
+  v: {
+    en: "One session on 2026-10-04, serve mode, a fresh server boot for every run; at each length the arms in the order Strata-xeno, layer split, peer, peer, layer split, Strata-xeno. Swift 1.5 Qwen3.8 Flash-Next IQ2_XS. Intel Core i5-13500, 48 GB DDR5, RTX 5060 Ti 16 GB (PCIe 4.0 x4) + RTX 4070 SUPER 12 GB (x16, the display), Windows 11.",
+    th: "เซสชันเดียว 2026-10-04 โหมด serve บูตเซิร์ฟเวอร์ใหม่ทุกรอบ ทุกความยาวสลับลำดับ Strata-xeno, layer split, peer, peer, layer split, Strata-xeno โมเดล Swift 1.5 Qwen3.8 Flash-Next IQ2_XS เครื่อง Intel Core i5-13500, DDR5 48 GB, RTX 5060 Ti 16 GB (PCIe 4.0 x4) + RTX 4070 SUPER 12 GB (x16 การ์ดจอ), Windows 11",
+  },
+};
+const LENGTH_GROUPS: L[] = ["1K", "4K", "32K", "64K", "128K"].map((n) => ({ en: n, th: n }));
+const SPEED_BY_LENGTH_SOURCE = [
+  { label: "Issue #165", href: issue(165) },
+  { label: "bench/results/2026-10-04-speed-xeno-vs-upstream-0138", href: `${LINKS.fork}/tree/main/bench/results/2026-10-04-speed-xeno-vs-upstream-0138` },
+];
 
 export const MEASURED: Measured[] = [
   {
@@ -112,6 +133,42 @@ export const MEASURED: Measured[] = [
       { label: "Issue #136", href: issue(136) },
     ],
   },
+  {
+    id: "v038-len-prompt",
+    label: { en: "Reading the prompt by length, against upstream v0.1.38", th: "การอ่าน prompt ตามความยาว เทียบกับ upstream v0.1.38" },
+    figures: [
+      { value: "1,021", unit: "tok/s", caption: { en: "Strata-xeno, 4K prompt", th: "Strata-xeno prompt 4K" } },
+      { value: "768", unit: "tok/s", caption: { en: "upstream v0.1.38, its fastest form at 4K (layer split)", th: "upstream v0.1.38 แบบที่เร็วที่สุดที่ 4K (layer split)" } },
+      { value: "1,508", unit: "tok/s", caption: { en: "Strata-xeno, 128K prompt", th: "Strata-xeno prompt 128K" } },
+      { value: "1,690", unit: "tok/s", caption: { en: "upstream v0.1.38, layer split, 128K: ahead here", th: "upstream v0.1.38 layer split ที่ 128K: เร็วกว่าที่นี่" } },
+    ],
+    conditions: [
+      { k: { en: "What was measured", th: "สิ่งที่วัด" }, v: { en: "Prompt tokens read per second, as the server logs it, for one code-agent prompt per length (1,064 / 4,136 / 32,808 / 65,575 / 131,112 tokens of C++ and CUDA source with a task). Mean of two runs.", th: "จำนวนโทเคน prompt ที่อ่านได้ต่อวินาทีตามที่เซิร์ฟเวอร์บันทึก prompt แบบ code-agent หนึ่งชุดต่อความยาว (1,064 / 4,136 / 32,808 / 65,575 / 131,112 โทเคน เป็นซอร์ส C++ และ CUDA พร้อมงานที่สั่ง) ค่าเฉลี่ยสองรอบ" } },
+      SPEED_BY_LENGTH_ARMS,
+      SPEED_BY_LENGTH_SESSION,
+      { k: { en: "Read it as", th: "อ่านอย่างไร" }, v: { en: "Strata-xeno reads 1K–4K prompts 33–47 % faster than upstream's fastest form. From 32K up, upstream's layer split reads 6.6–12.9 % faster, in both runs at every length. The two runs of a cell differ by a median of 2.7 %.", th: "Strata-xeno อ่าน prompt 1K–4K เร็วกว่าแบบที่เร็วที่สุดของ upstream 33–47 % ตั้งแต่ 32K ขึ้นไป layer split ของ upstream อ่านเร็วกว่า 6.6–12.9 % ทั้งสองรอบในทุกความยาว สองรอบของช่องเดียวกันต่างกันโดย median 2.7 %" } },
+      { k: { en: "Upstream's own figures", th: "ตัวเลขของ upstream เอง" }, v: { en: "Upstream's table for this model on an RTX 5070 (PCIe 5.0 x16), Ryzen 5 7600, 64 GB is 534 / 1,256 / 2,092 / 1,754 / 1,752 tok/s. Another machine and one-shot runs, so it is context, not a pairing.", th: "ตารางของ upstream สำหรับโมเดลนี้บน RTX 5070 (PCIe 5.0 x16), Ryzen 5 7600, 64 GB คือ 534 / 1,256 / 2,092 / 1,754 / 1,752 tok/s เป็นเครื่องอื่นและรันแบบ one-shot จึงใช้เป็นบริบท ไม่ใช่การเทียบคู่" } },
+    ],
+    source: SPEED_BY_LENGTH_SOURCE,
+  },
+  {
+    id: "v038-len-decode",
+    label: { en: "Decode speed by prompt length, against upstream v0.1.38", th: "ความเร็ว decode ตามความยาว prompt เทียบกับ upstream v0.1.38" },
+    figures: [
+      { value: "72.7", unit: "tok/s", caption: { en: "Strata-xeno, after a 4K prompt", th: "Strata-xeno หลัง prompt 4K" } },
+      { value: "50.0", unit: "tok/s", caption: { en: "upstream v0.1.38, its fastest form at 4K (peer tier)", th: "upstream v0.1.38 แบบที่เร็วที่สุดที่ 4K (ชั้น peer)" } },
+      { value: "62.8", unit: "tok/s", caption: { en: "Strata-xeno, after a 128K prompt", th: "Strata-xeno หลัง prompt 128K" } },
+      { value: "46.9", unit: "tok/s", caption: { en: "upstream v0.1.38, its fastest form at 128K (peer tier)", th: "upstream v0.1.38 แบบที่เร็วที่สุดที่ 128K (ชั้น peer)" } },
+    ],
+    conditions: [
+      { k: { en: "What was measured", th: "สิ่งที่วัด" }, v: { en: "Output tokens per second while writing a 256-token answer, greedy, with the MTP draft layer, after one code-agent prompt per length (1K to 128K). Mean of two runs.", th: "จำนวนโทเคนที่เขียนได้ต่อวินาทีขณะเขียนคำตอบ 256 โทเคน แบบ greedy พร้อม MTP draft layer หลัง prompt แบบ code-agent หนึ่งชุดต่อความยาว (1K ถึง 128K) ค่าเฉลี่ยสองรอบ" } },
+      SPEED_BY_LENGTH_ARMS,
+      SPEED_BY_LENGTH_SESSION,
+      { k: { en: "Read it as", th: "อ่านอย่างไร" }, v: { en: "Ahead of upstream's fastest form (its peer tier) at every length, by 30–45 %, and of its layer split by 61–82 %. Speed moves with the share of drafts accepted (Strata-xeno 0.65–0.80, upstream 0.62–0.95); the two runs of a cell differ by a median of 5 %.", th: "เร็วกว่าแบบที่เร็วที่สุดของ upstream (ชั้น peer) ทุกความยาว 30–45 % และเร็วกว่า layer split ของมัน 61–82 % ความเร็วขึ้นกับสัดส่วน draft ที่ยอมรับ (Strata-xeno 0.65–0.80, upstream 0.62–0.95) สองรอบของช่องเดียวกันต่างกันโดย median 5 %" } },
+      { k: { en: "Upstream's own figures", th: "ตัวเลขของ upstream เอง" }, v: { en: "Upstream's table for this model on an RTX 5070 (PCIe 5.0 x16), Ryzen 5 7600, 64 GB is 79.6 / 78.6 / 76.3 / 63.7 / 62.7 tok/s. Another machine and one-shot runs, so it is context, not a pairing.", th: "ตารางของ upstream สำหรับโมเดลนี้บน RTX 5070 (PCIe 5.0 x16), Ryzen 5 7600, 64 GB คือ 79.6 / 78.6 / 76.3 / 63.7 / 62.7 tok/s เป็นเครื่องอื่นและรันแบบ one-shot จึงใช้เป็นบริบท ไม่ใช่การเทียบคู่" } },
+    ],
+    source: SPEED_BY_LENGTH_SOURCE,
+  },
 ];
 
 export type Count = { value: string; label: L; method: string };
@@ -130,7 +187,15 @@ export const COUNTS: Count[] = [
  * The comparison charts. Every bar is a figure that is written out above, with the conditions it was measured under; the
  * differences are plain subtraction of two of those figures. A scale always starts at zero.
  */
-export type ChartId = "ram" | "decode" | "capacity" | "v038-prompt" | "v038-decode" | "v038-ram";
+export type ChartId =
+  | "ram"
+  | "decode"
+  | "capacity"
+  | "v038-prompt"
+  | "v038-decode"
+  | "v038-ram"
+  | "v038-len-prompt"
+  | "v038-len-decode";
 
 export const CHARTS: Record<ChartId, ChartSpec> = {
   ram: {
@@ -252,6 +317,57 @@ export const CHARTS: Record<ChartId, ChartSpec> = {
     caption: {
       en: "One run per arm, sampled every 10 s (4–7 samples), so the peaks are approximate. 48 GB PC: upstream ran it out of free RAM and paged from disk; Strata-xeno left 15.3 GB free.",
       th: "หนึ่งรอบต่อฝั่ง เก็บทุก 10 วินาที (4–7 จุด) ค่าสูงสุดจึงเป็นค่าประมาณ พีซี 48 GB: upstream ทำให้ RAM ว่างหมดและต้องอ่านหน้าจาก disk ส่วน Strata-xeno เหลือ RAM ว่าง 15.3 GB",
+    },
+  },
+  "v038-len-prompt": {
+    id: "v038-len-prompt",
+    title: { en: "Reading the prompt, by prompt length (tok/s, mean of two runs)", th: "การอ่าน prompt ตามความยาว prompt (tok/s ค่าเฉลี่ยสองรอบ)" },
+    unit: "tok/s",
+    better: "higher",
+    groups: LENGTH_GROUPS,
+    series: [
+      { name: { en: "Strata-xeno", th: "Strata-xeno" }, tone: "mine", values: [416.1, 1021.2, 1469.4, 1536.0, 1508.3] },
+      { name: { en: "upstream v0.1.38, layer split", th: "upstream v0.1.38 layer split" }, tone: "theirs", values: [283.8, 767.7, 1565.8, 1733.6, 1690.1] },
+      { name: { en: "upstream v0.1.38, peer tier", th: "upstream v0.1.38 ชั้น peer" }, tone: "theirs", values: [212.3, 605.0, 1055.0, 1073.4, 1048.3] },
+    ],
+    max: 2000,
+    step: 500,
+    digits: 0,
+    deltas: [
+      { en: "+132.3 tok/s over the fastest upstream", th: "+132.3 tok/s เหนือ upstream ที่เร็วที่สุด" },
+      { en: "+253.5 tok/s over the fastest upstream", th: "+253.5 tok/s เหนือ upstream ที่เร็วที่สุด" },
+      { en: "upstream's layer split +96.4 tok/s", th: "layer split ของ upstream +96.4 tok/s" },
+      { en: "upstream's layer split +197.6 tok/s", th: "layer split ของ upstream +197.6 tok/s" },
+      { en: "upstream's layer split +181.8 tok/s", th: "layer split ของ upstream +181.8 tok/s" },
+    ],
+    caption: {
+      en: "Swift 1.5 IQ2_XS, serve mode, one code-agent prompt per length; same session (2026-10-04), two runs per arm, one PC. From 32K up, upstream's layer split reads faster.",
+      th: "Swift 1.5 IQ2_XS โหมด serve prompt แบบ code-agent หนึ่งชุดต่อความยาว เซสชันเดียวกัน (2026-10-04) สองรอบต่อฝั่ง พีซีเครื่องเดียว ตั้งแต่ 32K ขึ้นไป layer split ของ upstream อ่านเร็วกว่า",
+    },
+  },
+  "v038-len-decode": {
+    id: "v038-len-decode",
+    title: { en: "Decode speed, by prompt length (tok/s, mean of two runs)", th: "ความเร็ว decode ตามความยาว prompt (tok/s ค่าเฉลี่ยสองรอบ)" },
+    unit: "tok/s",
+    better: "higher",
+    groups: LENGTH_GROUPS,
+    series: [
+      { name: { en: "Strata-xeno", th: "Strata-xeno" }, tone: "mine", values: [69.2, 72.7, 63.2, 58.0, 62.8] },
+      { name: { en: "upstream v0.1.38, layer split", th: "upstream v0.1.38 layer split" }, tone: "theirs", values: [40.4, 40.0, 39.3, 34.8, 37.8] },
+      { name: { en: "upstream v0.1.38, peer tier", th: "upstream v0.1.38 ชั้น peer" }, tone: "theirs", values: [53.2, 50.0, 46.1, 44.2, 46.9] },
+    ],
+    max: 80,
+    step: 20,
+    deltas: [
+      { en: "+16.0 tok/s over the fastest upstream", th: "+16.0 tok/s เหนือ upstream ที่เร็วที่สุด" },
+      { en: "+22.7 tok/s over the fastest upstream", th: "+22.7 tok/s เหนือ upstream ที่เร็วที่สุด" },
+      { en: "+17.1 tok/s over the fastest upstream", th: "+17.1 tok/s เหนือ upstream ที่เร็วที่สุด" },
+      { en: "+13.8 tok/s over the fastest upstream", th: "+13.8 tok/s เหนือ upstream ที่เร็วที่สุด" },
+      { en: "+15.9 tok/s over the fastest upstream", th: "+15.9 tok/s เหนือ upstream ที่เร็วที่สุด" },
+    ],
+    caption: {
+      en: "Swift 1.5 IQ2_XS, serve mode, 256 tokens after one code-agent prompt per length, greedy with the MTP draft layer; same session (2026-10-04), two runs per arm, one PC.",
+      th: "Swift 1.5 IQ2_XS โหมด serve 256 โทเคนหลัง prompt แบบ code-agent หนึ่งชุดต่อความยาว greedy พร้อม MTP draft layer เซสชันเดียวกัน (2026-10-04) สองรอบต่อฝั่ง พีซีเครื่องเดียว",
     },
   },
   capacity: {

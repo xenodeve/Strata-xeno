@@ -237,7 +237,9 @@ on `strata-flash-next-d2x.json`.
   | n0-long8k | 78.5 | 78.2 |
 
   The script's last column (`down`, 0 on IQ2_XS) divided by zero after the tok/s lines.
-- **Not measured:** prefill at 32K, `--ple-inflight 256` and `STRATA_MTP_BATCH_RING=1` as arms.
+- **Measured later:** prompt and output speed at 1K-128K against upstream's own settings (#165,
+  [`bench/results/2026-10-04-speed-xeno-vs-upstream-0138`](../../bench/results/2026-10-04-speed-xeno-vs-upstream-0138/README.md));
+  `STRATA_MTP_BATCH_RING=1` (#152, now the default). **Not measured:** `--ple-inflight 256` as an arm.
 
 ## 6. What moved: commits and the exe
 
