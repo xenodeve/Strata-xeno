@@ -57,6 +57,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.loop_guard import LoopGuard
+from serve import reasoning_carry
 from serve import cjk_guard, forced_opening, gguf_info, think_budget  # noqa: E402  (xeno #49 S4, S7 follow-up, S3)
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
@@ -1280,6 +1281,8 @@ class Service:
         self.min_free_vram_mib = 0
         self.before_load = None
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.reasoning_carry = "off"                     # #200: the config's reasoning_carry (off / history / resume)
+        self.carry = reasoning_carry.Carry()             # #200: the latest reply cut while still thinking
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -1849,6 +1852,37 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    def carry_in(self, req, messages):
+        """#200: -> (messages, ids to resume from or None, the request with "_carry" set).  The request's (else the
+        config's) reasoning_carry: "history" puts the latest cut reply's thinking back before the new user message,
+        "resume" returns the cut prompt + what it wrote to generate on from; either only when the request is that
+        conversation plus one new user message (serve/reasoning_carry.py).  A ValueError (a 400) for a bad mode."""
+        mode = reasoning_carry.mode_of(req, self.reasoning_carry)
+        if mode == "off":
+            return messages, None, req
+        req = {**req, "_carry": messages}               # what run() remembers if this reply is cut while thinking
+        if mode == "history":
+            carried = self.carry.history(messages)
+            if carried is not None:
+                print("[strata] reasoning carry (history): the cut reply's thinking goes back before the new message",
+                      flush=True)
+                return carried, None, req
+        elif not images_of(messages):                  # resume: the cut prompt's own ids (no image embeddings)
+            ids = self.carry.resume(messages)
+            if ids is not None:
+                print(f"[strata] reasoning carry (resume): generating on from the cut reply ({len(ids)} tokens); the "
+                      "new message is not shown to the model", flush=True)
+                return messages, ids, req
+        return messages, None, req
+
+    def resumed(self, ids, max_new):
+        """#200 resume: (ids, thinking, max_new) for the carried ids - inside the open thinking, the room re-checked."""
+        room = self.engine.max_context - CTX_SLACK - len(ids)
+        if room < 1:
+            raise ValueError(f"the carried thinking ({len(ids)} tokens) leaves no room to answer in the context "
+                             f"({self.engine.max_context})")
+        return ids, True, min(max_new, room) if max_new and max_new > 0 else room
+
     def prepare(self, messages, tools, kwargs, max_new=None, priority: int = 1):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
@@ -2044,6 +2078,7 @@ class Service:
         stop_filter = StopSequenceFilter(sampling["stop_sequences"]) if sampling.get("stop_sequences") else None
         matched_sequence = None
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        reasoning_text = []                             # #200: this reply's thinking, if it is cut
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         stop_detail = None
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
@@ -2112,6 +2147,8 @@ class Service:
                             self._note(n, evs)
                             last_print = self._progress(last_print)
                             for ev in evs:
+                                if ev.kind == "reasoning":
+                                    reasoning_text.append(ev.text)   # #200: what a cut reply carries
                                 if ev.kind in ("reasoning", "content") and guard.feed(
                                         ev.text, in_think=ev.kind == "reasoning"):
                                     cancel.set()
@@ -2144,6 +2181,11 @@ class Service:
                         # the loop guard and a stop sequence cancel the engine themselves; only a client cancel is one
                         if cancel.is_set() and not matched_sequence and not guard.reason:
                             finish = "stop" if getattr(cancel, "server_stop", False) else "cancel"
+                        # #200: cut at max_tokens while still thinking (not by a loop stop or a close): remembered
+                        carry_msgs = (sampling or {}).get("_carry")
+                        if carry_msgs is not None and finish == "length" and state["thinking"] \
+                                and stop_detail is None and not state["close"]:
+                            self.carry.remember(carry_msgs, ids, raw_ids, "".join(reasoning_text))
                     except EngineDied as e:
                         finish = "error"
                         self._say_died(e)
@@ -3697,7 +3739,10 @@ def make_handler(svc: Service):
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
+            messages, resume_ids, req = svc.carry_in(req, messages)     # #200
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
+            if resume_ids is not None:
+                ids, thinking, max_new = svc.resumed(resume_ids, max_new)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
             req = {**req, "_meta": svc.meta_for("openai", messages, tools, self.headers.get("User-Agent"))}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -3776,7 +3821,10 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             think_budget.side_effort(req, kw)                         # xeno #49 S3: before the template renders
+            messages, resume_ids, req = svc.carry_in(req, messages)     # #200
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, 0 if req.get("stream") else 1)
+            if resume_ids is not None:
+                ids, thinking, max_new = svc.resumed(resume_ids, max_new)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
             req = {**req, "_meta": svc.meta_for("anthropic", messages, tools, self.headers.get("User-Agent"))}
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
@@ -4383,6 +4431,12 @@ def main() -> int:
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
+    if cfg.get("reasoning_carry") is not None:          # #200: carry a thinking cut at max_tokens to the next turn
+        try:
+            svc.reasoning_carry = reasoning_carry.mode_of({}, cfg["reasoning_carry"])
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
+        print(f"[strata] reasoning carry: {svc.reasoning_carry}", flush=True)
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
