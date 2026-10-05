@@ -1094,6 +1094,10 @@ bool cuda0_owns(const Impl& m, int64_t l, int32_t e) {
 /// rows are the ones below `local_first`) -
 /// blocking on the host experts, which the 4070's stager copies to pinned buffers as the loop reaches them.  On
 /// return the 5060's compute stream only has to wait for ev_done before it reads bo.  `order`: the 4070's experts.
+// #179 DIAGNOSTIC (not for merge): STRATA_DIAG_SKIP_RELAY bits drop a relay copy of the expert split - 1: the routed sum
+// up into the 5060 (x4), 2: its D2H off the 4070, 4: the activations down off the 5060 (x4). Outputs are WRONG under it;
+// a read's time without that copy can be read
+static int diag_skip_relay() { static const int v = [] { const char* e = std::getenv("STRATA_DIAG_SKIP_RELAY"); return e ? std::atoi(e) : 0; }(); return v; }
 template <class Impl>   // Prefill::Impl (private: deduced, not named)
 bool split_send(Impl& m, int64_t l, int64_t T, int64_t chunk_i, const std::vector<int32_t>& order,
                 std::string& err) {
@@ -1115,7 +1119,7 @@ bool split_send(Impl& m, int64_t l, int64_t T, int64_t chunk_i, const std::vecto
     // #178: one mark chain, so the event between the two spans is recycled once, after its last use (two span() calls
     // sharing it put it into the free list twice, and record() then handed it to two spans)
     sp.clk_relay.mark(sp.tl_relay, "activations down", m.relay, l);
-    cudaMemcpyAsync(sp.hx, m.Xtok, xbytes, cudaMemcpyDeviceToHost, m.relay);
+    if (!(diag_skip_relay() & 4)) cudaMemcpyAsync(sp.hx, m.Xtok, xbytes, cudaMemcpyDeviceToHost, m.relay);
     cudaEventRecord(sp.ev_x, m.relay);
     if (m.wave) m.wave->publish_attn(chunk_i, l, m.cs);   // #35 D7: handed off: the next chunk may take this card
     // the routed sum's gates: needed only at the end, so they cross while the experts run (#35 D1: the shared
@@ -1290,7 +1294,7 @@ bool split_run(Impl& m, int64_t l, int64_t T, size_t unit, const std::vector<int
     moe_routed_sum(sp.dm, sp.slot, sp.w, sp.bo, T, sp.s, 0, local_first);
     cudaEventSynchronize(sp.ev_done);   // the 5060 has uploaded the previous layer's output from hbo
     sp.clk_s.mark(sp.tl_s, "output down", sp.s, l);
-    cudaMemcpyAsync(sp.hbo, sp.bo, (size_t) (T * N) * 4, cudaMemcpyDeviceToHost, sp.s);
+    if (!(diag_skip_relay() & 2)) cudaMemcpyAsync(sp.hbo, sp.bo, (size_t) (T * N) * 4, cudaMemcpyDeviceToHost, sp.s);
     cudaEventRecord(sp.ev_bo, sp.s);
     (void) cudaStreamQuery(sp.s);
     sp.clk_s.mark(sp.tl_s, nullptr, sp.s);
@@ -1310,7 +1314,7 @@ bool split_output_up(Impl& m, int64_t l, int64_t T, std::string& err) {
         cudaEventSynchronize(sp.ev_bo);
     }
     cudaEvent_t o0 = sp.clk_relay.record(m.relay);
-    cudaMemcpyAsync(m.bo, sp.hbo, (size_t) (T * N) * 4, cudaMemcpyHostToDevice, m.relay);
+    if (!(diag_skip_relay() & 1)) cudaMemcpyAsync(m.bo, sp.hbo, (size_t) (T * N) * 4, cudaMemcpyHostToDevice, m.relay);
     cudaEventRecord(sp.ev_done, m.relay);
     sp.clk_relay.span(sp.tl_relay, "output up", o0, sp.clk_relay.record(m.relay), l);
     const cudaError_t ce = cudaGetLastError();
