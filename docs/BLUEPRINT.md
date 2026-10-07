@@ -286,7 +286,7 @@ they sleep.
 `--adapt-gate --adapt-secondary --cache-cpu-only --exclusive-primary-experts --exclusive-secondary-experts
 --lock-cpu-experts --mmvq-exact --no-exclusive-primary-experts --no-exclusive-secondary-experts --no-tail-file
 --ple-ahead --pool-priority --pool-rest --process-priority --profile-decode-range --profile-prefill-range
---ram-cache-gib --secondary-async-launch --secondary-expert-mib --secondary-free-floor-mib
+--ram-cache-gib --secondary-async-launch --secondary-expert-mib --secondary-free-floor-mib --display-reserve-mib
 --secondary-graph --secondary-profile-timing --secondary-stage-only --tail-file`
 
 No upstream flag was removed. Upstream defaults we changed through a flag: `--pcie-frac` (−1 → 0), and

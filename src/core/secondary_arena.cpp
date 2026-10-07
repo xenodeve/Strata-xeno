@@ -222,6 +222,13 @@ bool SecondaryArena::fill_slot(uint64_t slot, const uint8_t* blob, uint64_t byte
 }
 
 bool SecondaryArena::check_free_floor(std::string& err) {
+    // #208: free_snapshot's cudaMemGetInfo reads the CURRENT device; the caller (after the fill) has device 0 current
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(ordinal_) != cudaSuccess) {
+        err = "secondary free-floor check cannot select its CUDA device";
+        return false;
+    }
+    const RestoreDevice restore{previous};
     uint64_t lower = 0;
     if (!free_snapshot(ordinal_, lower, err)) return false;
     if (lower < free_floor_bytes_) {

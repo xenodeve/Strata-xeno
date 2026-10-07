@@ -15,6 +15,13 @@ inline uint64_t secondary_effective_free(uint64_t cuda_free, uint64_t nvml_free)
     return cuda_free < nvml_free ? cuda_free : nvml_free;
 }
 
+// #208: one total reserve for everything else on the display card. What the other processes already use counts
+// toward it, so only the rest has to stay free; never below min_floor.
+inline uint64_t display_free_floor(uint64_t reserve, uint64_t others_used, uint64_t min_floor) {
+    const uint64_t rest = reserve > others_used ? reserve - others_used : 0;
+    return rest > min_floor ? rest : min_floor;
+}
+
 struct SecondaryBudget {
     uint64_t bytes = 0;
     uint64_t slots = 0;

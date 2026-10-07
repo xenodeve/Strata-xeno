@@ -339,6 +339,11 @@ inline bool gr_unfused() {
 bool split_layout_usable();   // below: the split's static conditions (a native pack, a layer on MMQ)
 bool split_layout_full();     // ... and every layer on MMQ (#113)
 bool split_layer(int64_t l);  // layer l's routed experts run on the peer card in a split chunk (#113)
+void split_group_bytes(int64_t n_layers, size_t& gub, size_t& db);   // #208: below
+bool split_env_on() {   // #32 S4: STRATA_PREFILL_EXPERT_SPLIT=1 asks for the expert split
+    static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_EXPERT_SPLIT"); return v && std::atoi(v) != 0; }();
+    return on;
+}
 // #113: a layer that is not on MMQ runs a split chunk on this card, so a partial split's ring holds the chunk
 inline size_t ring_cap(size_t T) {
     return g_split_layout && split_layout_full() ? std::min(T, (size_t) split_min() - 1) : T;
@@ -594,11 +599,41 @@ inline int wave_priority(bool high) {
 inline bool make_stream(cudaStream_t* st, int prio) {
     return cudaStreamCreateWithPriority(st, cudaStreamNonBlocking, prio) == cudaSuccess;
 }
-struct SplitTier {
+// #208: every device buffer SplitTier::init allocates on the peer card, in init's order.  init allocates exactly
+// these, and Prefill::split_device_bytes prices the 4070's share with them before the expert tier takes the rest.
+struct SplitSizes {
     static constexpr int64_t R = 4096;   // rows per sub-product (an expert with more rows spans several)
+    size_t xtok, xq, hq, gu, h, dm, bo, w, rows, slot, ids, bounds, grp_gu, grp_d, ring;
+    int64_t bounds_cap;
+    SplitSizes(int64_t T, int64_t n_expert, size_t gub, size_t db, size_t blob, int ring_slots) {
+        const int64_t TK = T * 10;
+        bounds_cap = 2 * n_expert + 2 * (TK / R + 2) + 8;
+        xtok = mmq::q8_bytes(T, N);
+        xq = mmq::q8_bytes(R, N);
+        hq = mmq::q8_bytes(R, 640);
+        gu = (size_t) (R * 1280) * 4;
+        h = (size_t) (R * 640) * 4;
+        dm = (size_t) (TK * N) * 4;
+        bo = (size_t) (T * N) * 4;
+        w = rows = slot = (size_t) TK * 4;
+        ids = (size_t) R * 4;
+        bounds = (size_t) bounds_cap * 4;
+        grp_gu = MMQ_GROUP * gub + MMQ_TAIL;
+        grp_d = MMQ_GROUP * db + MMQ_TAIL;
+        ring = ring_slots > 0 ? (size_t) ring_slots * blob : 0;
+    }
+    size_t total() const {
+        return xtok + xq + hq + gu + h + dm + bo + w + rows + slot + ids + bounds + grp_gu + grp_d + ring;
+    }
+};
+struct SplitTier {
+    static constexpr int64_t R = SplitSizes::R;
     // 4070 expert staging slots.  96, 192, 320, 480 and 512 measured the same (8.85-9.1 s at 8K) once the 5060's
     // experts came down on their own thread: the smallest keeps the VRAM
-    int RING = 96;   // #35 D4: 512 (a whole layer, +~500 MB of VRAM) measured 1.6 % vs 1.0 % faster than D1: not worth it
+    // #35 D4: 512 (a whole layer, +~500 MB of VRAM) measured 1.6 % vs 1.0 % faster than D1: not worth it; the wave's
+    // stream-owning lane takes kWaveRing (it feeds both lanes' layer)
+    static constexpr int kRing = 96, kWaveRing = 512;
+    int RING = kRing;
     int dev = -1, home = 0;
     int64_t T = 0;                       // the token capacity
     size_t blob = 0;                     // the largest expert blob, 16-byte aligned
@@ -759,7 +794,9 @@ struct SplitTier {
             ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
         ok = ok && cudaEventCreateWithFlags(&ev_q, cudaEventDisableTiming) == cudaSuccess;   // a stream wait: no host sync
         const int64_t TK = T * 10;
-        hbounds_cap = 2 * n_expert + 2 * (TK / R + 2) + 8;
+        if (!stream_owner) RING = 0;   // lane 2 gathers from lane 1's ring
+        const SplitSizes z(T, n_expert, gub, db, blob, RING);
+        hbounds_cap = z.bounds_cap;
         hx = (uint8_t*) h_alloc(mmq::q8_bytes(T, N));
         hbo = (float*) h_alloc((size_t) (T * N) * 4);
         hw = (float*) h_alloc((size_t) TK * 4);
@@ -773,7 +810,6 @@ struct SplitTier {
         for (cudaStream_t* st : {&s, &c, &u}) ok = ok && make_stream(st, prio);
         for (cudaEvent_t* e : {&ev_xread, &ev_gatesread, &ev_meta, &ev_bo})
             ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
-        if (!stream_owner) RING = 0;   // lane 2 gathers from lane 1's ring
         used.assign((size_t) RING, nullptr);
         copied.assign((size_t) RING, nullptr);
         used1.assign((size_t) RING, nullptr);
@@ -788,21 +824,21 @@ struct SplitTier {
             dev_bufs.push_back(q);
             return q;
         };
-        xtok = d_alloc(mmq::q8_bytes(T, N));
-        xq = d_alloc(mmq::q8_bytes(R, N));
-        hq = d_alloc(mmq::q8_bytes(R, 640));
-        gu = (float*) d_alloc((size_t) (R * 1280) * 4);
-        h = (float*) d_alloc((size_t) (R * 640) * 4);
-        dm = (float*) d_alloc((size_t) (TK * N) * 4);
-        bo = (float*) d_alloc((size_t) (T * N) * 4);
-        w = (float*) d_alloc((size_t) TK * 4);
-        rows = (int32_t*) d_alloc((size_t) TK * 4);
-        slot = (int32_t*) d_alloc((size_t) TK * 4);
-        ids = (int32_t*) d_alloc((size_t) R * 4);
-        bounds = (int32_t*) d_alloc((size_t) hbounds_cap * 4);
-        grp_gu = (uint8_t*) d_alloc(MMQ_GROUP * gub + MMQ_TAIL);
-        grp_d = (uint8_t*) d_alloc(MMQ_GROUP * db + MMQ_TAIL);
-        if (RING > 0) ring = (uint8_t*) d_alloc((size_t) RING * blob);
+        xtok = d_alloc(z.xtok);
+        xq = d_alloc(z.xq);
+        hq = d_alloc(z.hq);
+        gu = (float*) d_alloc(z.gu);
+        h = (float*) d_alloc(z.h);
+        dm = (float*) d_alloc(z.dm);
+        bo = (float*) d_alloc(z.bo);
+        w = (float*) d_alloc(z.w);
+        rows = (int32_t*) d_alloc(z.rows);
+        slot = (int32_t*) d_alloc(z.slot);
+        ids = (int32_t*) d_alloc(z.ids);
+        bounds = (int32_t*) d_alloc(z.bounds);
+        grp_gu = (uint8_t*) d_alloc(z.grp_gu);
+        grp_d = (uint8_t*) d_alloc(z.grp_d);
+        if (z.ring > 0) ring = (uint8_t*) d_alloc(z.ring);
         if (ok) {
             ctx = std::make_unique<mmq::Context>();
             mmq::iota(ids, R, s);
@@ -1042,6 +1078,16 @@ struct Prefill::WaveLink {
 };
 std::shared_ptr<Prefill::WaveLink> Prefill::make_wave_link() { return std::make_shared<WaveLink>(); }
 bool Prefill::wave_lane_splits(int64_t chunk) { return wave_lane_ok(wave_lane_chunk(chunk), split_min()); }   // #119
+uint64_t Prefill::split_device_bytes(int64_t n_layers, int64_t n_expert, int64_t chunk, bool wave) {   // #208
+    if (chunk <= 0 || !split_env_on() || !split_layout_usable()) return 0;
+    size_t gub = 0, db = 0;
+    split_group_bytes(n_layers, gub, db);
+    const size_t blob = ((size_t) MAXBLOB() + 255) / 256 * 256;
+    if (!wave) return SplitSizes(chunk, n_expert, gub, db, blob, SplitTier::kRing).total();
+    // the wave's two lanes, each with a lane chunk: lane 1 streams for both (a whole layer's ring), lane 2 has none
+    const int64_t lane = wave_lane_chunk(chunk);
+    return SplitSizes(lane, n_expert, gub, db, blob, SplitTier::kWaveRing).total() + SplitSizes(lane, n_expert, gub, db, blob, 0).total();
+}
 bool Prefill::run_wave(Prefill& a, Prefill& b, WaveLink& link, const int64_t* tokens, int64_t n, int64_t pos0,
                        int64_t n_layers, std::string& err) {
     wave_reset(link, (n + a.chunk() - 1) / a.chunk(), n_layers);
@@ -1438,6 +1484,16 @@ bool split_layout_usable() { return the_split_plan().usable; }
 bool split_layout_full() { return the_split_plan().full; }
 bool split_layer(int64_t l) {
     return the_split_plan().usable && l >= 0 && (size_t) l < mmq_plan().layer.size() && mmq_plan().layer[(size_t) l];
+}
+// the largest gate/up and down matrix of the layers on MMQ (#113: only those run split): a split group slot's size
+void split_group_bytes(int64_t n_layers, size_t& gub, size_t& db) {
+    const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
+    gub = db = 0;
+    for (int64_t l = 0; l < n_layers; ++l) {
+        if (!split_layer(l)) continue;
+        gub = std::max(gub, mmq::matrix_bytes(lay0.fmt[(size_t) l].gu_type, 1280, N));
+        db = std::max(db, mmq::matrix_bytes(lay0.fmt[(size_t) l].d_type, N, 640));
+    }
 }
 // #136 P3: a layout whose chunks run the fused experts (STRATA_PF_FUSED=1, the Q2_0 pack, a streamed chunk of
 // stream_all_min() tokens or more).  `src`: the layout streams experts (Prefill::init got an ExpertSource; without one
@@ -2297,22 +2353,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         const bool stream_all = m.ring > STAGE && T >= (g_split_layout ? split_min() : stream_all_min()) &&
                                 m.src != nullptr;
         // #32 S4: expert_split for this chunk (MMQ layers of a native pack whose peer tier is set)
-        static const bool split_env = [] { const char* v = std::getenv("STRATA_PREFILL_EXPERT_SPLIT"); return v && std::atoi(v) != 0; }();
+        static const bool split_env = split_env_on();
         bool split_on = split_env && m.peer_res != nullptr && m.peer_dev >= 0 && m.src != nullptr && split_layout_usable();
         if (split_on && (!m.split || m.split->T < m.T)) {
             m.split.reset();
             std::string se;
             size_t gub = 0, db = 0;
-            for (int64_t l = 0; l < g.n_layers; ++l) {   // the layers on MMQ (#113: only those run split)
-                if (!split_layer(l)) continue;
-                gub = std::max(gub, mmq::matrix_bytes(lay0.fmt[(size_t) l].gu_type, 1280, N));
-                db = std::max(db, mmq::matrix_bytes(lay0.fmt[(size_t) l].d_type, N, 640));
-            }
+            split_group_bytes(g.n_layers, gub, db);
             auto sp = std::make_unique<SplitTier>();
             if (!m.relay && !make_stream(&m.relay, wave_priority(m.wave && m.wave_lane == 0))) m.relay = nullptr;
             sp->high = m.wave && m.wave_lane == 0;
             if (m.wave && m.wave_lane == 1) { sp->lane_tag = ", lane 2"; sp->stream_owner = false; }
-            if (m.wave && m.wave_lane == 0) sp->RING = 512;   // #35 D7: the stream feeds both lanes' layer
+            if (m.wave && m.wave_lane == 0) sp->RING = SplitTier::kWaveRing;   // #35 D7: the stream feeds both lanes' layer
             if (m.relay && sp->init(m.peer_dev, m.T, m.g->n_expert, gub, db, (size_t) MAXBLOB(), m.src, se)) {
                 if (timeline::enabled()) sp->clk_relay.anchor(m.relay);
                 m.split = std::move(sp);

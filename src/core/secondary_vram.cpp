@@ -7,8 +7,8 @@
 
 namespace strata::core {
 
-bool secondary_nvml_free_bytes(int cuda_ordinal, uint64_t& free_bytes, std::string& err) {
-    free_bytes = 0;
+bool secondary_nvml_memory(int cuda_ordinal, uint64_t& free_bytes, uint64_t& used_bytes, std::string& err) {
+    free_bytes = used_bytes = 0;
 #if defined(STRATA_HAS_NVML)
     char pci_bus_id[32]{};
     const cudaError_t cuda_err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuda_ordinal);
@@ -35,12 +35,18 @@ bool secondary_nvml_free_bytes(int cuda_ordinal, uint64_t& free_bytes, std::stri
         return false;
     }
     free_bytes = memory.free;
+    used_bytes = memory.used;
     return true;
 #else
     (void) cuda_ordinal;
     err = "NVML is unavailable; secondary placement is disabled";
     return false;
 #endif
+}
+
+bool secondary_nvml_free_bytes(int cuda_ordinal, uint64_t& free_bytes, std::string& err) {
+    uint64_t used = 0;
+    return secondary_nvml_memory(cuda_ordinal, free_bytes, used, err);
 }
 
 } // namespace strata::core
