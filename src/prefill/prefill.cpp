@@ -858,9 +858,12 @@ struct SplitTier {
         }
         size_t f1 = 0;
         cudaMemGetInfo(&f1, &tot);
-        // #208: priced = what Prefill::split_device_bytes books for it; the difference is the allocator's overhead
-        std::fprintf(stderr, "strata prefill: expert_split (whole layer) on device %d: %.0f MiB of VRAM, priced %.0f MiB "
-                             "(%.0f MiB left free)\n", dev, (f0 - f1) / 1048576.0, z.total() / 1048576.0, f1 / 1048576.0);
+        // #208: priced = what Prefill::split_device_bytes books for this lane.  The cudaMemGetInfo delta is not a
+        // measurement of this lane: the wave's two lanes initialise concurrently, and on the WDDM display card the
+        // figure is a budget, not physical memory (nvidia-smi / NVML is the evidence, #208)
+        std::fprintf(stderr, "strata prefill: expert_split (whole layer) on device %d: priced %.0f MiB (cudaMemGetInfo "
+                             "delta %.0f MiB, %.0f MiB left in its budget)\n", dev, z.total() / 1048576.0,
+                             (f0 - f1) / 1048576.0, f1 / 1048576.0);
         if (ok && timeline::enabled()) {
             tl_relay = timeline::lane((std::string("gpu0 relay (prefill split") + lane_tag + ")").c_str());
         }
