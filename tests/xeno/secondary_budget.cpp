@@ -23,6 +23,15 @@ int main() {
     const auto shared_headroom = secondary_budget(1024 * mib, {256 * mib, 256 * mib, 256 * mib},
                                                    1024 * mib, 512 * mib);
     CHECK(shared_headroom.slots == 2 && shared_headroom.bytes == 512 * mib);
+    // #208: the floor is derived from that total reserve and what the others use at start. The developer's
+    // example: 3.2 GB reserve, others at 1.8 GB -> 1.4 GB more stays free. Others above the reserve, or a reserve
+    // below the minimum, keep the minimum floor; nothing wraps around.
+    using strata::core::display_free_floor;
+    CHECK(display_free_floor(3277 * mib, 1843 * mib, 640 * mib) == 1434 * mib);
+    CHECK(display_free_floor(3277 * mib, 3000 * mib, 640 * mib) == 640 * mib);
+    CHECK(display_free_floor(3277 * mib, 5000 * mib, 640 * mib) == 640 * mib);
+    CHECK(display_free_floor(3277 * mib, 0, 640 * mib) == 3277 * mib);
+    CHECK(display_free_floor(512 * mib, 0, 640 * mib) == 640 * mib);
     CHECK(secondary_effective_free(11070 * mib, 9812 * mib) == 9812 * mib);
     CHECK(secondary_effective_free(9000 * mib, 9812 * mib) == 9000 * mib);
     CHECK(secondary_effective_free(9000 * mib, 0) == 0);

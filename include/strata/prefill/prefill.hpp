@@ -128,6 +128,10 @@ public:
     }
     /// whether a wave over prompt-path chunks of `chunk` tokens still runs each lane's chunk split
     static bool wave_lane_splits(int64_t chunk);
+    /// #208: the peer card's (4070's) bytes of the expert split's buffers for prompt chunks of up to `chunk` tokens,
+    /// both lanes when `wave` (0 without a split layout).  The same terms the split allocates, so the expert tier can
+    /// leave room for them before the first prompt makes them.
+    static uint64_t split_device_bytes(int64_t n_layers, int64_t n_expert, int64_t chunk, bool wave);
 
     /// #35 D7: the two-lane wavefront.  Two Prefill objects on one session read a prompt's chunks alternately
     /// (chunk c on lane c % 2, each lane on its own stream of the same GPU), and chunk c's layer l starts only once

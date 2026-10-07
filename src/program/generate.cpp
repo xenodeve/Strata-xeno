@@ -59,6 +59,8 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/core/secondary_budget.hpp"
+#include "strata/core/secondary_vram.hpp"
 #include "strata/prefill/split_plan.hpp"
 #include "strata/timeline.hpp"
 #include "strata/core/pinned.hpp"
@@ -340,6 +342,8 @@ struct Options {
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
+    int display_reserve_mib = 0;          ///< #208: one reserve for everything else on the 4070 (0 = off): the others'
+                                          ///< use at start counts toward it, the rest stays free (>= the free floor)
     int pool_priority = 2;                ///< THREAD_PRIORITY_* for pool workers + host; 2 = HIGHEST (default, 0 = off)
     int mmvq_exact = 1;                   ///< 0: llama.cpp's multi-column MMVQ layout (not bitwise equal to ncols = 1)
     int pool_rest = 1;                    ///< send the pool's workers to sleep when a verify window ends (1, default)
@@ -676,6 +680,9 @@ void usage() {
                  "  --cache-cpu-only     Diagnostic: prefill normally, then route verify experts to CPU.\n"
                  "  --secondary-expert-mib N  Phase 3 expert tier on RTX 4070 SUPER (any native pack, #11);\n"
                  "  --secondary-free-floor-mib N  Experimental free floor on 4070; default 2560.\n"
+                 "  --display-reserve-mib N  #208: N MiB on the 4070 for everything else, counting what the others use at\n"
+                 "                         start (e.g. 3277 = 3.2 GB); the tier takes the rest up to --secondary-expert-mib\n"
+                 "                         (12288 = no cap), less the prompt split's buffers. 0 = off (default).\n"
                  "  --secondary-profile-timing  Opt-in CUDA event timing for secondary transfer/compute.\n"
                      "  --secondary-stage-only  Stage/verify weights, but compute all experts as before.\n"
                      "  --exclusive-primary-experts  Phase 4 static primary ownership; decommit host copies.\n"
@@ -1922,6 +1929,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--display-reserve-mib") {
+            const std::string v = next("--display-reserve-mib");
+            const auto parsed = std::from_chars(v.data(), v.data() + v.size(), o.display_reserve_mib);
+            if (parsed.ec != std::errc{} || parsed.ptr != v.data() + v.size() || o.display_reserve_mib < 0) {
+                std::fprintf(stderr, "strata generate: --display-reserve-mib needs an integer >= 0\n");
+                return 2;
+            }
+        }
         else if (a == "--secondary-stage-only") o.secondary_stage_only = true;
         else if (a == "--secondary-profile-timing") o.secondary_profile_timing = true;
         else if (a == "--secondary-async-launch") o.secondary_async_launch = true;
@@ -2472,6 +2487,25 @@ int main(int argc, char** argv) {
         (o.secondary_profile_timing && o.secondary_expert_mib == 0)) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
+    }
+    // #208: what the other processes use on the 4070 now, before this process allocates anything there (NVML makes no
+    // CUDA context).  The free floor becomes what they leave of the reserve; --secondary-free-floor-mib is its minimum
+    uint64_t display_others = 0, display_floor = 0;   // display_floor sizes the tier; the monitor keeps the minimum
+    if (o.display_reserve_mib > 0 && o.secondary_expert_mib == 0)
+        std::fprintf(stderr, "strata generate: --display-reserve-mib has no 4070 tier to size (no --secondary-expert-mib)\n");
+    if (o.display_reserve_mib > 0 && o.secondary_expert_mib > 0) {
+        uint64_t display_free = 0;
+        std::string nerr;
+        if (!strata::core::secondary_nvml_memory(1, display_free, display_others, nerr)) {
+            std::fprintf(stderr, "strata generate: --display-reserve-mib: %s\n", nerr.c_str());
+            return 1;
+        }
+        display_floor = strata::core::display_free_floor((uint64_t) o.display_reserve_mib << 20, display_others,
+                                                         (uint64_t) o.secondary_free_floor_mib << 20);
+        if (display_floor == (uint64_t) o.secondary_free_floor_mib << 20)
+            std::fprintf(stderr, "strata generate: --display-reserve-mib %d: the others already use %.2f GiB, so the minimum "
+                         "free floor (--secondary-free-floor-mib %d) sizes the tier instead\n", o.display_reserve_mib,
+                         (double) display_others / 1073741824.0, o.secondary_free_floor_mib);
     }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
         std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe or layer\n");
@@ -4289,11 +4323,31 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: secondary runner: %s\n", err.c_str());
             return 1;
         }
+        // #208: the tier also leaves room for the prompt path's split buffers, which the first prompt allocates on the
+        // 4070 after it; the runner and its monitor keep the plain floor
+        // (priced at o.prefill_chunk: under --prefill auto that is the auto maximum, an upper bound of the chunk
+        // plan_lend picks later; 8192 by default, which D2x picks.)  The sizing floor is the display floor + the split
+        // + kSplitSlack; the runner and its monitor keep --secondary-free-floor-mib, so the others may grow into the
+        // reserve without ending the engine.  kSplitSlack, MEASURED HERE (#208, ab208 boot 1): the first long prompt
+        // took 1,820 MiB of the 4070 on nvidia-smi for 1,779 MiB priced (allocation rounding, streams, events).
+        constexpr uint64_t kSplitSlack = 64ull << 20;
+        const uint64_t split = display_floor > 0 && o.exclusive_secondary
+            ? strata::prefill::Prefill::split_device_bytes(g.n_layers, g.n_expert, o.prefill_chunk,
+                                                           wave_on(o.prefill_chunk)) + kSplitSlack
+            : 0;
+        const uint64_t sizing_floor = display_floor > 0 ? display_floor + split : (uint64_t) o.secondary_free_floor_mib << 20;
         if (!secondary_arena.open(1, bytes, (uint64_t) o.secondary_expert_mib << 20, err,
-                                  nullptr, nullptr, (uint64_t) o.secondary_free_floor_mib << 20)) {
+                                  nullptr, nullptr, sizing_floor)) {
             std::fprintf(stderr, "strata generate: secondary arena: %s\n", err.c_str());
             return 1;
         }
+        if (display_floor > 0)
+            std::fprintf(stderr, "strata generate: display reserve %d MiB: others use %.2f GiB at start, free floor "
+                         "%.2f GiB, + %.2f GiB for the prompt split's buffers (priced at %lld-token chunks) -> 4070 "
+                         "tier %.2f GiB (cap %d MiB)\n", o.display_reserve_mib, (double) display_others / 1073741824.0,
+                         (double) display_floor / 1073741824.0, (double) split / 1073741824.0,
+                         (long long) o.prefill_chunk, (double) secondary_arena.bytes() / 1073741824.0,
+                         o.secondary_expert_mib);
         secondary_residency.assign((size_t) (g.n_layers * g.n_expert), -1);
         if (place_first) {
             // the same pipeline as the primary fill: a reader thread reads the next batch from the pack while this

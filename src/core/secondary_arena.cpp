@@ -24,13 +24,20 @@ bool free_snapshot(int ordinal, uint64_t& lower, std::string& err) {
     size_t cuda_free = 0, cuda_total = 0;
     int current = -1;
     (void) cudaGetDevice(&current);
+    // #208: cudaMemGetInfo reads the CURRENT device and NVML reads `ordinal`; select it so both are one card
+    // (the free-floor check after the fill ran with device 0 current and min'd the 5060's free into the 4070's)
+    if (cudaSetDevice(ordinal) != cudaSuccess) {
+        err = "secondary free-memory query cannot select CUDA device " + std::to_string(ordinal);
+        return false;
+    }
+    const RestoreDevice restore{current};
     const cudaError_t pending = cudaPeekAtLastError();
     const cudaError_t rc = cudaMemGetInfo(&cuda_free, &cuda_total);
     if (rc != cudaSuccess) {
         uint64_t nvml_free = 0;
         std::string nvml_err;
         const bool nvml_ok = secondary_nvml_free_bytes(ordinal, nvml_free, nvml_err);
-        err = std::string("secondary cudaMemGetInfo on CUDA device ") + std::to_string(current) +
+        err = std::string("secondary cudaMemGetInfo on CUDA device ") + std::to_string(ordinal) +
               ": " + cudaGetErrorString(rc) + "; pending before query: " + cudaGetErrorString(pending) +
               (nvml_ok ? "; NVML free: " + std::to_string(nvml_free) + " B" : "; " + nvml_err);
         return false;

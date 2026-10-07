@@ -1,5 +1,6 @@
 #include "strata/core/secondary_arena.hpp"
 #include "strata/core/secondary_budget.hpp"
+#include "strata/core/secondary_vram.hpp"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -47,6 +48,29 @@ int main() {
     CHECK(arena.verify_slot(0, blob.data(), mib, err));
     blob[0] ^= 1;
     CHECK(!arena.verify_slot(0, blob.data(), mib, err));
+    {
+        // #208: the floor check after the fill runs with device 0 current (generate.cpp restores it first). It
+        // must still measure the 4070: make the 5060's free memory the smaller figure, so a query of the current
+        // device would report it, then compare with the 4070's own reading.
+        size_t free1 = 0, total1 = 0, free0 = 0, total0 = 0;
+        CHECK(cudaSetDevice(1) == cudaSuccess && cudaMemGetInfo(&free1, &total1) == cudaSuccess);
+        uint64_t nvml1 = 0;
+        CHECK(strata::core::secondary_nvml_free_bytes(1, nvml1, err));
+        const uint64_t display_free = strata::core::secondary_effective_free(free1, nvml1);
+        CHECK(cudaSetDevice(0) == cudaSuccess && cudaMemGetInfo(&free0, &total0) == cudaSuccess);
+        CHECK(display_free > 1024 * mib);   // room for the squeezed 5060 to read lower than the 4070
+        void* squeeze = nullptr;
+        if (free0 > display_free - 512 * mib)
+            CHECK(cudaMalloc(&squeeze, free0 - (display_free - 512 * mib)) == cudaSuccess);
+        const bool checked = arena.check_free_floor(err);
+        int current = -1;
+        const bool restored = cudaGetDevice(&current) == cudaSuccess && current == 0;
+        if (squeeze) CHECK(cudaFree(squeeze) == cudaSuccess);
+        CHECK(checked);
+        CHECK(restored);   // the caller's device is restored
+        const uint64_t seen = arena.lower_free_after();
+        CHECK(seen + 256 * mib > display_free && seen < display_free + 256 * mib);
+    }
     CHECK(arena.close());
     // The free floor can be lower when existing desktop processes already
     // consume part of the shared 2.5 GiB headroom.
