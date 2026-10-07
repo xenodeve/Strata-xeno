@@ -4319,6 +4319,8 @@ int main(int argc, char** argv) {
         }
         // #208: the tier also leaves room for the prompt path's split buffers, which the first prompt allocates on the
         // 4070 after it; the runner and its monitor keep the plain floor
+        // (priced at o.prefill_chunk: under --prefill auto that is the auto maximum, an upper bound of the chunk
+        // plan_lend picks later; 8192 by default, which D2x picks.)
         uint64_t arena_floor = (uint64_t) o.secondary_free_floor_mib << 20;
         if (o.display_reserve_mib > 0) {
             const uint64_t split = o.exclusive_secondary

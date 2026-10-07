@@ -603,8 +603,9 @@ inline bool make_stream(cudaStream_t* st, int prio) {
 // these, and Prefill::split_device_bytes prices the 4070's share with them before the expert tier takes the rest.
 struct SplitSizes {
     static constexpr int64_t R = 4096;   // rows per sub-product (an expert with more rows spans several)
-    size_t xtok, xq, hq, gu, h, dm, bo, w, rows, slot, ids, bounds, grp_gu, grp_d, ring;
+    size_t xtok, xq, hq, gu, h, dm, bo, tk, ids, bounds, grp_gu, grp_d, ring;   // tk: w, rows and slot each
     int64_t bounds_cap;
+    static size_t blob_bytes(size_t max_blob) { return (max_blob + 255) / 256 * 256; }   // a ring slot
     SplitSizes(int64_t T, int64_t n_expert, size_t gub, size_t db, size_t blob, int ring_slots) {
         const int64_t TK = T * 10;
         bounds_cap = 2 * n_expert + 2 * (TK / R + 2) + 8;
@@ -615,7 +616,7 @@ struct SplitSizes {
         h = (size_t) (R * 640) * 4;
         dm = (size_t) (TK * N) * 4;
         bo = (size_t) (T * N) * 4;
-        w = rows = slot = (size_t) TK * 4;
+        tk = (size_t) TK * 4;
         ids = (size_t) R * 4;
         bounds = (size_t) bounds_cap * 4;
         grp_gu = MMQ_GROUP * gub + MMQ_TAIL;
@@ -623,7 +624,7 @@ struct SplitSizes {
         ring = ring_slots > 0 ? (size_t) ring_slots * blob : 0;
     }
     size_t total() const {
-        return xtok + xq + hq + gu + h + dm + bo + w + rows + slot + ids + bounds + grp_gu + grp_d + ring;
+        return xtok + xq + hq + gu + h + dm + bo + 3 * tk + ids + bounds + grp_gu + grp_d + ring;
     }
 };
 struct SplitTier {
@@ -636,7 +637,7 @@ struct SplitTier {
     int RING = kRing;
     int dev = -1, home = 0;
     int64_t T = 0;                       // the token capacity
-    size_t blob = 0;                     // the largest expert blob, 16-byte aligned
+    size_t blob = 0;                     // the largest expert blob, 256-byte aligned (SplitSizes::blob_bytes)
     // on the 4070: compute, host expert copies, late inputs
     cudaStream_t s = nullptr, c = nullptr, u = nullptr;
     std::unique_ptr<mmq::Context> ctx;       // on the 4070
@@ -779,7 +780,7 @@ struct SplitTier {
         cudaGetDevice(&home);
         dev = peer;
         T = tokens;
-        blob = (max_blob + 255) / 256 * 256;
+        blob = SplitSizes::blob_bytes(max_blob);
         grp_gu_bytes = gub;
         grp_d_bytes = db;
         bool ok = true;
@@ -793,16 +794,15 @@ struct SplitTier {
         for (cudaEvent_t* e : {&ev_x, &ev_gates, &ev_done})
             ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess;
         ok = ok && cudaEventCreateWithFlags(&ev_q, cudaEventDisableTiming) == cudaSuccess;   // a stream wait: no host sync
-        const int64_t TK = T * 10;
         if (!stream_owner) RING = 0;   // lane 2 gathers from lane 1's ring
         const SplitSizes z(T, n_expert, gub, db, blob, RING);
         hbounds_cap = z.bounds_cap;
-        hx = (uint8_t*) h_alloc(mmq::q8_bytes(T, N));
-        hbo = (float*) h_alloc((size_t) (T * N) * 4);
-        hw = (float*) h_alloc((size_t) TK * 4);
-        hrows = (int32_t*) h_alloc((size_t) TK * 4);
-        hslot = (int32_t*) h_alloc((size_t) TK * 4);
-        hbounds = (int32_t*) h_alloc((size_t) hbounds_cap * 4);
+        hx = (uint8_t*) h_alloc(z.xtok);
+        hbo = (float*) h_alloc(z.bo);
+        hw = (float*) h_alloc(z.tk);
+        hrows = (int32_t*) h_alloc(z.tk);
+        hslot = (int32_t*) h_alloc(z.tk);
+        hbounds = (int32_t*) h_alloc(z.bounds);
         Dev g(dev);
         size_t f0 = 0, tot = 0;
         cudaMemGetInfo(&f0, &tot);
@@ -831,9 +831,9 @@ struct SplitTier {
         h = (float*) d_alloc(z.h);
         dm = (float*) d_alloc(z.dm);
         bo = (float*) d_alloc(z.bo);
-        w = (float*) d_alloc(z.w);
-        rows = (int32_t*) d_alloc(z.rows);
-        slot = (int32_t*) d_alloc(z.slot);
+        w = (float*) d_alloc(z.tk);
+        rows = (int32_t*) d_alloc(z.tk);
+        slot = (int32_t*) d_alloc(z.tk);
         ids = (int32_t*) d_alloc(z.ids);
         bounds = (int32_t*) d_alloc(z.bounds);
         grp_gu = (uint8_t*) d_alloc(z.grp_gu);
@@ -1082,7 +1082,7 @@ uint64_t Prefill::split_device_bytes(int64_t n_layers, int64_t n_expert, int64_t
     if (chunk <= 0 || !split_env_on() || !split_layout_usable()) return 0;
     size_t gub = 0, db = 0;
     split_group_bytes(n_layers, gub, db);
-    const size_t blob = ((size_t) MAXBLOB() + 255) / 256 * 256;
+    const size_t blob = SplitSizes::blob_bytes((size_t) MAXBLOB());
     if (!wave) return SplitSizes(chunk, n_expert, gub, db, blob, SplitTier::kRing).total();
     // the wave's two lanes, each with a lane chunk: lane 1 streams for both (a whole layer's ring), lane 2 has none
     const int64_t lane = wave_lane_chunk(chunk);
@@ -2353,8 +2353,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         const bool stream_all = m.ring > STAGE && T >= (g_split_layout ? split_min() : stream_all_min()) &&
                                 m.src != nullptr;
         // #32 S4: expert_split for this chunk (MMQ layers of a native pack whose peer tier is set)
-        static const bool split_env = split_env_on();
-        bool split_on = split_env && m.peer_res != nullptr && m.peer_dev >= 0 && m.src != nullptr && split_layout_usable();
+        bool split_on = split_env_on() && m.peer_res != nullptr && m.peer_dev >= 0 && m.src != nullptr && split_layout_usable();
         if (split_on && (!m.split || m.split->T < m.T)) {
             m.split.reset();
             std::string se;
