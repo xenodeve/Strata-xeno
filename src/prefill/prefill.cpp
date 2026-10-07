@@ -858,8 +858,9 @@ struct SplitTier {
         }
         size_t f1 = 0;
         cudaMemGetInfo(&f1, &tot);
-        std::fprintf(stderr, "strata prefill: expert_split (whole layer) on device %d: %.0f MiB of VRAM (%.0f MiB left "
-                             "free)\n", dev, (f0 - f1) / 1048576.0, f1 / 1048576.0);
+        // #208: priced = what Prefill::split_device_bytes books for it; the difference is the allocator's overhead
+        std::fprintf(stderr, "strata prefill: expert_split (whole layer) on device %d: %.0f MiB of VRAM, priced %.0f MiB "
+                             "(%.0f MiB left free)\n", dev, (f0 - f1) / 1048576.0, z.total() / 1048576.0, f1 / 1048576.0);
         if (ok && timeline::enabled()) {
             tl_relay = timeline::lane((std::string("gpu0 relay (prefill split") + lane_tag + ")").c_str());
         }

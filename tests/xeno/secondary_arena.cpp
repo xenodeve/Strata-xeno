@@ -58,13 +58,16 @@ int main() {
         CHECK(strata::core::secondary_nvml_free_bytes(1, nvml1, err));
         const uint64_t display_free = strata::core::secondary_effective_free(free1, nvml1);
         CHECK(cudaSetDevice(0) == cudaSuccess && cudaMemGetInfo(&free0, &total0) == cudaSuccess);
+        CHECK(display_free > 1024 * mib);   // room for the squeezed 5060 to read lower than the 4070
         void* squeeze = nullptr;
         if (free0 > display_free - 512 * mib)
             CHECK(cudaMalloc(&squeeze, free0 - (display_free - 512 * mib)) == cudaSuccess);
-        CHECK(arena.check_free_floor(err));
+        const bool checked = arena.check_free_floor(err);
         int current = -1;
-        CHECK(cudaGetDevice(&current) == cudaSuccess && current == 0);   // the caller's device is restored
+        const bool restored = cudaGetDevice(&current) == cudaSuccess && current == 0;
         if (squeeze) CHECK(cudaFree(squeeze) == cudaSuccess);
+        CHECK(checked);
+        CHECK(restored);   // the caller's device is restored
         const uint64_t seen = arena.lower_free_after();
         CHECK(seen + 256 * mib > display_free && seen < display_free + 256 * mib);
     }
