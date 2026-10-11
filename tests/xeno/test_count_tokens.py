@@ -76,7 +76,7 @@ class CountTokensTest(unittest.TestCase):
             self.assertEqual(response.status, 200)
             count = json.load(response)['input_tokens']
         messages, tools, kwargs = anthropic_to_messages(body)
-        expected, _, _ = self.service.prepare(messages, tools, kwargs, None)
+        expected, _, _ = self.service.prepare(messages, tools, kwargs, None, count_only=True)   # merge #212
         self.assertEqual(count, len(expected))
         self.assertIn('Revenue is 42.', messages[0]['content'])
 
@@ -124,10 +124,12 @@ class CountTokensTest(unittest.TestCase):
         messages, tools, kwargs = anthropic_to_messages(body)
         with tempfile.TemporaryDirectory() as temp:
             tokenizer = ImageTokenizer()
-            service = Service(MockEngine(tokenizer, 'Hi.', max_context=8), tokenizer, self.template,
+            # merge #212: a count (count_only) stages no file, and prepare(None) is upstream's "the rest of the
+            # context", so the staging is exercised by a request that fits
+            service = Service(MockEngine(tokenizer, 'Hi.', max_context=4096), tokenizer, self.template,
                               vision=BrokenVision(Path(temp)))
             with self.assertRaises(FileNotFoundError):
-                service.prepare(messages, tools, kwargs, None)
+                service.prepare(messages, tools, kwargs, 1)
             self.assertEqual(list(Path(temp).glob('req-*.sve')), [])
 
 

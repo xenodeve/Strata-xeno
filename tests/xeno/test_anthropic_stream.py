@@ -13,7 +13,7 @@ class FakeService:
     def model_for(self, req):   # upstream #297 aliases (merge 0.1.34, #100)
         return self.model
     def __init__(self, events): self.events = events
-    def run(self, ids, thinking, tools, max_new, sampling, cancel):
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None):   # Service.run (merge #212: force)
         yield from self.events
 
 

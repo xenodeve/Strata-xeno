@@ -12,7 +12,7 @@ Qwen3.8-Flash-Next (125B parameters) on a gaming PC · NVIDIA · Windows · free
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), a large mixture-of-experts model that normally
 needs a server, on one graphics card plus system RAM.
 
-**Strata-xeno** follows upstream (last merged: v0.1.38) and changes it for one goal: **the lowest latency in a real
+**Strata-xeno** follows upstream (last merged: v0.1.42) and changes it for one goal: **the lowest latency in a real
 coding-agent turn** on a PC with two cards. Those turns are a long cached conversation, then short new parts and
 answers. The fork changes:
 - how the experts are spread over the GPUs and RAM;
@@ -113,7 +113,10 @@ Full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
 
 One card works. The second-GPU tier and the two-card prompt path need a second NVIDIA card.
 
-AMD and Linux support comes from upstream's code. The fork has not built, measured or tested it.
+AMD and Linux support comes from upstream's code. The fork has not built, measured or tested it. The same holds for
+upstream's experimental hardware, written and tested by its community: [older GPUs](docs/OLDER_GPUS.md) (Tesla P40 /
+V100, GTX 10, Radeon VII / MI50, through a second CUDA 12 engine), [Intel Arc](docs/INTEL_ARC.md),
+[Strix Halo](docs/STRIX_HALO.md) and [CPUs without AVX2](docs/INSTALL.md#older-cpus-experimental).
 
 ## Install
 
@@ -154,11 +157,13 @@ Models, sizes and what fits in how much RAM are unchanged from upstream: [docs/M
 - **In the browser:** `http://127.0.0.1:8080` opens the web app.
 - **Claude Code:** `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`. Other apps that use Anthropic's API:
   `http://127.0.0.1:8080/v1/messages`.
-- **OpenAI-compatible apps:** base URL `http://127.0.0.1:8080/v1`, any API key and any model name.
+- **OpenAI-compatible apps:** base URL `http://127.0.0.1:8080/v1`, any API key and any model name. Codex CLI and other
+  apps on the OpenAI Responses API: `/v1/responses` ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
 - **Thinking:** off, low, medium or high, in the chat menu or as your app's "reasoning effort".
 - **From another device:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always use a key.
 - **It answers one request at a time.** A conversation's first prompt is read in full; follow-ups reuse the cached
-  part.
+  part. Upstream's `"parallel": 2` answers several at once ([BATCHING.md](docs/BATCHING.md)); the fork has not
+  measured it with its two-card profile.
 
 More: [the API and every setting](docs/DETAILS.md#using-it), [where chats are stored](docs/INSTALL.md#where-things-are-stored).
 
@@ -175,6 +180,7 @@ Where to report a problem:
 - **The fork's code** (the server, the app, the two-card engine paths): [this repository's
   issues](https://github.com/xenodeve/Strata-xeno/issues).
 - **Something that also happens on upstream Strata:** [upstream's issues](https://github.com/Niko1221/Strata/issues).
+- **A security problem:** report it privately, as [SECURITY.md](SECURITY.md) says.
 
 ## For developers and coding agents
 
