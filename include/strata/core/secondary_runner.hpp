@@ -89,6 +89,10 @@ private:
     size_t meta_start_off_ = 0, meta_count_off_ = 0, meta_dst_off_ = 0, meta_tok_off_ = 0;
     size_t meta_bytes_ = 0;
     float* device_x_ = nullptr;
+    // APR (prism.hadamard): this device's copies of the gate/up (n_embd) and down (n_ff) sign vectors, nullptr for
+    // identity signs or a pack without folded experts (hadamard_device_signs owns them)
+    const float* device_sx_ = nullptr;
+    const float* device_sh_ = nullptr;
     uint8_t* device_xq_ = nullptr;
     float* device_scales_ = nullptr;
     float* device_out_ = nullptr;

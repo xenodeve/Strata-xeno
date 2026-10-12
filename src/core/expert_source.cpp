@@ -3750,7 +3750,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         if (secondary_claims) {
             const auto& f = lay.fmt[(size_t) d.layers];
-            const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            // APR: which of the layer's weights are Hadamard-folded; the runner rotates with its own device's signs
+            if (f.had_d) L.had_block = f.had_block;
+            if (f.had_gu) L.had_gu_block = f.had_block;
             std::string secondary_err;
             if (!d.secondary_runner->launch(L, *d.secondary_weights, x_f, secondary_slots,
                                              (int) n_tok, (int) k, secondary_err)) {
