@@ -124,9 +124,8 @@ constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
 // #789: a staged chunk (below stream_all_min) keeps STAGE actual transfers ahead and queues the shared expert after the
-// routing sync.  Upstream's default; STRATA_PREFILL_STREAM_AHEAD=0 keeps the previous routed-only upload schedule (A/B).
-// xeno (merge 0.1.42): OFF by default - it reschedules the served D2x's short prompt parts and has not been measured
-// here; STRATA_PREFILL_STREAM_AHEAD=1 is upstream's default (the ABBA arm)
+// routing sync.  Upstream turns it on by default; xeno (merge 0.1.42): OFF by default here - it reschedules the served
+// D2x's short prompt parts and has not been measured on them.  STRATA_PREFILL_STREAM_AHEAD=1 arms it (the ABBA arm).
 inline bool stream_ahead_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_PREFILL_STREAM_AHEAD");
@@ -398,6 +397,9 @@ inline bool fused_ring() {
 // the largest ring: 512 slots.  Upstream takes 1024 with the Q2_0 pack's fused experts, which fit only with P3's smaller
 // buffers; the fork keeps MMQ's (moe_bufs), so its ring stays at the 512 the native packs' fused layers were measured at
 inline int ring_cap() { return RING_MAX; }
+// 0.1.39's ring before the cap: 512 fused (xeno #103; upstream 1024) / 384 pinned, 96 when a large share goes through
+// host copies.  One copy for ring_slots and ring_default_slots (#212 review).
+inline int pinned_ring_slots() { return g_pinned_share >= 0.9 ? (fused_ring() ? 512 : 384) : 96; }
 // The ring's budget in bytes: the measured slot counts above, at the blob size they were measured with.  It is
 // bytes and not slots because a slot is one whole blob and the blob is the pack's - see the note above.
 inline constexpr uint64_t Q2_0_BLOB = 1382400ull;   // the blob of the pack the ring was tuned on
@@ -449,7 +451,7 @@ inline int ring_slots(size_t T) {
     // 0.1.39's ring (fused 512 here - xeno #103: upstream 1024, capped to ring_cap() - / 384 pinned, 96 when a large
     // share goes through host copies), and the #583 byte budget the auto scan chose for chunks past the size 0.1.39's
     // rule would have picked (set_ring_budget; only with STRATA_RING_BYTES=1 in the fork)
-    const int pinned_ring = g_pinned_share >= 0.9 ? (fused_ring() ? 512 : 384) : 96;
+    const int pinned_ring = pinned_ring_slots();
     const bool budget = ring_bytes_on() && g_ring_budget > 0 && (int64_t) T > g_ring_small_max;
     const int r = v ? std::atoi(v) : g_ring_override > 0 ? g_ring_override : budget ? g_ring_budget : pinned_ring;
     if (v && r == STAGE) return STAGE; // Explicit opt-in to routed-only staging, including large chunks.
@@ -2438,8 +2440,7 @@ uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core:
 }
 
 int64_t Prefill::ring_default_slots() {
-    const int r = g_pinned_share >= 0.9 ? (fused_ring() ? 512 : 384) : 96;   // (ring_slots' 0.1.39 ring: xeno #103 512)
-    return (int64_t) std::min(r, ring_cap());
+    return (int64_t) std::min(pinned_ring_slots(), ring_cap());   // ring_slots' 0.1.39 ring
 }
 
 int64_t Prefill::ring_cap_for(int64_t old_chunk) {

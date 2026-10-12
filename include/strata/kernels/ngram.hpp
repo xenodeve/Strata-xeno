@@ -190,7 +190,7 @@ public:
     /// with a row cache; a no-op otherwise).  Several may be outstanding; `gather_batch` waits for all of them
     /// first, so the rows it returns are the same bytes either way.  Rows never gathered only cost their reads.
     bool prefetch(const uint32_t* rows, size_t n);
-    /// Rows served from the row cache since `open` (Direct mode).
+    /// Rows served from the row cache since `open` or the last `reset_io_stats` (Direct mode).
     uint64_t cache_hits() const;
     /// #213: zero the reader's counters and the rows by path, so `io_report` counts from here (after the start-up
     /// probe, whose 4,096 random rows are not the requests').  The row cache keeps its rows.

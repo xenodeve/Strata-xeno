@@ -59,6 +59,25 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
 
 int planned_host_core(PoolAffinity affinity) { return detect_cpu_topology(true, affinity).host_core; }
 
+#if defined(_WIN32)
+// Every active logical processor, group-aware (group * 64 + index), the first one the host's when `skip_first`: the
+// fallback when the core query cannot name the cores (#212 review: one copy for both of its callers).
+static CpuTopology every_logical_processor(CpuTopology topo, bool skip_first) {
+    topo.worker_cores.clear();
+    const WORD groups = GetActiveProcessorGroupCount();
+    for (WORD group = 0; group < groups; ++group) {
+        const DWORD count = GetActiveProcessorCount(group);
+        if (count == 0 || count == (DWORD) -1 || count > 64) continue;
+        for (DWORD i = 0; i < count; ++i) topo.worker_cores.push_back((int) group * 64 + (int) i);
+    }
+    if (skip_first && !topo.worker_cores.empty()) {
+        topo.host_core = topo.worker_cores.front();
+        topo.worker_cores.erase(topo.worker_cores.begin());
+    }
+    return topo;
+}
+#endif
+
 static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affinity) {
     CpuTopology topo;
 #if defined(_WIN32)
@@ -69,17 +88,7 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
     if (len == 0) {
         // Preserve group identity even when detailed core topology is unavailable.
-        const WORD groups = GetActiveProcessorGroupCount();
-        for (WORD group = 0; group < groups; ++group) {
-            const DWORD count = GetActiveProcessorCount(group);
-            if (count == 0 || count == (DWORD) -1 || count > 64) continue;
-            for (DWORD i = 0; i < count; ++i) topo.worker_cores.push_back((int) group * 64 + (int) i);
-        }
-        if (skip_first && !topo.worker_cores.empty()) {
-            topo.host_core = topo.worker_cores.front();
-            topo.worker_cores.erase(topo.worker_cores.begin());
-        }
-        return topo;
+        return every_logical_processor(topo, skip_first);
     }
     std::vector<char> buf(len);
     if (GetLogicalProcessorInformationEx(RelationProcessorCore,
@@ -182,21 +191,7 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
         }
     }
     // xeno #2: the query failed or named no core - every logical processor counts, as when the size query fails
-    // (upstream's group-aware enumeration, as there).
-    topo.worker_cores.clear();
-    {
-        const WORD groups = GetActiveProcessorGroupCount();
-        for (WORD group = 0; group < groups; ++group) {
-            const DWORD count = GetActiveProcessorCount(group);
-            if (count == 0 || count == (DWORD) -1 || count > 64) continue;
-            for (DWORD i = 0; i < count; ++i) topo.worker_cores.push_back((int) group * 64 + (int) i);
-        }
-    }
-    if (skip_first && !topo.worker_cores.empty()) {
-        topo.host_core = topo.worker_cores.front();
-        topo.worker_cores.erase(topo.worker_cores.begin());
-    }
-    return topo;
+    return every_logical_processor(topo, skip_first);
 #else
     // The logical CPUs this process may run on, ONE PER PHYSICAL CORE (issue #40): SMT siblings share a core's
     // load/store bandwidth, so a worker on each would put two workers on one core, as the Windows branch above

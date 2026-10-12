@@ -776,6 +776,11 @@ struct Options {
     std::string ban_ids;
 };
 
+// xeno (#212 review): the fork's GPU tiers - exclusive placement (an owned expert has no RAM copy) or the 4070 tier.
+// Upstream's features that move experts or K/V on their own are refused beside either; one predicate, one reason.
+inline bool fork_tiers(const Options& o) { return o.exclusive_primary_experts || o.secondary_expert_mib > 0; }
+constexpr const char* kForkTiersWhy = "not with --exclusive-primary-experts or the 4070 tier (--secondary-expert-mib)";
+
 void usage() {
     std::fprintf(stderr,
                  "strata generate --pack DIR --tokens \"1,2,3\" [options]\n"
@@ -5052,7 +5057,7 @@ int main(int argc, char** argv) {
                             o.batch == 0 && !o.vram_elastic && o.peer_device < 0 &&
                             // xeno: the fork's exclusive placement leaves owned experts without a RAM copy, and its
                             // 4070 tier and paired swaps keep their own residency beside the cache's slots
-                            !o.exclusive_primary_experts && o.secondary_expert_mib <= 0;
+                            !fork_tiers(o);
             if (asked && !on)
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
                                      "every expert in RAM, no --batch, --vram-elastic, --peer-device, "
@@ -5859,8 +5864,7 @@ int main(int argc, char** argv) {
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         // xeno: a shrink makes the slots' experts CPU misses, and the fork's exclusive placement left
                         // them no RAM copy; the 4070 tier and the paired swaps keep their own residency beside the slots
-                        : o.exclusive_primary_experts || o.secondary_expert_mib > 0
-                            ? "not with --exclusive-primary-experts or the 4070 tier (--secondary-expert-mib)"
+                        : fork_tiers(o) ? kForkTiersWhy
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
 #if defined(STRATA_USE_HIP)
         if (why == nullptr) why = "it is NVIDIA-only for now";
@@ -8046,8 +8050,7 @@ int main(int argc, char** argv) {
                         : peer.valid() ? "not with --peer-device"
                         // xeno: the fork's paired swaps (--exclusive-primary-experts) and 4070 tier pick their swaps
                         // from the same table and own experts that have no RAM copy
-                        : o.exclusive_primary_experts || o.secondary_expert_mib > 0
-                            ? "not with --exclusive-primary-experts or the 4070 tier (--secondary-expert-mib)"
+                        : fork_tiers(o) ? kForkTiersWhy
                         : remote_opt ? "not with --remote-expert-opt"
                         : o.pipeline_windows >= 2 && !pl_async ? "not with --pipeline-windows 2 (STRATA_PIPELINE_ADAPT_ASYNC=0)"
                         : nullptr;
@@ -8328,18 +8331,13 @@ int main(int argc, char** argv) {
             }
         }
 #endif
+        // xeno (#212 review): the CPU prefill share is never armed by default on the fork - it has never run on the fork's
+        // prompt path (the expert split, the wave, the 4070 tier), and keyed to the 4070 tier upstream's default was armed
+        // by the #59 degraded restart.  STRATA_PREFILL_CPU_SHARE=auto (upstream's default, the measured share) or =x (a
+        // fixed share) arms it, with upstream's memory check (H11) warning when the host is short.
+        if (std::getenv("STRATA_PREFILL_CPU_SHARE") != nullptr) (void) share_default_ok();
         const bool share_pool = o.batch <= 0 && !o.no_pool;
-        bool share_has_work = strata::prefill::share_rules::default_share_has_work(
-            (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
-        if (!share_has_work)
-            std::fprintf(stderr, "strata serve: every expert is in the GPU cache (%lld of %lld): the CPU prefill share has "
-                                 "nothing to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
-                         (long long) xcache.slots(), (long long) (g.n_layers * g.n_expert));
-        // xeno: not by default beside the fork's 4070 tier (--secondary-expert-mib; its expert split and wave): upstream's
-        // default is measured on one GPU, and D2x's prompt path is the fork's.  STRATA_PREFILL_CPU_SHARE=1/auto still arms it.
-        const bool share_by_default = share_pool && stages.empty() && !multi_gpu && o.secondary_expert_mib <= 0;
-        if (share_by_default && share_has_work && !share_default_ok()) share_has_work = false;   // H11
-        strata::prefill::Prefill::arm_cpu_share(share_pool, share_by_default && share_has_work);
+        strata::prefill::Prefill::arm_cpu_share(share_pool, false);
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -9696,10 +9694,9 @@ int main(int argc, char** argv) {
             for (int64_t l = 0; l < g.n_layers; ++l) card[(size_t) l] = multi_gpu ? stage_of(l) : 0;
             // xeno: not beside the fork's 4070 tier - the dispatch would take or copy into a swap-space slot an expert
             // the 4070 holds (and an exclusive one has no RAM copy to copy from); not run together
-            if (o.secondary_expert_mib > 0) {
+            if (fork_tiers(o)) {
                 if (const char* fv = std::getenv("STRATA_FS_SLOTS"); fv != nullptr && std::atoi(fv) > 0)
-                    std::fprintf(stderr, "strata serve: STRATA_FS_SLOTS is off: not with the 4070 tier "
-                                         "(--secondary-expert-mib)\n");
+                    std::fprintf(stderr, "strata serve: STRATA_FS_SLOTS is off: %s\n", kForkTiersWhy);
             } else {
                 fs_swap.reset(strata::core::foresight_swap_from_env(g.n_layers, g.n_expert, card, devs));
             }
@@ -9715,28 +9712,14 @@ int main(int argc, char** argv) {
         ver.set_pcie_share(drive.d.pcie_num > 0);
         const bool all_experts_resident = !host_res.empty() &&
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
-        // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT on CUDA builds (owner decision, 0.1.42): a missed expert that every token of
-        // a verify window routes at rank 7 or lower is neither copied nor computed (answers differ slightly from 0.1.41,
-        // KL ~0.003-0.006; docs/DETAILS.md).  =0 restores 0.1.41's bytes.  Nothing to do, so no default and no line, when every
-        // expert is in VRAM; off with --batch slots (a window then mixes requests, and one request's skip would depend on
-        // another's tokens) and, as in the dispatch, with a peer or helper GPU.  A layer split is fine: each stage skips by itself.
-        {
-            const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
-#if !defined(STRATA_USE_HIP)
-            // xeno: nor beside the fork's 4070 tier (--secondary-expert-mib), which the dispatch's peer/helper test does not
-            // see: D2x keeps 0.1.41's bytes by default; an explicit STRATA_ROUTE_TAIL_SKIP=R still arms it
-            const bool tail_default_ok = tse == nullptr && !all_experts_resident && o.batch == 0 && o.peer_device < 0 &&
-                                         o.secondary_expert_mib <= 0;
-#else
-            const bool tail_default_ok = false;   // HIP and SYCL stay as they were
-#endif
-            if (tail_default_ok) strata::core::set_tail_skip_rank(7);
-            if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
-                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a verify window routes at rank %d or "
-                                     "lower is skipped (+10..20%% decode on 12-16 GB cards that miss experts, answers differ slightly from 0.1.41); "
-                                     "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
-                             tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
-        }
+        // STRATA_ROUTE_TAIL_SKIP=R: a missed expert that every token of a verify window routes at rank R or lower is neither
+        // copied nor computed (answers differ slightly, KL ~0.003-0.006; docs/DETAILS.md).  Upstream arms R=7 by default on
+        // CUDA serve (0.1.42); xeno (#212 review): never by default on the fork - it changes answers (AGENTS.md: a trade-off
+        // stays an option), and upstream's predicate keyed to the 4070 tier was armed by the #59 degraded restart.
+        if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
+            std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON: a missed expert that every token of a verify window routes at rank %d or "
+                                 "lower is skipped (+10..20%% decode on 12-16 GB cards that miss experts, answers differ slightly); "
+                                 "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(), strata::core::tail_skip_rank());
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         PcieAuto pcie_auto;
@@ -14124,11 +14107,9 @@ int main(int argc, char** argv) {
     std::shared_ptr<strata::prefill::Prefill::WaveLink> wave_link;
     cudaStream_t wave_cs = nullptr;
     // #1595: not by default when the cache holds every expert (nothing to take)
-    // xeno: not by default beside the fork's 4070 tier (its expert split and wave; see the serve path)
-    strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool,
-        !multi_gpu && !o.no_pool && o.batch <= 0 && o.secondary_expert_mib <= 0 &&
-        strata::prefill::share_rules::default_share_has_work((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert)) &&
-        share_default_ok());   // H11   // before the chunk below sizes the loan
+    // xeno (#212 review): never by default on the fork, as in the serve path; before the chunk below sizes the loan
+    if (std::getenv("STRATA_PREFILL_CPU_SHARE") != nullptr) (void) share_default_ok();
+    strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool, false);
     bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");

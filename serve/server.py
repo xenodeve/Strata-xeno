@@ -156,9 +156,9 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.  It is reported as the loop guard's stop (serve/loop_guard.py): stop_detail "loop", counted
 # in /status loops_stopped.  It catches what the guard cannot see: a token that never becomes reply text (a special
-# token, a tool call's arguments) and a repeated token longer than the guard's 8-character period.
+# token, a tool call's arguments) and a repeated token longer than the guard's 8-character period.  Its cost: a reply
+# that really wants one token 256+ times in a row (a long divider, padding) is cut there; 0 or a larger N allows it.
 REPEAT_STOP_TOKENS = 256
-REPEAT_STOP_DEFAULT = REPEAT_STOP_TOKENS
 ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
@@ -3080,7 +3080,7 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.reasoning_carry = "off"                     # #200: the config's reasoning_carry (off / history / resume)
         self.carry = reasoning_carry.Carry()             # #200: the latest reply cut while still thinking
-        self.repeat_stop_tokens = REPEAT_STOP_DEFAULT    # #606: one token this many times in a row ends a reply (0: off)
+        self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -4246,6 +4246,14 @@ class Service:
         if path is not None:
             Path(path).unlink(missing_ok=True)
 
+    def _loop_stopped(self) -> str:
+        """A reply ended as degenerate output (the loop guard, or #606's one-token run): counted in /status, and its
+        stop_detail."""
+        with self.status_lock:
+            self.status["loops_stopped"] += 1
+            self.status["last_stop_reason"] = "loop"
+        return "loop"
+
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
             s = self.status if st is None else st
@@ -4508,10 +4516,7 @@ class Service:
                                         ev.text, in_think=ev.kind == "reasoning"):
                                     cancel.set()
                                     finish = "length"
-                                    stop_detail = "loop"
-                                    with self.status_lock:
-                                        self.status["loops_stopped"] += 1
-                                        self.status["last_stop_reason"] = "loop"
+                                    stop_detail = self._loop_stopped()
                                     print(f"[strata] loop guard stopped generation: {guard.reason}", flush=True)
                                     break
                                 yield "event", ev
@@ -4570,10 +4575,7 @@ class Service:
                                   f"at {n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                                   "strata-<model>.json; remove it to turn this off)", flush=True)
                         elif repeated:
-                            stop_detail = "loop"            # reported as the loop guard's stop
-                            with self.status_lock:
-                                self.status["loops_stopped"] += 1
-                                self.status["last_stop_reason"] = "loop"
+                            stop_detail = self._loop_stopped()   # #606: reported as the loop guard's stop
                             print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                                   f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                                   "strata-<model>.json; 0 turns this off). If a new request with a short prompt does "
@@ -7667,7 +7669,7 @@ def main() -> int:
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
     svc.tool_call_recovery = recovery
-    rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_DEFAULT)  # #606
+    rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)  # #606
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs

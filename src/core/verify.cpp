@@ -66,6 +66,11 @@ namespace {
 
 constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
+// The head's pick is redone host-side for a sampled request, a penalty history, the fork's ban (xeno #49 S4) or a
+// logit bias: one test for run(), pl_finish() and sample_rows(), which drifted apart once (#212 review: the ban).
+bool needs_host_pick(const strata::kernels::SamplerParams& sp, bool hist) {
+    return (!sp.greedy && sp.temperature > 0.0f) || hist || sp.ban != nullptr || sp.logit_bias != nullptr;
+}
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
@@ -2173,8 +2178,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // xeno #49 S4: a request with banned ids (`sampling_.ban`) is picked again here too, greedy or not: the captured
     // greedy pick above has no ban, and every emitted token and every accepted draft is one of these picks.
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ &&
-        (sampled || hist_d_ != nullptr || sampling_.ban != nullptr || sampling_.logit_bias != nullptr)) {
+    if (head_sampling_ && needs_host_pick(sampling_, hist_d_ != nullptr)) {
         timeline::Span sampling_span("head sampling", T);
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
@@ -2879,7 +2883,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
     bool any = false;
     for (int t = 0; t < S; ++t) {
         strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
+        if (!needs_host_pick(sp, false)) continue;   // (no penalty history for batch rows)
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
         sp.penalty_last_n = 0;
         strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
@@ -3234,8 +3238,7 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));
     if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written
     const int T = fl_T_;
-    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
+    if (head_sampling_ && needs_host_pick(sampling_, hist_d_ != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);

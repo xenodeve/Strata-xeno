@@ -464,8 +464,7 @@ void PleTable::close() {
     impl_->rb = PLE_ROW_BYTES;
     impl_->fmt = &ple_format_info(PleFormat::IQ4_NL);
     impl_->scale = 1.0f;
-    impl_->bytes_read = 0;
-    impl_->path = Impl::PathRows{};
+    reset_io_stats();
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }

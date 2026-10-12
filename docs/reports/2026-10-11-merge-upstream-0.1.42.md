@@ -12,8 +12,9 @@ theirs of each conflicted file), `hunks.txt`, `conflicts.txt`, `upstream-commits
 to the deployed `main` (all seven `STRATA_STATE_HASH` fingerprints in four boots, `mtp=` included) and gives identical
 replies in Claude Code's request shape and identical generate-mode outputs. In the same session it reads every
 Claude Code part 84-149 ms faster (5-7 %), the long prefix at the same speed, and answers at 73.0 against 63.6 tok/s
-in the server with the same windows and draft acceptance; generate-mode decode is equal within noise (§5a). Which
-stage gives the server's decode gain is not measured yet. The PLE regression first reported here (#213) was an
+in the server with the same windows and draft acceptance. Generate-mode decode, equal within noise in the first session
+(§5a), was faster in all 12 round-pairs of four repeated rounds on 2026-10-12, from the primary GPU's `wait for rings`
+and MTP drafting (§10). The PLE regression first reported here (#213) was an
 instrument fault, found 2026-10-12 (§10): the `ple reads` line counted upstream's start-up probe of 4,096 random rows.
 With the probe left out, decode asks for exactly the rows main asks for.
 The tree builds at the first try, ctest passes but the known `ple_parity`, and the pytest suites pass. Every upstream
@@ -76,8 +77,8 @@ D2x (`strata-flash-next-d2x.json`): Swift 1.5 IQ2_XS, `--exclusive-primary-exper
 
 | item | reaches D2x | on | why / switch to upstream's value |
 |---|---|---|---|
-| `STRATA_ROUTE_TAIL_SKIP` default rank 7 on CUDA serve (`b4e3407b`) | yes | **off** | It changes outputs (KL ~0.003-0.006 per upstream). Upstream's predicate does not see the fork's 4070 tier (it excludes only `--peer-device`, helper GPUs, `--batch`), so D2x would have had it on. `tail_default_ok` (generate.cpp ~9727) adds `o.secondary_expert_mib <= 0`. `STRATA_ROUTE_TAIL_SKIP=7` is the arm. With it, the dispatch's skip loop now spares an expert the 4070 holds (`expert_source.cpp:3616`, `secondary_res >= 0`), as it spares a CUDA0-resident one |
-| CPU prefill share, on by default since 0.1.41 (`162ce64e`) | yes | **off** | Upstream's "one GPU" test (`stages.empty() && !multi_gpu`) passes with the 4070 tier. Two guards: `share_by_default` needs `o.secondary_expert_mib <= 0` (generate.cpp:8339, serve and generate mode), and prefill.cpp's `cpu_share_env` / `PoolHold` never arm it by default in a split layer or with the 4070 tier (`m.peer_res == nullptr`). `STRATA_PREFILL_CPU_SHARE=1` / `auto` arms it. It has never run on the fork's walk (§7) |
+| `STRATA_ROUTE_TAIL_SKIP` default rank 7 on CUDA serve (`b4e3407b`) | yes | **off** | It changes outputs (KL ~0.003-0.006 per upstream). Upstream's predicate does not see the fork's 4070 tier (it excludes only `--peer-device`, helper GPUs, `--batch`), so D2x would have had it on. Since the PR #214 review it is off on the fork everywhere (`tail_default_ok = false`): keyed to the 4070 tier, the #59 degraded restart (which drops `--secondary-expert-mib`) would have armed it. `STRATA_ROUTE_TAIL_SKIP=7` is the arm. With it, the dispatch's skip loop now spares an expert the 4070 holds (`expert_source.cpp:3616`, `secondary_res >= 0`), as it spares a CUDA0-resident one |
+| CPU prefill share, on by default since 0.1.41 (`162ce64e`) | yes | **off** | Upstream's "one GPU" test (`stages.empty() && !multi_gpu`) passes with the 4070 tier. Since the PR #214 review it is not armed by default on the fork at all (`share_by_default = false`, serve and generate mode): keyed to the 4070 tier, the #59 degraded restart would have armed it. prefill.cpp's `cpu_share_env` / `PoolHold` also keep it out of a split layer and the 4070 tier. `STRATA_PREFILL_CPU_SHARE=auto` (upstream's default, the measured share) arms it; `=x` is a fixed share x, not upstream's default. It has never run on the fork's walk (§7) |
 | `STRATA_RING_BYTES` (#583 byte-budget ring + `--prefill auto` scan, `bcd3603e`) | yes (`--prefill auto`) | **off** | It moves D2x's ring, its loan and its outputs. `=1` is upstream's default. The fork's corrected buffer count (#122) applies either way (prefill.md hunks 28-31) |
 | `STRATA_PREFILL_STREAM_AHEAD` (#789: deferred shared expert, `STAGE` copies in flight) | yes (staged chunks) | **off** | It reschedules D2x's staged parts. `=1` is upstream's default. It also governs the auto-merged `pending < STAGE` look-ahead |
 | `STRATA_MTP_CATCHUP_ALL` (#783 PR-i, `3fd0460b`) | yes (`--spec 4 --mtp`) | unset = **the whole window** (the fork's) | Upstream's default skips the drafter's K/V catch-up of the rejected rows. Its exactness rests on an argument about which cells are read later, not on identical kernels, and it is unmeasured here (the 0.1.38 `STRATA_MTP_BATCH_RING` precedent). `STRATA_MTP_CATCHUP_ALL=0` is upstream's (mtp.cpp:63-69) |
@@ -652,9 +653,9 @@ Same session, 2026-10-11, on `strata-flash-next-d2x.json` as served (every arm w
 
 - Base: `main` `8abbfa02`; upstream `upstream/main` `61b3fb5d` (tag `v0.1.42`); branch `xeno/212-merge-0.1.42`.
 - The merge commit: the commit that adds this report (parents `8abbfa02` and upstream's real `61b3fb5d`, not the
-  graft); its id is in #212 and in the PR. The local graft (`refs/replace/09817da3`) is deleted right after it
+  graft): `f3ddd6b9`, on `xeno/212-merge-0.1.42`, PR #214. The local graft (`refs/replace/09817da3`) is deleted right after it
   (`git replace -d 09817da3`) and is never pushed.
-- Engine measured in §5a: `C:\Strata-expun-212\strata.exe`, sha256
+- Engine measured in §5a: `C:\Strata-exp\run-212\strata.exe`, sha256
   `910652258eaadd37b9e272f68040f7851c840f3c13502217c53c814482571eb9`, a copy of `build-212\strata.exe`, built from the
   merged working tree. No C, C++ or CUDA file changed after that build (checked with `find -newer` on the exe); later
   changes are Python, tests and docs.
@@ -717,10 +718,10 @@ resolutions were designed around (§4), not bugs found in merged code.
 - **#213, closed by §10:** the "+4,096 PLE rows" was the start-up probe counted by the decode's `ple reads` line,
   not a double read. Left as measured, not fixed: ~200-380 more SSD reads per 256 tokens (the window prefetch reaches a
   row the #44 D4 read is still reading), with less blocked time than main.
-- **Not explained yet: the server's decode gain** (73.0 against 63.6 tok/s with the same windows, §5a). A timeline of
-  each arm splits the window.
+- **The decode gain is located but not split by kernel** (§10): the primary GPU's `wait for rings` and MTP drafting
+  are lower in every run; which of upstream's #783 changes gives it is not measured.
 - **ABBA arms not measured** (each upstream value behind its switch, §2): `STRATA_MTP_CATCHUP_ALL=0`,
-  `STRATA_RING_BYTES=1`, `STRATA_PREFILL_STREAM_AHEAD=1`, `STRATA_PREFILL_CPU_SHARE=1` / `auto`,
+  `STRATA_RING_BYTES=1`, `STRATA_PREFILL_STREAM_AHEAD=1`, `STRATA_PREFILL_CPU_SHARE=auto`,
   `STRATA_ROUTE_TAIL_SKIP=7`, `--ple-inflight 256`, `CUDA_MODULE_LOADING=EAGER`. The host
   pin (#626) has no arm; it is measured only inside the merge-vs-main ABBA.
 - **Questions for the developer:**
@@ -820,8 +821,8 @@ Two changes on the merge branch after `f3ddd6b9`, before the PR.
   and prints its rate; the row cache keeps its rows. Tested in `ple_reader_selftest` (a reset, then one prefetched
   token: `window 16 (tokens used 1, dropped 0)`).
 - **Verified on D2x, same session.** Run order V F F V; 256 tokens greedy; every arm at `--pool-priority 2
-  --process-priority 2`. F = `run-main-8abbfa0` (sha256 `0936c394…`); V = `C:\Strata-expun-213\strata.exe` (sha256
-  `1137f45d…`, the merge plus this fix). Data in `merge-212-record213b\`.
+  --process-priority 2`. F = `run-main-8abbfa0` (sha256 `0936c394…`); V = `C:\Strata-exp\run-213\strata.exe` (sha256
+  `1137f45d…`, the merge plus this fix). Data in `merge-212-record\r213\ab\`.
 
   | prompt | rows asked (V = F) | SSD reads F / V | blocked ms F / V | decode tok/s F / V |
   |---|---:|---|---|---|
@@ -836,10 +837,10 @@ Two changes on the merge branch after `f3ddd6b9`, before the PR.
   - **More keep-alive reads (126-152 against 17-42).** The probe starts upstream's 60 s SSD keep-alive window at boot,
     outside any request.
 - **Generate-mode decode: the merge is faster, measured (2026-10-12).** One first round (above) and three repeats
-  (`r213ep1..3`), each V F F V on three prompts, all at `--pool-priority 2 --process-priority 2`, 8 runs an arm a
+  (`r213\rep1..3`), each V F F V on three prompts, all at `--pool-priority 2 --process-priority 2`, 8 runs an arm a
   prompt. **The merge was faster in all 12 round-pairs** (V/F 1.04-1.20), and outputs were identical in all 48 runs.
-  Medians, main -> merge, ms per decode round (`tests/xeno/latency_breakdown.py`'s fields; `r213gg.py`,
-  `r213gg-today.txt`):
+  Medians, main -> merge, ms per decode round (`tests/xeno/latency_breakdown.py`'s fields; `r213\agg.py`,
+  `r213\agg-today.txt`):
 
   | stage | thai | py-async | long8k |
   |---|---|---|---|
@@ -859,9 +860,9 @@ Two changes on the merge branch after `f3ddd6b9`, before the PR.
     are in §2.
 - **Gates at this tip:** the whole tree builds (incremental, 91/91 steps, no error). ctest: 158 passed, 2 skipped and
   1 known failure (`ple_parity`, the deleted Q2_0 file), the same as at the merge commit. `gemm_bf16_parity` needs
-  CUDA's `bin` on `PATH` and passed when rerun with it (`merge-212-record213\ctest-213.log`). pytest serve +
+  CUDA's `bin` on `PATH` and passed when rerun with it (`merge-212-record\r213\ctest-213.log`). pytest serve +
   tests/xeno: 1603 passed, 0 failed.
-- **Exes:** `C:\Strata-expuild-212\strata.exe` is now this tip's build, not `f3ddd6b9`'s; `run-212` still holds
+- **Exes:** `C:\Strata-exp\build-212\strata.exe` is now this tip's build, not `f3ddd6b9`'s; `run-212` still holds
   `f3ddd6b9`'s (`91065225…`) and `run-213` this tip's (`1137f45d…`).
 
 **#606 `repeat_stop_tokens` on (256), reported as the loop guard's stop.**
@@ -872,3 +873,83 @@ Two changes on the merge branch after `f3ddd6b9`, before the PR.
     `RepeatStop.test_a_run_the_loop_guard_cannot_see` shows the guard leaving such a run alone;
   - a repeated token longer than the guard's 8-character period.
 - **Its cost** is one integer comparison per token.
+
+## 11. Review of PR #214 (2026-10-12)
+
+Three review gates ran on the PR (sub-agents, read-only):
+- the two axes of `/code-review`: the fork's standards and the spec (#212, this report, AGENTS.md);
+- `/security-review`.
+
+Their scope was the merge's hand resolutions (`git show --remerge-diff f3ddd6b9` with the graft restored for the diff:
+12,157 lines, 53 files) and the follow-up commits. Each finding was checked against the code before it was acted on.
+
+**Fixed:**
+- **Two upstream defaults were off only while the 4070 tier is set.** §2 calls `STRATA_ROUTE_TAIL_SKIP` (it changes
+  answers) and the CPU prompt share (never run on the fork's prompt path) "off". The code tested only
+  `--secondary-expert-mib`. The #59 degraded restart sets that to 0 and keeps `--exclusive-primary-experts`, so a
+  degraded D2x would have armed both. Both are now off by default on the fork everywhere; `STRATA_ROUTE_TAIL_SKIP=7`
+  and `STRATA_PREFILL_CPU_SHARE=auto` arm them.
+- **The refusals beside the fork's tiers used two different tests.** `STRATA_FS_SLOTS` checked only the 4070 tier,
+  though its own comment names the exclusive placement. There is now one predicate, `fork_tiers(o)` (exclusive
+  placement or the 4070 tier), with one reason string, for `--kv-grow`, `--vram-elastic`, `--adapt-async` and
+  `STRATA_FS_SLOTS`.
+- **The fork's ban** (`--ban-ids`, the CJK ban) is now applied in upstream's two other sampling sites, as in `run()`:
+  - `Verifier::sample_rows` (`--batch`) skipped every greedy row;
+  - `Verifier::pl_finish` (`--pipeline-windows`) left `ban` out of its test.
+
+  Neither path is D2x's, and neither was run here.
+- **Duplicates the resolution wrote, now one copy each:**
+  - the group-aware "every logical processor" enumeration in `pool.cpp` (`every_logical_processor`);
+  - the 0.1.39 ring slot count in `prefill.cpp` (`pinned_ring_slots`);
+  - the loop-stop reporting in `server.py` (`Service._loop_stopped`, used by the loop guard and #606);
+  - the counters' reset in `PleTable::close` (`reset_io_stats`).
+- **Comments and records:**
+  - `ngram.hpp`: `cache_hits` counts from the last `reset_io_stats`.
+  - `prefill.cpp`: the stream-ahead comment no longer calls upstream's default the fork's.
+  - `server.py`: #606's comment records its cost.
+  - This report: the verdict was stale against §10, and §2 / §7 named `STRATA_PREFILL_CPU_SHARE=1` as upstream's
+    default (it is `auto`; `=1` is a fixed share of 1.0).
+  - This report also had control bytes where `\r`, `\a` and `\b` of Windows paths had been turned into CR, BEL and BS.
+
+**Security review: no finding met the bar.**
+- Every new route uses main's guard chain (`_authorized`, `_foreign_page` / `_own_page`, the Host check).
+- `GET /status` now needs the key.
+- Slot file names are validated.
+- `POST /config` writes only its 15 editable keys.
+- Local image paths gained UNC and foreign-origin refusals.
+- Noted, not a vulnerability here: `api_key` is now a comma-separated list (#1344), so a single key that contains a
+  comma would accept either half (a list in the config gives such a key whole). D2x sets no key.
+
+**Verified after the fixes** (one job at a time, each after a free-RAM check; final exe `C:\Strata-exp\run-214f\strata.exe`,
+sha256 `70303a16a5b418410c9dfb0782f1cdf4da30778b91fa655aad2f0bac777fa064`; data in `merge-212-record\pr\`):
+- **Build:** the whole tree builds.
+- **pytest** serve + tests/xeno: 1603 passed, 0 failed.
+- **ctest:** 160 passed, 1 known failure (`ple_parity`).
+- **D2x generate mode:** V F F V against the PR's previous tip (`run-213`); outputs identical on all three prompts, and
+  tok/s within noise (V/F 1.03 / 0.98 / 1.00).
+- **The degraded restart's arguments** (`without_secondary` of D2x's `engine_args`), booted to READY in `--serve`:
+  - the previous tip printed `STRATA_ROUTE_TAIL_SKIP=7 is ON (default)`;
+  - the CPU share was held off that day only by its memory check (1.1 GiB free);
+  - the final exe prints neither.
+
+**`/simplify` (four cleanup reviews: reuse, simplification, efficiency, altitude), applied:**
+- **No dead default code.** The tail skip's default predicate and its "(default)" suffix are gone, since only
+  `STRATA_ROUTE_TAIL_SKIP` sets the rank now. The CPU share's default branch is gone on both paths, which now spell
+  the same decision. Upstream's memory check (H11) still runs, and warns, when `STRATA_PREFILL_CPU_SHARE` is set
+  explicitly; before, it ran only for the default.
+- **One `needs_host_pick(sp, hist)` in `verify.cpp`** for `run()`, `pl_finish()` and `sample_rows()`. That last one
+  now also re-picks a greedy batch row that carries a logit bias.
+- **`REPEAT_STOP_DEFAULT` is gone;** `REPEAT_STOP_TOKENS` is the default.
+- **Efficiency:** nothing to change. The per-path counters are plain adds on the reader's thread, and the #606
+  check is a compare per token.
+
+**Not fixed, recorded:**
+- Many resolution comments carry a bare `xeno:` with no issue number. The merge is #212.
+- The #626 host-thread pin has no switch back (§7).
+- **#606's run counter stays in `Service.run`** rather than becoming a token-level rule in `loop_guard.py`. The
+  reporting is already one path (`_loop_stopped`).
+- **`_loop_stopped` sets `last_stop_reason` mid-run,** and the end of the reply sets it again. The early write lets
+  `/status` show the stop as it happens.
+- **Not touched, because they predate the merge:**
+  - `pin_for_cuda` writes the `fork_tiers` test by hand;
+  - `ring_bytes` / `ring_max_slots` repeat `pinned_ring_slots`' 0.9 threshold.
