@@ -835,10 +835,28 @@ Two changes on the merge branch after `f3ddd6b9`, before the PR.
     leaves no latency to remove; it is recorded, not fixed.
   - **More keep-alive reads (126-152 against 17-42).** The probe starts upstream's 60 s SSD keep-alive window at boot,
     outside any request.
-  - **Generate-mode decode differed by +11-14 % here, in every V/F pair, and by about 0 on 2026-10-11 (§5a) on the same
-    two code bases. That is unproved.** Two sessions disagree; main itself moved (63-65 -> 67-69 tok/s on thai); the
-    pool's counters barely moved (V/F 0.93-0.99), so the difference is not split by stage. A timeline of each arm would
-    settle it. (This fix only resets counters.)
+- **Generate-mode decode: the merge is faster, measured (2026-10-12).** One first round (above) and three repeats
+  (`r213ep1..3`), each V F F V on three prompts, all at `--pool-priority 2 --process-priority 2`, 8 runs an arm a
+  prompt. **The merge was faster in all 12 round-pairs** (V/F 1.04-1.20), and outputs were identical in all 48 runs.
+  Medians, main -> merge, ms per decode round (`tests/xeno/latency_breakdown.py`'s fields; `r213gg.py`,
+  `r213gg-today.txt`):
+
+  | stage | thai | py-async | long8k |
+  |---|---|---|---|
+  | round (decode ms / rounds) | 34.8 -> 31.7 | 33.9 -> 31.2 | 39.0 -> 34.5 |
+  | `wait for rings` (the primary GPU) | 14.6 -> 13.0 | 15.9 -> 13.5 | 16.5 -> 14.6 |
+  | `mtp` drafting | 2.50 -> 2.10 | 2.82 -> 2.47 | 3.01 -> 2.57 |
+  | `pool` (the CPU experts) | 15.0 -> 13.8 | 12.7 -> 12.6 | 17.1 -> 15.0 |
+  | tok/s | 68.8 -> 75.5 (+9.8 %) | 87.8 -> 95.5 (+8.7 %) | 72.9 -> 82.1 (+12.6 %) |
+
+  - **The GPU stages carry the gain, and they hold in every run of both sessions.** `wait for rings` is 1.6-2.4 ms
+    lower and drafting 0.35-0.44 ms lower. Each arm's spread is about ±0.1 ms. The 2026-10-11 runs show the same two
+    drops (§5a's data, `dec212-runs`).
+  - **The CPU pool is what differs between sessions.** On 2026-10-11 the merge's pool ran slower than main's (thai
+    17.2 / 16.6 against 16.0 / 15.4 ms), which hid the GPU gain in tok/s. Today it ran equal or faster.
+  - **Which of upstream's decode changes give the GPU drop is not split.** The candidates are #783's series: the
+    sub-warp IQ kernels, the head mix, the shared-expert stream, `moe_combine`'s float4 kernel. Their bisect switches
+    are in §2.
 - **Gates at this tip:** the whole tree builds (incremental, 91/91 steps, no error). ctest: 158 passed, 2 skipped and
   1 known failure (`ple_parity`, the deleted Q2_0 file), the same as at the merge commit. `gemm_bf16_parity` needs
   CUDA's `bin` on `PATH` and passed when rerun with it (`merge-212-record213\ctest-213.log`). pytest serve +
