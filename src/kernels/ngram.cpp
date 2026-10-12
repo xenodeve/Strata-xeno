@@ -229,6 +229,13 @@ struct PleTable::Impl {
     };
     std::deque<Ahead> ahead;
     bool cached = false;   // the row cache is on: a prefetch is only worth its reads when it is
+    // #213: the rows each path hands the reader (Direct mode), for the `ple io` line's "by path" clause: the #44 D4
+    // read-ahead (`prefetch`), #783's per-token window prefetch (`prefetch_rows`), a batch gather's own request, the
+    // single-token `issue`; and the window prefetches a gather consumed directly or let go unused
+    struct PathRows {
+        uint64_t ahead = 0, window = 0, gather = 0, single = 0;
+        uint64_t window_used = 0, window_dropped = 0;   // prefetch_rows tokens a gather took / waited out unused
+    } path;
 
     void decode(const uint8_t* row, float* out160) const { fmt->dequant(row, scale, out160); }
 
@@ -412,6 +419,7 @@ void PleTable::wait_prefetches() {
     if (impl_->n_prefetch == 0) return;
     std::string dummy;
     for (size_t i = 0; i < impl_->n_prefetch; ++i) (void) impl_->reader.collect(impl_->prefetch_tickets[i], dummy);
+    impl_->path.window_dropped += impl_->n_prefetch;
     impl_->n_prefetch = 0;
 }
 
@@ -422,6 +430,7 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
         if (impl_->n_prefetch >= Impl::kMaxPrefetch) wait_prefetches();
         const size_t slot = impl_->n_prefetch++;
         std::memcpy(impl_->prefetch_keys[slot], rows16, sizeof(uint32_t) * PLE_N_HEADS);
+        impl_->path.window += PLE_N_HEADS;
         impl_->prefetch_tickets[slot] = impl_->reader.issue(impl_->prefetch_keys[slot], PLE_N_HEADS, impl_->prefetch_raw[slot]);
         return;
     }
@@ -456,6 +465,7 @@ void PleTable::close() {
     impl_->fmt = &ple_format_info(PleFormat::IQ4_NL);
     impl_->scale = 1.0f;
     impl_->bytes_read = 0;
+    impl_->path = Impl::PathRows{};
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
@@ -491,6 +501,7 @@ bool PleTable::issue(const uint32_t* rows16) {
     std::memcpy(impl_->rows, rows16, sizeof impl_->rows);
     if (impl_->mode == PleIo::Direct) {
         if (impl_->pending) return false;              // one token in flight per table
+        impl_->path.single += PLE_N_HEADS;
         impl_->ticket = impl_->reader.issue(impl_->rows, PLE_N_HEADS, impl_->raw);
         impl_->pending = true;
         return true;
@@ -536,12 +547,19 @@ bool PleTable::prefetch(const uint32_t* rows, size_t n) {
     }
     Impl::Ahead a;
     a.raw.resize(n * impl_->rb);   // the reader writes rb bytes a row: 160 for FP8, not 90
+    impl_->path.ahead += n;
     a.ticket = impl_->reader.issue(rows, n, a.raw.data());
     impl_->ahead.push_back(std::move(a));
     return true;
 }
 
 uint64_t PleTable::cache_hits() const { return impl_->reader.stats().cache_hits; }
+
+void PleTable::reset_io_stats() {
+    if (impl_->reader.is_open()) impl_->reader.reset_stats();
+    impl_->path = Impl::PathRows{};
+    impl_->bytes_read = 0;
+}
 
 bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
@@ -565,6 +583,8 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
                         return false;
                     }
                 }
+                impl_->path.window_used += n_tokens;
+                impl_->path.window_dropped += impl_->n_prefetch - n_tokens;
                 impl_->n_prefetch = 0;
                 for (size_t t = 0; t < n_tokens; ++t) {
                     for (int h = 0; h < PLE_N_HEADS; ++h) {
@@ -578,6 +598,7 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         }
         wait_prefetches();
         std::vector<uint8_t> raw(n * impl_->rb);
+        impl_->path.gather += n;
         const auto ticket = impl_->reader.issue(rows, n, raw.data());
         if (!impl_->reader.collect(ticket, err)) return false;
         for (size_t i = 0; i < n; ++i) impl_->decode(raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
@@ -605,7 +626,14 @@ std::string PleTable::io_report() const {
     if (s.keepalive_reads > 0 && n > 0 && n < (int) sizeof buf)
         std::snprintf(buf + n, sizeof buf - (size_t) n, ", SSD kept awake by %llu reads (slowest %.1f ms)",
                       (unsigned long long) s.keepalive_reads, s.keepalive_us_max / 1000.0);
-    return buf;
+    // #213: the rows asked above, by the path that asked them
+    const Impl::PathRows& p = impl_->path;
+    std::string out = buf;
+    std::snprintf(buf, sizeof buf, "; rows by path: ahead %llu, window %llu (tokens used %llu, dropped %llu), "
+                  "gather %llu, single %llu",
+                  (unsigned long long) p.ahead, (unsigned long long) p.window, (unsigned long long) p.window_used,
+                  (unsigned long long) p.window_dropped, (unsigned long long) p.gather, (unsigned long long) p.single);
+    return out + buf;
 }
 
 void PleTable::gather(const uint32_t* rows16, float* out2560) const {

@@ -191,6 +191,19 @@ void format_round_trip(const std::string& dir, const k::PleFormatInfo& f, uint32
             f.dequant(raw.data(), f.needs_scale ? 0.75f : 1.0f, ref);
             CHECK(std::memcmp(tok + (size_t) h * k::PLE_HEAD_DIM, ref, sizeof ref) == 0, "%s: %s: gather head %d differs", f.name, name, h);
         }
+        if (mode == k::PleIo::Direct) {   // #213: `io_report` counts from a reset, and splits the rows by path
+            CHECK(t.io_report().find("single 16") != std::string::npos, "%s: the token's gather is not counted: %s",
+                  f.name, t.io_report().c_str());
+            t.reset_io_stats();
+            t.prefetch_rows(rows16);
+            CHECK(t.gather_batch(rows16, 1, tok, err), "%s: gather_batch after prefetch_rows: %s", f.name, err.c_str());
+            const std::string rep = t.io_report();
+            CHECK(rep.rfind("ple io: 16 rows", 0) == 0 &&
+                      rep.find("ahead 0, window 16 (tokens used 1, dropped 0), gather 0, single 0") != std::string::npos,
+                  "%s: after a reset, one prefetched token: %s", f.name, rep.c_str());
+            t.reset_io_stats();
+            CHECK(t.io_report().rfind("ple io: 0 rows", 0) == 0, "%s: a reset left %s", f.name, t.io_report().c_str());
+        }
     }
     std::filesystem::remove(path);
 }

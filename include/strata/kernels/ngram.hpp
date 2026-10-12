@@ -192,6 +192,9 @@ public:
     bool prefetch(const uint32_t* rows, size_t n);
     /// Rows served from the row cache since `open` (Direct mode).
     uint64_t cache_hits() const;
+    /// #213: zero the reader's counters and the rows by path, so `io_report` counts from here (after the start-up
+    /// probe, whose 4,096 random rows are not the requests').  The row cache keeps its rows.
+    void reset_io_stats();
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

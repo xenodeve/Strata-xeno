@@ -13,8 +13,9 @@ to the deployed `main` (all seven `STRATA_STATE_HASH` fingerprints in four boots
 replies in Claude Code's request shape and identical generate-mode outputs. In the same session it reads every
 Claude Code part 84-149 ms faster (5-7 %), the long prefix at the same speed, and answers at 73.0 against 63.6 tok/s
 in the server with the same windows and draft acceptance; generate-mode decode is equal within noise (§5a). Which
-stage gives the server's decode gain is not measured yet. One regression is measured: the window's PLE rows are asked
-twice (+4,096 rows and about +4,100 SSD reads per 256 tokens, 0.1-0.15 ms a token, under the ABBA's resolution; #213).
+stage gives the server's decode gain is not measured yet. The PLE regression first reported here (#213) was an
+instrument fault, found 2026-10-12 (§10): the `ple reads` line counted upstream's start-up probe of 4,096 random rows.
+With the probe left out, decode asks for exactly the rows main asks for.
 The tree builds at the first try, ctest passes but the known `ple_parity`, and the pytest suites pass. Every upstream
 default that would change D2x's outputs or its prompt-path scheduling is kept at the fork's value, with upstream's
 value behind a switch, with two exceptions: the Windows host-thread pin (#626) is taken with no switch back, and
@@ -641,9 +642,9 @@ Same session, 2026-10-11, on `strata-flash-next-d2x.json` as served (every arm w
 - **The PLE reads** (`ple reads` line of the same runs): the merge asks for **exactly 4,096 more rows per 256 tokens**
   on every prompt, and about 4,100 more of them go to the SSD: thai 4,952 -> 9,049-9,080 SSD reads, blocked 8.0-8.6 ->
   32.4-47.5 ms; py-async 5,680-5,704 -> 9,793, blocked 11.1-13.5 -> 34.8-37.1 ms; long8k 92,6xx -> 96,7xx, blocked
-  unchanged (~1 s). This confirms §7's double-read hypothesis in its row counts: upstream's `prefetch_rows` asks for
-  the window's 16 rows a token again beside the fork's #44 D4 read-ahead. Its cost (0.1-0.15 ms a token) is under the
-  ABBA's resolution. **#213.**
+  unchanged (~1 s). This was read as §7's double-read hypothesis, but **it was wrong** (2026-10-12, §10): the 4,096
+  rows are upstream's start-up `--ple-io direct` probe (64 batches of 64 random rows, once per boot), which the line
+  counted. **#213.**
 - **Not measured:** the boot log's free-VRAM lines and the start-up time (#620's allocation order, the `--ple-io direct`
   probe); a timeline of either arm; the opt-in arms of §2.
 
@@ -713,13 +714,9 @@ resolutions were designed around (§4), not bugs found in merged code.
 ## 7. What is left
 
 - **Whether D2x moves to the merge's exe:** the developer's call, on §5a.
-- **Measured: the window's PLE rows are asked twice on D2x (#213).** Upstream's `Verifier::run` issues
-  `prefetch_rows` for the window's rows before the launch (verify.cpp:2014), beside the fork's #44 D4 read-ahead
-  (`PleAhead::push` -> `PleTable::prefetch` during the draft), and `prefetch_rows`' slots do not see the fork's tickets.
-  §5a: +4,096 rows and about +4,100 SSD reads per 256 tokens, +25-39 ms blocked on short prompts; the bits are the
-  same. One read-ahead for one job is the fix, chosen by an ABBA. (verify.cpp's second site, :3057, is in
-  `Verifier::pl_stage`, the `--pipeline-windows` path, which D2x does not pass; mtp.cpp's draft-time copy was not
-  taken.)
+- **#213, closed by §10:** the "+4,096 PLE rows" was the start-up probe counted by the decode's `ple reads` line,
+  not a double read. Left as measured, not fixed: ~200-380 more SSD reads per 256 tokens (the window prefetch reaches a
+  row the #44 D4 read is still reading), with less blocked time than main.
 - **Not explained yet: the server's decode gain** (73.0 against 63.6 tok/s with the same windows, §5a). A timeline of
   each arm splits the window.
 - **ABBA arms not measured** (each upstream value behind its switch, §2): `STRATA_MTP_CATCHUP_ALL=0`,
@@ -802,3 +799,51 @@ Every name `tools/blueprint_check.py` finds added in `git diff 8abbfa0` of the m
 **Environment variables** (218): `STRATA_ADAPT_JOB_CPU`, `STRATA_ADAPT_LAG`, `STRATA_ARENA_LOCK`, `STRATA_ARENA_MMAP`, `STRATA_ARENA_RELEASE`, `STRATA_ATTN_LANECELL`, `STRATA_ATTN_PRE75`, `STRATA_AUX_CPUS`, `STRATA_AUX_STAGER`, `STRATA_BATCH_DECODE_SHARE`, `STRATA_BATCH_MTP`, `STRATA_BATCH_TRACE`, `STRATA_BATCH_YIELD_CHUNKS`, `STRATA_BF16_TC`, `STRATA_CACHE_MESSAGE_BOUNDARY`, `STRATA_CUDA`, `STRATA_CVEC_FUSE`, `STRATA_CVEC_FUSE_CHECK`, `STRATA_DBG_CPU_GATE`, `STRATA_DBG_FEAT`, `STRATA_DBG_FEAT_LAYERS`, `STRATA_DBG_GDN`, `STRATA_DBG_NAN`, `STRATA_DBG_ROUTE_OVERRIDE`, `STRATA_DEC_BATCH`, `STRATA_DEFERRED_REGISTER`, `STRATA_DENSE_MMQ`, `STRATA_DF_BRANCH`, `STRATA_DF_PDL`, `STRATA_DF_PLE`, `STRATA_DF_QB_Q4`, `STRATA_DISJOINT_ADAPT`, `STRATA_DMA_BATCH`, `STRATA_DUMP_FIRST_LOGITS`, `STRATA_EMB_REUSE_ACCOUNT`, `STRATA_EXCHANGE_ROTATE`, `STRATA_EXPERIMENTAL_GFX1103`, `STRATA_EXPERT_V2`, `STRATA_EXPERT_V2K`, `STRATA_EXP_MODE`, `STRATA_FILE_RELEASE`, `STRATA_FILL_AHEAD`, `STRATA_FORCE_AVX2`, `STRATA_FORCE_ISA`, `STRATA_FS_AHEAD`, `STRATA_FS_SLOTS`, `STRATA_FUSED_SWIGLU_Q81`, `STRATA_FUSE_HEAD_GR`, `STRATA_GDN_CHUNKED`, `STRATA_GDN_COMMIT_SPLIT`, `STRATA_GDN_CONVL2`, `STRATA_GDN_HEAD`, `STRATA_GDN_NOY`, `STRATA_GDN_PP`, `STRATA_GDN_REC_HEADS`, `STRATA_GDN_SPLIT`, `STRATA_GFX1151_DEFAULTS`, `STRATA_GFX12_DEFAULTS`, `STRATA_GFX906_ATTN_QUERY_SWIZZLE`, `STRATA_GFX906_ATTN_QUERY_SWIZZLE_TRACE`, `STRATA_GFX906_ATTN_REDUCE12`, `STRATA_GFX906_ATTN_REDUCE12_TRACE`, `STRATA_GR_FAST`, `STRATA_GR_SPLIT`, `STRATA_HCD_EXACT`, `STRATA_HC_Q8`, `STRATA_HC_Q8_INJECT`, `STRATA_HC_UPMIX`, `STRATA_HC_UPMIX_CHECK`, `STRATA_HEAD_MIX_MULTI`, `STRATA_HIP_ADAPT_KERNEL_COPY`, `STRATA_HIP_PROMPT_F16`, `STRATA_HIP_ROUTER_FAST`, `STRATA_HIP_WMMA`, `STRATA_HOST_CORE`, `STRATA_HTTP_BACKLOG`, `STRATA_IO_PF_AHEAD`, `STRATA_IO_PF_STAGE`, `STRATA_IO_PF_THREADS`, `STRATA_IO_PREFETCH`, `STRATA_IO_PREFETCH_DEPTH`, `STRATA_IO_STATS`, `STRATA_IQ256_GATHER`, `STRATA_IQ3S_MT1`, `STRATA_IQ_PREFETCH`, `STRATA_IQ_STAGE_GRID`, `STRATA_IQ_STAGE_GRID_MMVQ`, `STRATA_ISA_FLOOR`, `STRATA_KEEP_EMPTY_TURNS`, `STRATA_KEEP_MAPPING`, `STRATA_KV_GROW`, `STRATA_KV_GROW_FLOOR`, `STRATA_KV_GROW_HOLD`, `STRATA_KV_GROW_INIT`, `STRATA_KV_GROW_STEP`, `STRATA_KV_HOST_DMA`, `STRATA_KV_PREFETCH`, `STRATA_KV_ROT`, `STRATA_LAYER_SPLIT_GATE`, `STRATA_LAYER_SPLIT_PROBE`, `STRATA_LFUSE`, `STRATA_LFUSE_GATE`, `STRATA_LFUSE_PAIR`, `STRATA_LOGPOS`, `STRATA_LOOKAHEAD_STATS`, `STRATA_LOOKUP_CHAIN_FIXED`, `STRATA_MAX_BODY_MIB`, `STRATA_MEMORY_LIMIT_MIB`, `STRATA_MMQ_RESIDENT_SORT_NE`, `STRATA_MMVF_ROWS`, `STRATA_MMVQ_IL`, `STRATA_MMVQ_IL_ROWS`, `STRATA_MMVQ_WAVE`, `STRATA_MTP_CATCHUP_ALL`, `STRATA_MTP_FULL_HEAD`, `STRATA_MTP_PRIORITY`, `STRATA_MTP_SHARED_BRANCH`, `STRATA_MTP_TOP2`, `STRATA_MULTI_BLOCK_ARGMAX`, `STRATA_NORM_ROPE`, `STRATA_NO_ARENA_THP`, `STRATA_NO_AVXVNNI`, `STRATA_NO_BATCH_KV_STEP`, `STRATA_NO_IQ128`, `STRATA_NO_LARGEPAGES`, `STRATA_NO_MMVQ_ROWS2`, `STRATA_NO_MULTI_GR`, `STRATA_NO_NORM_ROPE`, `STRATA_NO_Q8K_AVX1`, `STRATA_NO_Q8K_AVX2`, `STRATA_NVCC`, `STRATA_ONE_TOKEN_COMMIT`, `STRATA_OWNED_PRICE`, `STRATA_PARALLEL_SOLO`, `STRATA_PA_FAST`, `STRATA_PEER_NO_P2P`, `STRATA_PF_BK64`, `STRATA_PF_FUSED`, `STRATA_PF_FUSED_KQ`, `STRATA_PF_GEMM`, `STRATA_PF_HCDOWN`, `STRATA_PF_OCC`, `STRATA_PF_OCC_W`, `STRATA_PF_PAD`, `STRATA_PF_STEP_SYNC`, `STRATA_PF_SWITCH_MIN_T`, `STRATA_PIN_GUARD`, `STRATA_PIN_RESERVE_GIB`, `STRATA_PIPELINE_ADAPT_ASYNC`, `STRATA_PIPELINE_DEBUG`, `STRATA_PLE_BATCH`, `STRATA_PLE_PROBE`, `STRATA_PREBUILT_URL`, `STRATA_PREFILL_CPU_SHARE`, `STRATA_PREFILL_CPU_SHARE_MAX`, `STRATA_PREFILL_DUMP_R_ALL`, `STRATA_PREFILL_EQUAL`, `STRATA_PREFILL_HELP`, `STRATA_PREFILL_HELPER_SOURCE`, `STRATA_PREFILL_LEND_PCT`, `STRATA_PREFILL_STREAM_AHEAD`, `STRATA_Q2_BITPLANE`, `STRATA_Q6P_GRID`, `STRATA_Q6P_SELFTEST`, `STRATA_Q6_PACKED`, `STRATA_Q8_PACKED`, `STRATA_QFUSE`, `STRATA_QSA_EARLY_EXIT`, `STRATA_READ_AHEAD`, `STRATA_REPLICA_START`, `STRATA_RING_BYTES`, `STRATA_ROUTER_BLOCK`, `STRATA_ROUTE_PER_TOKEN`, `STRATA_ROUTE_PRIOR`, `STRATA_ROUTE_PROJ_PER_TOKEN`, `STRATA_ROUTE_RESIDENT`, `STRATA_ROUTE_RESIDENT_MTP`, `STRATA_ROUTE_RESIDENT_RANKS`, `STRATA_ROUTE_TAIL_SKIP`, `STRATA_RSS_TRACE`, `STRATA_S2_SWIGLU_Q8`, `STRATA_SELECT_SIMT`, `STRATA_SESSION_BUFFERED`, `STRATA_SH_FORK_LATE`, `STRATA_SH_STREAM`, `STRATA_SKIP_SHA256`, `STRATA_SM70_TABLE`, `STRATA_SOURCE`, `STRATA_SPEC_DEPTH`, `STRATA_SPEC_MIN_TEMP`, `STRATA_SPEC_PROB`, `STRATA_SPEC_PROB_DT`, `STRATA_SPEC_PROB_GATE`, `STRATA_SPLIT_COVER_B`, `STRATA_SPLIT_MTP_BATCH`, `STRATA_SPLIT_NEAR_TIE_PCT`, `STRATA_SPLIT_OWN_BUFFERS`, `STRATA_STAGER_BATCH`, `STRATA_STAGER_SLEEP`, `STRATA_STAGER_SSD`, `STRATA_STAGE_PIN`, `STRATA_STAGE_TRIM`, `STRATA_STARTUP_UNBUFFERED`, `STRATA_SYCL_BIN`, `STRATA_TEST_PAGEABLE`, `STRATA_TOPK_STREAM`, `STRATA_TSUM`, `STRATA_UMA_HEADROOM_GIB`, `STRATA_UNBUFFERED_LOAD`, `STRATA_VCVARS`, `STRATA_VERIFY_ALL_RESIDENT`, `STRATA_VERIFY_ARENA`, `STRATA_VERIFY_COMPLEMENT`, `STRATA_VERIFY_DEVICE_PLAN`, `STRATA_VERIFY_QDEDUP`, `STRATA_WATCHDOG_IO_S`, `STRATA_WMMA_BF16`, `STRATA_WMMA_GEMM`
 
 **New source files** (65): `include/strata/core/arch_defaults.hpp`, `include/strata/core/batch_rows.hpp`, `include/strata/core/conversation_file.hpp`, `include/strata/core/dma_batch.hpp`, `include/strata/core/exchange_storage.hpp`, `include/strata/core/foresight_swap.hpp`, `include/strata/core/logit_bias.hpp`, `include/strata/core/remote_expert_opt.hpp`, `include/strata/core/session_save_reclaim.hpp`, `include/strata/core/spec_prob.hpp`, `include/strata/core/vmm.hpp`, `include/strata/hip_compat/math_constants.h`, `include/strata/kernels/cpu/iq_avx1.hpp`, `include/strata/kernels/cpu/kq_avx1.hpp`, `include/strata/kernels/gfx_arch.hpp`, `include/strata/kernels/pdl.hpp`, `include/strata/kernels/q8_1_finite.hpp`, `include/strata/kernels/route_prior.hpp`, `include/strata/platform/aux_cpus.hpp`, `include/strata/platform/hip_compat/cublas_v2.h`, `include/strata/platform/hip_compat/cuda_fp16.h`, `include/strata/platform/hip_compat/cuda_runtime.h`, `include/strata/platform/hip_compat/math_constants.h`, `include/strata/platform/hip_compat/strata_hip.h`, `include/strata/platform/host_limits.hpp`, `include/strata/prefill/share_rules.hpp`, `include/strata/prefill/xmx_moe.hpp`, `include/strata/program/batch_groups.hpp`, `include/strata/program/batch_read.hpp`, `include/strata/program/draft_kv_plan.hpp`, `include/strata/program/message_boundary.hpp`, `include/strata/program/split_ring.hpp`, `include/strata/program/split_rules.hpp`, `include/strata/spec/draft_source.hpp`, `serve/cpu_affinity.py`, `serve/fixtures/rcall_specimens.json`, `serve/keepawake.py`, `serve/logit_bias.py`, `serve/prometheus.py`, `serve/replicas.py`, `serve/responses.py`, `serve/runconfig.py`, `serve/session_save_retry.py`, `serve/web/favicon.svg`, `src/core/arch_defaults.cpp`, `src/core/conversation_copy.hpp`, `src/core/conversation_file.cpp`, `src/core/remote_expert_opt.cu`, `src/core/vmm.cpp`, `src/kernels/cpu/iq_avx1.cpp`, `src/kernels/cpu/iq_avx2_rows.inl`, `src/kernels/cpu/kq_avx1.cpp`, `src/kernels/cpu/pool_affinity_linux.hpp`, `src/kernels/cpu/pool_affinity_win.hpp`, `src/kernels/cpu/q2_avx1.cpp`, `src/kernels/cpu/q2_avx2_rows.inl`, `src/kernels/cuda/q8_1_il.cuh`, `src/kernels/cuda/route_prior.cu`, `src/kernels/cuda/s26_tsum.cuh`, `src/kernels/fused_gr_bench.cpp`, `src/kernels/native_expert_bench.cpp`, `src/prefill/mmq_resident_sort.hpp`, `src/prefill/wmma_gemm.cu`, `src/prefill/wmma_gemm.h`, `src/spec/draft_source.cpp`
+
+## 10. After the merge commit (2026-10-12)
+
+Two changes on the merge branch after `f3ddd6b9`, before the PR.
+
+**#213: the PLE "double read" was an instrument fault.**
+- **How it was found.** The engine's `ple io` line gained a per-path split of the rows it counts (`PleTable`, ngram.cpp):
+  - `ahead`: the #44 D4 read-ahead during the draft;
+  - `window`: #783's `prefetch_rows` in `Verifier::run`, with the tokens a gather used or dropped;
+  - `gather`: a batch gather's own request;
+  - `single`: the one-token `issue`.
+- **What it showed.** One run of the merge's exe (thai, D2x) gave ahead 5,152, window 5,232 (327 tokens, all used,
+  none dropped) and gather 4,848.
+  - The window prefetch replaces the gather's own request; it does not add one.
+  - Of the gather rows, 752 were the prompt's (47 tokens). The other 4,096 were upstream's start-up probe
+    (`ple_direct_rows_per_s`, generate.cpp: 64 batches of 64 random rows, once per boot).
+  - The probe's stderr line (77-156k rows/s) gives 26-53 ms for those rows. That matches the extra "blocked" time.
+- **The fix:** `PleTable::reset_io_stats()` after the probe, so the line counts requests only. The probe still runs
+  and prints its rate; the row cache keeps its rows. Tested in `ple_reader_selftest` (a reset, then one prefetched
+  token: `window 16 (tokens used 1, dropped 0)`).
+- **Verified on D2x, same session.** Run order V F F V; 256 tokens greedy; every arm at `--pool-priority 2
+  --process-priority 2`. F = `run-main-8abbfa0` (sha256 `0936c394…`); V = `C:\Strata-expun-213\strata.exe` (sha256
+  `1137f45d…`, the merge plus this fix). Data in `merge-212-record213b\`.
+
+  | prompt | rows asked (V = F) | SSD reads F / V | blocked ms F / V | decode tok/s F / V |
+  |---|---:|---|---|---|
+  | n0-thai-net | 11,136 | 4,952 / 5,151-5,245 | 9.9-10.5 / 3.6-4.1 | 67.1, 68.5 / 74.0, 77.0 |
+  | n0-py-async | 11,472 | 5,680 / 6,039-6,061 | 14.6-14.7 / 5.3-5.5 | 88.3, 86.7 / 98.9, 101.0 |
+  | n0-long8k | 137,872 | 92,658 / 92,936-92,960 | 574-605 / 617-634 | 75.8, 71.6 / 83.8, 79.6 |
+
+  - **Outputs are identical on all three prompts.** The rows asked are now equal to main's on every prompt.
+  - **About 200-380 more SSD reads per 256 tokens remain.** The window prefetch reaches a row that the D4 read is still
+    reading, and the reader has no in-flight dedupe. Blocked time on the short prompts is lower than main's, so this
+    leaves no latency to remove; it is recorded, not fixed.
+  - **More keep-alive reads (126-152 against 17-42).** The probe starts upstream's 60 s SSD keep-alive window at boot,
+    outside any request.
+  - **Generate-mode decode is 11-14 % faster on the merge in this session,** in every V/F pair. This differs from §5a
+    (equal within noise, with two disturbed main runs). This fix only resets counters, so the gain is the merge's. It is
+    not split by stage here.
+
+**#606 `repeat_stop_tokens` on (256), reported as the loop guard's stop.**
+- **The decision.** The developer chose to remove the trade-off rather than keep the stop off (§2). A reply ended by
+  #606 now gets `stop_detail: "loop"` and counts in `/status loops_stopped`, the same as the loop guard's.
+- **What it adds.** It ends runs the guard cannot see:
+  - a run inside a tool call's arguments: the guard reads only reply text and thinking.
+    `RepeatStop.test_a_run_the_loop_guard_cannot_see` shows the guard leaving such a run alone;
+  - a repeated token longer than the guard's 8-character period.
+- **Its cost** is one integer comparison per token.
