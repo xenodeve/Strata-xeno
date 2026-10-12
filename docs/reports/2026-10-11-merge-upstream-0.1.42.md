@@ -835,9 +835,16 @@ Two changes on the merge branch after `f3ddd6b9`, before the PR.
     leaves no latency to remove; it is recorded, not fixed.
   - **More keep-alive reads (126-152 against 17-42).** The probe starts upstream's 60 s SSD keep-alive window at boot,
     outside any request.
-  - **Generate-mode decode is 11-14 % faster on the merge in this session,** in every V/F pair. This differs from §5a
-    (equal within noise, with two disturbed main runs). This fix only resets counters, so the gain is the merge's. It is
-    not split by stage here.
+  - **Generate-mode decode differed by +11-14 % here, in every V/F pair, and by about 0 on 2026-10-11 (§5a) on the same
+    two code bases. That is unproved.** Two sessions disagree; main itself moved (63-65 -> 67-69 tok/s on thai); the
+    pool's counters barely moved (V/F 0.93-0.99), so the difference is not split by stage. A timeline of each arm would
+    settle it. (This fix only resets counters.)
+- **Gates at this tip:** the whole tree builds (incremental, 91/91 steps, no error). ctest: 158 passed, 2 skipped and
+  1 known failure (`ple_parity`, the deleted Q2_0 file), the same as at the merge commit. `gemm_bf16_parity` needs
+  CUDA's `bin` on `PATH` and passed when rerun with it (`merge-212-record213\ctest-213.log`). pytest serve +
+  tests/xeno: 1603 passed, 0 failed.
+- **Exes:** `C:\Strata-expuild-212\strata.exe` is now this tip's build, not `f3ddd6b9`'s; `run-212` still holds
+  `f3ddd6b9`'s (`91065225…`) and `run-213` this tip's (`1137f45d…`).
 
 **#606 `repeat_stop_tokens` on (256), reported as the loop guard's stop.**
 - **The decision.** The developer chose to remove the trade-off rather than keep the stop off (§2). A reply ended by
