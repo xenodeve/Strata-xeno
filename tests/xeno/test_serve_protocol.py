@@ -11,7 +11,7 @@ from serve.server import StrataEngine
 class ProtocolTest(unittest.TestCase):
     def test_prompt_progress_is_a_heartbeat(self):
         engine = StrataEngine.__new__(StrataEngine)
-        engine.proc = SimpleNamespace(stdin=io.StringIO())
+        engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)   # generate() asks alive() (merge #212)
         engine.lines = queue.Queue()
         engine.can_stop = True
         engine.last = {}

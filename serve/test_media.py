@@ -307,7 +307,9 @@ class InTheChat(Fixture):
         self.assertTrue(res["ok"])
         self.assertIn("shot.png: 40 x 30 px", res["text"])
         self.assertNotIn("base64", json.dumps(events))                           # the page is not sent the picture again
-        self.assertEqual(len(self.fake.seen), 1)
+        # merge #212: upstream's _note_unreadable_tool_images encodes a tool's picture once to check it, and the prompt's
+        # encode asks again (the real Vision answers that from its cache): one picture, possibly asked twice
+        self.assertEqual(len(set(self.fake.seen)), 1)
         self.assertTrue(self.fake.seen[0].startswith("data:image/png;base64,"))
 
     def test_without_vision_the_model_is_told_and_nothing_breaks(self):

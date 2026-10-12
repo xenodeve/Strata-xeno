@@ -38,7 +38,8 @@ static bool check(int width, int rows, uint32_t seed) {
         aout[t] = avx2.data() + (size_t) t * rows;
         vout[t] = vnni.data() + (size_t) t * rows;
     }
-    cpu::q2_0_gguf_rows_multi_avx2(weights.data(), row_bytes, blocks, ap, tokens, aout, 0, rows);
+    // the AVX2 arm with VNNI off: since the 0.1.42 merge q2_0_gguf_rows_multi_avx2 takes VNNI by itself where the CPU has it
+    cpu::q2_0_gguf_rows_multi_avx2_v(false, weights.data(), row_bytes, blocks, ap, tokens, aout, 0, rows);
     cpu::q2_0_gguf_rows_multi_avxvnni(weights.data(), row_bytes, blocks, ap, tokens, vout, 0, rows);
     const bool equal = std::memcmp(avx2.data(), vnni.data(), avx2.size() * sizeof(float)) == 0;
     std::printf("Q2_0 width=%d rows=%d tokens=%d: %s\n", width, rows, tokens, equal ? "bit-exact" : "DIFFERENT");

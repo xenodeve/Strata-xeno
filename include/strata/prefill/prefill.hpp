@@ -18,11 +18,13 @@
 
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace strata::core { class PeerExperts; }
+namespace strata::kernels::cpu { class ExpertPool; }
 
 namespace strata::prefill {
 
@@ -38,12 +40,15 @@ struct PrefillStats {
     int64_t src_n[4] = {0, 0, 0, 0};
     uint64_t src_bytes[4] = {0, 0, 0, 0};
     int64_t src_rows[4] = {0, 0, 0, 0};   ///< routed token rows those experts served (small chunks; 0 on stream-all)
+    int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
+    double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
     /// #35 D7: another lane's stats of the same prompt: counts add up, the wall time is the longer lane's
     void merge_lane(const PrefillStats& o) {
         tokens += o.tokens; chunks += o.chunks; ms_total = ms_total > o.ms_total ? ms_total : o.ms_total;
         ms_experts_host += o.ms_experts_host; experts_streamed += o.experts_streamed; experts_dma += o.experts_dma;
         experts_resident += o.experts_resident; ms_ple += o.ms_ple;
+        experts_cpu += o.experts_cpu; cpu_share = cpu_share > o.cpu_share ? cpu_share : o.cpu_share;
         for (int i = 0; i < 4; ++i) { src_n[i] += o.src_n[i]; src_bytes[i] += o.src_bytes[i]; src_rows[i] += o.src_rows[i]; }
     }
 };
@@ -59,8 +64,9 @@ public:
     /// scratch - call it from on_chunk.  false with `err` empty: not applicable here (a ring or hybrid K/V, another
     /// device, too little scratch; STRATA_MTP_BATCH=0), the caller runs the drafter's own pass.  Not bit-identical to
     /// that pass (FP16 GEMMs instead of Q8_1 activations): the drafts may differ, never the target's tokens' logits.
+    /// `why` (optional): on a decline (false, `err` empty) the reason, a static string.
     bool draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
-                  std::string& err);
+                  std::string& err, const char** why = nullptr);
     Prefill();
     ~Prefill();
     Prefill(const Prefill&) = delete;
@@ -106,14 +112,20 @@ public:
     static bool split_wave_ok();   // #115: the wave may run on this pack's split
     static std::vector<int> split_one_card_layers();
     static double pinned_share();
+    /// The chunk size from which a chunk streams every expert the GPU does not hold (1024; STRATA_PREFILL_STREAM_MIN).
+    static int64_t stream_all_min_tokens();
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
+    /// #583: the auto chunk scan's byte-budget ring, for chunks above `small_max` (0.1.39's auto chunk: a prompt that
+    /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
+    static void set_ring_budget(int slots, int64_t small_max);
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).  #122: `kv_end`
-    /// as in relayout (0 = the worst case: boot-time sizing, the chunk choice and the lendable tail).
+    /// as in relayout (0 = the worst case: boot-time sizing, the chunk choice and the lendable tail).  Upstream's
+    /// `src` (a26fcbcd): init gets an ExpertSource (carve picks the fused MoE layout only then).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                 int64_t kv_end = 0);
+                                 int64_t kv_end = 0, bool src = true);
     /// #35 D7: a wave lane's chunk for a prompt-path chunk of `chunk` tokens (half, rounded up to 256), and the device
     /// bytes both lanes need - the one sizing rule for the lend, the layouts and the relayouts
     static int64_t wave_lane_chunk(int64_t chunk) { return chunk / 2 < 256 ? 256 : (chunk / 2 + 255) / 256 * 256; }
@@ -146,6 +158,41 @@ public:
     /// The first lane's error wins unless it only reports the other lane's failure.
     static bool run_wave(Prefill& a, Prefill& b, WaveLink& link, const int64_t* tokens, int64_t n, int64_t pos0,
                          int64_t n_layers, std::string& err);
+    /// Upstream's four-argument form `bytes_needed(g, ss, chunk, src)`, at kv_end 0.  merge 0.1.42: an exact-match
+    /// overload, so a `bool` fourth argument (upstream's `srcp != nullptr`) never converts into the fork's `kv_end` (as
+    /// 1).  A fourth argument of type `int` or `size_t` is ambiguous between the two (a compile error): pass int64_t.
+    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src);
+
+    /// What `init` allocates when the prompt path OWNS its buffers (the startup sizing of a cache without a loan).
+    /// xeno #30: the fork's init takes them as ONE cudaMalloc of bytes_needed, so this is bytes_needed rounded up to
+    /// a 2 MiB page (upstream's carve made one cudaMalloc per buffer, each rounded up).
+    static uint64_t bytes_needed_owned(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                       bool src = true);
+    /// The same without the streamed ring: what the chunk's own buffers cost.  The auto chunk scan sizes the chunk
+    /// first and hands the ring what the chunk leaves over, so it needs the chunk priced on its own.
+    static uint64_t bytes_needed_no_ring(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                         bool src = true);
+
+    /// The streamed ring's byte budget as a slot count for this pack (the measured slot count x Q2_0's blob, over
+    /// max_blob, never past ring_cap()):
+    /// what the auto chunk scan treats as a full ring.  A slot is one whole blob, so a pack with bigger blobs than
+    /// Q2_0's gets fewer of them for the same bytes - 384 on Q2_0, 199 on a 2.54 MiB-blob IQ3_S pack.
+    static int64_t ring_max_slots();
+    /// 0.1.39's ring for this PC (1024 fused / 384 pinned / 96), within ring_cap().
+    static int64_t ring_default_slots();
+    /// #583: the ring the auto scan keeps full, given the chunk 0.1.39's rule picked: its byte budget where that rule's
+    /// chunk was small (< 6144), else 0.1.39's ring (measured: shrinking it for a bigger chunk lost there).
+    static int64_t ring_cap_for(int64_t old_chunk);
+
+    /// What the ring actually resolves to for a chunk of `chunk` tokens, after the override, STRATA_PREFILL_RING
+    /// and the pinned-share rule - the slot count `init` lays out.  The engine reports it on its INFO line so the
+    /// Monitor tab shows the pair the run really got, not what it asked for.
+    static int64_t ring_slots_for(int64_t chunk);
+
+    /// 0.1.39b (#583): the ring as a byte budget and the auto chunk scan that keeps the ring full.  xeno (merge 0.1.42):
+    /// OFF by default - it moves the served D2x's loan and ring (--prefill auto) - STRATA_RING_BYTES=1 is upstream's
+    /// default.  The loan's corrected count is the fork's own and always on (prefill.cpp, bytes_needed).
+    static bool ring_bytes_enabled();
 
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
@@ -185,10 +232,46 @@ public:
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
 
+    /// LAYER SPLIT: upstream's help from another stage's GPU for a one-chunk prompt (opt-in STRATA_PREFILL_HELP=1) runs
+    /// on upstream's peer share of the prompt path (PeerPrefill), which this fork does not have (merge 0.1.38, #129).
+    /// Not ported (merge 0.1.42): unset, it does nothing (true), as upstream; with STRATA_PREFILL_HELP=1 it declines
+    /// (false, `err` says why) and the stage reads its prompts alone.
+    bool set_stage_helper(Prefill* helper, std::string& err);
+
+    /// The CPU expert pool (decode's, idle while a prompt is read). With STRATA_PREFILL_CPU_SHARE set, a chunk below
+    /// stream_all_min() tokens - an agent's tool output - hands it the non-resident experts routed by at most MAXT of
+    /// its tokens, fewest first, up to a share of the experts it would stream (`auto`: measured, where both sides end
+    /// together). The CPU reads them from RAM (the arena, the page-locked copy, or the mapped experts.bin's pages)
+    /// while the rest come over PCIe; their rows go to Dm's tail, as a peer's do. Not bit-identical to the GPU's rows
+    /// (the CPU's own activation format). Unset (default) or null: every expert on the GPU. Only for a pool no other
+    /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
+    /// for a chunk. Set before `init`.  xeno (merge 0.1.42): never in a split chunk's split layers (#35: the 4070 and
+    /// the expert split own those rows), and never on by default with the split layout (STRATA_PREFILL_EXPERT_SPLIT).
+    void set_cpu_pool(kernels::cpu::ExpertPool* pool);
+    /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
+    /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
+    /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
+    /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
+    /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
+    static void arm_cpu_share(bool applies, bool by_default = false);
+
 private:
+    static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                      int64_t kv_end, bool src);
+    kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
+    // Stage-1 pipeline: intermediate stages return after handing their chunk to
+    // the direct successor. The public run() drains the chain once at prompt end.
+    bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    bool drain_pipeline(std::string& err);
+
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+
+    std::string next_err_;
+    std::future<bool> next_run_;
+    int hand_buf_ = 0;
+
     bool carve(std::size_t T, void* alloc, int64_t kv_end);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;

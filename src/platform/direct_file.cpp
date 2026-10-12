@@ -1,5 +1,6 @@
 // src/platform/direct_file.cpp - see include/strata/platform/direct_file.hpp.
 #include "strata/platform/direct_file.hpp"
+#include "strata/platform/aux_cpus.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -185,7 +186,7 @@ bool DirectFile::open(const std::string& path, std::string& err, int issuers) {
     // Completions of reads that finish synchronously are still queued to the port, so every issued read
     // produces exactly one packet; `wait` is the only completion path.
     const int n = io_threads(issuers, 4);
-    for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
+    for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { strata::aux_cpus::pin_current_thread(); impl_->worker(); });
     return true;
 }
 
@@ -313,7 +314,7 @@ bool DirectFile::open(const std::string& path, std::string& err, int issuers) {
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
     const int n = io_threads(issuers, 16);
-    for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
+    for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { strata::aux_cpus::pin_current_thread(); impl_->worker(); });
     return true;
 }
 
