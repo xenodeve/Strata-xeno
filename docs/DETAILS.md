@@ -743,6 +743,9 @@ print(r.choices[0].message.content)
   server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
   state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in
   `strata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
+  On this fork the stop is reported as the loop guard's (`stop_detail` `"loop"`, counted in `/status`
+  `loops_stopped`). It covers what the guard cannot see: a token that never becomes reply text (a tool call's
+  arguments, a special token) and a repeated token longer than the guard's 8-character period.
 - **Repeated reasoning (opt-in, #728).** The single-token guard above does not see a model that repeats whole
   passages. `"reasoning_loop_recovery"` in `strata-<model>.json` is `false` (the default), `"stop"` or `"recover"`
   (`true` means `"recover"`). Every 512 output tokens, at a complete character and parser boundary, the reasoning is

@@ -83,7 +83,7 @@ D2x (`strata-flash-next-d2x.json`): Swift 1.5 IQ2_XS, `--exclusive-primary-exper
 | CUDA module loading | yes | **LAZY** (fork #30) | Upstream forces EAGER at the top of `main`. `CUDA_MODULE_LOADING=EAGER` in the environment gives upstream's |
 | `--ple-inflight` | yes | **64** | Kept from 0.1.38. `--ple-inflight 256` is upstream's |
 | PCIe share with no `--pcie-frac` (start-up probe + PcieAuto refinement, `aa7b0cb1`) | no (D2x passes `--pcie-frac 0`) | **0** (fork #27) | On this machine's x4 link the probe chose 0.15 and decode fell to 3.24 tok/s (#27). The probe is not taken, so `pcie_frac_auto` is never set and PcieAuto never runs; its code stays in place. **No switch restores upstream's no-flag default** (an explicit `--pcie-frac` turns PcieAuto off upstream too) |
-| #606 `repeat_stop_tokens` (serve) | yes | **0 (off)** | A trade-off: with 256, a single-token loop ends as "length" before the fork's loop guard ends it and counts it in `/status loops_stopped`. `"repeat_stop_tokens": 256` in the config is upstream's. Open question for the developer (§7) |
+| #606 `repeat_stop_tokens` (serve) | yes | **256 (on), since 2026-10-12** | At the merge commit it was 0: with 256 a single-token loop ended as "length" before the fork's loop guard, uncounted in `/status loops_stopped`. The developer chose to remove that cost instead (2026-10-12): the stop is now reported as the guard's (`stop_detail: "loop"`, counted in `loops_stopped`), so it is on by default. It sees what the guard cannot: a token that never becomes reply text (a tool call's arguments, a special token) and a repeated token longer than the guard's 8-character period. `"repeat_stop_tokens": 0` turns it off |
 | Claude Code billing header | yes (D2x serves Claude Code) | **the fork's strip** (xeno #6, `bc1b18f2`) | Upstream pins the stamp instead (`pin_billing_stamp`). Both aim at a stable prefix; the fork's prompt bytes stay. `pin_billing_stamp` and `BILLING_HEADER` stay defined, uncalled. No switch |
 
 **Upstream defaults taken that reach D2x.** What upstream claims for each is in its row. For the kernel and decode rows,
@@ -385,7 +385,7 @@ dropped line is in "not taken").
   - **stops:** upstream's `stop_strings()` + `StopMatcher` + `cut()` replace the fork's `StopSequenceFilter` (the same
     feature; upstream's is the superset: OpenAI `stop`, a 400 for a bad value). The fork's `finish = "stop"` and
     `last_stop_reason = "stop_sequence"` stay;
-  - #606 repeat stop (off by default, §2), `reasoning_tokens`, the `KEEPALIVE_S` ping, `latencies.observe`, #588
+  - #606 repeat stop (on by default since 2026-10-12, §2), `reasoning_tokens`, the `KEEPALIVE_S` ping, `latencies.observe`, #588
     `pcie_share` (`"offloaded"` is summed by `_merge_legs`), #465 per-request status;
   - #1619 queue keep-alive: `self.fifo.acquire(priority, timeout=QUEUE_BEAT_S)` in a loop; a client that leaves while
     queued gets `finish: "cancel"`;
@@ -447,8 +447,9 @@ dropped line is in "not taken").
 - **`test_server.py`:** the fork's `ANSWER`, both sides' test classes (`RequestHistory`, `MonitorGpus`, `HipEnvGuard`,
   `EndsInsideThinkingEngine`, `ReasoningCloseRetry`, `ReasoningBudget`, `EffortLevelsTests`, `WebSecurity`,
   `TelemetryNoDisks`); `StatusHandover.SlowRelease` keeps upstream's armed `release`; the fake `acquire` takes the
-  `RequestGate` signature. `RepeatStop`'s tests set `repeat_stop_tokens=256` explicitly; a new
-  `test_the_fork_default_is_off`; the "off" case uses a 300-token run and the alternating case 400 characters (upstream's
+  `RequestGate` signature. `RepeatStop` (2026-10-12): `test_the_default_is_on` (256), the stop reported as the loop
+  guard's (`stop_detail`, `loops_stopped`), and `test_a_run_the_loop_guard_cannot_see` (a run inside a tool call's
+  arguments, which only #606 ends); the "off" case uses a 300-token run and the alternating case 400 characters (upstream's
   1,000 and 800 are inside the loop guard's 512-character window). `ClaudeCodeBillingStamp`: 5 pin-specific tests
   skipped with the reason "the fork strips the Claude Code billing header instead of pinning it (xeno #6)"; the 2 that
   also hold under the strip run.
@@ -578,8 +579,8 @@ dropped line is in "not taken").
     continuation's DONE figures its own way (`_merge_legs`: the prompt read is the first call's);
   - `serve/test_fatal_recovery.py`: `/health` answers 503 `engine_exited` for an ended engine (fork `e9c69582`);
   - `serve/test_frontend.py`: `document` is read by the fork (xeno #46), so it is out of upstream's "left out" list;
-  - `serve/test_reasoning_loop_recovery.py`: the default `repeat_stop_tokens` is 0, and the loop guard ends the passage
-    loop (`stop_detail: "loop"`);
+  - `serve/test_reasoning_loop_recovery.py`: the default `repeat_stop_tokens` is 256 (0 at the merge commit), and the
+    loop guard ends the passage loop (`stop_detail: "loop"`);
   - `serve/test_lifecycle.py` (the mock pump reports not alive, xeno #48), `serve/test_logit_bias.py` (the GEN line
     always names `cache_slot=0`, xeno #49 S7), `serve/test_media.py` (one distinct picture, not one encode call),
     `tests/xeno/test_count_tokens.py` (`count_only=True`; the staging test uses a request that fits),
@@ -723,13 +724,13 @@ resolutions were designed around (§4), not bugs found in merged code.
   each arm splits the window.
 - **ABBA arms not measured** (each upstream value behind its switch, §2): `STRATA_MTP_CATCHUP_ALL=0`,
   `STRATA_RING_BYTES=1`, `STRATA_PREFILL_STREAM_AHEAD=1`, `STRATA_PREFILL_CPU_SHARE=1` / `auto`,
-  `STRATA_ROUTE_TAIL_SKIP=7`, `"repeat_stop_tokens": 256`, `--ple-inflight 256`, `CUDA_MODULE_LOADING=EAGER`. The host
+  `STRATA_ROUTE_TAIL_SKIP=7`, `--ple-inflight 256`, `CUDA_MODULE_LOADING=EAGER`. The host
   pin (#626) has no arm; it is measured only inside the merge-vs-main ABBA.
 - **Questions for the developer:**
   - upstream's PCIe probe + PcieAuto are unreachable without `--pcie-frac`; no switch restores upstream's no-flag
     default;
   - the host-thread pin (#626) moved a D2x default with no switch back;
-  - #606 `repeat_stop_tokens`: 0 (the fork's loop guard reports the stop) or 256;
+  - ~~#606 `repeat_stop_tokens`: 0 or 256~~ - answered 2026-10-12: 256, reported as the loop guard's stop (§2);
   - helper caches (`--expert-cache-device1..3`, `--remote-expert-opt`, `STRATA_PREFILL_HELPER_SOURCE`) with the 4070
     tier, and upstream's helper GPUs with the NVMe tier, are not refused;
   - the billing-stamp tests are skipped (the fork strips the header, xeno #6).

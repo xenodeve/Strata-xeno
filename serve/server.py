@@ -154,10 +154,11 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
 VISION_START = "<|vision_start|>"
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
-# sets it; 0 turns it off.  The fork's default is off (merge #212): its own loop guard (serve/loop_guard.py) stops
-# degenerate output and counts it in /status loops_stopped; "repeat_stop_tokens": 256 is upstream's default.
+# sets it; 0 turns it off.  It is reported as the loop guard's stop (serve/loop_guard.py): stop_detail "loop", counted
+# in /status loops_stopped.  It catches what the guard cannot see: a token that never becomes reply text (a special
+# token, a tool call's arguments) and a repeated token longer than the guard's 8-character period.
 REPEAT_STOP_TOKENS = 256
-REPEAT_STOP_DEFAULT = 0
+REPEAT_STOP_DEFAULT = REPEAT_STOP_TOKENS
 ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
@@ -4569,6 +4570,10 @@ class Service:
                                   f"at {n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                                   "strata-<model>.json; remove it to turn this off)", flush=True)
                         elif repeated:
+                            stop_detail = "loop"            # reported as the loop guard's stop
+                            with self.status_lock:
+                                self.status["loops_stopped"] += 1
+                                self.status["last_stop_reason"] = "loop"
                             print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                                   f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                                   "strata-<model>.json; 0 turns this off). If a new request with a short prompt does "
@@ -7662,7 +7667,7 @@ def main() -> int:
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
     svc.tool_call_recovery = recovery
-    rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_DEFAULT)  # #606: the fork's default off; 256 is upstream's
+    rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_DEFAULT)  # #606
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs

@@ -137,10 +137,10 @@ class ReasoningLoopRecovery(unittest.TestCase):
         engine = RecordingEngine(self.tok, [self.loop])
         service = Service(engine, self.tok, None)
         events = list(service.run(self.ids, True, [], 16384, {}, threading.Event()))
-        # the fork: #606 is off by default (merge #212), and its own loop guard (xeno #6, 6bff9c17
-        # "stop output loops", serve/loop_guard.py) ends the passage loop at its 4,096-character unit rule, not
-        # max_tokens; #728 stays off (no second pass)
-        self.assertEqual(service.repeat_stop_tokens, 0)
+        # #606 (on, 256) sees no single-token run here; the fork's loop guard (xeno #6, 6bff9c17 "stop output
+        # loops", serve/loop_guard.py) ends the passage loop at its 4,096-character unit rule, not max_tokens; #728
+        # stays off (no second pass)
+        self.assertEqual(service.repeat_stop_tokens, 256)
         self.assertEqual(len(engine.calls), 1)
         self.assertEqual(events[-1][1]['finish'], 'length')
         self.assertEqual(events[-1][1]['stop_detail'], 'loop')

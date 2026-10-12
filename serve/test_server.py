@@ -2276,41 +2276,60 @@ class LearnedProfile(unittest.TestCase):
 
 
 class RepeatStop(unittest.TestCase):
-    """#606: one token repeated repeat_stop_tokens times in a row ends the reply as "length"; 0 turns it off.
-    On the fork it is off by default (merge #212: its loop guard, serve/loop_guard.py, ends degenerate output and counts
-    it in /status loops_stopped); these tests set upstream's 256 to test the mechanism."""
+    """#606: one token repeated repeat_stop_tokens times in a row ends the reply as "length"; 0 turns it off.  It is
+    reported as the loop guard's stop (stop_detail "loop", /status loops_stopped) and catches what the guard cannot see."""
+    SCHEMA = [{"name": "write", "parameters": {"properties": {"content": {"type": "string"}}}}]
 
-    def test_the_fork_default_is_off(self):
+    def test_the_default_is_on(self):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        self.assertEqual(svc.repeat_stop_tokens, 0)
+        self.assertEqual(svc.repeat_stop_tokens, 256)
 
-    def run_reply(self, script, limit=256):
+    def run_reply(self, script, limit=256, tools=None):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         if limit is not None:
             svc.repeat_stop_tokens = limit
         ids = tok.encode("hi")
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            done = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event()) if kind == "done"][0]
+            done = [x for kind, x in svc.run(ids, False, tools, 3000, {}, threading.Event()) if kind == "done"][0]
+        self.status = svc.status
         return done, out.getvalue()
 
     def test_a_long_run_is_ended(self):
-        done, log = self.run_reply("ok " + "!" * 1000 + " never")
+        done, log = self.run_reply("ok " + "!" * 1000 + " never", limit=None)   # the default
         self.assertEqual(done["finish"], "length")
         self.assertEqual(done["completion_tokens"], 3 + 256)
         self.assertIn("repeated one token ('!') 256 times", log)
+        # reported as the loop guard's stop
+        self.assertEqual(done["stop_detail"], "loop")
+        self.assertEqual(self.status["loops_stopped"], 1)
+        self.assertEqual(self.status["last_stop_reason"], "loop")
+
+    def test_a_run_the_loop_guard_cannot_see(self):
+        """A run inside a tool call's arguments never reaches the loop guard (it reads reply text and thinking): only
+        #606 ends it."""
+        script = ("<tool_call>\n<function=write>\n<parameter=content>\n" + "!" * 1000 +
+                  "\n</parameter>\n</function>\n</tool_call>")
+        done, log = self.run_reply(script, tools=self.SCHEMA)
+        self.assertEqual((done["finish"], done["stop_detail"]), ("length", "loop"))
+        self.assertIn("repeated one token ('!') 256 times", log)
+        done, log = self.run_reply(script, limit=0, tools=self.SCHEMA)
+        self.assertIsNone(done.get("stop_detail"))
+        self.assertNotIn("loop guard stopped", log)
+        self.assertEqual(self.status["loops_stopped"], 0)
 
     def test_short_runs_and_off(self):
         done, _ = self.run_reply("=" * 255 + " fine")
         self.assertEqual(done["finish"], "stop")
-        # off: a run past 256 goes on (300, under the fork's loop guard's 512-character window, which would end
-        # upstream's 1,000)
+        # off: a run past 256 goes on (300, under the loop guard's 512-character window, which would end upstream's
+        # 1,000)
         done, log = self.run_reply("!" * 300 + " fine", limit=0)
         self.assertEqual((done["finish"], done["completion_tokens"]), ("stop", 306))
         self.assertNotIn("repeated one token", log)
-        done, _ = self.run_reply("ab" * 200, limit=8)       # alternating tokens are not one run (400 chars:
-        #                                                   the fork's loop guard ends upstream's 800)
+        self.assertIsNone(done.get("stop_detail"))
+        done, _ = self.run_reply("ab" * 200, limit=8)       # alternating tokens are not one run (400 characters:
+        #                                                   the loop guard ends upstream's 800)
         self.assertEqual(done["finish"], "stop")
 
 
