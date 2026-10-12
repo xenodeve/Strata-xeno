@@ -882,6 +882,7 @@ struct SplitTier {
     // on the 4070: compute, host expert copies, late inputs
     cudaStream_t s = nullptr, c = nullptr, u = nullptr;
     std::unique_ptr<mmq::Context> ctx;       // on the 4070
+    const float* had_sh = nullptr;           // APR: the 4070's copy of the n_ff (640) sign vector (nullptr: identity)
     std::unique_ptr<Stager> stager;          // on the 4070: host experts into pinned buffers
     void *xtok = nullptr, *xq = nullptr, *hq = nullptr;
     float *gu = nullptr, *h = nullptr, *dm = nullptr, *w = nullptr, *bo = nullptr;   // bo: the routed sum
@@ -1082,6 +1083,9 @@ struct SplitTier {
         if (z.ring > 0) ring = (uint8_t*) d_alloc(z.ring);
         if (ok) {
             ctx = std::make_unique<mmq::Context>();
+            // APR: this device's sign vector for the folded down projections (the 4070 is current here)
+            if (strata::kernels::cpu::hadamard_spec().any())
+                had_sh = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs(640), 640);
             mmq::iota(ids, R, s);
             cudaStreamSynchronize(s);
             if (timeline::enabled()) {
@@ -1251,6 +1255,7 @@ struct Prefill::Impl {
     // APR (prism.hadamard): per layer, this device's copies of the gate/up (n_embd) and down (n_ff) sign vectors
     // (nullptr: identity signs or not folded), resolved once in init so a prompt chunk reads a pointer
     std::vector<const float*> had_sx, had_sh;
+    float* Xr = nullptr;   // APR: the rotated copy of `mixed` for the MMQ path (carve, with the MMQ buffers)
 };
 
 namespace {
@@ -1662,7 +1667,13 @@ bool split_run(Impl& m, int64_t l, int64_t T, size_t unit, const std::vector<int
         a.bounds = sp.bounds + sb.boff; a.ids = sp.ids; a.n_embd = N; a.n_ff = 640; a.interleaved = false;
         a.xq = sp.xq; a.gu_out = sp.gu; a.h = sp.h; a.hq = sp.hq; a.dst = sp.dm + sb.r0 * N;
         sp.clk_s.mark(sp.tl_s, "products", sp.s, l, sb.grp);
-        mmq::expert_rows(*sp.ctx, a, sp.s);
+        if (f.had_d) {   // APR: folded down weights take H (s * h), with the 4070's copy of the n_ff signs
+            mmq::expert_rows_gate_up(*sp.ctx, a, sp.s);
+            strata::kernels::hadamard_rows(a.h, a.h, a.nr, 640, f.had_block, sp.had_sh, sp.s);
+            mmq::expert_rows_down(*sp.ctx, a, sp.s);
+        } else {
+            mmq::expert_rows(*sp.ctx, a, sp.s);
+        }
     }
     sp.clk_s.mark(sp.tl_s, "wait gates", sp.s, l);
     cudaStreamWaitEvent(sp.s, sp.ev_gatesread, 0);
@@ -1763,12 +1774,12 @@ const MmqPlan& mmq_plan() {
         p.fallback = !on || layers <= 0;
         for (int64_t l = 0; on && l < layers; ++l) {
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-            // APR (xeno): a Hadamard-folded layer takes the FP16 path, which rotates its input and its H.  The fork's
-            // MMQ path (one q8_1 image per token, Xtok, and mmq::expert_rows_*) does not rotate yet, and its trellis
-            // tiles exist only with the agention ggml tree (STRATA_MMQ_TQ) - so it would read unrotated activations.
-            const bool folded = lay.native && (lay.fmt[(size_t) l].had_gu || lay.fmt[(size_t) l].had_d);
+            // APR (xeno): a Hadamard-folded layer runs MMQ like any other where the tree has tiles for its types (the
+            // trellis types: only an agention ggml tree, STRATA_MMQ_TQ; elsewhere fits() is false and the FP16 path
+            // takes it).  Both MMQ paths rotate: Xtok is quantized from the rotated `mixed` (Xr), which the expert
+            // split sends to the 4070 as is, and H is rotated between gate/up and down on either card.
             // #420: a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
-            if (folded || !mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
+            if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
                 p.fallback = true;
                 // the fused path's buffers (Xq, H) exist for it; a chunk it does not take (a small one) keeps the FP16 path
                 if (on && lay.native && fused::native_supported(gt, dt)) { p.fo[(size_t) l] = 1; p.any = true; }
@@ -1846,6 +1857,8 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
         a.take<uint8_t>(mb.xq, ok);
         a.take<float>(mb.h, ok);
         a.take<uint8_t>(mb.hq, ok);
+        // APR: carve's m.Xr - counted here too, or the MoE set outgrows the region carve sizes from this
+        if (strata::kernels::cpu::hadamard_spec().any()) a.take<float>(T * N, ok);
     }
     return a.used;
 }
@@ -2107,6 +2120,9 @@ bool Prefill::carve(size_t T, void* alloc, int64_t kv_end) {
             m.Xq = c.take<uint8_t>(mb.xq, ok);
             m.H = c.take<float>(mb.h, ok);
             m.Hq = c.take<uint8_t>(mb.hq, ok);
+            // APR: the rotated copy of `mixed` that a Hadamard-folded layer quantizes into Xtok (only for such packs;
+            // moe_set_bytes counts it in the same place)
+            m.Xr = strata::kernels::cpu::hadamard_spec().any() ? c.take<float>(T * N, ok) : nullptr;
         }
         if (base == nullptr) ok = false;
     }
@@ -4103,7 +4119,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // rows from them: byte-identical to quantizing the gathered rows, xeno_q8_row_gather)
                             {
                                 timeline::Span qs("split: quantize enqueue", l);
-                                mmq::quantize(m.mixed, nullptr, m.Xtok, mmq_gt, N, N, T, m.cs);
+                                // APR: a folded gate/up takes H (s * x): Xtok from the rotated copy (the 4070's too:
+                                // split_send hands it Xtok); `mixed` itself stays for the shared expert and the CPU share
+                                const float* xsrc = m.mixed;
+                                if (had_gu) {
+                                    strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
+                                    xsrc = m.Xr;
+                                }
+                                mmq::quantize(xsrc, nullptr, m.Xtok, mmq_gt, N, N, T, m.cs);
                             }
                             if (split_l) {   // #133: the 4070's inputs first, then CUDA0's tables for its own experts
                                 if (!split_send(m, l, T, chunk_i, order_4070, err)) return false;
@@ -4267,6 +4290,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 a.interleaved = !lay.native;
                                 a.xq = m.Xq; a.gu_out = m.GU; a.h = m.H; a.hq = m.Hq; a.dst = m.Dm + sb.r0 * N;
                                 mmq::expert_rows_gate_up(*m.mmq_ctx, a, m.cs);
+                                // APR: folded down weights take H (s * h): the sub-product's nr rows of H, in place
+                                if (had_d) strata::kernels::hadamard_rows(a.h, a.h, a.nr, 640, had_block, had_sh, m.cs);
                                 pt.mark(kPfGemmD, cs);
                                 mmq::expert_rows_down(*m.mmq_ctx, a, m.cs);
                             }
