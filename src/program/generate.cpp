@@ -10308,6 +10308,9 @@ int main(int argc, char** argv) {
                 if (!swaps.empty()) cudaEventRecord(d2h_ev, adapt_stream);
                 paired_swaps += (int64_t) swaps.size();
                 if (sec_paired_serve && !sec_pick()) return false;   // xeno #229: the 4070 takes the overflow
+                // #477 --expert-profile-save: the paired tier returns here, before the count below the unpaired swaps
+                // (xeno #229: without this the saved ranking held no routing, only the residents and the prior)
+                for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
                 for (float& v : drive.d.usage) v *= o.adapt_decay;   // 0.7 unless --adapt-decay
                 return true;
             }
