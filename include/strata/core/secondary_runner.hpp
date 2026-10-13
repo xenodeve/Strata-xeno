@@ -59,6 +59,11 @@ public:
                        BreachHandler on_breach = nullptr, void* context = nullptr,
                        uint64_t free_floor_bytes = 2560ull << 20);
     void stop_monitor();
+    /// xeno (#208, developer 2026-10-13): the display card's rule is "other processes + free = the reserve; the server
+    /// may use the rest". When others grow into free memory the server has not broken that rule, so with warn the
+    /// monitor logs the breach (at most once a minute) and the engine keeps serving instead of ending (#203).
+    /// Set before start_monitor.
+    void set_breach_warn(bool on) { breach_warn_ = on; }
     uint64_t served_entries() const { return served_entries_; }
     uint64_t served_groups() const { return served_groups_; }
     /// Host time spent inside launch() enqueueing, and blocked in finish() waiting for the 4070 SUPER's partials.
@@ -110,6 +115,7 @@ private:
     std::atomic<uint64_t> free_checks_{0};
     std::atomic<uint64_t> min_free_bytes_{~uint64_t{0}};
     uint64_t free_floor_bytes_ = 2560ull << 20;
+    bool breach_warn_ = false;   ///< --secondary-breach warn (set_breach_warn)
     std::atomic<bool> monitor_stop_{false}, monitor_running_{false};
     std::thread monitor_;
     // async launch: one request in flight at a time (launch -> finish per layer)

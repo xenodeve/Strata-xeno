@@ -542,6 +542,18 @@ bool SecondaryRunner::start_monitor(int interval_ms, std::string& err,
                     }
                 }
                 record_free(lower);
+                if (!safe && breach_warn_) {   // xeno #208: others grew into free memory; keep serving
+                    static auto last = std::chrono::steady_clock::time_point{};
+                    const auto now = std::chrono::steady_clock::now();
+                    if (last == std::chrono::steady_clock::time_point{} || now - last >= std::chrono::seconds(60)) {
+                        last = now;
+                        std::fprintf(stderr, "strata: secondary display VRAM below the free floor (%s; %.0f MiB free) - "
+                                             "--secondary-breach warn: the engine keeps serving (#208)\n",
+                                     problem.c_str(), (double) lower / 1048576.0);
+                    }
+                    ++free_checks_;
+                    continue;
+                }
                 if (!safe) {
                     if (on_breach != nullptr) {
                         on_breach(problem.c_str(), context);

@@ -513,6 +513,7 @@ struct Options {
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
+    bool secondary_breach_warn = false;   ///< xeno #208: --secondary-breach warn - a breach of the floor is logged, not fatal
     int display_reserve_mib = 0;          ///< #208: one reserve for everything else on the 4070 (0 = off): the others'
                                           ///< use at start counts toward it, the rest stays free (>= the free floor)
     int pool_priority = 2;                ///< THREAD_PRIORITY_* for pool workers + host; 2 = HIGHEST (default, 0 = off)
@@ -978,6 +979,9 @@ void usage() {
                  "  --cache-cpu-only     Diagnostic: prefill normally, then route verify experts to CPU.\n"
                  "  --secondary-expert-mib N  Phase 3 expert tier on RTX 4070 SUPER (any native pack, #11);\n"
                  "  --secondary-free-floor-mib N  Experimental free floor on 4070; default 2560.\n"
+                 "  --secondary-breach end|warn  free VRAM on the 4070 below the floor: end the engine (default, #203) or\n"
+                 "                       log it and keep serving (xeno #208: with --display-reserve-mib the others own the\n"
+                 "                       reserve, so their growth into free memory is not the server's to answer)\n"
                  "  --display-reserve-mib N  #208: N MiB on the 4070 for everything else, counting what the others use at\n"
                  "                         start (e.g. 3277 = 3.2 GB); the tier takes the rest up to --secondary-expert-mib\n"
                  "                         (12288 = no cap), less the prompt split's buffers. 0 = off (default).\n"
@@ -2632,6 +2636,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--secondary-breach") {
+            const std::string v = next("--secondary-breach");
+            if (v != "end" && v != "warn") {
+                std::fprintf(stderr, "strata generate: --secondary-breach needs end or warn\n");
+                return 2;
+            }
+            o.secondary_breach_warn = v == "warn";
+        }
         else if (a == "--display-reserve-mib") {
             const std::string v = next("--display-reserve-mib");
             const auto parsed = std::from_chars(v.data(), v.data() + v.size(), o.display_reserve_mib);
@@ -3329,9 +3341,26 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --display-reserve-mib: %s\n", nerr.c_str());
             return 1;
         }
+        // xeno #208 (developer 2026-10-13: "others + free = the reserve; the server may use the rest"): the server's own
+        // VRAM on this card outside the engine - the vision encoder, which the server starts first, so NVML counts it
+        // among the others - is the server's, not the others'.  STRATA_DISPLAY_SERVER_MIB is what it holds at rest
+        // (taken off the others), STRATA_DISPLAY_SERVER_GROWTH_MIB what it adds while it works (kept free for it).
+        auto env_mib = [](const char* k) -> uint64_t {
+            const char* v = std::getenv(k);
+            return v != nullptr && std::atoll(v) > 0 ? (uint64_t) std::atoll(v) << 20 : 0;
+        };
+        const uint64_t server_rest = env_mib("STRATA_DISPLAY_SERVER_MIB"), server_growth = env_mib("STRATA_DISPLAY_SERVER_GROWTH_MIB");
+        const uint64_t others_measured = display_others;
+        display_others = display_others > server_rest ? display_others - server_rest : 0;
         display_floor = strata::core::display_free_floor((uint64_t) o.display_reserve_mib << 20, display_others,
-                                                         (uint64_t) o.secondary_free_floor_mib << 20);
-        if (display_floor == (uint64_t) o.secondary_free_floor_mib << 20)
+                                                         (uint64_t) o.secondary_free_floor_mib << 20) + server_growth;
+        if (server_rest > 0 || server_growth > 0)
+            std::fprintf(stderr, "strata generate: --display-reserve-mib %d: %.2f GiB in use on the 4070 before the engine, "
+                         "%.2f GiB of it the server's own (STRATA_DISPLAY_SERVER_MIB) -> others %.2f GiB; +%.2f GiB kept free "
+                         "for the server's growth (STRATA_DISPLAY_SERVER_GROWTH_MIB)\n", o.display_reserve_mib,
+                         (double) others_measured / 1073741824.0, (double) server_rest / 1073741824.0,
+                         (double) display_others / 1073741824.0, (double) server_growth / 1073741824.0);
+        if (display_floor - server_growth == (uint64_t) o.secondary_free_floor_mib << 20)
             std::fprintf(stderr, "strata generate: --display-reserve-mib %d: the others already use %.2f GiB, so the minimum "
                          "free floor (--secondary-free-floor-mib %d) sizes the tier instead\n", o.display_reserve_mib,
                          (double) display_others / 1073741824.0, o.secondary_free_floor_mib);
@@ -6523,6 +6552,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        secondary_runner.set_breach_warn(o.secondary_breach_warn);   // xeno #208
         if (!secondary_runner.start_monitor(100, err, nullptr, nullptr, nullptr,
                                             (uint64_t) o.secondary_free_floor_mib << 20)) {
             std::fprintf(stderr, "strata generate: secondary reserve monitor: %s\n", err.c_str());
