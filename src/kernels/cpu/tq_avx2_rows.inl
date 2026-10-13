@@ -69,18 +69,28 @@ STRATA_TQ_ROWS_FN STRATA_TQ_INLINE void decode8(const long long* tab, const uint
 // cleared names the same row as state qs[t-1] << 8 | qs[t] (15 bits).  Against the byte-wise decode it saves a load,
 // a shift and an OR per state; the loads were the part that mattered (xeno #220, tqab: P-core -6 %, E-core -11 %).
 // Windows: bytes 4M-4 .. 4M+3 for M >= 1, all inside the block; M = 0 reads bytes 0..7 and qs[31] for t = 0.
+// The four rows go into the ymm as two xmm pairs and one insert (MOVQ, MOVQ, PUNPCKLQDQ per pair, VINSERTI128)
+// rather than the broadcast/blend of rows4: a Gracemont E-core splits a ymm blend into two uops and runs the pairs
+// faster (tqab: E-core -4.5 % against q64's blend, P-core the same; xeno #220).
+STRATA_TQ_ROWS_FN STRATA_TQ_INLINE __m256i rows4x(const long long* tab, uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3) {
+    const __m128i a = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i*) (tab + s0)),
+                                         _mm_loadl_epi64((const __m128i*) (tab + s1)));
+    const __m128i b = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i*) (tab + s2)),
+                                         _mm_loadl_epi64((const __m128i*) (tab + s3)));
+    return _mm256_inserti128_si256(_mm256_castsi128_si256(a), b, 1);
+}
+
 template <int M>
 STRATA_TQ_ROWS_FN STRATA_TQ_INLINE __m256i rows4q(const long long* tab, const uint8_t* qs) {
     uint64_t x;
     if constexpr (M == 0) {
         std::memcpy(&x, qs, 8);
         const uint32_t i0 = ((uint32_t) qs[31] | ((uint32_t) qs[0] << 8)) & 0xff7fu;
-        return rows4<false>(tab, i0, (uint32_t) x & 0xff7fu, (uint32_t) (x >> 8) & 0xff7fu,
-                            (uint32_t) (x >> 16) & 0xff7fu);
+        return rows4x(tab, i0, (uint32_t) x & 0xff7fu, (uint32_t) (x >> 8) & 0xff7fu, (uint32_t) (x >> 16) & 0xff7fu);
     } else {
         std::memcpy(&x, qs + 4 * M - 4, 8);
-        return rows4<false>(tab, (uint32_t) (x >> 24) & 0xff7fu, (uint32_t) (x >> 32) & 0xff7fu,
-                            (uint32_t) (x >> 40) & 0xff7fu, (uint32_t) (x >> 48) & 0xff7fu);
+        return rows4x(tab, (uint32_t) (x >> 24) & 0xff7fu, (uint32_t) (x >> 32) & 0xff7fu,
+                      (uint32_t) (x >> 40) & 0xff7fu, (uint32_t) (x >> 48) & 0xff7fu);
     }
 }
 
