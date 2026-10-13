@@ -182,7 +182,8 @@ Greedy. Every xeno arm passes `--pool-priority 2 --process-priority 2`. rc2 has 
 - #219: one access violation at tier 7200 at the start of the long prompt; the crash report printed no stack or dump.
 - #220: the TQ CPU kernel's cost per expert entry. A timeline of the pool lane comes before any fix.
 - The 32-token replies after each part are about 6 % slower than rc2's with D2x's flags. With the proposed config they are faster (55 against 41 tok/s), but that comparison is across sessions.
-- Not run: Gyro-S / Gyro-L, vision with Gyro's `mmproj-F16.gguf`, the RAM budget (no arm is under 42 GB: 43.5 at 131K, 45.4 at 262K).
+- **Vision (added after, developer's ask):** D2x's vision section with Gyro's `mmproj-F16.gguf` works. The encoder's `--model` stays Swift's GGUF: strata-vision's llama.cpp cannot parse Gyro's TQ types. The image question was answered right in every run (`gyro-record/vision217.py`). The encoder takes ~2.2 GB of the 4070, so the tier drops to 5300: the 640 MiB floor holds with the desktop grown to 3.0 GB. 4070 peak 10,538 MiB (desktop 2,048), 35.6K prompt 19.4 s, decode 46.5 tok/s (one run). Installed as hub key 3 (`strata-gyro-m-d2x.json`, model name `Qwen3.8-Flash-Next-Strata`); #217.
+- Not run: Gyro-S / Gyro-L, the RAM budget (no arm is under 42 GB: 43.5 at 131K, 45.4 at 262K).
 - This branch's stock-ggml exe serves Swift D2x (gate in section 6). The Gyro exe needs agentionai's ggml tree, and the Swift D2x path was not gated on that exe.
 
 ## 8. Classic web app, README
