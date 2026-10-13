@@ -146,7 +146,8 @@ Greedy. Every xeno arm passes `--pool-priority 2 --process-priority 2`. rc2 has 
 **Gyro-M against Swift 1.5 on this engine** (cr1, tier 7200, the same decode): 55.3 against 91.4 tok/s, with the same windows (172 / 170), the same draft acceptance (231 / 230 of ~300) and about the same CPU entries (30.2K / 27.7K). The CPU pool's time per entry is 123 us against 59 us, about 11.8 of the 16.3 ms/window gap (#220).
 
 **What is left:**
-- #218: greedy replies differ between boots of the same exe and config (131K and 262K). STATE_HASH is needed to find where.
+- #218: greedy replies differ between boots of the same exe and config (131K and 262K). The deployed Swift D2x engine does it too on this workload (session det: 7 of 8 equal, the 400-token decode differs), so it is not the Gyro port alone. Gyro-M diverges more often (3-5 of 8 in some arms); whether that rate is really higher is not known. STATE_HASH is needed to find where.
+- rc2's figures are as measured. It ran with 1.6 GB of RAM free, and whether it paged was not checked.
 - #219: one access violation at tier 7200 at the start of the long prompt; the crash report printed no stack or dump.
 - #220: the TQ CPU kernel's cost per expert entry. A timeline of the pool lane comes before any fix.
 - The 32-token replies after each part are about 6 % slower than rc2's with D2x's flags. With the proposed config they are faster (55 against 41 tok/s), but that comparison is across sessions.
