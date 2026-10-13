@@ -7048,7 +7048,10 @@ int main(int argc, char** argv) {
                                  "the host through the doorbell the pool reads. Drop --no-pool.\n");
             return 2;
         }
-        routing = std::fopen(o.dump_routing.c_str(), "wb");
+        // xeno #226: STRATA_DUMP_ROUTING_APPEND=1 appends instead of truncating, so a served config collects one trace
+        // across engine restarts (each boot writes its own format / owned-set tags first; make_profile.py skips tags)
+        const char* app = std::getenv("STRATA_DUMP_ROUTING_APPEND");
+        routing = std::fopen(o.dump_routing.c_str(), app != nullptr && std::atoi(app) != 0 ? "ab" : "wb");
         if (routing == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_routing.c_str());
             return 1;
