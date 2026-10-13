@@ -374,10 +374,20 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout_in, c
             }
             graph_k_[gi] = k;
         }
+        const auto gl0 = std::chrono::steady_clock::now();
         if (!cuda_ok(cudaGraphLaunch((cudaGraphExec_t) ge, stream), "runner graph launch", err)) return fail_enqueued();
+        const auto gl1 = std::chrono::steady_clock::now();
         tl_close();
         if (!cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
             return fail_enqueued();
+        if (timeline::enabled()) {   // #220: where the launch's host time goes (the device restore follows, unstamped)
+            const auto gl2 = std::chrono::steady_clock::now();
+            timeline::complete("4070 l plan", launch_t0, switch_t0, n_tokens, (int64_t) rows);
+            timeline::complete("4070 l device", switch_t0, now, n_tokens);
+            timeline::complete("4070 l lookup", now, gl0, n_tokens);
+            timeline::complete("4070 l graph launch", gl0, gl1, n_tokens);
+            timeline::complete("4070 l event", gl1, gl2, n_tokens);
+        }
         // #10 item 1 STRATA_SECONDARY_POKE=1: hand the batch to the 4070 now (WDDM may hold it until finish() asks)
         static const bool poke = [] { const char* v = std::getenv("STRATA_SECONDARY_POKE"); return v && v[0] == '1'; }();
         if (poke) (void) cudaStreamQuery(stream);

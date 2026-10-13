@@ -3561,9 +3561,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
     const auto c0 = std::chrono::steady_clock::now();
+    // #220: "dispatch plan" split for the timeline - begin_layer, the GPU's share (plan, publish, fetch, peer, helpers),
+    // the 4070's launch; stamped only while the timeline records
+    const bool tl_plan = timeline::enabled();
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
+    const auto cb = tl_plan ? std::chrono::steady_clock::now() : c0;
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
@@ -3726,6 +3730,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
         }
     }
+    const auto cg = tl_plan ? std::chrono::steady_clock::now() : c0;
     // (xeno) the 4070 tier's claim first: the rows it takes become kind 2 before any_cpu below reads kind
     bool secondary_claims = false;
     int32_t secondary_slots[128];
@@ -3765,6 +3770,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
         }
     }
+    const auto ce = tl_plan ? std::chrono::steady_clock::now() : c0;
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // the GPU never reads the mapped rows of the ones it computed itself (dec_batch: upstream's copy_rows_from_mapped
     // zeroes them on the GPU; the fork's moe_hit_merge_mapped writes hit_out into them), so the host does not zero them;
@@ -3979,6 +3985,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_secondary_finish += secondary_finish_ms;
     if (timeline::enabled()) {   // #33: the layer's dispatch stages (inside the verify window's "cpu experts")
         timeline::complete("dispatch plan", c0, c1, d.layers, n_tok * k);
+        timeline::complete("plan begin layer", c0, cb, d.layers, n_tok * k);
+        timeline::complete("plan gpu share", cb, cg, d.layers, n_tok * k);
+        timeline::complete("plan 4070 launch", cg, ce, d.layers, secondary_claims ? 1 : 0);
         timeline::complete("act quantize", c1, c2, d.layers, n_tok);
         timeline::complete("dispatch jobs", c2, c3, d.layers, njobs);
         timeline::complete("cpu pool", pool_start, pool_end, d.layers, njobs);
