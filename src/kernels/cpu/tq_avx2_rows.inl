@@ -64,10 +64,11 @@ STRATA_TQ_ROWS_FN STRATA_TQ_INLINE void decode8(const long long* tab, const uint
                        tq_state<KB>(qs, wr, 4 * M + 2), tq_state<KB>(qs, wr, 4 * M + 3))), ...);
 }
 
-// Q (q64, TQ2_T only): one 8-byte window per four states, each state's row index shifted out of the register and
-// masked (x >> 8k) & 0xff7f into tq_state_table_w16 - the 16-bit window qs[t-1] | qs[t] << 8 with qs[t-1]'s top bit
-// cleared names the same row as state qs[t-1] << 8 | qs[t] (15 bits).  Against the byte-wise decode it saves a load,
-// a shift and an OR per state; the loads were the part that mattered (xeno #220, tqab: P-core -6 %, E-core -11 %).
+// Q (q64, TQ2_T only): one 8-byte window per four states, read big-endian, so state qs[t-1] << 8 | qs[t] (15 bits)
+// is a shift and a mask of it - (be >> (24 - 8k)) & 0x7fff - straight into the 256 KiB state table.  Against the
+// byte-wise decode it saves a load, a shift and an OR per state (xeno #220, tqab: P-core -6 %, E-core -11 %); the
+// big-endian read (one byte swap per window, not per state) replaced a 512 KiB re-indexed table with the base one:
+// half the pages, P-core -9 %, E-core -3 % more (Gemini's MOVBE suggestion, measured; a per-state swap had lost).
 // Windows: bytes 4M-4 .. 4M+3 for M >= 1, all inside the block; M = 0 reads bytes 0..7 and qs[31] for t = 0.
 // The four rows go into the ymm as two xmm pairs and one insert (MOVQ, MOVQ, PUNPCKLQDQ per pair, VINSERTI128)
 // rather than the broadcast/blend of rows4: a Gracemont E-core splits a ymm blend into two uops and runs the pairs
@@ -80,17 +81,27 @@ STRATA_TQ_ROWS_FN STRATA_TQ_INLINE __m256i rows4x(const long long* tab, uint32_t
     return _mm256_inserti128_si256(_mm256_castsi128_si256(a), b, 1);
 }
 
+STRATA_TQ_ROWS_FN STRATA_TQ_INLINE uint64_t tq_load_be64(const uint8_t* p) {
+    uint64_t x;
+    std::memcpy(&x, p, 8);
+#if defined(_MSC_VER) && !defined(__clang__)
+    return _byteswap_uint64(x);
+#else
+    return __builtin_bswap64(x);
+#endif
+}
+
 template <int M>
 STRATA_TQ_ROWS_FN STRATA_TQ_INLINE __m256i rows4q(const long long* tab, const uint8_t* qs) {
-    uint64_t x;
     if constexpr (M == 0) {
-        std::memcpy(&x, qs, 8);
-        const uint32_t i0 = ((uint32_t) qs[31] | ((uint32_t) qs[0] << 8)) & 0xff7fu;
-        return rows4x(tab, i0, (uint32_t) x & 0xff7fu, (uint32_t) (x >> 8) & 0xff7fu, (uint32_t) (x >> 16) & 0xff7fu);
+        const uint64_t be = tq_load_be64(qs);   // bytes 0..7, byte 0 on top
+        const uint32_t i0 = (((uint32_t) qs[31] & 0x7fu) << 8) | qs[0];
+        return rows4x(tab, i0, (uint32_t) (be >> 48) & 0x7fffu, (uint32_t) (be >> 40) & 0x7fffu,
+                      (uint32_t) (be >> 32) & 0x7fffu);
     } else {
-        std::memcpy(&x, qs + 4 * M - 4, 8);
-        return rows4x(tab, (uint32_t) (x >> 24) & 0xff7fu, (uint32_t) (x >> 32) & 0xff7fu,
-                      (uint32_t) (x >> 40) & 0xff7fu, (uint32_t) (x >> 48) & 0xff7fu);
+        const uint64_t be = tq_load_be64(qs + 4 * M - 4);   // bytes 4M-4 .. 4M+3
+        return rows4x(tab, (uint32_t) (be >> 24) & 0x7fffu, (uint32_t) (be >> 16) & 0x7fffu,
+                      (uint32_t) (be >> 8) & 0x7fffu, (uint32_t) be & 0x7fffu);
     }
 }
 
@@ -106,7 +117,7 @@ STRATA_TQ_ROWS_FN void rows_t(const uint8_t* w, size_t row_bytes, int n, const T
     const int nb = n / 128;
     constexpr size_t bsz = 2 + 4 * KB;
     constexpr bool q64 = Q && KB == 8 && !G && !CB;
-    const long long* tab = (const long long*) (q64 ? tq_state_table_w16() : tq_state_table());
+    const long long* tab = (const long long*) tq_state_table();
     const uint32_t* cb = (const uint32_t*) tq_codebook_i16();
     for (int r = r0; r < r1; ++r) {
         const uint8_t* x = w + (size_t) r * row_bytes;

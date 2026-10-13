@@ -49,9 +49,6 @@ const char* tq_isa_name(TqIsa isa);
 const int16_t* tq_state_table();
 /// The 2048-point codebook as int16 pairs at the table's scale and rounding (8 KiB; filled with the table).
 const int16_t* tq_codebook_i16();
-/// The state table re-indexed for TQ2_T's AVX2 decode (65536 x 4 int16, filled on first use): row w is state
-/// (w & 0x7f) << 8 | w >> 8 for a little-endian 16-bit window w of the block bytes with bit 7 clear (xeno #220).
-const int16_t* tq_state_table_w16();
 
 /// Rows [r0, r1) of a trellis matrix (`row_bytes` per row, `n` weights per row) against `nt` (<= 8) Q8_0
 /// activations of n values: out[t][r] = w_r . a[t].
@@ -87,9 +84,10 @@ inline constexpr int kTqGather = 1, kTqVnni = 2;
 /// slower on an i5-13500, the table rows are not the bound).
 inline constexpr int kTqCodebook = 4;
 /// kTqByteStates: TQ2_T's states built byte by byte (two byte loads, shift, or, mask: the decode before xeno #220's
-/// q64).  Off by default: the default reads one 8-byte window per four states and indexes tq_state_table_w16 with a
-/// shift and a mask, one load per state fewer - an i5-13500, one token, us per expert: P-core 464 -> 437, E-core
-/// 1,162 -> 1,030, the same bits.  STRATA_TQ_BYTE_STATES=1 turns it back on for A/B.
+/// q64).  Off by default: the default reads one big-endian 8-byte window per four states and indexes the state table
+/// with a shift and a mask, one load per state fewer - an i5-13500, one token, us per expert: P-core 464 -> 437, E-core
+/// 1,162 -> 1,030 (then -9 % / -3 % more with the big-endian windows), the same bits.  STRATA_TQ_BYTE_STATES=1 turns
+/// it back on for A/B.
 inline constexpr int kTqByteStates = 8;
 int tq_avx2_variant() noexcept;
 /// tq_rows_avx2 with a given variant (tests and benches; kTqVnni is honoured only where cpu_avxvnni_ok()).
