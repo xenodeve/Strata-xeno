@@ -120,6 +120,37 @@ Greedy. Every xeno arm passes `--pool-priority 2 --process-priority 2`. rc2 has 
 
 `rc2peer` (`--peer-device 1 --peer-reserve-mib 2560`) did not boot (`peer experts: stream: out of memory`).
 
+**Why rc2's peer did not boot, and rc2 with both cards** (sessions peer1-peer5, peerab):
+
+- It fails at `agention-rc2/src/core/peer_experts.cpp:123`, the first call that creates the 4070's context. The VRAM sizing (lines 141-157) is never reached.
+- rc2 pins its expert arena with `cudaHostRegisterPortable | Mapped`: 29 GiB here. The engine's per-process shared usage (`GPU Process Memory\Shared Usage`) charges the pinned arena to **each** card it is mapped into. Measured at a 12 GiB cap: 12.73 GiB on the 5060 Ti and 12.73 GiB on the 4070.
+- DXGI (`IDXGIAdapter3::QueryVideoMemoryInfo`, `gyro-record/dxgi_budget.py`) gives both cards the same 31.69 GiB shared segment and a 30.94 GiB non-local budget. The peer opens while the two cards' charges together stay under that one budget: 2 x (pin + 0.9 GiB) <= 30.94, so pin <= 14.6 GiB.
+- Boots against that bound:
+  - pin 29 (no cap): fails.
+  - `STRATA_ARENA_PIN_GIB=auto`: #243 computes 26.2 GiB from the primary alone; fails.
+  - cap 16 (15 GiB pinned): fails.
+  - cap 12 and cap 14 (13.7 GiB pinned, 14.60 GiB charged per card, 29.2 of 30.94 together): boot.
+  - cap 8: boots.
+- `rc2peerx` = rc2's config + `--peer-device 1 --peer-reserve-mib 1536 --peer-slots 5700`, `STRATA_ARENA_PIN_GIB=14`. 5,700 slots are 6.93 GiB, sized so the 4070 peaks near xeno's tier 6400.
+- rc2 prints `the two GPUs cannot access each other (no P2P) - the prompt path stays on the primary GPU`: here the peer helps decode only.
+
+**rc2 with both cards vs xeno, session peerab** (order rc2peerx, x131_6400p, x131_6400p, rc2peerx; both 131K; ms):
+
+| | rc2peerx | xeno 131K, tier 6400, shipped profile | change |
+|---|---|---|---|
+| prefix 9,731 | 12,674 / 12,686 | 6,756 / 6,427 | -48 % |
+| parts 465-2,442 fresh | 2,670-4,942 | 1,002-2,013 | -59..-70 % |
+| long 35,594 | 33,450 / 33,724 | 19,451 / 19,400 | -42 % |
+| decode 400, tok/s | 48.5 / 50.9 | 51.0 / 52.6 | +4 % (under the gate; xeno ahead in both pairs) |
+| 32-token replies, mean tok/s | 46.8 | 54.7 | +17 % |
+| private, GiB | 56.7 (RAM left 1.3-2.4 GB) | 43.5 (RAM left 14.9 GB) | |
+| 4070 peak used, MiB | 9,741 / 9,279 | 10,393 / 10,311 | |
+| boot, s | 25.8 / 26.3 | 23.1 / 19.1 | |
+
+- Against rc2 on one card (ab1, another session), the second card raised rc2's decode from 37.5 to 49.7 tok/s. The long prompt went from 28.5 to 33.6 s.
+- The pin cap did not move the long prompt (caps 8 / 12 / 14: 33.8 / 33.7 / 33.9 s). Two possible causes, neither measured: paging (56.7 GiB private on a 47.7 GiB PC), or the peer's cost on the prompt path.
+- #243's auto cap is upstream's bug. It sizes the pin from the primary's budget alone and ignores a peer that maps the same memory. The fork does not run this path, because `--peer-device` is refused together with the 4070 tier.
+
 **Config sweep** (sw1, sw2, sw3, cr1; each arm two boots, ABBA):
 
 | arm | decode 400 | 32-token mean | parts 465 / 788 | long 35.6K | commit | note |
