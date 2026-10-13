@@ -75,7 +75,13 @@ int tq_avx2_variant() noexcept {
         const char* v = std::getenv("STRATA_TQ_CODEBOOK");
         return v != nullptr && *v != '\0' ? (std::atoi(v) != 0 ? 1 : 0) : -1;
     }();
-    return (gather == 1 ? kTqGather : 0) | (vnni ? kTqVnni : 0) | (codebook == 1 ? kTqCodebook : 0);
+    // TQ2_T's q64 decode is the default; STRATA_TQ_BYTE_STATES=1 brings back the byte-wise one for A/B (kTqByteStates)
+    static const bool byte_states = [] {
+        const char* v = std::getenv("STRATA_TQ_BYTE_STATES");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return (gather == 1 ? kTqGather : 0) | (vnni ? kTqVnni : 0) | (codebook == 1 ? kTqCodebook : 0) |
+           (byte_states ? kTqByteStates : 0);
 }
 
 namespace {
@@ -83,18 +89,21 @@ template <bool V>
 void rows_any(int variant, int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
               float* const* out, int r0, int r1) {
     const bool g = (variant & kTqGather) != 0, c = (variant & kTqCodebook) != 0;
+    const bool q = (variant & kTqByteStates) == 0;   // q64 (TQ2_T, assembled rows, the state table)
 #if STRATA_AVXVNNI
     if constexpr (V) {
         if (g) c ? vnni::rows_kb<true, true>(kb, w, row_bytes, n, a, nt, out, r0, r1)
                  : vnni::rows_kb<true, false>(kb, w, row_bytes, n, a, nt, out, r0, r1);
-        else c ? vnni::rows_kb<false, true>(kb, w, row_bytes, n, a, nt, out, r0, r1)
+        else if (c) vnni::rows_kb<false, true>(kb, w, row_bytes, n, a, nt, out, r0, r1);
+        else q ? vnni::rows_kb<false, false, true>(kb, w, row_bytes, n, a, nt, out, r0, r1)
                : vnni::rows_kb<false, false>(kb, w, row_bytes, n, a, nt, out, r0, r1);
         return;
     }
 #endif
     if (g) c ? plain::rows_kb<true, true>(kb, w, row_bytes, n, a, nt, out, r0, r1)
              : plain::rows_kb<true, false>(kb, w, row_bytes, n, a, nt, out, r0, r1);
-    else c ? plain::rows_kb<false, true>(kb, w, row_bytes, n, a, nt, out, r0, r1)
+    else if (c) plain::rows_kb<false, true>(kb, w, row_bytes, n, a, nt, out, r0, r1);
+    else q ? plain::rows_kb<false, false, true>(kb, w, row_bytes, n, a, nt, out, r0, r1)
            : plain::rows_kb<false, false>(kb, w, row_bytes, n, a, nt, out, r0, r1);
 }
 }  // namespace

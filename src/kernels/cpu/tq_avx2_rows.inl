@@ -64,12 +64,39 @@ STRATA_TQ_ROWS_FN STRATA_TQ_INLINE void decode8(const long long* tab, const uint
                        tq_state<KB>(qs, wr, 4 * M + 2), tq_state<KB>(qs, wr, 4 * M + 3))), ...);
 }
 
-template <int KB, bool G, bool CB = false>
+// Q (q64, TQ2_T only): one 8-byte window per four states, each state's row index shifted out of the register and
+// masked (x >> 8k) & 0xff7f into tq_state_table_w16 - the 16-bit window qs[t-1] | qs[t] << 8 with qs[t-1]'s top bit
+// cleared names the same row as state qs[t-1] << 8 | qs[t] (15 bits).  Against the byte-wise decode it saves a load,
+// a shift and an OR per state; the loads were the part that mattered (xeno #220, tqab: P-core -6 %, E-core -11 %).
+// Windows: bytes 4M-4 .. 4M+3 for M >= 1, all inside the block; M = 0 reads bytes 0..7 and qs[31] for t = 0.
+template <int M>
+STRATA_TQ_ROWS_FN STRATA_TQ_INLINE __m256i rows4q(const long long* tab, const uint8_t* qs) {
+    uint64_t x;
+    if constexpr (M == 0) {
+        std::memcpy(&x, qs, 8);
+        const uint32_t i0 = ((uint32_t) qs[31] | ((uint32_t) qs[0] << 8)) & 0xff7fu;
+        return rows4<false>(tab, i0, (uint32_t) x & 0xff7fu, (uint32_t) (x >> 8) & 0xff7fu,
+                            (uint32_t) (x >> 16) & 0xff7fu);
+    } else {
+        std::memcpy(&x, qs + 4 * M - 4, 8);
+        return rows4<false>(tab, (uint32_t) (x >> 24) & 0xff7fu, (uint32_t) (x >> 32) & 0xff7fu,
+                            (uint32_t) (x >> 40) & 0xff7fu, (uint32_t) (x >> 48) & 0xff7fu);
+    }
+}
+
+template <int... M>
+STRATA_TQ_ROWS_FN STRATA_TQ_INLINE void decode8q(const long long* tab, const uint8_t* qs, __m256i* wv,
+                                                std::integer_sequence<int, M...>) {
+    ((wv[M] = rows4q<M>(tab, qs)), ...);
+}
+
+template <int KB, bool G, bool CB = false, bool Q = false>
 STRATA_TQ_ROWS_FN void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                               float* const* out, int r0, int r1) {
     const int nb = n / 128;
     constexpr size_t bsz = 2 + 4 * KB;
-    const long long* tab = (const long long*) tq_state_table();
+    constexpr bool q64 = Q && KB == 8 && !G && !CB;
+    const long long* tab = (const long long*) (q64 ? tq_state_table_w16() : tq_state_table());
     const uint32_t* cb = (const uint32_t*) tq_codebook_i16();
     for (int r = r0; r < r1; ++r) {
         const uint8_t* x = w + (size_t) r * row_bytes;
@@ -80,7 +107,9 @@ STRATA_TQ_ROWS_FN void rows_t(const uint8_t* w, size_t row_bytes, int n, const T
             const uint8_t* qs = blk + 2;
             const uint64_t wr = tq_wrap<KB>(qs);
             __m256i wv[8];   // wv[m] = weights 16m .. 16m+15 (states 4m .. 4m+3)
-            if constexpr (CB) {
+            if constexpr (q64) {
+                decode8q(tab, qs, wv, std::make_integer_sequence<int, 8>{});
+            } else if constexpr (CB) {
                 alignas(32) uint32_t st[32];
                 tq_states<KB>(qs, st);
                 for (int m = 0; m < 8; ++m) wv[m] = rows4_cb<G>(cb, st + 4 * m);
@@ -109,10 +138,10 @@ STRATA_TQ_ROWS_FN void rows_t(const uint8_t* w, size_t row_bytes, int n, const T
     }
 }
 
-template <bool G, bool CB>
+template <bool G, bool CB, bool Q = false>
 STRATA_TQ_ROWS_FN void rows_kb(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                                float* const* out, int r0, int r1) {
-    if (kb == 8) rows_t<8, G, CB>(w, row_bytes, n, a, nt, out, r0, r1);
+    if (kb == 8) rows_t<8, G, CB, Q>(w, row_bytes, n, a, nt, out, r0, r1);
     else if (kb == 6) rows_t<6, G, CB>(w, row_bytes, n, a, nt, out, r0, r1);
     else rows_t<7, G, CB>(w, row_bytes, n, a, nt, out, r0, r1);
 }

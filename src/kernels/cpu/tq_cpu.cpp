@@ -22,6 +22,17 @@ alignas(64) int16_t g_table[(tq_detail::kTqStateMask + 1) * 4];
 // the 2048-point codebook at the same scale and rounding as g_table (xeno #220): point i = entries 2i, 2i+1, so the
 // state table's row for state s is point (s * 0x9e3779b1) >> 21 followed by point ((s * 0x9e3779b1) >> 10) & 2047
 alignas(64) int16_t g_codebook[2048 * 2];
+// the state table re-indexed by a little-endian 16-bit window of a TQ2_T block (xeno #220): row w = the row of state
+// (w & 0x7f) << 8 | w >> 8 while bit 7 of w is clear (rows with it set are never read and stay zero).  512 KiB of
+// which the 256 KiB read are the state table's rows, so the cache footprint is the same.
+alignas(64) int16_t g_table_w16[65536 * 4];
+
+void fill_table_w16() {
+    tq_state_table();
+    for (uint32_t w = 0; w < 65536; ++w)
+        if ((w & 0x80u) == 0)
+            std::memcpy(g_table_w16 + 4 * w, g_table + 4 * (((w & 0x7fu) << 8) | (w >> 8)), 8);
+}
 
 void fill_table() {
     for (uint32_t s = 0; s <= tq_detail::kTqStateMask; ++s) {
@@ -93,6 +104,12 @@ const int16_t* tq_state_table() {
 const int16_t* tq_codebook_i16() {
     tq_state_table();   // one fill for both
     return g_codebook;
+}
+
+const int16_t* tq_state_table_w16() {
+    static std::once_flag once;
+    std::call_once(once, fill_table_w16);
+    return g_table_w16;
 }
 
 bool tq_supported(int t) noexcept { return t == 144 || t == 145 || t == 146; }
