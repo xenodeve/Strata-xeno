@@ -1,5 +1,6 @@
 // src/kernels/cpu/hadamard.cpp - see include/strata/kernels/cpu/hadamard.hpp.
 #include "strata/kernels/cpu/hadamard.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -90,6 +91,17 @@ bool hadamard_parse(const std::string& path, int64_t n_layers, HadamardSpec& h, 
 }
 
 void hadamard_rotate(float* x, int n, int block, const float* signs) {
+    // #220: block 128 (APR) in AVX2 where the CPU has it, the same bits (native_hadamard_test checks); the scalar
+    // transform with STRATA_HADAMARD_SCALAR=1 (A/B)
+    static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_HADAMARD_SCALAR") == nullptr;
+    if (avx2 && block == 128 && n % 128 == 0) {
+        hadamard_rotate128_avx2(x, n, signs);
+        return;
+    }
+    hadamard_rotate_scalar(x, n, block, signs);
+}
+
+void hadamard_rotate_scalar(float* x, int n, int block, const float* signs) {
     if (signs)
         for (int i = 0; i < n; ++i) x[i] *= signs[i];
     const float scale = 1.0f / std::sqrt((float) block);

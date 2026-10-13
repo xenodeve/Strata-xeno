@@ -294,11 +294,33 @@ int fwht_check() {
     return worst < 1e-5 ? 0 : 1;
 }
 
+// #220: the AVX2 block-128 transform gives the scalar transform's bits, with and without signs, over several blocks
+int fwht_avx2_check() {
+    if (!cpu_avx2_ok()) { std::printf("FWHT AVX2 vs scalar: no AVX2 here, skipped\n"); return 0; }
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.f, 3.f);
+    const int n = 2560;
+    std::vector<float> x(n), s(n), a, b;
+    for (auto& v : x) v = nd(rng);
+    for (int i = 0; i < n; ++i) s[i] = (i * 53 % 7) < 3 ? -1.f : 1.f;
+    int bad = 0;
+    for (const float* sg : {static_cast<const float*>(s.data()), static_cast<const float*>(nullptr)}) {
+        a = x;
+        b = x;
+        hadamard_rotate_scalar(a.data(), n, 128, sg);
+        hadamard_rotate128_avx2(b.data(), n, sg);
+        bad += std::memcmp(a.data(), b.data(), sizeof(float) * (size_t) n) != 0;
+    }
+    std::printf("FWHT AVX2 vs scalar (2560 values, with and without signs): %s\n", bad ? "FAILED" : "bit-exact");
+    return bad ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (!native_experts_available()) { std::fprintf(stderr, "built without native experts\n"); return 1; }
     int rc = fwht_check();
+    rc |= fwht_avx2_check();
     if (argc >= 5 && std::strcmp(argv[1], "--pack") == 0 && std::strcmp(argv[3], "--gguf") == 0) {
         for (int i = 5; i + 1 < argc || i == 5; i += 2) {   // [layer expert]...
             const int layer = argc > i ? std::atoi(argv[i]) : 0, expert = argc > i + 1 ? std::atoi(argv[i + 1]) : 0;

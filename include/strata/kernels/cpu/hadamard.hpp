@@ -47,5 +47,8 @@ const float* hadamard_signs(int width);
 /// In place: x[i] *= signs[i] (when signs is not null), then each block of `block` values -> H_block x / sqrt(block).
 /// `n` must be a multiple of `block`.
 void hadamard_rotate(float* x, int n, int block, const float* signs);
+/// The portable transform, and block 128 in AVX2 (tq_avx2.cpp; call only where cpu_avx2_ok()): the same bits.
+void hadamard_rotate_scalar(float* x, int n, int block, const float* signs);
+void hadamard_rotate128_avx2(float* x, int n, const float* signs);
 
 }  // namespace strata::kernels::cpu

@@ -17,6 +17,7 @@
 
 #include "tq_states.hpp"
 
+#include <cmath>
 #include <cstdlib>
 #include <immintrin.h>
 #include <utility>
@@ -115,3 +116,39 @@ void tq_rows_avx2(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct
 }
 
 }  // namespace strata::kernels::cpu::tq_detail
+
+namespace strata::kernels::cpu {
+
+// The APR rotation (hadamard.cpp) for block 128 in AVX2 (#220: the host's "act quantize" was 1.1 ms per decode round
+// on Gyro-M against 0.2 on Swift, the scalar transform on the verify window's critical path).  Every output value is
+// the scalar code's: the same sign multiply, the same a + c / a - c per butterfly with the operands in the same order
+// (strides 1, 2, 4 inside a register by a lane swap and a blend, 8..64 across registers), the same scale multiply.
+void hadamard_rotate128_avx2(float* x, int n, const float* signs) {
+    const __m256 scale = _mm256_set1_ps(1.0f / std::sqrt(128.0f));
+    for (int b0 = 0; b0 < n; b0 += 128) {
+        float* v = x + b0;
+        __m256 r[16];
+        for (int k = 0; k < 16; ++k) {
+            r[k] = _mm256_loadu_ps(v + 8 * k);
+            if (signs) r[k] = _mm256_mul_ps(r[k], _mm256_loadu_ps(signs + b0 + 8 * k));
+        }
+        for (int k = 0; k < 16; ++k) {
+            __m256 s = _mm256_permute_ps(r[k], 0xB1);                                           // stride 1
+            r[k] = _mm256_blend_ps(_mm256_add_ps(r[k], s), _mm256_sub_ps(s, r[k]), 0xAA);
+            s = _mm256_permute_ps(r[k], 0x4E);                                                  // stride 2
+            r[k] = _mm256_blend_ps(_mm256_add_ps(r[k], s), _mm256_sub_ps(s, r[k]), 0xCC);
+            s = _mm256_permute2f128_ps(r[k], r[k], 1);                                          // stride 4
+            r[k] = _mm256_blend_ps(_mm256_add_ps(r[k], s), _mm256_sub_ps(s, r[k]), 0xF0);
+        }
+        for (int len = 1; len < 16; len <<= 1)                                                  // strides 8..64
+            for (int i = 0; i < 16; i += len << 1)
+                for (int j = i; j < i + len; ++j) {
+                    const __m256 a = r[j], c = r[j + len];
+                    r[j] = _mm256_add_ps(a, c);
+                    r[j + len] = _mm256_sub_ps(a, c);
+                }
+        for (int k = 0; k < 16; ++k) _mm256_storeu_ps(v + 8 * k, _mm256_mul_ps(r[k], scale));
+    }
+}
+
+}  // namespace strata::kernels::cpu
