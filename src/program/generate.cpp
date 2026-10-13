@@ -3611,7 +3611,10 @@ int main(int argc, char** argv) {
                          ? (strata::kernels::cpu::cpu_avx1_ok() && std::getenv("STRATA_NO_IQ128") == nullptr
                             ? "AVX1 128-bit (iq_avx1, the older-CPU build)"
                             : "ggml-cpu vec_dot (no AVX2: the older-CPU build)")
-                     : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+                     // xeno: name AVX-VNNI where the kernels take their VNNI forms (iq / q2 / tq, cpu_avxvnni_ok)
+                     : std::getenv("STRATA_NO_IQ256") == nullptr
+                         ? (strata::kernels::cpu::cpu_avxvnni_ok() ? "AVX-VNNI (AVX-2 + VPDPWSSD / VPDPBUSD)" : "AVX-2")
+                         : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
