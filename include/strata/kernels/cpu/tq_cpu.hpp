@@ -47,6 +47,8 @@ const char* tq_isa_name(TqIsa isa);
 
 /// The 32768 x 4 int16 state table (filled on first use; thread-safe).
 const int16_t* tq_state_table();
+/// The 2048-point codebook as int16 pairs at the table's scale and rounding (8 KiB; filled with the table).
+const int16_t* tq_codebook_i16();
 
 /// Rows [r0, r1) of a trellis matrix (`row_bytes` per row, `n` weights per row) against `nt` (<= 8) Q8_0
 /// activations of n values: out[t][r] = w_r . a[t].
@@ -73,6 +75,18 @@ void tq_rows_scalar(int kb, const uint8_t* w, size_t row_bytes, int n, const TqA
                     float* const* out, int r0, int r1);
 void tq_rows_avx2(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                   float* const* out, int r0, int r1);
+/// The AVX2 kernel's variants (xeno #220), the same bits in all: kTqVnni - VPDPWSSD, on by default where
+/// cpu_avxvnni_ok() (STRATA_NO_AVXVNNI=1 turns it off); kTqGather - the state-table rows by VPGATHERQQ, off by default
+/// (STRATA_TQ_GATHER=1: slower on an i5-13500's P- and E-cores).
+inline constexpr int kTqGather = 1, kTqVnni = 2;
+/// kTqCodebook: the weights from tq_codebook_i16 at the hash's two points (computed per state) instead of the 256 KiB
+/// state table; with kTqGather the indices are computed in SIMD and gathered.  Off by default (STRATA_TQ_CODEBOOK=1:
+/// slower on an i5-13500, the table rows are not the bound).
+inline constexpr int kTqCodebook = 4;
+int tq_avx2_variant() noexcept;
+/// tq_rows_avx2 with a given variant (tests and benches; kTqVnni is honoured only where cpu_avxvnni_ok()).
+void tq_rows_avx2_v(int variant, int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                    float* const* out, int r0, int r1);
 void tq_rows_avx512(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1);
 }  // namespace tq_detail

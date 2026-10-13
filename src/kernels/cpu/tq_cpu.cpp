@@ -19,6 +19,9 @@ namespace strata::kernels::cpu {
 namespace {
 
 alignas(64) int16_t g_table[(tq_detail::kTqStateMask + 1) * 4];
+// the 2048-point codebook at the same scale and rounding as g_table (xeno #220): point i = entries 2i, 2i+1, so the
+// state table's row for state s is point (s * 0x9e3779b1) >> 21 followed by point ((s * 0x9e3779b1) >> 10) & 2047
+alignas(64) int16_t g_codebook[2048 * 2];
 
 void fill_table() {
     for (uint32_t s = 0; s <= tq_detail::kTqStateMask; ++s) {
@@ -30,6 +33,10 @@ void fill_table() {
                 const float v = tq_detail::tq_half_to_float(tq_lut_f16[2 * pts[h] + j]) * 8192.0f;
                 g_table[4 * s + 2 * h + j] = (int16_t) (v < 0.0f ? v - 0.5f : v + 0.5f);
             }
+    }
+    for (int i = 0; i < 2048 * 2; ++i) {
+        const float v = tq_detail::tq_half_to_float(tq_lut_f16[i]) * 8192.0f;
+        g_codebook[i] = (int16_t) (v < 0.0f ? v - 0.5f : v + 0.5f);
     }
 }
 
@@ -81,6 +88,11 @@ const int16_t* tq_state_table() {
     static std::once_flag once;
     std::call_once(once, fill_table);
     return g_table;
+}
+
+const int16_t* tq_codebook_i16() {
+    tq_state_table();   // one fill for both
+    return g_codebook;
 }
 
 bool tq_supported(int t) noexcept { return t == 144 || t == 145 || t == 146; }
