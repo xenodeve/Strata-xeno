@@ -171,6 +171,7 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # MTP tools ran with when Gyro was validated.  Pinned at the commit the fork's served Gyro-M engine was built against.
 AGENTION_LLAMA_COMMIT = "dc255f2a4b6e4211b555b0c05260b2523281f314"   # 2026-10-07
 AGENTION_LLAMA_ZIP = f"https://github.com/agentionai/llama.cpp/archive/{AGENTION_LLAMA_COMMIT}.zip"
+AGENTION_GGML = f"agentionai/llama.cpp@{AGENTION_LLAMA_COMMIT[:7]}"   # the Gyro engine's BUILD.json "ggml" stamp
 # A Gyro model runs its own compiled engine (no ready-made engine has the trellis types), in its own folder, so the
 # other models keep theirs (engine/) and an update of one never rebuilds the other with the wrong ggml.
 GYRO_ENGINE_DIR = "engine-gyro"
@@ -252,7 +253,7 @@ MODELS = {
     "M": {"about": "Gyro-M (TQ2_0 trellis experts): quality close to IQ3_S with 40% fewer bytes of experts, about "
                    "IQ3_S's speed",
           "download_gb": 92.0, "ram_gb": 48, "arena_gb": 29.9, "families": ("gyro",),
-          "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "nvidia_only": True, "low_ram": False,
+          "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "low_ram": False,
           "recommended": True},
     # Gyro-S: supported by agentionai's rc2 code (validated by agentionai on Linux, RTX 5090 / 3090); on this fork it
     # has the MSVC unroll and AVX-VNNI of the CPU trellis kernel, not Gyro-M's TQ2_T-only decode tuning (#220), and it
@@ -262,7 +263,7 @@ MODELS = {
     "S": {"about": "Gyro-S (TQ1_0: TQK6 / TQK7 trellis experts): quality on par with IQ2_XS with 24% less memory "
                    "(agentionai's numbers); not speed-tuned on this fork like Gyro-M (RAM estimated)",
           "download_gb": 58.5, "ram_gb": 32, "arena_gb": 24.0,
-          "families": ("gyro",), "file": "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "nvidia_only": True,
+          "families": ("gyro",), "file": "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1,
           "low_ram": False},
 }
 # xeno: the Gyro files at the pinned revision: name -> (bytes, sha256), from the Hub's LFS pointers
@@ -346,7 +347,7 @@ FAMILIES = {
              "file": "Qwen3.8-Flash-Next-Gyro-{q}.gguf", "shards": 1, "tag": "gyro-",
              "mmproj_hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"),
              "mmproj": "mmproj-F16.gguf", "name": "qwen3.8-flash-next-gyro",
-             "vision": False, "pack_args": ["--compat-bf16"], "sha256": GYRO_FILES, "engine": "gyro",
+             "vision": False, "pack_args": ["--compat-bf16"], "sha256": GYRO_FILES, "smaller": "Gyro-S, --model S",
              "recommended": "Gyro-M"},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
@@ -1172,6 +1173,12 @@ def engine_runs_on(g, toolkit=13, gyro=False) -> bool:
     return int(g["arch"]) in archs or (ptx and int(g["arch"]) > max(archs))
 
 
+def config_engine_runs_on(g, tk, gyro) -> bool:
+    """engine_runs_on for a config's engine: engine-gyro/ (xeno), else engine/ or engine-cuda12/ by its toolkit.  The
+    one-argument call stays for the common case (tests stand it in with a one-argument function)."""
+    return engine_runs_on(g, tk, True) if gyro else engine_runs_on(g) if tk == 13 else engine_runs_on(g, tk)
+
+
 def start_gpus(text):
     """--gpus when starting an installed model: NVIDIA cards as nvidia-smi numbers them, or on a PC whose AMD cards
     are the ones Strata can use, AMD cards as setup lists them ("all": every supported AMD card)."""
@@ -1376,8 +1383,7 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
         say(f"  {split_short_note(g)}.")
     tk = config_toolkit(cfg)
     gyro = config_gyro(cfg)                            # xeno: a Gyro config's engine is engine-gyro/
-    missing = [g for g in pair if not (engine_runs_on(g, tk, True) if gyro else
-                                       engine_runs_on(g) if tk == 13 else engine_runs_on(g, tk))]
+    missing = [g for g in pair if not config_engine_runs_on(g, tk, gyro)]
     if missing:
         say("  The installed engine has no code for " + ", ".join(g["name"] for g in missing) + ": to use them "
             "together, run START-HERE.bat --setup --gpus " + ",".join(str(g["index"]) for g in pair))
@@ -1815,6 +1821,12 @@ def get_llama_cpp(agention=False):
     z.unlink(missing_ok=True)
     z.with_name(z.name + ".done").unlink(missing_ok=True)
     return llama
+
+
+def llama_tree(gyro=False) -> Path:
+    """The llama.cpp tree an engine builds against: agentionai's for the Gyro engine (xeno), else the pinned one.  The
+    no-argument call stays for the common case (tests stand get_llama_cpp in with a no-argument function)."""
+    return get_llama_cpp(agention=True) if gyro else get_llama_cpp()
 
 
 def req_name(line: str) -> str:
@@ -3147,8 +3159,7 @@ def update_gyro_engine() -> None:
     if not (eng / EXE).exists():
         return
     meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
-    want = f"agentionai/llama.cpp@{AGENTION_LLAMA_COMMIT[:7]}"
-    if meta.get("src") == source_hash(ENGINE_SOURCES) and meta.get("ggml") == want:
+    if meta.get("src") == source_hash(ENGINE_SOURCES) and meta.get("ggml") == AGENTION_GGML:
         return
     try:                                               # a running engine cannot be replaced (Windows keeps it locked)
         with open(eng / EXE, "r+b"):
@@ -3161,7 +3172,7 @@ def update_gyro_engine() -> None:
         if gpu is None:
             raise RuntimeError("no NVIDIA GPU found")
         gpu = {**gpu, "archs": sorted({int(gpu["arch"]), *(int(x) for x in meta.get("archs", []))})}
-        build_engine(gpu, meta.get("vision") or "none", False, get_llama_cpp(agention=True), toolkit=13, gyro=True)
+        build_engine(gpu, meta.get("vision") or "none", False, llama_tree(True), toolkit=13, gyro=True)
     except (Exception, SystemExit) as e:
         warn(f"could not compile the updated Gyro engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
              "starting the installed one")
@@ -3494,7 +3505,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None, gyro=False) -> Path:
     # same; the compile keeps the generations it was built for
     new_arch = local and not set(archs) <= built
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
-    ggml = f"agentionai/llama.cpp@{AGENTION_LLAMA_COMMIT[:7]}" if gyro else None   # xeno: the tree it was built with
+    ggml = AGENTION_GGML if gyro else None             # xeno: the tree it was built with
     engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and \
         (meta.get("isa_floor") or "") == floor and meta.get("ggml") == ggml
     vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
@@ -3505,8 +3516,8 @@ def build_engine(gpu, vision, yes, llama, toolkit=None, gyro=False) -> Path:
         archs = sorted(built | set(archs))
     nvcc, vcvars = install_build_tools({**gpu, "archs": archs, "toolkit": toolkit}, yes)
     cuda_archs = ";".join(str(x) for x in archs)
-    bdir, vdir = (ROOT / "build-cuda12", ROOT / "build-vision-cuda12") if t12 else \
-        (ROOT / "build-gyro", ROOT / "build-vision") if gyro else (ROOT / "build", ROOT / "build-vision")
+    flavor = "-cuda12" if t12 else "-gyro" if gyro else ""   # the build folders' and .bat names' suffix
+    bdir, vdir = ROOT / ("build" + flavor), ROOT / ("build-vision" + ("-cuda12" if t12 else ""))
     if not engine_ok:
         say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) + " (a card it had no code for; "
             "10-20 minutes, once) ..." if new_arch else
@@ -3517,7 +3528,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None, gyro=False) -> Path:
                      f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}",
                      *host_compiler_defs(True), *engine_defs(archs, toolkit),
                      *isa_floor_defs(floor, bdir, meta)],
-                    vcvars, "build-strata-cuda12.bat" if t12 else "build-strata-gyro.bat" if gyro else "build-strata.bat")
+                    vcvars, f"build-strata{flavor}.bat")
         shutil.copy2(bdir / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
@@ -3763,8 +3774,9 @@ def confirm_paging(model, ram, choice, yes, explicit_model=False):
     already made."""
     need_gb, arena = MODELS[model]["ram_gb"], MODELS[model]["arena_gb"]
     off = choice == "off"
-    # xeno: a Gyro size has no low-RAM mode, and its smaller size is Gyro-S
-    smaller = "Gyro-S, --model S" if MODELS[model].get("families") == ("gyro",) else "Q2_0 or IQ2_XS"
+    # the family's own smaller size where it names one (xeno: Gyro-S), else the original's two smallest
+    fams = MODELS[model].get("families", ("qwen", "swift"))
+    smaller = FAMILIES.get(fams[0], {}).get("smaller", "Q2_0 or IQ2_XS")
     confirm_risk(f"{model} needs about {need_gb} GB of RAM and this PC has {ram:.0f} GB: its experts alone are "
                  f"{arena:.0f} GB and must stay in RAM, so Windows/Linux will page part of them from disk. Expect it "
                  f"to be much slower, and it may not start at all.\n       A smaller size ({smaller}) fits; more "
@@ -4757,8 +4769,7 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
         if gyro:
             fail("the Gyro engine is CUDA 13 only: a Pascal / Volta card cannot run this model", "docs/GYRO.md")
         return use_cuda12(cards, cfg_path, cfg, yes)
-    missing = [g for g in cards if not (engine_runs_on(g, tk, True) if gyro else
-                                        engine_runs_on(g) if tk == 13 else engine_runs_on(g, tk))]
+    missing = [g for g in cards if not config_engine_runs_on(g, tk, gyro)]
     if not missing:
         return cfg
     eng = engine_dir(tk, gyro)
@@ -4770,10 +4781,7 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     main = gpu_info(cards[0]["index"])
     archs = sorted({int(x) for x in meta.get("archs", [])} | {int(g["arch"]) for g in cards})
     vision = meta.get("vision") or ("gpu" if (eng / VEXE).exists() else "none")
-    if gyro:
-        build_engine({**main, "archs": archs}, vision, yes, get_llama_cpp(agention=True), toolkit=tk, gyro=True)
-    else:
-        build_engine({**main, "archs": archs}, vision, yes, get_llama_cpp(), toolkit=tk)
+    build_engine({**main, "archs": archs}, vision, yes, llama_tree(gyro), toolkit=tk, **({"gyro": True} if gyro else {}))
     dirs = json.loads(info.read_text(encoding="utf-8")).get("cuda_dirs") or []
     cfg["lib_dirs"] = dirs + [d for d in cfg.get("lib_dirs") or [] if d not in dirs]
     write_config(cfg_path, cfg)
@@ -5325,7 +5333,7 @@ def main() -> int:
         rec = str(names.index("S") + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
-    if fam.get("engine") == "gyro":
+    if family == "gyro":
         # xeno: the Gyro engine is compiled here with agentionai's ggml (no ready-made engine has the trellis types);
         # setup builds it for NVIDIA with CUDA 13 only - AMD is experimental and Linux-only (tools/gyro_setup.sh)
         if hip:
@@ -5559,8 +5567,8 @@ def main() -> int:
 
     # ---- 4. the engine
     step(4, "the Strata engine")
-    gyro = fam.get("engine") == "gyro"
-    llama = get_llama_cpp(agention=True) if gyro else get_llama_cpp()
+    gyro = family == "gyro"
+    llama = llama_tree(gyro)
     ok(f"agentionai llama.cpp {AGENTION_LLAMA_COMMIT[:7]} (gguf-py, ggml with the trellis types)" if gyro else
        f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
     if gyro:                                           # xeno: compiled here, in engine-gyro/ (no ready-made one)

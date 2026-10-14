@@ -36,7 +36,7 @@ class Registry(unittest.TestCase):
     def test_family_and_sizes(self):
         fam = setup.FAMILIES["gyro"]
         self.assertEqual(fam["tag"], "gyro-")
-        self.assertEqual(fam["engine"], "gyro")
+        self.assertEqual(fam["smaller"], "Gyro-S, --model S")
         names = [m for m in setup.MODELS if "gyro" in setup.MODELS[m].get("families", ("qwen", "swift"))]
         self.assertEqual(sorted(names), ["M", "S"])
         # the names a pack, config and start script get, as tools/gyro_setup.sh and the hub use them
@@ -71,7 +71,6 @@ class Registry(unittest.TestCase):
             self.assertFalse(setup.low_ram_wanted(model, 24, "on"))
             self.assertFalse(setup.low_ram_fits(model, 24, 16))
             self.assertIs(setup.MODELS[model].get("vision", setup.FAMILIES["gyro"].get("vision")), False)
-            self.assertTrue(setup.MODELS[model].get("nvidia_only"))
 
     def test_both_sizes_are_regular_choices_m_first(self):
         """Gyro-S runs on agentionai's rc2 code like Gyro-M (only Gyro-M's TQ2_T decode tuning is not its): neither is
@@ -121,7 +120,7 @@ class EngineFolder(unittest.TestCase):
                 mock.patch.object(setup, "get_llama_cpp", lambda agention=False: Path("agention" if agention else "stock")), \
                 mock.patch.object(setup, "build_engine", lambda *a, **k: calls.append((a, k))):
             self._engine(Path(d), {"source": "local", "src": "old", "archs": [89],
-                                   "ggml": f"agentionai/llama.cpp@{setup.AGENTION_LLAMA_COMMIT[:7]}"})
+                                   "ggml": setup.AGENTION_GGML})
             quiet(setup.update_gyro_engine)
         self.assertEqual(len(calls), 1)
         args, kw = calls[0]
@@ -135,7 +134,7 @@ class EngineFolder(unittest.TestCase):
                 mock.patch.object(setup, "source_hash", lambda parts: "same"), \
                 mock.patch.object(setup, "build_engine", lambda *a, **k: calls.append((a, k))):
             self._engine(Path(d), {"source": "local", "src": "same",
-                                   "ggml": f"agentionai/llama.cpp@{setup.AGENTION_LLAMA_COMMIT[:7]}"})
+                                   "ggml": setup.AGENTION_GGML})
             quiet(setup.update_gyro_engine)
         self.assertEqual(calls, [])
 
@@ -164,7 +163,7 @@ class EngineFolder(unittest.TestCase):
                 mock.patch.object(setup, "cpu_info", lambda: (None, True)), \
                 mock.patch.object(setup, "cpu_floor", lambda avx2: ""):
             eng = self._engine(Path(d), {"source": "local", "src": "same", "vision_src": None, "archs": [120],
-                                         "ggml": f"agentionai/llama.cpp@{setup.AGENTION_LLAMA_COMMIT[:7]}"})
+                                         "ggml": setup.AGENTION_GGML})
             got, out = quiet(setup.build_engine, {"arch": "120"}, "none", True, Path("x"), toolkit=13, gyro=True)
             self.assertEqual(got, eng)
             self.assertIn("already built", out)
