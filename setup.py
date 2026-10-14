@@ -171,7 +171,7 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # MTP tools ran with when Gyro was validated.  Pinned at the commit the fork's served Gyro-M engine was built against.
 AGENTION_LLAMA_COMMIT = "dc255f2a4b6e4211b555b0c05260b2523281f314"   # 2026-10-07
 AGENTION_LLAMA_ZIP = f"https://github.com/agentionai/llama.cpp/archive/{AGENTION_LLAMA_COMMIT}.zip"
-AGENTION_GGML = f"agentionai/llama.cpp@{AGENTION_LLAMA_COMMIT[:7]}"   # the Gyro engine's BUILD.json "ggml" stamp
+AGENTION_GGML_STAMP = f"agentionai/llama.cpp@{AGENTION_LLAMA_COMMIT[:7]}"   # the Gyro engine's BUILD.json "ggml"
 # A Gyro model runs its own compiled engine (no ready-made engine has the trellis types), in its own folder, so the
 # other models keep theirs (engine/) and an update of one never rebuilds the other with the wrong ggml.
 GYRO_ENGINE_DIR = "engine-gyro"
@@ -247,22 +247,24 @@ MODELS = {
     # xeno: agentionai's Gyro (rotor / trellis quants, docs/GYRO.md): one GGUF each, about half of it the n-gram (PLE)
     # table read from the SSD.  The engine is compiled here with agentionai's ggml (GYRO_ENGINE_DIR); NVIDIA and CUDA 13
     # only in setup; no low-RAM mode and no images yet (both untested with the trellis types).
-    # Gyro-M: measured on this fork (RTX 5060 Ti + RTX 4070 SUPER, 48 GB RAM: private commit 43.5-45.4 GiB at 131-262K)
-    # RECOMMENDED (the developer's own tests, 2026-10-14): quality about ISTA-DASLab's IQ3_S with far fewer bytes of
-    # experts in memory (29.9 against 50.3 GB), and about IQ3_S's speed on the fork's PC
-    "M": {"about": "Gyro-M (TQ2_0 trellis experts): quality close to IQ3_S with 40% fewer bytes of experts, about "
-                   "IQ3_S's speed",
-          "download_gb": 92.0, "ram_gb": 48, "arena_gb": 29.9, "families": ("gyro",),
+    # arena_gb is decimal GB like every other size: docs/GYRO.md's 29.9 GiB (Gyro-M) and 24.0 GiB (Gyro-S) of experts
+    # Gyro-M: measured on this fork (RTX 5060 Ti + RTX 4070 SUPER, 48 GB RAM: private commit 43.5-46.2 GiB at 131-262K)
+    # RECOMMENDED (the developer's own tests, 2026-10-14): quality about ISTA-DASLab's IQ3_S with 36% fewer bytes of
+    # experts in memory (32.1 against 50.3 GB), and about IQ3_S's speed on the fork's PC
+    "M": {"about": "Gyro-M (TQ2_0 trellis experts): quality close to IQ3_S with 36% fewer bytes of experts, about "
+                   "IQ3_S's speed (the developer's tests)",
+          "download_gb": 92.0, "ram_gb": 48, "arena_gb": 32.1, "families": ("gyro",),
           "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "low_ram": False,
           "recommended": True},
     # Gyro-S: supported by agentionai's rc2 code (validated by agentionai on Linux, RTX 5090 / 3090); on this fork it
     # has the MSVC unroll and AVX-VNNI of the CPU trellis kernel, not Gyro-M's TQ2_T-only decode tuning (#220), and it
-    # has not been measured here: its RAM is estimated from its experts the way the Coder's is (23.4 GB -> 32 GB)
+    # has not been measured here: its RAM is estimated from its experts the way the Coder's is (23.4 GB -> 32 GB, so
+    # 25.8 GB -> 36 GB)
     # quality: agentionai's model card at the pinned revision - KLD 0.401 / top-1 75.29 % against ISTA-DASLab's IQ2_XS
     # 0.420 / 74.22 %, with 27.64 against 36.52 GiB of GPU-resident weights (24 % less)
-    "S": {"about": "Gyro-S (TQ1_0: TQK6 / TQK7 trellis experts): quality on par with IQ2_XS with 24% less memory "
-                   "(agentionai's numbers); not speed-tuned on this fork like Gyro-M (RAM estimated)",
-          "download_gb": 58.5, "ram_gb": 32, "arena_gb": 24.0,
+    "S": {"about": "Gyro-S (TQ1_0: TQK6 / TQK7 trellis experts): quality on par with IQ2_XS with 24% less GPU "
+                   "memory (agentionai's numbers); not speed-tuned on this fork like Gyro-M (RAM estimated)",
+          "download_gb": 58.5, "ram_gb": 36, "arena_gb": 25.8,
           "families": ("gyro",), "file": "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1,
           "low_ram": False},
 }
@@ -3159,7 +3161,7 @@ def update_gyro_engine() -> None:
     if not (eng / EXE).exists():
         return
     meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
-    if meta.get("src") == source_hash(ENGINE_SOURCES) and meta.get("ggml") == AGENTION_GGML:
+    if meta.get("src") == source_hash(ENGINE_SOURCES) and meta.get("ggml") == AGENTION_GGML_STAMP:
         return
     try:                                               # a running engine cannot be replaced (Windows keeps it locked)
         with open(eng / EXE, "r+b"):
@@ -3505,7 +3507,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None, gyro=False) -> Path:
     # same; the compile keeps the generations it was built for
     new_arch = local and not set(archs) <= built
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
-    ggml = AGENTION_GGML if gyro else None             # xeno: the tree it was built with
+    ggml = AGENTION_GGML_STAMP if gyro else None       # xeno: the tree it was built with
     engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and \
         (meta.get("isa_floor") or "") == floor and meta.get("ggml") == ggml
     vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
@@ -3516,8 +3518,8 @@ def build_engine(gpu, vision, yes, llama, toolkit=None, gyro=False) -> Path:
         archs = sorted(built | set(archs))
     nvcc, vcvars = install_build_tools({**gpu, "archs": archs, "toolkit": toolkit}, yes)
     cuda_archs = ";".join(str(x) for x in archs)
-    flavor = "-cuda12" if t12 else "-gyro" if gyro else ""   # the build folders' and .bat names' suffix
-    bdir, vdir = ROOT / ("build" + flavor), ROOT / ("build-vision" + ("-cuda12" if t12 else ""))
+    build_suffix = "-cuda12" if t12 else "-gyro" if gyro else ""   # the build folder's and its .bat's names
+    bdir, vdir = ROOT / ("build" + build_suffix), ROOT / ("build-vision" + ("-cuda12" if t12 else ""))
     if not engine_ok:
         say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) + " (a card it had no code for; "
             "10-20 minutes, once) ..." if new_arch else
@@ -3528,7 +3530,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None, gyro=False) -> Path:
                      f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}",
                      *host_compiler_defs(True), *engine_defs(archs, toolkit),
                      *isa_floor_defs(floor, bdir, meta)],
-                    vcvars, f"build-strata{flavor}.bat")
+                    vcvars, f"build-strata{build_suffix}.bat")
         shutil.copy2(bdir / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
@@ -5333,6 +5335,9 @@ def main() -> int:
         rec = str(names.index("S") + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
+    if family == "gyro" and a.low_ram not in ("auto", "off"):
+        warn(f"--low-ram {a.low_ram} does not apply to Gyro-{model}: the low-RAM mode is untested with the trellis "
+             "types, so its experts stay in RAM")
     if family == "gyro":
         # xeno: the Gyro engine is compiled here with agentionai's ggml (no ready-made engine has the trellis types);
         # setup builds it for NVIDIA with CUDA 13 only - AMD is experimental and Linux-only (tools/gyro_setup.sh)

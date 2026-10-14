@@ -120,7 +120,7 @@ class EngineFolder(unittest.TestCase):
                 mock.patch.object(setup, "get_llama_cpp", lambda agention=False: Path("agention" if agention else "stock")), \
                 mock.patch.object(setup, "build_engine", lambda *a, **k: calls.append((a, k))):
             self._engine(Path(d), {"source": "local", "src": "old", "archs": [89],
-                                   "ggml": setup.AGENTION_GGML})
+                                   "ggml": setup.AGENTION_GGML_STAMP})
             quiet(setup.update_gyro_engine)
         self.assertEqual(len(calls), 1)
         args, kw = calls[0]
@@ -134,7 +134,7 @@ class EngineFolder(unittest.TestCase):
                 mock.patch.object(setup, "source_hash", lambda parts: "same"), \
                 mock.patch.object(setup, "build_engine", lambda *a, **k: calls.append((a, k))):
             self._engine(Path(d), {"source": "local", "src": "same",
-                                   "ggml": setup.AGENTION_GGML})
+                                   "ggml": setup.AGENTION_GGML_STAMP})
             quiet(setup.update_gyro_engine)
         self.assertEqual(calls, [])
 
@@ -163,7 +163,7 @@ class EngineFolder(unittest.TestCase):
                 mock.patch.object(setup, "cpu_info", lambda: (None, True)), \
                 mock.patch.object(setup, "cpu_floor", lambda avx2: ""):
             eng = self._engine(Path(d), {"source": "local", "src": "same", "vision_src": None, "archs": [120],
-                                         "ggml": setup.AGENTION_GGML})
+                                         "ggml": setup.AGENTION_GGML_STAMP})
             got, out = quiet(setup.build_engine, {"arch": "120"}, "none", True, Path("x"), toolkit=13, gyro=True)
             self.assertEqual(got, eng)
             self.assertIn("already built", out)

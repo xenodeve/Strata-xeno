@@ -29,7 +29,7 @@ Or run `START-HERE.bat` and choose "Qwen3.8-Flash-Next (Gyro)" from the model li
 
 **Gyro-M is labelled recommended in setup.** By the developer's own tests on the fork's PC (2026-10-14), its quality is
 close to ISTA-DASLab's IQ3_S, which is larger where it counts: IQ3_S keeps 50.3 GB of experts in memory and asks for
-62 GB of RAM; Gyro-M keeps 29.9 GB and asks for 48. On disk Gyro-M's GGUF is the bigger file (92 against 83.6 GB),
+62 GB of RAM; Gyro-M keeps 32.1 GB (29.9 GiB, 36 % fewer bytes) and asks for 48. On disk Gyro-M's GGUF is the bigger file (92 against 83.6 GB),
 because about half of it is the n-gram table, which is read from the SSD. Its speed is about IQ3_S's. The
 comparison's runs are not recorded in this repository; no benchmark here backs the quality claim yet.
 
@@ -46,7 +46,7 @@ KL divergence and top-1 agreement against unsloth's Q8_0 on a held-out corpus of
 | **Gyro-M** | **34.98 GiB** | **0.291** | **78.75 %** |
 | ISTA-DASLab GSQ-RCO IQ3_XXS | 43.80 GiB | 0.311 | 77.68 % |
 
-- Gyro-S is slightly ahead of IQ2_XS with 24 % less memory.
+- Gyro-S is slightly ahead of IQ2_XS with 24 % less GPU memory.
 - Gyro-M is ahead of IQ3_XXS with 20 % less memory. The card has no IQ3_S row; the IQ3_S comparison above is the
   developer's own.
 - These numbers were not reproduced on the fork.
@@ -63,9 +63,9 @@ What setup does differently for Gyro:
   `--gguf-dir <folder>` uses a copy you already have.
 - **It writes the pack with `--compat-bf16`** to `packs/gyro-m` (or `gyro-s`), the config `strata-gyro-m.json` and
   the start script `run-gyro-m`.
-- **RAM:** Gyro-M asks for 48 GB. That is measured: the fork's PC runs it with a private commit of 43.5-46 GiB at
-  131-262K context. Gyro-S asks for 32 GB, an estimate from its experts (24 GiB, scaled the way the Coder's 23.4 GiB
-  are), and setup recommends it below 48 GB.
+- **RAM:** Gyro-M asks for 48 GB. That is measured: the fork's PC runs it with a private commit of 43.5-46.2 GiB at
+  131-262K context. Gyro-S asks for 36 GB, an estimate from its experts (25.8 GB, scaled the way the Coder's 23.4 GB
+  are: 32 GB of RAM), and setup recommends it below 48 GB.
 - **Speed work:** Gyro-S's TQK6 / TQK7 experts get the fork's CPU-kernel unroll and AVX-VNNI (#220). The TQ2_T-only
   decode tuning (one 8-byte window per four states, big-endian windows) is Gyro-M's. The tier and swap work (#229)
   applies to both.
