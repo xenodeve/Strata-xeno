@@ -66,6 +66,45 @@ Every run, the flags of each arm, draft acceptance and what was not measured:
 [bench/results/2026-10-04-speed-xeno-vs-upstream-0138](bench/results/2026-10-04-speed-xeno-vs-upstream-0138/README.md).
 Earlier comparisons and every lever tried: [docs/reports/](docs/reports/).
 
+### Gyro-M, the model the fork serves
+
+Measured on the same PC during development, 2026-10-13/14. Every arm was run with `--pool-priority 2
+--process-priority 2`, and both cards were in use.
+
+**Against agentionai's own Gyro port** (`rc2`, the code Gyro came from). Same session, both at 131K context, both with
+the second card: rc2 through its peer tier, the fork through its own 4070 tier. Greedy.
+
+| | agentionai rc2 | **Strata-xeno** | change |
+| --- | ---: | ---: | ---: |
+| 9,731-token prefix | 12.7 s | **6.4-6.8 s** | -48 % |
+| follow-up parts, 465-2,442 new tokens | 2.7-4.9 s | **1.0-2.0 s** | -59..-70 % |
+| 35,594-token prompt | 33.5-33.7 s | **19.4-19.5 s** | -42 % |
+| decode, 400 tokens | 48.5-50.9 tok/s | **51.0-52.6 tok/s** | +4 % (under the noise gate) |
+| 32-token replies | 46.8 tok/s | **54.7 tok/s** | +17 % |
+| RAM left free on the 48 GB PC | 1.3-2.4 GB | **14.9 GB** | |
+
+**Coding-agent turns since then** (five sessions, 23 turns from 1.3K to 57K tokens of prompt, 256 new tokens each,
+same-session ABBA, the served 262K config):
+
+| what changed | decode, median per arm | how |
+| --- | ---: | --- |
+| baseline after the rc2 merge, before the swaps below | 60.1 tok/s | #229 arm A |
+| the 4070 tier learns from use and swaps experts while serving (#229) | **65.1 tok/s** (x1.074 per turn, faster in 18 of 23) | #229 arm B; CPU share of the experts 11.8 -> 8.7 % |
+| later arms of the same config (2026-10-14) | **64.7-71.4 tok/s** | #220 |
+
+- **Prompt reading:** 1,400-2,600 tok/s for 4K-57K tokens (timeline of real Claude Code requests, #220).
+- **Where the experts ran:** 69-70 % on the RTX 5060 Ti, 21-22 % on the RTX 4070 SUPER, 8-9 % on the CPU. Draft
+  acceptance was 65-69 %.
+- **The fork's CPU kernel for Gyro-M's TQ2_T experts:** a one-token expert takes 410-428 µs on a P-core, down from 700,
+  with bit-exact outputs (#220). In the engine, the unroll with AVX-VNNI measured x1.063 on held-out agent turns
+  (56.0 -> 59.3 tok/s, faster in 9 of 10). The later kernel steps were bit-exact, but an ABBA could not separate them
+  from the noise.
+- **Measured and not shipped:** waking the CPU pool early, and re-laid-out hyper-connection kernels. The numbers are in
+  #220 and #227.
+
+Every Gyro number, with its method: [docs/GYRO.md](docs/GYRO.md) and the merge report
+[docs/reports/2026-10-13-merge-agention-rc2-gyro.md](docs/reports/2026-10-13-merge-agention-rc2-gyro.md).
+
 ## What it adds over upstream
 
 **Engine** (C++/CUDA):
