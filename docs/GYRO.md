@@ -21,12 +21,19 @@ Qwen3.8-Flash-Next models. It is not the GGUF draft file from the Gyro repositor
 ## Install with setup (Windows and Linux, NVIDIA)
 
 ```text
-START-HERE.bat --family gyro --model M        (Linux: ./setup.sh --family gyro --model M)
+START-HERE.bat --family gyro --model M        (Linux: ./setup.sh --family gyro --model M)   recommended
 START-HERE.bat --family gyro --model S        Gyro-S: smaller; recommended below 48 GB of RAM
 ```
 
-Or run `START-HERE.bat` and choose "Qwen3.8-Flash-Next (Gyro)" from the model list. What setup does differently for
-Gyro:
+Or run `START-HERE.bat` and choose "Qwen3.8-Flash-Next (Gyro)" from the model list.
+
+**Gyro-M is labelled recommended in setup.** By the developer's own tests on the fork's PC (2026-10-14), its quality is
+close to ISTA-DASLab's IQ3_S, which is larger where it counts: IQ3_S keeps 50.3 GB of experts in memory and asks for
+62 GB of RAM; Gyro-M keeps 29.9 GB and asks for 48. On disk Gyro-M's GGUF is the bigger file (92 against 83.6 GB),
+because about half of it is the n-gram table, which is read from the SSD. Its speed is about IQ3_S's. The
+comparison's runs are not recorded in this repository; no benchmark here backs the quality claim yet.
+
+What setup does differently for Gyro:
 - **It compiles the engine on this PC** (10-20 minutes, once). No ready-made engine has the trellis types. The build
   uses agentionai's llama.cpp fork as its GGML, pinned at `dc255f2a` (`AGENTION_LLAMA_COMMIT` in `setup.py`). Its
   ggml has the trellis types the prompt path reads through MMQ, and its gguf-py is what the pack and MTP tools use.

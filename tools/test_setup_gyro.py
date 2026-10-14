@@ -192,7 +192,7 @@ class Install(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def main(self, argv, ram=63.7, answers=None, model="M", amd=()):
+    def main(self, argv, ram=63.7, answers=None, model="M", amd=(), family=True):
         import types
         self.asked = []
 
@@ -253,7 +253,8 @@ class Install(unittest.TestCase):
             mock.patch.object(setup, "saved_calibration", lambda cfg: None),
             mock.patch.object(setup, "start", mock.Mock(side_effect=AssertionError("started"))),
             mock.patch.dict(sys.modules, {"gguf_reader": types.SimpleNamespace(GGUFFile=FakeGGUF)}),
-            mock.patch.object(sys, "argv", ["setup.py", "--family", "gyro", *(["--model", model] if model else []),
+            mock.patch.object(sys, "argv", ["setup.py", *(["--family", "gyro"] if family else []),
+                                            *(["--model", model] if model else []),
                                             *(["--yes"] if answers is None else []), "--no-start",
                                             "--models-dir", str(self.t / "models"), *argv]),
             mock.patch("builtins.input", fake_input),
@@ -302,6 +303,19 @@ class Install(unittest.TestCase):
             self.assertNotIn(flag, args)
         self.assertEqual(cfg["model_name"], "qwen3.8-flash-next-gyro-m")
         self.assertNotIn("vision", cfg)
+
+    def test_gyro_m_is_labelled_recommended(self):
+        """The developer's label (2026-10-14): Gyro-M's quality is close to ISTA's IQ3_S at a smaller size."""
+        self.assertTrue(setup.MODELS["M"].get("recommended"))
+        self.assertFalse(setup.MODELS["S"].get("recommended"))
+        self.assertEqual(setup.FAMILIES["gyro"].get("recommended"), "Gyro-M")
+        _, out, _ = self.main([], answers={"Context": "1", "Which model?": str(list(setup.FAMILIES).index("gyro") + 1)},
+                              model=None, family=False)
+        self.assertRegex(out, r"Qwen3\.8-Flash-Next \(Gyro\).*\[recommended: Gyro-M\]")
+        size_lines = [ln for ln in out.splitlines() if ln.strip().startswith(("1) M ", "2) S "))]
+        self.assertEqual(len(size_lines), 2, out)
+        self.assertTrue(size_lines[0].rstrip().endswith("[recommended]"))
+        self.assertNotIn("[recommended]", size_lines[1])
 
     def test_the_default_size_follows_the_ram(self):
         """Gyro-M from its measured 48 GB of RAM, Gyro-S below it."""

@@ -247,9 +247,13 @@ MODELS = {
     # table read from the SSD.  The engine is compiled here with agentionai's ggml (GYRO_ENGINE_DIR); NVIDIA and CUDA 13
     # only in setup; no low-RAM mode and no images yet (both untested with the trellis types).
     # Gyro-M: measured on this fork (RTX 5060 Ti + RTX 4070 SUPER, 48 GB RAM: private commit 43.5-45.4 GiB at 131-262K)
-    "M": {"about": "Gyro-M (TQ2_0 trellis experts), the measured Gyro size", "download_gb": 92.0, "ram_gb": 48,
-          "arena_gb": 29.9, "families": ("gyro",), "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1,
-          "nvidia_only": True, "low_ram": False},
+    # RECOMMENDED (the developer's own tests, 2026-10-14): quality about ISTA-DASLab's IQ3_S with far fewer bytes of
+    # experts in memory (29.9 against 50.3 GB), and about IQ3_S's speed on the fork's PC
+    "M": {"about": "Gyro-M (TQ2_0 trellis experts): quality close to IQ3_S with 40% fewer bytes of experts, about "
+                   "IQ3_S's speed",
+          "download_gb": 92.0, "ram_gb": 48, "arena_gb": 29.9, "families": ("gyro",),
+          "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "nvidia_only": True, "low_ram": False,
+          "recommended": True},
     # Gyro-S: supported by agentionai's rc2 code (validated by agentionai on Linux, RTX 5090 / 3090); on this fork it
     # has the MSVC unroll and AVX-VNNI of the CPU trellis kernel, not Gyro-M's TQ2_T-only decode tuning (#220), and it
     # has not been measured here: its RAM is estimated from its experts the way the Coder's is (23.4 GB -> 32 GB)
@@ -339,7 +343,8 @@ FAMILIES = {
              "file": "Qwen3.8-Flash-Next-Gyro-{q}.gguf", "shards": 1, "tag": "gyro-",
              "mmproj_hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"),
              "mmproj": "mmproj-F16.gguf", "name": "qwen3.8-flash-next-gyro",
-             "vision": False, "pack_args": ["--compat-bf16"], "sha256": GYRO_FILES, "engine": "gyro"},
+             "vision": False, "pack_args": ["--compat-bf16"], "sha256": GYRO_FILES, "engine": "gyro",
+             "recommended": "Gyro-M"},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -5282,6 +5287,7 @@ def main() -> int:
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
+                + (f"   [recommended: {d['recommended']}]" if d.get("recommended") else "")
                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
         family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)],
                               str(fams.index(rec_fam) + 1), a.yes)) - 1]
@@ -5309,7 +5315,8 @@ def main() -> int:
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu)) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the rest from the SSD)"))
-        say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
+        say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}"
+            + ("   [recommended]" if d.get("recommended") else ""))
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     if family == "gyro" and ram < MODELS["M"]["ram_gb"] and "S" in names:   # xeno: Gyro-S below Gyro-M's measured RAM
         rec = str(names.index("S") + 1)
