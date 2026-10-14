@@ -3754,13 +3754,15 @@ def confirm_paging(model, ram, choice, yes, explicit_model=False):
     already made."""
     need_gb, arena = MODELS[model]["ram_gb"], MODELS[model]["arena_gb"]
     off = choice == "off"
+    # xeno: a Gyro size has no low-RAM mode, and its smaller size is Gyro-S (experimental)
+    smaller = "Gyro-S, --model S (experimental)" if MODELS[model].get("families") == ("gyro",) else "Q2_0 or IQ2_XS"
     confirm_risk(f"{model} needs about {need_gb} GB of RAM and this PC has {ram:.0f} GB: its experts alone are "
                  f"{arena:.0f} GB and must stay in RAM, so Windows/Linux will page part of them from disk. Expect it "
-                 "to be much slower, and it may not start at all.\n       A smaller size (Q2_0 or IQ2_XS) fits; more "
+                 f"to be much slower, and it may not start at all.\n       A smaller size ({smaller}) fits; more "
                  "RAM fixes it.", off or explicit_model, yes,
                  f"{model} needs about {need_gb} GB of RAM; this PC has {ram:.0f} GB",
-                 "choose Q2_0 or IQ2_XS, or add RAM" + ("" if off else f"; or --model {model} --yes (or --low-ram off "
-                                                                        "--yes) to install it anyway"),
+                 f"choose {smaller}, or add RAM" + ("" if off else f"; or --model {model} --yes (or --low-ram off "
+                                                                    "--yes) to install it anyway"),
                  "  Install it anyway?", "y" if off else "n")
     warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose" + (" (--low-ram off)" if off else
                                                                           " (--model)" if explicit_model else ""))
@@ -5307,9 +5309,7 @@ def main() -> int:
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
-    rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
-    if family == "gyro" and ram < MODELS["M"]["ram_gb"] and "S" in names:   # xeno: Gyro-S below Gyro-M's measured RAM
-        rec = str(names.index("S") + 1)
+    rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"   # (Gyro: M; S is experimental)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
     if fam.get("engine") == "gyro":

@@ -170,5 +170,153 @@ class EngineFolder(unittest.TestCase):
                 quiet(setup.build_engine, {"arch": "120"}, "none", True, Path("x"), toolkit=12, gyro=True)
 
 
+class FakeGGUF:
+    """gguf_reader.GGUFFile: a Gyro file holds the experts and the PLE table in one shard."""
+    def __init__(self, path):
+        import types
+        self.tensors = [types.SimpleNamespace(name=n) for n in ("blk.0.ffn_up_exps.weight", "per_layer_token_embd.weight")]
+
+
+class Install(unittest.TestCase):
+    """setup.main() for --family gyro, every outside effect mocked (no download, no compile)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = Path(self.tmp.name)
+        (self.t / "data" / "mtp" / "rt").mkdir(parents=True)
+        (self.t / "data" / "mtp" / "rt" / "experts.bin").write_bytes(b"")
+        self.downloads, self.runs, self.verified, self.builds = [], [], [], []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def main(self, argv, ram=63.7, answers=None, model="M", amd=()):
+        import types
+        self.asked = []
+
+        def fake_input(prompt=""):
+            if answers is None:
+                raise AssertionError(f"asked {prompt!r}")
+            self.asked.append(prompt)
+            return next((v for k, v in answers.items() if k in prompt), "")
+
+        found = [{"index": 0, "name": "NVIDIA GeForce RTX 5070", "vram_gb": 11.9, "arch": "120", "driver": "580.97"}]
+
+        def fake_download(url, dst, what=None):
+            self.downloads.append(url)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"")
+            setup.mark(dst)
+
+        def fake_build(gpu, vision, yes, llama, toolkit=None, gyro=False):
+            self.builds.append({"llama": llama, "toolkit": toolkit, "gyro": gyro, "vision": vision})
+            eng = setup.engine_dir(toolkit or 13, gyro)
+            eng.mkdir(exist_ok=True)
+            (eng / setup.EXE).write_bytes(b"exe")
+            (eng / "BUILD.json").write_text(json.dumps({"source": "local", "version": "0.1.42", "archs": [120],
+                                                        "cuda_dirs": ["C:/cuda/bin"]}))
+            return eng
+
+        def fake_run(cmd, cwd=None, env=None, check=True, quiet=False):
+            self.runs.append(([str(x) for x in cmd], dict(env or {})))
+
+        def no_prebuilt(*a, **k):
+            raise AssertionError("a ready-made engine was fetched for Gyro")
+
+        patches = [
+            mock.patch.object(setup, "ROOT", self.t),
+            mock.patch.object(setup, "GPU_PICK", None),
+            mock.patch.object(setup, "data_folder", lambda d: (self.t / "data", [])),
+            mock.patch.object(setup, "installed_configs", lambda: []),
+            mock.patch.object(setup, "gpus", lambda: found),
+            mock.patch.object(setup, "amd_gpus", lambda *a: list(amd)),
+            mock.patch.object(setup, "ram_gb", lambda: ram),
+            mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, True)),
+            mock.patch.object(setup, "cpu_cores", lambda: None),
+            mock.patch.object(setup, "page_file_gb", lambda: 16.0),
+            mock.patch.object(setup, "free_gb", lambda p: 500.0),
+            mock.patch.object(setup, "rotational_disk", lambda p: None),
+            mock.patch.object(setup, "is_wsl", lambda: False),
+            mock.patch.object(setup, "pip_install", lambda *a, **k: None),
+            mock.patch.object(setup, "get_llama_cpp",
+                              lambda agention=False: self.t / ("llama.cpp-agention" if agention else "llama.cpp")),
+            mock.patch.object(setup, "get_prebuilt", no_prebuilt),
+            mock.patch.object(setup, "build_engine", fake_build),
+            mock.patch.object(setup, "download", fake_download),
+            mock.patch.object(setup, "check_shards", lambda shards: None),
+            mock.patch.object(setup, "verify_sha256", lambda s, size, sha: self.verified.append((s.name, size, sha))),
+            mock.patch.object(setup, "run", fake_run),
+            mock.patch.object(setup, "refresh_draft_vocab", lambda *a, **k: None),
+            mock.patch.object(setup, "write_run_script", lambda tag, cfg, port, *_: self.t / f"start-{tag}.bat"),
+            mock.patch.object(setup, "saved_calibration", lambda cfg: None),
+            mock.patch.object(setup, "start", mock.Mock(side_effect=AssertionError("started"))),
+            mock.patch.dict(sys.modules, {"gguf_reader": types.SimpleNamespace(GGUFFile=FakeGGUF)}),
+            mock.patch.object(sys, "argv", ["setup.py", "--family", "gyro", *(["--model", model] if model else []),
+                                            *(["--yes"] if answers is None else []), "--no-start",
+                                            "--models-dir", str(self.t / "models"), *argv]),
+            mock.patch("builtins.input", fake_input),
+        ]
+        with contextlib.ExitStack() as st:
+            for p in patches:
+                st.enter_context(p)
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    code = setup.main()
+            except SystemExit as e:                    # setup stopped (fail): its exit code
+                code = e.code
+            out = buf.getvalue()
+        cfg = self.t / f"strata-gyro-{(model or 'm').lower()}.json"
+        return code, out, (json.loads(cfg.read_text()) if cfg.exists() else None)
+
+    def test_install_gyro_m(self):
+        code, out, cfg = self.main(["--context", "65536"])
+        self.assertEqual(code, 0, out)
+        # one GGUF from the pinned revision, its size and SHA-256 checked; no image encoder
+        self.assertEqual(self.downloads, [setup.FAMILIES["gyro"]["hf"] + M_FILE])
+        self.assertEqual(self.verified, [(M_FILE, *setup.GYRO_FILES[M_FILE])])
+        # the engine compiled with agentionai's tree into engine-gyro/ (no ready-made engine)
+        self.assertEqual(len(self.builds), 1)
+        self.assertTrue(self.builds[0]["gyro"])
+        self.assertEqual(self.builds[0]["llama"].name, "llama.cpp-agention")
+        self.assertEqual(self.builds[0]["vision"], "none")
+        self.assertEqual(Path(cfg["exe"]).parent.name, "engine-gyro")
+        self.assertTrue(setup.config_gyro(cfg))
+        self.assertEqual(cfg["lib_dirs"], ["C:/cuda/bin"])
+        # the pack with --compat-bf16, through agentionai's gguf-py
+        packs = [(c, e) for c, e in self.runs if c[1].endswith("iq_pack.py")]
+        self.assertEqual(len(packs), 1, self.runs)
+        cmd, env = packs[0]
+        self.assertIn("--compat-bf16", cmd)
+        self.assertNotIn("--experts-bin", cmd)
+        self.assertTrue(cmd[cmd.index("--gguf") + 1].endswith(M_FILE))
+        self.assertTrue(cmd[cmd.index("--out") + 1].replace("\\", "/").endswith("packs/gyro-m"))
+        self.assertTrue(env["STRATA_GGUF_PY"].replace("\\", "/").endswith("llama.cpp-agention/gguf-py"))
+        # the config: the same file as --native and --ple-gguf, no low-RAM flags, no images
+        args = cfg["args"]
+        self.assertTrue(args[args.index("--native") + 1].endswith(M_FILE))
+        self.assertEqual(args[args.index("--ple-gguf") + 1], args[args.index("--native") + 1])
+        for flag in ("--mmap-experts", "--resident-experts", "--vision", "--resident-budget-gib"):
+            self.assertNotIn(flag, args)
+        self.assertEqual(cfg["model_name"], "qwen3.8-flash-next-gyro-m")
+        self.assertNotIn("vision", cfg)
+
+    def test_the_default_size_is_m_even_below_its_ram(self):
+        """Gyro-S is experimental: never the recommended answer, also on a 32 GB PC (a deliberate --model S)."""
+        code, _, _ = self.main([], ram=32.0, answers={"Context": "1"}, model=None)
+        size_q = [q for q in self.asked if q.startswith("Which size?")]
+        self.assertEqual(size_q, ["Which size? [1]: "])           # 1 = M (S sorts last as experimental)
+        self.assertNotEqual(code, 0)                              # M on 32 GB: the paging question, "no" by default
+
+    def test_amd_is_refused_before_any_download(self):
+        amd = [{"index": 0, "name": "AMD Radeon RX 9070 XT", "vram_gb": 16.0, "arch": "gfx1201", "count": 1}]
+        with mock.patch.object(setup, "amd_problem", lambda g: None):
+            code, out, cfg = self.main(["--backend", "hip"], amd=amd)
+        self.assertNotEqual(code, 0)
+        self.assertIn("needs an NVIDIA GPU in setup", out)
+        self.assertEqual(self.downloads, [])
+        self.assertIsNone(cfg)
+
+
 if __name__ == "__main__":
     unittest.main()
