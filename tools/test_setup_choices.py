@@ -122,7 +122,7 @@ class GgufDirUnsupported(unittest.TestCase):
         self.assertEqual(msg, "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf is UD-IQ3_XXS, a GGUF Strata "
                               "cannot run")
         self.assertIn("ISTA-DASLab's GSQ-RCO files", hint)
-        self.assertIn("Unsloth's UD-Q4_K_XL and UD-IQ4_XS only", hint)
+        self.assertIn("Unsloth's UD-Q4_K_XL and UD-IQ4_XS, and agentionai's Gyro-S / Gyro-M", hint)
 
     def test_a_folder_without_the_choice_names_what_is_there(self):
         gsq = ["Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-%05d-of-00002.gguf" % i for i in (1, 2)]

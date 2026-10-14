@@ -20,7 +20,7 @@ What the first run does (each step is skipped when it is already done):
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.bat / run-<model>.sh and starts the model
 
-Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768, --rope-scaling none|linear|yarn
+Options: --family qwen|swift|coder|unsloth|gyro, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S (gyro: M|S), --context 32768, --rope-scaling none|linear|yarn
 (--rope-scale F; past the trained 262144 the setup adds yarn and the factor is the final context over 262144,
 at least 1 - an explicit --rope-scaling none is refused for such a context), --vision yes|no|gpu|cpu, --port
 8080, --yes (recommended
@@ -68,6 +68,7 @@ HF_REVISIONS = {
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "b22d729eae29b5796f76fb70f91aef549b9fc52c",   # 2026-09-24
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
+    "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "8fa6f45c64be05fc7e629749dcb6660e7d7acb0f",           # 2026-10-13
 }
 
 
@@ -165,6 +166,15 @@ def ms_meta(repo: str, path: str):
 HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
+# xeno: the Gyro family (agentionai's trellis quants, docs/GYRO.md) needs agentionai's llama.cpp fork: its ggml has the
+# trellis types (TQ2_T / TQK6 / TQK7) the engine's prompt path reads through MMQ, and its gguf-py is what the pack and
+# MTP tools ran with when Gyro was validated.  Pinned at the commit the fork's served Gyro-M engine was built against.
+AGENTION_LLAMA_COMMIT = "dc255f2a4b6e4211b555b0c05260b2523281f314"   # 2026-10-07
+AGENTION_LLAMA_ZIP = f"https://github.com/agentionai/llama.cpp/archive/{AGENTION_LLAMA_COMMIT}.zip"
+AGENTION_GGML_STAMP = f"agentionai/llama.cpp@{AGENTION_LLAMA_COMMIT[:7]}"   # the Gyro engine's BUILD.json "ggml"
+# A Gyro model runs its own compiled engine (no ready-made engine has the trellis types), in its own folder, so the
+# other models keep theirs (engine/) and an update of one never rebuilds the other with the wrong ggml.
+GYRO_ENGINE_DIR = "engine-gyro"
 
 # The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
 # by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
@@ -234,6 +244,36 @@ MODELS = {
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "engine": (0, 1, 38),
                   "vision": True},
+    # xeno: agentionai's Gyro (rotor / trellis quants, docs/GYRO.md): one GGUF each, about half of it the n-gram (PLE)
+    # table read from the SSD.  The engine is compiled here with agentionai's ggml (GYRO_ENGINE_DIR); NVIDIA and CUDA 13
+    # only in setup; no low-RAM mode and no images yet (both untested with the trellis types).
+    # arena_gb is decimal GB like every other size: docs/GYRO.md's 29.9 GiB (Gyro-M) and 24.0 GiB (Gyro-S) of experts
+    # Gyro-M: measured on this fork (RTX 5060 Ti + RTX 4070 SUPER, 48 GB RAM: private commit 43.5-46.2 GiB at 131-262K)
+    # RECOMMENDED (the developer's own tests, 2026-10-14): quality about ISTA-DASLab's IQ3_S with 36% fewer bytes of
+    # experts in memory (32.1 against 50.3 GB), and about IQ3_S's speed on the fork's PC
+    "M": {"about": "Gyro-M (TQ2_0 trellis experts): quality close to IQ3_S with 36% fewer bytes of experts, about "
+                   "IQ3_S's speed (the developer's tests)",
+          "download_gb": 92.0, "ram_gb": 48, "arena_gb": 32.1, "families": ("gyro",),
+          "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "low_ram": False,
+          "recommended": True},
+    # Gyro-S: supported by agentionai's rc2 code (validated by agentionai on Linux, RTX 5090 / 3090); on this fork it
+    # has the MSVC unroll and AVX-VNNI of the CPU trellis kernel, not Gyro-M's TQ2_T-only decode tuning (#220), and it
+    # has not been measured here: its RAM is estimated from its experts the way the Coder's is (23.4 GB -> 32 GB, so
+    # 25.8 GB -> 36 GB)
+    # quality: agentionai's model card at the pinned revision - KLD 0.401 / top-1 75.29 % against ISTA-DASLab's IQ2_XS
+    # 0.420 / 74.22 %, with 27.64 against 36.52 GiB of GPU-resident weights (24 % less)
+    "S": {"about": "Gyro-S (TQ1_0: TQK6 / TQK7 trellis experts): quality on par with IQ2_XS with 24% less GPU "
+                   "memory (agentionai's numbers); not speed-tuned on this fork like Gyro-M (RAM estimated)",
+          "download_gb": 58.5, "ram_gb": 36, "arena_gb": 25.8,
+          "families": ("gyro",), "file": "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1,
+          "low_ram": False},
+}
+# xeno: the Gyro files at the pinned revision: name -> (bytes, sha256), from the Hub's LFS pointers
+GYRO_FILES = {
+    "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf":
+        (91965774272, "7aa36d15131d255179ab6c87fa9c9f81a0b541fc9e81e959d4c3e29eb20feb5f"),
+    "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf":
+        (58487015808, "c6ea1b08ca312f99095b27588ba35976b53f948268e7f91e7761926aa01d9c87"),
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -301,6 +341,16 @@ FAMILIES = {
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": False, "pack_args": ["--compat-bf16"],
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
+    # xeno: agentionai's Gyro quants of the original model (docs/GYRO.md); the sizes are MODELS "M" and "S"
+    "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "by": "agentionai's rotor (trellis) quantizations",
+             "about": "Gyro-M: a 92 GB download, ~48 GB of RAM (Gyro-S: 58.5 GB, ~32 GB); NVIDIA only, the engine "
+                      "is compiled on this PC (10-20 minutes, once)",
+             "hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"),
+             "file": "Qwen3.8-Flash-Next-Gyro-{q}.gguf", "shards": 1, "tag": "gyro-",
+             "mmproj_hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"),
+             "mmproj": "mmproj-F16.gguf", "name": "qwen3.8-flash-next-gyro",
+             "vision": False, "pack_args": ["--compat-bf16"], "sha256": GYRO_FILES, "smaller": "Gyro-S, --model S",
+             "recommended": "Gyro-M"},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -985,9 +1035,17 @@ def cuda_choice(archs, cuda=None):
     return 13, None
 
 
-def engine_dir(toolkit=13) -> Path:
-    """The folder of the engine a model runs: engine/ (CUDA 13, or HIP), engine-cuda12/ (the experimental one)."""
+def engine_dir(toolkit=13, gyro=False) -> Path:
+    """The folder of the engine a model runs: engine/ (CUDA 13, or HIP), engine-cuda12/ (the experimental one),
+    engine-gyro/ (xeno: a Gyro model's engine, compiled with agentionai's ggml)."""
+    if gyro:
+        return ROOT / GYRO_ENGINE_DIR
     return ROOT / (ENGINE12_DIR if int(toolkit) == 12 else "engine")
+
+
+def config_gyro(cfg: dict) -> bool:
+    """xeno: a model config that runs the Gyro engine (its exe is in engine-gyro/)."""
+    return Path(str(cfg.get("exe", ""))).parent.name == GYRO_ENGINE_DIR
 
 
 def config_toolkit(cfg: dict) -> int:
@@ -1090,9 +1148,9 @@ def check_gpus(sel, found, what="", yes=False, named=False) -> None:
         fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} {what}cannot be used: {p}", hint)
 
 
-def engine_archs(toolkit=13):
+def engine_archs(toolkit=13, gyro=False):
     """The GPU generations the installed engine has code for: (archs, ptx), or None when there is none."""
-    info = engine_dir(toolkit) / "BUILD.json"
+    info = engine_dir(toolkit, gyro) / "BUILD.json"
     try:
         meta = json.loads(info.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1109,12 +1167,18 @@ def engine_archs_hip():
     return [str(x) for x in meta.get("archs", [])] if meta.get("backend") == "hip" else None
 
 
-def engine_runs_on(g, toolkit=13) -> bool:
-    ea = engine_archs(toolkit)
+def engine_runs_on(g, toolkit=13, gyro=False) -> bool:
+    ea = engine_archs(toolkit, gyro)
     if ea is None or not ea[0]:
         return True
     archs, ptx = ea
     return int(g["arch"]) in archs or (ptx and int(g["arch"]) > max(archs))
+
+
+def config_engine_runs_on(g, tk, gyro) -> bool:
+    """engine_runs_on for a config's engine: engine-gyro/ (xeno), else engine/ or engine-cuda12/ by its toolkit.  The
+    one-argument call stays for the common case (tests stand it in with a one-argument function)."""
+    return engine_runs_on(g, tk, True) if gyro else engine_runs_on(g) if tk == 13 else engine_runs_on(g, tk)
 
 
 def start_gpus(text):
@@ -1320,7 +1384,8 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
     for g in short:
         say(f"  {split_short_note(g)}.")
     tk = config_toolkit(cfg)
-    missing = [g for g in pair if not (engine_runs_on(g) if tk == 13 else engine_runs_on(g, tk))]
+    gyro = config_gyro(cfg)                            # xeno: a Gyro config's engine is engine-gyro/
+    missing = [g for g in pair if not config_engine_runs_on(g, tk, gyro)]
     if missing:
         say("  The installed engine has no code for " + ", ".join(g["name"] for g in missing) + ": to use them "
             "together, run START-HERE.bat --setup --gpus " + ",".join(str(g["index"]) for g in pair))
@@ -1581,7 +1646,8 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
 SUPPORTED_GGUFS = ("Strata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
-                   "1.5's; the Coder's IQ1_M) and Unsloth's UD-Q4_K_XL and UD-IQ4_XS only: other GGUFs (Unsloth's "
+                   "1.5's; the Coder's IQ1_M), Unsloth's UD-Q4_K_XL and UD-IQ4_XS, and agentionai's Gyro-S / Gyro-M "
+                   "(--family gyro --model S|M) only: other GGUFs (Unsloth's "
                    "UD-IQ3_XXS or "
                    "UD-Q2_K_XL, K-quants) cannot be used")
 
@@ -1716,13 +1782,15 @@ def check_shards(shards):
                  f"delete {s.name} and its .done mark and run setup again")
 
 
-def get_llama_cpp():
-    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
-    llama = ROOT / "third_party" / "llama.cpp"
+def get_llama_cpp(agention=False):
+    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git.
+    agention (xeno, the Gyro family): agentionai's fork at its pin, in its own folder (third_party/llama.cpp-agention)."""
+    llama = ROOT / "third_party" / ("llama.cpp-agention" if agention else "llama.cpp")
+    commit, url = (AGENTION_LLAMA_COMMIT, AGENTION_LLAMA_ZIP) if agention else (LLAMA_CPP_COMMIT, LLAMA_CPP_ZIP)
     if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
         return llama
-    z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
-    download(LLAMA_CPP_ZIP, z, "llama.cpp source")
+    z = ROOT / "third_party" / f"llama.cpp{'-agention' if agention else ''}-{commit[:7]}.zip"
+    download(url, z, "agentionai llama.cpp source" if agention else "llama.cpp source")
     tmp = ROOT / "third_party" / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
     try:
@@ -1755,6 +1823,12 @@ def get_llama_cpp():
     z.unlink(missing_ok=True)
     z.with_name(z.name + ".done").unlink(missing_ok=True)
     return llama
+
+
+def llama_tree(gyro=False) -> Path:
+    """The llama.cpp tree an engine builds against: agentionai's for the Gyro engine (xeno), else the pinned one.  The
+    no-argument call stays for the common case (tests stand get_llama_cpp in with a no-argument function)."""
+    return get_llama_cpp(agention=True) if gyro else get_llama_cpp()
 
 
 def req_name(line: str) -> str:
@@ -3080,6 +3154,32 @@ def update_engine_gpu(toolkit=13):
     return {**g, "count": len(found)}
 
 
+def update_gyro_engine() -> None:
+    """xeno: the Gyro engine (engine-gyro/, compiled here with agentionai's ggml) after a `git pull`: compiled again
+    when its source or its ggml pin changed, the way a compiled engine/ is.  A failed compile keeps the installed one."""
+    eng = engine_dir(gyro=True)
+    if not (eng / EXE).exists():
+        return
+    meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+    if meta.get("src") == source_hash(ENGINE_SOURCES) and meta.get("ggml") == AGENTION_GGML_STAMP:
+        return
+    try:                                               # a running engine cannot be replaced (Windows keeps it locked)
+        with open(eng / EXE, "r+b"):
+            pass
+    except OSError:
+        warn("the Gyro engine is in use: close the model window and run this again to update it")
+        return
+    try:
+        gpu = update_engine_gpu(13)
+        if gpu is None:
+            raise RuntimeError("no NVIDIA GPU found")
+        gpu = {**gpu, "archs": sorted({int(gpu["arch"]), *(int(x) for x in meta.get("archs", []))})}
+        build_engine(gpu, meta.get("vision") or "none", False, llama_tree(True), toolkit=13, gyro=True)
+    except (Exception, SystemExit) as e:
+        warn(f"could not compile the updated Gyro engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
+             "starting the installed one")
+
+
 def update_installed_engine(url_base, toolkit=None) -> None:
     """An installed ready-made engine older than MIN_ENGINE is replaced before the model starts, so a plain
     START-HERE.bat on an existing install picks up a new release.  If that cannot happen (no internet, the model
@@ -3089,6 +3189,8 @@ def update_installed_engine(url_base, toolkit=None) -> None:
         update_installed_engine(url_base, 13)
         if (engine_dir(12) / "BUILD.json").exists():
             update_installed_engine(url_base, 12)
+        if (engine_dir(gyro=True) / "BUILD.json").exists():
+            update_gyro_engine()
         return
     eng = engine_dir(toolkit)
     info = eng / "BUILD.json"
@@ -3382,7 +3484,7 @@ def prebuilt_vision(meta: dict, gpu: dict, vision: str) -> str:
     return vision
 
 
-def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
+def build_engine(gpu, vision, yes, llama, toolkit=None, gyro=False) -> Path:
     """Compile the engine (and, for images, the encoder) for this GPU; the results go to engine/.  A compiled
     engine whose source files changed since (a `git pull`) is compiled again: only the changed files, a few minutes.
     toolkit 12 (default: 12 for a card older than CUDA 13 supports): the experimental CUDA 12 engine, in
@@ -3390,7 +3492,9 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     if toolkit is None:
         toolkit = 12 if min(int(x) for x in gpu.get("archs", [gpu["arch"]])) < CUDA13_MIN_ARCH else 13
     t12 = int(toolkit) == 12
-    eng = engine_dir(toolkit)
+    if gyro and t12:
+        fail("the Gyro engine is CUDA 13 only in setup (RTX 20 or newer)", "docs/GYRO.md")
+    eng = engine_dir(toolkit, gyro)
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
     meta = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
@@ -3403,8 +3507,9 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     # same; the compile keeps the generations it was built for
     new_arch = local and not set(archs) <= built
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
+    ggml = AGENTION_GGML_STAMP if gyro else None       # xeno: the tree it was built with
     engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and \
-        (meta.get("isa_floor") or "") == floor
+        (meta.get("isa_floor") or "") == floor and meta.get("ggml") == ggml
     vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
@@ -3413,7 +3518,8 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
         archs = sorted(built | set(archs))
     nvcc, vcvars = install_build_tools({**gpu, "archs": archs, "toolkit": toolkit}, yes)
     cuda_archs = ";".join(str(x) for x in archs)
-    bdir, vdir = (ROOT / "build-cuda12", ROOT / "build-vision-cuda12") if t12 else (ROOT / "build", ROOT / "build-vision")
+    build_suffix = "-cuda12" if t12 else "-gyro" if gyro else ""   # the build folder's and its .bat's names
+    bdir, vdir = ROOT / ("build" + build_suffix), ROOT / ("build-vision" + ("-cuda12" if t12 else ""))
     if not engine_ok:
         say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) + " (a card it had no code for; "
             "10-20 minutes, once) ..." if new_arch else
@@ -3424,7 +3530,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
                      f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}",
                      *host_compiler_defs(True), *engine_defs(archs, toolkit),
                      *isa_floor_defs(floor, bdir, meta)],
-                    vcvars, "build-strata-cuda12.bat" if t12 else "build-strata.bat")
+                    vcvars, f"build-strata{build_suffix}.bat")
         shutil.copy2(bdir / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
@@ -3439,7 +3545,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
     dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
     stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs,
-                                 "vision": vision, **({"toolkit": 12} if t12 else {}),
+                                 "vision": vision, **({"toolkit": 12} if t12 else {}), **({"ggml": ggml} if ggml else {}),
                                  "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None,
                                  **({"isa_floor": floor} if floor else {})}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
@@ -3495,7 +3601,10 @@ def low_ram_resident(model, ram, vram_gb, ctx=32768, kv="int8") -> bool:
 
 
 def low_ram_fits(model, ram, vram_gb) -> bool:
-    """In the low-RAM mode: the experts the GPU does not hold fit the RAM left beside the rest (as file cache)."""
+    """In the low-RAM mode: the experts the GPU does not hold fit the RAM left beside the rest (as file cache).
+    False for a model without the mode (xeno: Gyro, "low_ram": False)."""
+    if MODELS[model].get("low_ram") is False:
+        return False
     arena = MODELS[model]["arena_gb"]
     return ram - 6 + max(0.0, vram_gb - 5) >= arena
 
@@ -3506,7 +3615,7 @@ def low_ram_wanted(model, ram, choice="auto") -> bool:
     it always reads part of its experts from the files, through its RAM budget.  Step 5 applies exactly this answer,
     and the launcher's preset diff asks it too - so a preset that says "auto" is compared with what auto decides,
     not with the word."""
-    if MODELS[model].get("budget"):
+    if MODELS[model].get("budget") or MODELS[model].get("low_ram") is False:   # xeno: Gyro has no low-RAM mode yet
         return False
     return choice in ("on", "resident", "mmap") or (choice == "auto" and low_ram_needed(model, ram))
 
@@ -3667,13 +3776,16 @@ def confirm_paging(model, ram, choice, yes, explicit_model=False):
     already made."""
     need_gb, arena = MODELS[model]["ram_gb"], MODELS[model]["arena_gb"]
     off = choice == "off"
+    # the family's own smaller size where it names one (xeno: Gyro-S), else the original's two smallest
+    fams = MODELS[model].get("families", ("qwen", "swift"))
+    smaller = FAMILIES.get(fams[0], {}).get("smaller", "Q2_0 or IQ2_XS")
     confirm_risk(f"{model} needs about {need_gb} GB of RAM and this PC has {ram:.0f} GB: its experts alone are "
                  f"{arena:.0f} GB and must stay in RAM, so Windows/Linux will page part of them from disk. Expect it "
-                 "to be much slower, and it may not start at all.\n       A smaller size (Q2_0 or IQ2_XS) fits; more "
+                 f"to be much slower, and it may not start at all.\n       A smaller size ({smaller}) fits; more "
                  "RAM fixes it.", off or explicit_model, yes,
                  f"{model} needs about {need_gb} GB of RAM; this PC has {ram:.0f} GB",
-                 "choose Q2_0 or IQ2_XS, or add RAM" + ("" if off else f"; or --model {model} --yes (or --low-ram off "
-                                                                        "--yes) to install it anyway"),
+                 f"choose {smaller}, or add RAM" + ("" if off else f"; or --model {model} --yes (or --low-ram off "
+                                                                    "--yes) to install it anyway"),
                  "  Install it anyway?", "y" if off else "n")
     warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose" + (" (--low-ram off)" if off else
                                                                           " (--model)" if explicit_model else ""))
@@ -4654,12 +4766,15 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     card gets the engine compiled for all of them, before the start.  A Pascal / Volta card added to a model on the
     CUDA 13 engine moves the model to the experimental CUDA 12 engine (CUDA 13 has no code for it)."""
     tk = config_toolkit(cfg)
+    gyro = config_gyro(cfg)                            # xeno: engine-gyro/, CUDA 13 only
     if tk == 13 and any(int(g["arch"]) < CUDA13_MIN_ARCH for g in cards):
+        if gyro:
+            fail("the Gyro engine is CUDA 13 only: a Pascal / Volta card cannot run this model", "docs/GYRO.md")
         return use_cuda12(cards, cfg_path, cfg, yes)
-    missing = [g for g in cards if not (engine_runs_on(g) if tk == 13 else engine_runs_on(g, tk))]
+    missing = [g for g in cards if not config_engine_runs_on(g, tk, gyro)]
     if not missing:
         return cfg
-    eng = engine_dir(tk)
+    eng = engine_dir(tk, gyro)
     info = eng / "BUILD.json"
     meta = json.loads(info.read_text(encoding="utf-8"))
     say()
@@ -4668,7 +4783,7 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     main = gpu_info(cards[0]["index"])
     archs = sorted({int(x) for x in meta.get("archs", [])} | {int(g["arch"]) for g in cards})
     vision = meta.get("vision") or ("gpu" if (eng / VEXE).exists() else "none")
-    build_engine({**main, "archs": archs}, vision, yes, get_llama_cpp(), toolkit=tk)
+    build_engine({**main, "archs": archs}, vision, yes, llama_tree(gyro), toolkit=tk, **({"gyro": True} if gyro else {}))
     dirs = json.loads(info.read_text(encoding="utf-8")).get("cuda_dirs") or []
     cfg["lib_dirs"] = dirs + [d for d in cfg.get("lib_dirs") or [] if d not in dirs]
     write_config(cfg_path, cfg)
@@ -4795,7 +4910,8 @@ def sycl_setup(argv) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
+    ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, "
+                    "gyro = agentionai's Gyro (--model M or S)")
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
@@ -5184,6 +5300,7 @@ def main() -> int:
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
+                + (f"   [recommended: {d['recommended']}]" if d.get("recommended") else "")
                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
         family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)],
                               str(fams.index(rec_fam) + 1), a.yes)) - 1]
@@ -5211,10 +5328,24 @@ def main() -> int:
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu)) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the rest from the SSD)"))
-        say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
+        say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}"
+            + ("   [recommended]" if d.get("recommended") else ""))
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
+    if family == "gyro" and ram < MODELS["M"]["ram_gb"] and "S" in names:   # xeno: Gyro-S below Gyro-M's measured RAM
+        rec = str(names.index("S") + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
+    if family == "gyro" and a.low_ram not in ("auto", "off"):
+        warn(f"--low-ram {a.low_ram} does not apply to Gyro-{model}: the low-RAM mode is untested with the trellis "
+             "types, so its experts stay in RAM")
+    if family == "gyro":
+        # xeno: the Gyro engine is compiled here with agentionai's ggml (no ready-made engine has the trellis types);
+        # setup builds it for NVIDIA with CUDA 13 only - AMD is experimental and Linux-only (tools/gyro_setup.sh)
+        if hip:
+            fail(f"Gyro-{model} needs an NVIDIA GPU in setup", "AMD (experimental, Linux): tools/gyro_setup.sh "
+                 "--backend hip (docs/GYRO.md)")
+        if cuda_tk == 12:
+            fail(f"Gyro-{model} needs the CUDA 13 engine (RTX 20 or newer)", "docs/GYRO.md")
     if MODELS[model].get("budget"):
         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
         # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode had no layer split) unless
@@ -5441,9 +5572,13 @@ def main() -> int:
 
     # ---- 4. the engine
     step(4, "the Strata engine")
-    llama = get_llama_cpp()
-    ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-    if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
+    gyro = family == "gyro"
+    llama = llama_tree(gyro)
+    ok(f"agentionai llama.cpp {AGENTION_LLAMA_COMMIT[:7]} (gguf-py, ggml with the trellis types)" if gyro else
+       f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
+    if gyro:                                           # xeno: compiled here, in engine-gyro/ (no ready-made one)
+        eng = build_engine(gpu, vision, a.yes, llama, toolkit=cuda_tk, gyro=True)
+    elif hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
         eng = None if a.build else get_prebuilt_hip(a.prebuilt, gpu)
         if eng is None:
             fail("no ready-made AMD engine for this Strata version" + (" (--build)" if a.build else ""),
@@ -5454,7 +5589,7 @@ def main() -> int:
     else:
         eng = None if a.build or hip else get_prebuilt(a.prebuilt, gpu, vision, **({"toolkit": 12} if cuda_tk == 12
                                                                                     else {}))
-    if eng is not None and not hip and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
+    if eng is not None and not hip and not gyro and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
         pip_cuda_libs(cuda_tk)
         if vision != "none" and not (eng / VEXE).exists():
             warn("the ready-made engine has no image encoder: compiling it")

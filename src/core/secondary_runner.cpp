@@ -4,6 +4,7 @@
 #include "strata/core/secondary_budget.hpp"
 #include "strata/core/secondary_vram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/timeline.hpp"
 #include "strata/timeline_gpu.hpp"
@@ -137,6 +138,10 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     stream_ = stream;
     done_ = done;
     std::memset(host_meta_, 0, meta_bytes_);
+    if (kernels::cpu::hadamard_spec().any()) {   // APR: device 1's copies of the sign vectors (device 1 is current)
+        device_sx_ = kernels::hadamard_device_signs(kernels::cpu::hadamard_signs(n_embd), n_embd);
+        device_sh_ = kernels::hadamard_device_signs(kernels::cpu::hadamard_signs(n_ff), n_ff);
+    }
     if (profile_timing_) {
         for (void*& raw : timing_events_) {
             cudaEvent_t event = nullptr;
@@ -237,9 +242,14 @@ void SecondaryRunner::stop_launcher() {
     async_ = false;
 }
 
-bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
+bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout_in, const SecondaryArena& weights,
                                  const float* x, const int32_t* selected_slots, int n_tokens, int k,
                                  std::string& err) {
+    // APR (prism.hadamard): a folded down projection rotates h with this device's sign vector; a folded gate/up
+    // takes H (s * x), rotated below in device_x_ (this runner's private copy) before it is quantized
+    kernels::NativeExpertLayout layout = layout_in;
+    if (layout.had_block > 0) layout.d_signs = device_sh_;
+    const int gu_block = layout.had_gu_block;
     if (stream_ == nullptr || pending_ || failed_ || x == nullptr || selected_slots == nullptr ||
         n_tokens <= 0 || n_tokens > max_tokens_ || k <= 0 || k > max_entries_ / n_tokens ||
         layout.n_embd != n_embd_ || layout.n_ff != n_ff_ || !kernels::iq_supported(layout.gu_type) ||
@@ -321,7 +331,9 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
     if (graph_ && !profile_timing_) {
         const size_t rows = selected_rows_.size();
         // a captured graph bakes in the layer's formats: one table of graphs per (gate/up, down) pair
-        const int fmt_key = layout.gu_type << 8 | layout.d_type;
+        // (APR: and whether the layer is folded, which can differ between layers of the same formats)
+        const int fmt_key = layout.gu_type << 8 | layout.d_type | (gu_block > 0 ? 1 << 20 : 0) |
+                            (layout.had_block > 0 ? 1 << 21 : 0);
         const size_t per = (size_t) (max_tokens_ + 1) * (size_t) (max_entries_ + 1);
         size_t fi = 0;
         while (fi < graph_fmts_.size() && graph_fmts_[fi] != fmt_key) ++fi;
@@ -342,6 +354,7 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
             cudaMemcpyAsync(device_ptr_, host_meta_, meta_bytes_, cudaMemcpyHostToDevice, stream);
             cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float), cudaMemcpyHostToDevice,
                             stream);
+            if (gu_block > 0) kernels::hadamard_rows(device_x_, device_x_, n_tokens, n_embd_, gu_block, device_sx_, stream);
             if (q2) kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
             else kernels::quantize_q8_1_rows(device_x_, n_tokens, n_embd_, device_xq_, stream);
             kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
@@ -361,10 +374,20 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
             }
             graph_k_[gi] = k;
         }
+        const auto gl0 = std::chrono::steady_clock::now();
         if (!cuda_ok(cudaGraphLaunch((cudaGraphExec_t) ge, stream), "runner graph launch", err)) return fail_enqueued();
+        const auto gl1 = std::chrono::steady_clock::now();
         tl_close();
         if (!cuda_ok(cudaEventRecord((cudaEvent_t) done_, stream), "runner completion event", err))
             return fail_enqueued();
+        if (timeline::enabled()) {   // #220: where the launch's host time goes (the device restore follows, unstamped)
+            const auto gl2 = std::chrono::steady_clock::now();
+            timeline::complete("4070 l plan", launch_t0, switch_t0, n_tokens, (int64_t) rows);
+            timeline::complete("4070 l device", switch_t0, now, n_tokens);
+            timeline::complete("4070 l lookup", now, gl0, n_tokens);
+            timeline::complete("4070 l graph launch", gl0, gl1, n_tokens);
+            timeline::complete("4070 l event", gl1, gl2, n_tokens);
+        }
         // #10 item 1 STRATA_SECONDARY_POKE=1: hand the batch to the 4070 now (WDDM may hold it until finish() asks)
         static const bool poke = [] { const char* v = std::getenv("STRATA_SECONDARY_POKE"); return v && v[0] == '1'; }();
         if (poke) (void) cudaStreamQuery(stream);
@@ -381,6 +404,7 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout, cons
         !cuda_ok(cudaMemcpyAsync(device_x_, host_x_, (size_t) n_tokens * n_embd_ * sizeof(float),
                                  cudaMemcpyHostToDevice, stream), "runner activation H2D", err) ||
         !mark(1) || !mark(2)) return fail_enqueued();   // no clear: the down kernel writes every claimed row
+    if (gu_block > 0) kernels::hadamard_rows(device_x_, device_x_, n_tokens, n_embd_, gu_block, device_sx_, stream);
     if (q2) kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
     else kernels::quantize_q8_1_rows(device_x_, n_tokens, n_embd_, device_xq_, stream);
     if (!mark(3)) return fail_enqueued();
@@ -528,6 +552,18 @@ bool SecondaryRunner::start_monitor(int interval_ms, std::string& err,
                     }
                 }
                 record_free(lower);
+                if (!safe && breach_warn_) {   // xeno #208: others grew into free memory; keep serving
+                    static auto last = std::chrono::steady_clock::time_point{};
+                    const auto now = std::chrono::steady_clock::now();
+                    if (last == std::chrono::steady_clock::time_point{} || now - last >= std::chrono::seconds(60)) {
+                        last = now;
+                        std::fprintf(stderr, "strata: secondary display VRAM below the free floor (%s; %.0f MiB free) - "
+                                             "--secondary-breach warn: the engine keeps serving (#208)\n",
+                                     problem.c_str(), (double) lower / 1048576.0);
+                    }
+                    ++free_checks_;
+                    continue;
+                }
                 if (!safe) {
                     if (on_breach != nullptr) {
                         on_breach(problem.c_str(), context);
