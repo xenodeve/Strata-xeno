@@ -18,7 +18,9 @@ answers. The fork changes:
 - how the experts are spread over the GPUs and RAM;
 - how prompts are read across two cards;
 - what the server does for Claude Code;
-- the web app.
+- the web app;
+- **the models:** it also runs [agentionai's Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)
+  quants, and **Gyro-M is the recommended model for a 48 GB PC** ([below](#gyro-recommended-on-48-gb)).
 
 Every speed figure below is measured on the fork's own PC, with the conditions next to it.
 
@@ -79,6 +81,9 @@ Earlier comparisons and every lever tried: [docs/reports/](docs/reports/).
   - checkpoints written off the critical path;
   - a CPU pool that rests between rounds;
   - AVX-VNNI CPU kernels for Q2_0 experts.
+- **Gyro support** (agentionai's trellis quants, merged from agentionai's `rc2`): the TQ2_T / TQK6 / TQK7 experts and
+  their Hadamard rotation on the GPUs and the CPU, with the fork's own CPU kernel work for Gyro-M (one-token expert
+  700 -> 410-428 µs on a P-core, bit-exact), and setup installs Gyro-M and Gyro-S ([docs/GYRO.md](docs/GYRO.md)).
 - **Capacity mode** for models larger than RAM: a bounded RAM cache with the NVMe behind it.
 - **Thai in the draft vocabulary,** so Thai answers are drafted ahead too.
 
@@ -106,7 +111,7 @@ The full list, each item with its code and tests: [the website's register](https
 
 The fork is developed and measured on **NVIDIA, Windows 11, two cards**. Upstream's requirements are the floor:
 - an RTX 20-50 series card with 12 GB of VRAM or more;
-- 48 GB of RAM for IQ2_XS;
+- 48 GB of RAM for IQ2_XS or **Gyro-M (recommended on 48 GB)**;
 - about 80 GB of free disk on an SSD.
 
 Full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
@@ -151,15 +156,25 @@ measured profile is in the [benchmark's matrix](bench/results/2026-10-04-speed-x
 (arm `d2x`).
 
 Models, sizes and what fits in how much RAM are upstream's ([docs/MODELS.md](docs/MODELS.md)), with one family
-added: **agentionai's Gyro** (`START-HERE.bat --family gyro --model M`, or `S`). For Gyro, setup compiles a second
-engine with agentionai's llama.cpp, in `engine-gyro/`.
+added: **agentionai's Gyro**.
+
+### Gyro: recommended on 48 GB
+
+```text
+START-HERE.bat --build --family gyro --model M        (Linux: ./setup.sh --build --family gyro --model M)
+```
+
+**On a PC with 48 GB of RAM, Gyro-M is the recommended model.** It asks for 48 GB of RAM, measured on the fork's PC
+(private commit 43.5-46.2 GiB at 131-262K context). Setup shows it as `[recommended]`. For Gyro, setup compiles a second
+engine with agentionai's llama.cpp, in `engine-gyro/` (NVIDIA, CUDA 13).
 - **Gyro-M is labelled recommended.** By the developer's own tests its quality is close to ISTA's IQ3_S, at about
   IQ3_S's speed, with 36 % fewer bytes of experts (32.1 against 50.3 GB). It is what the fork serves daily (60-71
   tokens/s on agent turns, two cards).
 - **Gyro-S's quality is on par with ISTA's IQ2_XS** in 24 % less GPU memory (KLD 0.401 against 0.420 on
   [agentionai's model card](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)). It runs on the same code
-  (agentionai's rc2) without Gyro-M's TQ2_T tuning, and has not been measured here yet. The setup path has only been checked with its unit tests so far. Details:
-[docs/GYRO.md](docs/GYRO.md).
+  (agentionai's rc2) without Gyro-M's TQ2_T tuning, and has not been measured here yet. Setup asks for 36 GB of RAM
+  for it (an estimate) and recommends it below 48 GB.
+- The setup path has only been checked with its unit tests so far. Details: [docs/GYRO.md](docs/GYRO.md).
 
 ## Using it
 
@@ -209,6 +224,8 @@ Where to report a problem:
 support its author: [buymeacoffee.com/strataengine](https://buymeacoffee.com/strataengine).
 
 The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It is compressed by
-[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5) and Unsloth.
+[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5), Unsloth and
+[agentionai](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) (Gyro, with its
+[llama.cpp fork](https://github.com/agentionai/llama.cpp) and the Gyro port of Strata it maintains).
 Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). A few parts and every model carry
 their own licenses: [which ones](docs/HOW_IT_WORKS.md#license).
