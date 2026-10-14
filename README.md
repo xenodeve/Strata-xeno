@@ -150,7 +150,11 @@ Do not list both cards in the config's `gpu` field: that makes the server add `-
 measured profile is in the [benchmark's matrix](bench/results/2026-10-04-speed-xeno-vs-upstream-0138/matrix.json)
 (arm `d2x`).
 
-Models, sizes and what fits in how much RAM are unchanged from upstream: [docs/MODELS.md](docs/MODELS.md).
+Models, sizes and what fits in how much RAM are upstream's ([docs/MODELS.md](docs/MODELS.md)), with one family
+added: **agentionai's Gyro** (`START-HERE.bat --family gyro --model M`, or `S`). For Gyro, setup compiles a second
+engine with agentionai's llama.cpp, in `engine-gyro/`. Gyro-M is what the fork serves daily (60-71 tokens/s on
+agent turns, two cards). Gyro-S has not been run on the fork's PC. The setup path has only been checked with its
+unit tests so far. Details: [docs/GYRO.md](docs/GYRO.md).
 
 ## Using it
 
