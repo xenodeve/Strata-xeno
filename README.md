@@ -164,8 +164,8 @@ added: **agentionai's Gyro**.
 START-HERE.bat --build --family gyro --model M        (Linux: ./setup.sh --build --family gyro --model M)
 ```
 
-**On a PC with 48 GB of RAM, Gyro-M is the recommended model.** It asks for 48 GB of RAM, measured on the fork's PC
-(private commit 43.5-46.2 GiB at 131-262K context). Setup shows it as `[recommended]`. For Gyro, setup compiles a second
+**On a PC with 48 GB of RAM, Gyro-M is the recommended model.** It asks for 48 GB of RAM: the fork's 48 GB PC serves
+it daily at 262K context. Setup shows it as `[recommended]`. For Gyro, setup compiles a second
 engine with agentionai's llama.cpp, in `engine-gyro/` (NVIDIA, CUDA 13).
 - **Gyro-M is labelled recommended.** By the developer's own tests its quality is close to ISTA's IQ3_S, at about
   IQ3_S's speed, with 36 % fewer bytes of experts (32.1 against 50.3 GB). It is what the fork serves daily (60-71

@@ -248,7 +248,7 @@ MODELS = {
     # table read from the SSD.  The engine is compiled here with agentionai's ggml (GYRO_ENGINE_DIR); NVIDIA and CUDA 13
     # only in setup; no low-RAM mode and no images yet (both untested with the trellis types).
     # arena_gb is decimal GB like every other size: docs/GYRO.md's 29.9 GiB (Gyro-M) and 24.0 GiB (Gyro-S) of experts
-    # Gyro-M: measured on this fork (RTX 5060 Ti + RTX 4070 SUPER, 48 GB RAM: private commit 43.5-46.2 GiB at 131-262K)
+    # Gyro-M: measured on this fork (RTX 5060 Ti + RTX 4070 SUPER, 48 GB RAM: served daily at 131-262K context)
     # RECOMMENDED (the developer's own tests, 2026-10-14): quality about ISTA-DASLab's IQ3_S with 36% fewer bytes of
     # experts in memory (32.1 against 50.3 GB), and about IQ3_S's speed on the fork's PC
     "M": {"about": "Gyro-M (TQ2_0 trellis experts): quality close to IQ3_S with 36% fewer bytes of experts, about "

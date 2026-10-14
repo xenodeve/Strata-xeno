@@ -63,8 +63,8 @@ What setup does differently for Gyro:
   `--gguf-dir <folder>` uses a copy you already have.
 - **It writes the pack with `--compat-bf16`** to `packs/gyro-m` (or `gyro-s`), the config `strata-gyro-m.json` and
   the start script `run-gyro-m`.
-- **RAM:** Gyro-M asks for 48 GB. That is measured: the fork's PC runs it with a private commit of 43.5-46.2 GiB at
-  131-262K context. Gyro-S asks for 36 GB, an estimate from its experts (25.8 GB, scaled the way the Coder's 23.4 GB
+- **RAM:** Gyro-M asks for 48 GB: the fork's 48 GB PC serves it daily at 131-262K context. What counts is the RAM in
+  use, not the commit: a commit above the physical RAM is fine as long as it stays under the commit limit. Gyro-S asks for 36 GB, an estimate from its experts (25.8 GB, scaled the way the Coder's 23.4 GB
   are: 32 GB of RAM), and setup recommends it below 48 GB.
 - **Speed work:** Gyro-S's TQK6 / TQK7 experts get the fork's CPU-kernel unroll and AVX-VNNI (#220). The TQ2_T-only
   decode tuning (one 8-byte window per four states, big-endian windows) is Gyro-M's. The tier and swap work (#229)
@@ -182,7 +182,7 @@ Coding-agent turns (`turns217.py`: five sessions, 23 turns from 1.3K to 57K toke
 | prompt read | 1,400-2,600 tok/s for 4K-57K tokens; shorter is slower (1.6K: 1,000, 0.6K: 430) | timeline `tl-s229e` |
 | where the experts ran | 5060 Ti 69-70 %, 4070 SUPER 21-22 %, CPU 8-9 % | ABBA STATS |
 | draft acceptance | 65-69 % | ABBA |
-| private commit | 43.5 GiB at 131K, 45.4-46.2 GiB at 262K | #217, the #229 soak |
+| RAM | served daily on the 48 GB PC at 262K context; the RAM in use itself is not recorded here yet | |
 
 The fork's own CPU kernels for TQ2_T (MSVC unroll + AVX-VNNI, one 8-byte window per four states, big-endian windows) are
 bit-exact against the reference decode (`tq_cpu_parity`). They took a one-token expert from 700 to 410-428 µs on a
