@@ -73,10 +73,12 @@ class Registry(unittest.TestCase):
             self.assertIs(setup.MODELS[model].get("vision", setup.FAMILIES["gyro"].get("vision")), False)
             self.assertTrue(setup.MODELS[model].get("nvidia_only"))
 
-    def test_s_is_experimental_and_sorts_after_m(self):
-        self.assertTrue(setup.MODELS["S"].get("experimental"))
+    def test_both_sizes_are_regular_choices_m_first(self):
+        """Gyro-S runs on agentionai's rc2 code like Gyro-M (only Gyro-M's TQ2_T decode tuning is not its): neither is
+        experimental, and the menu lists M first."""
+        self.assertFalse(setup.MODELS["S"].get("experimental"))
         self.assertFalse(setup.MODELS["M"].get("experimental"))
-        names = ["S", "M"]
+        names = [m for m in setup.MODELS if "gyro" in setup.MODELS[m].get("families", ("qwen", "swift"))]
         names.sort(key=lambda m: bool(setup.MODELS[m].get("experimental")))   # as main() orders a family's sizes
         self.assertEqual(names, ["M", "S"])
 
@@ -301,12 +303,13 @@ class Install(unittest.TestCase):
         self.assertEqual(cfg["model_name"], "qwen3.8-flash-next-gyro-m")
         self.assertNotIn("vision", cfg)
 
-    def test_the_default_size_is_m_even_below_its_ram(self):
-        """Gyro-S is experimental: never the recommended answer, also on a 32 GB PC (a deliberate --model S)."""
-        code, _, _ = self.main([], ram=32.0, answers={"Context": "1"}, model=None)
-        size_q = [q for q in self.asked if q.startswith("Which size?")]
-        self.assertEqual(size_q, ["Which size? [1]: "])           # 1 = M (S sorts last as experimental)
-        self.assertNotEqual(code, 0)                              # M on 32 GB: the paging question, "no" by default
+    def test_the_default_size_follows_the_ram(self):
+        """Gyro-M from its measured 48 GB of RAM, Gyro-S below it."""
+        self.main([], ram=32.0, answers={"Context": "1"}, model=None)
+        self.assertEqual([q for q in self.asked if q.startswith("Which size?")], ["Which size? [2]: "])   # 2 = S
+        self.asked = []
+        self.main([], ram=63.7, answers={"Context": "1"}, model=None)
+        self.assertEqual([q for q in self.asked if q.startswith("Which size?")], ["Which size? [1]: "])   # 1 = M
 
     def test_amd_is_refused_before_any_download(self):
         amd = [{"index": 0, "name": "AMD Radeon RX 9070 XT", "vram_gb": 16.0, "arch": "gfx1201", "count": 1}]

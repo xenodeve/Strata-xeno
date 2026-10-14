@@ -8,7 +8,7 @@ The targets are the published files of `agentionai/Qwen3.8-Flash-Next-Gyro-GGUF`
 
 | File | Experts | GPU memory for the experts | Status |
 |---|---|---:|---|
-| `Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf` (58.5 GB) | TQK6 gate/up, TQK7 down, block-128 Hadamard | 24.0 GiB | validated by agentionai (Linux, RTX 5090, RTX 3090); **not run on the fork's PC** |
+| `Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf` (58.5 GB) | TQK6 gate/up, TQK7 down, block-128 Hadamard | 24.0 GiB | supported by agentionai's rc2 code and validated by agentionai (Linux, RTX 5090, RTX 3090); on the fork it runs on the same code without Gyro-M's TQ2_T tuning, and has not been measured on the fork's PC yet |
 | `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf` (92.0 GB) | TQ2_T, block-128 Hadamard | 29.9 GiB | validated by agentionai (Linux, RTX 5090, RTX 3090); **served daily on the fork's PC** (Windows, two cards) since 2026-10-13 |
 
 Both files carry their own experts in the trellis types TQ2_T/TQK6/TQK7 and record the activation rotation in
@@ -22,7 +22,7 @@ Qwen3.8-Flash-Next models. It is not the GGUF draft file from the Gyro repositor
 
 ```text
 START-HERE.bat --family gyro --model M        (Linux: ./setup.sh --family gyro --model M)
-START-HERE.bat --family gyro --model S        Gyro-S: experimental on the fork, see below
+START-HERE.bat --family gyro --model S        Gyro-S: smaller; recommended below 48 GB of RAM
 ```
 
 Or run `START-HERE.bat` and choose "Qwen3.8-Flash-Next (Gyro)" from the model list. What setup does differently for
@@ -40,7 +40,10 @@ Gyro:
   the start script `run-gyro-m`.
 - **RAM:** Gyro-M asks for 48 GB. That is measured: the fork's PC runs it with a private commit of 43.5-46 GiB at
   131-262K context. Gyro-S asks for 32 GB, an estimate from its experts (24 GiB, scaled the way the Coder's 23.4 GiB
-  are). It has not been run on the fork.
+  are), and setup recommends it below 48 GB.
+- **Speed work:** Gyro-S's TQK6 / TQK7 experts get the fork's CPU-kernel unroll and AVX-VNNI (#220). The TQ2_T-only
+  decode tuning (one 8-byte window per four states, big-endian windows) is Gyro-M's. The tier and swap work (#229)
+  applies to both.
 
 Not offered by setup for Gyro yet:
 - **AMD.** Use `tools/gyro_setup.sh --backend hip` on Linux; it is experimental (below).

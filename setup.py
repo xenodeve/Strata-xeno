@@ -250,12 +250,13 @@ MODELS = {
     "M": {"about": "Gyro-M (TQ2_0 trellis experts), the measured Gyro size", "download_gb": 92.0, "ram_gb": 48,
           "arena_gb": 29.9, "families": ("gyro",), "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1,
           "nvidia_only": True, "low_ram": False},
-    # Gyro-S: validated by agentionai (Linux, RTX 5090 / 3090), not measured on this fork: its RAM is estimated from
-    # its experts the way the Coder's is (23.4 GB of experts -> 32 GB)
-    "S": {"about": "Gyro-S (TQ1_0 trellis experts), smaller and lower quality; EXPERIMENTAL here (RAM estimated, not "
-                   "measured on this fork)", "download_gb": 58.5, "ram_gb": 32, "arena_gb": 24.0,
+    # Gyro-S: supported by agentionai's rc2 code (validated by agentionai on Linux, RTX 5090 / 3090); on this fork it
+    # has the MSVC unroll and AVX-VNNI of the CPU trellis kernel, not Gyro-M's TQ2_T-only decode tuning (#220), and it
+    # has not been measured here: its RAM is estimated from its experts the way the Coder's is (23.4 GB -> 32 GB)
+    "S": {"about": "Gyro-S (TQ1_0: TQK6 / TQK7 trellis experts), smaller and lower quality; not speed-tuned on this "
+                   "fork like Gyro-M (RAM estimated)", "download_gb": 58.5, "ram_gb": 32, "arena_gb": 24.0,
           "families": ("gyro",), "file": "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "nvidia_only": True,
-          "low_ram": False, "experimental": True},
+          "low_ram": False},
 }
 # xeno: the Gyro files at the pinned revision: name -> (bytes, sha256), from the Hub's LFS pointers
 GYRO_FILES = {
@@ -332,8 +333,8 @@ FAMILIES = {
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
     # xeno: agentionai's Gyro quants of the original model (docs/GYRO.md); the sizes are MODELS "M" and "S"
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "by": "agentionai's rotor (trellis) quantizations",
-             "about": "Gyro-M: a 92 GB download, ~48 GB of RAM (Gyro-S: 58.5 GB, experimental); NVIDIA only, the "
-                      "engine is compiled on this PC (10-20 minutes, once)",
+             "about": "Gyro-M: a 92 GB download, ~48 GB of RAM (Gyro-S: 58.5 GB, ~32 GB); NVIDIA only, the engine "
+                      "is compiled on this PC (10-20 minutes, once)",
              "hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"),
              "file": "Qwen3.8-Flash-Next-Gyro-{q}.gguf", "shards": 1, "tag": "gyro-",
              "mmproj_hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"),
@@ -3754,8 +3755,8 @@ def confirm_paging(model, ram, choice, yes, explicit_model=False):
     already made."""
     need_gb, arena = MODELS[model]["ram_gb"], MODELS[model]["arena_gb"]
     off = choice == "off"
-    # xeno: a Gyro size has no low-RAM mode, and its smaller size is Gyro-S (experimental)
-    smaller = "Gyro-S, --model S (experimental)" if MODELS[model].get("families") == ("gyro",) else "Q2_0 or IQ2_XS"
+    # xeno: a Gyro size has no low-RAM mode, and its smaller size is Gyro-S
+    smaller = "Gyro-S, --model S" if MODELS[model].get("families") == ("gyro",) else "Q2_0 or IQ2_XS"
     confirm_risk(f"{model} needs about {need_gb} GB of RAM and this PC has {ram:.0f} GB: its experts alone are "
                  f"{arena:.0f} GB and must stay in RAM, so Windows/Linux will page part of them from disk. Expect it "
                  f"to be much slower, and it may not start at all.\n       A smaller size ({smaller}) fits; more "
@@ -5309,7 +5310,9 @@ def main() -> int:
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
-    rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"   # (Gyro: M; S is experimental)
+    rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
+    if family == "gyro" and ram < MODELS["M"]["ram_gb"] and "S" in names:   # xeno: Gyro-S below Gyro-M's measured RAM
+        rec = str(names.index("S") + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
     if fam.get("engine") == "gyro":
@@ -5320,9 +5323,6 @@ def main() -> int:
                  "--backend hip (docs/GYRO.md)")
         if cuda_tk == 12:
             fail(f"Gyro-{model} needs the CUDA 13 engine (RTX 20 or newer)", "docs/GYRO.md")
-        if MODELS[model].get("experimental"):
-            warn(f"Gyro-{model} is EXPERIMENTAL on this fork: agentionai validated it (Linux, RTX 5090 / 3090), "
-                 "its RAM here is an estimate (docs/GYRO.md)")
     if MODELS[model].get("budget"):
         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
         # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode had no layer split) unless
