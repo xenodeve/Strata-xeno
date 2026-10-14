@@ -33,6 +33,24 @@ close to ISTA-DASLab's IQ3_S, which is larger where it counts: IQ3_S keeps 50.3 
 because about half of it is the n-gram table, which is read from the SSD. Its speed is about IQ3_S's. The
 comparison's runs are not recorded in this repository; no benchmark here backs the quality claim yet.
 
+**Gyro-S's quality is on par with ISTA-DASLab's IQ2_XS in less memory.** The
+[model card](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) at the pinned revision (`8fa6f45c`, with
+the updated Gyro-S of 2026-10-10 and Gyro-M of 2026-10-11) gives these numbers. They are agentionai's measurements:
+KL divergence and top-1 agreement against unsloth's Q8_0 on a held-out corpus of 2026 technical writing and code
+(`-c 2048`, 60 chunks), with GPU memory as GPU-resident weights (the n-gram table stays on disk):
+
+| file | GPU memory | KLD (lower is better) | top-1 |
+|---|---:|---:|---:|
+| **Gyro-S** | **27.64 GiB** | **0.401** | **75.29 %** |
+| ISTA-DASLab GSQ-RCO IQ2_XS | 36.52 GiB | 0.420 | 74.22 % |
+| **Gyro-M** | **34.98 GiB** | **0.291** | **78.75 %** |
+| ISTA-DASLab GSQ-RCO IQ3_XXS | 43.80 GiB | 0.311 | 77.68 % |
+
+- Gyro-S is slightly ahead of IQ2_XS with 24 % less memory.
+- Gyro-M is ahead of IQ3_XXS with 20 % less memory. The card has no IQ3_S row; the IQ3_S comparison above is the
+  developer's own.
+- These numbers were not reproduced on the fork.
+
 What setup does differently for Gyro:
 - **It compiles the engine on this PC** (10-20 minutes, once). No ready-made engine has the trellis types. The build
   uses agentionai's llama.cpp fork as its GGML, pinned at `dc255f2a` (`AGENTION_LLAMA_COMMIT` in `setup.py`). Its

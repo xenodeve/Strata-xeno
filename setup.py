@@ -257,8 +257,11 @@ MODELS = {
     # Gyro-S: supported by agentionai's rc2 code (validated by agentionai on Linux, RTX 5090 / 3090); on this fork it
     # has the MSVC unroll and AVX-VNNI of the CPU trellis kernel, not Gyro-M's TQ2_T-only decode tuning (#220), and it
     # has not been measured here: its RAM is estimated from its experts the way the Coder's is (23.4 GB -> 32 GB)
-    "S": {"about": "Gyro-S (TQ1_0: TQK6 / TQK7 trellis experts), smaller and lower quality; not speed-tuned on this "
-                   "fork like Gyro-M (RAM estimated)", "download_gb": 58.5, "ram_gb": 32, "arena_gb": 24.0,
+    # quality: agentionai's model card at the pinned revision - KLD 0.401 / top-1 75.29 % against ISTA-DASLab's IQ2_XS
+    # 0.420 / 74.22 %, with 27.64 against 36.52 GiB of GPU-resident weights (24 % less)
+    "S": {"about": "Gyro-S (TQ1_0: TQK6 / TQK7 trellis experts): quality on par with IQ2_XS with 24% less memory "
+                   "(agentionai's numbers); not speed-tuned on this fork like Gyro-M (RAM estimated)",
+          "download_gb": 58.5, "ram_gb": 32, "arena_gb": 24.0,
           "families": ("gyro",), "file": "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "nvidia_only": True,
           "low_ram": False},
 }

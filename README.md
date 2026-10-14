@@ -154,7 +154,8 @@ Models, sizes and what fits in how much RAM are upstream's ([docs/MODELS.md](doc
 added: **agentionai's Gyro** (`START-HERE.bat --family gyro --model M`, or `S`). For Gyro, setup compiles a second
 engine with agentionai's llama.cpp, in `engine-gyro/`. **Gyro-M is labelled recommended**: by the developer's own
 tests its quality is close to ISTA's IQ3_S, which needs far more RAM (50.3 against 29.9 GB of experts), at about
-IQ3_S's speed. It is what the fork serves daily (60-71
+IQ3_S's speed. Gyro-S's quality is on par with ISTA's IQ2_XS in 24 % less memory (KLD 0.401 against 0.420 on
+[agentionai's model card](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)). It is what the fork serves daily (60-71
 tokens/s on agent turns, two cards). Gyro-S runs on the same code (agentionai's rc2) without Gyro-M's TQ2_T tuning, and has not
 been measured here yet. The setup path has only been checked with its unit tests so far. Details:
 [docs/GYRO.md](docs/GYRO.md).

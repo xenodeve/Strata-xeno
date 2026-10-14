@@ -317,6 +317,10 @@ class Install(unittest.TestCase):
         self.assertTrue(size_lines[0].rstrip().endswith("[recommended]"))
         self.assertNotIn("[recommended]", size_lines[1])
 
+    def test_the_sizes_say_what_they_compare_with(self):
+        self.assertIn("IQ3_S", setup.MODELS["M"]["about"])     # the developer's tests
+        self.assertIn("IQ2_XS", setup.MODELS["S"]["about"])    # agentionai's model card (KLD, top-1)
+
     def test_the_default_size_follows_the_ram(self):
         """Gyro-M from its measured 48 GB of RAM, Gyro-S below it."""
         self.main([], ram=32.0, answers={"Context": "1"}, model=None)
