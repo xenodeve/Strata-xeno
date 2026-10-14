@@ -48,6 +48,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/platform/crash_report.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -512,6 +513,7 @@ struct Options {
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     int secondary_expert_mib = 0; ///< staging-only Phase 3 probe; 0 keeps the single-GPU path
     int secondary_free_floor_mib = 2560; ///< experimental free floor; default preserves old reserve
+    bool secondary_breach_warn = false;   ///< xeno #208: --secondary-breach warn - a breach of the floor is logged, not fatal
     int display_reserve_mib = 0;          ///< #208: one reserve for everything else on the 4070 (0 = off): the others'
                                           ///< use at start counts toward it, the rest stays free (>= the free floor)
     int pool_priority = 2;                ///< THREAD_PRIORITY_* for pool workers + host; 2 = HIGHEST (default, 0 = off)
@@ -977,6 +979,9 @@ void usage() {
                  "  --cache-cpu-only     Diagnostic: prefill normally, then route verify experts to CPU.\n"
                  "  --secondary-expert-mib N  Phase 3 expert tier on RTX 4070 SUPER (any native pack, #11);\n"
                  "  --secondary-free-floor-mib N  Experimental free floor on 4070; default 2560.\n"
+                 "  --secondary-breach end|warn  free VRAM on the 4070 below the floor: end the engine (default, #203) or\n"
+                 "                       log it and keep serving (xeno #208: with --display-reserve-mib the others own the\n"
+                 "                       reserve, so their growth into free memory is not the server's to answer)\n"
                  "  --display-reserve-mib N  #208: N MiB on the 4070 for everything else, counting what the others use at\n"
                  "                         start (e.g. 3277 = 3.2 GB); the tier takes the rest up to --secondary-expert-mib\n"
                  "                         (12288 = no cap), less the prompt split's buffers. 0 = off (default).\n"
@@ -2631,6 +2636,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--secondary-breach") {
+            const std::string v = next("--secondary-breach");
+            if (v != "end" && v != "warn") {
+                std::fprintf(stderr, "strata generate: --secondary-breach needs end or warn\n");
+                return 2;
+            }
+            o.secondary_breach_warn = v == "warn";
+        }
         else if (a == "--display-reserve-mib") {
             const std::string v = next("--display-reserve-mib");
             const auto parsed = std::from_chars(v.data(), v.data() + v.size(), o.display_reserve_mib);
@@ -3328,9 +3341,26 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --display-reserve-mib: %s\n", nerr.c_str());
             return 1;
         }
+        // xeno #208 (developer 2026-10-13: "others + free = the reserve; the server may use the rest"): the server's own
+        // VRAM on this card outside the engine - the vision encoder, which the server starts first, so NVML counts it
+        // among the others - is the server's, not the others'.  STRATA_DISPLAY_SERVER_MIB is what it holds at rest
+        // (taken off the others), STRATA_DISPLAY_SERVER_GROWTH_MIB what it adds while it works (kept free for it).
+        auto env_mib = [](const char* k) -> uint64_t {
+            const char* v = std::getenv(k);
+            return v != nullptr && std::atoll(v) > 0 ? (uint64_t) std::atoll(v) << 20 : 0;
+        };
+        const uint64_t server_rest = env_mib("STRATA_DISPLAY_SERVER_MIB"), server_growth = env_mib("STRATA_DISPLAY_SERVER_GROWTH_MIB");
+        const uint64_t others_measured = display_others;
+        display_others = display_others > server_rest ? display_others - server_rest : 0;
         display_floor = strata::core::display_free_floor((uint64_t) o.display_reserve_mib << 20, display_others,
-                                                         (uint64_t) o.secondary_free_floor_mib << 20);
-        if (display_floor == (uint64_t) o.secondary_free_floor_mib << 20)
+                                                         (uint64_t) o.secondary_free_floor_mib << 20) + server_growth;
+        if (server_rest > 0 || server_growth > 0)
+            std::fprintf(stderr, "strata generate: --display-reserve-mib %d: %.2f GiB in use on the 4070 before the engine, "
+                         "%.2f GiB of it the server's own (STRATA_DISPLAY_SERVER_MIB) -> others %.2f GiB; +%.2f GiB kept free "
+                         "for the server's growth (STRATA_DISPLAY_SERVER_GROWTH_MIB)\n", o.display_reserve_mib,
+                         (double) others_measured / 1073741824.0, (double) server_rest / 1073741824.0,
+                         (double) display_others / 1073741824.0, (double) server_growth / 1073741824.0);
+        if (display_floor - server_growth == (uint64_t) o.secondary_free_floor_mib << 20)
             std::fprintf(stderr, "strata generate: --display-reserve-mib %d: the others already use %.2f GiB, so the minimum "
                          "free floor (--secondary-free-floor-mib %d) sizes the tier instead\n", o.display_reserve_mib,
                          (double) display_others / 1073741824.0, o.secondary_free_floor_mib);
@@ -3470,6 +3500,28 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        // APR (prism.hadamard) packs: every expert path rotates its activations (CPU pool: native_quant_act / _h;
+        // GPU verify, remote GPUs, prompt FP16 path: hadamard_rows).  Validated end to end on CUDA (sm_86, sm_89 with
+        // a two-GPU layer split and peer decode, sm_120) and on HIP gfx1151.  Other HIP architectures run the same
+        // kernels but have not been run end to end with such a pack: said here, not refused (the P2P prompt peer
+        // says the same in Prefill::set_peer).  The former opt-in STRATA_APR is no longer read.
+        if (strata::kernels::cpu::hadamard_spec().any()) {
+            std::fprintf(stderr, "strata generate: APR pack: Hadamard-folded experts (block %d)\n",
+                         strata::kernels::cpu::hadamard_spec().block);
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+            int dev = 0;
+            cudaDeviceProp p{};
+            if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
+                std::string arch(p.gcnArchName);
+                if (const size_t colon = arch.find(':'); colon != std::string::npos) arch.resize(colon);
+                if (arch != "gfx1151")
+                    std::fprintf(stderr, "strata generate: warning: Hadamard-folded experts are validated end to end "
+                                         "on gfx1151 among AMD GPUs, not yet on %s\n", arch.c_str());
+            } else {
+                (void) cudaGetLastError();
+            }
+#endif
+        }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
@@ -3530,8 +3582,8 @@ int main(int argc, char** argv) {
     // committed or read; GPU tiers fill straight from the pack, and only the host-owned experts are committed and
     // loaded afterwards - so neither RAM nor the commit charge ever holds an expert a GPU owns, not even at boot.
     o.exclusive_secondary = o.exclusive_secondary_mode == 1 ||
-                            (o.exclusive_secondary_mode < 0 && o.secondary_expert_mib > 0 && !o.mmap_experts &&
-                             !(o.serve && o.adapt_secondary > 0));
+                            (o.exclusive_secondary_mode < 0 && o.secondary_expert_mib > 0 && !o.mmap_experts);
+    // (xeno #229: --serve with --adapt-secondary N keeps the tier exclusive and swaps it paired, see the serve adapt)
     const bool place_first = !o.mmap_experts && (o.exclusive_primary_experts || o.exclusive_secondary);
     if (o.ram_cache_gib > 0.0 && !place_first) {   // #11: never a silently ignored capacity flag
         std::fprintf(stderr, "strata generate: --ram-cache-gib needs placement-first (exclusive primary experts: a "
@@ -3569,9 +3621,15 @@ int main(int argc, char** argv) {
     // adaptive tiers: measured wins with no trade-off inside the mode that enables them (AGENTS.md default rule)
     if (o.adapt_swaps < 0) o.adapt_swaps = o.exclusive_primary_experts ? 8 : 96;
     if (o.adapt_every < 0) o.adapt_every = o.exclusive_primary_experts ? 1 : 4;
-    if (o.exclusive_secondary && (o.secondary_expert_mib <= 0 || o.mmap_experts || (o.serve && o.adapt_secondary > 0))) {
+    if (o.exclusive_secondary && (o.secondary_expert_mib <= 0 || o.mmap_experts)) {
         std::fprintf(stderr, "strata generate: --exclusive-secondary-experts needs --secondary-expert-mib and the "
-                             "arena expert source; under --serve its 4070 swaps are not paired yet (--adapt-secondary 0)\n");
+                             "arena expert source\n");
+        return 2;
+    }
+    // xeno #229: under --serve the exclusive 4070 tier's swaps ride the primary's paired adapt (stage 1 after its pick)
+    if (o.serve && o.exclusive_secondary && o.adapt_secondary > 0 && !(o.exclusive_primary_experts && o.adapt_swaps > 0)) {
+        std::fprintf(stderr, "strata generate: --adapt-secondary under --serve with the exclusive 4070 tier needs "
+                             "--exclusive-primary-experts and --adapt-swaps above 0 (its swaps follow the primary's)\n");
         return 2;
     }
     if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 && !(o.exclusive_secondary && o.serve) ? 8 : 0;
@@ -3588,7 +3646,10 @@ int main(int argc, char** argv) {
                          ? (strata::kernels::cpu::cpu_avx1_ok() && std::getenv("STRATA_NO_IQ128") == nullptr
                             ? "AVX1 128-bit (iq_avx1, the older-CPU build)"
                             : "ggml-cpu vec_dot (no AVX2: the older-CPU build)")
-                     : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+                     // xeno: name AVX-VNNI where the kernels take their VNNI forms (iq / q2 / tq, cpu_avxvnni_ok)
+                     : std::getenv("STRATA_NO_IQ256") == nullptr
+                         ? (strata::kernels::cpu::cpu_avxvnni_ok() ? "AVX-VNNI (AVX-2 + VPDPWSSD / VPDPBUSD)" : "AVX-2")
+                         : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
@@ -6497,6 +6558,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        secondary_runner.set_breach_warn(o.secondary_breach_warn);   // xeno #208
         if (!secondary_runner.start_monitor(100, err, nullptr, nullptr, nullptr,
                                             (uint64_t) o.secondary_free_floor_mib << 20)) {
             std::fprintf(stderr, "strata generate: secondary reserve monitor: %s\n", err.c_str());
@@ -7025,7 +7087,10 @@ int main(int argc, char** argv) {
                                  "the host through the doorbell the pool reads. Drop --no-pool.\n");
             return 2;
         }
-        routing = std::fopen(o.dump_routing.c_str(), "wb");
+        // xeno #226: STRATA_DUMP_ROUTING_APPEND=1 appends instead of truncating, so a served config collects one trace
+        // across engine restarts (each boot writes its own format / owned-set tags first; make_profile.py skips tags)
+        const char* app = std::getenv("STRATA_DUMP_ROUTING_APPEND");
+        routing = std::fopen(o.dump_routing.c_str(), app != nullptr && std::atoi(app) != 0 ? "ab" : "wb");
         if (routing == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_routing.c_str());
             return 1;
@@ -9829,9 +9894,193 @@ int main(int argc, char** argv) {
         };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
+        // xeno #229: the 4070's paired swaps under --serve.  With --exclusive-secondary-experts the 4070 holds the only
+        // copy of its experts, so a swap moves like the primary's: 1 the victim's bytes D2H into staging (it stays
+        // 4070-served meanwhile); 2 once landed, copy it home, publish it CPU-owned, stage the newcomer and H2D it into
+        // the slot; 3 once landed, the newcomer is 4070-served and its host pages are released (host RAM stays flat).
+        // The generate path's sec_paired, run inline: stages 2 and 3 at the top of every adapt(), stage 1 right after
+        // the primary's own pick, so the 5060 takes the hottest misses of each layer first and the 4070 the overflow
+        // across the model (the developer's order; gyro-record/tier_sim.py on real traffic: CPU entries 14.0 -> ~8 %).
+        const bool sec_paired_serve = sec_adapt && o.exclusive_secondary;
+        auto sec_inflight = [&](int64_t i) {   // an expert in a 4070 swap: never a primary candidate meanwhile
+            for (const SSwap& x : sx_d2h) if (x.in == i || x.out == i) return true;
+            for (const SSwap& x : sx_h2d) if (x.in == i || x.out == i) return true;
+            return false;
+        };
+        // The heavy half of a 4070 swap - the victim's host pages recommitted and its bytes copied home, the newcomer
+        // copied into staging, and the newcomer's host pages decommitted once the 4070 serves it - runs on this worker,
+        // beside the verify windows.  Everything a window reads (the residency table, the arena's published copies, the
+        // slot's H2D) still changes only inside adapt(), between windows.  Measured first (timeline, 717 rounds): with
+        // those copies and decommits inside adapt() the host waited 3.2 ms per round on "adapt join" (#229).
+        std::atomic<int> ps_prep{0};          // the same for the primary's batch in ps_d2h (with the 4070 swaps on)
+        std::vector<char> ps_went_home;       // per ps_d2h entry: its victim was GPU-owned and came home
+        std::atomic<int> sx_prep{0};          // the batch in sx_d2h: 0 not started, 1 preparing, 2 prepared, -1 failed
+        std::atomic<bool> sx_io_failed{false};
+        std::string sx_io_err;                // written by the worker before it sets a failure flag
+        struct SxWorker {   // declared after everything its jobs touch, so it joins before they go
+            std::thread t;
+            std::mutex m;
+            std::condition_variable cv;
+            std::deque<std::function<void()>> q;
+            bool stop = false;
+            void post(std::function<void()> f) {
+                { std::lock_guard<std::mutex> lk(m); q.push_back(std::move(f)); }
+                cv.notify_one();
+            }
+            void start() {
+                t = std::thread([this] {
+                    strata::aux_cpus::pin_current_thread();
+                    strata::timeline::name_thread("4070 swap io");
+                    for (;;) {
+                        std::function<void()> f;
+                        {
+                            std::unique_lock<std::mutex> lk(m);
+                            cv.wait(lk, [this] { return stop || !q.empty(); });
+                            if (q.empty()) return;   // stop, and nothing left
+                            f = std::move(q.front());
+                            q.pop_front();
+                        }
+                        f();
+                    }
+                });
+            }
+            ~SxWorker() {
+                { std::lock_guard<std::mutex> lk(m); stop = true; }
+                cv.notify_one();
+                if (t.joinable()) t.join();
+            }
+        } sx_io;
+        if (sec_paired_serve) sx_io.start();
+        auto sec_progress = [&]() -> bool {   // stages 3 and 2 (their light, table-changing halves)
+            if (sx_io_failed.load(std::memory_order_acquire)) {
+                std::fprintf(stderr, "strata serve: paired 4070 swap: %s\n", sx_io_err.c_str());
+                return false;
+            }
+            if (sx_d2h.empty() && sx_h2d.empty()) return true;
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            int prev = 0;
+            cudaGetDevice(&prev);
+            cudaSetDevice(1);
+            struct Restore { int d; ~Restore() { cudaSetDevice(d); } } restore{prev};
+            if (!sx_h2d.empty() && cudaEventQuery(ss_ev) == cudaSuccess) {   // stage 3: the newcomers are 4070-served
+                strata::timeline::Span st3("4070 stage 3");
+                std::vector<int32_t> rel;
+                for (const SSwap& x : sx_h2d) {
+                    secondary_residency[(size_t) x.in] = x.slot;
+                    rel.push_back(x.in);
+                }
+                sec_swaps += (int64_t) sx_h2d.size();
+                sx_h2d.clear();
+                // no window reads these host copies from the next window on (the table says 4070 now, and this runs
+                // between windows), so the decommit can run beside it
+                sx_io.post([&, rel = std::move(rel)] {
+                    strata::timeline::Span sp("4070 release");
+                    for (const int32_t in : rel) {
+                        std::string e;
+                        if (!arena_src.release_host_copy(in / (int32_t) g.n_expert, in % (int32_t) g.n_expert, e)) {
+                            sx_io_err = "release: " + e;
+                            sx_io_failed.store(true, std::memory_order_release);
+                            return;
+                        }
+                    }
+                });
+            }
+            if (!sx_d2h.empty() && sx_h2d.empty() && cudaEventQuery(sx_d2h_ev) == cudaSuccess) {   // stage 2
+                const int prep = sx_prep.load(std::memory_order_acquire);
+                if (prep == 0) {   // the copies, on the worker: the victims home, the newcomers into staging
+                    sx_prep.store(1, std::memory_order_relaxed);
+                    sx_io.post([&, batch = sx_d2h] {
+                        strata::timeline::Span sp("4070 prepare", (int64_t) batch.size());
+                        const auto& lay = strata::kernels::cpu::expert_layout();   // not the caller's (gone by now)
+                        for (size_t i = 0; i < batch.size(); ++i) {
+                            const SSwap& x = batch[i];
+                            // ranked across the whole model: victim and newcomer may be in different layers
+                            const int32_t out_layer = x.out / (int32_t) g.n_expert, in_layer = x.in / (int32_t) g.n_expert;
+                            uint8_t* st = ss_stage + i * ps_blob;
+                            std::string e;
+                            uint8_t* home = arena_src.recommit_host_copy(out_layer, x.out % (int32_t) g.n_expert, e);
+                            // held from the lookup on (#62), until adapt() publishes the swap
+                            const uint8_t* src = arena_src.acquire(in_layer, x.in % (int32_t) g.n_expert, e);
+                            if (home == nullptr || src == nullptr) {
+                                if (src != nullptr) arena_src.release_hold(in_layer, x.in % (int32_t) g.n_expert);
+                                sx_io_err = "copy-home: " + e;
+                                sx_prep.store(-1, std::memory_order_release);
+                                sx_io_failed.store(true, std::memory_order_release);
+                                return;
+                            }
+                            // one thread: the copies run beside a window, so they leave the pool's cores alone
+                            std::memcpy(home, st, (size_t) lay.blob_bytes(out_layer));
+                            std::memcpy(st, src, (size_t) lay.blob_bytes(in_layer));
+                        }
+                        sx_prep.store(2, std::memory_order_release);
+                    });
+                } else if (prep == 2) {   // publish: the victims CPU-served from their copies, the slots refilled
+                    strata::timeline::Span st2("4070 stage 2");
+                    for (size_t i = 0; i < sx_d2h.size(); ++i) {
+                        const SSwap& x = sx_d2h[i];
+                        const int32_t in_layer = x.in / (int32_t) g.n_expert;
+                        arena_src.release_hold(in_layer, x.in % (int32_t) g.n_expert);
+                        arena_src.publish_host_copy(x.out / (int32_t) g.n_expert, x.out % (int32_t) g.n_expert);
+                        arena_src.admit_home(x.out / (int32_t) g.n_expert, x.out % (int32_t) g.n_expert);
+                        secondary_residency[(size_t) x.out] = -1;   // CPU-served from now on, from the copy just made
+                        if (cudaMemcpyAsync(secondary_arena.slot_ptr((uint64_t) x.slot), ss_stage + i * ps_blob,
+                                            (size_t) lay.blob_bytes(in_layer), cudaMemcpyHostToDevice,
+                                            ss_stream) != cudaSuccess)
+                            return false;
+                    }
+                    cudaEventRecord(ss_ev, ss_stream);
+                    sx_h2d.swap(sx_d2h);
+                    sx_d2h.clear();
+                    sx_prep.store(0, std::memory_order_relaxed);
+                }
+            }
+            return true;
+        };
+        std::vector<char> sx_busy;
+        auto sec_pick = [&]() -> bool {   // stage 1: after the primary's pick, from what it left
+            if (!sx_d2h.empty() || !sx_h2d.empty() || !adapt_start) return true;
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            int prev = 0;
+            cudaGetDevice(&prev);
+            cudaSetDevice(1);
+            struct Restore { int d; ~Restore() { cudaSetDevice(d); } } restore{prev};
+            strata::timeline::Span pick_span("4070 pick");
+            sx_busy.assign(secondary_residency.size(), 0);   // the primary's swaps in flight, the ones just chosen included
+            for (const PSwap& b : ps_d2h)
+                sx_busy[(size_t) b.layer * g.n_expert + b.in] = sx_busy[(size_t) b.layer * g.n_expert + b.out] = 1;
+            for (const PSwap& b : ps_h2d)
+                sx_busy[(size_t) b.layer * g.n_expert + b.in] = sx_busy[(size_t) b.layer * g.n_expert + b.out] = 1;
+            std::vector<std::pair<float, int32_t>> sc, sv;   // (usage, layer * n_expert + expert)
+            for (int64_t i = 0; i < (int64_t) secondary_residency.size(); ++i) {
+                if (sx_busy[(size_t) i]) continue;
+                const float u = drive.d.usage[(size_t) i];
+                if (secondary_residency[(size_t) i] >= 0) sv.emplace_back(u, (int32_t) i);
+                else if (host_res[(size_t) i] < 0 && u >= 2.0f) sc.emplace_back(u, (int32_t) i);
+            }
+            const size_t n = std::min<size_t>({sc.size(), sv.size(), (size_t) o.adapt_secondary});
+            std::partial_sort(sc.begin(), sc.begin() + (ptrdiff_t) n, sc.end(),
+                              [](auto& a, auto& b) { return a.first > b.first; });
+            std::partial_sort(sv.begin(), sv.begin() + (ptrdiff_t) n, sv.end(),
+                              [](auto& a, auto& b) { return a.first < b.first; });
+            for (size_t k = 0; k < n && sc[k].first >= sv[k].first + o.adapt_min_gain; ++k) {
+                const int32_t in = sc[k].second, out = sv[k].second;
+                const int32_t slot = secondary_residency[(size_t) out];
+                const int32_t out_layer = out / (int32_t) g.n_expert, in_layer = in / (int32_t) g.n_expert;
+                if (srcp->blob(in_layer, in % (int32_t) g.n_expert) == nullptr) break;
+                if (!secondary_arena.fits((uint64_t) slot, (uint64_t) lay.blob_bytes(in_layer))) continue;   // #11
+                if (cudaMemcpyAsync(ss_stage + sx_d2h.size() * ps_blob, secondary_arena.slot_ptr((uint64_t) slot),
+                                    (size_t) lay.blob_bytes(out_layer), cudaMemcpyDeviceToHost, ss_stream) != cudaSuccess)
+                    return false;
+                sx_d2h.push_back({in, out, slot});
+            }
+            if (!sx_d2h.empty()) cudaEventRecord(sx_d2h_ev, ss_stream);
+            return true;
+        };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
-            if (sec_adapt) {   // the 4070 tier, independent of the primary swaps below
+            if (sec_paired_serve) {   // xeno #229: stages 3 and 2 here, stage 1 after the primary's pick
+                if (!sec_progress()) return false;
+            } else if (sec_adapt) {   // the 4070 tier, independent of the primary swaps below
                 if (!ss_pending.empty() && cudaEventQuery(ss_ev) == cudaSuccess) {
                     for (const auto& [i, slot] : ss_pending) secondary_residency[(size_t) i] = slot;
                     ss_pending.clear();
@@ -9885,19 +10134,88 @@ int main(int argc, char** argv) {
             if (paired) {
                 const auto& lay = strata::kernels::cpu::expert_layout();
                 if (!ps_h2d.empty() && cudaEventQuery(adapt_ev) == cudaSuccess) {   // stage 3
+                    std::vector<std::pair<int32_t, int32_t>> rel;   // (layer, expert): decommitted on the worker
                     for (const PSwap& s : ps_h2d) {
                         host_res[(size_t) s.layer * g.n_expert + s.in] = s.slot;
                         std::string e;
-                        if (s.slot < excl_keep_from && !arena_src.release_host_copy(s.layer, s.in, e)) {
+                        if (s.slot >= excl_keep_from) continue;
+                        if (sec_paired_serve) { rel.emplace_back(s.layer, s.in); continue; }   // xeno #229
+                        if (!arena_src.release_host_copy(s.layer, s.in, e)) {
                             std::fprintf(stderr, "strata generate: paired swap release: %s\n", e.c_str());
                             return false;
                         }
                     }
                     ps_h2d.clear();
+                    if (!rel.empty())   // the table says VRAM from the next window on: nobody reads these copies
+                        sx_io.post([&, rel = std::move(rel)] {
+                            strata::timeline::Span sp("5060 release");
+                            for (const auto& [l, x] : rel) {
+                                std::string e;
+                                if (!arena_src.release_host_copy(l, x, e)) {
+                                    sx_io_err = "5060 release: " + e;
+                                    sx_io_failed.store(true, std::memory_order_release);
+                                    return;
+                                }
+                            }
+                        });
                     if (d_res != nullptr)
                         cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 }
-                if (!ps_d2h.empty() && ps_h2d.empty() && cudaEventQuery(d2h_ev) == cudaSuccess) {   // stage 2
+                if (sec_paired_serve && !ps_d2h.empty() && ps_h2d.empty() && cudaEventQuery(d2h_ev) == cudaSuccess) {
+                    // xeno #229: stage 2 in two halves - the copies on the worker beside a window, then the publish here
+                    const int prep = ps_prep.load(std::memory_order_acquire);
+                    if (prep == 0) {
+                        ps_prep.store(1, std::memory_order_relaxed);
+                        ps_went_home.assign(ps_d2h.size(), 0);
+                        sx_io.post([&, batch = ps_d2h] {
+                            strata::timeline::Span sp("5060 prepare", (int64_t) batch.size());
+                            const auto& lay2 = strata::kernels::cpu::expert_layout();
+                            for (size_t i = 0; i < batch.size(); ++i) {
+                                const PSwap& s = batch[i];
+                                const size_t bytes = (size_t) lay2.blob_bytes(s.layer);
+                                uint8_t* st = ps_stage + i * ps_blob;
+                                std::string e;
+                                const uint8_t* src = arena_src.acquire(s.layer, s.in, e);   // held until the publish
+                                if (arena_src.blob(s.layer, s.out) == nullptr) {   // GPU-owned: its only copy comes home
+                                    uint8_t* home = arena_src.recommit_host_copy(s.layer, s.out, e);
+                                    if (home == nullptr) {
+                                        if (src != nullptr) arena_src.release_hold(s.layer, s.in);
+                                        sx_io_err = "5060 copy-home: " + e;
+                                        ps_prep.store(-1, std::memory_order_release);
+                                        sx_io_failed.store(true, std::memory_order_release);
+                                        return;
+                                    }
+                                    std::memcpy(home, st, bytes);
+                                    ps_went_home[i] = 1;
+                                }
+                                if (src == nullptr) {
+                                    sx_io_err = "5060 newcomer has no host copy";
+                                    ps_prep.store(-1, std::memory_order_release);
+                                    sx_io_failed.store(true, std::memory_order_release);
+                                    return;
+                                }
+                                std::memcpy(st, src, bytes);
+                            }
+                            ps_prep.store(2, std::memory_order_release);
+                        });
+                    } else if (prep == 2) {
+                        for (const PSwap& s : ps_d2h) arena_src.release_hold(s.layer, s.in);
+                        for (size_t i = 0; i < ps_d2h.size(); ++i) {
+                            const PSwap& s = ps_d2h[i];
+                            if (ps_went_home[i]) { arena_src.publish_host_copy(s.layer, s.out); arena_src.admit_home(s.layer, s.out); }
+                            host_res[(size_t) s.layer * g.n_expert + s.out] = strata::core::kNotResident;
+                            if (cudaMemcpyAsync(xcache.device_slot(s.slot), ps_stage + i * ps_blob, (size_t) lay.blob_bytes(s.layer),
+                                                cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
+                                return false;
+                        }
+                        cudaEventRecord(adapt_ev, adapt_stream);
+                        ps_h2d.swap(ps_d2h);
+                        ps_d2h.clear();
+                        ps_prep.store(0, std::memory_order_relaxed);
+                        if (d_res != nullptr)
+                            cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                    }
+                } else if (!ps_d2h.empty() && ps_h2d.empty() && cudaEventQuery(d2h_ev) == cudaSuccess) {   // stage 2
                     // the evicted expert goes home first; its staging slot then takes the newcomer
                     std::vector<CopyJob> home_jobs, in_jobs;
                     std::vector<char> went_home(ps_d2h.size(), 0);
@@ -9959,7 +10277,8 @@ int main(int argc, char** argv) {
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) {
                         if (u[e] >= 2.0f && (sr == nullptr || sr[e] < 0) && !(peer.valid() && peer.has(l, e)) &&
-                            !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e))
+                            !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e) &&
+                            !(sec_paired_serve && sec_inflight(l * g.n_expert + e)))
                             cand.emplace_back(u[e], e);
                     }
                     else if (!paired || r[e] < excl_keep_from) vict.emplace_back(u[e], e);   // not the lent tail
@@ -9988,6 +10307,10 @@ int main(int argc, char** argv) {
                 }
                 if (!swaps.empty()) cudaEventRecord(d2h_ev, adapt_stream);
                 paired_swaps += (int64_t) swaps.size();
+                if (sec_paired_serve && !sec_pick()) return false;   // xeno #229: the 4070 takes the overflow
+                // #477 --expert-profile-save: the paired tier returns here, before the count below the unpaired swaps
+                // (xeno #229: without this the saved ranking held no routing, only the residents and the prior)
+                for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
                 for (float& v : drive.d.usage) v *= o.adapt_decay;   // 0.7 unless --adapt-decay
                 return true;
             }
@@ -13944,6 +14267,8 @@ int main(int argc, char** argv) {
                                      "%.2f GiB\n", (long long) sum, (long long) te[0], (long long) te[1],
                              (long long) te[2], (long long) te[3], drive.cpu_ms - cpu_ms0,
                              (long long) (arena_src.nvme_loads() - nvme0), private_commit_bytes() / 1073741824.0);
+                std::fprintf(stderr, "strata serve: adaptive swaps since start: 5060 %lld, 4070 %lld\n",
+                             (long long) paired_swaps, (long long) sec_swaps);   // xeno #229
                 if (dec_windows > 0) {   // #11 acceptance 7: per verify window and per emitted token
                     const double w = (double) dec_windows, tk = produced_n > 0 ? (double) produced_n : 1.0;
                     const double all = sum > 0 ? (double) sum : 1.0;
