@@ -8,8 +8,8 @@ A background thread samples once a second and keeps the last 60 readings of each
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 - Memory pressure (xeno #237): RAM available, the commit charge, hard page faults per second, and the engine's working
   set and page faults per second - read from the OS directly, psutil or not.
-- The record kept (xeno #237): TelemetryLog keeps the last two hours in memory, one point a second, and writes them to
-  the request history's folder as telemetry-YYYY-MM-DD.jsonl, so a past stall can be read back.
+- The record kept (xeno #237): TelemetryLog keeps the last two hours in memory, one point a second, and hands them to
+  a sink - the server's HistoryStore, which writes telemetry-YYYY-MM-DD.jsonl - so a past stall can be read back.
 Anything that cannot be read is None; nothing here can stop the server.
 """
 from __future__ import annotations
@@ -320,6 +320,39 @@ def _cpu_name():
     return platform.processor() or None
 
 
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def os_memory():
+    """The OS's own memory figures, psutil or not: {"total", "avail", "commit_used", "commit_limit"} in bytes, or {}.
+    Windows: GlobalMemoryStatusEx, whose page-file fields are the commit charge and its limit.  Linux: /proc/meminfo,
+    MemAvailable and Committed_AS / CommitLimit."""
+    if os.name == "nt":
+        m = _MemoryStatusEx()
+        m.dwLength = ctypes.sizeof(m)
+        try:
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return {"total": m.ullTotalPhys, "avail": m.ullAvailPhys,
+                        "commit_used": m.ullTotalPageFile - m.ullAvailPageFile, "commit_limit": m.ullTotalPageFile}
+        except (OSError, AttributeError):
+            pass
+        return {}
+    try:
+        info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
+        kb = lambda k: int(info[k].split()[0]) * 1024     # noqa: E731
+        out = {"total": kb("MemTotal"), "avail": kb("MemAvailable")}
+        if "Committed_AS" in info and "CommitLimit" in info:
+            out.update(commit_used=kb("Committed_AS"), commit_limit=kb("CommitLimit"))
+        return out
+    except (OSError, KeyError, ValueError):
+        return {}
+
+
 class _CpuRamFallback:
     """CPU load and RAM without psutil."""
 
@@ -347,34 +380,22 @@ class _CpuRamFallback:
 
     @staticmethod
     def ram():
-        if os.name == "nt":
-            class MS(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-            m = MS()
-            m.dwLength = ctypes.sizeof(MS)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
-                return m.ullTotalPhys - m.ullAvailPhys, m.ullTotalPhys
+        m = os_memory()
+        if "total" not in m:
             return None, None
-        try:
-            info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
-            total = int(info["MemTotal"].split()[0]) * 1024
-            avail = int(info["MemAvailable"].split()[0]) * 1024
-            return total - avail, total
-        except (OSError, KeyError, ValueError):
-            return None, None
+        return m["total"] - m["avail"], m["total"]
 
 
 # ------------------------------------------------------------------------------------------------ memory pressure
 class _MemPressure:
-    """What paging looks like (xeno #237), with or without psutil: the RAM still available, the commit charge against
-    its limit, the hard page faults per second (pages read back from disk, the system-wide stutter), and the engine
-    process's working set and page faults per second (soft and hard; a working set the OS trimmed faults back in).
-    Windows: GlobalMemoryStatusEx, the PDH counter \\Memory\\Pages Input/sec and K32GetProcessMemoryInfo.  Linux:
-    /proc/meminfo, /proc/vmstat pgmajfault, /proc/<pid>/statm and /proc/<pid>/stat.  Anything unreadable is None."""
+    """What paging looks like (xeno #237), with or without psutil: the commit charge against its limit, the hard page
+    faults per second (pages read back from disk, the system-wide stutter), and the engine process's working set and
+    page faults per second (soft and hard; a working set the OS trimmed faults back in).  The RAM left comes from the
+    sampler's own RAM reading.  Windows: os_memory, the PDH counter \\Memory\\Pages Input/sec and
+    K32GetProcessMemoryInfo.  Linux: os_memory, /proc/vmstat pgmajfault, /proc/<pid>/statm and /proc/<pid>/stat.
+    Rates are taken over at least a second: a reading sooner than that returns the last one."""
+
+    MIN_INTERVAL_S = 1.0
 
     def __init__(self):
         self.nt = os.name == "nt"
@@ -382,8 +403,13 @@ class _MemPressure:
         self._proc = (None, None)             # (pid, handle) on Windows
         self._prev_sys = None                 # Linux: (time, pgmajfault)
         self._prev_eng = None                 # (pid, time, page faults)
+        self._last = (0.0, None, {})          # (time, pid, reading) for the readings sooner than MIN_INTERVAL_S
         if self.nt:
             self._open_pdh()
+            k32 = ctypes.windll.kernel32
+            k32.OpenProcess.restype = ctypes.c_void_p
+            k32.K32GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
 
     def _open_pdh(self):
         try:
@@ -408,72 +434,42 @@ class _MemPressure:
                                                    "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
                                                    "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
 
-    def _system_nt(self):
-        out = {}
-
-        class MS(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        m = MS()
-        m.dwLength = ctypes.sizeof(MS)
-        try:
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
-                out["ram_avail"] = m.ullAvailPhys
-                out["commit_used"] = m.ullTotalPageFile - m.ullAvailPageFile     # the page-file fields are the commit
-                out["commit_limit"] = m.ullTotalPageFile
-        except (OSError, AttributeError):
-            pass
-        if self._pdh is not None:
+    def _hard_faults_s(self):
+        if self.nt:
+            if self._pdh is None:
+                return None
             v = self._PdhValue()
             try:
                 if self._pdh.PdhCollectQueryData(self._q) == 0 and \
                         self._pdh.PdhGetFormattedCounterValue(self._c, 0x200, None, ctypes.byref(v)) == 0:   # PDH_FMT_DOUBLE
-                    out["hard_pf_s"] = v.doubleValue
+                    return v.doubleValue
             except (OSError, AttributeError):
                 pass
-        return out
-
-    def _system_linux(self):
-        out = {}
-        try:
-            info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
-            kb = lambda k: int(info[k].split()[0]) * 1024     # noqa: E731
-            out["ram_avail"] = kb("MemAvailable")
-            out["commit_used"], out["commit_limit"] = kb("Committed_AS"), kb("CommitLimit")
-        except (OSError, KeyError, ValueError):
-            pass
+            return None
         try:
             maj = next(int(line.split()[1]) for line in open("/proc/vmstat") if line.startswith("pgmajfault "))
-            now, prev = time.time(), self._prev_sys
-            self._prev_sys = (now, maj)
-            if prev is not None and now > prev[0]:
-                out["hard_pf_s"] = (maj - prev[1]) / (now - prev[0])
         except (OSError, StopIteration, ValueError):
-            pass
-        return out
+            return None
+        now, prev = time.time(), self._prev_sys
+        self._prev_sys = (now, maj)
+        return (maj - prev[1]) / (now - prev[0]) if prev is not None and now > prev[0] else None
 
     def _engine_nt(self, pid):
         k32 = ctypes.windll.kernel32
         if self._proc[0] != pid:
             if self._proc[1]:
-                k32.CloseHandle(ctypes.c_void_p(self._proc[1]))
-            k32.OpenProcess.restype = ctypes.c_void_p
-            h = k32.OpenProcess(ctypes.c_ulong(0x1000 | 0x0010), False, ctypes.c_ulong(pid))   # QUERY_LIMITED | VM_READ
-            self._proc = (pid, h)
+                k32.CloseHandle(self._proc[1])
+            self._proc = (pid, k32.OpenProcess(ctypes.c_ulong(0x1000 | 0x0010), False, ctypes.c_ulong(pid)))   # QUERY_LIMITED | VM_READ
         h = self._proc[1]
         if not h:
             return None
         pm = self._ProcMem()
         pm.cb = ctypes.sizeof(pm)
-        k32.K32GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
-        if not k32.K32GetProcessMemoryInfo(ctypes.c_void_p(h), ctypes.byref(pm), pm.cb):
+        if not k32.K32GetProcessMemoryInfo(h, ctypes.byref(pm), pm.cb):
             self._proc = (None, None)         # the engine exited: a new handle next time
-            k32.CloseHandle(ctypes.c_void_p(h))
+            k32.CloseHandle(h)
             return None
-        return pm.WorkingSetSize, pm.PageFaultCount, 2**32      # a DWORD count wraps
+        return pm.WorkingSetSize, pm.PageFaultCount
 
     @staticmethod
     def _engine_linux(pid):
@@ -481,13 +477,18 @@ class _MemPressure:
             rss = int(open(f"/proc/{pid}/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
             s = open(f"/proc/{pid}/stat").read()
             rest = s[s.rfind(")") + 2:].split()                # field n of stat(5) is rest[n - 3]
-            return rss, int(rest[7]) + int(rest[9]), None        # minflt + majflt
+            return rss, int(rest[7]) + int(rest[9])              # minflt + majflt
         except (OSError, ValueError, IndexError):
             return None
 
     def read(self, pid=None):
+        now = time.time()
+        if now - self._last[0] < self.MIN_INTERVAL_S and pid == self._last[1]:
+            return self._last[2]
         try:
-            out = self._system_nt() if self.nt else self._system_linux()
+            m = os_memory()
+            out = {k: m[k] for k in ("commit_used", "commit_limit") if k in m}
+            out["hard_pf_s"] = self._hard_faults_s()
         except Exception:  # noqa: BLE001 - telemetry must never take the server down
             out = {}
         if pid:
@@ -496,16 +497,17 @@ class _MemPressure:
             except Exception:  # noqa: BLE001
                 r = None
             if r is not None:
-                ws, faults, wrap = r
+                ws, faults = r
                 out["engine_ws"] = ws
-                now, prev = time.time(), self._prev_eng
+                prev = self._prev_eng
                 self._prev_eng = (pid, now, faults)
                 if prev is not None and prev[0] == pid and now > prev[1]:
                     d = faults - prev[2]
-                    if d < 0 and wrap:
-                        d += wrap
+                    if d < 0 and self.nt:
+                        d += 2**32                # PageFaultCount is a DWORD and wraps
                     if d >= 0:
                         out["engine_pf_s"] = d / (now - prev[1])
+        self._last = (now, pid, out)
         return out
 
 
@@ -523,111 +525,92 @@ def compact_point(s, t, busy):
                   for g in s.get("gpus") or []]}
 
 
-def window_summary(points, t0, t1):
-    """The hardware over one request (xeno #237): the lowest RAM left, the highest commit and fault rates, the engine's
-    working set range, the CPU, and each card's load and VRAM.  None when no point falls in [t0, t1]."""
-    pts = [p for p in points if t0 <= p["t"] <= t1]
+def window_summary(pts):
+    """The hardware over one request's points (xeno #237): the lowest RAM left, the highest commit and fault rates,
+    the engine's working-set range, the CPU, and each card's load and VRAM.  None when there are no points."""
     if not pts:
         return None
+    mean = lambda v: sum(v) / len(v)                              # noqa: E731
+
+    def agg(fn, vals):
+        vals = [v for v in vals if v is not None]
+        return round(fn(vals), 1) if vals else None
 
     def col(k):
-        return [p[k] for p in pts if p.get(k) is not None]
+        return [p.get(k) for p in pts]
 
-    def agg(fn, k):
-        v = col(k)
-        return round(fn(v), 1) if v else None
+    def card_col(i, j):
+        return [p["g"][i][j] for p in pts if len(p.get("g") or []) > i]
 
-    mean = lambda v: sum(v) / len(v)                              # noqa: E731
-    gpus = []
-    for i in range(max((len(p.get("g") or []) for p in pts), default=0)):
-        util = [p["g"][i][0] for p in pts if len(p.get("g") or []) > i and p["g"][i][0] is not None]
-        mem = [p["g"][i][1] for p in pts if len(p.get("g") or []) > i and p["g"][i][1] is not None]
-        gpus.append({"util_mean": round(mean(util), 1) if util else None, "util_max": max(util) if util else None,
-                     "mem_max_mib": max(mem) if mem else None})
-    return {"samples": len(pts), "ram_avail_min_mib": agg(min, "ram_avail"), "commit_max_mib": agg(max, "commit"),
-            "commit_limit_mib": agg(max, "commit_limit"), "hard_pf_max": agg(max, "hard_pf"),
-            "hard_pf_mean": agg(mean, "hard_pf"), "eng_ws_min_mib": agg(min, "eng_ws"),
-            "eng_ws_max_mib": agg(max, "eng_ws"), "eng_pf_max": agg(max, "eng_pf"), "eng_pf_mean": agg(mean, "eng_pf"),
-            "cpu_max": agg(max, "cpu"), "cpu_mean": agg(mean, "cpu"), "gpus": gpus}
+    cards = max((len(p.get("g") or []) for p in pts), default=0)
+    return {"samples": len(pts), "ram_avail_min_mib": agg(min, col("ram_avail")), "commit_max_mib": agg(max, col("commit")),
+            "commit_limit_mib": agg(max, col("commit_limit")), "hard_pf_max": agg(max, col("hard_pf")),
+            "hard_pf_mean": agg(mean, col("hard_pf")), "eng_ws_min_mib": agg(min, col("eng_ws")),
+            "eng_ws_max_mib": agg(max, col("eng_ws")), "eng_pf_max": agg(max, col("eng_pf")),
+            "eng_pf_mean": agg(mean, col("eng_pf")), "cpu_max": agg(max, col("cpu")), "cpu_mean": agg(mean, col("cpu")),
+            "gpus": [{"util_mean": agg(mean, card_col(i, 0)), "util_max": agg(max, card_col(i, 0)),
+                      "mem_max_mib": agg(max, card_col(i, 1))} for i in range(cards)]}
 
 
 class TelemetryLog:
     """The readings kept past the 60-second window (xeno #237), so a stall or a stutter can be read back afterwards:
-    one compact point a second in memory for the last KEEP_S seconds (a finished request's hardware summary reads its
-    window from them), and on disk as <dir>/telemetry-YYYY-MM-DD.jsonl - every second while a request runs, every
-    IDLE_EVERY_S seconds otherwise.  Files older than `keep_days` are deleted.  A failing disk only stops the file."""
+    one compact point a second in memory for the last KEEP_S seconds (a finished request's hardware reads its window
+    from them), handed to `sink(point)` - every second while a request runs, every IDLE_EVERY_S seconds otherwise.
+    The server's sink is HistoryStore.append_telemetry, which owns the files and their age.  A sink that raises
+    OSError (a full or missing disk) is dropped; the memory window stays."""
 
     KEEP_S = 7200
     IDLE_EVERY_S = 10.0
 
-    def __init__(self, directory=None, keep_days=14):
-        self.dir = None if directory is None else os.fspath(directory)
-        self.keep_days = keep_days
+    def __init__(self, sink=None):
+        self.sink = sink
         self.lock = threading.Lock()
         self.points = collections.deque(maxlen=self.KEEP_S)
-        self._last_disk = 0.0
-        self._day = None
+        self._last_sink = 0.0
 
     def add(self, s, t, busy):
         p = compact_point(s, t, busy)
         with self.lock:
             self.points.append(p)
-        if self.dir is None or (not busy and t - self._last_disk < self.IDLE_EVERY_S):
+        if self.sink is None or (not busy and t - self._last_sink < self.IDLE_EVERY_S):
             return
-        self._last_disk = t
+        self._last_sink = t
         try:
-            day = time.strftime("%Y-%m-%d", time.localtime(t))
-            if day != self._day:
-                os.makedirs(self.dir, exist_ok=True)
-                self._day = day
-                self._prune(t)
-            with open(os.path.join(self.dir, f"telemetry-{day}.jsonl"), "a", encoding="utf-8") as f:
-                f.write(json.dumps(p, separators=(",", ":")) + "\n")
+            self.sink(p)
         except OSError:
-            self.dir = None                   # a full or missing disk: keep the memory window, stop writing
+            self.sink = None
 
-    def _prune(self, now):
-        try:
-            names = os.listdir(self.dir)
-        except OSError:
-            return
-        cut = time.strftime("%Y-%m-%d", time.localtime(now - self.keep_days * 86400))
-        for n in names:
-            if n.startswith("telemetry-") and n.endswith(".jsonl") and n[10:20] < cut:
-                try:
-                    os.remove(os.path.join(self.dir, n))
-                except OSError:
-                    pass
-
-    def summary(self, t0, t1):
+    def window(self, t0, t1, max_points=600):
+        """(summary, points) for [t0, t1]: the summary over every point of the window, the points thinned evenly to at
+        most `max_points`.  The points are in time order, so the walk starts at the newest and stops before t0."""
+        pts = []
         with self.lock:
-            pts = list(self.points)
-        return window_summary(pts, t0, t1)
-
-    def series(self, t0, t1, max_points=600):
-        """The points of [t0, t1], thinned evenly to at most `max_points` (a request's detail file)."""
-        with self.lock:
-            pts = [p for p in self.points if t0 <= p["t"] <= t1]
+            for p in reversed(self.points):
+                if p["t"] < t0:
+                    break
+                if p["t"] <= t1:
+                    pts.append(p)
+        pts.reverse()
         step = max(1, -(-len(pts) // max_points))
-        return pts[::step]
+        return window_summary(pts), pts[::step]
 
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, busy_fn=None, model_path=None, amd=False,
-                 pid_fn=None, log_dir=None, keep_days=14):
+                 pid_fn=None, sink=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
         PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
         cards, numbered as HIP numbers them, read from sysfs (#301).  `pid_fn()` -> the engine's process id or None,
-        for its working set and page faults; `log_dir`: where TelemetryLog writes its daily files (None: memory only),
-        kept `keep_days` days (xeno #237)."""
+        for its working set and page faults; `sink(point)`: where TelemetryLog hands its per-second points (the
+        server's HistoryStore.append_telemetry; None: memory only) (xeno #237)."""
         self.extra = extra
         self.busy_fn = busy_fn            # True while a request runs: the cards are then sampled five times a second
         self.pid_fn = pid_fn
         self.mem = _MemPressure()
-        self.log = TelemetryLog(log_dir, keep_days)
+        self.log = TelemetryLog(sink)
         self.last_record = 0.0
         self.disks_now = None
         self.lock = threading.Lock()
@@ -752,10 +735,12 @@ class Telemetry:
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
         s["disks"] = self._disks_per()        # per disk (psutil only): MB/s and the OS-observed read latency
-        mem = getattr(self, "mem", None)
-        if mem is not None:                   # xeno #237: RAM left, commit, hard faults, the engine's working set
+        if s.get("ram_total") is not None and s.get("ram_used") is not None:
+            s["ram_avail"] = s["ram_total"] - s["ram_used"]          # xeno #237: the RAM left, from the same reading
+        mem = getattr(self, "mem", None)     # None in a sampler built without __init__ (the tests' bare())
+        if mem is not None:                   # xeno #237: commit, hard faults, the engine's working set
             try:
-                pid = self.pid_fn() if getattr(self, "pid_fn", None) else None
+                pid = self.pid_fn() if self.pid_fn else None
             except Exception:  # noqa: BLE001 - telemetry must never take the server down
                 pid = None
             s.update(mem.read(pid))
@@ -791,13 +776,9 @@ class Telemetry:
                     pass
             self._stop.wait(self.interval())
 
-    def request_summary(self, t0, t1):
-        """The hardware over [t0, t1] for a finished request's record (xeno #237), or None."""
-        return self.log.summary(t0, t1)
-
-    def request_series(self, t0, t1):
-        """The per-second points of [t0, t1] for a request's detail file (xeno #237)."""
-        return self.log.series(t0, t1)
+    def request_hw(self, t0, t1):
+        """(summary, points) of [t0, t1]: a finished request's `hw` and its detail's `hw_series` (xeno #237)."""
+        return self.log.window(t0, t1)
 
     def snapshot(self):
         with self.lock:

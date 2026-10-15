@@ -1754,12 +1754,9 @@ class RequestHistory(unittest.TestCase):
         seen = []
 
         class FakeTelemetry:
-            def request_summary(self, t0, t1):
+            def request_hw(self, t0, t1):
                 seen.append((t0, t1))
-                return {"samples": 2, "ram_avail_min_mib": 3100}
-
-            def request_series(self, t0, t1):
-                return [{"t": t0, "ram_avail": 3200}, {"t": t1, "ram_avail": 3100}]
+                return {"samples": 2, "ram_avail_min_mib": 3100}, [{"t": t0, "ram_avail": 3200}, {"t": t1, "ram_avail": 3100}]
 
             def snapshot(self):
                 return {"now": {}, "history": {}, "static": {}}
@@ -1780,10 +1777,11 @@ class RequestHistory(unittest.TestCase):
 
     def test_the_per_second_record_lands_beside_the_history(self):
         """xeno #237: the sampler's daily file goes into the history folder (history.telemetry, on by default)."""
-        tel = self.svc.telemetry
-        self.assertEqual(tel.log.dir, str(Path(self.tmp.name)))
-        tel.log.add({"ram_avail": 2**30}, time.time(), busy=True)
+        self.svc.telemetry.log.add({"ram_avail": 2**30}, time.time(), busy=True)
         self.assertTrue(list(Path(self.tmp.name).glob("telemetry-*.jsonl")))
+        self.svc.hstore = type(self.svc.hstore)(Path(self.tmp.name) / "off", telemetry=False)   # the sink follows hstore
+        self.svc.telemetry.log.add({"ram_avail": 2**30}, time.time(), busy=True)
+        self.assertFalse((Path(self.tmp.name) / "off").exists())
 
     def call(self, path, body, headers=None):
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),

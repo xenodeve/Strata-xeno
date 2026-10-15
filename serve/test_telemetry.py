@@ -144,19 +144,28 @@ def reading(**kw):
 
 
 class MemoryPressure(unittest.TestCase):
-    """xeno #237: RAM left, commit, hard faults and the engine's working set, read from the OS, psutil or not."""
+    """xeno #237: commit, hard faults and the engine's working set, read from the OS, psutil or not."""
 
     def test_this_process_reads_as_an_engine(self):
         from serve.telemetry import _MemPressure
         import os
         m = _MemPressure()
+        m.MIN_INTERVAL_S = 0.0                             # two readings back to back
         first = m.read(os.getpid())
         self.assertGreater(first.get("engine_ws") or 0, 0)
-        self.assertGreater(first.get("ram_avail") or 0, 0)
         self.assertGreater(first.get("commit_limit") or 0, 0)
         bytearray(64 * 2**20)                              # touch fresh pages so the fault count moves
         second = m.read(os.getpid())
-        self.assertGreaterEqual(second.get("engine_pf_s"), 0)
+        self.assertIn("engine_pf_s", second, "the second reading of the same process gives its fault rate")
+        self.assertGreaterEqual(second["engine_pf_s"], 0)
+
+    def test_a_reading_sooner_than_a_second_is_the_last_one(self):
+        from serve.telemetry import _MemPressure
+        import os
+        m = _MemPressure()
+        first = m.read(os.getpid())
+        self.assertIs(m.read(os.getpid()), first)         # the sampler's 5 Hz does not read the OS five times
+        self.assertIsNot(m.read(None), first)              # another process (none) is a new reading
 
     def test_no_engine_and_a_gone_engine_give_no_engine_fields(self):
         from serve.telemetry import _MemPressure
@@ -164,14 +173,21 @@ class MemoryPressure(unittest.TestCase):
         self.assertNotIn("engine_ws", m.read(None))
         self.assertNotIn("engine_ws", m.read(2**31 - 7))   # no such process: nothing, no exception
 
-    def test_a_sampler_without_the_reader_still_samples(self):
-        s = bare([FakeCard("A", 1, 1)]).sample()        # tests and old pickles build Telemetry without __init__
+    def test_the_ram_left_comes_from_the_same_reading_as_the_ram_used(self):
+        s = bare([FakeCard("A", 1, 1)]).sample()        # bare(): RAM (1 used, 2 total), no memory-pressure reader
+        self.assertEqual(s["ram_avail"], 1)
         self.assertNotIn("engine_ws", s)
+
+    def test_os_memory_has_the_commit(self):
+        from serve.telemetry import os_memory
+        m = os_memory()
+        self.assertGreater(m["total"], m["avail"])
+        self.assertGreater(m["commit_limit"], 0)
 
 
 class Record(unittest.TestCase):
-    """xeno #237: the per-second record past the 60-second window - compact points, a request's window summary, the
-    daily files (every second busy, every 10 s idle), the age limit, and a disk that fails."""
+    """xeno #237: the per-second record past the 60-second window - compact points, a request's window, the sink's
+    cadence (every second busy, every 10 s idle), and a sink that fails."""
 
     def test_a_point_is_compact_and_keeps_every_card(self):
         from serve.telemetry import compact_point
@@ -182,57 +198,39 @@ class Record(unittest.TestCase):
         self.assertLess(len(json.dumps(p, separators=(",", ":"))), 260)
         self.assertIsNone(compact_point({}, 1.0, False)["ram_avail"])    # unreadable stays None, never 0
 
-    def test_a_request_summary_reads_only_its_own_window(self):
-        from serve.telemetry import compact_point, window_summary
-        pts = [compact_point(reading(ram_avail=a * 2**30, hard_pf_s=f, gpus=[{"util": u, "mem_used": 2**30}]), t, True)
-               for t, a, f, u in ((10, 9, 0.0, 10), (11, 3, 500.0, 90), (12, 4, 100.0, 50), (13, 1, 9000.0, 99))]
-        s = window_summary(pts, 10.5, 12.5)
+    def test_a_request_window_reads_only_its_own_seconds(self):
+        from serve.telemetry import TelemetryLog
+        log = TelemetryLog()
+        for t, a, f, u in ((10, 9, 0.0, 10), (11, 3, 500.0, 90), (12, 4, 100.0, 50), (13, 1, 9000.0, 99)):
+            log.add(reading(ram_avail=a * 2**30, hard_pf_s=f, gpus=[{"util": u, "mem_used": 2**30}]), t, True)
+        s, pts = log.window(10.5, 12.5)
         self.assertEqual((s["samples"], s["ram_avail_min_mib"], s["hard_pf_max"], s["hard_pf_mean"]), (2, 3072, 500.0, 300.0))
         self.assertEqual(s["gpus"], [{"util_mean": 70.0, "util_max": 90, "mem_max_mib": 1024}])
-        self.assertIsNone(window_summary(pts, 20, 30))
+        self.assertEqual([p["t"] for p in pts], [11, 12])
+        self.assertEqual(log.window(20, 30), (None, []))
 
-    def test_busy_seconds_are_all_written_idle_ones_every_ten(self):
-        import tempfile
+    def test_busy_seconds_all_reach_the_sink_idle_ones_every_ten(self):
         from serve.telemetry import TelemetryLog
-        with tempfile.TemporaryDirectory() as d:
-            log = TelemetryLog(d)
-            t0 = 1_800_000_000.0
-            for i in range(30):
-                log.add(reading(), t0 + i, busy=i < 5)          # 5 busy seconds, then 25 idle ones
-            files = list(Path(d).glob("telemetry-*.jsonl"))
-            self.assertEqual(len(files), 1)
-            lines = [json.loads(x) for x in files[0].read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([round(x["t"] - t0) for x in lines], [0, 1, 2, 3, 4, 14, 24])
-            self.assertEqual(len(log.points), 30)              # memory keeps every second
-            self.assertEqual(len(log.series(t0, t0 + 29, max_points=10)), 10)
+        got = []
+        log = TelemetryLog(got.append)
+        t0 = 1_800_000_000.0
+        for i in range(30):
+            log.add(reading(), t0 + i, busy=i < 5)              # 5 busy seconds, then 25 idle ones
+        self.assertEqual([round(p["t"] - t0) for p in got], [0, 1, 2, 3, 4, 14, 24])
+        self.assertEqual(len(log.points), 30)                  # memory keeps every second
+        self.assertEqual(len(log.window(t0, t0 + 29, max_points=10)[1]), 10)
 
-    def test_old_days_are_deleted_and_other_files_are_left(self):
-        import tempfile
-        import time as _t
+    def test_a_sink_that_fails_is_dropped_and_the_memory_window_stays(self):
         from serve.telemetry import TelemetryLog
-        with tempfile.TemporaryDirectory() as d:
-            now = _t.time()
-            old = _t.strftime("%Y-%m-%d", _t.localtime(now - 20 * 86400))
-            recent = _t.strftime("%Y-%m-%d", _t.localtime(now - 3 * 86400))
-            for n in (f"telemetry-{old}.jsonl", f"telemetry-{recent}.jsonl", "requests-2026-10.jsonl"):
-                (Path(d) / n).write_text("{}\n", encoding="utf-8")
-            TelemetryLog(d, keep_days=14).add(reading(), now, busy=True)
-            names = sorted(p.name for p in Path(d).iterdir())
-            self.assertNotIn(f"telemetry-{old}.jsonl", names)
-            self.assertIn(f"telemetry-{recent}.jsonl", names)
-            self.assertIn("requests-2026-10.jsonl", names)
+        calls = []
 
-    def test_a_disk_that_fails_stops_the_file_not_the_memory_window(self):
-        import tempfile
-        from serve.telemetry import TelemetryLog
-        with tempfile.TemporaryDirectory() as d:
-            blocker = Path(d) / "file"
-            blocker.write_text("x", encoding="utf-8")
-            log = TelemetryLog(blocker / "sub")                 # a folder under a file cannot be made
-            log.add(reading(), 1_800_000_000.0, busy=True)
-            log.add(reading(), 1_800_000_001.0, busy=True)
-            self.assertIsNone(log.dir)
-            self.assertEqual(len(log.points), 2)
+        def full_disk(p):
+            calls.append(p)
+            raise OSError("No space left on device")
+        log = TelemetryLog(full_disk)
+        log.add(reading(), 1_800_000_000.0, busy=True)
+        log.add(reading(), 1_800_000_001.0, busy=True)
+        self.assertEqual((len(calls), log.sink, len(log.points)), (1, None, 2))
 
 
 if __name__ == "__main__":

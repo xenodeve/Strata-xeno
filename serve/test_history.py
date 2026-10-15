@@ -279,12 +279,59 @@ class Permissions(unittest.TestCase):
                 store = HistoryStore(Path(d) / "h")
                 store.append(rec(1))
                 store.write_detail("r0001", {"prompt": ["x"]})
+                store.append_telemetry({"t": time.time(), "ram_avail": 1})        # #237: the hardware record too
                 for p in (store.dir, store.dir / "detail"):
                     self.assertEqual(os.stat(p).st_mode & 0o077, 0, str(p))
-                for p in list(store.dir.glob("*.jsonl")) + list((store.dir / "detail").glob("*.gz")):
+                files = list(store.dir.glob("*.jsonl")) + list((store.dir / "detail").glob("*.gz"))
+                self.assertTrue(any(p.name.startswith("telemetry-") for p in files))
+                for p in files:
                     self.assertEqual(os.stat(p).st_mode & 0o077, 0, str(p))
         finally:
             os.umask(old)
+
+
+class Telemetry(unittest.TestCase):
+    """xeno #237: the per-second hardware record beside the requests - one file a day, the old days deleted, off with
+    the history or with "telemetry": false, and invisible to the request pages."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_points_go_to_the_day_file(self):
+        store = HistoryStore(self.dir)
+        t = time.time()
+        store.append_telemetry({"t": t, "ram_avail": 3000})
+        store.append_telemetry({"t": t + 1, "ram_avail": 2900})
+        day = time.strftime("%Y-%m-%d", time.localtime(t))
+        lines = (self.dir / f"telemetry-{day}.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual([json.loads(x)["ram_avail"] for x in lines], [3000, 2900])
+
+    def test_old_days_are_deleted_and_other_files_are_left(self):
+        now = time.time()
+        old = time.strftime("%Y-%m-%d", time.localtime(now - 20 * 86400))
+        recent = time.strftime("%Y-%m-%d", time.localtime(now - 3 * 86400))
+        for n in (f"telemetry-{old}.jsonl", f"telemetry-{recent}.jsonl", "requests-2026-10.jsonl"):
+            (self.dir / n).write_text("{}\n", encoding="utf-8")
+        HistoryStore(self.dir, telemetry_days=14).append_telemetry({"t": now})
+        names = sorted(p.name for p in self.dir.iterdir())
+        self.assertNotIn(f"telemetry-{old}.jsonl", names)
+        self.assertIn(f"telemetry-{recent}.jsonl", names)
+        self.assertIn("requests-2026-10.jsonl", names)
+
+    def test_off_with_the_history_or_with_telemetry_false(self):
+        HistoryStore(self.dir / "a", enabled=False).append_telemetry({"t": time.time()})
+        HistoryStore(self.dir / "b", telemetry=False).append_telemetry({"t": time.time()})
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_the_request_pages_do_not_count_the_record(self):
+        store = HistoryStore(self.dir)
+        store.append(rec(1))
+        store.append_telemetry({"t": time.time()})
+        self.assertEqual(store.page(0, 10)["total"], 1)
 
 
 if __name__ == "__main__":
