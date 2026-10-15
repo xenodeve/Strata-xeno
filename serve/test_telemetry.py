@@ -167,6 +167,15 @@ class MemoryPressure(unittest.TestCase):
         self.assertIs(m.read(os.getpid()), first)         # the sampler's 5 Hz does not read the OS five times
         self.assertIsNot(m.read(None), first)              # another process (none) is a new reading
 
+    @unittest.skipUnless(sys.platform == "win32", "the shared ctypes.windll exists on Windows only")
+    def test_the_shared_kernel32_prototypes_are_left_alone(self):
+        import ctypes
+        import os
+        from serve.telemetry import _MemPressure
+        before = (ctypes.windll.kernel32.OpenProcess.restype, ctypes.windll.kernel32.CloseHandle.argtypes)
+        _MemPressure().read(os.getpid())
+        self.assertEqual((ctypes.windll.kernel32.OpenProcess.restype, ctypes.windll.kernel32.CloseHandle.argtypes), before)
+
     def test_no_engine_and_a_gone_engine_give_no_engine_fields(self):
         from serve.telemetry import _MemPressure
         m = _MemPressure()
@@ -218,19 +227,25 @@ class Record(unittest.TestCase):
             log.add(reading(), t0 + i, busy=i < 5)              # 5 busy seconds, then 25 idle ones
         self.assertEqual([round(p["t"] - t0) for p in got], [0, 1, 2, 3, 4, 14, 24])
         self.assertEqual(len(log.points), 30)                  # memory keeps every second
-        self.assertEqual(len(log.window(t0, t0 + 29, max_points=10)[1]), 10)
+        self.assertEqual(len(log.window(t0, t0 + 29)[1]), 30)         # a request's detail keeps every second
 
-    def test_a_sink_that_fails_is_dropped_and_the_memory_window_stays(self):
+    def test_a_sink_that_fails_pauses_a_minute_and_the_memory_window_stays(self):
         from serve.telemetry import TelemetryLog
-        calls = []
+        calls, fail = [], [True]
 
-        def full_disk(p):
-            calls.append(p)
-            raise OSError("No space left on device")
-        log = TelemetryLog(full_disk)
-        log.add(reading(), 1_800_000_000.0, busy=True)
-        log.add(reading(), 1_800_000_001.0, busy=True)
-        self.assertEqual((len(calls), log.sink, len(log.points)), (1, None, 2))
+        def disk(p):
+            calls.append(p["t"])
+            if fail[0]:
+                raise OSError("No space left on device")
+        log = TelemetryLog(disk)
+        t0 = 1_800_000_000.0
+        log.add(reading(), t0, busy=True)                     # fails: paused for SINK_RETRY_S
+        log.add(reading(), t0 + 30, busy=True)                # still paused: not tried
+        fail[0] = False
+        log.add(reading(), t0 + 61, busy=True)                # tried again, and it works
+        log.add(reading(), t0 + 62, busy=True)
+        self.assertEqual([round(t - t0) for t in calls], [0, 61, 62])
+        self.assertEqual(len(log.points), 4)
 
 
 if __name__ == "__main__":

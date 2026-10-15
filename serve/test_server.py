@@ -1738,7 +1738,9 @@ class RequestHistory(unittest.TestCase):
         tok = ByteTokenizer()
         self.svc = Service(RecordingEngine(tok, "</think>\n\nhello", max_context=CTX), tok,
                            ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        self.svc.hstore = HistoryStore(self.tmp.name)
+        # #237: no hardware record here: the sampler thread would write into the folder tearDown removes (a
+        # PermissionError on Windows when the two meet); the one test of the record turns it on for itself
+        self.svc.hstore = HistoryStore(self.tmp.name, telemetry=False)
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
@@ -1746,7 +1748,7 @@ class RequestHistory(unittest.TestCase):
         self.httpd.shutdown()
         self.httpd.server_close()
         if getattr(self.svc, "telemetry", None) is not None:
-            self.svc.telemetry.close()          # #237: its record writes into the folder about to be removed
+            self.svc.telemetry.close()
         self.tmp.cleanup()
 
     def test_the_hardware_over_a_request_goes_to_the_summary_and_the_detail(self):
@@ -1777,9 +1779,12 @@ class RequestHistory(unittest.TestCase):
 
     def test_the_per_second_record_lands_beside_the_history(self):
         """xeno #237: the sampler's daily file goes into the history folder (history.telemetry, on by default)."""
+        from serve.history import HistoryStore
+        rec_dir = Path(self.tmp.name) / "on"
+        self.svc.hstore = HistoryStore(rec_dir)                  # telemetry on: the default
         self.svc.telemetry.log.add({"ram_avail": 2**30}, time.time(), busy=True)
-        self.assertTrue(list(Path(self.tmp.name).glob("telemetry-*.jsonl")))
-        self.svc.hstore = type(self.svc.hstore)(Path(self.tmp.name) / "off", telemetry=False)   # the sink follows hstore
+        self.assertTrue(list(rec_dir.glob("telemetry-*.jsonl")))
+        self.svc.hstore = HistoryStore(Path(self.tmp.name) / "off", telemetry=False)   # the sink follows hstore
         self.svc.telemetry.log.add({"ram_avail": 2**30}, time.time(), busy=True)
         self.assertFalse((Path(self.tmp.name) / "off").exists())
 

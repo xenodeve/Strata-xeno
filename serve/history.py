@@ -137,7 +137,8 @@ class HistoryStore:
     def _prune_telemetry(self, now: float) -> None:
         cut = time.strftime("%Y-%m-%d", time.localtime(now - self.telemetry_days * 86400))
         for p in self.dir.glob("telemetry-*.jsonl"):
-            if p.name[10:20] < cut:
+            day = p.name[len("telemetry-"):-len(".jsonl")]       # YYYY-MM-DD: the dates sort as text
+            if day < cut:
                 try:
                     p.unlink()
                 except OSError:

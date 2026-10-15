@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import collections
 import ctypes
-import json
 import os
 import platform
 import sys
@@ -406,7 +405,9 @@ class _MemPressure:
         self._last = (0.0, None, {})          # (time, pid, reading) for the readings sooner than MIN_INTERVAL_S
         if self.nt:
             self._open_pdh()
-            k32 = ctypes.windll.kernel32
+            # its own kernel32 instance, as serve/winjob.py has: the prototypes set here must not change
+            # ctypes.windll.kernel32, which the whole process shares
+            self._k32 = k32 = ctypes.WinDLL("kernel32")
             k32.OpenProcess.restype = ctypes.c_void_p
             k32.K32GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
             k32.CloseHandle.argtypes = [ctypes.c_void_p]
@@ -455,7 +456,7 @@ class _MemPressure:
         return (maj - prev[1]) / (now - prev[0]) if prev is not None and now > prev[0] else None
 
     def _engine_nt(self, pid):
-        k32 = ctypes.windll.kernel32
+        k32 = self._k32
         if self._proc[0] != pid:
             if self._proc[1]:
                 k32.CloseHandle(self._proc[1])
@@ -557,32 +558,36 @@ class TelemetryLog:
     one compact point a second in memory for the last KEEP_S seconds (a finished request's hardware reads its window
     from them), handed to `sink(point)` - every second while a request runs, every IDLE_EVERY_S seconds otherwise.
     The server's sink is HistoryStore.append_telemetry, which owns the files and their age.  A sink that raises
-    OSError (a full or missing disk) is dropped; the memory window stays."""
+    OSError (a full disk, a file an antivirus holds) is paused SINK_RETRY_S seconds with one line in the log, then
+    tried again; the memory window never stops."""
 
     KEEP_S = 7200
     IDLE_EVERY_S = 10.0
+    SINK_RETRY_S = 60.0
 
     def __init__(self, sink=None):
         self.sink = sink
         self.lock = threading.Lock()
         self.points = collections.deque(maxlen=self.KEEP_S)
         self._last_sink = 0.0
+        self._sink_paused_until = 0.0
 
     def add(self, s, t, busy):
         p = compact_point(s, t, busy)
         with self.lock:
             self.points.append(p)
-        if self.sink is None or (not busy and t - self._last_sink < self.IDLE_EVERY_S):
+        if self.sink is None or t < self._sink_paused_until or (not busy and t - self._last_sink < self.IDLE_EVERY_S):
             return
         self._last_sink = t
         try:
             self.sink(p)
-        except OSError:
-            self.sink = None
+        except OSError as e:
+            self._sink_paused_until = t + self.SINK_RETRY_S
+            print(f"[strata] hardware record not saved ({e}); trying again in {self.SINK_RETRY_S:.0f} s", flush=True)
 
-    def window(self, t0, t1, max_points=600):
-        """(summary, points) for [t0, t1]: the summary over every point of the window, the points thinned evenly to at
-        most `max_points`.  The points are in time order, so the walk starts at the newest and stops before t0."""
+    def window(self, t0, t1):
+        """(summary, points) for [t0, t1], every second of it (at most KEEP_S points).  The points are in time order, so
+        the walk starts at the newest and stops before t0: a request's window costs its own length, not the deque's."""
         pts = []
         with self.lock:
             for p in reversed(self.points):
@@ -591,8 +596,7 @@ class TelemetryLog:
                 if p["t"] <= t1:
                     pts.append(p)
         pts.reverse()
-        step = max(1, -(-len(pts) // max_points))
-        return window_summary(pts), pts[::step]
+        return window_summary(pts), pts
 
 
 # ------------------------------------------------------------------------------------------------ the sampler

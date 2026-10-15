@@ -701,7 +701,14 @@ three kinds of file:
   `hw_series` (the request's seconds). The total is capped at `detail_cap_gb`, with the oldest deleted first.
 - **`telemetry-YYYY-MM-DD.jsonl`:** one point every second while a request runs, every 10 s otherwise. A point holds
   CPU, RAM used and available, commit, hard faults/s, the engine's working set and faults/s, tok/s, and each card's
-  load, VRAM and PCIe traffic. These files are kept `telemetry_days` days.
+  load, VRAM and PCIe traffic. A point is about 207 bytes with two cards (0.75 MB per busy hour, 0.07 MB per idle
+  hour). These files are kept `telemetry_days` days. A write that fails (a full disk, a file an antivirus holds) is
+  logged once and retried a minute later; the two hours in memory are kept either way.
+
+Measured on this PC (i5-13500, Windows 11):
+- one OS reading costs 20 µs, and it is taken at most once a second;
+- a request's `hw` and `hw_series` cost 0.25 ms at the end of a 2-minute request and 1.1 ms at the end of a
+  10-minute one, at most 29 ms for a request that fills the whole 2-hour window.
 
 Memory pressure is read from the OS directly, with or without psutil:
 - Windows: `GlobalMemoryStatusEx`, the PDH counter `\Memory\Pages Input/sec` and `K32GetProcessMemoryInfo`;
