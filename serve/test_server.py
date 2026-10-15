@@ -1745,7 +1745,45 @@ class RequestHistory(unittest.TestCase):
     def tearDown(self):
         self.httpd.shutdown()
         self.httpd.server_close()
+        if getattr(self.svc, "telemetry", None) is not None:
+            self.svc.telemetry.close()          # #237: its record writes into the folder about to be removed
         self.tmp.cleanup()
+
+    def test_the_hardware_over_a_request_goes_to_the_summary_and_the_detail(self):
+        """xeno #237: the summary row carries the hardware of the request's own window, the detail its seconds."""
+        seen = []
+
+        class FakeTelemetry:
+            def request_summary(self, t0, t1):
+                seen.append((t0, t1))
+                return {"samples": 2, "ram_avail_min_mib": 3100}
+
+            def request_series(self, t0, t1):
+                return [{"t": t0, "ram_avail": 3200}, {"t": t1, "ram_avail": 3100}]
+
+            def snapshot(self):
+                return {"now": {}, "history": {}, "static": {}}
+
+            def close(self):
+                pass
+
+        self.svc.telemetry.close()
+        self.svc.telemetry = FakeTelemetry()
+        self.call("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5})
+        row = self.get("/metrics/requests")[1]["items"][0]
+        self.assertEqual(row["hw"], {"samples": 2, "ram_avail_min_mib": 3100})
+        self.assertEqual(len(seen), 1)
+        self.assertLessEqual(row["time"], seen[0][1])
+        self.assertEqual(seen[0][0], row["time"])                       # the window starts with the request
+        detail = self.get(f"/metrics/requests/{row['id']}")[1]["detail"]
+        self.assertEqual([p["ram_avail"] for p in detail["hw_series"]], [3200, 3100])
+
+    def test_the_per_second_record_lands_beside_the_history(self):
+        """xeno #237: the sampler's daily file goes into the history folder (history.telemetry, on by default)."""
+        tel = self.svc.telemetry
+        self.assertEqual(tel.log.dir, str(Path(self.tmp.name)))
+        tel.log.add({"ram_avail": 2**30}, time.time(), busy=True)
+        self.assertTrue(list(Path(self.tmp.name).glob("telemetry-*.jsonl")))
 
     def call(self, path, body, headers=None):
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),

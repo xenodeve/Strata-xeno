@@ -685,6 +685,31 @@ token, time between tokens and request duration (p50 / p95), the prompt cache an
 own panels (state, batch slots, rates, expert cache hit rate, GPU and RAM). Its first row uses only vLLM's names, so
 it also reads a vLLM server.
 
+**What is kept on disk, for reading a stall back afterwards (xeno #237).** The request history lives in
+`%LOCALAPPDATA%\Strata\history` (Linux: `$XDG_STATE_HOME/Strata/history`, or `~/.local/state/Strata/history`). It has
+three kinds of file:
+
+- **`requests-YYYY-MM.jsonl`:** one summary per request, kept for good (`GET /metrics/requests`). It holds the prompt,
+  the tokens reused and read, the timings, the finish reason and the tier split. Its `hw` field is the hardware over
+  that request's own seconds:
+  - the lowest RAM available and the highest commit;
+  - hard page faults per second (max and mean);
+  - the engine's working-set range and its page faults per second;
+  - CPU;
+  - each card's load and VRAM.
+- **`detail/<id>.json.gz`:** per request, the prompt-read chunks, the decode series, the stage counters, and
+  `hw_series` (the request's seconds). The total is capped at `detail_cap_gb`, with the oldest deleted first.
+- **`telemetry-YYYY-MM-DD.jsonl`:** one point every second while a request runs, every 10 s otherwise. A point holds
+  CPU, RAM used and available, commit, hard faults/s, the engine's working set and faults/s, tok/s, and each card's
+  load, VRAM and PCIe traffic. These files are kept `telemetry_days` days.
+
+Memory pressure is read from the OS directly, with or without psutil:
+- Windows: `GlobalMemoryStatusEx`, the PDH counter `\Memory\Pages Input/sec` and `K32GetProcessMemoryInfo`;
+- Linux: `/proc/meminfo`, `/proc/vmstat` and `/proc/<pid>`.
+
+The run-config block is `"history": {"enabled": true, "dir": "...", "detail_cap_gb": 2, "telemetry": true,
+"telemetry_days": 14}`. `"telemetry": false` keeps the record in memory only (the last two hours).
+
 `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `/slots` uses llama.cpp's names: `n_ctx` and `n_prompt_tokens` (the running request's prompt size, kept after it ends: what a front-end's context meter divides by `n_ctx`). `total_slots` in `/props` is the number of `--batch` slots (1 without). `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
 
 `chat_template_caps` uses llama.cpp's field names. Strata checks them when loading the active template by rendering
