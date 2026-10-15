@@ -6,6 +6,10 @@ A background thread samples once a second and keeps the last 60 readings of each
   amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
+- Memory pressure (xeno #237): RAM available, the commit charge, hard page faults per second, and the engine's working
+  set and page faults per second - read from the OS directly, psutil or not.
+- The record kept (xeno #237): TelemetryLog keeps the last two hours in memory, one point a second, and hands them to
+  a sink - the server's HistoryStore, which writes telemetry-YYYY-MM-DD.jsonl - so a past stall can be read back.
 Anything that cannot be read is None; nothing here can stop the server.
 """
 from __future__ import annotations
@@ -315,6 +319,39 @@ def _cpu_name():
     return platform.processor() or None
 
 
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def os_memory():
+    """The OS's own memory figures, psutil or not: {"total", "avail", "commit_used", "commit_limit"} in bytes, or {}.
+    Windows: GlobalMemoryStatusEx, whose page-file fields are the commit charge and its limit.  Linux: /proc/meminfo,
+    MemAvailable and Committed_AS / CommitLimit."""
+    if os.name == "nt":
+        m = _MemoryStatusEx()
+        m.dwLength = ctypes.sizeof(m)
+        try:
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return {"total": m.ullTotalPhys, "avail": m.ullAvailPhys,
+                        "commit_used": m.ullTotalPageFile - m.ullAvailPageFile, "commit_limit": m.ullTotalPageFile}
+        except (OSError, AttributeError):
+            pass
+        return {}
+    try:
+        info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
+        kb = lambda k: int(info[k].split()[0]) * 1024     # noqa: E731
+        out = {"total": kb("MemTotal"), "avail": kb("MemAvailable")}
+        if "Committed_AS" in info and "CommitLimit" in info:
+            out.update(commit_used=kb("Committed_AS"), commit_limit=kb("CommitLimit"))
+        return out
+    except (OSError, KeyError, ValueError):
+        return {}
+
+
 class _CpuRamFallback:
     """CPU load and RAM without psutil."""
 
@@ -342,37 +379,242 @@ class _CpuRamFallback:
 
     @staticmethod
     def ram():
-        if os.name == "nt":
-            class MS(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-            m = MS()
-            m.dwLength = ctypes.sizeof(MS)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
-                return m.ullTotalPhys - m.ullAvailPhys, m.ullTotalPhys
+        m = os_memory()
+        if "total" not in m:
             return None, None
+        return m["total"] - m["avail"], m["total"]
+
+
+# ------------------------------------------------------------------------------------------------ memory pressure
+class _MemPressure:
+    """What paging looks like (xeno #237), with or without psutil: the commit charge against its limit, the hard page
+    faults per second (pages read back from disk, the system-wide stutter), and the engine process's working set and
+    page faults per second (soft and hard; a working set the OS trimmed faults back in).  The RAM left comes from the
+    sampler's own RAM reading.  Windows: os_memory, the PDH counter \\Memory\\Pages Input/sec and
+    K32GetProcessMemoryInfo.  Linux: os_memory, /proc/vmstat pgmajfault, /proc/<pid>/statm and /proc/<pid>/stat.
+    Rates are taken over at least a second: a reading sooner than that returns the last one."""
+
+    MIN_INTERVAL_S = 1.0
+
+    def __init__(self):
+        self.nt = os.name == "nt"
+        self._pdh = self._q = self._c = None
+        self._proc = (None, None)             # (pid, handle) on Windows
+        self._prev_sys = None                 # Linux: (time, pgmajfault)
+        self._prev_eng = None                 # (pid, time, page faults)
+        self._last = (0.0, None, {})          # (time, pid, reading) for the readings sooner than MIN_INTERVAL_S
+        if self.nt:
+            self._open_pdh()
+            # its own kernel32 instance, as serve/winjob.py has: the prototypes set here must not change
+            # ctypes.windll.kernel32, which the whole process shares
+            self._k32 = k32 = ctypes.WinDLL("kernel32")
+            k32.OpenProcess.restype = ctypes.c_void_p
+            k32.K32GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    def _open_pdh(self):
         try:
-            info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
-            total = int(info["MemTotal"].split()[0]) * 1024
-            avail = int(info["MemAvailable"].split()[0]) * 1024
-            return total - avail, total
-        except (OSError, KeyError, ValueError):
-            return None, None
+            pdh = ctypes.WinDLL("pdh")
+            q, c = ctypes.c_void_p(), ctypes.c_void_p()
+            if pdh.PdhOpenQueryW(None, None, ctypes.byref(q)) != 0:
+                return
+            if pdh.PdhAddEnglishCounterW(q, ctypes.c_wchar_p(r"\Memory\Pages Input/sec"), None, ctypes.byref(c)) != 0:
+                pdh.PdhCloseQuery(q)
+                return
+            pdh.PdhCollectQueryData(q)        # a rate needs two collections: the first one is the base
+            self._pdh, self._q, self._c = pdh, q, c
+        except (OSError, AttributeError):
+            self._pdh = None
+
+    class _PdhValue(ctypes.Structure):
+        _fields_ = [("CStatus", ctypes.c_ulong), ("doubleValue", ctypes.c_double)]
+
+    class _ProcMem(ctypes.Structure):
+        _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong)] + \
+                   [(n, ctypes.c_size_t) for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                                                   "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                                                   "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
+
+    def _hard_faults_s(self):
+        if self.nt:
+            if self._pdh is None:
+                return None
+            v = self._PdhValue()
+            try:
+                if self._pdh.PdhCollectQueryData(self._q) == 0 and \
+                        self._pdh.PdhGetFormattedCounterValue(self._c, 0x200, None, ctypes.byref(v)) == 0:   # PDH_FMT_DOUBLE
+                    return v.doubleValue
+            except (OSError, AttributeError):
+                pass
+            return None
+        try:
+            maj = next(int(line.split()[1]) for line in open("/proc/vmstat") if line.startswith("pgmajfault "))
+        except (OSError, StopIteration, ValueError):
+            return None
+        now, prev = time.time(), self._prev_sys
+        self._prev_sys = (now, maj)
+        return (maj - prev[1]) / (now - prev[0]) if prev is not None and now > prev[0] else None
+
+    def _engine_nt(self, pid):
+        k32 = self._k32
+        if self._proc[0] != pid:
+            if self._proc[1]:
+                k32.CloseHandle(self._proc[1])
+            self._proc = (pid, k32.OpenProcess(ctypes.c_ulong(0x1000 | 0x0010), False, ctypes.c_ulong(pid)))   # QUERY_LIMITED | VM_READ
+        h = self._proc[1]
+        if not h:
+            return None
+        pm = self._ProcMem()
+        pm.cb = ctypes.sizeof(pm)
+        if not k32.K32GetProcessMemoryInfo(h, ctypes.byref(pm), pm.cb):
+            self._proc = (None, None)         # the engine exited: a new handle next time
+            k32.CloseHandle(h)
+            return None
+        return pm.WorkingSetSize, pm.PageFaultCount
+
+    @staticmethod
+    def _engine_linux(pid):
+        try:
+            rss = int(open(f"/proc/{pid}/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+            s = open(f"/proc/{pid}/stat").read()
+            rest = s[s.rfind(")") + 2:].split()                # field n of stat(5) is rest[n - 3]
+            return rss, int(rest[7]) + int(rest[9])              # minflt + majflt
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def read(self, pid=None):
+        now = time.time()
+        if now - self._last[0] < self.MIN_INTERVAL_S and pid == self._last[1]:
+            return self._last[2]
+        try:
+            m = os_memory()
+            out = {k: m[k] for k in ("commit_used", "commit_limit") if k in m}
+            out["hard_pf_s"] = self._hard_faults_s()
+        except Exception:  # noqa: BLE001 - telemetry must never take the server down
+            out = {}
+        if pid:
+            try:
+                r = self._engine_nt(pid) if self.nt else self._engine_linux(pid)
+            except Exception:  # noqa: BLE001
+                r = None
+            if r is not None:
+                ws, faults = r
+                out["engine_ws"] = ws
+                prev = self._prev_eng
+                self._prev_eng = (pid, now, faults)
+                if prev is not None and prev[0] == pid and now > prev[1]:
+                    d = faults - prev[2]
+                    if d < 0 and self.nt:
+                        d += 2**32                # PageFaultCount is a DWORD and wraps
+                    if d >= 0:
+                        out["engine_pf_s"] = d / (now - prev[1])
+        self._last = (now, pid, out)
+        return out
+
+
+# ------------------------------------------------------------------------------------------------ the record kept
+def compact_point(s, t, busy):
+    """One second of readings as the log keeps it (~200 bytes): RAM, commit and the engine in MiB, faults per second,
+    and per card [load %, VRAM used MiB, PCIe rx MB/s, PCIe tx MB/s]."""
+    mib = lambda v: None if v is None else int(v) >> 20          # noqa: E731
+    num = lambda v: None if v is None else round(v, 1)           # noqa: E731
+    return {"t": round(t, 1), "busy": 1 if busy else 0, "cpu": num(s.get("cpu")), "ram_used": mib(s.get("ram_used")),
+            "ram_avail": mib(s.get("ram_avail")), "commit": mib(s.get("commit_used")),
+            "commit_limit": mib(s.get("commit_limit")), "hard_pf": num(s.get("hard_pf_s")),
+            "eng_ws": mib(s.get("engine_ws")), "eng_pf": num(s.get("engine_pf_s")), "tok_s": num(s.get("tok_s")),
+            "g": [[g.get("util"), mib(g.get("mem_used")), num(g.get("pcie_rx_mb")), num(g.get("pcie_tx_mb"))]
+                  for g in s.get("gpus") or []]}
+
+
+def window_summary(pts):
+    """The hardware over one request's points (xeno #237): the lowest RAM left, the highest commit and fault rates,
+    the engine's working-set range, the CPU, and each card's load and VRAM.  None when there are no points."""
+    if not pts:
+        return None
+    mean = lambda v: sum(v) / len(v)                              # noqa: E731
+
+    def agg(fn, vals):
+        vals = [v for v in vals if v is not None]
+        return round(fn(vals), 1) if vals else None
+
+    def col(k):
+        return [p.get(k) for p in pts]
+
+    def card_col(i, j):
+        return [p["g"][i][j] for p in pts if len(p.get("g") or []) > i]
+
+    cards = max((len(p.get("g") or []) for p in pts), default=0)
+    return {"samples": len(pts), "ram_avail_min_mib": agg(min, col("ram_avail")), "commit_max_mib": agg(max, col("commit")),
+            "commit_limit_mib": agg(max, col("commit_limit")), "hard_pf_max": agg(max, col("hard_pf")),
+            "hard_pf_mean": agg(mean, col("hard_pf")), "eng_ws_min_mib": agg(min, col("eng_ws")),
+            "eng_ws_max_mib": agg(max, col("eng_ws")), "eng_pf_max": agg(max, col("eng_pf")),
+            "eng_pf_mean": agg(mean, col("eng_pf")), "cpu_max": agg(max, col("cpu")), "cpu_mean": agg(mean, col("cpu")),
+            "gpus": [{"util_mean": agg(mean, card_col(i, 0)), "util_max": agg(max, card_col(i, 0)),
+                      "mem_max_mib": agg(max, card_col(i, 1))} for i in range(cards)]}
+
+
+class TelemetryLog:
+    """The readings kept past the 60-second window (xeno #237), so a stall or a stutter can be read back afterwards:
+    one compact point a second in memory for the last KEEP_S seconds (a finished request's hardware reads its window
+    from them), handed to `sink(point)` - every second while a request runs, every IDLE_EVERY_S seconds otherwise.
+    The server's sink is HistoryStore.append_telemetry, which owns the files and their age.  A sink that raises
+    OSError (a full disk, a file an antivirus holds) is paused SINK_RETRY_S seconds with one line in the log, then
+    tried again; the memory window never stops."""
+
+    KEEP_S = 7200
+    IDLE_EVERY_S = 10.0
+    SINK_RETRY_S = 60.0
+
+    def __init__(self, sink=None):
+        self.sink = sink
+        self.lock = threading.Lock()
+        self.points = collections.deque(maxlen=self.KEEP_S)
+        self._last_sink = 0.0
+        self._sink_paused_until = 0.0
+
+    def add(self, s, t, busy):
+        p = compact_point(s, t, busy)
+        with self.lock:
+            self.points.append(p)
+        if self.sink is None or t < self._sink_paused_until or (not busy and t - self._last_sink < self.IDLE_EVERY_S):
+            return
+        self._last_sink = t
+        try:
+            self.sink(p)
+        except OSError as e:
+            self._sink_paused_until = t + self.SINK_RETRY_S
+            print(f"[strata] hardware record not saved ({e}); trying again in {self.SINK_RETRY_S:.0f} s", flush=True)
+
+    def window(self, t0, t1):
+        """(summary, points) for [t0, t1], every second of it (at most KEEP_S points).  The points are in time order, so
+        the walk starts at the newest and stops before t0: a request's window costs its own length, not the deque's."""
+        pts = []
+        with self.lock:
+            for p in reversed(self.points):
+                if p["t"] < t0:
+                    break
+                if p["t"] <= t1:
+                    pts.append(p)
+        pts.reverse()
+        return window_summary(pts), pts
 
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, busy_fn=None, model_path=None, amd=False):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, busy_fn=None, model_path=None, amd=False,
+                 pid_fn=None, sink=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
         PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
-        cards, numbered as HIP numbers them, read from sysfs (#301)."""
+        cards, numbered as HIP numbers them, read from sysfs (#301).  `pid_fn()` -> the engine's process id or None,
+        for its working set and page faults; `sink(point)`: where TelemetryLog hands its per-second points (the
+        server's HistoryStore.append_telemetry; None: memory only) (xeno #237)."""
         self.extra = extra
         self.busy_fn = busy_fn            # True while a request runs: the cards are then sampled five times a second
+        self.pid_fn = pid_fn
+        self.mem = _MemPressure()
+        self.log = TelemetryLog(sink)
         self.last_record = 0.0
         self.disks_now = None
         self.lock = threading.Lock()
@@ -427,7 +669,7 @@ class Telemetry:
     @staticmethod
     def history_keys(s):
         keys = ["gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used", "disk_read_mb",
-                "tok_s", "prefill_tok_s_mean"]
+                "tok_s", "prefill_tok_s_mean", "ram_avail", "hard_pf_s", "engine_ws", "engine_pf_s"]   # the last four: #237
         for g in s.get("gpus", []):
             keys += [f"gpu{g['index']}_{k}" for k in ("util", "temp", "power", "mem_used", "pcie_rx_mb", "pcie_tx_mb")]
         return keys
@@ -497,6 +739,15 @@ class Telemetry:
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
         s["disks"] = self._disks_per()        # per disk (psutil only): MB/s and the OS-observed read latency
+        if s.get("ram_total") is not None and s.get("ram_used") is not None:
+            s["ram_avail"] = s["ram_total"] - s["ram_used"]          # xeno #237: the RAM left, from the same reading
+        mem = getattr(self, "mem", None)     # None in a sampler built without __init__ (the tests' bare())
+        if mem is not None:                   # xeno #237: commit, hard faults, the engine's working set
+            try:
+                pid = self.pid_fn() if self.pid_fn else None
+            except Exception:  # noqa: BLE001 - telemetry must never take the server down
+                pid = None
+            s.update(mem.read(pid))
         if self.extra:
             try:
                 s.update(self.extra())
@@ -511,16 +762,27 @@ class Telemetry:
     def _loop(self):
         while not self._stop.is_set():
             s = self.sample()
+            now = time.time()
             with self.lock:
                 self.now = s
-                if self.should_record(time.time()):
+                record = self.should_record(now)
+                if record:
                     for k in self.history_keys(s):
                         v = s.get(k)
                         if v is None and k.startswith("gpu") and k[3].isdigit():       # a card's own series
                             idx, _, field = k[3:].partition("_")
                             v = next((g.get(field) for g in s.get("gpus", []) if str(g["index"]) == idx), None)
                         self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+            if record:                        # outside self.lock: the log has its own, and a disk write may be slow
+                try:
+                    self.log.add(s, now, bool(self.busy_fn()) if self.busy_fn else False)
+                except Exception:  # noqa: BLE001 - telemetry must never take the server down
+                    pass
             self._stop.wait(self.interval())
+
+    def request_hw(self, t0, t1):
+        """(summary, points) of [t0, t1]: a finished request's `hw` and its detail's `hw_series` (xeno #237)."""
+        return self.log.window(t0, t1)
 
     def snapshot(self):
         with self.lock:

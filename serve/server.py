@@ -3644,7 +3644,11 @@ class Service:
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        busy_fn=lambda: bool(self.status.get("busy")),      # 5 Hz while a request runs
                                        model_path=getattr(self.engine, "model_path", None),
-                                       amd=getattr(self, "backend", None) == "hip")
+                                       amd=getattr(self, "backend", None) == "hip",
+                                       # xeno #237: the engine's working set and faults; the per-second record goes to
+                                       # the request history, which decides whether to keep it (history.telemetry)
+                                       pid_fn=lambda: getattr(getattr(self.engine, "proc", None), "pid", None),
+                                       sink=lambda p: self.hstore.append_telemetry(p))
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
                 # slow card keeps the GPU at work while the host thread sleeps)
@@ -4670,10 +4674,14 @@ class Service:
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
+                            tel = getattr(self, "telemetry", None)       # xeno #237: the hardware over this request
+                            hw, hw_series = tel.request_hw(started, time.time()) if tel is not None else (None, [])
+                            rec["hw"] = hw
                             self.history.append(rec)
                             to_disk = (rec, {"prefill_chunks": chunks["items"] if chunks else [],
                                              "decode_series": decode["series"] if decode else [],
                                              "stats": last.get("stats"),
+                                             "hw_series": hw_series,
                                              **({"prompt": prompt} if prompt is not None else {})})   # written after the lock is let go
                             t = self.totals
                             t["requests"] += 1
@@ -7633,10 +7641,12 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
-    hist = cfg.get("history") if isinstance(cfg.get("history"), dict) else {}      # {"enabled", "dir", "detail_cap_gb"}
-    from serve.history import default_dir
+    hist = cfg.get("history") if isinstance(cfg.get("history"), dict) else {}      # {"enabled", "dir", "detail_cap_gb",
+    from serve.history import TELEMETRY_DAYS, default_dir                          #  "telemetry", "telemetry_days"}
     svc.hstore = HistoryStore(hist.get("dir") or default_dir(), enabled=hist.get("enabled", True) is not False,
-                              detail_cap_bytes=int(float(hist.get("detail_cap_gb", 2)) * 2**30))
+                              detail_cap_bytes=int(float(hist.get("detail_cap_gb", 2)) * 2**30),
+                              telemetry=hist.get("telemetry", True) is not False,             # xeno #237
+                              telemetry_days=hist.get("telemetry_days", TELEMETRY_DAYS))
     svc.checkpoints = checkpoints_mod.Checkpoints()          # the way back for files the tools change: in the user's data folder, the oldest trimmed at start
     threading.Thread(target=svc.checkpoints.trim, daemon=True).start()
     def _model_info(files=gguf_info.files_from_args(list(cfg.get("args") or []))):

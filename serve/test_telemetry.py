@@ -134,5 +134,119 @@ class Storage(unittest.TestCase):
         self.assertEqual(rates[1], {"index": 1, "read_mb": 0.0, "write_mb": 0.0, "read_ms_op": None})   # no reads: no latency
 
 
+def reading(**kw):
+    s = {"cpu": 40.0, "ram_used": 44 * 2**30, "ram_avail": 3 * 2**30, "commit_used": 85 * 2**30,
+         "commit_limit": 95 * 2**30, "hard_pf_s": 20.0, "engine_ws": 20 * 2**30, "engine_pf_s": 1000.0, "tok_s": 50.0,
+         "gpus": [{"util": 30, "mem_used": 11 * 2**30, "pcie_rx_mb": 100.0, "pcie_tx_mb": 5.0},
+                  {"util": 90, "mem_used": 15 * 2**30, "pcie_rx_mb": 50.0, "pcie_tx_mb": 1.0}]}
+    s.update(kw)
+    return s
+
+
+class MemoryPressure(unittest.TestCase):
+    """xeno #237: commit, hard faults and the engine's working set, read from the OS, psutil or not."""
+
+    def test_this_process_reads_as_an_engine(self):
+        from serve.telemetry import _MemPressure
+        import os
+        m = _MemPressure()
+        m.MIN_INTERVAL_S = 0.0                             # two readings back to back
+        first = m.read(os.getpid())
+        self.assertGreater(first.get("engine_ws") or 0, 0)
+        self.assertGreater(first.get("commit_limit") or 0, 0)
+        bytearray(64 * 2**20)                              # touch fresh pages so the fault count moves
+        second = m.read(os.getpid())
+        self.assertIn("engine_pf_s", second, "the second reading of the same process gives its fault rate")
+        self.assertGreaterEqual(second["engine_pf_s"], 0)
+
+    def test_a_reading_sooner_than_a_second_is_the_last_one(self):
+        from serve.telemetry import _MemPressure
+        import os
+        m = _MemPressure()
+        first = m.read(os.getpid())
+        self.assertIs(m.read(os.getpid()), first)         # the sampler's 5 Hz does not read the OS five times
+        self.assertIsNot(m.read(None), first)              # another process (none) is a new reading
+
+    @unittest.skipUnless(sys.platform == "win32", "the shared ctypes.windll exists on Windows only")
+    def test_the_shared_kernel32_prototypes_are_left_alone(self):
+        import ctypes
+        import os
+        from serve.telemetry import _MemPressure
+        before = (ctypes.windll.kernel32.OpenProcess.restype, ctypes.windll.kernel32.CloseHandle.argtypes)
+        _MemPressure().read(os.getpid())
+        self.assertEqual((ctypes.windll.kernel32.OpenProcess.restype, ctypes.windll.kernel32.CloseHandle.argtypes), before)
+
+    def test_no_engine_and_a_gone_engine_give_no_engine_fields(self):
+        from serve.telemetry import _MemPressure
+        m = _MemPressure()
+        self.assertNotIn("engine_ws", m.read(None))
+        self.assertNotIn("engine_ws", m.read(2**31 - 7))   # no such process: nothing, no exception
+
+    def test_the_ram_left_comes_from_the_same_reading_as_the_ram_used(self):
+        s = bare([FakeCard("A", 1, 1)]).sample()        # bare(): RAM (1 used, 2 total), no memory-pressure reader
+        self.assertEqual(s["ram_avail"], 1)
+        self.assertNotIn("engine_ws", s)
+
+    def test_os_memory_has_the_commit(self):
+        from serve.telemetry import os_memory
+        m = os_memory()
+        self.assertGreater(m["total"], m["avail"])
+        self.assertGreater(m["commit_limit"], 0)
+
+
+class Record(unittest.TestCase):
+    """xeno #237: the per-second record past the 60-second window - compact points, a request's window, the sink's
+    cadence (every second busy, every 10 s idle), and a sink that fails."""
+
+    def test_a_point_is_compact_and_keeps_every_card(self):
+        from serve.telemetry import compact_point
+        p = compact_point(reading(), 1000.04, True)
+        self.assertEqual((p["t"], p["busy"], p["ram_avail"], p["commit"], p["eng_ws"], p["hard_pf"]),
+                         (1000.0, 1, 3072, 87040, 20480, 20.0))
+        self.assertEqual(p["g"], [[30, 11264, 100.0, 5.0], [90, 15360, 50.0, 1.0]])
+        self.assertLess(len(json.dumps(p, separators=(",", ":"))), 260)
+        self.assertIsNone(compact_point({}, 1.0, False)["ram_avail"])    # unreadable stays None, never 0
+
+    def test_a_request_window_reads_only_its_own_seconds(self):
+        from serve.telemetry import TelemetryLog
+        log = TelemetryLog()
+        for t, a, f, u in ((10, 9, 0.0, 10), (11, 3, 500.0, 90), (12, 4, 100.0, 50), (13, 1, 9000.0, 99)):
+            log.add(reading(ram_avail=a * 2**30, hard_pf_s=f, gpus=[{"util": u, "mem_used": 2**30}]), t, True)
+        s, pts = log.window(10.5, 12.5)
+        self.assertEqual((s["samples"], s["ram_avail_min_mib"], s["hard_pf_max"], s["hard_pf_mean"]), (2, 3072, 500.0, 300.0))
+        self.assertEqual(s["gpus"], [{"util_mean": 70.0, "util_max": 90, "mem_max_mib": 1024}])
+        self.assertEqual([p["t"] for p in pts], [11, 12])
+        self.assertEqual(log.window(20, 30), (None, []))
+
+    def test_busy_seconds_all_reach_the_sink_idle_ones_every_ten(self):
+        from serve.telemetry import TelemetryLog
+        got = []
+        log = TelemetryLog(got.append)
+        t0 = 1_800_000_000.0
+        for i in range(30):
+            log.add(reading(), t0 + i, busy=i < 5)              # 5 busy seconds, then 25 idle ones
+        self.assertEqual([round(p["t"] - t0) for p in got], [0, 1, 2, 3, 4, 14, 24])
+        self.assertEqual(len(log.points), 30)                  # memory keeps every second
+        self.assertEqual(len(log.window(t0, t0 + 29)[1]), 30)         # a request's detail keeps every second
+
+    def test_a_sink_that_fails_pauses_a_minute_and_the_memory_window_stays(self):
+        from serve.telemetry import TelemetryLog
+        calls, fail = [], [True]
+
+        def disk(p):
+            calls.append(p["t"])
+            if fail[0]:
+                raise OSError("No space left on device")
+        log = TelemetryLog(disk)
+        t0 = 1_800_000_000.0
+        log.add(reading(), t0, busy=True)                     # fails: paused for SINK_RETRY_S
+        log.add(reading(), t0 + 30, busy=True)                # still paused: not tried
+        fail[0] = False
+        log.add(reading(), t0 + 61, busy=True)                # tried again, and it works
+        log.add(reading(), t0 + 62, busy=True)
+        self.assertEqual([round(t - t0) for t in calls], [0, 61, 62])
+        self.assertEqual(len(log.points), 4)
+
+
 if __name__ == "__main__":
     unittest.main()

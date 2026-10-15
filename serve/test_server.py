@@ -1738,14 +1738,55 @@ class RequestHistory(unittest.TestCase):
         tok = ByteTokenizer()
         self.svc = Service(RecordingEngine(tok, "</think>\n\nhello", max_context=CTX), tok,
                            ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        self.svc.hstore = HistoryStore(self.tmp.name)
+        # #237: no hardware record here: the sampler thread would write into the folder tearDown removes (a
+        # PermissionError on Windows when the two meet); the one test of the record turns it on for itself
+        self.svc.hstore = HistoryStore(self.tmp.name, telemetry=False)
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
     def tearDown(self):
         self.httpd.shutdown()
         self.httpd.server_close()
+        if getattr(self.svc, "telemetry", None) is not None:
+            self.svc.telemetry.close()
         self.tmp.cleanup()
+
+    def test_the_hardware_over_a_request_goes_to_the_summary_and_the_detail(self):
+        """xeno #237: the summary row carries the hardware of the request's own window, the detail its seconds."""
+        seen = []
+
+        class FakeTelemetry:
+            def request_hw(self, t0, t1):
+                seen.append((t0, t1))
+                return {"samples": 2, "ram_avail_min_mib": 3100}, [{"t": t0, "ram_avail": 3200}, {"t": t1, "ram_avail": 3100}]
+
+            def snapshot(self):
+                return {"now": {}, "history": {}, "static": {}}
+
+            def close(self):
+                pass
+
+        self.svc.telemetry.close()
+        self.svc.telemetry = FakeTelemetry()
+        self.call("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5})
+        row = self.get("/metrics/requests")[1]["items"][0]
+        self.assertEqual(row["hw"], {"samples": 2, "ram_avail_min_mib": 3100})
+        self.assertEqual(len(seen), 1)
+        self.assertLessEqual(row["time"], seen[0][1])
+        self.assertEqual(seen[0][0], row["time"])                       # the window starts with the request
+        detail = self.get(f"/metrics/requests/{row['id']}")[1]["detail"]
+        self.assertEqual([p["ram_avail"] for p in detail["hw_series"]], [3200, 3100])
+
+    def test_the_per_second_record_lands_beside_the_history(self):
+        """xeno #237: the sampler's daily file goes into the history folder (history.telemetry, on by default)."""
+        from serve.history import HistoryStore
+        rec_dir = Path(self.tmp.name) / "on"
+        self.svc.hstore = HistoryStore(rec_dir)                  # telemetry on: the default
+        self.svc.telemetry.log.add({"ram_avail": 2**30}, time.time(), busy=True)
+        self.assertTrue(list(rec_dir.glob("telemetry-*.jsonl")))
+        self.svc.hstore = HistoryStore(Path(self.tmp.name) / "off", telemetry=False)   # the sink follows hstore
+        self.svc.telemetry.log.add({"ram_avail": 2**30}, time.time(), busy=True)
+        self.assertFalse((Path(self.tmp.name) / "off").exists())
 
     def call(self, path, body, headers=None):
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),

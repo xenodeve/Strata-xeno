@@ -2,6 +2,7 @@
 
     <dir>/requests-YYYY-MM.jsonl     one summary line per request, kept forever (~1 KB each)
     <dir>/detail/<id>.json.gz        the rounds / chunks / stages of one request, capped in total, oldest deleted first
+    <dir>/telemetry-YYYY-MM-DD.jsonl the hardware a second while busy, every 10 s idle (xeno #237), kept telemetry_days
 
 A deleted detail leaves its summary: the page says "detail deleted". Everything can be switched off (enabled=False).
 """
@@ -16,6 +17,7 @@ import time
 from pathlib import Path
 
 DEFAULT_DETAIL_CAP = 2 * 2**30              # 2 GB
+TELEMETRY_DAYS = 14                         # xeno #237: the hardware record's age limit
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -102,12 +104,45 @@ def window_rates(times, window: int = 16):
 
 
 class HistoryStore:
-    def __init__(self, directory, enabled=True, detail_cap_bytes=DEFAULT_DETAIL_CAP):
+    def __init__(self, directory, enabled=True, detail_cap_bytes=DEFAULT_DETAIL_CAP, telemetry=True,
+                 telemetry_days=TELEMETRY_DAYS):
         self.dir = Path(directory)
         self.enabled = enabled
         self.cap = int(detail_cap_bytes)
-        self.lock = threading.Lock()              # writers only (append, write_detail, prune)
+        self.telemetry = telemetry                # xeno #237: the per-second hardware record beside the requests
+        self.telemetry_days = max(1, int(telemetry_days))
+        self.lock = threading.Lock()              # writers only (append, write_detail, prune, append_telemetry)
         self._counts: dict = {}
+        self._telemetry_day = None
+
+    # ------------------------------------------------------------------------------------------ hardware record (#237)
+    def append_telemetry(self, point: dict) -> None:
+        """One point of serve/telemetry.py's TelemetryLog into telemetry-YYYY-MM-DD.jsonl, owner-only like the rest of the
+        folder.  The first write of each day deletes the days older than `telemetry_days`.  Off with the history or with
+        "telemetry": false.  An OSError reaches the caller, which then stops handing points."""
+        if not (self.enabled and self.telemetry):
+            return
+        t = point.get("t") or time.time()
+        day = time.strftime("%Y-%m-%d", time.localtime(t))
+        line = json.dumps(point, separators=(",", ":")) + "\n"
+        with self.lock:
+            if day != self._telemetry_day:
+                self._private_dir(self.dir)
+                self._telemetry_day = day
+                self._prune_telemetry(t)
+            fd = os.open(self.dir / f"telemetry-{day}.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(line)
+
+    def _prune_telemetry(self, now: float) -> None:
+        cut = time.strftime("%Y-%m-%d", time.localtime(now - self.telemetry_days * 86400))
+        for p in self.dir.glob("telemetry-*.jsonl"):
+            day = p.name[len("telemetry-"):-len(".jsonl")]       # YYYY-MM-DD: the dates sort as text
+            if day < cut:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------------------------------ summaries
     def append(self, record: dict) -> None:
