@@ -183,6 +183,18 @@ public:
     int p_threads() const { return topo_.p_threads; }
     int e_cores() const { return topo_.e_cores; }
     PoolAffinity affinity() const { return affinity_; }
+    /// #220 A5 STRATA_POOL_ECORE_SKIP_TAIL=K (default 0 = off; read at construction, only for a pinned hybrid pool):
+    /// an E-core worker claims none of a batch's last K tasks, which the P-core workers and the host then take.
+    int ecore_skip_tail() const { return ecore_skip_tail_; }
+    /// The threads on P-cores that drain a batch: the P-core workers, and the host when it works.
+    int fast_threads() const { return n_fast_workers_ + (host_works_ ? 1 : 0); }
+    /// Whether task `i` of an `n`-task batch is claimable by a thread: an E-core (`ecore`) leaves the last `keep` to
+    /// the `fast` P-core threads when the batch has at least 2 x `fast` tasks (smaller, the P-cores alone are slower).
+    static bool may_claim(uint32_t i, uint32_t n, bool ecore, int keep, int fast) {
+        if (i >= n) return false;
+        if (!ecore || keep <= 0 || fast <= 0 || n < 2u * (uint32_t) fast) return true;
+        return i + (uint32_t) keep < n;
+    }
 
     /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -252,7 +264,7 @@ private:
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
-    int claim(uint32_t epoch);
+    int claim(uint32_t epoch, bool ecore = false);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
     uint32_t begin_batch(int n);
     /// The host's waits, bounded by `kStall`.
@@ -262,6 +274,8 @@ private:
     void publish();
 
     int n_ = 0;
+    int n_fast_workers_ = 0;     ///< workers [0, n_fast_workers_) sit on P-cores (a pinned hybrid pool); the rest on E-cores
+    int ecore_skip_tail_ = 0;    ///< #220 A5, see ecore_skip_tail()
     bool host_works_ = true;
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;

@@ -476,6 +476,13 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int spin_us, Po
         n_ = (int) topo_.worker_cores.size();
     }
     if (n_ < 1) n_ = 1;
+    // #220 A5: the workers take topo_.worker_cores in order, the P-cores first (the host, when it took a core, the
+    // first P-core); with no pinning the classes are unknown and every worker counts as a P-core
+    n_fast_workers_ = n_;
+    if (pin && topo_.is_hybrid)
+        n_fast_workers_ = (std::min)(n_, (std::max)(0, topo_.p_cores - (topo_.host_core >= 0 ? 1 : 0)));
+    if (const char* v = std::getenv("STRATA_POOL_ECORE_SKIP_TAIL"); v != nullptr && *v && n_fast_workers_ < n_)
+        ecore_skip_tail_ = (std::max)(0, std::atoi(v));
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
@@ -584,12 +591,15 @@ void ExpertPool::worker(int id) {
     }
 }
 
-int ExpertPool::claim(uint32_t epoch) {
+int ExpertPool::claim(uint32_t epoch, bool ecore) {
     uint64_t h = head_.load(std::memory_order_acquire);
     for (;;) {
         if ((uint32_t) (h >> 32) != epoch) return -1;               // not the batch this thread woke for
         const uint32_t n = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
         if (i >= n) return -1;                                       // exhausted
+        // #220 A5: an E-core leaves the batch's tail to the P-cores; they (and the host) claim until `n`, so every
+        // task is still claimed and `done_` still reaches `n`
+        if (ecore && !may_claim(i, n, true, ecore_skip_tail_, fast_threads())) return -1;
         if (head_.compare_exchange_weak(h, h + 1, std::memory_order_acq_rel, std::memory_order_acquire))
             return (int) i;
     }
@@ -652,7 +662,7 @@ void ExpertPool::wait_done(int n) {
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
     for (;;) {
-        const int ci = claim(epoch);
+        const int ci = claim(epoch, id >= n_fast_workers_);
         if (ci < 0) break;
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
