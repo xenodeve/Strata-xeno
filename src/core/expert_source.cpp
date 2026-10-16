@@ -3799,16 +3799,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             n_staged = best_m;
             if (best_m > 0) { secondary_claims = true; d.secondary_staged += best_m; }
         }
-        if (secondary_claims) {
+        // #227 STRATA_SECONDARY_WINDOW_GRAPH: every layer publishes (an empty plan when nothing is claimed)
+        const bool window = d.secondary_runner->window_on();
+        if (secondary_claims || window) {
             const auto& f = lay.fmt[(size_t) d.layers];
             auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
             // APR: which of the layer's weights are Hadamard-folded; the runner rotates with its own device's signs
             if (f.had_d) L.had_block = f.had_block;
             if (f.had_gu) L.had_gu_block = f.had_block;
             std::string secondary_err;
-            if (!d.secondary_runner->launch(L, *d.secondary_weights, x_f, secondary_slots,
-                                             (int) n_tok, (int) k, secondary_err, staged_blobs, n_staged,
-                                             (size_t) lay.blob_bytes(d.layers))) {
+            if (window ? !d.secondary_runner->launch_layer((int) d.layers, L, *d.secondary_weights, x_f, secondary_slots,
+                                                           (int) n_tok, (int) k, secondary_err)
+                       : !d.secondary_runner->launch(L, *d.secondary_weights, x_f, secondary_slots,
+                                                     (int) n_tok, (int) k, secondary_err, staged_blobs, n_staged,
+                                                     (size_t) lay.blob_bytes(d.layers))) {
                 d.failed = true;
                 d.secondary_fail = "secondary expert launch: " + secondary_err;
                 d.fail = d.secondary_fail.c_str();

@@ -9,7 +9,11 @@
 #include "strata/timeline.hpp"
 #include "strata/timeline_gpu.hpp"
 
+#include "strata/core/progress.hpp"
+#include "strata/kernels/verify_kernels.hpp"
+
 #include <cuda_runtime.h>
+#include <immintrin.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -477,7 +481,230 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout_in, c
     return true;
 }
 
+namespace {
+// #227/#267: the runner whose window graph end_engine releases (one runner per process)
+std::atomic<SecondaryRunner*> g_window_runner{nullptr};
+void release_window_runner(std::FILE* f) {
+    if (SecondaryRunner* r = g_window_runner.load()) {
+        r->release_window();
+        if (f != nullptr) std::fprintf(f, "strata: released the 4070 window graph's waits (#227, #267)\n");
+    }
+}
+}  // namespace
+
+bool SecondaryRunner::enable_window(const std::vector<kernels::NativeExpertLayout>& layouts, std::string& err) {
+    if (stream_ == nullptr || window_ || async_ || profile_timing_ || layouts.empty() || layouts.size() > 256) {
+        err = "secondary runner: the window graph needs an initialised runner without the async launcher or profile "
+              "timing, once";
+        return false;
+    }
+    for (const auto& L : layouts)
+        if (L.n_embd != n_embd_ || L.n_ff != n_ff_ || !kernels::iq_supported(L.gu_type) || !kernels::iq_supported(L.d_type)) {
+            err = "secondary runner: a layer's layout does not fit the window graph";
+            return false;
+        }
+    int previous = -1;
+    if (!cuda_ok(cudaGetDevice(&previous), "window current device", err) ||
+        !cuda_ok(cudaSetDevice(1), "window select device", err)) return false;
+    const RestoreDevice restore{previous};
+    win_layers_ = (int) layouts.size();
+    win_layout_ = layouts;
+    const size_t xs = (size_t) max_tokens_ * n_embd_;
+    void* go = nullptr;
+    void* done = nullptr;
+    if (!cuda_ok(cudaHostAlloc((void**) &host_wmeta_, (size_t) win_layers_ * meta_bytes_, cudaHostAllocPortable),
+                 "window plans", err) ||
+        !cuda_ok(cudaHostAlloc((void**) &host_wx_, (size_t) win_layers_ * xs * sizeof(float), cudaHostAllocPortable),
+                 "window activations", err) ||
+        !cuda_ok(cudaHostAlloc((void**) &host_wout_, (size_t) max_entries_ * n_embd_ * sizeof(float),
+                               cudaHostAllocPortable | cudaHostAllocMapped), "window rows", err) ||
+        !cuda_ok(cudaHostAlloc(&go, (size_t) win_layers_ * sizeof(uint32_t), cudaHostAllocPortable | cudaHostAllocMapped),
+                 "window go flags", err) ||
+        !cuda_ok(cudaHostAlloc(&done, (size_t) win_layers_ * sizeof(uint32_t), cudaHostAllocPortable | cudaHostAllocMapped),
+                 "window done flags", err))
+        return false;
+    host_go_ = (volatile uint32_t*) go;
+    host_done_ = (volatile uint32_t*) done;
+    std::memset(host_wmeta_, 0, (size_t) win_layers_ * meta_bytes_);
+    for (int l = 0; l < win_layers_; ++l) { host_go_[l] = 0; host_done_[l] = 0; }
+    if (!cuda_ok(cudaHostGetDevicePointer((void**) &dev_wout_, host_wout_, 0), "window rows pointer", err) ||
+        !cuda_ok(cudaHostGetDevicePointer((void**) &dev_go_, go, 0), "window go pointer", err) ||
+        !cuda_ok(cudaHostGetDevicePointer((void**) &dev_done_, done, 0), "window done pointer", err) ||
+        !cuda_ok(cudaMalloc((void**) &dev_count_, (size_t) win_layers_ * sizeof(uint32_t)), "window counts", err) ||
+        !cuda_ok(cudaMemset(dev_count_, 0, (size_t) win_layers_ * sizeof(uint32_t)), "window counts clear", err))
+        return false;
+    win_graph_.assign((size_t) max_tokens_ + 1, nullptr);
+    for (int t = 1; t <= max_tokens_; ++t)
+        if (!capture_window(t, err)) return false;
+    window_ = true;
+    g_window_runner.store(this);
+    core::release_secondary_fn().store(&release_window_runner);
+    err.clear();
+    return true;
+}
+
+bool SecondaryRunner::capture_window(int n_tokens, std::string& err) {
+    cudaStream_t stream = (cudaStream_t) stream_;
+    const int entries = n_tokens * (max_entries_ / max_tokens_);
+    const size_t xs = (size_t) max_tokens_ * n_embd_;
+    if (!cuda_ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "window graph capture", err))
+        return false;
+    for (int l = 0; l < win_layers_; ++l) {
+        kernels::NativeExpertLayout layout = win_layout_[(size_t) l];
+        if (layout.had_block > 0) layout.d_signs = device_sh_;
+        const bool q2 = layout.gu_type == 42 && layout.d_type == 42;
+        kernels::window_wait(dev_go_ + l, dev_count_ + l, stream);
+        cudaMemcpyAsync(device_ptr_, host_wmeta_ + (size_t) l * meta_bytes_, meta_bytes_, cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(device_x_, host_wx_ + (size_t) l * xs, (size_t) n_tokens * n_embd_ * sizeof(float),
+                        cudaMemcpyHostToDevice, stream);
+        if (layout.had_gu_block > 0)
+            kernels::hadamard_rows(device_x_, device_x_, n_tokens, n_embd_, layout.had_gu_block, device_sx_, stream);
+        if (q2) kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
+        else kernels::quantize_q8_1_rows(device_x_, n_tokens, n_embd_, device_xq_, stream);
+        kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
+                                       entries, entries, device_xq_, device_scratch_, device_out_, stream,
+                                       q2 ? device_scales_ : nullptr);
+        kernels::window_rows_to_host(device_out_, dev_wout_, device_start_, device_count_, n_embd_, max_entries_, stream);
+        kernels::window_signal(dev_done_ + l, dev_count_ + l, stream);
+    }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(stream, &graph);
+    void*& ge = win_graph_[(size_t) n_tokens];
+    const cudaError_t ie = ce == cudaSuccess ? cudaGraphInstantiate((cudaGraphExec_t*) &ge, graph, 0) : ce;
+    if (graph != nullptr) cudaGraphDestroy(graph);
+    if (ie != cudaSuccess) {
+        ge = nullptr;
+        err = std::string("secondary runner: window graph capture: ") + cudaGetErrorString(ie);
+        return false;
+    }
+    return true;
+}
+
+void SecondaryRunner::publish_empty(int layer) {
+    int32_t zero = 0;
+    std::memcpy(host_wmeta_ + (size_t) layer * meta_bytes_ + meta_count_off_, &zero, sizeof zero);
+    std::atomic_thread_fence(std::memory_order_release);
+    _mm_sfence();
+    host_go_[layer] = win_seq_;
+}
+
+void SecondaryRunner::end_window() {
+    if (!window_ || win_seq_ == 0) return;
+    for (int l = win_next_; l < win_layers_; ++l) publish_empty(l);
+    win_next_ = win_layers_;
+}
+
+void SecondaryRunner::release_window() {
+    if (host_go_ == nullptr) return;
+    for (int l = 0; l < win_layers_; ++l) host_go_[l] = UINT32_MAX;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+}
+
+bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout& layout_in, const SecondaryArena& weights,
+                                   const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!window_ || pending_ || failed_ || layer < 0 || layer >= win_layers_ || x == nullptr ||
+        selected_slots == nullptr || n_tokens <= 0 || n_tokens > max_tokens_ || k <= 0 || k > max_entries_ / n_tokens ||
+        k != max_entries_ / max_tokens_ || layout_in.gu_type != win_layout_[(size_t) layer].gu_type ||
+        layout_in.d_type != win_layout_[(size_t) layer].d_type) {
+        err = "secondary runner: invalid window launch";
+        return false;
+    }
+    if (layer == 0) {   // a new window: close the last one, then the window's one launch
+        end_window();
+        ++win_seq_;
+        win_next_ = 0;
+        win_tokens_ = n_tokens;
+        const auto l0 = std::chrono::steady_clock::now();
+        int previous = -1;
+        if (!cuda_ok(cudaGetDevice(&previous), "runner current device", err) ||
+            !cuda_ok(cudaSetDevice(1), "runner select device", err)) return false;
+        const RestoreDevice restore{previous};
+        cudaStream_t stream = (cudaStream_t) stream_;
+        if (!cuda_ok(cudaGraphLaunch((cudaGraphExec_t) win_graph_[(size_t) n_tokens], stream), "window graph launch", err)) {
+            failed_ = true;
+            return false;
+        }
+        (void) cudaStreamQuery(stream);   // WDDM: hand the graph to the 4070 now
+        if (timeline::enabled()) timeline::complete("4070 window launch", l0, std::chrono::steady_clock::now(), n_tokens);
+    } else if (n_tokens != win_tokens_ || layer < win_next_) {
+        err = "secondary runner: a window layer out of order";
+        return false;
+    }
+    for (int l = win_next_; l < layer; ++l) publish_empty(l);   // layers the dispatch did not publish
+    ptr_.clear(); start_.clear(); dst_.clear(); tok_.clear(); selected_rows_.clear(); group_slots_.clear();
+    const int entries = n_tokens * k;
+    for (int i = 0; i < entries; ++i) {
+        const int32_t slot = selected_slots[i];
+        if (slot < 0) continue;
+        if (weights.slot_ptr((uint64_t) slot) == nullptr) {
+            err = "secondary runner: selected slot is not resident";
+            return false;
+        }
+        bool seen = false;
+        for (const int32_t prior : group_slots_) if (prior == slot) { seen = true; break; }
+        if (!seen) group_slots_.push_back(slot);
+    }
+    for (const int32_t slot : group_slots_) {
+        ptr_.push_back((unsigned long long) weights.slot_ptr((uint64_t) slot));
+        start_.push_back((int32_t) dst_.size());
+        for (int i = 0; i < entries; ++i) if (selected_slots[i] == slot) {
+            dst_.push_back((int32_t) selected_rows_.size());
+            tok_.push_back(i / k);
+            selected_rows_.push_back(i);
+        }
+    }
+    start_.push_back((int32_t) dst_.size());
+    uint8_t* meta = host_wmeta_ + (size_t) layer * meta_bytes_;
+    host_count_ = (int32_t) group_slots_.size();
+    if (host_count_ > 0) {
+        std::memcpy(host_wx_ + (size_t) layer * max_tokens_ * n_embd_, x, (size_t) n_tokens * n_embd_ * sizeof(float));
+        std::memcpy(meta, ptr_.data(), ptr_.size() * sizeof(ptr_[0]));
+        std::memcpy(meta + meta_start_off_, start_.data(), start_.size() * sizeof(start_[0]));
+        std::memcpy(meta + meta_dst_off_, dst_.data(), dst_.size() * sizeof(dst_[0]));
+        std::memcpy(meta + meta_tok_off_, tok_.data(), tok_.size() * sizeof(tok_[0]));
+    }
+    std::memcpy(meta + meta_count_off_, &host_count_, sizeof host_count_);
+    std::atomic_thread_fence(std::memory_order_release);
+    _mm_sfence();
+    host_go_[layer] = win_seq_;
+    win_next_ = layer + 1;
+    win_layer_ = layer;
+    pending_ = host_count_ > 0;
+    ms_launch_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    err.clear();
+    return true;
+}
+
 bool SecondaryRunner::finish(float* output, std::string& err) {
+    if (window_) {   // #227: the layer's done flag, then its rows from mapped memory - no CUDA call
+        if (!pending_) { err.clear(); return true; }
+        if (output == nullptr) { err = "secondary runner: output is null"; return false; }
+        const auto wait_t0 = std::chrono::steady_clock::now();
+        uint32_t spins = 0;
+        while (host_done_[win_layer_] < win_seq_) {
+            _mm_pause();
+            if ((++spins & 4095u) == 0 &&
+                std::chrono::steady_clock::now() - wait_t0 > std::chrono::seconds(30)) {
+                failed_ = true;
+                err = "secondary runner: the 4070's window graph did not finish layer " + std::to_string(win_layer_) +
+                      " in 30 s";
+                return false;
+            }
+        }
+        const auto w1 = std::chrono::steady_clock::now();
+        ms_wait_ += std::chrono::duration<double, std::milli>(w1 - wait_t0).count();
+        if (timeline::enabled()) timeline::complete("4070 wait", wait_t0, w1, win_layer_);
+        for (size_t dense = 0; dense < selected_rows_.size(); ++dense)
+            std::memcpy(output + (size_t) selected_rows_[dense] * n_embd_, host_wout_ + dense * n_embd_,
+                        (size_t) n_embd_ * sizeof(float));
+        served_entries_ += selected_rows_.size();
+        served_groups_ += group_slots_.size();
+        pending_ = false;
+        err.clear();
+        return true;
+    }
     if (async_) {
         const auto t0 = std::chrono::steady_clock::now();
         while (!launch_done_.load(std::memory_order_acquire)) std::this_thread::yield();
@@ -635,6 +862,11 @@ void SecondaryRunner::stop_monitor() {
 void SecondaryRunner::close() {
     stop_launcher();
     stop_monitor();
+    if (window_) {   // #227: no segment may still wait when the stream is drained below
+        release_window();
+        SecondaryRunner* self = this;
+        g_window_runner.compare_exchange_strong(self, nullptr);
+    }
     if (workspace_.slots() == 0 && stream_ == nullptr && done_ == nullptr &&
         host_x_ == nullptr && host_out_ == nullptr && host_meta_ == nullptr) return;
     int previous = -1;
@@ -656,6 +888,13 @@ void SecondaryRunner::close() {
     if (done_ != nullptr && cudaEventDestroy((cudaEvent_t) done_) != cudaSuccess) std::abort();
     for (void*& ge : graph_exec_)
         if (ge != nullptr) { cudaGraphExecDestroy((cudaGraphExec_t) ge); ge = nullptr; }
+    for (void*& ge : win_graph_)
+        if (ge != nullptr) { cudaGraphExecDestroy((cudaGraphExec_t) ge); ge = nullptr; }
+    if (dev_count_ != nullptr) cudaFree(dev_count_);
+    for (void* p : {(void*) host_wmeta_, (void*) host_wx_, (void*) host_wout_, (void*) host_go_, (void*) host_done_})
+        if (p != nullptr) cudaFreeHost(p);
+    dev_count_ = nullptr; host_wmeta_ = nullptr; host_wx_ = nullptr; host_wout_ = nullptr;
+    host_go_ = nullptr; host_done_ = nullptr; window_ = false;
     if (stream_ != nullptr && cudaStreamDestroy((cudaStream_t) stream_) != cudaSuccess) std::abort();
     if (host_out_ != nullptr && cudaFreeHost(host_out_) != cudaSuccess) std::abort();
     if (host_meta_ != nullptr && cudaFreeHost(host_meta_) != cudaSuccess) std::abort();

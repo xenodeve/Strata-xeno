@@ -6564,6 +6564,27 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        // #227 STRATA_SECONDARY_WINDOW_GRAPH=1 (default off): one 4070 graph per verify window, its layers started by
+        // host flags in mapped memory, instead of a graph launch per layer
+        if (const char* wg = std::getenv("STRATA_SECONDARY_WINDOW_GRAPH"); wg != nullptr && wg[0] == '1' && secondary_compute) {
+            std::vector<strata::kernels::NativeExpertLayout> wl;
+            const auto& wlay = strata::kernels::cpu::expert_layout();
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                const auto& f = wlay.fmt[(size_t) l];
+                auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                if (f.had_d) L.had_block = f.had_block;   // as expert_pool_dispatch_multi builds it
+                if (f.had_gu) L.had_gu_block = f.had_block;
+                wl.push_back(L);
+            }
+            const auto tw = Clock::now();
+            if (!secondary_runner.enable_window(wl, err)) {
+                std::fprintf(stderr, "strata generate: 4070 window graph: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: 4070 window graph (#227): one launch per verify window, %lld layers, "
+                                 "token counts 1-%d captured in %.0f ms\n", (long long) g.n_layers,
+                         (int) strata::kernels::cpu::MAXT, std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
+        }
         secondary_runner.set_breach_warn(o.secondary_breach_warn);   // xeno #208
         if (!secondary_runner.start_monitor(100, err, nullptr, nullptr, nullptr,
                                             (uint64_t) o.secondary_free_floor_mib << 20)) {
@@ -14296,6 +14317,7 @@ int main(int argc, char** argv) {
                              (long long) (arena_src.nvme_loads() - nvme0), private_commit_bytes() / 1073741824.0);
                 std::fprintf(stderr, "strata serve: adaptive swaps since start: 5060 %lld, 4070 %lld\n",
                              (long long) paired_swaps, (long long) sec_swaps);   // xeno #229
+                secondary_runner.end_window();   // #227: nothing of this request's last window waits on the 4070
                 if (secondary_runner.stage_slots() > 0) {   // #228
                     const auto hp = arena_src.hot_pin_stats();
                     std::fprintf(stderr, "strata serve: 4070 staged experts since start: %lld; hot pins %lld experts "
@@ -15724,6 +15746,10 @@ int main(int argc, char** argv) {
         if (rounds > 0 && o.secondary_expert_mib > 0)
             std::printf("%-24s launch %.3f  wait %.3f ms/round (wait > 0: the 4070 SUPER finished after the CPU pool)\n",
                         "secondary timing", secondary_runner.ms_launch() / rounds, secondary_runner.ms_wait() / rounds);
+        secondary_runner.end_window();   // #227
+        if (rounds > 0 && secondary_runner.window_on())
+            std::printf("%-24s %llu windows, one 4070 launch each\n", "secondary window graph",
+                        (unsigned long long) secondary_runner.windows());
         if (rounds > 0 && secondary_runner.stage_slots() > 0)   // #228
             std::printf("%-24s %lld experts (%.2f per round); hot pins %lld experts, %lld of them GPU-owned now\n",
                         "secondary staged", (long long) drive.d.secondary_staged,

@@ -41,6 +41,15 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// #227 the 4070's window graph: a layer's segment waits until *go (mapped host memory) reaches *count + 1, where
+/// *count (device memory) is how many times this segment has run - so the value is not baked into the graph and a
+/// graph replayed every window needs no parameter update.  window_signal then advances *count and writes it to
+/// *done (mapped) after a system fence.  window_rows_to_host copies the layer's claimed rows (start[*n_groups] of
+/// them, n_embd floats each) from device to mapped host memory, then fences.
+void window_wait(const uint32_t* go, const uint32_t* count, void* stream);
+void window_signal(uint32_t* done, uint32_t* count, void* stream);
+void window_rows_to_host(const float* src, float* dst_mapped, const int32_t* start, const int32_t* n_groups,
+                         int n_embd, int max_rows, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);

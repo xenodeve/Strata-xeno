@@ -1198,6 +1198,49 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     check("wait_flag_ge");
 }
 
+namespace {
+__global__ void window_wait_kernel(const volatile uint32_t* go, const uint32_t* count) {
+    const uint32_t want = *count + 1u;
+    while (*go < want) strata_spin_pause();
+    __threadfence_system();
+}
+__global__ void window_signal_kernel(volatile uint32_t* done, uint32_t* count) {
+    const uint32_t c = *count + 1u;
+    *count = c;
+    __threadfence_system();
+    *done = c;
+    __threadfence_system();
+}
+__global__ void window_rows_kernel(const float4* __restrict__ src, float4* dst, const int32_t* start,
+                                   const int32_t* n_groups, int n4_per_row, int max_rows) {
+    const int groups = *n_groups;
+    int rows = groups > 0 ? start[groups] : 0;
+    rows = rows < max_rows ? rows : max_rows;
+    const long long n4 = (long long) rows * n4_per_row;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (long long) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+    __threadfence_system();
+}
+}  // namespace
+
+void window_wait(const uint32_t* go, const uint32_t* count, void* stream) {
+    window_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(go, count);
+    check("window_wait");
+}
+
+void window_signal(uint32_t* done, uint32_t* count, void* stream) {
+    window_signal_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(done, count);
+    check("window_signal");
+}
+
+void window_rows_to_host(const float* src, float* dst_mapped, const int32_t* start, const int32_t* n_groups,
+                         int n_embd, int max_rows, void* stream) {
+    // a few blocks: a 2,048-float row is 512 float4s; 40 rows of a 4-token window are 20K float4s
+    window_rows_kernel<<<32, 256, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst_mapped, start,
+                                                              n_groups, n_embd / 4, max_rows);
+    check("window_rows_to_host");
+}
+
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
                           int n_tok, int64_t n, int code_bits, int code_bias, int group_elems, uint64_t row_codes,
                           uint64_t row_groups, float* out, void* stream) {
