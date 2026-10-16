@@ -3759,14 +3759,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // there, the split chosen by the cost model of the design note (#228 comment 6216634040)
         const int stage_cap = d.remote_count == 0 && d.peer == nullptr ? d.secondary_runner->stage_slots() : 0;
         if (stage_cap > 0) {
-            struct Cost { double pool, copy, group, base, issue, launch; int min_cpu; };
+            // pool: the CPU pool's batch costs pool_base + pool * jobs, and nothing when no job is left (no pool call):
+            // the shape of the measured medians (~85 + 77 n us, tl-227-TW; 75.9 + 72.9 n on tl-227-T0, #228 comment
+            // 6222169060).  #228 v1 priced 117 us per job and no batch start.
+            struct Cost { double pool, copy, group, base, issue, launch, pool_base; int min_cpu; };
             static const Cost cost = [] {
-                Cost c{117, 62, 15, 40, 5, 55, 0};
+                Cost c{77, 62, 15, 40, 5, 55, 85, 0};
                 if (const char* v = std::getenv("STRATA_SECONDARY_STAGE_COST"))
-                    std::sscanf(v, "%lf,%lf,%lf,%lf,%lf,%lf", &c.pool, &c.copy, &c.group, &c.base, &c.issue, &c.launch);
+                    std::sscanf(v, "%lf,%lf,%lf,%lf,%lf,%lf,%lf", &c.pool, &c.copy, &c.group, &c.base, &c.issue, &c.launch,
+                                &c.pool_base);
                 if (const char* v = std::getenv("STRATA_SECONDARY_STAGE_MIN_CPU")) c.min_cpu = std::max(0, std::atoi(v));
                 return c;
             }();
+            const bool stage_window = d.secondary_runner->window_on();   // #228 v2
             int n_cpu = 0, r_groups = 0, h = 0;
             int64_t cand[kMaxWindowEntries];   // first entry of each stageable CPU expert, in routing order
             const uint8_t* cand_blob[kMaxWindowEntries];
@@ -3778,15 +3783,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (kind[i] == 2) { ++r_groups; continue; }
                 if (kind[i] != -1 || e < 0 || e >= d.n_expert) continue;
                 ++n_cpu;
-                if (const uint8_t* b = d.src->stage_blob(d.layers, e)) { cand[h] = i; cand_blob[h] = b; ++h; }
+                // the window graph fetches the blob itself (its device pointer); launch() copies from the host's
+                if (const uint8_t* b = stage_window ? d.src->stage_blob_device(d.layers, e) : d.src->stage_blob(d.layers, e);
+                    b != nullptr && (!stage_window || ((uintptr_t) b & 15u) == 0)) {
+                    cand[h] = i; cand_blob[h] = b; ++h;
+                }
             }
             const int m_max = std::min({h, stage_cap, std::max(0, n_cpu - cost.min_cpu)});
             int best_m = 0;
             double best = 0;
             for (int m = 0; m <= m_max; ++m) {
-                const double pool = cost.pool * (n_cpu - m);
+                const double pool = n_cpu - m > 0 ? cost.pool_base + cost.pool * (n_cpu - m) : 0.0;
                 const double g4070 = r_groups + m > 0 ? cost.base + cost.group * (r_groups + m) + cost.copy * m : 0.0;
-                const double host = cost.issue * m + (r_groups == 0 && m > 0 ? cost.launch : 0.0);
+                // the window graph's segment runs anyway and takes the blobs from the plan: no host CUDA call
+                const double host = stage_window ? 0.0 : cost.issue * m + (r_groups == 0 && m > 0 ? cost.launch : 0.0);
                 const double t = std::max(pool, g4070) + host;
                 if (m == 0 || t < best) { best = t; best_m = m; }
             }
@@ -3809,7 +3819,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (f.had_gu) L.had_gu_block = f.had_block;
             std::string secondary_err;
             if (window ? !d.secondary_runner->launch_layer((int) d.layers, L, *d.secondary_weights, x_f, secondary_slots,
-                                                           (int) n_tok, (int) k, secondary_err)
+                                                           (int) n_tok, (int) k, secondary_err, staged_blobs, n_staged,
+                                                           (size_t) lay.blob_bytes(d.layers))
                        : !d.secondary_runner->launch(L, *d.secondary_weights, x_f, secondary_slots,
                                                      (int) n_tok, (int) k, secondary_err, staged_blobs, n_staged,
                                                      (size_t) lay.blob_bytes(d.layers))) {
@@ -5714,6 +5725,15 @@ const uint8_t* ArenaExpertSource::stage_blob(int64_t layer, int64_t expert) cons
     return host_at((size_t) idx);
 }
 
+const uint8_t* ArenaExpertSource::stage_blob_device(int64_t layer, int64_t expert) const {
+    if (stage_blob(layer, expert) == nullptr) return nullptr;
+    const size_t idx = (size_t) (layer * n_expert_ + expert);
+    const int32_t run = hot_run_of_[idx];
+    if (run < 0 || (size_t) run >= hot_runs_.size() || hot_runs_[(size_t) run].dev == nullptr) return nullptr;
+    const HotRun& r = hot_runs_[(size_t) run];
+    return r.dev + (host_at(idx) - r.base);
+}
+
 bool ArenaExpertSource::pin_cpu_hot(const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t budget_bytes,
                                     bool portable, std::string& err) {
     std::lock_guard<std::mutex> lk(host_mu_);
@@ -5749,8 +5769,10 @@ bool ArenaExpertSource::pin_cpu_hot(const std::vector<std::pair<int32_t, int32_t
                 ++e1;
             const uintptr_t first = (uintptr_t) (base_ + lay.blob_offset(l, e)) & ~(page - 1);
             const uintptr_t last = ((uintptr_t) (base_ + lay.blob_offset(l, e1) + lay.blob_bytes(l)) + page - 1) & ~(page - 1);
+            // mapped (#228 v2): the 4070's window graph reads the blobs itself through their device pointer
             const cudaError_t r = cudaHostRegister((void*) first, (size_t) (last - first),
-                                                   portable ? cudaHostRegisterPortable : cudaHostRegisterDefault);
+                                                   (portable ? cudaHostRegisterPortable : cudaHostRegisterDefault) |
+                                                       cudaHostRegisterMapped);
             if (r != cudaSuccess) {   // e.g. the OS refuses more locked pages: keep what is pinned, say so
                 cudaGetLastError();
                 err = std::string("cudaHostRegister stopped after ") + std::to_string(hot_stats_.experts) +
@@ -5758,7 +5780,9 @@ bool ArenaExpertSource::pin_cpu_hot(const std::vector<std::pair<int32_t, int32_t
                 break;
             }
             const int32_t run = (int32_t) hot_runs_.size();
-            hot_runs_.push_back({(uint8_t*) first, (size_t) (last - first), (int32_t) l, (int32_t) e, (int32_t) e1});
+            uint8_t* dev = nullptr;   // this device's view (CanUseHostPointerForRegisteredMem is 0 on the 4070)
+            if (cudaHostGetDevicePointer((void**) &dev, (void*) first, 0) != cudaSuccess) { cudaGetLastError(); dev = nullptr; }
+            hot_runs_.push_back({(uint8_t*) first, (size_t) (last - first), (int32_t) l, (int32_t) e, (int32_t) e1, dev});
             for (int64_t x = e; x <= e1; ++x) {
                 hot_run_of_[(size_t) (l * n_expert_ + x)] = run;
                 hot_[(size_t) (l * n_expert_ + x)].store(1, std::memory_order_release);

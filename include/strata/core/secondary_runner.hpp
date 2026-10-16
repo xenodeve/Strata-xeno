@@ -49,9 +49,9 @@ public:
                 const float* x, const int32_t* selected_slots, int n_tokens, int k,
                 std::string& err, const uint8_t* const* staged = nullptr, int n_staged = 0,
                 size_t staged_bytes = 0);
-    /// #228: staging slots launch() takes (0 when none were carved, or once the async launcher is on: refused there;
-    /// also 0 in the window graph, which takes resident slots only).
-    int stage_slots() const { return async_ || window_ ? 0 : stage_slots_; }
+    /// #228: staging slots launch() and launch_layer() take (0 when none were carved, or once the async launcher is
+    /// on: refused there).  In the window graph (v2) the layer's segment fetches them itself from mapped host memory.
+    int stage_slots() const { return async_ ? 0 : stage_slots_; }
 
     /// #227 STRATA_SECONDARY_WINDOW_GRAPH=1: one CUDA graph per verify window instead of one launch per layer.  The
     /// graph (one per token count, captured here for 1..max_tokens) holds a segment per layer: wait until the layer's
@@ -68,13 +68,22 @@ public:
     bool window_on() const { return window_; }
     /// The window mode's per-layer publish: every layer of every window, claimed or not (`selected_slots` all -1 when
     /// not; a layer that is not published is filled with an empty plan at the next layer 0 or end_window).
+    /// #228 v2: `staged_dev[s]` (s < n_staged) is the device pointer of a page-locked, mapped host blob of
+    /// `staged_bytes` (16-byte aligned) for slot code -(s + 2); the segment fetches it into staging slot s first.
     bool launch_layer(int layer, const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
-                      const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err);
+                      const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err,
+                      const uint8_t* const* staged_dev = nullptr, int n_staged = 0, size_t staged_bytes = 0);
     /// Publish an empty plan for every layer of the open window not published yet, so its graph runs to the end and
     /// no segment keeps spinning on the display card (between requests, before teardown).
     void end_window();
     /// #267: raise every go flag past any count, so no segment of a window graph spins after the engine ends.
     void release_window();
+    /// #245: open the next window for `n_tokens` before its layer 0 is dispatched: close the last window and hand the
+    /// graph launch to a helper thread on device 1, so the ~0.6 ms cudaGraphLaunch overlaps the host's wait for layer
+    /// 0's router instead of sitting between layer 0's plan and its CPU pool.  launch_layer(0) then publishes into the
+    /// open window without launching.  On by default with the window graph; STRATA_SECONDARY_WINDOW_EARLY=0 keeps the
+    /// launch at layer 0 (for A/B).  A failed launch is reported by the next launch_layer or finish.
+    void begin_window(int n_tokens);
     uint64_t windows() const { return win_seq_; }
     uint64_t staged_experts() const { return staged_experts_; }
     bool finish(float* output, std::string& err);
@@ -131,9 +140,13 @@ private:
     float* host_out_ = nullptr;
     uint8_t* host_meta_ = nullptr;
     size_t meta_start_off_ = 0, meta_count_off_ = 0, meta_dst_off_ = 0, meta_tok_off_ = 0;
+    size_t meta_stage_n_off_ = 0, meta_stage_src_off_ = 0, meta_stage_bytes_off_ = 0;   ///< #228 v2 (window plans)
     size_t meta_bytes_ = 0;
     float* device_x_ = nullptr;
     uint8_t* device_stage_ = nullptr;   ///< #228: stage_slots_ x stage_stride_ bytes
+    int32_t* device_stage_n_ = nullptr;                ///< #228 v2: the layer plan's staged count, sources and bytes
+    unsigned long long* device_stage_src_ = nullptr;
+    long long* device_stage_bytes_ = nullptr;
     int stage_slots_ = 0;
     uint64_t stage_stride_ = 0;
     uint64_t staged_experts_ = 0;
@@ -142,6 +155,22 @@ private:
     int win_layers_ = 0, win_next_ = 0, win_tokens_ = 0, win_layer_ = -1;
     uint32_t win_seq_ = 0;
     std::atomic<bool> win_released_{false};   ///< release_window ran: nothing is launched or published after it
+    // #245 begin_window: a helper thread on device 1 launches each window's graph, in the order the windows open
+    bool win_early_ = false;                  ///< STRATA_SECONDARY_WINDOW_EARLY (default on with the window graph)
+    uint32_t win_opened_ = 0;                 ///< win_seq_ of the window begin_window opened and layer 0 has not taken
+    std::thread win_launcher_;
+    std::mutex win_mu_;
+    std::condition_variable win_cv_;
+    int win_req_tokens_ = 0;                  ///< (win_mu_) the token count of a launch not yet taken, 0 when none
+    uint32_t win_req_seq_ = 0;                ///< (win_mu_) its window
+    bool win_stop_ = false;                   ///< (win_mu_)
+    uint32_t win_requested_ = 0;              ///< host thread: the last window handed to the helper
+    std::atomic<uint32_t> win_launched_{0};   ///< the last window the helper launched (or failed to)
+    std::atomic<bool> win_launch_failed_{false};
+    std::string win_launch_err_;              ///< written before win_launch_failed_ is raised
+    void win_launcher_loop();
+    void stop_win_launcher();
+    bool wait_win_launched(std::string& err);
     std::vector<kernels::NativeExpertLayout> win_layout_;
     uint8_t* host_wmeta_ = nullptr;      ///< win_layers_ x meta_bytes_, pinned
     float* host_wx_ = nullptr;           ///< win_layers_ x max_tokens_ x n_embd_, pinned

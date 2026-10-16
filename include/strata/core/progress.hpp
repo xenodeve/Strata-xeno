@@ -41,6 +41,10 @@ inline std::atomic<DiagFn>& diag_verify_fn() { static std::atomic<DiagFn> f{null
 inline std::atomic<DiagFn>& release_gpu_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
 /// #227: the 4070's window graph waits on host flags too (SecondaryRunner::enable_window registers its release)
 inline std::atomic<DiagFn>& release_secondary_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
+/// #245: the verifier opens the 4070's window right after its own graph launch, so the window graph's launch overlaps
+/// the host's wait for layer 0 instead of sitting between layer 0's plan and its CPU pool (SecondaryRunner::begin_window)
+using BeginWindowFn = void (*)(int n_tokens);
+inline std::atomic<BeginWindowFn>& begin_secondary_window_fn() { static std::atomic<BeginWindowFn> f{nullptr}; return f; }
 inline void release_gpu_waits(std::FILE* f) {
     if (auto fn = release_secondary_fn().load()) fn(f);   // first: its release is two stores, no wait
     if (auto fn = release_gpu_fn().load()) fn(f);

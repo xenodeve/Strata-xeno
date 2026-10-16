@@ -2059,6 +2059,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     (void) cudaStreamQuery(cs_);
     ms_launch += ms_since(tl);
     if (timeline::enabled()) timeline::complete("verify launch", tl, Clock::now(), T);
+    if (!ar_on())   // #245: the 4070's window opens now, while this window's layer 0 runs (no dispatch when all resident)
+        if (auto begin = begin_secondary_window_fn().load()) begin(T);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;

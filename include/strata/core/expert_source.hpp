@@ -178,6 +178,9 @@ public:
     /// #228: the host bytes of a CPU-owned expert that the 4070 can copy asynchronously (page-locked for device 1 by
     /// pin_cpu_hot), else nullptr.  Counts no use, unlike blob().
     virtual const uint8_t* stage_blob(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+    /// #228 v2: the same blob's device-1 pointer (the pages are registered mapped), for the 4070's window graph to
+    /// fetch itself; nullptr when it has none.
+    virtual const uint8_t* stage_blob_device(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
 
     /// Called once before the first expert of a layer.  A source that reads from disk wants to start the read
     /// here so it overlaps the quantisation, and a prefetching source in Phase 3 wants the ids.
@@ -1056,6 +1059,7 @@ public:
     int64_t reads() const { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* stage_blob(int64_t layer, int64_t expert) const override;
+    const uint8_t* stage_blob_device(int64_t layer, int64_t expert) const override;
     /// #228 STRATA_PIN_CPU_HOT_MIB: page-lock, in place, the host-owned experts of `ranked` (layer, expert; best first)
     /// up to `budget_bytes`, for the device current at the call (device 1; `portable` registers for every device).
     /// Blobs that share a page are registered as one run.  After the load (never while pages are written); refused
@@ -1177,7 +1181,7 @@ private:
         std::vector<int32_t> cold;         ///< decommitted again (reused before `next` grows)
     };
     // #228 pin_cpu_hot: registered page runs; per expert its run (-1 none) and a bit the dispatch reads without the lock
-    struct HotRun { uint8_t* base = nullptr; size_t bytes = 0; int32_t layer = 0, e0 = 0, e1 = 0; };
+    struct HotRun { uint8_t* base = nullptr; size_t bytes = 0; int32_t layer = 0, e0 = 0, e1 = 0; uint8_t* dev = nullptr; };
     std::vector<HotRun> hot_runs_;
     std::vector<int32_t> hot_run_of_;
     std::unique_ptr<std::atomic<uint8_t>[]> hot_;

@@ -280,13 +280,81 @@ int main(int argc, char** argv) {
         different += window(false, "window, claims on layer 1");
         runner.end_window();
         different += window(true, "window after end_window");
-        // a slot code below -1 (a staged slot) has no staging in this mode: refused, not skipped
+        // a slot code below -1 (a staged slot) with no staged blob (this runner has no staging slots): refused
         const int32_t staged_code[ENTRIES] = {-2, -2, 1};
         if (runner.launch_layer(0, a.layout, arena, a.x.data(), staged_code, ENTRIES, 1, err)) {
             std::fprintf(stderr, "window: a staged slot code was accepted\n");
             ++different;
         }
         different += window(false, "window after a refused launch");
+        // #245 begin_window: the window opened at the verify launch, its graph launched by the helper thread; layer 0
+        // then publishes into it.  A window opened and never dispatched is closed by the next one, not reused.
+        auto opened = [&](bool first_claims, const char* what) {
+            runner.begin_window(ENTRIES);
+            return window(first_claims, what);
+        };
+        different += opened(true, "window opened early, claims on layer 0");
+        different += opened(false, "window opened early, claims on layer 1");
+        runner.begin_window(ENTRIES);
+        different += opened(true, "window opened early after an unused one");
+        different += window(true, "window opened at layer 0 after early ones");
+        runner.begin_window(ENTRIES);
+        runner.end_window();
+        different += window(false, "window opened at layer 0 after an ended early one");
+        different += opened(true, "window opened early after that");
+    }
+    {   // #228 v2: staged experts in the window graph, fetched by the layer's segment from mapped host memory
+        strata::core::SecondaryRunner runner;
+        if (!runner.init(ENTRIES, ENTRIES, H, FF, err, strata::core::kSecondaryReserveBytes, false, 2, a.blob.size()) ||
+            !runner.enable_window({a.layout, a.layout}, err)) {
+            std::fprintf(stderr, "secondary runner (window staged): %s\n", err.c_str());
+            return 1;
+        }
+        if (runner.stage_slots() != 2) { std::fprintf(stderr, "window runner reports %d slots\n", runner.stage_slots()); return 1; }
+        uint8_t *h0 = nullptr, *h1 = nullptr, *d0 = nullptr, *d1 = nullptr;
+        ck(cudaHostAlloc((void**) &h0, a.blob.size(), cudaHostAllocMapped), "window staged blob pin");
+        ck(cudaHostAlloc((void**) &h1, a.blob2.size(), cudaHostAllocMapped), "window staged blob2 pin");
+        ck(cudaHostGetDevicePointer((void**) &d0, h0, 0), "window staged blob device pointer");
+        ck(cudaHostGetDevicePointer((void**) &d1, h1, 0), "window staged blob2 device pointer");
+        std::memcpy(h0, a.blob.data(), a.blob.size());
+        std::memcpy(h1, a.blob2.data(), a.blob2.size());
+        const uint8_t* staged[2] = {d0, d1};
+        const int32_t none[ENTRIES] = {-1, -1, -1}, claim[ENTRIES] = {0, 0, 1};
+        // `layer`: the layer that claims (the other publishes an empty plan); mixed: expert E staged, E+1 resident
+        auto staged_window = [&](int layer, bool mixed, bool resident, const char* what) {
+            const int32_t sel[ENTRIES] = {-2, -2, mixed ? 1 : -3};
+            const int32_t* use = resident ? claim : sel;
+            const int ns = resident ? 0 : (mixed ? 1 : 2);
+            std::vector<float> got(a.x.size(), 0.f);
+            bool ran = true;
+            for (int l = 0; l < 2 && ran; ++l)
+                ran = runner.launch_layer(l, a.layout, arena, a.x.data(), l == layer ? use : none, ENTRIES, 1, err,
+                                          l == layer ? staged : nullptr, l == layer ? ns : 0, a.blob.size()) &&
+                      runner.finish(got.data(), err);
+            if (!ran) { std::fprintf(stderr, "secondary runner (%s): %s\n", what, err.c_str()); return (int) got.size(); }
+            int d = 0;
+            for (size_t i = 0; i < got.size(); ++i) d += std::memcmp(&a.reference[i], &got[i], sizeof(float)) != 0;
+            std::printf("%s: layer %d, 4070 window graph vs 5060 verify path, differing %d/%zu floats\n", what, a.index,
+                        d, got.size());
+            return d;
+        };
+        different += staged_window(0, false, false, "window staged, both on layer 0");
+        different += staged_window(1, true, false, "window staged/resident on layer 1");
+        different += staged_window(0, false, true, "window resident after staged");   // no stale fetch
+        runner.begin_window(ENTRIES);
+        different += staged_window(1, false, false, "window opened early, both staged on layer 1");
+        // more staged blobs than slots, and a slot code past the staged blobs: refused
+        const uint8_t* three[3] = {d0, d1, d0};
+        const int32_t past[ENTRIES] = {-2, -2, -3};
+        if (runner.launch_layer(0, a.layout, arena, a.x.data(), claim, ENTRIES, 1, err, three, 3, a.blob.size()) ||
+            runner.launch_layer(0, a.layout, arena, a.x.data(), past, ENTRIES, 1, err, staged, 1, a.blob.size())) {
+            std::fprintf(stderr, "window staged: an invalid staged launch was accepted\n");
+            ++different;
+        }
+        different += staged_window(0, true, false, "window staged after refused launches");
+        runner.end_window();
+        cudaFreeHost(h0);
+        cudaFreeHost(h1);
     }
     {   // after release (the engine is ending) nothing more is launched or published: a runner of its own
         strata::core::SecondaryRunner runner;

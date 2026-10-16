@@ -108,6 +108,10 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     const uint64_t count_at = carve(sizeof(int32_t));
     const uint64_t dst_at = carve((uint64_t) max_entries * sizeof(int32_t));
     const uint64_t tok_at = carve((uint64_t) max_entries * sizeof(int32_t));
+    // #228 v2: the window plan's staged blobs (count, device sources, bytes), copied with the rest of the plan
+    const uint64_t stage_n_at = carve(sizeof(int32_t));
+    const uint64_t stage_src_at = carve((uint64_t) kMaxStageSlots * sizeof(unsigned long long));
+    const uint64_t stage_bytes_at = carve(sizeof(long long));
     const uint64_t meta_end = cursor;
     stage_slots_ = stage_slots;
     stage_stride_ = stage_slots > 0 ? aligned(stage_blob_bytes) : 0;
@@ -116,6 +120,9 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     meta_count_off_ = (size_t) (count_at - ptr_at);
     meta_dst_off_ = (size_t) (dst_at - ptr_at);
     meta_tok_off_ = (size_t) (tok_at - ptr_at);
+    meta_stage_n_off_ = (size_t) (stage_n_at - ptr_at);
+    meta_stage_src_off_ = (size_t) (stage_src_at - ptr_at);
+    meta_stage_bytes_off_ = (size_t) (stage_bytes_at - ptr_at);
     meta_bytes_ = (size_t) (meta_end - ptr_at);
     if (!workspace_.open(1, {cursor}, cursor, err)) return false;
     uint8_t* base = workspace_.slot_ptr(0);
@@ -130,6 +137,9 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     device_dst_ = (int32_t*) (base + dst_at);
     device_tok_ = (int32_t*) (base + tok_at);
     device_stage_ = stage_slots > 0 ? base + stage_at : nullptr;
+    device_stage_n_ = (int32_t*) (base + stage_n_at);
+    device_stage_src_ = (unsigned long long*) (base + stage_src_at);
+    device_stage_bytes_ = (long long*) (base + stage_bytes_at);
 
     int previous = -1;
     if (!cuda_ok(cudaGetDevice(&previous), "runner current device", err) ||
@@ -490,6 +500,9 @@ void release_window_runner(std::FILE* f) {
         if (f != nullptr) std::fprintf(f, "strata: released the 4070 window graph's waits (#227, #267)\n");
     }
 }
+void begin_window_runner(int n_tokens) {   // #245: on the verifier's host thread, the one that dispatches the layers
+    if (SecondaryRunner* r = g_window_runner.load()) r->begin_window(n_tokens);
+}
 }  // namespace
 
 const char* SecondaryRunner::window_refusal(bool spec_split, bool layer_split, int pipeline_windows, int batch_groups,
@@ -570,6 +583,15 @@ bool SecondaryRunner::enable_window(const std::vector<kernels::NativeExpertLayou
     window_ = true;
     g_window_runner.store(this);
     core::release_secondary_fn().store(&release_window_runner);
+    {   // #245 STRATA_SECONDARY_WINDOW_EARLY (default on): the window's launch on a helper, at the verify launch
+        const char* v = std::getenv("STRATA_SECONDARY_WINDOW_EARLY");
+        win_early_ = v == nullptr || v[0] == '\0' || v[0] != '0';
+    }
+    if (win_early_) {
+        win_stop_ = false;
+        win_launcher_ = std::thread([this] { win_launcher_loop(); });
+        core::begin_secondary_window_fn().store(&begin_window_runner);
+    }
     err.clear();
     return true;
 }
@@ -586,6 +608,9 @@ bool SecondaryRunner::capture_window(int n_tokens, std::string& err) {
         const bool q2 = layout.gu_type == 42 && layout.d_type == 42;
         kernels::window_wait(dev_go_ + l, dev_count_ + l, stream);
         cudaMemcpyAsync(device_ptr_, host_wmeta_ + (size_t) l * meta_bytes_, meta_bytes_, cudaMemcpyHostToDevice, stream);
+        if (stage_slots_ > 0)   // #228 v2: this layer's staged experts, from mapped host memory into the staging slots
+            kernels::window_fetch_blobs(device_stage_n_, device_stage_src_, device_stage_bytes_, device_stage_,
+                                        stage_stride_, stage_slots_, stream);
         cudaMemcpyAsync(device_x_, host_wx_ + (size_t) l * xs, (size_t) n_tokens * n_embd_ * sizeof(float),
                         cudaMemcpyHostToDevice, stream);
         if (layout.had_gu_block > 0)
@@ -616,6 +641,7 @@ bool SecondaryRunner::publish_empty(int layer, std::string& err) {
     if (!wait_consumed(layer, err)) return false;
     int32_t zero = 0;
     std::memcpy(host_wmeta_ + (size_t) layer * meta_bytes_ + meta_count_off_, &zero, sizeof zero);
+    std::memcpy(host_wmeta_ + (size_t) layer * meta_bytes_ + meta_stage_n_off_, &zero, sizeof zero);   // #228 v2
     std::atomic_thread_fence(std::memory_order_release);
     _mm_sfence();
     host_go_[layer] = win_seq_;
@@ -628,6 +654,7 @@ void SecondaryRunner::end_window() {
     for (int l = win_next_; l < win_layers_; ++l)
         if (!publish_empty(l, err)) break;
     win_next_ = win_layers_;
+    win_opened_ = 0;   // #245: an ended window is never published into again
 }
 
 void SecondaryRunner::release_window() {
@@ -638,8 +665,93 @@ void SecondaryRunner::release_window() {
     _mm_sfence();
 }
 
+void SecondaryRunner::begin_window(int n_tokens) {
+    if (!window_ || !win_early_ || failed_ || pending_ || n_tokens <= 0 || n_tokens > max_tokens_ ||
+        win_graph_[(size_t) n_tokens] == nullptr || win_released_.load(std::memory_order_acquire))
+        return;   // layer 0 opens the window itself (and reports what is wrong)
+    const auto t0 = std::chrono::steady_clock::now();
+    // no CUDA call: the last window's unpublished layers get empty plans (all of them when it was opened here and its
+    // layer 0 never came, so it runs through and is not reused)
+    end_window();
+    if (failed_) return;
+    // one launch request at a time: the last window's must be taken before this one replaces it (a lost launch leaves
+    // the graph's run count one behind the host's window count, and every later window waits forever)
+    std::string err;
+    if (!wait_win_launched(err)) return;
+    ++win_seq_;
+    win_next_ = 0;
+    win_tokens_ = n_tokens;
+    win_opened_ = win_seq_;
+    win_requested_ = win_seq_;
+    {
+        std::lock_guard<std::mutex> lk(win_mu_);
+        win_req_tokens_ = n_tokens;
+        win_req_seq_ = win_seq_;
+    }
+    win_cv_.notify_one();
+    if (timeline::enabled()) timeline::complete("4070 window open", t0, std::chrono::steady_clock::now(), n_tokens);
+}
+
+void SecondaryRunner::win_launcher_loop() {
+    cudaSetDevice(1);
+    timeline::name_thread("4070 window launcher");
+    for (;;) {
+        int tokens = 0;
+        uint32_t seq = 0;
+        {
+            std::unique_lock<std::mutex> lk(win_mu_);
+            win_cv_.wait(lk, [this] { return win_req_tokens_ > 0 || win_stop_; });
+            if (win_req_tokens_ == 0) return;   // stopped with nothing left to launch
+            tokens = win_req_tokens_;
+            seq = win_req_seq_;
+            win_req_tokens_ = 0;
+        }
+        const auto l0 = std::chrono::steady_clock::now();
+        cudaStream_t stream = (cudaStream_t) stream_;
+        const cudaError_t e = cudaGraphLaunch((cudaGraphExec_t) win_graph_[(size_t) tokens], stream);
+        if (e == cudaSuccess) (void) cudaStreamQuery(stream);   // WDDM: hand the graph to the 4070 now
+        else if (!win_launch_failed_.load(std::memory_order_relaxed)) {
+            win_launch_err_ = std::string("secondary runner: window graph launch: ") + cudaGetErrorString(e);
+            win_launch_failed_.store(true, std::memory_order_release);
+        }
+        if (timeline::enabled()) timeline::complete("4070 window launch", l0, std::chrono::steady_clock::now(), tokens);
+        win_launched_.store(seq, std::memory_order_release);
+    }
+}
+
+void SecondaryRunner::stop_win_launcher() {
+    if (!win_launcher_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(win_mu_);
+        win_stop_ = true;
+    }
+    win_cv_.notify_one();
+    win_launcher_.join();   // after the launch it may still hold (stream order is kept)
+}
+
+bool SecondaryRunner::wait_win_launched(std::string& err) {
+    // the helper launches in the order the windows opened; a launch from this thread must not overtake one of its
+    const auto t0 = std::chrono::steady_clock::now();
+    uint32_t spins = 0;
+    while (win_launched_.load(std::memory_order_acquire) != win_requested_) {
+        _mm_pause();
+        if ((++spins & 4095u) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+            failed_ = true;
+            err = "secondary runner: the window launcher did not launch in 30 s";
+            return false;
+        }
+    }
+    if (win_launch_failed_.load(std::memory_order_acquire)) {
+        failed_ = true;
+        err = win_launch_err_;
+        return false;
+    }
+    return true;
+}
+
 bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout& layout_in, const SecondaryArena& weights,
-                                   const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err) {
+                                   const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err,
+                                   const uint8_t* const* staged_dev, int n_staged, size_t staged_bytes) {
     const auto t0 = std::chrono::steady_clock::now();
     if (!window_ || pending_ || failed_ || layer < 0 || layer >= win_layers_ || x == nullptr ||
         selected_slots == nullptr || n_tokens <= 0 || n_tokens > max_tokens_ || k <= 0 || k > max_entries_ / n_tokens ||
@@ -657,12 +769,31 @@ bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout&
         err = "secondary runner: the window graph was released (the engine is ending)";
         return false;
     }
-    for (int i = 0; i < n_tokens * k; ++i)
-        if (selected_slots[i] < -1) {   // a staged slot: this mode has no staging slots (stage_slots() is 0)
-            err = "secondary runner: a staged slot in window mode";
+    if (n_staged < 0 || n_staged > stage_slots_ || (n_staged > 0 && (staged_dev == nullptr || staged_bytes == 0 ||
+                                                                     staged_bytes > stage_stride_))) {
+        err = "secondary runner: staged blobs do not fit the staging slots";
+        return false;
+    }
+    for (int s = 0; s < n_staged; ++s)
+        if (staged_dev[s] == nullptr || ((uintptr_t) staged_dev[s] & 15u) != 0) {
+            err = "secondary runner: a staged blob is not a 16-byte aligned device pointer";
             return false;
         }
-    if (layer == 0) {   // a new window: close the last one, then the window's one launch
+    for (int i = 0; i < n_tokens * k; ++i)
+        if (selected_slots[i] < -1 && -(selected_slots[i] + 2) >= n_staged) {   // #228 v2: past the staged blobs
+            err = "secondary runner: selected staging slot has no staged blob";
+            return false;
+        }
+    if (layer == 0 && win_opened_ != 0) {   // #245: begin_window opened it and its helper launches (or launched) it
+        win_opened_ = 0;
+        if (n_tokens != win_tokens_) {
+            failed_ = true;
+            err = "secondary runner: the window was opened for another token count";
+            return false;
+        }
+        if (win_launch_failed_.load(std::memory_order_acquire)) { failed_ = true; err = win_launch_err_; return false; }
+    } else if (layer == 0) {   // a new window: close the last one, then the window's one launch
+        if (win_early_ && !wait_win_launched(err)) return false;
         const auto l0 = std::chrono::steady_clock::now();
         int previous = -1;
         if (!cuda_ok(cudaGetDevice(&previous), "runner current device", err) ||
@@ -694,8 +825,8 @@ bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout&
     const int entries = n_tokens * k;
     for (int i = 0; i < entries; ++i) {
         const int32_t slot = selected_slots[i];
-        if (slot < 0) continue;
-        if (weights.slot_ptr((uint64_t) slot) == nullptr) {
+        if (slot == -1) continue;   // not on the 4070; below -1 a staged slot (#228 v2)
+        if (slot >= 0 && weights.slot_ptr((uint64_t) slot) == nullptr) {
             err = "secondary runner: selected slot is not resident";
             return false;
         }
@@ -704,7 +835,8 @@ bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout&
         if (!seen) group_slots_.push_back(slot);
     }
     for (const int32_t slot : group_slots_) {
-        ptr_.push_back((unsigned long long) weights.slot_ptr((uint64_t) slot));
+        ptr_.push_back(slot < -1 ? (unsigned long long) (device_stage_ + (uint64_t) -(slot + 2) * stage_stride_)
+                                 : (unsigned long long) weights.slot_ptr((uint64_t) slot));
         start_.push_back((int32_t) dst_.size());
         for (int i = 0; i < entries; ++i) if (selected_slots[i] == slot) {
             dst_.push_back((int32_t) selected_rows_.size());
@@ -721,6 +853,16 @@ bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout&
         std::memcpy(meta + meta_start_off_, start_.data(), start_.size() * sizeof(start_[0]));
         std::memcpy(meta + meta_dst_off_, dst_.data(), dst_.size() * sizeof(dst_[0]));
         std::memcpy(meta + meta_tok_off_, tok_.data(), tok_.size() * sizeof(tok_[0]));
+    }
+    {   // #228 v2: the staged blobs the segment fetches before its experts (none without claims)
+        const int32_t ns = host_count_ > 0 ? n_staged : 0;
+        const long long nb = (long long) staged_bytes;
+        std::memcpy(meta + meta_stage_n_off_, &ns, sizeof ns);
+        if (ns > 0) {
+            std::memcpy(meta + meta_stage_src_off_, staged_dev, (size_t) ns * sizeof(unsigned long long));
+            std::memcpy(meta + meta_stage_bytes_off_, &nb, sizeof nb);
+            staged_experts_ += (uint64_t) ns;
+        }
     }
     std::memcpy(meta + meta_count_off_, &host_count_, sizeof host_count_);
     std::atomic_thread_fence(std::memory_order_release);
@@ -742,7 +884,12 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
         uint32_t spins = 0;
         while (host_done_[win_layer_] < win_seq_) {
             _mm_pause();
-            if ((++spins & 4095u) == 0 &&
+            if ((++spins & 4095u) == 0 && win_launch_failed_.load(std::memory_order_acquire)) {   // #245
+                failed_ = true;
+                err = win_launch_err_;
+                return false;
+            }
+            if ((spins & 4095u) == 0 &&
                 std::chrono::steady_clock::now() - wait_t0 > std::chrono::seconds(30)) {
                 failed_ = true;
                 err = "secondary runner: the 4070's window graph did not finish layer " + std::to_string(win_layer_) +
@@ -919,6 +1066,9 @@ void SecondaryRunner::stop_monitor() {
 
 void SecondaryRunner::close() {
     stop_launcher();
+    stop_win_launcher();   // #245
+    if (window_ && core::begin_secondary_window_fn().load() == &begin_window_runner)
+        core::begin_secondary_window_fn().store(nullptr);
     stop_monitor();
     if (window_) {   // #227: no segment may still wait when the stream is drained below
         release_window();

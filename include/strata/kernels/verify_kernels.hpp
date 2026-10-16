@@ -50,6 +50,11 @@ void window_wait(const uint32_t* go, const uint32_t* count, void* stream);
 void window_signal(uint32_t* done, uint32_t* count, void* stream);
 void window_rows_to_host(const float* src, float* dst_mapped, const int32_t* start, const int32_t* n_groups,
                          int n_embd, int max_rows, void* stream);
+/// #228 v2: the window segment's staged experts.  Copies *n blobs of *bytes each from src[s] (device pointers of
+/// page-locked, mapped host memory; 16-byte aligned) to dst + s * stride, for s < *n <= max_slots.  The counts are read
+/// from device memory (the layer's plan), so the captured graph needs no update; *n = 0 costs one empty launch.
+void window_fetch_blobs(const int32_t* n, const unsigned long long* src, const long long* bytes, uint8_t* dst,
+                        unsigned long long stride, int max_slots, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
