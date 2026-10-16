@@ -6396,11 +6396,17 @@ int main(int argc, char** argv) {
         bytes.reserve(candidates.size());
         for (const auto& pair : candidates) bytes.push_back(pair.bytes);
         const bool secondary_compute = !o.secondary_stage_only && !o.cache_cpu_only;
+        // #228 STRATA_SECONDARY_STAGE_SLOTS=N (default 0): device-1 slots for CPU-missed experts the dispatch copies
+        // in per layer; carved here, before the tier below is sized from the display reserve
+        const int stage_slots = [] {
+            const char* v = std::getenv("STRATA_SECONDARY_STAGE_SLOTS");
+            return v != nullptr ? std::clamp(std::atoi(v), 0, strata::core::SecondaryRunner::kMaxStageSlots) : 0;
+        }();
         if (!secondary_runner.init(strata::kernels::cpu::MAXT,
                                    (int) (strata::kernels::cpu::MAXT * K),
                                    (int) g.n_embd, (int) g.n_ff, err,
                                    (uint64_t) o.secondary_free_floor_mib << 20,
-                                   o.secondary_profile_timing)) {
+                                   o.secondary_profile_timing, stage_slots, layout.max_blob)) {
             std::fprintf(stderr, "strata generate: secondary runner: %s\n", err.c_str());
             return 1;
         }
@@ -6954,6 +6960,27 @@ int main(int argc, char** argv) {
         drive.d.secondary_runner = &secondary_runner;
         drive.d.secondary_weights = &secondary_arena;
         drive.d.secondary_res = secondary_residency.data();
+        // #228 STRATA_PIN_CPU_HOT_MIB=N (default 0): page-lock the profile's hottest CPU-owned experts in place for the
+        // 4070 (device 1, not portable unless STRATA_PIN_CPU_HOT_PORTABLE=1), so a staged copy needs no host memcpy
+        const char* hot_v = std::getenv("STRATA_PIN_CPU_HOT_MIB");
+        const long long hot_mib = hot_v != nullptr ? std::atoll(hot_v) : 0;
+        if (hot_mib > 0 && srcp == &arena_src) {
+            const char* pv = std::getenv("STRATA_PIN_CPU_HOT_PORTABLE");
+            const bool portable = pv != nullptr && pv[0] == '1';
+            int prev = -1;
+            cudaGetDevice(&prev);
+            cudaSetDevice(1);
+            std::string pin_err;
+            const bool pinned_ok = arena_src.pin_cpu_hot(profile, (uint64_t) hot_mib << 20, portable, pin_err);
+            cudaSetDevice(prev);
+            const auto st = arena_src.hot_pin_stats();
+            std::fprintf(stderr, "strata generate: hot CPU experts page-locked for the 4070 (#228): %lld experts in %lld "
+                                 "runs, %.2f GiB (%s), in %.0f ms; %d staging slots%s%s\n",
+                         (long long) st.experts, (long long) st.runs, (double) st.bytes / 1073741824.0,
+                         portable ? "portable" : "device 1 only", st.ms, secondary_runner.stage_slots(),
+                         pin_err.empty() ? "" : "; ", pin_err.c_str());
+            if (!pinned_ok) return 1;
+        }
     }
     drive.d.jobs.resize((size_t) K);
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
@@ -14269,6 +14296,12 @@ int main(int argc, char** argv) {
                              (long long) (arena_src.nvme_loads() - nvme0), private_commit_bytes() / 1073741824.0);
                 std::fprintf(stderr, "strata serve: adaptive swaps since start: 5060 %lld, 4070 %lld\n",
                              (long long) paired_swaps, (long long) sec_swaps);   // xeno #229
+                if (secondary_runner.stage_slots() > 0) {   // #228
+                    const auto hp = arena_src.hot_pin_stats();
+                    std::fprintf(stderr, "strata serve: 4070 staged experts since start: %lld; hot pins %lld experts "
+                                         "(%.2f GiB), %lld dropped by swaps\n", (long long) drive.d.secondary_staged,
+                                 (long long) hp.experts, (double) hp.bytes / 1073741824.0, (long long) hp.dropped);
+                }
                 if (dec_windows > 0) {   // #11 acceptance 7: per verify window and per emitted token
                     const double w = (double) dec_windows, tk = produced_n > 0 ? (double) produced_n : 1.0;
                     const double all = sum > 0 ? (double) sum : 1.0;
@@ -15691,6 +15724,11 @@ int main(int argc, char** argv) {
         if (rounds > 0 && o.secondary_expert_mib > 0)
             std::printf("%-24s launch %.3f  wait %.3f ms/round (wait > 0: the 4070 SUPER finished after the CPU pool)\n",
                         "secondary timing", secondary_runner.ms_launch() / rounds, secondary_runner.ms_wait() / rounds);
+        if (rounds > 0 && secondary_runner.stage_slots() > 0)   // #228
+            std::printf("%-24s %lld experts (%.2f per round); hot pins %lld experts, %lld dropped by swaps\n",
+                        "secondary staged", (long long) drive.d.secondary_staged,
+                        (double) drive.d.secondary_staged / rounds, (long long) arena_src.hot_pin_stats().experts,
+                        (long long) arena_src.hot_pin_stats().dropped);
         if (rounds > 0 && o.secondary_async_launch)
             std::printf("%-24s helper enqueue %.3f  finish waited for it %.3f ms/round\n", "secondary async",
                         secondary_runner.ms_async_enqueue() / rounds, secondary_runner.ms_async_wait() / rounds);

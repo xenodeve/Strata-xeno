@@ -70,10 +70,15 @@ void SecondaryRunner::record_free(uint64_t bytes) {
 }
 
 bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff,
-                           std::string& err, uint64_t free_floor_bytes, bool profile_timing) {
+                           std::string& err, uint64_t free_floor_bytes, bool profile_timing,
+                           int stage_slots, uint64_t stage_blob_bytes) {
     if (max_tokens <= 0 || max_tokens > 16 || max_entries <= 0 || max_entries > 128 ||
         n_embd <= 0 || n_embd % 32 != 0 || n_ff <= 0 || n_ff % 32 != 0) {
         err = "secondary runner: invalid verify-window geometry";
+        return false;
+    }
+    if (stage_slots < 0 || stage_slots > kMaxStageSlots || (stage_slots > 0 && stage_blob_bytes == 0)) {
+        err = "secondary runner: staging slots must be 0.." + std::to_string(kMaxStageSlots) + " of a non-empty blob";
         return false;
     }
     if (workspace_.slots() != 0 || stream_ != nullptr) {
@@ -99,11 +104,15 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     const uint64_t count_at = carve(sizeof(int32_t));
     const uint64_t dst_at = carve((uint64_t) max_entries * sizeof(int32_t));
     const uint64_t tok_at = carve((uint64_t) max_entries * sizeof(int32_t));
+    const uint64_t meta_end = cursor;
+    stage_slots_ = stage_slots;
+    stage_stride_ = stage_slots > 0 ? aligned(stage_blob_bytes) : 0;
+    const uint64_t stage_at = carve((uint64_t) stage_slots * stage_stride_);   // after the metadata (not in its H2D)
     meta_start_off_ = (size_t) (start_at - ptr_at);
     meta_count_off_ = (size_t) (count_at - ptr_at);
     meta_dst_off_ = (size_t) (dst_at - ptr_at);
     meta_tok_off_ = (size_t) (tok_at - ptr_at);
-    meta_bytes_ = (size_t) (cursor - ptr_at);
+    meta_bytes_ = (size_t) (meta_end - ptr_at);
     if (!workspace_.open(1, {cursor}, cursor, err)) return false;
     uint8_t* base = workspace_.slot_ptr(0);
     device_x_ = (float*) (base + x_at);
@@ -116,6 +125,7 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     device_count_ = (int32_t*) (base + count_at);
     device_dst_ = (int32_t*) (base + dst_at);
     device_tok_ = (int32_t*) (base + tok_at);
+    device_stage_ = stage_slots > 0 ? base + stage_at : nullptr;
 
     int previous = -1;
     if (!cuda_ok(cudaGetDevice(&previous), "runner current device", err) ||
@@ -166,8 +176,12 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
 
 bool SecondaryRunner::launch(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
                              const float* x, const int32_t* selected_slots, int n_tokens, int k,
-                             std::string& err) {
-    if (!async_) return launch_now(layout, weights, x, selected_slots, n_tokens, k, err);
+                             std::string& err, const uint8_t* const* staged, int n_staged, size_t staged_bytes) {
+    if (!async_) return launch_now(layout, weights, x, selected_slots, n_tokens, k, err, staged, n_staged, staged_bytes);
+    if (n_staged > 0) {
+        err = "secondary runner: staged experts are not taken by the async launcher";
+        return false;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     const int entries = n_tokens * k;
     if (!launch_done_.load(std::memory_order_acquire) || x == nullptr || selected_slots == nullptr ||
@@ -244,7 +258,7 @@ void SecondaryRunner::stop_launcher() {
 
 bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout_in, const SecondaryArena& weights,
                                  const float* x, const int32_t* selected_slots, int n_tokens, int k,
-                                 std::string& err) {
+                                 std::string& err, const uint8_t* const* staged, int n_staged, size_t staged_bytes) {
     // APR (prism.hadamard): a folded down projection rotates h with this device's sign vector; a folded gate/up
     // takes H (s * x), rotated below in device_x_ (this runner's private copy) before it is quantized
     kernels::NativeExpertLayout layout = layout_in;
@@ -263,20 +277,33 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout_in, c
     const auto launch_t0 = std::chrono::steady_clock::now();
     ptr_.clear(); start_.clear(); dst_.clear(); tok_.clear(); selected_rows_.clear(); group_slots_.clear();
     const int entries = n_tokens * k;
+    if (n_staged < 0 || n_staged > stage_slots_ || (n_staged > 0 && (staged == nullptr || staged_bytes == 0 ||
+                                                                     staged_bytes > stage_stride_))) {
+        err = "secondary runner: staged blobs do not fit the staging slots";
+        return false;
+    }
+    int n_staged_used = 0;
     for (int i = 0; i < entries; ++i) {
         const int32_t slot = selected_slots[i];
-        if (slot < 0) continue;
-        if (weights.slot_ptr((uint64_t) slot) == nullptr) {
+        if (slot == -1) continue;
+        if (slot < -1) {   // #228: staging slot -(slot + 2)
+            const int s = -(slot + 2);
+            if (s >= n_staged || staged[s] == nullptr) {
+                err = "secondary runner: selected staging slot has no staged blob";
+                return false;
+            }
+        } else if (weights.slot_ptr((uint64_t) slot) == nullptr) {
             err = "secondary runner: selected slot is not resident";
             return false;
         }
         bool seen = false;
         for (const int32_t prior : group_slots_) if (prior == slot) { seen = true; break; }
-        if (!seen) group_slots_.push_back(slot);
+        if (!seen) { group_slots_.push_back(slot); n_staged_used += slot < -1; }
     }
     if (group_slots_.empty()) { err.clear(); return true; }
     for (const int32_t slot : group_slots_) {
-        ptr_.push_back((unsigned long long) weights.slot_ptr((uint64_t) slot));
+        ptr_.push_back(slot < -1 ? (unsigned long long) (device_stage_ + (uint64_t) -(slot + 2) * stage_stride_)
+                                 : (unsigned long long) weights.slot_ptr((uint64_t) slot));
         start_.push_back((int32_t) dst_.size());
         for (int i = 0; i < entries; ++i) if (selected_slots[i] == slot) {
             dst_.push_back((int32_t) selected_rows_.size());
@@ -328,6 +355,19 @@ bool SecondaryRunner::launch_now(const kernels::NativeExpertLayout& layout_in, c
         return !profile_timing_ || cuda_ok(cudaEventRecord((cudaEvent_t) timing_events_[index], stream),
                                            "runner timing marker", err);
     };
+    if (n_staged_used > 0) {   // #228: the staged blobs first; stream order holds the kernels until they have landed
+        cudaEvent_t st0 = tl_clock().record(stream);
+        for (const int32_t slot : group_slots_) {
+            if (slot >= -1) continue;
+            const int s = -(slot + 2);
+            if (!cuda_ok(cudaMemcpyAsync(device_stage_ + (uint64_t) s * stage_stride_, staged[s], staged_bytes,
+                                         cudaMemcpyHostToDevice, stream), "runner staged blob H2D", err))
+                return fail_enqueued();
+        }
+        static const int tl_stage_lane = timeline::lane("gpu1 4070 experts");
+        tl_clock().span(tl_stage_lane, "4070 stage h2d", st0, tl_clock().record(stream), n_tokens, n_staged_used);
+        staged_experts_ += (uint64_t) n_staged_used;
+    }
     if (graph_ && !profile_timing_) {
         const size_t rows = selected_rows_.size();
         // a captured graph bakes in the layer's formats: one table of graphs per (gate/up, down) pair

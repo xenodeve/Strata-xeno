@@ -3734,6 +3734,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // (xeno) the 4070 tier's claim first: the rows it takes become kind 2 before any_cpu below reads kind
     bool secondary_claims = false;
     int32_t secondary_slots[128];
+    const uint8_t* staged_blobs[strata::core::SecondaryRunner::kMaxStageSlots];   // #228
+    int n_staged = 0;
     if (d.secondary_runner != nullptr) {
         if (!native || d.secondary_weights == nullptr || d.secondary_res == nullptr || n > 128) {
             d.failed = true;
@@ -3753,6 +3755,50 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
         }
+        // #228 STRATA_SECONDARY_STAGE_SLOTS: some CPU-missed experts copied to the 4070 for this layer and computed
+        // there, the split chosen by the cost model of the design note (#228 comment 6216634040)
+        const int stage_cap = d.remote_count == 0 && d.peer == nullptr ? d.secondary_runner->stage_slots() : 0;
+        if (stage_cap > 0) {
+            struct Cost { double pool, copy, group, base, issue, launch; int min_cpu; };
+            static const Cost cost = [] {
+                Cost c{117, 62, 15, 40, 5, 55, 0};
+                if (const char* v = std::getenv("STRATA_SECONDARY_STAGE_COST"))
+                    std::sscanf(v, "%lf,%lf,%lf,%lf,%lf,%lf", &c.pool, &c.copy, &c.group, &c.base, &c.issue, &c.launch);
+                if (const char* v = std::getenv("STRATA_SECONDARY_STAGE_MIN_CPU")) c.min_cpu = std::max(0, std::atoi(v));
+                return c;
+            }();
+            int n_cpu = 0, r_groups = 0, h = 0;
+            int64_t cand[kMaxWindowEntries];   // first entry of each stageable CPU expert, in routing order
+            const uint8_t* cand_blob[kMaxWindowEntries];
+            for (int64_t i = 0; i < n; ++i) {
+                const int32_t e = ids[i];
+                bool first = true;
+                for (int64_t j = 0; j < i; ++j) if (ids[j] == e) { first = false; break; }
+                if (!first) continue;
+                if (kind[i] == 2) { ++r_groups; continue; }
+                if (kind[i] != -1 || e < 0 || e >= d.n_expert) continue;
+                ++n_cpu;
+                if (const uint8_t* b = d.src->stage_blob(d.layers, e)) { cand[h] = i; cand_blob[h] = b; ++h; }
+            }
+            const int m_max = std::min({h, stage_cap, std::max(0, n_cpu - cost.min_cpu)});
+            int best_m = 0;
+            double best = 0;
+            for (int m = 0; m <= m_max; ++m) {
+                const double pool = cost.pool * (n_cpu - m);
+                const double g4070 = r_groups + m > 0 ? cost.base + cost.group * (r_groups + m) + cost.copy * m : 0.0;
+                const double host = cost.issue * m + (r_groups == 0 && m > 0 ? cost.launch : 0.0);
+                const double t = std::max(pool, g4070) + host;
+                if (m == 0 || t < best) { best = t; best_m = m; }
+            }
+            for (int s = 0; s < best_m; ++s) {
+                const int32_t e = ids[cand[s]];
+                for (int64_t i = cand[s]; i < n; ++i)
+                    if (ids[i] == e) { secondary_slots[i] = -(s + 2); kind[i] = 2; }
+                staged_blobs[s] = cand_blob[s];
+            }
+            n_staged = best_m;
+            if (best_m > 0) { secondary_claims = true; d.secondary_staged += best_m; }
+        }
         if (secondary_claims) {
             const auto& f = lay.fmt[(size_t) d.layers];
             auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
@@ -3761,7 +3807,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (f.had_gu) L.had_gu_block = f.had_block;
             std::string secondary_err;
             if (!d.secondary_runner->launch(L, *d.secondary_weights, x_f, secondary_slots,
-                                             (int) n_tok, (int) k, secondary_err)) {
+                                             (int) n_tok, (int) k, secondary_err, staged_blobs, n_staged,
+                                             (size_t) lay.blob_bytes(d.layers))) {
                 d.failed = true;
                 d.secondary_fail = "secondary expert launch: " + secondary_err;
                 d.fail = d.secondary_fail.c_str();
@@ -3988,6 +4035,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         timeline::complete("plan begin layer", c0, cb, d.layers, n_tok * k);
         timeline::complete("plan gpu share", cb, cg, d.layers, n_tok * k);
         timeline::complete("plan 4070 launch", cg, ce, d.layers, secondary_claims ? 1 : 0);
+        if (n_staged > 0) timeline::complete("4070 staged", cg, ce, d.layers, n_staged);   // #228: experts moved
         timeline::complete("act quantize", c1, c2, d.layers, n_tok);
         timeline::complete("dispatch jobs", c2, c3, d.layers, njobs);
         timeline::complete("cpu pool", pool_start, pool_end, d.layers, njobs);
@@ -5553,6 +5601,7 @@ void ArenaExpertSource::close() {
     map_ = nullptr;
     map_bytes_ = 0;
     inputs_.clear();
+    unpin_all_hot();   // #228
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
         arena_ = nullptr;
@@ -5651,6 +5700,100 @@ bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
 }
 
+const uint8_t* ArenaExpertSource::stage_blob(int64_t layer, int64_t expert) const {
+    if (!hot_ || base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx >= blobs_ || !hot_[(size_t) idx].load(std::memory_order_acquire)) return nullptr;
+    return host_at((size_t) idx);
+}
+
+bool ArenaExpertSource::pin_cpu_hot(const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t budget_bytes,
+                                    bool portable, std::string& err) {
+    std::lock_guard<std::mutex> lk(host_mu_);
+    if (base_ == nullptr || arena_ == nullptr || deferred_ || slab_ || !nvme_.empty() || hot_) {
+        err = "hot CPU-expert pinning needs a loaded arena without an NVMe tier or slab, once";
+        return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    cudaGetDevice(&hot_device_);
+    hot_.reset(new std::atomic<uint8_t>[(size_t) blobs_]());
+    hot_run_of_.assign((size_t) blobs_, -1);
+    std::vector<uint8_t> want((size_t) blobs_, 0);
+    uint64_t used = 0;
+    for (const auto& [l, e] : ranked) {
+        if (l < 0 || e < 0 || e >= n_expert_) continue;
+        const int64_t idx = (int64_t) l * n_expert_ + e;
+        if (idx >= blobs_ || want[(size_t) idx] || ((size_t) idx < exclusive_.size() && exclusive_[(size_t) idx]) ||
+            pinned(l, e))
+            continue;   // GPU-owned (no host pages), or in the portable pinned prefix already
+        const uint64_t bb = lay.blob_bytes(l);
+        if (used + bb > budget_bytes) break;
+        want[(size_t) idx] = 1;
+        used += bb;
+    }
+    const uintptr_t page = 4096;
+    const int64_t n_layers = blobs_ / n_expert_;
+    for (int64_t l = 0; l < n_layers; ++l)
+        for (int64_t e = 0; e < n_expert_; ++e) {
+            if (!want[(size_t) (l * n_expert_ + e)]) continue;
+            int64_t e1 = e;   // neighbours that share a page register as one run (blobs are not page multiples)
+            while (e1 + 1 < n_expert_ && want[(size_t) (l * n_expert_ + e1 + 1)] && lay.blob_offset(l, e1 + 1) % page != 0)
+                ++e1;
+            const uintptr_t first = (uintptr_t) (base_ + lay.blob_offset(l, e)) & ~(page - 1);
+            const uintptr_t last = ((uintptr_t) (base_ + lay.blob_offset(l, e1) + lay.blob_bytes(l)) + page - 1) & ~(page - 1);
+            const cudaError_t r = cudaHostRegister((void*) first, (size_t) (last - first),
+                                                   portable ? cudaHostRegisterPortable : cudaHostRegisterDefault);
+            if (r != cudaSuccess) {   // e.g. the OS refuses more locked pages: keep what is pinned, say so
+                cudaGetLastError();
+                err = std::string("cudaHostRegister stopped after ") + std::to_string(hot_stats_.experts) +
+                      " experts: " + cudaGetErrorString(r);
+                break;
+            }
+            const int32_t run = (int32_t) hot_runs_.size();
+            hot_runs_.push_back({(uint8_t*) first, (size_t) (last - first), (int32_t) l, (int32_t) e, (int32_t) e1});
+            for (int64_t x = e; x <= e1; ++x) {
+                hot_run_of_[(size_t) (l * n_expert_ + x)] = run;
+                hot_[(size_t) (l * n_expert_ + x)].store(1, std::memory_order_release);
+            }
+            hot_stats_.experts += e1 - e + 1;
+            hot_stats_.bytes += (uint64_t) (last - first);
+            ++hot_stats_.runs;
+            e = e1;
+        }
+    hot_stats_.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return hot_stats_.experts > 0 || err.empty();
+}
+
+void ArenaExpertSource::unpin_hot_run(size_t idx) {
+    if (!hot_ || idx >= hot_run_of_.size() || hot_run_of_[idx] < 0) return;
+    HotRun& r = hot_runs_[(size_t) hot_run_of_[idx]];
+    const int64_t row = (int64_t) r.layer * n_expert_;
+    for (int32_t x = r.e0; x <= r.e1; ++x) {   // nobody stages them from the next layer window on
+        hot_[(size_t) (row + x)].store(0, std::memory_order_release);
+        hot_run_of_[(size_t) (row + x)] = -1;
+    }
+    // a run is unregistered only at a swap's release, after the window that last read it: its copies have landed
+    // (SecondaryRunner::finish waited for every staged launch of that window)
+    int prev = -1;
+    cudaGetDevice(&prev);
+    cudaSetDevice(hot_device_);
+    if (cudaHostUnregister(r.base) != cudaSuccess) cudaGetLastError();
+    cudaSetDevice(prev);
+    hot_stats_.dropped += r.e1 - r.e0;   // the released expert's neighbours in its run lose their pin too
+    hot_stats_.experts -= r.e1 - r.e0 + 1;
+    hot_stats_.bytes -= r.bytes;
+    r = HotRun{};
+}
+
+void ArenaExpertSource::unpin_all_hot() {
+    if (!hot_) return;
+    for (size_t i = 0; i < hot_run_of_.size(); ++i) unpin_hot_run(i);
+    hot_.reset();
+    hot_run_of_.clear();
+    hot_runs_.clear();
+}
+
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
     const auto& lay = strata::kernels::cpu::expert_layout();
@@ -5712,6 +5855,7 @@ bool ArenaExpertSource::host_release(size_t idx, uint64_t& given, std::string& e
         if (slot_of_[idx] >= 0) { free_slot(idx); given = lay.blob_bytes(l); }
         return true;
     }
+    unpin_hot_run(idx);   // #228: locked pages are unregistered before they are decommitted
     return ((PinnedArena*) arena_)->decommit_interior(lay.blob_offset(l, x), lay.blob_bytes(l), given, err);
 }
 

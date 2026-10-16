@@ -37,11 +37,21 @@ public:
     SecondaryRunner(const SecondaryRunner&) = delete;
     SecondaryRunner& operator=(const SecondaryRunner&) = delete;
 
+    /// #228: `stage_slots` (0..kMaxStageSlots) device-1 slots of `stage_blob_bytes` each, carved in the workspace, for
+    /// experts that are not resident on the 4070: launch() copies them in from pinned host memory first.
+    static constexpr int kMaxStageSlots = 16;
     bool init(int max_tokens, int max_entries, int n_embd, int n_ff, std::string& err,
-              uint64_t free_floor_bytes = 2560ull << 20, bool profile_timing = false);
+              uint64_t free_floor_bytes = 2560ull << 20, bool profile_timing = false,
+              int stage_slots = 0, uint64_t stage_blob_bytes = 0);
+    /// `selected_slots[i]` is a resident slot (>= 0), -1 (not on the 4070), or #228 a staged blob -(s + 2): staging slot
+    /// s, filled from `staged[s]` (`staged_bytes` each, pinned host memory for an asynchronous copy) before the kernels.
     bool launch(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
                 const float* x, const int32_t* selected_slots, int n_tokens, int k,
-                std::string& err);
+                std::string& err, const uint8_t* const* staged = nullptr, int n_staged = 0,
+                size_t staged_bytes = 0);
+    /// #228: staging slots launch() takes (0 when none were carved, or once the async launcher is on: refused there).
+    int stage_slots() const { return async_ ? 0 : stage_slots_; }
+    uint64_t staged_experts() const { return staged_experts_; }
     bool finish(float* output, std::string& err);
     /// Opt-in: from now on launch() hands its enqueue to a helper thread that stays on device 1 (pinned to
     /// `core` when >= 0), so the host thread goes straight on to the CPU pool; finish() first waits for the
@@ -76,7 +86,8 @@ public:
 
 private:
     bool launch_now(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
-                    const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err);
+                    const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err,
+                    const uint8_t* const* staged = nullptr, int n_staged = 0, size_t staged_bytes = 0);
     void launcher_loop(int core);
     void stop_launcher();
     void close();
@@ -94,6 +105,10 @@ private:
     size_t meta_start_off_ = 0, meta_count_off_ = 0, meta_dst_off_ = 0, meta_tok_off_ = 0;
     size_t meta_bytes_ = 0;
     float* device_x_ = nullptr;
+    uint8_t* device_stage_ = nullptr;   ///< #228: stage_slots_ x stage_stride_ bytes
+    int stage_slots_ = 0;
+    uint64_t stage_stride_ = 0;
+    uint64_t staged_experts_ = 0;
     // APR (prism.hadamard): this device's copies of the gate/up (n_embd) and down (n_ff) sign vectors, nullptr for
     // identity signs or a pack without folded experts (hadamard_device_signs owns them)
     const float* device_sx_ = nullptr;

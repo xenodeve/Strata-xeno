@@ -152,6 +152,36 @@ static int compare(strata::core::SecondaryRunner& runner, const strata::core::Se
     return different;
 }
 
+// #228: the same experts staged from pinned host memory into the runner's staging slots (slot -(s + 2)) instead of
+// read from resident 4070 slots: the same kernel on the same bytes, so the rows must match the reference bit for bit.
+// `mixed`: expert E staged, E+1 resident (slot s1) in the same launch.
+static int compare_staged(strata::core::SecondaryRunner& runner, const strata::core::SecondaryArena& arena,
+                          const Layer& l, int32_t s1, bool mixed, const char* what) {
+    uint8_t *h0 = nullptr, *h1 = nullptr;
+    ck(cudaHostAlloc((void**) &h0, l.blob.size(), cudaHostAllocDefault), "staged blob pin");
+    ck(cudaHostAlloc((void**) &h1, l.blob2.size(), cudaHostAllocDefault), "staged blob2 pin");
+    std::memcpy(h0, l.blob.data(), l.blob.size());
+    std::memcpy(h1, l.blob2.data(), l.blob2.size());
+    const uint8_t* staged[2] = {h0, h1};
+    const int32_t selected[ENTRIES] = {-2, -2, mixed ? s1 : -3};
+    std::vector<float> got(l.x.size(), 0.f);
+    std::string err;
+    const bool ran = runner.launch(l.layout, arena, l.x.data(), selected, ENTRIES, 1, err, staged, mixed ? 1 : 2,
+                                   l.blob.size()) &&
+                     runner.finish(got.data(), err);
+    cudaFreeHost(h0);
+    cudaFreeHost(h1);
+    if (!ran) {
+        std::fprintf(stderr, "secondary runner (%s): %s\n", what, err.c_str());
+        return (int) got.size();
+    }
+    int different = 0;
+    for (size_t i = 0; i < got.size(); ++i) different += std::memcmp(&l.reference[i], &got[i], sizeof(float)) != 0;
+    std::printf("%s: layer %d, experts %d/%d %s: 4070 runner vs 5060 verify path, differing %d/%zu floats\n", what,
+                l.index, l.e, (l.e + 1) % cpu::NE, mixed ? "staged/resident" : "both staged", different, got.size());
+    return different;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr, "usage: xeno_secondary_iq_parity <shard1.gguf> <layer> [layer2]\n");
@@ -193,6 +223,26 @@ int main(int argc, char** argv) {
             return 1;
         }
         different += compare(runner, arena, a, 0, 1, "eager");
+    }
+    for (const bool graph : {false, true}) {   // #228: staging slots, eager then captured graphs
+        strata::core::SecondaryRunner runner;
+        if (!runner.init(ENTRIES, ENTRIES, H, FF, err, strata::core::kSecondaryReserveBytes, false, 2,
+                         std::max(a.blob.size(), a.blob2.size())) ||
+            !runner.set_graph(graph, err)) {
+            std::fprintf(stderr, "secondary runner (staged): %s\n", err.c_str());
+            return 1;
+        }
+        if (runner.stage_slots() != 2) { std::fprintf(stderr, "staged runner reports %d slots\n", runner.stage_slots()); return 1; }
+        different += compare_staged(runner, arena, a, 1, false, graph ? "graph staged" : "eager staged");
+        different += compare_staged(runner, arena, a, 1, true, graph ? "graph staged" : "eager staged");
+        different += compare(runner, arena, a, 0, 1, graph ? "graph after staged" : "eager after staged");
+        // a staged slot past the launch's staged blobs is refused, not read
+        const int32_t bad[ENTRIES] = {-3, -3, 1};
+        const uint8_t* one[1] = {a.blob.data()};
+        if (runner.launch(a.layout, arena, a.x.data(), bad, ENTRIES, 1, err, one, 1, a.blob.size())) {
+            std::fprintf(stderr, "staged slot 1 with one staged blob was accepted\n");
+            return 1;
+        }
     }
     if (L2 >= 0) {
         strata::core::SecondaryRunner runner;   // captured graphs, two layer formats in turn
