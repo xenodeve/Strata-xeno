@@ -244,6 +244,67 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    {   // #227 window graph: two layers, published per layer, the rows read back from mapped memory
+        using strata::core::SecondaryRunner;
+        // the modes that dispatch a layer more than once per window, or interleave two windows, are refused at boot
+        if (SecondaryRunner::window_refusal(false, false, 0, 1, false) != nullptr ||
+            SecondaryRunner::window_refusal(true, false, 0, 1, false) == nullptr ||
+            SecondaryRunner::window_refusal(false, true, 0, 1, false) == nullptr ||
+            SecondaryRunner::window_refusal(false, false, 1, 1, false) == nullptr ||
+            SecondaryRunner::window_refusal(false, false, 0, 2, false) == nullptr ||
+            SecondaryRunner::window_refusal(false, false, 0, 1, true) == nullptr) {
+            std::fprintf(stderr, "window_refusal: a combination was judged wrong\n");
+            ++different;
+        }
+        SecondaryRunner runner;
+        if (!runner.init(ENTRIES, ENTRIES, H, FF, err, strata::core::kSecondaryReserveBytes) ||
+            !runner.enable_window({a.layout, a.layout}, err)) {
+            std::fprintf(stderr, "secondary runner (window): %s\n", err.c_str());
+            return 1;
+        }
+        const int32_t claim[ENTRIES] = {0, 0, 1}, none[ENTRIES] = {-1, -1, -1};
+        auto window = [&](bool first_claims, const char* what) {
+            std::vector<float> got(a.x.size(), 0.f);
+            bool ran = runner.launch_layer(0, a.layout, arena, a.x.data(), first_claims ? claim : none, ENTRIES, 1, err) &&
+                       runner.finish(got.data(), err);
+            ran = ran && runner.launch_layer(1, a.layout, arena, a.x.data(), first_claims ? none : claim, ENTRIES, 1, err) &&
+                  runner.finish(got.data(), err);
+            if (!ran) { std::fprintf(stderr, "secondary runner (%s): %s\n", what, err.c_str()); return (int) got.size(); }
+            int d = 0;
+            for (size_t i = 0; i < got.size(); ++i) d += std::memcmp(&a.reference[i], &got[i], sizeof(float)) != 0;
+            std::printf("%s: layer %d, 4070 window graph vs 5060 verify path, differing %d/%zu floats\n", what, a.index,
+                        d, got.size());
+            return d;
+        };
+        different += window(true, "window, claims on layer 0");
+        different += window(false, "window, claims on layer 1");
+        runner.end_window();
+        different += window(true, "window after end_window");
+        // a slot code below -1 (a staged slot) has no staging in this mode: refused, not skipped
+        const int32_t staged_code[ENTRIES] = {-2, -2, 1};
+        if (runner.launch_layer(0, a.layout, arena, a.x.data(), staged_code, ENTRIES, 1, err)) {
+            std::fprintf(stderr, "window: a staged slot code was accepted\n");
+            ++different;
+        }
+        different += window(false, "window after a refused launch");
+    }
+    {   // after release (the engine is ending) nothing more is launched or published: a runner of its own
+        strata::core::SecondaryRunner runner;
+        const int32_t claim[ENTRIES] = {0, 0, 1};
+        std::vector<float> got(a.x.size(), 0.f);
+        if (!runner.init(ENTRIES, ENTRIES, H, FF, err, strata::core::kSecondaryReserveBytes) ||
+            !runner.enable_window({a.layout, a.layout}, err) ||
+            !runner.launch_layer(0, a.layout, arena, a.x.data(), claim, ENTRIES, 1, err) ||
+            !runner.finish(got.data(), err)) {
+            std::fprintf(stderr, "secondary runner (window release): %s\n", err.c_str());
+            return 1;
+        }
+        runner.release_window();
+        if (runner.launch_layer(0, a.layout, arena, a.x.data(), claim, ENTRIES, 1, err)) {
+            std::fprintf(stderr, "window: a launch after release_window was accepted\n");
+            ++different;
+        }
+    }
     if (L2 >= 0) {
         strata::core::SecondaryRunner runner;   // captured graphs, two layer formats in turn
         if (!runner.init(ENTRIES, ENTRIES, H, FF, err, strata::core::kSecondaryReserveBytes) ||

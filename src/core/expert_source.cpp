@@ -5781,8 +5781,8 @@ void ArenaExpertSource::unpin_hot_run(size_t idx) {
         hot_[(size_t) (row + x)].store(0, std::memory_order_release);
         hot_run_of_[(size_t) (row + x)] = -1;
     }
-    // a run is unregistered only at a swap's release, after the window that last read it: its copies have landed
-    // (SecondaryRunner::finish waited for every staged launch of that window)
+    // a run is unregistered only at close (unpin_all_hot), never from a swap: cudaHostUnregister waits for every
+    // device's work, and in decode the 5060 spins on host flags for the whole window (baf6471e, #228)
     int prev = -1;
     cudaGetDevice(&prev);
     cudaSetDevice(hot_device_);

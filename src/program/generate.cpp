@@ -6567,6 +6567,13 @@ int main(int argc, char** argv) {
         // #227 STRATA_SECONDARY_WINDOW_GRAPH=1 (default off): one 4070 graph per verify window, its layers started by
         // host flags in mapped memory, instead of a graph launch per layer
         if (const char* wg = std::getenv("STRATA_SECONDARY_WINDOW_GRAPH"); wg != nullptr && wg[0] == '1' && secondary_compute) {
+            if (const char* why = strata::core::SecondaryRunner::window_refusal(
+                    o.spec_split, !o.layer_split.empty(), o.pipeline_windows, o.batch > 0 ? o.batch_groups : 1,
+                    false)) {   // (--batch-groups auto is resolved into o.batch_groups by now)
+                std::fprintf(stderr, "strata generate: STRATA_SECONDARY_WINDOW_GRAPH=1 needs each layer dispatched once "
+                                     "per window, in order: %s\n", why);
+                return 1;
+            }
             std::vector<strata::kernels::NativeExpertLayout> wl;
             const auto& wlay = strata::kernels::cpu::expert_layout();
             for (int64_t l = 0; l < g.n_layers; ++l) {

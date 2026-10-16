@@ -60,6 +60,11 @@ public:
     /// call except at layer 0 (the graph launch); finish() spins on the done flag.  `layouts` has one entry per layer
     /// (its formats and folding, as the dispatch builds them).  Call once, after init(), before any launch.
     bool enable_window(const std::vector<kernels::NativeExpertLayout>& layouts, std::string& err);
+    /// The window graph needs every layer dispatched once per window, in order.  The reason it cannot run with these
+    /// options (a split verify window dispatches each layer twice; a layer split, pipelined windows and batch groups
+    /// interleave two windows' layers), or null when it can.
+    static const char* window_refusal(bool spec_split, bool layer_split, int pipeline_windows, int batch_groups,
+                                      bool batch_groups_auto);
     bool window_on() const { return window_; }
     /// The window mode's per-layer publish: every layer of every window, claimed or not (`selected_slots` all -1 when
     /// not; a layer that is not published is filled with an empty plan at the next layer 0 or end_window).
@@ -113,7 +118,8 @@ private:
     void close();
     void record_free(uint64_t bytes);
     bool capture_window(int n_tokens, std::string& err);
-    void publish_empty(int layer);
+    bool publish_empty(int layer, std::string& err);
+    bool wait_consumed(int layer, std::string& err);
     SecondaryArena workspace_;
     int max_tokens_ = 0, max_entries_ = 0, n_embd_ = 0, n_ff_ = 0;
     void* stream_ = nullptr;
@@ -135,6 +141,7 @@ private:
     bool window_ = false;
     int win_layers_ = 0, win_next_ = 0, win_tokens_ = 0, win_layer_ = -1;
     uint32_t win_seq_ = 0;
+    std::atomic<bool> win_released_{false};   ///< release_window ran: nothing is launched or published after it
     std::vector<kernels::NativeExpertLayout> win_layout_;
     uint8_t* host_wmeta_ = nullptr;      ///< win_layers_ x meta_bytes_, pinned
     float* host_wx_ = nullptr;           ///< win_layers_ x max_tokens_ x n_embd_, pinned

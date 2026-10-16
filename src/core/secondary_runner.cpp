@@ -492,6 +492,37 @@ void release_window_runner(std::FILE* f) {
 }
 }  // namespace
 
+const char* SecondaryRunner::window_refusal(bool spec_split, bool layer_split, int pipeline_windows, int batch_groups,
+                                            bool batch_groups_auto) {
+    // launch_layer takes layer 0 as a new window: a second dispatch of layer 0 in the same window, or layer 0 of the
+    // next window before this one's last layer, closes the window early and the next layer fails as out of order
+    if (spec_split) return "--spec-split dispatches each layer twice per window";
+    if (layer_split) return "--layer-split runs two windows' layers interleaved";
+    if (pipeline_windows > 0) return "--pipeline-windows runs two windows' layers interleaved";
+    if (batch_groups > 1 || batch_groups_auto) return "--batch-groups runs two groups' layers interleaved";
+    return nullptr;
+}
+
+// #227: before layer l's plan and activations are rewritten for window win_seq_, the previous window's segment of
+// that layer must have read them (its done flag).  A layer that had claims was waited for by finish(); one without
+// claims was not, and with the 4070 a window behind (WDDM preemption) its copy could read a half-written plan.
+bool SecondaryRunner::wait_consumed(int layer, std::string& err) {
+    if (win_seq_ < 2 || host_done_[layer] + 1 >= win_seq_) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    uint32_t spins = 0;
+    while (host_done_[layer] + 1 < win_seq_) {
+        _mm_pause();
+        if ((++spins & 4095u) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+            failed_ = true;
+            err = "secondary runner: the 4070's window graph did not reach layer " + std::to_string(layer) +
+                  " of the previous window in 30 s";
+            return false;
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return true;
+}
+
 bool SecondaryRunner::enable_window(const std::vector<kernels::NativeExpertLayout>& layouts, std::string& err) {
     if (stream_ == nullptr || window_ || async_ || profile_timing_ || layouts.empty() || layouts.size() > 256) {
         err = "secondary runner: the window graph needs an initialised runner without the async launcher or profile "
@@ -580,22 +611,28 @@ bool SecondaryRunner::capture_window(int n_tokens, std::string& err) {
     return true;
 }
 
-void SecondaryRunner::publish_empty(int layer) {
+bool SecondaryRunner::publish_empty(int layer, std::string& err) {
+    if (win_released_.load(std::memory_order_acquire)) return false;   // the flags stay raised past any count
+    if (!wait_consumed(layer, err)) return false;
     int32_t zero = 0;
     std::memcpy(host_wmeta_ + (size_t) layer * meta_bytes_ + meta_count_off_, &zero, sizeof zero);
     std::atomic_thread_fence(std::memory_order_release);
     _mm_sfence();
     host_go_[layer] = win_seq_;
+    return true;
 }
 
 void SecondaryRunner::end_window() {
-    if (!window_ || win_seq_ == 0) return;
-    for (int l = win_next_; l < win_layers_; ++l) publish_empty(l);
+    if (!window_ || win_seq_ == 0 || failed_) return;
+    std::string err;
+    for (int l = win_next_; l < win_layers_; ++l)
+        if (!publish_empty(l, err)) break;
     win_next_ = win_layers_;
 }
 
 void SecondaryRunner::release_window() {
     if (host_go_ == nullptr) return;
+    win_released_.store(true, std::memory_order_release);   // launch_layer and publish_empty refuse from now on
     for (int l = 0; l < win_layers_; ++l) host_go_[l] = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
@@ -611,16 +648,34 @@ bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout&
         err = "secondary runner: invalid window launch";
         return false;
     }
+    if (win_released_.load(std::memory_order_acquire)) {
+        // only end_engine (#203/#267) and close() release, and nothing launches after close(): the process is being
+        // terminated with end_engine's code.  Wait for that rather than fail this layer, whose error would race it to
+        // the server as an invalid request and an exit code of its own (the server then restarts the engine at once,
+        // where a breach's code 3 keeps the tier released: measured 2026-10-17, gyro-record/breach227-win3b)
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        err = "secondary runner: the window graph was released (the engine is ending)";
+        return false;
+    }
+    for (int i = 0; i < n_tokens * k; ++i)
+        if (selected_slots[i] < -1) {   // a staged slot: this mode has no staging slots (stage_slots() is 0)
+            err = "secondary runner: a staged slot in window mode";
+            return false;
+        }
     if (layer == 0) {   // a new window: close the last one, then the window's one launch
-        end_window();
-        ++win_seq_;
-        win_next_ = 0;
-        win_tokens_ = n_tokens;
         const auto l0 = std::chrono::steady_clock::now();
         int previous = -1;
         if (!cuda_ok(cudaGetDevice(&previous), "runner current device", err) ||
-            !cuda_ok(cudaSetDevice(1), "runner select device", err)) return false;
+            !cuda_ok(cudaSetDevice(1), "runner select device", err)) {
+            failed_ = true;
+            return false;
+        }
         const RestoreDevice restore{previous};
+        end_window();
+        if (failed_) { err = "secondary runner: the window graph's last window did not end"; return false; }
+        ++win_seq_;   // from here every exit without the graph launched poisons the runner (its count moved on)
+        win_next_ = 0;
+        win_tokens_ = n_tokens;
         cudaStream_t stream = (cudaStream_t) stream_;
         if (!cuda_ok(cudaGraphLaunch((cudaGraphExec_t) win_graph_[(size_t) n_tokens], stream), "window graph launch", err)) {
             failed_ = true;
@@ -632,7 +687,9 @@ bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout&
         err = "secondary runner: a window layer out of order";
         return false;
     }
-    for (int l = win_next_; l < layer; ++l) publish_empty(l);   // layers the dispatch did not publish
+    for (int l = win_next_; l < layer; ++l)   // layers the dispatch did not publish
+        if (!publish_empty(l, err)) { failed_ = true; return false; }
+    if (!wait_consumed(layer, err)) return false;
     ptr_.clear(); start_.clear(); dst_.clear(); tok_.clear(); selected_rows_.clear(); group_slots_.clear();
     const int entries = n_tokens * k;
     for (int i = 0; i < entries; ++i) {
@@ -693,6 +750,7 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
                 return false;
             }
         }
+        std::atomic_thread_fence(std::memory_order_acquire);   // the rows are read after the done flag
         const auto w1 = std::chrono::steady_clock::now();
         ms_wait_ += std::chrono::duration<double, std::milli>(w1 - wait_t0).count();
         if (timeline::enabled()) timeline::complete("4070 wait", wait_t0, w1, win_layer_);
