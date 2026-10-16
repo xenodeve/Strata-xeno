@@ -599,7 +599,10 @@ int ExpertPool::claim(uint32_t epoch, bool ecore) {
         if (i >= n) return -1;                                       // exhausted
         // #220 A5: an E-core leaves the batch's tail to the P-cores; they (and the host) claim until `n`, so every
         // task is still claimed and `done_` still reaches `n`
-        if (ecore && !may_claim(i, n, true, ecore_skip_tail_, fast_threads())) return -1;
+        if (ecore && !may_claim(i, n, true, ecore_skip_tail_, fast_threads())) {
+            ecore_skips_.fetch_add(1, std::memory_order_relaxed);
+            return -1;
+        }
         if (head_.compare_exchange_weak(h, h + 1, std::memory_order_acq_rel, std::memory_order_acquire))
             return (int) i;
     }

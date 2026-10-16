@@ -186,6 +186,8 @@ public:
     /// #220 A5 STRATA_POOL_ECORE_SKIP_TAIL=K (default 0 = off; read at construction, only for a pinned hybrid pool):
     /// an E-core worker claims none of a batch's last K tasks, which the P-core workers and the host then take.
     int ecore_skip_tail() const { return ecore_skip_tail_; }
+    /// How often an E-core worker left a batch's tail to the P-cores (one count per refused claim).
+    uint64_t ecore_skips() const { return ecore_skips_.load(std::memory_order_relaxed); }
     /// The threads on P-cores that drain a batch: the P-core workers, and the host when it works.
     int fast_threads() const { return n_fast_workers_ + (host_works_ ? 1 : 0); }
     /// Whether task `i` of an `n`-task batch is claimable by a thread: an E-core (`ecore`) leaves the last `keep` to
@@ -276,6 +278,7 @@ private:
     int n_ = 0;
     int n_fast_workers_ = 0;     ///< workers [0, n_fast_workers_) sit on P-cores (a pinned hybrid pool); the rest on E-cores
     int ecore_skip_tail_ = 0;    ///< #220 A5, see ecore_skip_tail()
+    std::atomic<uint64_t> ecore_skips_{0};
     bool host_works_ = true;
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;

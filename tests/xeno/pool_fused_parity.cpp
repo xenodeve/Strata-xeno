@@ -53,13 +53,18 @@ int main(int argc, char** argv) {
         cpu::native_quant_act(f, x.data() + (size_t) t * H, nact.data() + (size_t) t * cpu::kNativeActBytes);
     }
     int bad = 0, cases = 0;
+    uint64_t skips = 0;   // #220 A5: E-core claims the tail rule refused (0 unless pinned with the switch on)
     for (int workers : {1, 4, 13})
         for (int n : {1, 2, 5, NEXP}) {
             std::vector<float> two((size_t) NEXP * T * H, 0.f), one((size_t) NEXP * T * H, 0.f);
-            for (int fused = 1; fused >= 0; --fused) {
+            // #220 A5: STRATA_TEST_POOL_PIN=1 pins the pools (the E-core tail rule needs core classes) and adds a
+            // third arm, unpinned and fused, that the pinned fused output must equal bit for bit
+            static const bool pin = std::getenv("STRATA_TEST_POOL_PIN") != nullptr;
+            std::vector<float> ref(pin ? (size_t) NEXP * T * H : 0, 0.f);
+            for (int fused = pin ? 2 : 1; fused >= 0; --fused) {
                 // a pool per arm: one arm's intermediate buffers must not stand in for the other's
-                cpu::ExpertPool pool(workers, false, true);
-                std::vector<float>& out = fused ? one : two;
+                cpu::ExpertPool pool(workers, pin && fused < 2, true);
+                std::vector<float>& out = fused == 2 ? ref : fused ? one : two;
                 std::vector<cpu::ExpertJobMulti> jobs((size_t) n);
                 for (int e = 0; e < n; ++e) {
                     jobs[e].blob = blobs[e].data();
@@ -72,14 +77,19 @@ int main(int argc, char** argv) {
                 }
                 pool.set_fused(fused != 0);
                 pool.run_split_multi_native(f, jobs.data(), n);
+                skips += pool.ecore_skips();
             }
             ++cases;
             if (std::memcmp(two.data(), one.data(), two.size() * sizeof(float)) != 0) {
                 ++bad;
                 std::printf("FAIL: %d workers, %d experts: the one-phase output differs\n", workers, n);
+            } else if (pin && std::memcmp(ref.data(), one.data(), ref.size() * sizeof(float)) != 0) {
+                ++bad;
+                std::printf("FAIL: %d workers, %d experts: the pinned pool's output differs from the unpinned one\n",
+                            workers, n);
             }
         }
-    std::printf("%s: %d of %d cases bit-identical (layer %d, gate/up type %d, down type %d)\n", bad ? "FAIL" : "PASS",
-                cases - bad, cases, L, f.gu_type, f.d_type);
+    std::printf("%s: %d of %d cases bit-identical (layer %d, gate/up type %d, down type %d); E-core tail skips %llu\n",
+                bad ? "FAIL" : "PASS", cases - bad, cases, L, f.gu_type, f.d_type, (unsigned long long) skips);
     return bad ? 1 : 0;
 }
