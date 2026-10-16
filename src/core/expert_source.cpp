@@ -5636,6 +5636,9 @@ void ArenaExpertSource::publish_host_copy(int64_t layer, int64_t expert) {
     std::lock_guard<std::mutex> lk(host_mu_);
     const size_t index = (size_t) (layer * n_expert_ + expert);
     if (index < exclusive_.size()) { exclusive_[index] = 0; touch(index); }
+    if (hot_ && index < hot_run_of_.size() && hot_run_of_[index] >= 0 &&   // #228: its pages stayed registered
+        hot_[index].exchange(1, std::memory_order_acq_rel) == 0)
+        --hot_stats_.gpu_owned;
 }
 
 bool ArenaExpertSource::release_host_copy(int64_t layer, int64_t expert, std::string& err) {
@@ -5767,6 +5770,7 @@ bool ArenaExpertSource::pin_cpu_hot(const std::vector<std::pair<int32_t, int32_t
 
 void ArenaExpertSource::unpin_hot_run(size_t idx) {
     if (!hot_ || idx >= hot_run_of_.size() || hot_run_of_[idx] < 0) return;
+    // only at close (no decode window spinning: see host_release)
     HotRun& r = hot_runs_[(size_t) hot_run_of_[idx]];
     const int64_t row = (int64_t) r.layer * n_expert_;
     for (int32_t x = r.e0; x <= r.e1; ++x) {   // nobody stages them from the next layer window on
@@ -5780,9 +5784,6 @@ void ArenaExpertSource::unpin_hot_run(size_t idx) {
     cudaSetDevice(hot_device_);
     if (cudaHostUnregister(r.base) != cudaSuccess) cudaGetLastError();
     cudaSetDevice(prev);
-    hot_stats_.dropped += r.e1 - r.e0;   // the released expert's neighbours in its run lose their pin too
-    hot_stats_.experts -= r.e1 - r.e0 + 1;
-    hot_stats_.bytes -= r.bytes;
     r = HotRun{};
 }
 
@@ -5855,7 +5856,15 @@ bool ArenaExpertSource::host_release(size_t idx, uint64_t& given, std::string& e
         if (slot_of_[idx] >= 0) { free_slot(idx); given = lay.blob_bytes(l); }
         return true;
     }
-    unpin_hot_run(idx);   // #228: locked pages are unregistered before they are decommitted
+    // #228: a page-locked hot expert that a swap gives to a GPU keeps its pages, registered: cudaHostUnregister waits
+    // for every device's work to end, and in decode the 5060 spins on host flags the whole window (measured with
+    // xeno_host_unregister_spin: blocked 3.0 s, until the spin ended) - from the swap worker, which holds host_mu_, that
+    // deadlocked the host at its next materialize (2026-10-16, tl-228-TB).  Only its bit goes; publish_host_copy sets
+    // it again when the expert comes home.  The pages were resident before and stay so: no RAM is added.
+    if (hot_ && idx < hot_run_of_.size() && hot_run_of_[idx] >= 0) {
+        if (hot_[idx].exchange(0, std::memory_order_acq_rel) != 0) ++hot_stats_.gpu_owned;
+        return true;
+    }
     return ((PinnedArena*) arena_)->decommit_interior(lay.blob_offset(l, x), lay.blob_bytes(l), given, err);
 }
 

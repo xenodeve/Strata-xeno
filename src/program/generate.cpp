@@ -14299,8 +14299,8 @@ int main(int argc, char** argv) {
                 if (secondary_runner.stage_slots() > 0) {   // #228
                     const auto hp = arena_src.hot_pin_stats();
                     std::fprintf(stderr, "strata serve: 4070 staged experts since start: %lld; hot pins %lld experts "
-                                         "(%.2f GiB), %lld dropped by swaps\n", (long long) drive.d.secondary_staged,
-                                 (long long) hp.experts, (double) hp.bytes / 1073741824.0, (long long) hp.dropped);
+                                         "(%.2f GiB), %lld of them GPU-owned now\n", (long long) drive.d.secondary_staged,
+                                 (long long) hp.experts, (double) hp.bytes / 1073741824.0, (long long) hp.gpu_owned);
                 }
                 if (dec_windows > 0) {   // #11 acceptance 7: per verify window and per emitted token
                     const double w = (double) dec_windows, tk = produced_n > 0 ? (double) produced_n : 1.0;
@@ -15725,10 +15725,10 @@ int main(int argc, char** argv) {
             std::printf("%-24s launch %.3f  wait %.3f ms/round (wait > 0: the 4070 SUPER finished after the CPU pool)\n",
                         "secondary timing", secondary_runner.ms_launch() / rounds, secondary_runner.ms_wait() / rounds);
         if (rounds > 0 && secondary_runner.stage_slots() > 0)   // #228
-            std::printf("%-24s %lld experts (%.2f per round); hot pins %lld experts, %lld dropped by swaps\n",
+            std::printf("%-24s %lld experts (%.2f per round); hot pins %lld experts, %lld of them GPU-owned now\n",
                         "secondary staged", (long long) drive.d.secondary_staged,
                         (double) drive.d.secondary_staged / rounds, (long long) arena_src.hot_pin_stats().experts,
-                        (long long) arena_src.hot_pin_stats().dropped);
+                        (long long) arena_src.hot_pin_stats().gpu_owned);
         if (rounds > 0 && o.secondary_async_launch)
             std::printf("%-24s helper enqueue %.3f  finish waited for it %.3f ms/round\n", "secondary async",
                         secondary_runner.ms_async_enqueue() / rounds, secondary_runner.ms_async_wait() / rounds);

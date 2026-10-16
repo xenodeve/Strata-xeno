@@ -1059,8 +1059,9 @@ public:
     /// #228 STRATA_PIN_CPU_HOT_MIB: page-lock, in place, the host-owned experts of `ranked` (layer, expert; best first)
     /// up to `budget_bytes`, for the device current at the call (device 1; `portable` registers for every device).
     /// Blobs that share a page are registered as one run.  After the load (never while pages are written); refused
-    /// in capacity mode (the slab moves experts).  A later release_host_copy unregisters the expert's run first.
-    struct HotPinStats { int64_t experts = 0, runs = 0, dropped = 0; uint64_t bytes = 0; double ms = 0; };
+    /// in capacity mode (the slab moves experts).  A release_host_copy (a swap to a GPU tier) keeps the pages and only
+    /// clears the expert's bit (`gpu_owned` counts those now); publish_host_copy sets it again.  Unregistered at close.
+    struct HotPinStats { int64_t experts = 0, runs = 0, gpu_owned = 0; uint64_t bytes = 0; double ms = 0; };
     bool pin_cpu_hot(const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t budget_bytes, bool portable,
                      std::string& err);
     HotPinStats hot_pin_stats() const { return hot_stats_; }
@@ -1182,7 +1183,7 @@ private:
     std::unique_ptr<std::atomic<uint8_t>[]> hot_;
     HotPinStats hot_stats_{};
     int hot_device_ = 1;
-    void unpin_hot_run(size_t idx);   ///< the expert's run, if any: bits cleared, then unregistered
+    void unpin_hot_run(size_t idx);   ///< the expert's run, if any: bits cleared, then unregistered (close only)
     void unpin_all_hot();
     bool slab_ = false;
     std::vector<SlabClass> classes_;
