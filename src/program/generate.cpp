@@ -9683,9 +9683,12 @@ int main(int argc, char** argv) {
                        ") - a GPU hang; on Windows the driver is then reset";
             return false;
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
+        // synced: the caller has run gpu_sync_ok() (#188: the save then runs on a helper thread beside the refill)
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 bool synced = false) -> bool {
             ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
+            strata::timeline::Span ckpt_span("checkpoint save", L);   // #188: a conversation checkpoint after a part
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
                     c.used = ++check_clock;
@@ -9704,7 +9707,7 @@ int main(int argc, char** argv) {
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else {
-                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
+                if ((!synced && !gpu_sync_ok()) || !checkpoint_save(c, ss, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
@@ -12829,6 +12832,7 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const auto t_ln = Clock::now();
+                strata::timeline::Span lend_span("lend slots", tokens);   // #188: the part's loan, before its batched read
                 // what this segment needs, capped by the configured chunk (STRATA_PREFILL_EQUAL=1: equal chunks, upstream
                 // PR #693; unset it is the fork's min(chunk, tokens rounded up to 256))
                 const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
@@ -13112,12 +13116,21 @@ int main(int argc, char** argv) {
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
+            // #188: the checkpoint after a batched part copies the GDN state (~118 MB on Gyro-M) to the host over the x4
+            // while the refill copies the lent experts the other way; it is joined before the next part reads (which
+            // moves that state) and before decode.  Measured 34-41 ms per save, on the host, before.
+            std::future<bool> ckpt_pending;
+            auto join_ckpt = [&]() -> bool { return !ckpt_pending.valid() || ckpt_pending.get(); };
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                    return serve_fatal();
+                }
+                if (!join_ckpt()) {
+                    std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return serve_fatal();
                 }
                 if (!win && !lend(to - at, n - 1, err)) {   // the last part ends at n - 1
@@ -13158,11 +13171,24 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at || to == shared_at || to == message_at || to == pin_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != shared_at &&
-                                                    to != pin_at)) {   // the tail kind leaves first
-                    std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
-                    return serve_fatal();
+                if (to == turn_at || to == root_at || to == shared_at || to == message_at || to == pin_at) {
+                    const bool as_tail = to == message_at && to != turn_at && to != root_at && to != shared_at &&
+                                         to != pin_at;   // the tail kind leaves first
+                    // #188: after a batched part the save goes beside the refill (one GPU, no pin to follow)
+                    // STRATA_CKPT_BESIDE=0 keeps the save on this thread before the refill (the A/B arm)
+                    static const bool beside_on = [] { const char* v = std::getenv("STRATA_CKPT_BESIDE"); return !v || v[0] != '0'; }();
+                    const bool beside = beside_on && !win && to != pin_at && stages.empty() && o.prompt_cache > 0;
+                    if (beside && gpu_sync_ok()) {
+                        int dev = 0;
+                        cudaGetDevice(&dev);   // the helper copies on its own stream on the session's card
+                        ckpt_pending = std::async(std::launch::async, [&checkpoint_at, to, as_tail, dev] {
+                            cudaSetDevice(dev);
+                            return checkpoint_at(to, nullptr, as_tail, true);
+                        });
+                    } else if (!checkpoint_at(to, nullptr, as_tail)) {
+                        std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                        return serve_fatal();
+                    }
                 }
                 if (to == pin_at && !pin_checkpoint(pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
@@ -13172,6 +13198,10 @@ int main(int argc, char** argv) {
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                return serve_fatal();
+            }
+            if (!join_ckpt()) {
+                std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                 return serve_fatal();
             }
             tr("prompt done (slots refilled)");
