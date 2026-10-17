@@ -291,7 +291,10 @@ public:
     void enable_stats(int64_t n_layers);
     bool stats_on() const { return stats_on_; }
     void stats_window_start() { gen_.fetch_add(1, std::memory_order_relaxed); }
-    void stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num = 0);
+    /// `sec_res` (#228 v3, STRATA_LOOKAHEAD_STATS=2): also leave out the 4070-resident experts, so the predictor is
+    /// scored against the CPU misses only
+    void stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num = 0,
+                     const int32_t* sec_res = nullptr);
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
     double busy_ms() const { return (double) busy_us_.load(std::memory_order_relaxed) / 1000.0; }
@@ -1068,6 +1071,13 @@ public:
     struct HotPinStats { int64_t experts = 0, runs = 0, gpu_owned = 0; uint64_t bytes = 0; double ms = 0; };
     bool pin_cpu_hot(const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t budget_bytes, bool portable,
                      std::string& err);
+    /// #228 v3: between requests only (no GPU work may wait on a host flag: cudaHostUnregister waits for every
+    /// device).  Unregisters the hot runs whose experts all went to a GPU and decommits them (their RAM comes back),
+    /// then pins the next CPU-owned experts of pin_cpu_hot's ranking up to its budget, at most `max_new_runs` runs.
+    struct RepinResult { int64_t unpinned_runs = 0, unpinned_experts = 0, pinned_experts = 0; uint64_t returned_bytes = 0;
+                         double ms = 0; };
+    /// `stop` (may be null): checked before every registration change; the refresh ends early when it is raised.
+    bool repin_hot(int max_new_runs, RepinResult& out, std::string& err, const std::atomic<bool>* stop = nullptr);
     HotPinStats hot_pin_stats() const { return hot_stats_; }
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     void prefetch(int64_t layer, int64_t expert) override;
@@ -1187,6 +1197,10 @@ private:
     std::unique_ptr<std::atomic<uint8_t>[]> hot_;
     HotPinStats hot_stats_{};
     int hot_device_ = 1;
+    std::vector<std::pair<int32_t, int32_t>> hot_rank_;   ///< pin_cpu_hot's ranking, for repin_hot
+    uint64_t hot_budget_ = 0;
+    bool hot_portable_ = false;
+    size_t hot_rank_at_ = 0;                              ///< repin_hot resumes the ranking here
     void unpin_hot_run(size_t idx);   ///< the expert's run, if any: bits cleared, then unregistered (close only)
     void unpin_all_hot();
     bool slab_ = false;

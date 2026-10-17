@@ -153,6 +153,43 @@
 #include <vector>
 #include <memory>
 
+
+namespace {
+// #228 v3: the hot CPU experts' pin refresh (ArenaExpertSource::repin_hot) on a thread of its own while the server is
+// idle between requests - no window spins then, so cudaHostUnregister does not block.  finish() raises its stop flag
+// and joins (the refresh ends after its current registration change) and logs what it did.
+struct HotRepinWorker {
+    std::thread t;
+    std::atomic<bool> stop{false};
+    strata::core::ArenaExpertSource::RepinResult res{};
+    std::string err;
+    std::chrono::steady_clock::time_point t0{};
+    void start(strata::core::ArenaExpertSource& a) {
+        if (t.joinable()) return;
+        stop.store(false, std::memory_order_release);
+        res = {};
+        err.clear();
+        t0 = std::chrono::steady_clock::now();
+        t = std::thread([this, &a] { a.repin_hot(1024, res, err, &stop); });   // (stop ends it at the next request)
+    }
+    void finish() {
+        if (!t.joinable()) return;
+        const auto w0 = std::chrono::steady_clock::now();
+        stop.store(true, std::memory_order_release);
+        t.join();
+        const double idle_ms = std::chrono::duration<double, std::milli>(w0 - t0).count();
+        const double wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+        std::fprintf(stderr, "strata serve: hot pins refreshed while idle: %lld runs unpinned (%lld experts, %.2f GiB back "
+                             "to the OS), %lld experts pinned, %.1f ms of %.1f ms idle; the request waited %.2f ms%s%s\n",
+                     (long long) res.unpinned_runs, (long long) res.unpinned_experts,
+                     (double) res.returned_bytes / 1073741824.0, (long long) res.pinned_experts, res.ms, idle_ms, wait_ms,
+                     err.empty() ? "" : "; ", err.c_str());
+    }
+    ~HotRepinWorker() { if (t.joinable()) { stop.store(true); t.join(); } }
+};
+HotRepinWorker g_hot_repin;
+}  // namespace
+
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
@@ -11681,8 +11718,10 @@ int main(int argc, char** argv) {
                 // a request reads its prompt through every stage: the groups in flight finish first
                 if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return serve_fatal();
             } else if (!next_line(line)) {
+                g_hot_repin.finish();   // #228 v3
                 break;
             }
+            g_hot_repin.finish();   // #228 v3: a line came: the idle hot-pin refresh ends after its current change
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
             if (line.rfind("BSTOP ", 0) == 0) {
@@ -14325,6 +14364,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: adaptive swaps since start: 5060 %lld, 4070 %lld\n",
                              (long long) paired_swaps, (long long) sec_swaps);   // xeno #229
                 secondary_runner.end_window();   // #227: nothing of this request's last window waits on the 4070
+                if (secondary_runner.stage_slots() > 0 && arena_src.hot_pin_stats().runs > 0) {
+                    // #228 v3 STRATA_PIN_CPU_HOT_REPIN (default on with the hot pins): between requests no window
+                    // spins, so the runs the swaps emptied go back to RAM and the next CPU-owned experts are pinned
+                    // (on a thread of its own while the server is idle: it ends at the next request line, so a request
+                    // that comes at once waits for one registration change at most, not the ~0.1-0.2 s of the refresh)
+                    static const bool repin = [] { const char* v = std::getenv("STRATA_PIN_CPU_HOT_REPIN"); return v == nullptr || std::atoi(v) != 0; }();
+                    if (repin) g_hot_repin.start(arena_src);
+                }
                 if (secondary_runner.stage_slots() > 0) {   // #228
                     const auto hp = arena_src.hot_pin_stats();
                     std::fprintf(stderr, "strata serve: 4070 staged experts since start: %lld; hot pins %lld experts "
@@ -15762,6 +15809,9 @@ int main(int argc, char** argv) {
                         "secondary staged", (long long) drive.d.secondary_staged,
                         (double) drive.d.secondary_staged / rounds, (long long) arena_src.hot_pin_stats().experts,
                         (long long) arena_src.hot_pin_stats().gpu_owned);
+        if (double wb = 0, wg = 0, wc = 0; rounds > 0 && secondary_runner.window_cost(wb, wg, wc))   // #228 v3
+            std::printf("%-24s base %.1f + %.1f per resident group + %.1f per staged blob us (fitted per layer)\n",
+                        "secondary window cost", wb, wg, wc);
         if (rounds > 0 && o.secondary_async_launch)
             std::printf("%-24s helper enqueue %.3f  finish waited for it %.3f ms/round\n", "secondary async",
                         secondary_runner.ms_async_enqueue() / rounds, secondary_runner.ms_async_wait() / rounds);

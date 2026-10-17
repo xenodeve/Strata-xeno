@@ -1199,14 +1199,24 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
 }
 
 namespace {
-__global__ void window_wait_kernel(const volatile uint32_t* go, const uint32_t* count) {
+__global__ void window_wait_kernel(const volatile uint32_t* go, const uint32_t* count, unsigned long long* stamp) {
     const uint32_t want = *count + 1u;
     while (*go < want) strata_spin_pause();
     __threadfence_system();
+    if (stamp != nullptr) {   // #241: the segment's start
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        *(volatile unsigned long long*) stamp = t;
+    }
 }
-__global__ void window_signal_kernel(volatile uint32_t* done, uint32_t* count) {
+__global__ void window_signal_kernel(volatile uint32_t* done, uint32_t* count, unsigned long long* stamp) {
     const uint32_t c = *count + 1u;
     *count = c;
+    if (stamp != nullptr) {   // #241: the segment's end, visible before its done flag
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        *(volatile unsigned long long*) stamp = t;
+    }
     __threadfence_system();
     *done = c;
     __threadfence_system();
@@ -1223,13 +1233,13 @@ __global__ void window_rows_kernel(const float4* __restrict__ src, float4* dst, 
 }
 }  // namespace
 
-void window_wait(const uint32_t* go, const uint32_t* count, void* stream) {
-    window_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(go, count);
+void window_wait(const uint32_t* go, const uint32_t* count, void* stream, unsigned long long* stamp) {
+    window_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(go, count, stamp);
     check("window_wait");
 }
 
-void window_signal(uint32_t* done, uint32_t* count, void* stream) {
-    window_signal_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(done, count);
+void window_signal(uint32_t* done, uint32_t* count, void* stream, unsigned long long* stamp) {
+    window_signal_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(done, count, stamp);
     check("window_signal");
 }
 

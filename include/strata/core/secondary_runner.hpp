@@ -85,6 +85,10 @@ public:
     /// launch at layer 0 (for A/B).  A failed launch is reported by the next launch_layer or finish.
     void begin_window(int n_tokens);
     uint64_t windows() const { return win_seq_; }
+    /// #228 v3: the window segment's cost on the 4070, fitted from its own %globaltimer stamps over the claimed layers
+    /// (us = base + group * resident groups + copy * staged blobs, exponentially weighted); false until enough
+    /// layers were seen (or STRATA_SECONDARY_STAGE_LIVE=0).
+    bool window_cost(double& base, double& group, double& copy) const;
     uint64_t staged_experts() const { return staged_experts_; }
     bool finish(float* output, std::string& err);
     /// Opt-in: from now on launch() hands its enqueue to a helper thread that stays on device 1 (pinned to
@@ -155,6 +159,18 @@ private:
     int win_layers_ = 0, win_next_ = 0, win_tokens_ = 0, win_layer_ = -1;
     uint32_t win_seq_ = 0;
     std::atomic<bool> win_released_{false};   ///< release_window ran: nothing is launched or published after it
+    // #241 / #228 v3: per layer the segment's %globaltimer start and end (mapped), and the fit of its cost
+    volatile unsigned long long* host_wstamp_ = nullptr;
+    unsigned long long* dev_wstamp_ = nullptr;
+    int win_groups_ = 0, win_staged_ = 0;     ///< the published layer's resident groups and staged blobs
+    double fit_[3][4] = {};                   ///< decayed normal equations of [1, groups, staged] -> us (+ the rhs)
+    uint64_t fit_n_ = 0;
+    bool fit_live_ = true;
+    double fit_cost_[3] = {0, 0, 0};          ///< solved every 256 layers
+    bool fit_ok_ = false;
+    long long tl_off_ns_ = 0;                 ///< steady_clock ns - %globaltimer ns (the smallest seen): the lane's clock
+    bool tl_off_set_ = false;
+    void window_sample(int layer, std::chrono::steady_clock::time_point seen);
     // #245 begin_window: a helper thread on device 1 launches each window's graph, in the order the windows open
     bool win_early_ = false;                  ///< STRATA_SECONDARY_WINDOW_EARLY (default on with the window graph)
     uint32_t win_opened_ = 0;                 ///< win_seq_ of the window begin_window opened and layer 0 has not taken

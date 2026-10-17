@@ -16,6 +16,8 @@
 #include <immintrin.h>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <exception>
 
@@ -567,6 +569,17 @@ bool SecondaryRunner::enable_window(const std::vector<kernels::NativeExpertLayou
         !cuda_ok(cudaHostAlloc(&done, (size_t) win_layers_ * sizeof(uint32_t), cudaHostAllocPortable | cudaHostAllocMapped),
                  "window done flags", err))
         return false;
+    if (stage_slots_ > 0 || timeline::enabled()) {   // #241: each segment's %globaltimer start and end (only for
+        void* ws = nullptr;                             // staging's cost fit or the timeline: the default path is unchanged)
+        if (!cuda_ok(cudaHostAlloc(&ws, (size_t) win_layers_ * 2 * sizeof(unsigned long long),
+                                   cudaHostAllocPortable | cudaHostAllocMapped), "window stamps", err) ||
+            !cuda_ok(cudaHostGetDevicePointer((void**) &dev_wstamp_, ws, 0), "window stamps pointer", err))
+            return false;
+        host_wstamp_ = (volatile unsigned long long*) ws;
+        for (int i = 0; i < 2 * win_layers_; ++i) host_wstamp_[i] = 0;
+        const char* v = std::getenv("STRATA_SECONDARY_STAGE_LIVE");
+        fit_live_ = v == nullptr || v[0] == '\0' || v[0] != '0';
+    }
     host_go_ = (volatile uint32_t*) go;
     host_done_ = (volatile uint32_t*) done;
     std::memset(host_wmeta_, 0, (size_t) win_layers_ * meta_bytes_);
@@ -606,7 +619,7 @@ bool SecondaryRunner::capture_window(int n_tokens, std::string& err) {
         kernels::NativeExpertLayout layout = win_layout_[(size_t) l];
         if (layout.had_block > 0) layout.d_signs = device_sh_;
         const bool q2 = layout.gu_type == 42 && layout.d_type == 42;
-        kernels::window_wait(dev_go_ + l, dev_count_ + l, stream);
+        kernels::window_wait(dev_go_ + l, dev_count_ + l, stream, dev_wstamp_ ? dev_wstamp_ + 2 * l : nullptr);
         cudaMemcpyAsync(device_ptr_, host_wmeta_ + (size_t) l * meta_bytes_, meta_bytes_, cudaMemcpyHostToDevice, stream);
         if (stage_slots_ > 0)   // #228 v2: this layer's staged experts, from mapped host memory into the staging slots
             kernels::window_fetch_blobs(device_stage_n_, device_stage_src_, device_stage_bytes_, device_stage_,
@@ -621,7 +634,7 @@ bool SecondaryRunner::capture_window(int n_tokens, std::string& err) {
                                        entries, entries, device_xq_, device_scratch_, device_out_, stream,
                                        q2 ? device_scales_ : nullptr);
         kernels::window_rows_to_host(device_out_, dev_wout_, device_start_, device_count_, n_embd_, max_entries_, stream);
-        kernels::window_signal(dev_done_ + l, dev_count_ + l, stream);
+        kernels::window_signal(dev_done_ + l, dev_count_ + l, stream, dev_wstamp_ ? dev_wstamp_ + 2 * l + 1 : nullptr);
     }
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(stream, &graph);
@@ -663,6 +676,61 @@ void SecondaryRunner::release_window() {
     for (int l = 0; l < win_layers_; ++l) host_go_[l] = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
+}
+
+void SecondaryRunner::window_sample(int layer, std::chrono::steady_clock::time_point seen) {
+    if (host_wstamp_ == nullptr || layer < 0 || layer >= win_layers_) return;
+    const unsigned long long g0 = host_wstamp_[2 * layer], g1 = host_wstamp_[2 * layer + 1];
+    if (g0 == 0 || g1 <= g0) return;
+    const double us = (double) (g1 - g0) / 1000.0;
+    if (fit_live_ && us < 5000.0) {   // the fit: decayed sums of [1, groups, staged] (x) and their products with us
+        const double x[3] = {1.0, (double) win_groups_, (double) win_staged_};
+        const double decay = 0.999;
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) fit_[i][j] = fit_[i][j] * decay + x[i] * x[j];
+            fit_[i][3] = fit_[i][3] * decay + x[i] * us;
+        }
+        if ((++fit_n_ & 255u) == 0) {   // solve the 3 x 3 system (Gaussian elimination, partial pivoting)
+            double a[3][4];
+            std::memcpy(a, fit_, sizeof a);
+            for (int i = 0; i < 3; ++i) a[i][i] += 1e-6;   // a column that never varied stays solvable
+            bool ok = true;
+            for (int c = 0; c < 3 && ok; ++c) {
+                int p = c;
+                for (int r = c + 1; r < 3; ++r) if (std::fabs(a[r][c]) > std::fabs(a[p][c])) p = r;
+                if (std::fabs(a[p][c]) < 1e-9) { ok = false; break; }
+                for (int k = 0; k < 4; ++k) std::swap(a[c][k], a[p][k]);
+                for (int r = 0; r < 3; ++r) {
+                    if (r == c) continue;
+                    const double f = a[r][c] / a[c][c];
+                    for (int k = c; k < 4; ++k) a[r][k] -= f * a[c][k];
+                }
+            }
+            if (ok) {   // clamped to what the measurements justify: few staged layers early leave the copy term loose
+                static const double lo[3] = {5.0, 2.0, 50.0}, hi[3] = {150.0, 40.0, 200.0};   // base, group, staged blob
+                for (int i = 0; i < 3; ++i) fit_cost_[i] = std::clamp(a[i][3] / a[i][i], lo[i], hi[i]);
+                fit_ok_ = fit_n_ >= 512;
+            }
+        }
+    }
+    if (timeline::enabled()) {   // #241: the segment on a GPU1 lane, its clock tied to the host's by the smallest gap
+        const long long seen_ns = (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      seen.time_since_epoch()).count();
+        const long long off = seen_ns - (long long) g1;
+        if (!tl_off_set_ || off < tl_off_ns_) { tl_off_ns_ = off; tl_off_set_ = true; }
+        static const int lane = timeline::lane("gpu1 4070 window");
+        const auto t0 = std::chrono::steady_clock::time_point(std::chrono::nanoseconds((long long) g0 + tl_off_ns_));
+        const auto t1 = std::chrono::steady_clock::time_point(std::chrono::nanoseconds((long long) g1 + tl_off_ns_));
+        timeline::complete_on(lane, "4070 segment", timeline::us(t0), timeline::us(t1), layer, (int64_t) win_groups_ * 1000 + win_staged_);
+    }
+}
+
+bool SecondaryRunner::window_cost(double& base, double& group, double& copy) const {
+    if (!fit_ok_) return false;
+    base = fit_cost_[0];
+    group = fit_cost_[1];
+    copy = fit_cost_[2];
+    return true;
 }
 
 void SecondaryRunner::begin_window(int n_tokens) {
@@ -856,6 +924,8 @@ bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout&
     }
     {   // #228 v2: the staged blobs the segment fetches before its experts (none without claims)
         const int32_t ns = host_count_ > 0 ? n_staged : 0;
+        win_staged_ = ns;
+        win_groups_ = host_count_ - ns;
         const long long nb = (long long) staged_bytes;
         std::memcpy(meta + meta_stage_n_off_, &ns, sizeof ns);
         if (ns > 0) {
@@ -899,6 +969,7 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
         }
         std::atomic_thread_fence(std::memory_order_acquire);   // the rows are read after the done flag
         const auto w1 = std::chrono::steady_clock::now();
+        window_sample(win_layer_, w1);
         ms_wait_ += std::chrono::duration<double, std::milli>(w1 - wait_t0).count();
         if (timeline::enabled()) timeline::complete("4070 wait", wait_t0, w1, win_layer_);
         for (size_t dense = 0; dense < selected_rows_.size(); ++dense)
@@ -1099,8 +1170,10 @@ void SecondaryRunner::close() {
     for (void*& ge : win_graph_)
         if (ge != nullptr) { cudaGraphExecDestroy((cudaGraphExec_t) ge); ge = nullptr; }
     if (dev_count_ != nullptr) cudaFree(dev_count_);
-    for (void* p : {(void*) host_wmeta_, (void*) host_wx_, (void*) host_wout_, (void*) host_go_, (void*) host_done_})
+    for (void* p : {(void*) host_wmeta_, (void*) host_wx_, (void*) host_wout_, (void*) host_go_, (void*) host_done_,
+                    (void*) host_wstamp_})
         if (p != nullptr) cudaFreeHost(p);
+    host_wstamp_ = nullptr;
     dev_count_ = nullptr; host_wmeta_ = nullptr; host_wx_ = nullptr; host_wout_ = nullptr;
     host_go_ = nullptr; host_done_ = nullptr; window_ = false;
     if (stream_ != nullptr && cudaStreamDestroy((cudaStream_t) stream_) != cudaSuccess) std::abort();

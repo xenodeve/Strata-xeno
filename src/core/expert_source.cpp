@@ -2159,7 +2159,8 @@ void RouterLookahead::enable_stats(int64_t n_layers) {
 }
 
 // the dispatch thread: score the prediction made for `layer` against the experts it routes outside the GPU cache
-void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num) {
+void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num,
+                                  const int32_t* sec_res) {
     if (!stats_on_ || layer < 1 || layer >= (int64_t) routers_.size()) return;
     ++st_layers_;
     if (pstamp_[(size_t) layer].load(std::memory_order_acquire) != gen_.load(std::memory_order_relaxed) + 1) {
@@ -2171,6 +2172,7 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
         const int32_t e = ids[i];
         if (e < 0 || e >= n_expert_) continue;
         if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;
+        if (sec_res != nullptr && sec_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;
         act[(size_t) (e >> 6)] |= 1ull << (e & 63);
     }
     uint64_t na = 0;
@@ -2191,6 +2193,7 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
             const int32_t e = ids[i];
             if (e < 0 || e >= n_expert_) continue;
             if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;
+            if (sec_res != nullptr && sec_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;
             if (std::find(order_miss.begin(), order_miss.end(), e) == order_miss.end()) order_miss.push_back(e);
         }
         const int m = ((int) order_miss.size() * pcie_num) >> 8;
@@ -3540,7 +3543,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.lookahead != nullptr) {
         if (d.lookahead->stats_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
-            d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
+            // STRATA_LOOKAHEAD_STATS=2 (#228 v3): scored against the CPU misses only (the 4070's experts left out too)
+            static const bool la_cpu = [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) == 2; }();
+            d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num, la_cpu ? d.secondary_res : nullptr);
         }
         d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1
     }
@@ -3790,11 +3795,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
             const int m_max = std::min({h, stage_cap, std::max(0, n_cpu - cost.min_cpu)});
+            // #228 v3: in window mode the 4070's base / per-group / per-staged-blob costs come from its own segment
+            // times once the runner has fitted them (STRATA_SECONDARY_STAGE_LIVE=0: the constants)
+            double c_base = cost.base, c_group = cost.group, c_copy = cost.copy;
+            bool live = false;   // the fitted copy term is a staged blob's fetch and its compute together
+            if (stage_window) {
+                double b = 0, gr = 0, cp = 0;
+                if (d.secondary_runner->window_cost(b, gr, cp)) { c_base = b; c_group = gr; c_copy = cp; live = true; }
+            }
             int best_m = 0;
             double best = 0;
             for (int m = 0; m <= m_max; ++m) {
                 const double pool = n_cpu - m > 0 ? cost.pool_base + cost.pool * (n_cpu - m) : 0.0;
-                const double g4070 = r_groups + m > 0 ? cost.base + cost.group * (r_groups + m) + cost.copy * m : 0.0;
+                const double g4070 = r_groups + m > 0 ? c_base + c_group * (r_groups + (live ? 0 : m)) + c_copy * m : 0.0;
                 // the window graph's segment runs anyway and takes the blobs from the plan: no host CUDA call
                 const double host = stage_window ? 0.0 : cost.issue * m + (r_groups == 0 && m > 0 ? cost.launch : 0.0);
                 const double t = std::max(pool, g4070) + host;
@@ -3808,6 +3821,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             n_staged = best_m;
             if (best_m > 0) { secondary_claims = true; d.secondary_staged += best_m; }
+            if (tl_plan) timeline::instant("4070 stage choice", n_cpu, (int64_t) h * 1000 + best_m);   // #228 v3
         }
         // #227 STRATA_SECONDARY_WINDOW_GRAPH: every layer publishes (an empty plan when nothing is claimed)
         const bool window = d.secondary_runner->window_on();
@@ -5746,6 +5760,10 @@ bool ArenaExpertSource::pin_cpu_hot(const std::vector<std::pair<int32_t, int32_t
     cudaGetDevice(&hot_device_);
     hot_.reset(new std::atomic<uint8_t>[(size_t) blobs_]());
     hot_run_of_.assign((size_t) blobs_, -1);
+    hot_runs_.reserve((size_t) blobs_);   // #228 v3: repin_hot appends; stage_blob_device reads runs without the lock
+    hot_rank_ = ranked;
+    hot_budget_ = budget_bytes;
+    hot_portable_ = portable;
     std::vector<uint8_t> want((size_t) blobs_, 0);
     uint64_t used = 0;
     for (const auto& [l, e] : ranked) {
@@ -5794,6 +5812,97 @@ bool ArenaExpertSource::pin_cpu_hot(const std::vector<std::pair<int32_t, int32_t
         }
     hot_stats_.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return hot_stats_.experts > 0 || err.empty();
+}
+
+bool ArenaExpertSource::repin_hot(int max_new_runs, RepinResult& out, std::string& err, const std::atomic<bool>* stop) {
+    out = {};
+    err.clear();
+    std::lock_guard<std::mutex> lk(host_mu_);
+    if (!hot_ || base_ == nullptr || arena_ == nullptr) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    int prev = -1;
+    cudaGetDevice(&prev);
+    cudaSetDevice(hot_device_);
+    // 1. the runs whose experts all went to a GPU: unregistered, then decommitted as host_release would have done
+    auto stopped = [&] { return stop != nullptr && stop->load(std::memory_order_acquire); };
+    for (HotRun& r : hot_runs_) {
+        if (stopped()) break;
+        if (r.base == nullptr) continue;
+        const int64_t row = (int64_t) r.layer * n_expert_;
+        bool all_gpu = true;
+        for (int32_t x = r.e0; x <= r.e1 && all_gpu; ++x) {
+            const size_t idx = (size_t) (row + x);
+            all_gpu = idx < exclusive_.size() && exclusive_[idx] && hot_[idx].load(std::memory_order_acquire) == 0;
+        }
+        if (!all_gpu) continue;
+        for (int32_t x = r.e0; x <= r.e1; ++x) hot_run_of_[(size_t) (row + x)] = -1;
+        if (cudaHostUnregister(r.base) != cudaSuccess) { cudaGetLastError(); }
+        for (int32_t x = r.e0; x <= r.e1; ++x) {
+            uint64_t given = 0;
+            std::string e;
+            if (((PinnedArena*) arena_)->decommit_interior(lay.blob_offset(r.layer, x), lay.blob_bytes(r.layer), given, e)) {
+                released_host_bytes_ += given;
+                out.returned_bytes += given;
+            }
+        }
+        const int64_t n = r.e1 - r.e0 + 1;
+        hot_stats_.experts -= n;
+        hot_stats_.gpu_owned -= n;
+        hot_stats_.bytes -= (uint64_t) r.bytes;
+        --hot_stats_.runs;
+        ++out.unpinned_runs;
+        out.unpinned_experts += n;
+        r = HotRun{};
+    }
+    // 2. the next CPU-owned experts of the ranking, up to the budget (a run that would share a page with a registered
+    //    one is skipped: the driver refuses the overlap)
+    const uintptr_t page = 4096;
+    int new_runs = 0;
+    for (; hot_rank_at_ < hot_rank_.size() && new_runs < max_new_runs && !stopped(); ++hot_rank_at_) {
+        const auto [l, e] = hot_rank_[hot_rank_at_];
+        if (l < 0 || e < 0 || e >= n_expert_) continue;
+        const int64_t idx = (int64_t) l * n_expert_ + e;
+        if (idx >= blobs_ || hot_run_of_[(size_t) idx] >= 0 ||
+            ((size_t) idx < exclusive_.size() && exclusive_[(size_t) idx]) || pinned(l, e))
+            continue;
+        const uint64_t bb = lay.blob_bytes(l);
+        if (hot_stats_.bytes + bb + 2 * page > hot_budget_) break;
+        auto shares = [&](int64_t other) {   // `other` (same layer) is in a run and shares a page with expert e
+            if (other < 0 || other >= n_expert_ || hot_run_of_[(size_t) (l * n_expert_ + other)] < 0) return false;
+            return other < e ? lay.blob_offset(l, e) % page != 0 : lay.blob_offset(l, other) % page != 0;
+        };
+        if (shares(e - 1) || shares(e + 1)) continue;
+        const uintptr_t first = (uintptr_t) (base_ + lay.blob_offset(l, e)) & ~(page - 1);
+        const uintptr_t last = ((uintptr_t) (base_ + lay.blob_offset(l, e) + bb) + page - 1) & ~(page - 1);
+        const cudaError_t rr = cudaHostRegister((void*) first, (size_t) (last - first),
+                                                (hot_portable_ ? cudaHostRegisterPortable : cudaHostRegisterDefault) |
+                                                    cudaHostRegisterMapped);
+        if (rr != cudaSuccess) {
+            cudaGetLastError();
+            if (rr == cudaErrorHostMemoryAlreadyRegistered) continue;
+            err = std::string("cudaHostRegister: ") + cudaGetErrorString(rr);   // the OS refuses more: stop here
+            break;
+        }
+        uint8_t* dev = nullptr;
+        if (cudaHostGetDevicePointer((void**) &dev, (void*) first, 0) != cudaSuccess) { cudaGetLastError(); dev = nullptr; }
+        if (hot_runs_.size() == hot_runs_.capacity()) {   // never reallocate under a lock-free reader: stop instead
+            cudaHostUnregister((void*) first);
+            break;
+        }
+        const int32_t run = (int32_t) hot_runs_.size();
+        hot_runs_.push_back({(uint8_t*) first, (size_t) (last - first), l, e, e, dev});
+        hot_run_of_[(size_t) idx] = run;
+        hot_[(size_t) idx].store(1, std::memory_order_release);
+        ++hot_stats_.experts;
+        ++hot_stats_.runs;
+        hot_stats_.bytes += (uint64_t) (last - first);
+        ++out.pinned_experts;
+        ++new_runs;
+    }
+    cudaSetDevice(prev);
+    out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return err.empty();
 }
 
 void ArenaExpertSource::unpin_hot_run(size_t idx) {

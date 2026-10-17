@@ -46,8 +46,9 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
 /// graph replayed every window needs no parameter update.  window_signal then advances *count and writes it to
 /// *done (mapped) after a system fence.  window_rows_to_host copies the layer's claimed rows (start[*n_groups] of
 /// them, n_embd floats each) from device to mapped host memory, then fences.
-void window_wait(const uint32_t* go, const uint32_t* count, void* stream);
-void window_signal(uint32_t* done, uint32_t* count, void* stream);
+/// `stamp` (#241, may be null): the GPU's %globaltimer (ns) once the go flag is seen / just before the done flag.
+void window_wait(const uint32_t* go, const uint32_t* count, void* stream, unsigned long long* stamp = nullptr);
+void window_signal(uint32_t* done, uint32_t* count, void* stream, unsigned long long* stamp = nullptr);
 void window_rows_to_host(const float* src, float* dst_mapped, const int32_t* start, const int32_t* n_groups,
                          int n_embd, int max_rows, void* stream);
 /// #228 v2: the window segment's staged experts.  Copies *n blobs of *bytes each from src[s] (device pointers of
