@@ -4039,6 +4039,48 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto pool_start = std::chrono::steady_clock::now();
     if (njobs > 0) run_jobs(0, njobs);
     const auto pool_end = std::chrono::steady_clock::now();
+    {   // #255 diagnostic STRATA_CPU_ROW_CHECK=L: layer L's CPU rows against ggml's float reference, 8 windows
+        static const int64_t chk = [] { const char* v = std::getenv("STRATA_CPU_ROW_CHECK"); return v ? (int64_t) std::atoll(v) : (int64_t) -1; }();
+        static int checked = 0;
+        if (chk >= 0 && d.layers == chk && native && checked < 8) {
+            ++checked;
+            int shown = 0;
+            for (int64_t i = 0; i < n_tok * k && shown < 3; ++i) {
+                const int64_t e = ids[i];
+                if (kind[i] != -1 || e < 0 || e >= d.n_expert || d.job_of[(size_t) e] < 0) continue;
+                const ExpertJobMulti& jb = d.jobs_multi[(size_t) d.job_of[(size_t) e]];
+                double l1 = 0;
+                const double r = strata::kernels::cpu::native_expert_ref_rel(lay.fmt[(size_t) d.layers], jb.blob,
+                                                                             x_f + (size_t) (i / k) * H, out + (size_t) i * H, &l1);
+                std::fprintf(stderr, "strata cpu row check: layer %lld expert %lld token %lld rank %lld: rel %.3e (ref L1 %.3e)\n",
+                             (long long) d.layers, (long long) e, (long long) (i / k), (long long) (i % k), r, l1);
+                static const char* gpath = std::getenv("STRATA_CPU_ROW_CHECK_GGUF");
+                static std::unique_ptr<strata::GgufModel> gm;
+                if (gpath != nullptr && gm == nullptr) gm = std::make_unique<strata::GgufModel>(strata::gguf_split_paths(gpath));
+                if (gm != nullptr) {
+                    const auto& f = lay.fmt[(size_t) d.layers];
+                    const char* roles[3] = {"gate", "up", "down"};
+                    const size_t off[3] = {0, f.up_off, f.down_off};
+                    const size_t len[3] = {f.up_off, f.down_off - f.up_off, f.bytes - f.down_off};
+                    for (int q = 0; q < 3; ++q) {
+                        size_t at = 0;
+                        const strata::TensorInfo* ti = gm->find("blk." + std::to_string(d.layers) + ".ffn_" + roles[q] + "_exps.weight", &at);
+                        if (ti == nullptr) { std::fprintf(stderr, "strata cpu row check:   %s: no tensor\n", roles[q]); continue; }
+                        const uint8_t* g0 = gm->shard(at).tensor_data(*ti);
+                        const bool same = std::memcmp(g0 + (size_t) e * len[q], jb.blob + off[q], len[q]) == 0;
+                        int64_t match = -1;
+                        if (!same)
+                            for (int64_t e2 = 0; e2 < d.n_expert && match < 0; ++e2)
+                                if (std::memcmp(g0 + (size_t) e2 * len[q], jb.blob + off[q], len[q]) == 0) match = e2;
+                        std::fprintf(stderr, "strata cpu row check:   %s bytes %s the GGUF's expert %lld%s%lld\n", roles[q],
+                                     same ? "equal" : "DIFFER from", (long long) e, same ? "" : "; they are expert ",
+                                     (long long) (same ? e : match));
+                    }
+                }
+                ++shown;
+            }
+        }
+    }
     if (nvme_pending) {   // #95: the reads have had the resident run to land; publish them, then run their jobs
         std::string ne;
         if (!d.src->materialize_end(ne)) { fail_nvme(ne); return; }
@@ -4100,6 +4142,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
         *dh.flag = dh.want;
+        // diagnostic STRATA_DEFER_DROP=1: the deferred experts are dropped (their slot stays zero)
+        static const bool drop = [] { const char* v = std::getenv("STRATA_DEFER_DROP"); return v != nullptr && std::atoi(v) == 1; }();
+        if (drop) def_list.clear();
         const auto q0 = std::chrono::steady_clock::now();
         static thread_local std::vector<float> def_rows;
         if (def_rows.size() < (size_t) (n_tok * k * H)) def_rows.resize((size_t) (n_tok * k * H));
