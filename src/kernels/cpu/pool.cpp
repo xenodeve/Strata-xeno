@@ -793,6 +793,19 @@ void ExpertPool::native_rows(int mode, int64_t g0, int64_t g1) {
 void ExpertPool::wait_quantized(int e) {
     // the host may be the one waiting here, inside its drain: it does not reach wait_done's clock, so this one has
     // its own - a gate/up task that never ends is the same stall (issue #29)
+    if (gu_left_[e].load(std::memory_order_acquire) < 0) return;
+    // timeline "pool wait quantized" (a = expert, b = the gate/up tasks still left): a down task that waited for its
+    // expert's last gate/up task (#187 R3); only waits that happened, so the span's total is the spin
+    struct WaitSpan {
+        bool on;
+        std::chrono::steady_clock::time_point t;
+        int e, left;
+        ~WaitSpan() { if (on) timeline::complete("pool wait quantized", t, std::chrono::steady_clock::now(), e, left); }
+    } wait_span{timeline::enabled(), {}, e, 0};
+    if (wait_span.on) {
+        wait_span.t = std::chrono::steady_clock::now();
+        wait_span.left = gu_left_[e].load(std::memory_order_relaxed);
+    }
     uint32_t spins = 0;
     std::chrono::steady_clock::time_point t0{};
     int seen = 0;
