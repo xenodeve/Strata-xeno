@@ -8,6 +8,7 @@
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/memory.hpp"
 
+#include <mutex>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -228,6 +229,9 @@ struct PleTable::Impl {
         std::vector<uint8_t> raw;
     };
     std::deque<Ahead> ahead;
+    // #247: the prompt path's two wave lanes gather on this table at once, and the first gather of a request drains
+    // the read-ahead the last request's drafts left: two lanes popping one deque crashed the engine (0xc0000005)
+    std::mutex ahead_mu;
     bool cached = false;   // the row cache is on: a prefetch is only worth its reads when it is
     // #213: the rows each path hands the reader (Direct mode), for the `ple io` line's "by path" clause: the #44 D4
     // read-ahead (`prefetch`), #783's per-token window prefetch (`prefetch_rows`), a batch gather's own request, the
@@ -240,6 +244,7 @@ struct PleTable::Impl {
     void decode(const uint8_t* row, float* out160) const { fmt->dequant(row, scale, out160); }
 
     bool drain_ahead(std::string& err) {
+        std::lock_guard<std::mutex> lk(ahead_mu);
         bool ok = true;
         while (!ahead.empty()) {
             std::string e;
@@ -540,6 +545,7 @@ bool PleTable::prefetch(const uint32_t* rows, size_t n) {
     if (impl_->mode != PleIo::Direct || !impl_->reader.is_open() || !impl_->cached || n == 0) return true;
     constexpr size_t kMaxAhead = 32;   // bounds the buffers; the oldest are the likeliest to have landed
     std::string ignored;
+    std::lock_guard<std::mutex> lk(impl_->ahead_mu);   // #247
     while (impl_->ahead.size() >= kMaxAhead) {
         impl_->reader.collect(impl_->ahead.front().ticket, ignored);
         impl_->ahead.pop_front();
