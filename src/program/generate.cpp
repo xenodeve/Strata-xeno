@@ -1570,22 +1570,95 @@ bool refill_lent(const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n
     bool q_failed = false, q_stop = false;
     std::string rerr;
     std::thread reader([&] {
-        for (size_t b = 0; b < n_batches; ++b) {
-            {
-                std::unique_lock<std::mutex> lk(q_mu);
-                q_cv.wait(lk, [&] { return q_stop || b < q_copied + kBufs; });
-                if (q_stop) return;
+        if (!use_file) {   // the model path: one batch at a time through the arena's reader
+            for (size_t b = 0; b < n_batches; ++b) {
+                {
+                    std::unique_lock<std::mutex> lk(q_mu);
+                    q_cv.wait(lk, [&] { return q_stop || b < q_copied + kBufs; });
+                    if (q_stop) return;
+                }
+                std::string e;
+                const bool ok = read_batch(b * kBatch, (int) (b % kBufs), e);
+                {
+                    std::lock_guard<std::mutex> lk(q_mu);
+                    if (ok) q_read = b + 1;
+                    else { q_failed = true; rerr = e; }
+                }
+                q_cv.notify_all();
+                if (!ok) return;
             }
-            std::string e;
-            const bool ok = read_batch(b * kBatch, (int) (b % kBufs), e);
-            {
-                std::lock_guard<std::mutex> lk(q_mu);
-                if (ok) q_read = b + 1;
-                else { q_failed = true; rerr = e; }
-            }
-            q_cv.notify_all();
-            if (!ok) return;
+            return;
         }
+        // the tail file: the next batch's requests go to the drive before the current batch's last one completes (up
+        // to two batches in flight), so its queue does not run dry between batches
+        struct Batch { std::vector<std::pair<uint64_t, uint32_t>> pieces; std::vector<size_t> dst; size_t left = 0; double t0 = 0; };
+        std::vector<Batch> bt(n_batches);
+        const auto r0 = std::chrono::steady_clock::now();
+        auto fail = [&](const std::string& e) {
+            { std::lock_guard<std::mutex> lk(q_mu); q_failed = true; rerr = e; }
+            q_cv.notify_all();
+        };
+        size_t sub = 0, done = 0;
+        while (done < n_batches) {
+            while (sub < n_batches && sub < done + 2) {
+                {
+                    std::unique_lock<std::mutex> lk(q_mu);
+                    if (q_stop) return;
+                    if (sub >= q_copied + kBufs) {
+                        if (sub > done) break;   // wait for the batch in flight instead
+                        q_cv.wait(lk, [&] { return q_stop || sub < q_copied + kBufs; });
+                        if (q_stop) return;
+                    }
+                }
+                Batch& B = bt[sub];
+                const size_t at = sub * kBatch, nb = std::min<size_t>(kBatch, from_pack.size() - at);
+                size_t filled = 0;
+                for (size_t j = 0; j < nb;) {
+                    size_t k = j + 1;
+                    while (k < nb && from_pack[at + k].second == from_pack[at + k - 1].second + 1) ++k;   // a run of slots
+                    uint64_t off = g_tail.offset(from_pack[at + j].second), left = (uint64_t) (k - j) * g_tail.stride;
+                    while (left > 0) {
+                        const uint32_t len = (uint32_t) std::min<uint64_t>(left, 8ull << 20);
+                        B.pieces.emplace_back(off, len);
+                        B.dst.push_back(filled);
+                        off += len; filled += len; left -= len;
+                    }
+                    j = k;
+                }
+                B.left = B.pieces.size();
+                B.t0 = strata::timeline::enabled() ? strata::timeline::now_us() : 0;
+                uint8_t* buf = bounce[sub % kBufs];
+                for (size_t q = 0; q < B.pieces.size(); ++q) {
+                    std::string e;
+                    if (!g_tail.file.submit(B.pieces[q].first, buf + B.dst[q], B.pieces[q].second, (sub << 16) | q, e)) {
+                        fail(e);
+                        return;
+                    }
+                }
+                io_requests += (int64_t) B.pieces.size();
+                io_bytes += (int64_t) filled;
+                ++sub;
+            }
+            strata::platform::Completion c[64];
+            const int k = g_tail.file.wait(c, 64, -1);
+            for (int i = 0; i < k; ++i) {
+                if (c[i].tag == strata::platform::DirectFile::WAKE_TAG) continue;
+                const size_t b = (size_t) (c[i].tag >> 16), q = (size_t) (c[i].tag & 0xffff);
+                if (b >= n_batches || q >= bt[b].pieces.size() || !c[i].ok || c[i].bytes != bt[b].pieces[q].second) {
+                    fail("tail file: short read");
+                    return;
+                }
+                --bt[b].left;
+            }
+            while (done < sub && bt[done].left == 0) {
+                if (bt[done].t0 > 0)
+                    strata::timeline::complete("pack refill read", bt[done].t0, strata::timeline::now_us(), (int64_t) (done * kBatch));
+                { std::lock_guard<std::mutex> lk(q_mu); q_read = done + 1; }
+                q_cv.notify_all();
+                ++done;
+            }
+        }
+        read_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - r0).count();
     });
     auto stop_reader = [&] {
         { std::lock_guard<std::mutex> lk(q_mu); q_stop = true; }
