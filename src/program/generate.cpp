@@ -1340,12 +1340,15 @@ struct LinkProbe {
 // #35 D7 (STRATA_PREFILL_WAVE=1 with the split layout): two prompt-path lanes of half the chunk each
 bool g_prefill_wave = false;
 bool wave_on(int64_t prefill_chunk) { return g_prefill_wave && prefill_chunk >= 4096; }   // lanes of 2,048+ tokens
-/// #35 D7: the wave's lane streams on this card: lane 0 (the chunk ahead) at the highest priority, lane 1 the lowest
+/// #35 D7: the wave's lane streams on this card (#188: both at the lowest priority by default)
 void make_lane_streams(cudaStream_t& lane0, cudaStream_t& lane1) {
     int least = 0, greatest = 0;
     cudaDeviceGetStreamPriorityRange(&least, &greatest);
-    cudaStreamCreateWithPriority(&lane0, cudaStreamNonBlocking, greatest);
-    cudaStreamCreateWithPriority(&lane1, cudaStreamNonBlocking, least);
+    // #188: STRATA_PREFILL_WAVE_PRIO (prefill.cpp's wave_lane_high): 1 neither high (the default), 0 lane 0 (D7's
+    // rule, the chunk ahead), 2 lane 1
+    static const int mode = [] { const char* e = std::getenv("STRATA_PREFILL_WAVE_PRIO"); return e ? std::atoi(e) : 1; }();
+    cudaStreamCreateWithPriority(&lane0, cudaStreamNonBlocking, mode == 0 ? greatest : least);
+    cudaStreamCreateWithPriority(&lane1, cudaStreamNonBlocking, mode == 2 ? greatest : least);
 }
 // #122: `kv_end` = the request's end position, which sizes the KV-streaming staging pool (0 = the worst case: the
 // boot-time chunk choice and lendable tail)
@@ -14595,7 +14598,7 @@ int main(int argc, char** argv) {
         // #35 D7: with the wave, two lanes of half the chunk, each with half the borrowed region and its own stream
         const bool wave = wave_on(o.prefill_chunk);
         cudaStream_t lane0_cs = (cudaStream_t) main_cs;
-        if (wave) make_lane_streams(lane0_cs, wave_cs);   // #35 D7: the chunk ahead (lane 0) goes first on this card
+        if (wave) make_lane_streams(lane0_cs, wave_cs);   // #35 D7: the two lanes' streams (#188: equal priority)
         const int64_t lane_chunk = wave ? strata::prefill::Prefill::wave_lane_chunk(o.prefill_chunk) : o.prefill_chunk;
         uint64_t lane_bytes = borrow_bytes;
         if (wave && borrow != nullptr) {
