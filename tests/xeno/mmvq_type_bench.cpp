@@ -217,6 +217,41 @@ int main(int argc, char** argv) {
         }
     }
     if (bad_total) std::printf("PARITY FAILED in %d matrices\n", bad_total);
+    {   // #257: the prompt path's dequant of one Gyro-M expert (TQ2_T 144, 2560 x 640, gate/up + down in one launch).
+        // Run once as is and once with STRATA_DQ_K8=0: the hashes must match (the same values, other stores).
+        const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(144, 144, 2560, 640);
+        std::vector<uint8_t> blob(L.bytes);
+        for (auto& b : blob) b = (uint8_t) (rng() & 0xff);
+        void* db[COPIES];
+        for (int c = 0; c < COPIES; ++c) {
+            cudaMalloc(&db[c], L.bytes);
+            cudaMemcpy(db[c], blob.data(), L.bytes, cudaMemcpyHostToDevice);
+        }
+        const size_t ngu = (size_t) 2 * 640 * 2560, nd = (size_t) 2560 * 640;
+        uint16_t *gu = nullptr, *dn = nullptr;
+        cudaMalloc(&gu, ngu * 2);
+        cudaMalloc(&dn, nd * 2);
+        strata::kernels::iq_dequant_expert_f16(L, db[0], gu, dn, s);
+        std::vector<uint16_t> h(ngu + nd);
+        cudaMemcpy(h.data(), gu, ngu * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h.data() + ngu, dn, nd * 2, cudaMemcpyDeviceToHost);
+        uint64_t fnv = 1469598103934665603ull;
+        for (uint16_t v : h) { fnv ^= v; fnv *= 1099511628211ull; }
+        for (int i = 0; i < 10; ++i) strata::kernels::iq_dequant_expert_f16(L, db[i % COPIES], gu, dn, s);
+        cudaEventRecord(e0, s);
+        for (int i = 0; i < iters; ++i) strata::kernels::iq_dequant_expert_f16(L, db[i % COPIES], gu, dn, s);
+        cudaEventRecord(e1, s);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        const double us = 1000.0 * ms / iters;
+        std::printf("\nexpert TQ2_T 2560x640  %8.2f us  %7.1f GB/s FP16 out  hash %016llx  (STRATA_DQ_K8=%s)\n", us,
+                    (double) (ngu + nd) * 2 / (us * 1e3), (unsigned long long) fnv,
+                    std::getenv("STRATA_DQ_K8") ? std::getenv("STRATA_DQ_K8") : "unset");
+        for (int c = 0; c < COPIES; ++c) cudaFree(db[c]);
+        cudaFree(gu);
+        cudaFree(dn);
+    }
     const cudaError_t err = cudaGetLastError();
     std::printf("%s\n", err == cudaSuccess ? "DONE" : cudaGetErrorString(err));
     return err == cudaSuccess ? 0 : 1;

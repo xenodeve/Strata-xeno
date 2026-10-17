@@ -2177,7 +2177,9 @@ __device__ void dq_bf16(const void* vx, int64_t ibs, dst_t* yy, int tid) {
 
 // APR trellis types: one 256-value call = two 128-blocks; thread tid decodes block tid/16, lane (tid/2)%8, steps
 // 2(tid%2)..2(tid%2)+1 (8 values)
-template<int TY, typename dst_t>
+// V16 (#257, 2-byte outputs whose row is 16-byte aligned): the thread's 8 consecutive values in one 16-byte store
+// instead of eight 2-byte stores 16 bytes apart across the warp; the same values
+template<int TY, typename dst_t, bool V16 = false>
 __device__ void dq_tq(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const int blk = tid >> 4, l = (tid >> 1) & 7, half = tid & 1;
     const auto* b = (const typename TqInfo<TY>::block_t*) vx + 2 * ibs + blk;
@@ -2185,20 +2187,34 @@ __device__ void dq_tq(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     uint32_t s[4];
     tq_states4<TY>(b->qs, l, s);
     dst_t* y = yy + blk * 128 + 16 * l + 8 * half;
+    if constexpr (V16 && sizeof(dst_t) == 2) {
+        __align__(16) dst_t v[8];
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        float2 a, c;
-        tq_step(s[2 * half + i], a, c);
-        y[4 * i + 0] = cvt<dst_t>(d * a.x);
-        y[4 * i + 1] = cvt<dst_t>(d * a.y);
-        y[4 * i + 2] = cvt<dst_t>(d * c.x);
-        y[4 * i + 3] = cvt<dst_t>(d * c.y);
+        for (int i = 0; i < 2; ++i) {
+            float2 a, c;
+            tq_step(s[2 * half + i], a, c);
+            v[4 * i + 0] = cvt<dst_t>(d * a.x);
+            v[4 * i + 1] = cvt<dst_t>(d * a.y);
+            v[4 * i + 2] = cvt<dst_t>(d * c.x);
+            v[4 * i + 3] = cvt<dst_t>(d * c.y);
+        }
+        *(uint4*) y = *(const uint4*) v;
+    } else {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            float2 a, c;
+            tq_step(s[2 * half + i], a, c);
+            y[4 * i + 0] = cvt<dst_t>(d * a.x);
+            y[4 * i + 1] = cvt<dst_t>(d * a.y);
+            y[4 * i + 2] = cvt<dst_t>(d * c.x);
+            y[4 * i + 3] = cvt<dst_t>(d * c.y);
+        }
     }
 }
 
 // Every type below must also be in is_iq() (BF16: embed_type_supported): the host entry points refuse the others,
 // so the default is unreachable.
-template<typename dst_t>
+template<typename dst_t, bool V16 = false>
 __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid) {
     switch (ty) {
         case 16: dq_iq2_xxs(vx, ibs, y, tid); break;
@@ -2220,9 +2236,9 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 3: dq_q4_1(vx, ibs, y, tid); break;
         case 8: dq_q8_0(vx, ibs, y, tid); break;
         case 30: dq_bf16(vx, ibs, y, tid); break;
-        case 144: dq_tq<144>(vx, ibs, y, tid); break;
-        case 145: dq_tq<145>(vx, ibs, y, tid); break;
-        case 146: dq_tq<146>(vx, ibs, y, tid); break;
+        case 144: dq_tq<144, dst_t, V16>(vx, ibs, y, tid); break;
+        case 145: dq_tq<145, dst_t, V16>(vx, ibs, y, tid); break;
+        case 146: dq_tq<146, dst_t, V16>(vx, ibs, y, tid); break;
         default: break;
     }
 }
@@ -2244,15 +2260,16 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // one expert blob in one launch: blockIdx.y 0/1 = the gate/up superblocks exactly as dequant_gu_kernel writes them,
 // 2 = the down superblocks exactly as dequant_flat_kernel writes them (the two roles have the same superblock count)
+template<bool V16>
 __global__ void dequant_expert_kernel(int gty, int dty, const uint8_t* __restrict__ blob, size_t up_off, size_t down_off,
                                       int64_t per_row, __half* __restrict__ gu, __half* __restrict__ dn) {
     const int64_t i = blockIdx.x;
     const int role = blockIdx.y;
     if (role < 2) {
         const int64_t r = i / per_row, c = i % per_row;
-        dq_dispatch<__half>(gty, role ? blob + up_off : blob, i, gu + ((2 * r + role) * per_row + c) * QK_K, threadIdx.x);
+        dq_dispatch<__half, V16>(gty, role ? blob + up_off : blob, i, gu + ((2 * r + role) * per_row + c) * QK_K, threadIdx.x);
     } else {
-        dq_dispatch<__half>(dty, blob + down_off, i, dn + i * QK_K, threadIdx.x);
+        dq_dispatch<__half, V16>(dty, blob + down_off, i, dn + i * QK_K, threadIdx.x);
     }
 }
 
@@ -3153,8 +3170,16 @@ void iq_dequant_expert_f16(const NativeExpertLayout& L, const void* blob, uint16
         std::fprintf(stderr, "iq_dequant_expert_f16: bad arguments\n");
         std::exit(1);
     }
-    dequant_expert_kernel<<<dim3((unsigned) (L.n_ff * per_row), 3), 32, 0, (cudaStream_t) stream>>>(
-        L.gu_type, L.d_type, (const uint8_t*) blob, L.up_off, L.down_off, per_row, (__half*) gu, (__half*) down);
+    // #257: the trellis types' 16-byte stores where both outputs are 16-byte aligned; STRATA_DQ_K8=0 (diagnostic)
+    // keeps the 2-byte stores
+    static const bool v16_on = [] { const char* v = std::getenv("STRATA_DQ_K8"); return v == nullptr || std::atoi(v) != 0; }();
+    const dim3 grid((unsigned) (L.n_ff * per_row), 3);
+    if (v16_on && ((reinterpret_cast<uintptr_t>(gu) | reinterpret_cast<uintptr_t>(down)) & 15) == 0)
+        dequant_expert_kernel<true><<<grid, 32, 0, (cudaStream_t) stream>>>(
+            L.gu_type, L.d_type, (const uint8_t*) blob, L.up_off, L.down_off, per_row, (__half*) gu, (__half*) down);
+    else
+        dequant_expert_kernel<false><<<grid, 32, 0, (cudaStream_t) stream>>>(
+            L.gu_type, L.d_type, (const uint8_t*) blob, L.up_off, L.down_off, per_row, (__half*) gu, (__half*) down);
     check("iq_dequant_expert_f16");
 }
 
