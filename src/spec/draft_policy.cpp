@@ -75,8 +75,9 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     if (best_t > 0 && best > base * (1.0 + margin_)) {
         p.lookup = true;
         p.t = best_t;
-        // a wider size whose cost has gone stale is re-measured, so one slow stretch cannot price it out for good
-        if (best_t < t_full && q >= 0.85 && stale(t_full)) p.t = t_full;
+        // a wider size whose cost is only guessed (never measured: stale() needs a measurement) or has gone stale is
+        // measured, so neither kShape's guess nor one slow stretch can price it out for good
+        if (best_t < t_full && q >= 0.85 && (cost_n_[t_full] < kProbes || stale(t_full))) p.t = t_full;
         return p;
     }
     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would

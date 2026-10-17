@@ -15693,17 +15693,19 @@ int main(int argc, char** argv) {
             }
             if (first_window) T = 1;
             bool from_sfx = false;
-            int sfx_match = 0;
+            int sfx_match = 0, sfx_k = 0;
             const Clock::time_point t_sfx = Clock::now();   // #44: the suffix drafter's search
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
                 if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
+                    sfx_k = k;
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
-            if (strata::timeline::enabled()) strata::timeline::complete("suffix propose", t_sfx, Clock::now(), T);
+            // b: the drafts the lookup offered the policy (0: none, or its first token disagreed with the MTP's)
+            if (strata::timeline::enabled()) strata::timeline::complete("suffix propose", t_sfx, Clock::now(), T, sfx_k);
             // The window's rows sit at p .. p + T - 1, and past the context there is no cell to verify them in: near
             // its end the window takes only the rows that fit (the admission checked the prompt and max_new, which a
             // full window can overrun)

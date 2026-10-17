@@ -59,6 +59,20 @@ int main() {
         check(!p.choose(4, 5, 40).lookup, "after the probes, the measured cost decides");
     }
     {
+        // a shorter lookup already wins on kShape's guess and the full size was never measured: it is still probed
+        // (stale() needs a measurement, so it alone never fired), then the measured cost decides
+        DraftPolicy p(6);
+        for (int i = 0; i < 50; ++i) p.observe(false, 4, 0, 0, cost(4));      // a weak MTP: 1 token per window
+        for (int i = 0; i < 40; ++i) p.observe(true, 4, i % 4 == 3 ? 0 : 3, 40, cost(4));   // q ~ 0.9, size 4 only
+        const double q = p.lookup_rate(40);
+        const DraftPolicy::Pick k = p.choose(4, 5, 40);
+        check(q >= 0.85 && q < 0.93 && k.lookup && k.t == 6,
+              "a winning shorter lookup does not keep an unmeasured full size from its probes");
+        for (int i = 0; i < 3; ++i) p.observe(true, 6, 5, 40, 3.0 * cost(6));   // it turns out very expensive
+        const DraftPolicy::Pick k2 = p.choose(4, 5, 40);
+        check(k2.lookup && k2.t < 6, "after those probes, the measured cost decides the size");
+    }
+    {
         // #1252: a wide size priced high in one slow stretch is measured again after a while
         DraftPolicy p(6);
         for (int i = 0; i < 50; ++i) p.observe(false, 4, 3, 0, cost(4));      // a strong MTP
