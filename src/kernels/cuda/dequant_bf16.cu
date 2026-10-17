@@ -199,6 +199,87 @@ __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t 
     for (int k = 0; k < (int) (8 * sizeof(T) / 16); ++k) o[k] = ((const uint4*) v)[k];
 }
 
+// #256: Q4_K / Q5_K / Q6_K / IQ4_NL / IQ4_XS in the same shape - four threads per 32-value group, 8 values each, one
+// 16-byte store - with group32's arithmetic for those 8 values (the same bits).  A thread per group stored 2-byte
+// values 64 bytes apart: ~50 GB/s against Q8_0's 240 (xeno_mmvq_type_bench).  2-byte outputs only.
+template <int TYPE, typename T>
+__global__ void dequant_k8_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
+                                  int64_t groups_per_row, int64_t ld, T* __restrict__ out) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * groups_per_row * 4) return;
+    const int64_t g = i >> 2, r = g / groups_per_row;
+    const int gi_in_row = (int) (g % groups_per_row), l0 = 8 * (int) (i & 3);
+    const uint8_t* row_blocks = blocks + (row0 + r) * row_bytes;
+    __align__(16) T v[8];
+    if constexpr (TYPE == 12) {                                    // Q4_K
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 144;
+        const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
+        const float d = h2f(b), dmin = h2f(b + 2);
+        int sc, m;
+        scale_min_k4(gi, b + 4, sc, m);
+        const float d1 = d * (float) sc, m1 = dmin * (float) m;
+        const uint8_t* q = b + 16 + 32 * j64 + l0;
+#pragma unroll
+        for (int l = 0; l < 8; ++l) put(v, l, d1 * (float) (hi ? (q[l] >> 4) : (q[l] & 0xF)) - m1);
+    } else if constexpr (TYPE == 13) {                             // Q5_K
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 176;
+        const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
+        const float d = h2f(b), dmin = h2f(b + 2);
+        int sc, m;
+        scale_min_k4(gi, b + 4, sc, m);
+        const float d1 = d * (float) sc, m1 = dmin * (float) m;
+        const uint8_t* qh = b + 16 + l0;
+        const uint8_t* ql = b + 48 + 32 * j64 + l0;
+        const uint8_t u = (uint8_t) (1u << (2 * j64 + hi));
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int nib = hi ? (ql[l] >> 4) : (ql[l] & 0xF);
+            put(v, l, d1 * (float) (nib + ((qh[l] & u) ? 16 : 0)) - m1);
+        }
+    } else if constexpr (TYPE == 20 || TYPE == 23) {               // IQ4_NL, IQ4_XS
+        float dl;
+        const uint8_t* qs;
+        if constexpr (TYPE == 20) {
+            const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
+            dl = h2f(b);
+            qs = b + 2;
+        } else {
+            const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 136;
+            const int ib = gi_in_row % 8;
+            const float d = h2f(b);
+            const uint16_t scales_h = (uint16_t) (b[2] | (b[3] << 8));
+            const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((scales_h >> (2 * ib)) & 3) << 4);
+            dl = d * (float) (ls - 32);
+            qs = b + 8 + 16 * ib;
+        }
+        if (l0 < 16) {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) put(v, k, dl * (float) kv_iq4nl[qs[l0 + k] & 0xf]);
+        } else {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) put(v, k, dl * (float) kv_iq4nl[qs[l0 - 16 + k] >> 4]);
+        }
+    } else {                                                       // Q6_K
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 210;
+        const int gi = gi_in_row % 8, n = gi / 4, qu = gi % 4;
+        const uint8_t* ql = b + 64 * n;
+        const uint8_t* qh = b + 128 + 32 * n;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + 8 * n;
+        const float d = h2f(b + 208);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int l = l0 + k, is = l / 16;
+            int q;
+            if (qu == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+            else if (qu == 1) q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+            else if (qu == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+            else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+            put(v, k, d * (float) sc[is + 2 * qu] * (float) (q - 32));
+        }
+    }
+    *(uint4*) (out + r * ld + (int64_t) gi_in_row * 32 + l0) = *(const uint4*) v;
+}
+
 bool geometry(int type, int& block_elems, int& block_bytes) {
     switch (type) {
     case 2: block_elems = 32; block_bytes = 18; return true;
@@ -236,6 +317,22 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
+    }
+    // #256; STRATA_DQ_K8=0 (diagnostic, A/B): the thread-per-group kernel for the K-quants as before
+    static const bool k8 = [] { const char* v = std::getenv("STRATA_DQ_K8"); return v == nullptr || std::atoi(v) != 0; }();
+    if constexpr (sizeof(T) == 2) {
+        if (k8 && (type == 12 || type == 13 || type == 14 || type == 20 || type == 23) && ld % 8 == 0 &&
+            (reinterpret_cast<uintptr_t>(out) & 15) == 0) {
+            const unsigned g4 = (unsigned) ((4 * total + 255) / 256);
+            if (type == 12) dequant_k8_kernel<12, T><<<g4, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out);
+            else if (type == 13) dequant_k8_kernel<13, T><<<g4, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out);
+            else if (type == 14) dequant_k8_kernel<14, T><<<g4, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out);
+            else if (type == 20) dequant_k8_kernel<20, T><<<g4, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out);
+            else dequant_k8_kernel<23, T><<<g4, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out);
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+            return;
+        }
     }
 #define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out); break
     switch (type) {
