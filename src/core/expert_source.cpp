@@ -4039,6 +4039,27 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto pool_start = std::chrono::steady_clock::now();
     if (njobs > 0) run_jobs(0, njobs);
     const auto pool_end = std::chrono::steady_clock::now();
+    // #254: the deferred experts' batch starts here, on the workers, while this thread waits for the 4070 below
+    // (STRATA_DEFER_ASYNC=0: after the early flag, on this thread, as before)
+    static thread_local std::vector<float> def_rows;
+    int def_first = -1;
+    bool def_async = false;
+    static const bool defer_async = [] { const char* v = std::getenv("STRATA_DEFER_ASYNC"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool defer_drop = [] { const char* v = std::getenv("STRATA_DEFER_DROP"); return v != nullptr && std::atoi(v) == 1; }();
+    if (dh.active && !def_list.empty() && !defer_drop) {
+        if (def_rows.size() < (size_t) (n_tok * k * H)) def_rows.resize((size_t) (n_tok * k * H));
+        def_first = njobs;
+        for (const int32_t i : def_list)
+            if (!add_entry(i, def_rows.data() + (size_t) i * H)) return;
+        if (defer_async && native && !nvme_pending && njobs > def_first)
+            def_async = d.pool->run_split_multi_native_begin(lay.fmt[(size_t) d.layers], d.jobs_multi.data() + def_first,
+                                                             njobs - def_first);
+    }
+    // a failure return between the start and the join must not leave the batch running
+    struct DeferJoin {
+        decltype(d.pool) p;
+        ~DeferJoin() { if (p != nullptr && p->async_running()) p->run_async_end(); }
+    } defer_join{def_async ? d.pool : nullptr};
     {   // #255 diagnostic STRATA_CPU_ROW_CHECK=L: layer L's CPU rows against ggml's float reference, 8 windows
         static const int64_t chk = [] { const char* v = std::getenv("STRATA_CPU_ROW_CHECK"); return v ? (int64_t) std::atoll(v) : (int64_t) -1; }();
         static int checked = 0;
@@ -4144,15 +4165,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         _mm_sfence();
         *dh.flag = dh.want;
         // diagnostic STRATA_DEFER_DROP=1: the deferred experts are dropped (their slot stays zero)
-        static const bool drop = [] { const char* v = std::getenv("STRATA_DEFER_DROP"); return v != nullptr && std::atoi(v) == 1; }();
-        if (drop) def_list.clear();
+        if (defer_drop) def_list.clear();
         const auto q0 = std::chrono::steady_clock::now();
-        static thread_local std::vector<float> def_rows;
-        if (def_rows.size() < (size_t) (n_tok * k * H)) def_rows.resize((size_t) (n_tok * k * H));
-        const int first = njobs;
-        for (const int32_t i : def_list)
-            if (!add_entry(i, def_rows.data() + (size_t) i * H)) return;
-        if (njobs > first) run_jobs(first, njobs - first);
+        if (def_async) d.pool->run_async_end();
+        else if (def_first >= 0 && njobs > def_first) run_jobs(def_first, njobs - def_first);
         for (const int32_t i : def_list) {   // entry order: the same sum every time
             const float wv = def_w[(size_t) i];
             const float* r = def_rows.data() + (size_t) i * H;

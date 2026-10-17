@@ -942,6 +942,48 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+bool ExpertPool::run_split_multi_native_begin(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
+    if (n <= 0 || n > kMaxSplitMulti || !fused_ || n_ <= 0 || async_on_) return false;
+    async_t0_ = std::chrono::steady_clock::now();
+    mjobs_ = jobs;
+    nfmt_ = &f;
+    fgu_rows_ = (int64_t) n * FF;   // the one-phase setup of run_split_multi_native, for one batch
+    fd_rows_ = (int64_t) n * H;
+    ftasks_gu_ = phase_tasks(fgu_rows_);
+    ftasks_d_ = phase_tasks(fd_rows_);
+    for (int e = 0; e < n; ++e) gu_left_[e].store(0, std::memory_order_relaxed);
+    for (int i = 0; i < ftasks_gu_; ++i) {
+        const int64_t g0 = fgu_rows_ * i / ftasks_gu_, g1 = fgu_rows_ * (i + 1) / ftasks_gu_;
+        if (g1 > g0)
+            for (int e = (int) (g0 / FF); e <= (int) ((g1 - 1) / FF); ++e) gu_left_[e].fetch_add(1, std::memory_order_relaxed);
+    }
+    wait_parked("before a deferred phase");
+    mode_ = 7;
+    njobs_ = ftasks_gu_ + ftasks_d_;
+    async_tasks_ = njobs_;
+    async_n_ = n;
+    async_bytes_ = f.bytes;
+    async_on_ = true;
+    async_epoch_ = begin_batch(njobs_);
+    return true;
+}
+
+void ExpertPool::run_async_end() {
+    if (!async_on_) return;
+    if (host_works_) drain(-1, host_scratch_, async_epoch_);
+    wait_done(async_tasks_);
+    wait_parked("after a deferred phase");
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    const auto d = std::chrono::steady_clock::now();
+    timeline::complete("pool one phase", async_t0_, d, async_n_);
+    ms_multi_gu += std::chrono::duration<double, std::milli>(d - async_t0_).count();
+    multi_bytes += (int64_t) async_n_ * (int64_t) async_bytes_;
+    ms_drain_ += std::chrono::duration<double, std::milli>(d - async_t0_).count();
+    mode_ = 0;
+    async_on_ = false;
+}
+
 void ExpertPool::run(ExpertJob* jobs, int n) {
     if (n <= 0) return;
     if (n_ == 1) {   // no workers: run inline, so a single-core machine still produces a token
