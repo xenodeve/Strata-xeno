@@ -530,13 +530,16 @@ void ExpertPool::publish() {
     rest_.store(false, std::memory_order_relaxed);   // ordered before the epoch bump below (seq_cst)
     if (timeline::enabled()) publish_us_.store(timeline::now_us(), std::memory_order_relaxed);
     epoch_.fetch_add(1, std::memory_order_seq_cst);
-    if (sleepers_.load(std::memory_order_seq_cst) != 0) {
+    if (const uint32_t asleep = sleepers_.load(std::memory_order_seq_cst); asleep != 0) {
+        // #249: the host's own time in the wake call (WakeByAddressAll readies the sleepers one by one on this thread)
+        const double tn0 = timeline::enabled() ? timeline::now_us() : 0;
         if (wake_on_address()) {
             epoch_.notify_all();   // the sleepers compare epoch_ inside wait(), so none can miss this bump
         } else {
             std::lock_guard<std::mutex> lk(sleep_mu_);
             sleep_cv_.notify_all();
         }
+        if (tn0 > 0) timeline::complete("pool notify", tn0, timeline::now_us(), (int64_t) asleep);
     }
 }
 
