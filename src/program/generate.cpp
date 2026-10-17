@@ -2045,6 +2045,7 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
 bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+    strata::timeline::Span restore_span("checkpoint restore", (int64_t) c.ids.size());   // #188: the request's resume point
     std::string error;
     if (strata::core::conversation_checkpoint_restore(c, ss, g, error)) return true;
     std::fprintf(stderr, "strata serve: checkpoint restore: %s\n", error.c_str());
@@ -9683,6 +9684,12 @@ int main(int argc, char** argv) {
                        ") - a GPU hang; on Windows the driver is then reset";
             return false;
         };
+        // #188: the GDN-state buffer of the last evicted checkpoint, reused by the next save.  A fresh 118 MB std::vector
+        // costs its zero fill and first-touch page faults, 17.5-18.4 ms of a 36 ms save (gyro-record/gemm_bench/
+        // ckpt_bench.cu); a reused one of the same size resizes to nothing.  One is kept, so the RAM in use never passes
+        // what the cache held before that eviction.  STRATA_CKPT_REUSE=0 frees it at once (the A/B arm).
+        static const bool ckpt_reuse = [] { const char* v = std::getenv("STRATA_CKPT_REUSE"); return !v || v[0] != '0'; }();
+        std::vector<std::vector<uint8_t>> gdn_spare;
         // synced: the caller has run gpu_sync_ok() (#188: the save then runs on a helper thread beside the refill)
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
                                  bool synced = false) -> bool {
@@ -9707,6 +9714,10 @@ int main(int argc, char** argv) {
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else {
+                if (!gdn_spare.empty()) {
+                    c.gdn = std::move(gdn_spare.back());
+                    gdn_spare.pop_back();
+                }
                 if ((!synced && !gpu_sync_ok()) || !checkpoint_save(c, ss, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
@@ -9748,6 +9759,8 @@ int main(int argc, char** argv) {
                     }
                 const size_t victim = strata::program::conv_cache::eviction_victim(
                     stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get());
+                if (ckpt_reuse && gdn_spare.empty() && checks[victim].stage_parts.empty())
+                    gdn_spare.push_back(std::move(checks[victim].gdn));
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
             return true;
