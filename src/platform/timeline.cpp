@@ -1,6 +1,8 @@
 // src/platform/timeline.cpp - see include/strata/timeline.hpp.
 #include "strata/timeline.hpp"
 
+#include <thread>
+#include <condition_variable>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -244,6 +246,46 @@ void flush() {
     }
     std::fwrite(out.data(), 1, out.size(), f);
     std::fclose(f);
+}
+
+namespace {
+// #248: one writer thread, detached (it holds no lock between flushes, and the exit path's synchronous flush() waits
+// on file_mu for a write it is in the middle of)
+struct FlushWriter {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool want = false, started = false;
+};
+FlushWriter& flush_writer() {
+    static FlushWriter* w = new FlushWriter();   // never destroyed: the detached thread may outlive static teardown
+    return *w;
+}
+}  // namespace
+
+void flush_async() {
+    if (!enabled()) return;
+    FlushWriter& w = flush_writer();
+    {
+        std::lock_guard<std::mutex> lk(w.mu);
+        w.want = true;
+        if (!w.started) {
+            w.started = true;
+            std::thread([&w] {
+                name_thread("timeline writer");
+                for (;;) {
+                    {
+                        std::unique_lock<std::mutex> lk(w.mu);
+                        w.cv.wait(lk, [&w] { return w.want; });
+                        w.want = false;
+                    }
+                    const double t0 = now_us();
+                    flush();
+                    complete("timeline flush", t0, now_us());
+                }
+            }).detach();
+        }
+    }
+    w.cv.notify_one();
 }
 
 }  // namespace strata::timeline

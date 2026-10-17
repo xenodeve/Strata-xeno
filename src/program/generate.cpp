@@ -14339,7 +14339,8 @@ int main(int argc, char** argv) {
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             if (strata::timeline::enabled()) {
                 strata::timeline::complete("request", tl_req0, strata::timeline::now_us(), n, produced_n);
-                strata::timeline::flush();
+                // #248: on the timeline's writer thread - inline, a 55 MB flush to a slow drive held the next GEN 13 s
+                strata::timeline::flush_async();
             }
             // "12288 of 98179" when cancelled mid-read (#471), the rate from what was read
             char read_txt[64];
