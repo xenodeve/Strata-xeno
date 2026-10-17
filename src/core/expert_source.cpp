@@ -5654,6 +5654,10 @@ uint8_t* ArenaExpertSource::recommit_host_copy(int64_t layer, int64_t expert, st
         err = "exclusive host re-commit needs a GPU-owned expert";
         return nullptr;
     }
+    if (hot_) {   // #228 v3: in transit home until publish_host_copy - repin_hot leaves its run alone
+        if (homing_.size() != exclusive_.size()) homing_.assign(exclusive_.size(), 0);
+        homing_[index] = 1;
+    }
     uint64_t held = 0;   // capacity mode: the copy comes home into a slot
     if (!host_commit(index, held, err)) return nullptr;
     released_host_bytes_ -= held < released_host_bytes_ ? held : released_host_bytes_;
@@ -5665,6 +5669,7 @@ void ArenaExpertSource::publish_host_copy(int64_t layer, int64_t expert) {
     std::lock_guard<std::mutex> lk(host_mu_);
     const size_t index = (size_t) (layer * n_expert_ + expert);
     if (index < exclusive_.size()) { exclusive_[index] = 0; touch(index); }
+    if (index < homing_.size()) homing_[index] = 0;   // #228 v3: home
     if (hot_ && index < hot_run_of_.size() && hot_run_of_[index] >= 0 &&   // #228: its pages stayed registered
         hot_[index].exchange(1, std::memory_order_acq_rel) == 0)
         --hot_stats_.gpu_owned;
@@ -5833,7 +5838,8 @@ bool ArenaExpertSource::repin_hot(int max_new_runs, RepinResult& out, std::strin
         bool all_gpu = true;
         for (int32_t x = r.e0; x <= r.e1 && all_gpu; ++x) {
             const size_t idx = (size_t) (row + x);
-            all_gpu = idx < exclusive_.size() && exclusive_[idx] && hot_[idx].load(std::memory_order_acquire) == 0;
+            all_gpu = idx < exclusive_.size() && exclusive_[idx] && hot_[idx].load(std::memory_order_acquire) == 0 &&
+                      !(idx < homing_.size() && homing_[idx]);   // not on its way home (its pages are being filled)
         }
         if (!all_gpu) continue;
         for (int32_t x = r.e0; x <= r.e1; ++x) hot_run_of_[(size_t) (row + x)] = -1;

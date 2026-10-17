@@ -1201,6 +1201,7 @@ private:
     uint64_t hot_budget_ = 0;
     bool hot_portable_ = false;
     size_t hot_rank_at_ = 0;                              ///< repin_hot resumes the ranking here
+    std::vector<uint8_t> homing_;   ///< (host_mu_) recommit_host_copy .. publish_host_copy: its pages are being filled
     void unpin_hot_run(size_t idx);   ///< the expert's run, if any: bits cleared, then unregistered (close only)
     void unpin_all_hot();
     bool slab_ = false;
