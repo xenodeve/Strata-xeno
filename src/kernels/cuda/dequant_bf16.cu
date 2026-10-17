@@ -199,6 +199,13 @@ __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t 
     for (int k = 0; k < (int) (8 * sizeof(T) / 16); ++k) o[k] = ((const uint4*) v)[k];
 }
 
+// kv_iq4nl[n] from registers (__byte_perm over the table's 16 bytes): constant memory serializes when a warp's
+// threads read different entries
+__device__ __forceinline__ int iq4nl_val(int n) {
+    const uint32_t lo = n < 8 ? 0xBFAD9881u : 0x26190D01u, hi = n < 8 ? 0xF6EADDCFu : 0x71594535u;
+    return (int) (int8_t) (__byte_perm(lo, hi, (unsigned) (n & 7)) & 0xff);
+}
+
 // #256: Q4_K / Q5_K / Q6_K / IQ4_NL / IQ4_XS in the same shape - four threads per 32-value group, 8 values each, one
 // 16-byte store - with group32's arithmetic for those 8 values (the same bits).  A thread per group stored 2-byte
 // values 64 bytes apart: ~50 GB/s against Q8_0's 240 (xeno_mmvq_type_bench).  2-byte outputs only.
@@ -254,10 +261,10 @@ __global__ void dequant_k8_kernel(const uint8_t* __restrict__ blocks, int64_t ro
         }
         if (l0 < 16) {
 #pragma unroll
-            for (int k = 0; k < 8; ++k) put(v, k, dl * (float) kv_iq4nl[qs[l0 + k] & 0xf]);
+            for (int k = 0; k < 8; ++k) put(v, k, dl * (float) iq4nl_val(qs[l0 + k] & 0xf));
         } else {
 #pragma unroll
-            for (int k = 0; k < 8; ++k) put(v, k, dl * (float) kv_iq4nl[qs[l0 - 16 + k] >> 4]);
+            for (int k = 0; k < 8; ++k) put(v, k, dl * (float) iq4nl_val(qs[l0 - 16 + k] >> 4));
         }
     } else {                                                       // Q6_K
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 210;
