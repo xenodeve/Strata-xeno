@@ -4132,6 +4132,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return;
         }
     }
+    const auto c_imm = std::chrono::steady_clock::now();   // #254: the immediate rows are in (the deferred run follows)
     if (dh.active && !def_list.empty()) {   // #254: the GPU may go on; the deferred experts' sum lands next layer
         // the ids and weights first: once the flag is up the GPU's next layer publishes its own into the same rows
         static thread_local std::vector<int32_t> def_ids;
@@ -4181,7 +4182,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         timeline::complete("dispatch jobs", c2, c3, d.layers, njobs);
         timeline::complete("cpu pool", pool_start, pool_end, d.layers, njobs);
         if (secondary_claims)
-            timeline::complete("4070 finish", cpu_end, c4, d.layers, (int64_t) d.secondary_runner->served_entries());
+            timeline::complete("4070 finish", cpu_end, c_imm, d.layers, (int64_t) d.secondary_runner->served_entries());
     }
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = id_src[i];

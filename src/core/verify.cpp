@@ -2,6 +2,7 @@
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/defer.hpp"
+#include "strata/core/expert_source.hpp"   // tail_skip_rank (#254 STRATA_VERIFY_HIT_PLAN)
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -739,6 +740,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
         device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
     }
+    {   // #254: the resident share of every layer planned on the device, so the graph never waits for the host's
+        // plan (flag A); not beside E-6 or set_always_publish, nor with Foresight's swap slots (the host plans those)
+        const char* v = std::getenv("STRATA_VERIFY_HIT_PLAN");
+        const char* fs = std::getenv("STRATA_FS_SLOTS");
+        hit_plan_ = !all_resident_ && !always_publish_ && !device_plan_ && hits.d_res != nullptr &&
+                    (fs == nullptr || std::atoi(fs) <= 0) && strata::core::tail_skip_rank() == 0 &&
+                    (v != nullptr && std::atoi(v) != 0);
+    }
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
         if (cudaMalloc((void**) &qcnt_, sizeof(unsigned) * (size_t) (g.n_embd / 32)) != cudaSuccess ||
@@ -748,7 +757,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             qcnt_ = nullptr;
         }
     }
-    if (all_resident_ || device_plan_) {
+    if (all_resident_ || device_plan_ || hit_plan_) {
         bool ok2 = true;
         if (device_plan_)
             ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
@@ -757,7 +766,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                   cudaMemcpy(slot_off_d_, hits.slot_off, (size_t) hits.n_slots * sizeof(unsigned long long),
                              cudaMemcpyHostToDevice) == cudaSuccess;
         }
-        if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
+        if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; hit_plan_ = false; }
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
@@ -891,6 +900,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     const bool defer_on = defer_active(G, g.n_layers);   // #254
+    const bool hit_plan_on = hit_plan_ && !remote_opt_ && !pcie_share_;   // #254 STRATA_VERIFY_HIT_PLAN
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         stamp(l, 0, grp);
@@ -1449,6 +1459,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 cudaEventRecord(ev_fork_, cs);
                 cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
             }
+            if (hit_plan_on)   // #254: this group's resident share, planned here instead of waiting for the host's
+                resident_hits_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                                   hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                                   plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, cs);
         }
         stamp(l, 17, grp);
         bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
@@ -1553,7 +1567,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
         } else {
-            if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+            if (hit_plan_on) {
+                // #254: the plan is the device's own (resident_hits_plan after the doorbell): no wait for flag A
+            } else if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
                 wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
                 copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
             } else {

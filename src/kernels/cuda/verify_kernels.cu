@@ -1148,6 +1148,63 @@ __global__ void resident_plan_par_kernel(const int32_t* __restrict__ ids, int n,
     __syncthreads();
     if (i == 0) *skip = ring;
 }
+// #254 STRATA_VERIFY_HIT_PLAN: the resident entries' plan (the host's: distinct resident experts in order of first
+// occurrence, each group's entries in increasing i; the misses left out, no PCIe share) in one block, thread i =
+// entry i (n <= 128)
+__global__ void resident_hits_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
+                                          int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                                          long long blob, int32_t* __restrict__ pl, long long capx) {
+    __shared__ int32_t s_id[128];
+    __shared__ int s_first[128], s_size[128];
+    const int i = threadIdx.x;
+    int32_t e = -1;
+    bool hit = false;
+    if (i < n) {
+        e = ids[i];
+        hit = e >= 0 && e < n_expert && res[e] >= 0;
+        s_id[i] = hit ? e : -1;
+    }
+    __syncthreads();
+    int first = i, rank = 0, size = 0;
+    if (i < n && hit)
+        for (int j = 0; j < n; ++j) {
+            const bool same = s_id[j] == e;
+            if (same && j < first) first = j;
+            if (same && j < i) ++rank;
+            size += same;
+        }
+    if (i < n) { s_first[i] = hit ? first : -1; s_size[i] = hit ? size : 0; }
+    __syncthreads();
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+    if (i < n && hit) {
+        int group = 0, gstart = 0;
+        for (int j = 0; j < first; ++j)
+            if (s_first[j] == j) { ++group; gstart += s_size[j]; }
+        if (i == first) {
+            const int32_t slot = res[e];
+            ptr[group] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+            start[group] = gstart;
+        }
+        dst[gstart + rank] = i;
+        tok[gstart + rank] = i / k;
+    }
+    if (i == 0) {
+        int groups = 0, entries = 0;
+        for (int j = 0; j < n; ++j)
+            if (s_first[j] == j) { ++groups; entries += s_size[j]; }
+        start[groups] = entries;
+        start2[0] = entries;
+        counts[0] = groups;
+        counts[1] = entries;
+        counts[2] = 0;
+    }
+}
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
     while (*flag < value) strata_spin_pause();
@@ -1172,6 +1229,14 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     resident_plan_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
                                                               blob, plan, capx, skip, ring, plan_err);
     check("resident_plan");
+}
+void resident_hits_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                        const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                        long long capx, void* stream) {
+    if (n_entries > 128) { std::fprintf(stderr, "resident_hits_plan: %d entries (at most 128)\n", n_entries); std::exit(1); }
+    resident_hits_plan_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base,
+                                                                     slot_off, blob, plan, capx);
+    check("resident_hits_plan");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);
