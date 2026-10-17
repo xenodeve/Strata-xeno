@@ -2919,7 +2919,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (!m.relay && !make_stream(&m.relay, wave_priority(m.wave && wave_lane_high(m.wave_lane)))) m.relay = nullptr;
             sp->high = m.wave && wave_lane_high(m.wave_lane);
             if (m.wave && m.wave_lane == 1) { sp->lane_tag = ", lane 2"; sp->stream_owner = false; }
-            if (m.wave && m.wave_lane == 0) sp->RING = SplitTier::kWaveRing;   // #35 D7: the stream feeds both lanes' layer
+            // #35 D7: the stream feeds both lanes' layer.  #188: also when this run is a lane on its own (a short part,
+            // WaveDetach holds the link): the tier lives on, so the first request's size used to fix the ring for the
+            // whole session (96 slots after a short first part, the issuer 35 % in `split ring full`), and boot priced
+            // the wave ring anyway (split_device_bytes)
+            if ((m.wave || wave_detach.held) && m.wave_lane == 0) sp->RING = SplitTier::kWaveRing;
             if (m.relay && sp->init(m.peer_dev, m.T, m.g->n_expert, gub, db, (size_t) MAXBLOB(), m.src, se)) {
                 if (timeline::enabled()) sp->clk_relay.anchor(m.relay);
                 m.split = std::move(sp);
