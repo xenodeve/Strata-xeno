@@ -1193,6 +1193,15 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     check("copy_or_zero_from_mapped");
 }
 
+// #254: dst[i] += src[i] (the previous layer's deferred experts into this layer's MoE output; src is mapped)
+__global__ void add_rows_kernel(float* __restrict__ dst, const float* __restrict__ src, long long n) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+void add_rows(float* dst, const float* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    add_rows_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(dst, src, (long long) n);
+}
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");

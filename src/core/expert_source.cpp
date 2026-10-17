@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/defer.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -24,6 +25,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <immintrin.h>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -3518,6 +3521,19 @@ namespace {
 // explicit environment value is read once; the serve start-up (generate.cpp) sets the CUDA default where it applies.
 std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
 }  // namespace
+DeferHook& defer_hook() {
+    static thread_local DeferHook h;
+    return h;
+}
+int defer_rank_env() {
+    static const int r = [] {
+        const char* v = std::getenv("STRATA_DEFER_RANK");
+        if (v == nullptr || *v == '\0') return -1;
+        const int x = std::atoi(v);
+        return x >= 0 && x < 10 ? x : -1;
+    }();
+    return r;
+}
 int tail_skip_rank() {
     int r = g_tail_skip_rank.load(std::memory_order_relaxed);
     if (r < 0) {
@@ -3920,9 +3936,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         ~EndBatch() { std::string e; src->materialize_end(e); }
     } end_batch{d.src};
     int njobs = 0;
+    // #254: the routed ids this dispatch reads - the caller's mapped ids, or this thread's copy once a deferral has let
+    // the GPU go on (its next layer's doorbell rewrites the mapped ids and weights)
+    const int32_t* id_src = ids;
     // routed entry i onto its expert's job, made at the expert's first entry; false: the dispatch failed
-    auto add_entry = [&](int64_t i) -> bool {
-        const int64_t t = i / k, e = ids[i];
+    auto add_entry = [&](int64_t i, float* row_out = nullptr) -> bool {
+        const int64_t t = i / k, e = id_src[i];
         int16_t& jo = d.job_of[(size_t) e];
         if (jo < 0) {
             const uint8_t* b = d.src->blob(d.layers, e);
@@ -3943,7 +3962,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
         jb.act[jb.nt] = &d.act_multi[(size_t) t];
         jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-        jb.out[jb.nt] = out + (size_t) i * H;
+        jb.out[jb.nt] = row_out != nullptr ? row_out : out + (size_t) i * H;
         ++jb.nt;
         ++d.multi_entries;
         ++d.tier_entries[3];
@@ -3955,6 +3974,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     };
     static thread_local std::vector<int32_t> deferred;   // #95: routed entries whose expert is still being read
     deferred.clear();
+    // #254: expert deferral - the window's best rank per expert, and the CPU entries that wait for the next layer
+    DeferHook& dh = defer_hook();
+    static thread_local std::vector<int8_t> best_rank;
+    static thread_local std::vector<int32_t> def_list;
+    def_list.clear();
+    if (dh.active) {
+        if ((int64_t) best_rank.size() < d.n_expert) best_rank.assign((size_t) d.n_expert, (int8_t) 99);
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            const int64_t e = ids[i];
+            if (e >= 0 && e < d.n_expert && (int8_t) (i % k) < best_rank[(size_t) e]) best_rank[(size_t) e] = (int8_t) (i % k);
+        }
+        std::memset(dh.out, 0, (size_t) n_tok * H * sizeof(float));
+    }
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
@@ -3985,6 +4017,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 continue;
             }
             ++d.cache_refused;
+            if (dh.active && best_rank[(size_t) e] >= dh.rank && d.src->resident(d.layers, e)) {   // #254
+                std::memset(row, 0, (size_t) H * sizeof(float));
+                def_list.push_back((int32_t) i);
+                continue;
+            }
             // #95: still in flight (or past the batch's 128): after materialize_end, in the second pass - a
             // materialize here would wait on the host tier this thread holds.  resident(), not blob(): blob() counts a
             // use, and add_entry's lookup is the one use
@@ -3994,6 +4031,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             if (!add_entry(i)) return;
         }
+    if (dh.active)   // #254: the ranks are this window's only
+        for (int64_t i = 0; i < n_tok * k; ++i)
+            if (ids[i] >= 0 && ids[i] < d.n_expert) best_rank[(size_t) ids[i]] = (int8_t) 99;
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     const auto pool_start = std::chrono::steady_clock::now();
@@ -4050,6 +4090,33 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return;
         }
     }
+    if (dh.active && !def_list.empty()) {   // #254: the GPU may go on; the deferred experts' sum lands next layer
+        // the ids and weights first: once the flag is up the GPU's next layer publishes its own into the same rows
+        static thread_local std::vector<int32_t> def_ids;
+        static thread_local std::vector<float> def_w;
+        def_ids.assign(ids, ids + n_tok * k);
+        def_w.assign(dh.w, dh.w + n_tok * k);
+        id_src = def_ids.data();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        *dh.flag = dh.want;
+        const auto q0 = std::chrono::steady_clock::now();
+        static thread_local std::vector<float> def_rows;
+        if (def_rows.size() < (size_t) (n_tok * k * H)) def_rows.resize((size_t) (n_tok * k * H));
+        const int first = njobs;
+        for (const int32_t i : def_list)
+            if (!add_entry(i, def_rows.data() + (size_t) i * H)) return;
+        if (njobs > first) run_jobs(first, njobs - first);
+        for (const int32_t i : def_list) {   // entry order: the same sum every time
+            const float wv = def_w[(size_t) i];
+            const float* r = def_rows.data() + (size_t) i * H;
+            float* o = dh.out + (size_t) (i / k) * H;
+            for (int64_t x = 0; x < H; ++x) o[x] = std::fmaf(r[x], wv, o[x]);
+        }
+        dh.deferred_entries += (int64_t) def_list.size();
+        if (timeline::enabled())
+            timeline::complete("cpu pool deferred", q0, std::chrono::steady_clock::now(), d.layers, (int64_t) def_list.size());
+    }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -4072,7 +4139,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             timeline::complete("4070 finish", cpu_end, c4, d.layers, (int64_t) d.secondary_runner->served_entries());
     }
     for (int64_t i = 0; i < n_tok * k; ++i) {
-        const int64_t e = ids[i];
+        const int64_t e = id_src[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
     }
     d.multi_misses += njobs;

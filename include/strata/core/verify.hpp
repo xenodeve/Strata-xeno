@@ -369,6 +369,11 @@ private:
     /// was all-resident.  refresh_ar() looks at the host table before each window.
     bool ar_off_ = false;
     bool ar_on() const { return all_resident_ && !ar_off_; }
+    // #254: expert deferral runs on a one-stage, one-group window with CPU work, no remote helpers
+    bool defer_active(int G, int64_t n_layers) const {
+        return defer_rank_ >= 0 && G == 1 && !ar_on() && remote_opt_ == nullptr && lb_ == 0 && le_ == n_layers &&
+               h_def_ != nullptr;
+    }
     void refresh_ar();
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
@@ -457,6 +462,11 @@ private:
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
+    // #254 (STRATA_DEFER_RANK): the deferred experts' weighted sums, two layer slots of T * n_embd, and their flag
+    float* h_def_ = nullptr;     float* m_def_ = nullptr;
+    uint32_t* h_flagD_ = nullptr; uint32_t* m_flagD_ = nullptr;
+    int defer_rank_ = -1;
+    bool defer_same_ = false;   // #254 diagnostic STRATA_DEFER_SAME=1: the deferred sum added in its own layer
 
     // device
     void* arena_ = nullptr;
