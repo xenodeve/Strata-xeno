@@ -1486,7 +1486,10 @@ bool refill_lent(const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n
     constexpr int kBatch = 32;
     std::atomic<int64_t> io_requests{0}, io_bytes{0};
     const size_t stride = (size_t) tail_stride();   // the tail file's, and the model path reads at the same spacing
-    static uint8_t* bounce[2] = {nullptr, nullptr};   // pinned, allocated once (2 x batch x 1.38 MB)
+    // #188: three pinned buffers, so the reader thread keeps the drive busy while a batch is copied (2 x batch x
+    // 1.38 MB before: the read and the copies both ran at ~5 GB/s, each waiting on the other between batches)
+    constexpr int kBufs = 3;
+    static uint8_t* bounce[kBufs] = {nullptr, nullptr, nullptr};   // pinned, allocated once
     for (auto& b : bounce)
         if (b == nullptr && cudaHostAlloc((void**) &b, (size_t) kBatch * stride, cudaHostAllocDefault) != cudaSuccess) {
             cudaGetLastError();
@@ -1552,28 +1555,80 @@ bool refill_lent(const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n
         for (int j = 0; j < n; ++j) io_bytes += (int64_t) lay.blob_bytes(ls[(size_t) j]);
         return arena->read_experts(ls.data(), es.data(), n, bounce[buf], stride, e);
     };
+    // #188: one reader thread runs up to kBufs batches ahead; each batch's copies are queued on one stream and waited for
+    // once (the per-expert blocking cudaMemcpy synchronized 32 times a batch).  The same bytes into the same slots.
+    static cudaStream_t copy_stream = nullptr;
+    if (copy_stream == nullptr && cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        cudaGetLastError();
+        err = "the pack refill's copy stream could not be created";
+        return false;
+    }
+    const size_t n_batches = (from_pack.size() + kBatch - 1) / kBatch;
+    std::mutex q_mu;
+    std::condition_variable q_cv;
+    size_t q_read = 0, q_copied = 0;   // batches read into their buffer / copied out of it
+    bool q_failed = false, q_stop = false;
     std::string rerr;
-    if (!read_batch(0, 0, rerr)) { err = "pack refill: " + rerr; return false; }
-    for (size_t at = 0, k = 0; at < from_pack.size(); at += kBatch, ++k) {
-        const int buf = (int) (k & 1);
-        std::future<bool> next;
-        if (at + kBatch < from_pack.size()) next = std::async(std::launch::async, read_batch, at + kBatch, buf ^ 1, std::ref(rerr));
-        const size_t n = std::min<size_t>(kBatch, from_pack.size() - at);
+    std::thread reader([&] {
+        for (size_t b = 0; b < n_batches; ++b) {
+            {
+                std::unique_lock<std::mutex> lk(q_mu);
+                q_cv.wait(lk, [&] { return q_stop || b < q_copied + kBufs; });
+                if (q_stop) return;
+            }
+            std::string e;
+            const bool ok = read_batch(b * kBatch, (int) (b % kBufs), e);
+            {
+                std::lock_guard<std::mutex> lk(q_mu);
+                if (ok) q_read = b + 1;
+                else { q_failed = true; rerr = e; }
+            }
+            q_cv.notify_all();
+            if (!ok) return;
+        }
+    });
+    auto stop_reader = [&] {
+        { std::lock_guard<std::mutex> lk(q_mu); q_stop = true; }
+        q_cv.notify_all();
+        reader.join();
+    };
+    for (size_t b = 0; b < n_batches; ++b) {
+        {
+            std::unique_lock<std::mutex> lk(q_mu);
+            q_cv.wait(lk, [&] { return q_failed || q_read > b; });
+            if (q_read <= b) {
+                lk.unlock();
+                stop_reader();
+                err = "pack refill: " + rerr;
+                return false;
+            }
+        }
+        const size_t at = b * kBatch, n = std::min<size_t>(kBatch, from_pack.size() - at);
+        const uint8_t* src_buf = bounce[b % kBufs];
         const auto tf0 = std::chrono::steady_clock::now();
         {
             strata::timeline::Span sp("pack refill H2D", (int64_t) at);
             for (size_t j = 0; j < n; ++j) {
                 const auto& [i, slot] = from_pack[at + j];
-                if (!cache.fill_slot_blocking(slot, bounce[buf] + j * stride, err, (int64_t) lay.blob_bytes(i / n_expert))) {
-                    if (next.valid()) next.wait();
+                if (!cache.fill_slot_async(slot, src_buf + j * stride, copy_stream, err, (int64_t) lay.blob_bytes(i / n_expert))) {
+                    cudaStreamSynchronize(copy_stream);
+                    stop_reader();
                     return false;
                 }
                 host_res[(size_t) i] = slot;
             }
+            const cudaError_t e = cudaStreamSynchronize(copy_stream);   // the buffer is free for the reader again
+            if (e != cudaSuccess) {
+                stop_reader();
+                err = std::string("pack refill: ") + cudaGetErrorString(e);
+                return false;
+            }
         }
         fill_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tf0).count();
-        if (next.valid() && !next.get()) { err = "pack refill: " + rerr; return false; }
+        { std::lock_guard<std::mutex> lk(q_mu); q_copied = b + 1; }
+        q_cv.notify_all();
     }
+    reader.join();
     const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_all).count();
     double gb = 0;
     for (const auto& pr : from_pack) gb += (double) lay.blob_bytes(pr.first / n_expert) / 1e9;

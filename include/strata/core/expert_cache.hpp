@@ -188,6 +188,9 @@ public:
     /// against a `cudaStreamNonBlocking` one.  The first version used the async form and `verify_slot` refused
     /// the whole run with "slot 0 differs from the arena at byte 0" - which is the check doing its job.
     bool fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
+    /// #188: the same copy queued on `stream` (the caller synchronizes it before reusing `host_blob`); HIP builds take
+    /// the blocking path (its pageable staging)
+    bool fill_slot_async(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes = 0);
     /// perf-review D-4: `fill_slot_blocking`'s copy on the same (legacy) stream, but queued: many slots are refilled
     /// with one `sync_queued` at the end instead of a wait per slot. Same ordering against earlier work, same bytes.
     bool fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
