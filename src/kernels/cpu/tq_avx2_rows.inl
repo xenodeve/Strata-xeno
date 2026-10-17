@@ -111,9 +111,10 @@ STRATA_TQ_ROWS_FN STRATA_TQ_INLINE void decode8q(const long long* tab, const uin
     ((wv[M] = rows4q<M>(tab, qs)), ...);
 }
 
-template <int KB, bool G, bool CB = false, bool Q = false>
-STRATA_TQ_ROWS_FN void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+template <int KB, bool G, bool CB = false, bool Q = false, int NT = 0, bool F16 = false>
+STRATA_TQ_ROWS_FN void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt_,
                               float* const* out, int r0, int r1) {
+    const int nt = NT > 0 ? NT : nt_;   // #220: a constant count keeps acc[] and a[] in registers
     const int nb = n / 128;
     constexpr size_t bsz = 2 + 4 * KB;
     constexpr bool q64 = Q && KB == 8 && !G && !CB;
@@ -137,7 +138,7 @@ STRATA_TQ_ROWS_FN void rows_t(const uint8_t* w, size_t row_bytes, int n, const T
             } else {
                 decode8<KB, G>(tab, qs, wr, wv, std::make_integer_sequence<int, 8>{});
             }
-            const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
+            const __m128 dx = F16 ? _mm_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128((int) tq_ld16(blk)))) : _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
             for (int t = 0; t < nt; ++t) {
                 const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
                 const __m256i p0 = pair_dot(wv[0], q + 0, wv[1], q + 1);
@@ -156,6 +157,21 @@ STRATA_TQ_ROWS_FN void rows_t(const uint8_t* w, size_t row_bytes, int n, const T
             _mm_store_ps(v, acc[t]);
             out[t][r] = ((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f);
         }
+    }
+}
+
+template <bool F16>
+STRATA_TQ_ROWS_FN void rows_q64_nt(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                                   float* const* out, int r0, int r1) {
+    switch (nt) {   // #220: one body per token count
+        case 1: rows_t<8, false, false, true, 1, F16>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 2: rows_t<8, false, false, true, 2, F16>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 3: rows_t<8, false, false, true, 3, F16>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 4: rows_t<8, false, false, true, 4, F16>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 5: rows_t<8, false, false, true, 5, F16>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 6: rows_t<8, false, false, true, 6, F16>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 7: rows_t<8, false, false, true, 7, F16>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        default: rows_t<8, false, false, true, 8, F16>(w, row_bytes, n, a, nt, out, r0, r1); break;
     }
 }
 

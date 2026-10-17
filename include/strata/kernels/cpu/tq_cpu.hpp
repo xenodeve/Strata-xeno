@@ -89,6 +89,9 @@ inline constexpr int kTqCodebook = 4;
 /// 1,162 -> 1,030 (then -9 % / -3 % more with the big-endian windows), the same bits.  STRATA_TQ_BYTE_STATES=1 turns
 /// it back on for A/B.
 inline constexpr int kTqByteStates = 8;
+/// #220 (TQ2_T q64): the group's token count as a compile-time constant (STRATA_TQ_FIXNT), and the block scale
+/// converted by F16C (STRATA_TQ_F16C); both give the same bits
+inline constexpr int kTqFixNt = 16, kTqF16c = 32;
 int tq_avx2_variant() noexcept;
 /// tq_rows_avx2 with a given variant (tests and benches; kTqVnni is honoured only where cpu_avxvnni_ok()).
 void tq_rows_avx2_v(int variant, int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,

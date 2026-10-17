@@ -80,8 +80,11 @@ int tq_avx2_variant() noexcept {
         const char* v = std::getenv("STRATA_TQ_BYTE_STATES");
         return v != nullptr && std::atoi(v) != 0;
     }();
+    // #220: on by default (bit-exact, measured faster on both core types); =0 for A/B
+    static const bool fixnt = [] { const char* v = std::getenv("STRATA_TQ_FIXNT"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool f16c = [] { const char* v = std::getenv("STRATA_TQ_F16C"); return v == nullptr || std::atoi(v) != 0; }();
     return (gather == 1 ? kTqGather : 0) | (vnni ? kTqVnni : 0) | (codebook == 1 ? kTqCodebook : 0) |
-           (byte_states ? kTqByteStates : 0);
+           (byte_states ? kTqByteStates : 0) | (fixnt ? kTqFixNt : 0) | (f16c ? kTqF16c : 0);
 }
 
 namespace {
@@ -90,11 +93,15 @@ void rows_any(int variant, int kb, const uint8_t* w, size_t row_bytes, int n, co
               float* const* out, int r0, int r1) {
     const bool g = (variant & kTqGather) != 0, c = (variant & kTqCodebook) != 0;
     const bool q = (variant & kTqByteStates) == 0;   // q64 (TQ2_T, assembled rows, the state table)
+    const bool fx = (variant & kTqFixNt) != 0, f16 = (variant & kTqF16c) != 0;   // #220
 #if STRATA_AVXVNNI
     if constexpr (V) {
         if (g) c ? vnni::rows_kb<true, true>(kb, w, row_bytes, n, a, nt, out, r0, r1)
                  : vnni::rows_kb<true, false>(kb, w, row_bytes, n, a, nt, out, r0, r1);
         else if (c) vnni::rows_kb<false, true>(kb, w, row_bytes, n, a, nt, out, r0, r1);
+        else if (q && kb == 8 && fx) f16 ? vnni::rows_q64_nt<true>(w, row_bytes, n, a, nt, out, r0, r1)
+                                        : vnni::rows_q64_nt<false>(w, row_bytes, n, a, nt, out, r0, r1);
+        else if (q && kb == 8 && f16) vnni::rows_t<8, false, false, true, 0, true>(w, row_bytes, n, a, nt, out, r0, r1);
         else q ? vnni::rows_kb<false, false, true>(kb, w, row_bytes, n, a, nt, out, r0, r1)
                : vnni::rows_kb<false, false>(kb, w, row_bytes, n, a, nt, out, r0, r1);
         return;
