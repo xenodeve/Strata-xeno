@@ -831,16 +831,6 @@ struct Stager {
 // pinned stager and a ring.  The products are mmq::expert_rows, byte-identical across the cards
 // (xeno_moe_layer_cross_arch).
 // #35 D7: a wave lane's stream priority (wave_lane_high picks the lane; #188: by default neither is high).
-// #188: the wave's ring, in expert slots (STRATA_PREFILL_WAVE_RING, default SplitTier::kWaveRing).  Lane 2 runs a layer
-// behind lane 1 on the 4070, so the ring holds lane 2's layer while lane 1's next one streams in; at 512 slots (1.45
-// layers of Gyro-M's host experts) the issuer waited 'split ring full' 6.0 s of a 45K read (tl-pf-p1)
-inline int wave_ring_slots() {
-    static const int v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_WAVE_RING");
-        return e ? std::clamp(std::atoi(e), 96, 2048) : 512;   // 512: SplitTier::kWaveRing
-    }();
-    return v;
-}
 // #188: which wave lane's streams run at the cards' highest priority (STRATA_PREFILL_WAVE_PRIO): 1 (default) neither;
 // 0 lane 1, the chunk ahead (D7's rule); 2 lane 2.  Lane 1's priority starved lane 2's trunk, so lane 2 reached the
 // 4070 late and the 4070's ring waited on it: equal priority read 45K tokens 13.4 % faster on Gyro-M (8K 12.5 %, 4K
@@ -890,9 +880,9 @@ struct SplitTier {
     // 4070 expert staging slots.  96, 192, 320, 480 and 512 measured the same (8.85-9.1 s at 8K) once the 5060's
     // experts came down on their own thread: the smallest keeps the VRAM
     // #35 D4: 512 (a whole layer, +~500 MB of VRAM) measured 1.6 % vs 1.0 % faster than D1: not worth it; the wave's
-    // stream-owning lane takes kWaveRing (it feeds both lanes' layer)
+    // stream-owning lane takes kWaveRing (it feeds both lanes' layer); #188: 1024 read 45K tokens in 0.954 of 512's time
+    // under D7's lane priorities, 0.997 with the equal ones (and costs 637 MiB of the 4070 tier): kept at 512
     static constexpr int kRing = 96, kWaveRing = 512;
-    static int wave_ring() { return wave_ring_slots(); }
     int RING = kRing;
     int dev = -1, home = 0;
     int64_t T = 0;                       // the token capacity
@@ -1395,7 +1385,7 @@ uint64_t Prefill::split_device_bytes(int64_t n_layers, int64_t n_expert, int64_t
     if (!wave) return SplitSizes(chunk, n_expert, gub, db, blob, SplitTier::kRing).total();
     // the wave's two lanes, each with a lane chunk: lane 1 streams for both (a whole layer's ring), lane 2 has none
     const int64_t lane = wave_lane_chunk(chunk);
-    return SplitSizes(lane, n_expert, gub, db, blob, SplitTier::wave_ring()).total() + SplitSizes(lane, n_expert, gub, db, blob, 0).total();
+    return SplitSizes(lane, n_expert, gub, db, blob, SplitTier::kWaveRing).total() + SplitSizes(lane, n_expert, gub, db, blob, 0).total();
 }
 bool Prefill::run_wave(Prefill& a, Prefill& b, WaveLink& link, const int64_t* tokens, int64_t n, int64_t pos0,
                        int64_t n_layers, std::string& err) {
@@ -2929,7 +2919,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (!m.relay && !make_stream(&m.relay, wave_priority(m.wave && wave_lane_high(m.wave_lane)))) m.relay = nullptr;
             sp->high = m.wave && wave_lane_high(m.wave_lane);
             if (m.wave && m.wave_lane == 1) { sp->lane_tag = ", lane 2"; sp->stream_owner = false; }
-            if (m.wave && m.wave_lane == 0) sp->RING = SplitTier::wave_ring();   // #35 D7: the stream feeds both lanes' layer
+            if (m.wave && m.wave_lane == 0) sp->RING = SplitTier::kWaveRing;   // #35 D7: the stream feeds both lanes' layer
             if (m.relay && sp->init(m.peer_dev, m.T, m.g->n_expert, gub, db, (size_t) MAXBLOB(), m.src, se)) {
                 if (timeline::enabled()) sp->clk_relay.anchor(m.relay);
                 m.split = std::move(sp);
