@@ -2166,6 +2166,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         DeferHook& dh = defer_hook();
         float* def_slot = defer_win ? h_def_ + (size_t) (l & 1) * max_t_ * g.n_embd + (size_t) tb * g.n_embd : nullptr;
         dh.active = defer_win && k > 0 && l + 1 < g.n_layers;
+        dh.w = h_w_ + (size_t) tb * ss.k;   // read only when active, or by the #255 diagnostic STRATA_DROP_MATCH
         if (dh.active) {
             dh.rank = defer_rank_;
             dh.flag = (volatile uint32_t*) flag;

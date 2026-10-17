@@ -3987,6 +3987,40 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         std::memset(dh.out, 0, (size_t) n_tok * H * sizeof(float));
     }
+    // #255 control (diagnostic STRATA_DROP_MATCH, changes outputs): 1 = every CPU-tier entry is dropped (the cold set,
+    // computed nowhere); 2 = those are computed and, for each, the 4070-tier entry of the same token nearest in rank is
+    // dropped instead (the warm set, a matched count).  Dropped rows stay zero: the router weights are not renormalized.
+    // stderr every 4096 steps: the dropped entries and their share of the router mass so far.
+    static const int drop_match = [] { const char* v = std::getenv("STRATA_DROP_MATCH"); return v ? std::atoi(v) : 0; }();
+    static double dm_mass_all = 0, dm_mass_drop = 0;
+    static int64_t dm_entries = 0, dm_dropped = 0, dm_unmatched = 0, dm_steps = 0;
+    static thread_local std::vector<char> warm_drop;
+    auto dm_drop = [&](int64_t i) { ++dm_dropped; if (dh.w != nullptr) dm_mass_drop += dh.w[i]; };
+    if (drop_match != 0) {
+        dm_entries += n_tok * k;
+        if (dh.w != nullptr) for (int64_t i = 0; i < n_tok * k; ++i) dm_mass_all += dh.w[i];
+        if (drop_match == 2) {
+            warm_drop.assign((size_t) (n_tok * k), 0);
+            for (int64_t t = 0; t < n_tok; ++t)
+                for (int64_t j = 0; j < k; ++j) {
+                    const int64_t i = t * k + j, e = ids[i];
+                    if (kind[i] != -1 || e < 0 || e >= d.n_expert || !d.src->resident(d.layers, e)) continue;
+                    int64_t best = -1;
+                    for (int64_t j2 = 0; j2 < k; ++j2) {
+                        const int64_t i2 = t * k + j2;
+                        if (kind[i2] != 2 || warm_drop[(size_t) i2]) continue;
+                        if (best < 0 || std::llabs(j2 - j) < std::llabs(best - j)) best = j2;
+                    }
+                    if (best >= 0) warm_drop[(size_t) (t * k + best)] = 1;
+                    else ++dm_unmatched;
+                }
+        }
+        if (++dm_steps % 4096 == 0)
+            std::fprintf(stderr, "strata drop-match %d: %lld of %lld entries dropped (%.2f %%), %.2f %% of the router mass, "
+                                 "%lld CPU entries with no 4070 entry to match\n", drop_match, (long long) dm_dropped,
+                         (long long) dm_entries, 100.0 * (double) dm_dropped / (double) (std::max)(dm_entries, (int64_t) 1),
+                         100.0 * dm_mass_drop / (dm_mass_all > 0 ? dm_mass_all : 1.0), (long long) dm_unmatched);
+    }
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
@@ -4017,6 +4051,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 continue;
             }
             ++d.cache_refused;
+            if (drop_match == 1 && d.src->resident(d.layers, e)) {   // #255 control: the cold set dropped
+                std::memset(row, 0, (size_t) H * sizeof(float));
+                dm_drop(i);
+                continue;
+            }
             if (dh.active && best_rank[(size_t) e] >= dh.rank && d.src->resident(d.layers, e)) {   // #254
                 std::memset(row, 0, (size_t) H * sizeof(float));
                 def_list.push_back((int32_t) i);
@@ -4153,6 +4192,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return;
         }
     }
+    if (drop_match == 2)   // #255 control: the matched 4070-tier rows, now that every GPU's rows are in
+        for (int64_t i = 0; i < n_tok * k; ++i)
+            if (warm_drop[(size_t) i]) { std::memset(out + (size_t) i * H, 0, (size_t) H * sizeof(float)); dm_drop(i); }
     const auto c_imm = std::chrono::steady_clock::now();   // #254: the immediate rows are in (the deferred run follows)
     if (dh.active && !def_list.empty()) {   // #254: the GPU may go on; the deferred experts' sum lands next layer
         // the ids and weights first: once the flag is up the GPU's next layer publishes its own into the same rows
