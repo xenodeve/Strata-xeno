@@ -244,7 +244,8 @@ public:
     /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's
     /// batches are microseconds apart and a wake-up from the OS costs more than that.  But a spin that never ends
     /// keeps every worker's core at 100% while the engine waits for a request - issue #4, "CPU 50% even when
-    /// doing nothing" (7 of the 5700X's 16 threads).  Between requests the workers block on `sleep_cv_`.  NOT only
+    /// doing nothing" (7 of the 5700X's 16 threads).  Between requests the workers block on `epoch_` (#249: its
+    /// address, so a publish lets them all out at once; `sleep_cv_` with STRATA_POOL_WAKE_CV=1).  NOT only
     /// between requests: with most experts in VRAM (a 24 GB card) many layers have no CPU work, so the workers
     /// also sleep mid-request - which the claim protocol above must survive (issue #29).
     /// `STRATA_POOL_SPIN_US` overrides it (a test knob: a short spin makes the workers sleep constantly).

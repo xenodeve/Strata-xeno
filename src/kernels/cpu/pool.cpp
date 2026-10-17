@@ -30,6 +30,14 @@
 namespace strata::kernels::cpu {
 
 namespace {
+// A sleeping worker waits on `epoch_` itself (std::atomic::wait: WaitOnAddress on Windows, a futex on Linux), so the
+// publish's notify_all lets every sleeper out at once.  Before, they slept on sleep_cv_ under one mutex and left it one
+// at a time: in a decode round the k-th worker out woke ~4 us after the (k-1)-th (30 us first, 88 us twelfth,
+// pool_wake.py on tl-227-TW).  STRATA_POOL_WAKE_CV=1 keeps the condition variable (the A/B arm).
+bool wake_on_address() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_POOL_WAKE_CV"); return e == nullptr || *e != '1'; }();
+    return v;
+}
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
@@ -523,8 +531,12 @@ void ExpertPool::publish() {
     if (timeline::enabled()) publish_us_.store(timeline::now_us(), std::memory_order_relaxed);
     epoch_.fetch_add(1, std::memory_order_seq_cst);
     if (sleepers_.load(std::memory_order_seq_cst) != 0) {
-        std::lock_guard<std::mutex> lk(sleep_mu_);
-        sleep_cv_.notify_all();
+        if (wake_on_address()) {
+            epoch_.notify_all();   // the sleepers compare epoch_ inside wait(), so none can miss this bump
+        } else {
+            std::lock_guard<std::mutex> lk(sleep_mu_);
+            sleep_cv_.notify_all();
+        }
     }
 }
 
@@ -560,6 +572,17 @@ void ExpertPool::worker(int id) {
             if ((++spins & 1023u) != 0) continue;
             if (!rest_.load(std::memory_order_relaxed) &&
                 std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
+            if (wake_on_address()) {
+                // the same lost-wakeup argument as publish(): sleepers_++ then the compare inside wait(); stop_ is
+                // always followed by a publish, so waiting on epoch_ alone covers it
+                wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
+                sleepers_.fetch_add(1, std::memory_order_seq_cst);
+                while (epoch_.load(std::memory_order_seq_cst) == seen && !stop_.load(std::memory_order_relaxed))
+                    epoch_.wait(seen, std::memory_order_seq_cst);
+                sleepers_.fetch_sub(1, std::memory_order_relaxed);
+                wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
+                continue;
+            }
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
