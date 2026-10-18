@@ -14,6 +14,7 @@ These are the scripts behind the 2026-09-28/29 reports in `docs/reports/`. They 
 | `h2_nsys.py` | Nsight Systems capture of the verifier decode, then kernel time per device and per class. |
 | `gguf_sizes.py` | Tensor bytes from GGUF headers, split into experts and trunk. |
 | `timeline.py` | The whole-pipeline latency budget from one `STRATA_TIMELINE` run (#33). See below. |
+| `humaneval.py` | Task quality of a decode-path option: HumanEval / HumanEval+ pass@1 through the server, greedy, thinking off (#255). Use it, not teacher-forced NLL, for changes that remove or delay experts. |
 
 ## `ab.py`
 
