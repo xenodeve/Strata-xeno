@@ -2565,11 +2565,12 @@ namespace {
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfWaitHost, kPfCount };
+               kPfWaitHost, kPfSplitSend, kPfTables, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "wait host"};
+                                        "gdn recurrence", "gdn out proj", "wait host", "split send",
+                                        "mmq tables"};
 // "wait host" (#31): marked after the last kernel an expert enqueues, so the time until the next expert's work reaches
 // the stream is the GPU idle while the launching thread is elsewhere (a stager or issuer wait, a copy issue); it used
 // to land on "dequant", the phase before it.
@@ -4152,10 +4153,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 mmq::quantize(xsrc, nullptr, m.Xtok, mmq_gt, N, N, T, m.cs);
                             }
+                            // #259: "gather" is the activations' Hadamard + q8_1 quantize; the 4070's inputs and the
+                            // tables follow as phases of their own
                             if (split_l) {   // #133: the 4070's inputs first, then CUDA0's tables for its own experts
+                                pt.mark(kPfSplitSend, cs);
                                 if (!split_send(m, l, T, chunk_i, order_4070, err)) return false;
                                 m.split->n_local += (int64_t) order.size();
+                                pt.mark(kPfTables, cs);
                                 upload_tables();
+                            } else {
+                                pt.mark(kPfTables, cs);
                             }
                             // the layer's rows per expert (absolute), then each group's sub-products: at most mmq_rows
                             // rows each, with a 0-based bounds block that gate/up and down both read
