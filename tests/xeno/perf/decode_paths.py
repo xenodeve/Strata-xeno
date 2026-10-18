@@ -18,6 +18,8 @@ from collections import defaultdict
 
 def load(path: str) -> list[dict]:
     text = open(path, encoding="utf-8").read().rstrip().rstrip(",")
+    if not text.endswith("]") and not text.endswith("}"):   # a server stopped mid-write: drop the partial event
+        text = text[:text.rfind("},") + 1]
     return json.loads(text if text.endswith("]") else text + "]")   # the engine leaves the array open
 
 
@@ -73,6 +75,57 @@ def sync_split(events: list[dict]) -> dict:
     return out
 
 
+def window_split(events: list[dict]) -> dict:
+    """#227 window graph: the 4070 runs one graph per window and has no "4070 experts" span; each layer's work is a
+    "4070 segment" on the gpu1 lane (args a = layer), tied to the host clock by the runner.  Per host "cpu experts"
+    stage with a 4070 share, pair its "plan 4070 launch", "4070 finish" (starts when the CPU part is done) and
+    "4070 wait" with the segment of the same layer, and split the wait: the 4070 starting late after the plan, the
+    4070 still computing when the CPU part ended (the straggle a deferral of its output could hide at most), and
+    the wait left after the segment had ended (the done flag's readback)."""
+    xs = [e for e in events if e.get("ph") == "X"]
+    rounds = max(1, sum(1 for e in xs if e["name"] == "decode round"))
+    seg: dict[int, list] = defaultdict(list)
+    for e in xs:
+        if e["name"] == "4070 segment":
+            seg[e["args"]["a"]].append((e["ts"], e["ts"] + e["dur"]))
+    for v in seg.values():
+        v.sort()
+    stages = sorted((e for e in xs if e["name"] == "cpu experts"), key=lambda e: e["ts"])
+    starts = [e["ts"] for e in stages]
+    inner: list[dict] = [{} for _ in stages]
+    for e in xs:
+        if e["name"] in ("plan 4070 launch", "4070 finish", "4070 wait"):
+            i = bisect.bisect_right(starts, e["ts"]) - 1
+            if i >= 0 and e["ts"] <= stages[i]["ts"] + stages[i]["dur"]:
+                inner[i][e["name"]] = e
+    acc: dict[str, float] = defaultdict(float)
+    straggles: list[float] = []
+    n = later = 0
+    for st, sp in zip(stages, inner):
+        if not all(k in sp for k in ("plan 4070 launch", "4070 finish", "4070 wait")):
+            continue
+        plan, fin, wait = sp["plan 4070 launch"], sp["4070 finish"], sp["4070 wait"]
+        lay = seg.get(wait["args"]["a"], [])
+        wend = wait["ts"] + wait["dur"]
+        k = bisect.bisect_right([s for s, _ in lay], wend) - 1   # the layer's last segment to start before the wait ended
+        if k < 0 or lay[k][1] < st["ts"]:
+            continue
+        g0, g1 = lay[k]
+        cpu_end = fin["ts"]
+        n += 1
+        later += g1 > cpu_end
+        straggles.append(max(0.0, g1 - cpu_end))
+        for key, v in (("plan -> segment start", g0 - (plan["ts"] + plan["dur"])), ("segment", g1 - g0),
+                       ("4070 straggle past cpu", max(0.0, g1 - cpu_end)), ("4070 wait", wait["dur"]),
+                       ("wait with the 4070 done", wend - max(g1, wait["ts"])), ("4070 finish", fin["dur"])):
+            acc[key] += v
+    # the most a segment shorter by d us could take off the host's wait: each step's straggle, capped at d
+    shave = {d: round(sum(min(d, s) for s in straggles) / 1000 / rounds, 6) for d in SHAVE_US}
+    return {"layers": n, "rounds": rounds, "4070 after cpu": later / n if n else 0.0,
+            "ms": {k: round(v / 1000 / rounds, 6) for k, v in acc.items()}, "shave ms": shave}
+
+
+SHAVE_US = (5, 10, 20, 40)
 GPU_DECODE = ("verify graph", "commit graph", "mtp round", "mtp step")   # the "gpu0 decode" lane (#44)
 EDGE_HOST = ("verify stage", "verify launch", "verify tail", "head sampling", "verify commit", "mtp draft", "emit tokens",
              "adapt join", "adapt apply", "verify capture", "ple gather", "suffix propose")
@@ -115,6 +168,14 @@ def main(argv: list[str]) -> int:
         for k, v in r["ms"].items():
             print(f"  {k:32}{v:8.2f}")
         print(f"  the 4070 ended after the CPU pool in {r['4070 after pool']:.0%} of those layers")
+        w = window_split(ev)
+        if w["layers"]:
+            print(f"  window graph: {w['layers']} layers with a 4070 segment; the 4070 ended after the CPU part in "
+                  f"{w['4070 after cpu']:.0%} of them (ms per round)")
+            for k, v in w["ms"].items():
+                print(f"    {k:30}{v:8.2f}")
+            print("    a segment shorter by d us takes at most (ms/round): " +
+                  ", ".join(f"{d} us {v:.2f}" for d, v in w["shave ms"].items()))
         s = sync_split(ev)
         n = s["done"]["n"] + s["running"]["n"]
         if n:
