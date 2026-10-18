@@ -3104,9 +3104,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     cudaStreamWaitEvent(t.c, t.used[rs], 0);   // the group that read this slot has gathered it
                     if (t.lanes_expected == 2) cudaStreamWaitEvent(t.c, t.used1[rs], 0);   // and lane 2's (#35 D7)
                     cudaEvent_t c0 = nullptr;
+                    // #259 Step 0, STRATA_SPLIT_NO_COPY=1 (a timing diagnostic: the 4070 computes on stale slots, the output
+                    // is garbage): the issuer publishes every entry without its host-to-device copy, which bounds what
+                    // copying each expert once per part (layer-major) could give
+                    static const bool no_copy = [] { const char* v = std::getenv("STRATA_SPLIT_NO_COPY"); return v != nullptr && std::atoi(v) != 0; }();
                     if (en.kind == 2) {
                         c0 = t.clk_c.record(t.c);
-                        cudaMemcpyAsync(dst, m.src->blob(en.l, en.e), bb, cudaMemcpyHostToDevice, t.c);
+                        if (!no_copy) cudaMemcpyAsync(dst, m.src->blob(en.l, en.e), bb, cudaMemcpyHostToDevice, t.c);
                     } else {
                         const uint8_t* hb = nullptr;
                         {
@@ -3114,7 +3118,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             hb = t.stager->wait(en.job);
                         }
                         c0 = t.clk_c.record(t.c);
-                        cudaMemcpyAsync(dst, hb, bb, cudaMemcpyHostToDevice, t.c);
+                        if (!no_copy) cudaMemcpyAsync(dst, hb, bb, cudaMemcpyHostToDevice, t.c);
                         t.stager->issued_one(en.job, t.c);
                     }
                     cudaEventRecord(t.copied[rs], t.c);
