@@ -1629,8 +1629,12 @@ bool split_run(Impl& m, int64_t l, int64_t T, size_t unit, const std::vector<int
                 if (pn == 0) return;
                 if (k_wait >= 0) { cudaStreamWaitEvent(sp.s, xs.copied[k_wait % xs.RING], 0); k_wait = -1; }   // same card
                 sp.clk_s.mark(sp.tl_s, "gather", sp.s, l, sb.grp);
-                mmq::gather_native_group(blobs, (int) pn, f.up_off, f.down_off, gub / 2, db, sp.grp_gu + (p0 - a) * gub,
-                                         gub, sp.grp_d + (p0 - a) * db, db, sp.s);
+                // STRATA_SPLIT_NO_GATHER=1 (a timing diagnostic: the products read stale group buffers, the output is
+                // garbage): bounds what multiplying straight from the slots and the ring, without this repack, could give
+                static const bool no_gather = [] { const char* v = std::getenv("STRATA_SPLIT_NO_GATHER"); return v != nullptr && std::atoi(v) != 0; }();
+                if (!no_gather)
+                    mmq::gather_native_group(blobs, (int) pn, f.up_off, f.down_off, gub / 2, db, sp.grp_gu + (p0 - a) * gub,
+                                             gub, sp.grp_d + (p0 - a) * db, db, sp.s);
                 int64_t k_last = -1;
                 for (size_t i = 0; i < pn; ++i)
                     if (ents[i] >= 0) { cudaEventRecord(my_used[ents[i] % xs.RING], sp.s); k_last = ents[i]; }
@@ -1675,7 +1679,11 @@ bool split_run(Impl& m, int64_t l, int64_t T, size_t unit, const std::vector<int
         a.bounds = sp.bounds + sb.boff; a.ids = sp.ids; a.n_embd = N; a.n_ff = 640; a.interleaved = false;
         a.xq = sp.xq; a.gu_out = sp.gu; a.h = sp.h; a.hq = sp.hq; a.dst = sp.dm + sb.r0 * N;
         sp.clk_s.mark(sp.tl_s, "products", sp.s, l, sb.grp);
-        if (f.had_d) {   // APR: folded down weights take H (s * h), with the 4070's copy of the n_ff signs
+        // STRATA_SPLIT_NO_PRODUCTS=1 (a timing diagnostic, the output is garbage): the 4070 skips its expert products,
+        // which bounds what any faster 4070 expert kernel could give the prompt read
+        static const bool no_products = [] { const char* v = std::getenv("STRATA_SPLIT_NO_PRODUCTS"); return v != nullptr && std::atoi(v) != 0; }();
+        if (no_products) {
+        } else if (f.had_d) {   // APR: folded down weights take H (s * h), with the 4070's copy of the n_ff signs
             mmq::expert_rows_gate_up(*sp.ctx, a, sp.s);
             strata::kernels::hadamard_rows(a.h, a.h, a.nr, 640, f.had_block, sp.had_sh, sp.s);
             mmq::expert_rows_down(*sp.ctx, a, sp.s);
