@@ -231,6 +231,7 @@ def main(argv=None):
     c = sub.add_parser("cmp")
     c.add_argument("tags", nargs="+")
     a = ap.parse_args(argv)
+    a.out = os.path.abspath(a.out)   # the server runs in its own directory and reads the config from here
     {"run": run, "plus": plus, "cmp": cmp}[a.cmd](a)
 
 
