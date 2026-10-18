@@ -115,6 +115,16 @@ def check_plus(prob, code, runs, python=sys.executable):
     return _isolated(files, "h.py", 120, runs, python)
 
 
+def long_context(path: str | None, chars: int) -> list:
+    """--prefix: a system message of unrelated text before every problem, to test the prompt path at long context.
+    The prefix is the same for every problem, so the server reads it once and resumes each problem from its message
+    boundary: the state the prefix left (and any rounding a change makes in it) reaches every answer."""
+    if not path:
+        return []
+    text = open(path, encoding="utf-8", errors="replace").read()[:chars or None]
+    return [{"role": "system", "content": "Reference material for the session (unrelated to the task below):\n\n" + text}]
+
+
 def run(a):
     c = json.load(open(a.config, encoding="utf-8"))
     c.pop("_comment", None)
@@ -143,8 +153,9 @@ def run(a):
                 pass
             time.sleep(3)
         probs = load_problems(a.data)
+        lead = long_context(a.prefix, a.prefix_chars)
         for k, prob in enumerate(probs[:a.n] if a.n else probs):
-            body = json.dumps({"model": "x", "messages": [{"role": "user", "content": ASK.format(prompt=prob["prompt"])}],
+            body = json.dumps({"model": "x", "messages": lead + [{"role": "user", "content": ASK.format(prompt=prob["prompt"])}],
                                "max_tokens": 512, "temperature": 0, "stream": False,
                                "chat_template_kwargs": {"enable_thinking": False}}).encode()
             req = urllib.request.Request(f"http://127.0.0.1:{a.port}/v1/chat/completions", data=body,
@@ -226,6 +237,8 @@ def main(argv=None):
     r.add_argument("--server", default=r"C:\Strata-exp\src-main\serve\server.py")
     r.add_argument("--python", default=sys.executable)
     r.add_argument("--cuda-devices", default="1,0")
+    r.add_argument("--prefix", help="a text file read in front of every problem as a system message (long context)")
+    r.add_argument("--prefix-chars", type=int, default=0, help="the first N characters of --prefix (0: all)")
     p = sub.add_parser("plus")
     p.add_argument("tags", nargs="+")
     c = sub.add_parser("cmp")

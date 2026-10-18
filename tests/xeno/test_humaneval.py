@@ -47,3 +47,11 @@ def test_compare_counts_gained_and_lost_problems():
                                "arm": {"a": True, "b": False, "c": True}})
     assert lines[0].startswith("base: pass@1 2/3")
     assert lines[1].endswith("vs base: +1 -1 (net +0)")
+
+
+def test_long_context_prefix(tmp_path):
+    f = tmp_path / "ctx.txt"
+    f.write_text("abcdef" * 10, encoding="utf-8")
+    assert humaneval.long_context(None, 0) == []
+    m = humaneval.long_context(str(f), 9)
+    assert len(m) == 1 and m[0]["role"] == "system" and m[0]["content"].endswith("abcdefabc")
