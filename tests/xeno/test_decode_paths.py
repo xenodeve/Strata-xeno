@@ -61,6 +61,15 @@ def test_the_window_graph_4070_is_split_into_late_start_and_straggling_compute()
     assert w["shave ms"] == {5: 0.005, 10: 0.01, 20: 0.02, 40: 0.03}
 
 
+def test_the_fetch_overlap_counts_only_steps_that_staged_capped_by_compute_and_straggle():
+    w = {"rounds": 1, "steps": [(30.0, 2, 1), (100.0, 0, 3), (500.0, 10, 2), (80.0, 5, 0)]}
+    # step 1: min(57, 14, 30) = 14; step 2: no resident group to hide under -> 0; step 3: min(114, 70, 500) = 70;
+    # step 4 staged nothing
+    assert dp.fetch_overlap(w, 57.0, 7.0) == 0.084
+    # with a fixed 40 us of kernel time: step 1 min(57, 54, 30) = 30; step 3 min(114, 110, 500) = 110
+    assert dp.fetch_overlap(w, 57.0, 7.0, 40.0) == 0.14
+
+
 def test_a_window_graph_layer_without_a_segment_is_skipped():
     ev = [_x("decode round", 0, 100), _xa("cpu experts", 10, 50, 0), _xa("plan 4070 launch", 12, 3, 3),
           _xa("4070 finish", 40, 5, 3), _xa("4070 wait", 40, 4, 3)]

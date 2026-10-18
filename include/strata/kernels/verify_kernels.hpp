@@ -58,6 +58,11 @@ void window_rows_to_host(const float* src, float* dst_mapped, const int32_t* sta
 /// from device memory (the layer's plan), so the captured graph needs no update; *n = 0 costs one empty launch.
 void window_fetch_blobs(const int32_t* n, const unsigned long long* src, const long long* bytes, uint8_t* dst,
                         unsigned long long stride, int max_slots, void* stream);
+/// #262: the window segment's plan and activations in one kernel: bytes_a from src_a to dst_a and bytes_b from src_b
+/// to dst_b (sources in mapped host memory; 16-byte aligned, sizes multiples of 16).  It replaces two memcpy nodes,
+/// which in a graph with a side branch started ~25 us after the node before them (nsys, gyro-record/nsys_seg.py).
+void window_copy_in(const void* src_a, void* dst_a, size_t bytes_a, const void* src_b, void* dst_b, size_t bytes_b,
+                    void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);

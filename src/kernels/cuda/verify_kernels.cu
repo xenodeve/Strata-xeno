@@ -1333,6 +1333,23 @@ __global__ void window_fetch_kernel(const int32_t* n, const unsigned long long* 
 }
 }  // namespace
 
+namespace {
+__global__ void window_copy_in_kernel(const uint4* a, uint4* da, long long na, const uint4* b, uint4* db, long long nb) {
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < na + nb; i += (long long) gridDim.x * blockDim.x) {
+        if (i < na) da[i] = a[i];
+        else db[i - na] = b[i - na];
+    }
+}
+}  // namespace
+
+void window_copy_in(const void* src_a, void* dst_a, size_t bytes_a, const void* src_b, void* dst_b, size_t bytes_b,
+                    void* stream) {
+    window_copy_in_kernel<<<16, 256, 0, (cudaStream_t) stream>>>((const uint4*) src_a, (uint4*) dst_a,
+                                                                 (long long) (bytes_a / 16), (const uint4*) src_b,
+                                                                 (uint4*) dst_b, (long long) (bytes_b / 16));
+    check("window_copy_in");
+}
+
 void window_fetch_blobs(const int32_t* n, const unsigned long long* src, const long long* bytes, uint8_t* dst,
                         unsigned long long stride, int max_slots, void* stream) {
     window_fetch_kernel<<<dim3(16, (unsigned) max_slots), 256, 0, (cudaStream_t) stream>>>(n, src, bytes, dst, stride);

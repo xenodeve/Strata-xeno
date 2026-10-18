@@ -87,7 +87,7 @@ def window_split(events: list[dict]) -> dict:
     seg: dict[int, list] = defaultdict(list)
     for e in xs:
         if e["name"] == "4070 segment":
-            seg[e["args"]["a"]].append((e["ts"], e["ts"] + e["dur"]))
+            seg[e["args"]["a"]].append((e["ts"], e["ts"] + e["dur"], e["args"].get("b", 0)))
     for v in seg.values():
         v.sort()
     stages = sorted((e for e in xs if e["name"] == "cpu experts"), key=lambda e: e["ts"])
@@ -100,6 +100,7 @@ def window_split(events: list[dict]) -> dict:
                 inner[i][e["name"]] = e
     acc: dict[str, float] = defaultdict(float)
     straggles: list[float] = []
+    steps: list[tuple] = []
     n = later = 0
     for st, sp in zip(stages, inner):
         if not all(k in sp for k in ("plan 4070 launch", "4070 finish", "4070 wait")):
@@ -107,14 +108,15 @@ def window_split(events: list[dict]) -> dict:
         plan, fin, wait = sp["plan 4070 launch"], sp["4070 finish"], sp["4070 wait"]
         lay = seg.get(wait["args"]["a"], [])
         wend = wait["ts"] + wait["dur"]
-        k = bisect.bisect_right([s for s, _ in lay], wend) - 1   # the layer's last segment to start before the wait ended
+        k = bisect.bisect_right([s[0] for s in lay], wend) - 1   # the layer's last segment to start before the wait ended
         if k < 0 or lay[k][1] < st["ts"]:
             continue
-        g0, g1 = lay[k]
+        g0, g1, gb = lay[k]
         cpu_end = fin["ts"]
         n += 1
         later += g1 > cpu_end
         straggles.append(max(0.0, g1 - cpu_end))
+        steps.append((max(0.0, g1 - cpu_end), gb // 1000, gb % 1000))   # straggle, resident groups, staged blobs
         for key, v in (("plan -> segment start", g0 - (plan["ts"] + plan["dur"])), ("segment", g1 - g0),
                        ("4070 straggle past cpu", max(0.0, g1 - cpu_end)), ("4070 wait", wait["dur"]),
                        ("wait with the 4070 done", wend - max(g1, wait["ts"])), ("4070 finish", fin["dur"])):
@@ -122,7 +124,15 @@ def window_split(events: list[dict]) -> dict:
     # the most a segment shorter by d us could take off the host's wait: each step's straggle, capped at d
     shave = {d: round(sum(min(d, s) for s in straggles) / 1000 / rounds, 6) for d in SHAVE_US}
     return {"layers": n, "rounds": rounds, "4070 after cpu": later / n if n else 0.0,
-            "ms": {k: round(v / 1000 / rounds, 6) for k, v in acc.items()}, "shave ms": shave}
+            "ms": {k: round(v / 1000 / rounds, 6) for k, v in acc.items()}, "shave ms": shave, "steps": steps}
+
+
+def fetch_overlap(w: dict, fetch_us: float, group_us: float, base_us: float = 0.0) -> float:
+    """The most hiding the staged blobs' fetch under the resident groups' compute could take off the host's wait, in
+    ms/round: per step that staged, min(the fetch, the resident compute (base_us + group_us per group, nothing without
+    a resident group), the step's straggle)."""
+    return round(sum(min(fetch_us * st, base_us + group_us * g if g > 0 else 0.0, s)
+                     for s, g, st in w["steps"] if st > 0) / 1000 / w["rounds"], 6)
 
 
 SHAVE_US = (5, 10, 20, 40)
@@ -174,6 +184,9 @@ def main(argv: list[str]) -> int:
                   f"{w['4070 after cpu']:.0%} of them (ms per round)")
             for k, v in w["ms"].items():
                 print(f"    {k:30}{v:8.2f}")
+            print(f"    hiding the staged fetch (57 us/blob) under the resident groups (7 us/group) takes at most "
+                  f"{fetch_overlap(w, 57.0, 7.0):.2f} ms/round, {fetch_overlap(w, 57.0, 7.0, 40.0):.2f} with the "
+                  f"expert kernels' own 40 us")
             print("    a segment shorter by d us takes at most (ms/round): " +
                   ", ".join(f"{d} us {v:.2f}" for d, v in w["shave ms"].items()))
         s = sync_split(ev)

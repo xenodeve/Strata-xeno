@@ -114,6 +114,11 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     const uint64_t stage_n_at = carve(sizeof(int32_t));
     const uint64_t stage_src_at = carve((uint64_t) kMaxStageSlots * sizeof(unsigned long long));
     const uint64_t stage_bytes_at = carve(sizeof(long long));
+    // #262: the fetch overlap's split of the groups (resident first; the staged ones' own table)
+    const uint64_t count_a_at = carve(sizeof(int32_t));
+    const uint64_t ptr_b_at = carve((uint64_t) kMaxStageSlots * sizeof(unsigned long long));
+    const uint64_t start_b_at = carve((uint64_t) (kMaxStageSlots + 1) * sizeof(int32_t));
+    const uint64_t count_b_at = carve(sizeof(int32_t));
     const uint64_t meta_end = cursor;
     stage_slots_ = stage_slots;
     stage_stride_ = stage_slots > 0 ? aligned(stage_blob_bytes) : 0;
@@ -125,6 +130,10 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     meta_stage_n_off_ = (size_t) (stage_n_at - ptr_at);
     meta_stage_src_off_ = (size_t) (stage_src_at - ptr_at);
     meta_stage_bytes_off_ = (size_t) (stage_bytes_at - ptr_at);
+    meta_count_a_off_ = (size_t) (count_a_at - ptr_at);
+    meta_ptr_b_off_ = (size_t) (ptr_b_at - ptr_at);
+    meta_start_b_off_ = (size_t) (start_b_at - ptr_at);
+    meta_count_b_off_ = (size_t) (count_b_at - ptr_at);
     meta_bytes_ = (size_t) (meta_end - ptr_at);
     if (!workspace_.open(1, {cursor}, cursor, err)) return false;
     uint8_t* base = workspace_.slot_ptr(0);
@@ -142,6 +151,10 @@ bool SecondaryRunner::init(int max_tokens, int max_entries, int n_embd, int n_ff
     device_stage_n_ = (int32_t*) (base + stage_n_at);
     device_stage_src_ = (unsigned long long*) (base + stage_src_at);
     device_stage_bytes_ = (long long*) (base + stage_bytes_at);
+    device_count_a_ = (int32_t*) (base + count_a_at);
+    device_ptr_b_ = (unsigned long long*) (base + ptr_b_at);
+    device_start_b_ = (int32_t*) (base + start_b_at);
+    device_count_b_ = (int32_t*) (base + count_b_at);
 
     int previous = -1;
     if (!cuda_ok(cudaGetDevice(&previous), "runner current device", err) ||
@@ -558,10 +571,17 @@ bool SecondaryRunner::enable_window(const std::vector<kernels::NativeExpertLayou
     const size_t xs = (size_t) max_tokens_ * n_embd_;
     void* go = nullptr;
     void* done = nullptr;
-    if (!cuda_ok(cudaHostAlloc((void**) &host_wmeta_, (size_t) win_layers_ * meta_bytes_, cudaHostAllocPortable),
+    if (stage_slots_ > 0) {   // #262: the staged blobs' fetch beside the resident groups' gate/up (=0: one chain)
+        const char* v = std::getenv("STRATA_SECONDARY_FETCH_OVERLAP");
+        fetch_overlap_ = v == nullptr || v[0] == '\0' || v[0] != '0';
+    }
+    const unsigned in_flags = cudaHostAllocPortable | (fetch_overlap_ ? cudaHostAllocMapped : 0u);
+    if (!cuda_ok(cudaHostAlloc((void**) &host_wmeta_, (size_t) win_layers_ * meta_bytes_, in_flags),
                  "window plans", err) ||
-        !cuda_ok(cudaHostAlloc((void**) &host_wx_, (size_t) win_layers_ * xs * sizeof(float), cudaHostAllocPortable),
+        !cuda_ok(cudaHostAlloc((void**) &host_wx_, (size_t) win_layers_ * xs * sizeof(float), in_flags),
                  "window activations", err) ||
+        (fetch_overlap_ && (!cuda_ok(cudaHostGetDevicePointer((void**) &dev_wmeta_, host_wmeta_, 0), "window plans pointer", err) ||
+                            !cuda_ok(cudaHostGetDevicePointer((void**) &dev_wx_, host_wx_, 0), "window activations pointer", err))) ||
         !cuda_ok(cudaHostAlloc((void**) &host_wout_, (size_t) max_entries_ * n_embd_ * sizeof(float),
                                cudaHostAllocPortable | cudaHostAllocMapped), "window rows", err) ||
         !cuda_ok(cudaHostAlloc(&go, (size_t) win_layers_ * sizeof(uint32_t), cudaHostAllocPortable | cudaHostAllocMapped),
@@ -590,6 +610,15 @@ bool SecondaryRunner::enable_window(const std::vector<kernels::NativeExpertLayou
         !cuda_ok(cudaMalloc((void**) &dev_count_, (size_t) win_layers_ * sizeof(uint32_t)), "window counts", err) ||
         !cuda_ok(cudaMemset(dev_count_, 0, (size_t) win_layers_ * sizeof(uint32_t)), "window counts clear", err))
         return false;
+    if (fetch_overlap_) {
+        cudaStream_t fs = nullptr;
+        cudaEvent_t fork = nullptr, join = nullptr;
+        if (!cuda_ok(cudaStreamCreateWithFlags(&fs, cudaStreamNonBlocking), "window fetch stream", err) ||
+            !cuda_ok(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming), "window fetch fork", err) ||
+            !cuda_ok(cudaEventCreateWithFlags(&join, cudaEventDisableTiming), "window fetch join", err))
+            return false;
+        fetch_stream_ = fs; fetch_fork_ = fork; fetch_join_ = join;
+    }
     win_graph_.assign((size_t) max_tokens_ + 1, nullptr);
     for (int t = 1; t <= max_tokens_; ++t)
         if (!capture_window(t, err)) return false;
@@ -620,19 +649,40 @@ bool SecondaryRunner::capture_window(int n_tokens, std::string& err) {
         if (layout.had_block > 0) layout.d_signs = device_sh_;
         const bool q2 = layout.gu_type == 42 && layout.d_type == 42;
         kernels::window_wait(dev_go_ + l, dev_count_ + l, stream, dev_wstamp_ ? dev_wstamp_ + 2 * l : nullptr);
-        cudaMemcpyAsync(device_ptr_, host_wmeta_ + (size_t) l * meta_bytes_, meta_bytes_, cudaMemcpyHostToDevice, stream);
+        cudaStream_t fs = (cudaStream_t) fetch_stream_;
+        if (fetch_overlap_) {   // #262: the plan and x by one kernel, then the fetch on a side branch, joined before the
+            kernels::window_copy_in(dev_wmeta_ + (size_t) l * meta_bytes_, device_ptr_, meta_bytes_,   // staged gate/up
+                                    dev_wx_ + (size_t) l * xs, device_x_, (size_t) n_tokens * n_embd_ * sizeof(float), stream);
+            cudaEventRecord((cudaEvent_t) fetch_fork_, stream);
+            cudaStreamWaitEvent(fs, (cudaEvent_t) fetch_fork_, 0);
+        } else {
+            cudaMemcpyAsync(device_ptr_, host_wmeta_ + (size_t) l * meta_bytes_, meta_bytes_, cudaMemcpyHostToDevice,
+                            stream);
+        }
         if (stage_slots_ > 0)   // #228 v2: this layer's staged experts, from mapped host memory into the staging slots
             kernels::window_fetch_blobs(device_stage_n_, device_stage_src_, device_stage_bytes_, device_stage_,
-                                        stage_stride_, stage_slots_, stream);
-        cudaMemcpyAsync(device_x_, host_wx_ + (size_t) l * xs, (size_t) n_tokens * n_embd_ * sizeof(float),
-                        cudaMemcpyHostToDevice, stream);
+                                        stage_stride_, stage_slots_, fetch_overlap_ ? fs : stream);
+        if (fetch_overlap_) cudaEventRecord((cudaEvent_t) fetch_join_, fs);
+        else
+            cudaMemcpyAsync(device_x_, host_wx_ + (size_t) l * xs, (size_t) n_tokens * n_embd_ * sizeof(float),
+                            cudaMemcpyHostToDevice, stream);
         if (layout.had_gu_block > 0)
             kernels::hadamard_rows(device_x_, device_x_, n_tokens, n_embd_, layout.had_gu_block, device_sx_, stream);
         if (q2) kernels::quantize_q8_1_rows_scaled(device_x_, n_tokens, n_embd_, device_xq_, device_scales_, stream);
         else kernels::quantize_q8_1_rows(device_x_, n_tokens, n_embd_, device_xq_, stream);
-        kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
-                                       entries, entries, device_xq_, device_scratch_, device_out_, stream,
-                                       q2 ? device_scales_ : nullptr);
+        const float* xs_q2 = q2 ? device_scales_ : nullptr;
+        if (fetch_overlap_) {   // the resident groups (first in the plan) whole, then, after the fetch, the staged ones:
+            // each call writes only its own groups' rows (the second's SwiGLU recomputes the first's h, the same values)
+            kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_a_, device_dst_, device_tok_,
+                                           entries, entries, device_xq_, device_scratch_, device_out_, stream, xs_q2);
+            cudaStreamWaitEvent(stream, (cudaEvent_t) fetch_join_, 0);
+            kernels::native_expert_grouped(layout, device_ptr_b_, device_start_b_, device_count_b_, device_dst_,
+                                           device_tok_, kMaxStageSlots, entries, device_xq_, device_scratch_,
+                                           device_out_, stream, xs_q2);
+        } else {
+            kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
+                                           entries, entries, device_xq_, device_scratch_, device_out_, stream, xs_q2);
+        }
         kernels::window_rows_to_host(device_out_, dev_wout_, device_start_, device_count_, n_embd_, max_entries_, stream);
         kernels::window_signal(dev_done_ + l, dev_count_ + l, stream, dev_wstamp_ ? dev_wstamp_ + 2 * l + 1 : nullptr);
     }
@@ -655,6 +705,10 @@ bool SecondaryRunner::publish_empty(int layer, std::string& err) {
     int32_t zero = 0;
     std::memcpy(host_wmeta_ + (size_t) layer * meta_bytes_ + meta_count_off_, &zero, sizeof zero);
     std::memcpy(host_wmeta_ + (size_t) layer * meta_bytes_ + meta_stage_n_off_, &zero, sizeof zero);   // #228 v2
+    if (fetch_overlap_) {   // #262: the split passes' counts too
+        std::memcpy(host_wmeta_ + (size_t) layer * meta_bytes_ + meta_count_a_off_, &zero, sizeof zero);
+        std::memcpy(host_wmeta_ + (size_t) layer * meta_bytes_ + meta_count_b_off_, &zero, sizeof zero);
+    }
     std::atomic_thread_fence(std::memory_order_release);
     _mm_sfence();
     host_go_[layer] = win_seq_;
@@ -902,6 +956,8 @@ bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout&
         for (const int32_t prior : group_slots_) if (prior == slot) { seen = true; break; }
         if (!seen) group_slots_.push_back(slot);
     }
+    if (fetch_overlap_)   // #262: resident groups first, in their order, then the staged ones (each entry keeps its row)
+        std::stable_partition(group_slots_.begin(), group_slots_.end(), [](int32_t s) { return s >= 0; });
     for (const int32_t slot : group_slots_) {
         ptr_.push_back(slot < -1 ? (unsigned long long) (device_stage_ + (uint64_t) -(slot + 2) * stage_stride_)
                                  : (unsigned long long) weights.slot_ptr((uint64_t) slot));
@@ -921,6 +977,17 @@ bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout&
         std::memcpy(meta + meta_start_off_, start_.data(), start_.size() * sizeof(start_[0]));
         std::memcpy(meta + meta_dst_off_, dst_.data(), dst_.size() * sizeof(dst_[0]));
         std::memcpy(meta + meta_tok_off_, tok_.data(), tok_.size() * sizeof(tok_[0]));
+    }
+    if (fetch_overlap_) {   // #262: the resident groups' count, and the staged groups' own table
+        int32_t na = 0;
+        for (const int32_t slot : group_slots_) na += slot >= 0;
+        const int32_t nb = host_count_ - na;
+        std::memcpy(meta + meta_count_a_off_, &na, sizeof na);
+        std::memcpy(meta + meta_count_b_off_, &nb, sizeof nb);
+        if (nb > 0) {
+            std::memcpy(meta + meta_ptr_b_off_, ptr_.data() + na, (size_t) nb * sizeof(ptr_[0]));
+            std::memcpy(meta + meta_start_b_off_, start_.data() + na, (size_t) (nb + 1) * sizeof(start_[0]));
+        }
     }
     {   // #228 v2: the staged blobs the segment fetches before its experts (none without claims)
         const int32_t ns = host_count_ > 0 ? n_staged : 0;
@@ -1170,6 +1237,13 @@ void SecondaryRunner::close() {
     for (void*& ge : win_graph_)
         if (ge != nullptr) { cudaGraphExecDestroy((cudaGraphExec_t) ge); ge = nullptr; }
     if (dev_count_ != nullptr) cudaFree(dev_count_);
+    if (fetch_fork_ != nullptr) cudaEventDestroy((cudaEvent_t) fetch_fork_);
+    if (fetch_join_ != nullptr) cudaEventDestroy((cudaEvent_t) fetch_join_);
+    if (fetch_stream_ != nullptr) cudaStreamDestroy((cudaStream_t) fetch_stream_);
+    fetch_fork_ = fetch_join_ = fetch_stream_ = nullptr;
+    fetch_overlap_ = false;
+    dev_wmeta_ = nullptr;
+    dev_wx_ = nullptr;
     for (void* p : {(void*) host_wmeta_, (void*) host_wx_, (void*) host_wout_, (void*) host_go_, (void*) host_done_,
                     (void*) host_wstamp_})
         if (p != nullptr) cudaFreeHost(p);

@@ -145,6 +145,18 @@ private:
     uint8_t* host_meta_ = nullptr;
     size_t meta_start_off_ = 0, meta_count_off_ = 0, meta_dst_off_ = 0, meta_tok_off_ = 0;
     size_t meta_stage_n_off_ = 0, meta_stage_src_off_ = 0, meta_stage_bytes_off_ = 0;   ///< #228 v2 (window plans)
+    // #262: the plan's groups split for the fetch overlap - the resident ones' count (they come first), and the staged
+    // ones' own pointer / start table and count
+    size_t meta_count_a_off_ = 0, meta_ptr_b_off_ = 0, meta_start_b_off_ = 0, meta_count_b_off_ = 0;
+    int32_t* device_count_a_ = nullptr;
+    unsigned long long* device_ptr_b_ = nullptr;
+    int32_t *device_start_b_ = nullptr, *device_count_b_ = nullptr;
+    bool fetch_overlap_ = false;     ///< #262 STRATA_SECONDARY_FETCH_OVERLAP (default on with staging slots)
+    void* fetch_stream_ = nullptr;   ///< the window graph's side branch for the staged blobs' fetch (capture only)
+    void* fetch_fork_ = nullptr;
+    void* fetch_join_ = nullptr;
+    uint8_t* dev_wmeta_ = nullptr;   ///< #262: the plans and activations, mapped (the fetch overlap copies them by kernel)
+    float* dev_wx_ = nullptr;
     size_t meta_bytes_ = 0;
     float* device_x_ = nullptr;
     uint8_t* device_stage_ = nullptr;   ///< #228: stage_slots_ x stage_stride_ bytes
