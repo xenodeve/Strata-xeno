@@ -13379,6 +13379,9 @@ int main(int argc, char** argv) {
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
+            // STRATA_MTP_TOP2 by the draft's own probability (< 0.6, < 0.8, < 0.95, >= 0.95): drafts verified, rejected,
+            // runner-up right - what a sibling added only below a confidence threshold would cost and catch
+            int64_t t2b_tested[4] = {}, t2b_rej[4] = {}, t2b_hit[4] = {};
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
             strata::spec::PromptLookupSource lookup_src(sfx);
@@ -14183,6 +14186,13 @@ int main(int argc, char** argv) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
+                if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window)
+                    for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) {
+                        const float pd = dprob[(size_t) d];
+                        const int b = pd < 0.6f ? 0 : pd < 0.8f ? 1 : pd < 0.95f ? 2 : 3;
+                        ++t2b_tested[b];
+                        if (d == a) { ++t2b_rej[b]; t2b_hit[b] += mtp.top2(a) == outv[(size_t) a]; }
+                    }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
@@ -14689,6 +14699,13 @@ int main(int argc, char** argv) {
                                      "of %lld windows\n", (long long) t2_rej[0], (long long) t2_hit[0], (long long) t2_rej[1],
                              (long long) t2_hit[1], (long long) t2_rej[2], (long long) t2_hit[2], (long long) t2_rej[3],
                              (long long) t2_hit[3], (long long) dec_windows);
+            if (strata::core::MtpDrafter::top2_env())
+                std::fprintf(stderr, "strata serve: mtp top2 by draft p (<0.6 <0.8 <0.95 >=0.95): tested/rejected/runner-up "
+                                     "%lld/%lld/%lld %lld/%lld/%lld %lld/%lld/%lld %lld/%lld/%lld\n",
+                             (long long) t2b_tested[0], (long long) t2b_rej[0], (long long) t2b_hit[0],
+                             (long long) t2b_tested[1], (long long) t2b_rej[1], (long long) t2b_hit[1],
+                             (long long) t2b_tested[2], (long long) t2b_rej[2], (long long) t2b_hit[2],
+                             (long long) t2b_tested[3], (long long) t2b_rej[3], (long long) t2b_hit[3]);
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
                 std::fprintf(stderr, "strata serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "
