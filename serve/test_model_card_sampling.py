@@ -101,7 +101,9 @@ class ModelCardSampling(unittest.TestCase):
 
     def test_no_family_no_defaults(self):
         self.svc.model_arch = None
-        self.assertEqual(self.keys(), "")
+        # xeno: sampling_keys always leads with the request's conversation-cache slot (xeno #49 S7, cache_slot=0 when
+        # the request names none), so "no sampling keys" is that key alone
+        self.assertEqual(self.keys(), " cache_slot=0")
 
 
 if __name__ == "__main__":

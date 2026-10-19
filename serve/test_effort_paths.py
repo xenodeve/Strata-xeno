@@ -68,6 +68,12 @@ class EffortPaths(unittest.TestCase):
         return status
 
     def level(self, path, body):
+        if path == "/v1/messages":
+            # xeno #49 S3: a non-streamed Anthropic request without tools is a side request (the auto-mode classifier,
+            # titles) and thinks at the low effort whatever it asks (think_budget.side_effort), so the request forms of
+            # the main turn are sent as Claude Code sends it, streamed.  test_an_anthropic_side_request_thinks_low pins
+            # the side rule.
+            body = {"stream": True, **body}
         status = self.post(path, body)
         self.assertEqual(status, 200, (path, body))
         return level_of(self.tok.decode(self.engine.last_prompt))
@@ -105,6 +111,16 @@ class EffortPaths(unittest.TestCase):
         self.assertEqual(self.level("/v1/messages", {"messages": MSG, "max_tokens": 50, "thinking": {"type": "disabled"}}),
                          "none")
         self.assertEqual(self.level("/v1/messages", {"messages": MSG, "max_tokens": 50}), "xhigh")   # nothing asked: it thinks
+
+    def test_an_anthropic_side_request_thinks_low(self):
+        # xeno #49 S3: not streamed and no tools -> a side request at the low effort, whatever level it names; thinking
+        # off stays off
+        for extra in ({}, {"output_config": {"effort": "high"}}, {"thinking": {"type": "enabled", "budget_tokens": 20000}}):
+            with self.subTest(extra=extra):
+                self.assertEqual(self.level("/v1/messages", {"messages": MSG, "max_tokens": 50, "stream": False, **extra}),
+                                 "low")
+        self.assertEqual(self.level("/v1/messages", {"messages": MSG, "max_tokens": 50, "stream": False,
+                                                     "thinking": {"type": "disabled"}}), "none")
 
     def test_responses_reasoning_effort(self):
         for given, want in (("low", "low"), ("medium", "medium"), ("high", "xhigh"), ("none", "none"), ("minimal", "none")):

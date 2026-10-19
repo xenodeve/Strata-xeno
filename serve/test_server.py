@@ -49,7 +49,9 @@ class MaxTokens(unittest.TestCase):
     def setUpClass(cls):
         tok = ByteTokenizer()
         cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
-        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        # xeno (#268): fit_max_tokens is off by default on the fork (upstream 0.2.0 turned it on); these tests are of
+        # the feature, so it is set here (test_strict_mode_keeps_the_llama_cpp_400 turns it off and back on)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), fit_max_tokens=True)
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -120,6 +122,15 @@ class MaxTokens(unittest.TestCase):
         self.assertNotIn("enable_thinking", kw(thinking={"type": "enabled", "budget_tokens": 2048}))
         self.assertNotIn("enable_thinking", kw(output_config={"effort": "high"}))
         self.assertNotIn("enable_thinking", kw(reasoning_budget_tokens=30))
+
+    def test_anthropic_budget_tokens_is_not_copied_to_reasoning_budget_tokens(self):
+        # xeno (merge #268): budget_tokens is the fork's S3 budget (think_budget.for_anthropic -> _think_budget).
+        # Upstream 0.1.45's copy into reasoning_budget_tokens made #123's cut, capped by the #984 answer reserve, win
+        # the served Claude Code shape (max_tokens 32000, budget_tokens 31999: 24000 instead of S3's 29952)
+        from serve.frontend import anthropic_to_messages
+        req = {"messages": [{"role": "user", "content": "u"}], "thinking": {"type": "enabled", "budget_tokens": 31999}}
+        anthropic_to_messages(req)
+        self.assertNotIn("reasoning_budget_tokens", req)
 
     def test_count_tokens_is_the_prompt_messages_reads(self):
         # /v1/messages/count_tokens renders and tokenizes the same prompt /v1/messages would read, without running it.
@@ -212,20 +223,24 @@ class MaxTokens(unittest.TestCase):
                 self.assertEqual(self.engine.last_max_new, room)             # one over: cut by one
 
     def test_a_prompt_that_alone_does_not_fit_is_still_a_400(self):
-        _, _, pt0, _ = self.call("openai", max_tokens=1)
-        overhead = pt0 - len("hi")
+        # xeno: the text alone is the whole context - not 50 tokens over the OpenAI prompt's overhead, since the fork's
+        # Anthropic request here (not streamed, no tools) is a #49 S3 side request with the shorter low-effort sentence,
+        # 71 tokens less overhead, and that prompt left room for an answer
         for api in ("openai", "anthropic", "responses"):
             with self.subTest(api=api):
-                s, b, _, _ = self.call_any(api, text="y" * (CTX - overhead + 50), max_tokens=CTX)
+                s, b, _, _ = self.call_any(api, text="y" * CTX, max_tokens=CTX)
                 self.assertEqual(s, 400, b)
                 self.assertIn("exceeds the context window", b["error"]["message"])
                 self.assertIn("no room to answer", b["error"]["message"])
                 self.assertIn("never truncated", b["error"]["message"])
 
     def test_thinking_budget_follows_the_shortened_cap(self):
-        # answer_room: thinking gets 3/4 of the cap; with the cap cut to the room left the budget is cut with it
+        # answer_room: thinking gets 3/4 of the cap; with the cap cut to the room left the budget is cut with it.
+        # xeno (#268): answer_room is opt-in on the fork (the config's "answer_room": true), so it is set for this test
         import contextlib
         import io
+        self.svc.answer_room = True
+        self.addCleanup(setattr, self.svc, "answer_room", False)
         for api in ("openai", "anthropic", "responses"):
             with self.subTest(api=api):
                 out = io.StringIO()
@@ -450,7 +465,8 @@ class ImageMarkers(unittest.TestCase):
             self.assertEqual(svc.embeddings.keys, ["fedcba9876543210", "0123456789abcdef"])
             svc.embeddings.path.unlink(missing_ok=True)
         keys = StrataEngine.sampling_keys({"strata_img_keys": ["fedcba9876543210", "0123456789abcdef"]})
-        self.assertEqual(keys, " img_keys=fedcba9876543210,0123456789abcdef")
+        # xeno: the fork's sampling_keys always leads with the conversation-cache slot (xeno #49 S7)
+        self.assertEqual(keys, " cache_slot=0 img_keys=fedcba9876543210,0123456789abcdef")
         for bad in ([], ["XYZ"], ["ab cd"], "abc", [3]):   # never sent malformed: the engine falls back to the embeddings
             with self.subTest(bad=bad):
                 self.assertNotIn("img_keys", StrataEngine.sampling_keys({"strata_img_keys": bad}))
@@ -5704,7 +5720,9 @@ class ReasoningBudget(unittest.TestCase):
 
     def test_a_cap_that_the_thinking_would_eat_leaves_room_to_answer(self):
         """0.1.45: max_tokens counts the thinking; a thinking that would fill it gets closed with a quarter left (the
-        agent harness sends max_completion_tokens 8192; the pagoda's thinking took all of it and no answer came)."""
+        agent harness sends max_completion_tokens 8192; the pagoda's thinking took all of it and no answer came).
+        xeno (#268): answer_room is opt-in on the fork (the config's "answer_room": true), so it is set here."""
+        self.svc.answer_room = True
         self.engine.THOUGHT = "Let me think step by step about two plus two. " * 40    # 1,800 reasoning tokens
         code, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 1024,
                                                      "messages": [{"role": "user", "content": "2+2?"}]})
@@ -5716,6 +5734,7 @@ class ReasoningBudget(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 2)              # the wrap-up continuation
 
     def test_the_answer_room_has_its_limits(self):
+        self.svc.answer_room = True             # xeno (#268): opt-in on the fork; on, so the floor is tested with it
         self.engine.THOUGHT = "Let me think step by step about two plus two. " * 40
         code, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 300,        # below the floor: as before
                                                      "messages": [{"role": "user", "content": "2+2?"}]})
@@ -5731,13 +5750,17 @@ class ReasoningBudget(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 3)              # thinking off: no budget, one prompt each
 
     def test_anthropic_thinking_budget_tokens_is_a_budget(self):
-        """0.1.45: thinking {type: enabled, budget_tokens: N} closes the thinking after N tokens (it was only a level)."""
-        from serve.server import REASONING_WRAP_UP
+        """0.1.45: thinking {type: enabled, budget_tokens: N} closes the thinking after N tokens (it was only a level).
+        xeno: on the fork that budget is #49 S3's (serve/think_budget.py), closed with its CLOSE, not #123's
+        REASONING_WRAP_UP (merge #268 did not take upstream's copy of budget_tokens into reasoning_budget_tokens, see
+        serve/frontend.py).  This request (not streamed, no tools) is a side request there: budget min(30,
+        STRATA_SIDE_BUDGET), 256 tokens of room."""
+        from serve import think_budget
         code, b = self.post("/v1/messages", {"model": "m", "max_tokens": 400, "thinking": {"type": "enabled", "budget_tokens": 30},
                                              "messages": [{"role": "user", "content": "2+2?"}]})
         self.assertEqual(code, 200, b)
         thinking = "".join(c.get("thinking", "") for c in b["content"] if c["type"] == "thinking")
-        self.assertEqual(thinking, ThinkingEngine.THOUGHT[:30] + REASONING_WRAP_UP.split("</think>")[0])
+        self.assertEqual(thinking, ThinkingEngine.THOUGHT[:30] + think_budget.CLOSE.split("</think>")[0])
         self.assertEqual("".join(c.get("text", "") for c in b["content"] if c["type"] == "text"), ThinkingEngine.ANSWER)
         self.assertEqual(len(self.engine.prompts), 2)
 

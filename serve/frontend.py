@@ -690,11 +690,12 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True,
     # "output_config": {"effort": "low" | "medium" | "high"}
     thinking = req.get("thinking")
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
-    # 0.1.45: Anthropic's budget_tokens is a real budget, not only a level: the thinking is closed (wrap-up, </think>,
-    # the answer) after that many tokens.  A reasoning_budget_tokens of the request's own wins.
-    bt = thinking.get("budget_tokens") if isinstance(thinking, dict) and thinking.get("type") != "disabled" else None
-    if isinstance(bt, int) and not isinstance(bt, bool) and bt > 0 and req.get("reasoning_budget_tokens") is None:
-        req["reasoning_budget_tokens"] = bt
+    # Anthropic's budget_tokens is a real budget, not only a level, on the fork since xeno #49 S3 (2026-09-26):
+    # serve/think_budget.for_anthropic turns it into the request's `_think_budget` (server.py's Anthropic handler).
+    # Upstream 0.1.45 (194c2688) also copied it into `reasoning_budget_tokens` here; not taken (merge #268): #123's
+    # cut of that copy is capped by the #984 answer reserve (a quarter of max_tokens), so it undercut S3's and won on
+    # the served Claude Code shape - max_tokens 32000, budget_tokens 31999 cut at 24000 with REASONING_WRAP_UP
+    # instead of S3's 29952 with its CLOSE.  A reasoning_budget_tokens of the request's own still applies (#123).
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         kwargs["enable_thinking"] = False
     elif effort:

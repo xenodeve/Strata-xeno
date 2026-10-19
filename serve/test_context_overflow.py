@@ -86,9 +86,11 @@ class ContextOverflow(unittest.TestCase):
                             self.assertEqual(set(error), {"type", "message"})
 
     def test_default_service_shortens_an_overshooting_budget_in_every_dialect(self):
-        # the Service default (fit_max_tokens on): a prompt that fits is answered, streaming or not; the prompt that
-        # alone leaves no room is the 400 of the strict test above
-        self.assertTrue(Service(self.engine, ByteTokenizer(), self.svc.template).fit_max_tokens)
+        # fit_max_tokens on: a prompt that fits is answered, streaming or not; the prompt that alone leaves no room is
+        # the 400 of the strict test above.  xeno (#268): the Service default is OFF on the fork (upstream 0.2.0 turned
+        # it on; here it is the config's "fit_max_tokens": true), so the default is pinned as off and the feature is
+        # tested with it set.
+        self.assertFalse(Service(self.engine, ByteTokenizer(), self.svc.template).fit_max_tokens)
         self.svc.fit_max_tokens = True
         for path, key in APIS:
             for stream in (False, True):
