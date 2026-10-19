@@ -1415,7 +1415,6 @@ struct Prefill::Impl {
     // APR (prism.hadamard): per layer, this device's copies of the gate/up (n_embd) and down (n_ff) sign vectors
     // (nullptr: identity signs or not folded), resolved once in init so a prompt chunk reads a pointer
     std::vector<const float*> had_sx, had_sh;
-    float* Xr = nullptr;   // APR: the rotated copy of `mixed` for the MMQ path (carve, with the MMQ buffers)
     PinnedUpload tok_up;
     core::PinnedRing up_ring;                // #1996: every other upload of the prompt path whose host side is pageable
 };

@@ -19,6 +19,10 @@
 #include <cstring>
 #include <random>
 #include <vector>
+#ifdef _WIN32   // xeno: MSVC has no POSIX setenv / unsetenv
+static int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+static int unsetenv(const char* name) { return _putenv_s(name, ""); }
+#endif
 
 namespace k = strata::kernels;
 

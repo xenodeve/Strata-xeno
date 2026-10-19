@@ -28,6 +28,9 @@
 #include <limits>
 #include <string>
 #include <vector>
+#ifdef _WIN32   // xeno: MSVC has no POSIX setenv / unsetenv
+static int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+#endif
 
 namespace {
 
