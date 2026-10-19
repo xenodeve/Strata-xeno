@@ -50,7 +50,6 @@
 
 namespace strata::prefill {
 namespace {
-#if defined(__HIPCC__)
 // Y's rows, written by an FP16-out GEMM as FP16 at the start of each FP32 row (ldc = 2 ldy halves), widened in place.
 // Float c overwrites halves 2c and 2c+1, so a row is walked from its end in blocks: a block's halves are read into
 // registers, the block syncs, then writes its floats - which only cover halves of blocks already read.
@@ -69,6 +68,7 @@ __global__ void widen_rows_f16(float* __restrict__ Y, int64_t n, int64_t ldy, in
         __syncthreads();
     }
 }
+#if defined(__HIPCC__)
 // BF16 weight rows -> FP16, saturated (bench/results/2026-10-04-rdna2-fp16-prompt: none leaves FP16's range)
 __global__ void bf16_to_f16_rows(const uint16_t* __restrict__ s, __half* __restrict__ d, int64_t n) {
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
@@ -714,6 +714,29 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     // few shapes - narrow ones, and the set moves with K - with CUBLAS_STATUS_INTERNAL_ERROR; a fixed algorithm keeps
     // a kernel that state does not break.  Only the shapes that fail are moved (the failing call itself is harmless);
     // the wide shapes, for which the fixed algorithms are markedly slower, stay on the default.
+    // #188 (opt-in STRATA_PF_GEMM_F16ACC=1): FP16 accumulate, FP16 out written into Y's own rows and widened there.
+    // On a GeForce card FP32 accumulate runs at half the tensor rate: 49 against 93 TFLOPS on the 5060 Ti at the
+    // prompt's shapes (gyro-record/gemm_bench).  The sums round to FP16 (and past 65504 overflow), so outputs move.
+    static const bool f16acc = [] { const char* v = std::getenv("STRATA_PF_GEMM_F16ACC"); return v && v[0] == '1'; }();
+    if (f16acc && beta == 0.0f) {
+        static const bool count_nf = std::getenv("STRATA_DBG_NAN") != nullptr;
+        const __half h1 = __float2half(1.0f), h0 = __float2half(0.0f);
+        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &h1, W,
+                        CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &h0, Y, CUDA_R_16F, (int) (2 * ldy),
+                        CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT),
+           "cublasGemmEx f16 accumulate");
+        widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, count_nf ? 1 : 0);
+        if (count_nf) {   // debug only: a sync per GEMM
+            unsigned long long bad = 0, zero_count = 0;
+            cudaStreamSynchronize((cudaStream_t) stream_);
+            if (cudaMemcpyFromSymbol(&bad, g_f16_nonfinite, sizeof bad) == cudaSuccess && bad != 0) {
+                std::fprintf(stderr, "strata prefill: STRATA_DBG_NAN: %llu non-finite FP16-accumulate outputs (T=%lld "
+                             "N=%lld K=%lld)\n", bad, (long long) T, (long long) N, (long long) K);
+                cudaMemcpyToSymbol(g_f16_nonfinite, &zero_count, sizeof zero_count);
+            }
+        }
+        return;
+    }
     const int64_t shape = ((int64_t) K << 32) | (uint32_t) N;
     cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT;
     for (int i = 0; i < f16_algo_n_; ++i)

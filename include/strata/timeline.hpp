@@ -52,6 +52,10 @@ void instant(const char* name, int64_t a = -1, int64_t b = -1);
 /// engine flushes after each request and at exit).  The file is a JSON array left open: each record ends with
 /// ",\n", and a reader closes it (tests/xeno/perf/timeline.py load()).
 void flush();
+/// #248: flush() on a writer thread of its own, so the caller does not wait for the disk (the serve loop after each
+/// request); records a "timeline flush" span (written by the next flush).  flush() from any thread waits for a write
+/// in progress (the exit path's last flush), so nothing is lost or written twice.
+void flush_async();
 
 /// A scoped span of the calling thread.
 struct Span {

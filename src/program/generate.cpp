@@ -153,6 +153,43 @@
 #include <vector>
 #include <memory>
 
+
+namespace {
+// #228 v3: the hot CPU experts' pin refresh (ArenaExpertSource::repin_hot) on a thread of its own while the server is
+// idle between requests - no window spins then, so cudaHostUnregister does not block.  finish() raises its stop flag
+// and joins (the refresh ends after its current registration change) and logs what it did.
+struct HotRepinWorker {
+    std::thread t;
+    std::atomic<bool> stop{false};
+    strata::core::ArenaExpertSource::RepinResult res{};
+    std::string err;
+    std::chrono::steady_clock::time_point t0{};
+    void start(strata::core::ArenaExpertSource& a) {
+        if (t.joinable()) return;
+        stop.store(false, std::memory_order_release);
+        res = {};
+        err.clear();
+        t0 = std::chrono::steady_clock::now();
+        t = std::thread([this, &a] { a.repin_hot(1024, res, err, &stop); });   // (stop ends it at the next request)
+    }
+    void finish() {
+        if (!t.joinable()) return;
+        const auto w0 = std::chrono::steady_clock::now();
+        stop.store(true, std::memory_order_release);
+        t.join();
+        const double idle_ms = std::chrono::duration<double, std::milli>(w0 - t0).count();
+        const double wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+        std::fprintf(stderr, "strata serve: hot pins refreshed while idle: %lld runs unpinned (%lld experts, %.2f GiB back "
+                             "to the OS), %lld experts pinned, %.1f ms of %.1f ms idle; the request waited %.2f ms%s%s\n",
+                     (long long) res.unpinned_runs, (long long) res.unpinned_experts,
+                     (double) res.returned_bytes / 1073741824.0, (long long) res.pinned_experts, res.ms, idle_ms, wait_ms,
+                     err.empty() ? "" : "; ", err.c_str());
+    }
+    ~HotRepinWorker() { if (t.joinable()) { stop.store(true); t.join(); } }
+};
+HotRepinWorker g_hot_repin;
+}  // namespace
+
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
@@ -1303,12 +1340,15 @@ struct LinkProbe {
 // #35 D7 (STRATA_PREFILL_WAVE=1 with the split layout): two prompt-path lanes of half the chunk each
 bool g_prefill_wave = false;
 bool wave_on(int64_t prefill_chunk) { return g_prefill_wave && prefill_chunk >= 4096; }   // lanes of 2,048+ tokens
-/// #35 D7: the wave's lane streams on this card: lane 0 (the chunk ahead) at the highest priority, lane 1 the lowest
+/// #35 D7: the wave's lane streams on this card (#188: both at the lowest priority by default)
 void make_lane_streams(cudaStream_t& lane0, cudaStream_t& lane1) {
     int least = 0, greatest = 0;
     cudaDeviceGetStreamPriorityRange(&least, &greatest);
-    cudaStreamCreateWithPriority(&lane0, cudaStreamNonBlocking, greatest);
-    cudaStreamCreateWithPriority(&lane1, cudaStreamNonBlocking, least);
+    // #188: STRATA_PREFILL_WAVE_PRIO (prefill.cpp's wave_lane_high): 1 neither high (the default), 0 lane 0 (D7's
+    // rule, the chunk ahead), 2 lane 1
+    static const int mode = [] { const char* e = std::getenv("STRATA_PREFILL_WAVE_PRIO"); return e ? std::atoi(e) : 1; }();
+    cudaStreamCreateWithPriority(&lane0, cudaStreamNonBlocking, mode == 0 ? greatest : least);
+    cudaStreamCreateWithPriority(&lane1, cudaStreamNonBlocking, mode == 2 ? greatest : least);
 }
 // #122: `kv_end` = the request's end position, which sizes the KV-streaming staging pool (0 = the worst case: the
 // boot-time chunk choice and lendable tail)
@@ -1446,7 +1486,10 @@ bool refill_lent(const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n
     constexpr int kBatch = 32;
     std::atomic<int64_t> io_requests{0}, io_bytes{0};
     const size_t stride = (size_t) tail_stride();   // the tail file's, and the model path reads at the same spacing
-    static uint8_t* bounce[2] = {nullptr, nullptr};   // pinned, allocated once (2 x batch x 1.38 MB)
+    // #188: three pinned buffers, so the reader thread keeps the drive busy while a batch is copied (2 x batch x
+    // 1.38 MB before: the read and the copies both ran at ~5 GB/s, each waiting on the other between batches)
+    constexpr int kBufs = 3;
+    static uint8_t* bounce[kBufs] = {nullptr, nullptr, nullptr};   // pinned, allocated once
     for (auto& b : bounce)
         if (b == nullptr && cudaHostAlloc((void**) &b, (size_t) kBatch * stride, cudaHostAllocDefault) != cudaSuccess) {
             cudaGetLastError();
@@ -1512,28 +1555,153 @@ bool refill_lent(const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n
         for (int j = 0; j < n; ++j) io_bytes += (int64_t) lay.blob_bytes(ls[(size_t) j]);
         return arena->read_experts(ls.data(), es.data(), n, bounce[buf], stride, e);
     };
+    // #188: one reader thread runs up to kBufs batches ahead; each batch's copies are queued on one stream and waited for
+    // once (the per-expert blocking cudaMemcpy synchronized 32 times a batch).  The same bytes into the same slots.
+    static cudaStream_t copy_stream = nullptr;
+    if (copy_stream == nullptr && cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        cudaGetLastError();
+        err = "the pack refill's copy stream could not be created";
+        return false;
+    }
+    const size_t n_batches = (from_pack.size() + kBatch - 1) / kBatch;
+    std::mutex q_mu;
+    std::condition_variable q_cv;
+    size_t q_read = 0, q_copied = 0;   // batches read into their buffer / copied out of it
+    bool q_failed = false, q_stop = false;
     std::string rerr;
-    if (!read_batch(0, 0, rerr)) { err = "pack refill: " + rerr; return false; }
-    for (size_t at = 0, k = 0; at < from_pack.size(); at += kBatch, ++k) {
-        const int buf = (int) (k & 1);
-        std::future<bool> next;
-        if (at + kBatch < from_pack.size()) next = std::async(std::launch::async, read_batch, at + kBatch, buf ^ 1, std::ref(rerr));
-        const size_t n = std::min<size_t>(kBatch, from_pack.size() - at);
+    std::thread reader([&] {
+        if (!use_file) {   // the model path: one batch at a time through the arena's reader
+            for (size_t b = 0; b < n_batches; ++b) {
+                {
+                    std::unique_lock<std::mutex> lk(q_mu);
+                    q_cv.wait(lk, [&] { return q_stop || b < q_copied + kBufs; });
+                    if (q_stop) return;
+                }
+                std::string e;
+                const bool ok = read_batch(b * kBatch, (int) (b % kBufs), e);
+                {
+                    std::lock_guard<std::mutex> lk(q_mu);
+                    if (ok) q_read = b + 1;
+                    else { q_failed = true; rerr = e; }
+                }
+                q_cv.notify_all();
+                if (!ok) return;
+            }
+            return;
+        }
+        // the tail file: the next batch's requests go to the drive before the current batch's last one completes (up
+        // to two batches in flight), so its queue does not run dry between batches
+        struct Batch { std::vector<std::pair<uint64_t, uint32_t>> pieces; std::vector<size_t> dst; size_t left = 0; double t0 = 0; };
+        std::vector<Batch> bt(n_batches);
+        const auto r0 = std::chrono::steady_clock::now();
+        auto fail = [&](const std::string& e) {
+            { std::lock_guard<std::mutex> lk(q_mu); q_failed = true; rerr = e; }
+            q_cv.notify_all();
+        };
+        size_t sub = 0, done = 0;
+        while (done < n_batches) {
+            while (sub < n_batches && sub < done + 2) {
+                {
+                    std::unique_lock<std::mutex> lk(q_mu);
+                    if (q_stop) return;
+                    if (sub >= q_copied + kBufs) {
+                        if (sub > done) break;   // wait for the batch in flight instead
+                        q_cv.wait(lk, [&] { return q_stop || sub < q_copied + kBufs; });
+                        if (q_stop) return;
+                    }
+                }
+                Batch& B = bt[sub];
+                const size_t at = sub * kBatch, nb = std::min<size_t>(kBatch, from_pack.size() - at);
+                size_t filled = 0;
+                for (size_t j = 0; j < nb;) {
+                    size_t k = j + 1;
+                    while (k < nb && from_pack[at + k].second == from_pack[at + k - 1].second + 1) ++k;   // a run of slots
+                    uint64_t off = g_tail.offset(from_pack[at + j].second), left = (uint64_t) (k - j) * g_tail.stride;
+                    while (left > 0) {
+                        const uint32_t len = (uint32_t) std::min<uint64_t>(left, 8ull << 20);
+                        B.pieces.emplace_back(off, len);
+                        B.dst.push_back(filled);
+                        off += len; filled += len; left -= len;
+                    }
+                    j = k;
+                }
+                B.left = B.pieces.size();
+                B.t0 = strata::timeline::enabled() ? strata::timeline::now_us() : 0;
+                uint8_t* buf = bounce[sub % kBufs];
+                for (size_t q = 0; q < B.pieces.size(); ++q) {
+                    std::string e;
+                    if (!g_tail.file.submit(B.pieces[q].first, buf + B.dst[q], B.pieces[q].second, (sub << 16) | q, e)) {
+                        fail(e);
+                        return;
+                    }
+                }
+                io_requests += (int64_t) B.pieces.size();
+                io_bytes += (int64_t) filled;
+                ++sub;
+            }
+            strata::platform::Completion c[64];
+            const int k = g_tail.file.wait(c, 64, -1);
+            for (int i = 0; i < k; ++i) {
+                if (c[i].tag == strata::platform::DirectFile::WAKE_TAG) continue;
+                const size_t b = (size_t) (c[i].tag >> 16), q = (size_t) (c[i].tag & 0xffff);
+                if (b >= n_batches || q >= bt[b].pieces.size() || !c[i].ok || c[i].bytes != bt[b].pieces[q].second) {
+                    fail("tail file: short read");
+                    return;
+                }
+                --bt[b].left;
+            }
+            while (done < sub && bt[done].left == 0) {
+                if (bt[done].t0 > 0)
+                    strata::timeline::complete("pack refill read", bt[done].t0, strata::timeline::now_us(), (int64_t) (done * kBatch));
+                { std::lock_guard<std::mutex> lk(q_mu); q_read = done + 1; }
+                q_cv.notify_all();
+                ++done;
+            }
+        }
+        read_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - r0).count();
+    });
+    auto stop_reader = [&] {
+        { std::lock_guard<std::mutex> lk(q_mu); q_stop = true; }
+        q_cv.notify_all();
+        reader.join();
+    };
+    for (size_t b = 0; b < n_batches; ++b) {
+        {
+            std::unique_lock<std::mutex> lk(q_mu);
+            q_cv.wait(lk, [&] { return q_failed || q_read > b; });
+            if (q_read <= b) {
+                lk.unlock();
+                stop_reader();
+                err = "pack refill: " + rerr;
+                return false;
+            }
+        }
+        const size_t at = b * kBatch, n = std::min<size_t>(kBatch, from_pack.size() - at);
+        const uint8_t* src_buf = bounce[b % kBufs];
         const auto tf0 = std::chrono::steady_clock::now();
         {
             strata::timeline::Span sp("pack refill H2D", (int64_t) at);
             for (size_t j = 0; j < n; ++j) {
                 const auto& [i, slot] = from_pack[at + j];
-                if (!cache.fill_slot_blocking(slot, bounce[buf] + j * stride, err, (int64_t) lay.blob_bytes(i / n_expert))) {
-                    if (next.valid()) next.wait();
+                if (!cache.fill_slot_async(slot, src_buf + j * stride, copy_stream, err, (int64_t) lay.blob_bytes(i / n_expert))) {
+                    cudaStreamSynchronize(copy_stream);
+                    stop_reader();
                     return false;
                 }
                 host_res[(size_t) i] = slot;
             }
+            const cudaError_t e = cudaStreamSynchronize(copy_stream);   // the buffer is free for the reader again
+            if (e != cudaSuccess) {
+                stop_reader();
+                err = std::string("pack refill: ") + cudaGetErrorString(e);
+                return false;
+            }
         }
         fill_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tf0).count();
-        if (next.valid() && !next.get()) { err = "pack refill: " + rerr; return false; }
+        { std::lock_guard<std::mutex> lk(q_mu); q_copied = b + 1; }
+        q_cv.notify_all();
     }
+    reader.join();
     const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_all).count();
     double gb = 0;
     for (const auto& pr : from_pack) gb += (double) lay.blob_bytes(pr.first / n_expert) / 1e9;
@@ -2005,6 +2173,7 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
 bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+    strata::timeline::Span restore_span("checkpoint restore", (int64_t) c.ids.size());   // #188: the request's resume point
     std::string error;
     if (strata::core::conversation_checkpoint_restore(c, ss, g, error)) return true;
     std::fprintf(stderr, "strata serve: checkpoint restore: %s\n", error.c_str());
@@ -6396,11 +6565,17 @@ int main(int argc, char** argv) {
         bytes.reserve(candidates.size());
         for (const auto& pair : candidates) bytes.push_back(pair.bytes);
         const bool secondary_compute = !o.secondary_stage_only && !o.cache_cpu_only;
+        // #228 STRATA_SECONDARY_STAGE_SLOTS=N (default 0): device-1 slots for CPU-missed experts the dispatch copies
+        // in per layer; carved here, before the tier below is sized from the display reserve
+        const int stage_slots = [] {
+            const char* v = std::getenv("STRATA_SECONDARY_STAGE_SLOTS");
+            return v != nullptr ? std::clamp(std::atoi(v), 0, strata::core::SecondaryRunner::kMaxStageSlots) : 0;
+        }();
         if (!secondary_runner.init(strata::kernels::cpu::MAXT,
                                    (int) (strata::kernels::cpu::MAXT * K),
                                    (int) g.n_embd, (int) g.n_ff, err,
                                    (uint64_t) o.secondary_free_floor_mib << 20,
-                                   o.secondary_profile_timing)) {
+                                   o.secondary_profile_timing, stage_slots, layout.max_blob)) {
             std::fprintf(stderr, "strata generate: secondary runner: %s\n", err.c_str());
             return 1;
         }
@@ -6557,6 +6732,34 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: secondary async launch: %s\n", err.c_str());
                 return 1;
             }
+        }
+        // #227 STRATA_SECONDARY_WINDOW_GRAPH=1 (default off): one 4070 graph per verify window, its layers started by
+        // host flags in mapped memory, instead of a graph launch per layer
+        if (const char* wg = std::getenv("STRATA_SECONDARY_WINDOW_GRAPH"); wg != nullptr && wg[0] == '1' && secondary_compute) {
+            if (const char* why = strata::core::SecondaryRunner::window_refusal(
+                    o.spec_split, !o.layer_split.empty(), o.pipeline_windows, o.batch > 0 ? o.batch_groups : 1,
+                    false)) {   // (--batch-groups auto is resolved into o.batch_groups by now)
+                std::fprintf(stderr, "strata generate: STRATA_SECONDARY_WINDOW_GRAPH=1 needs each layer dispatched once "
+                                     "per window, in order: %s\n", why);
+                return 1;
+            }
+            std::vector<strata::kernels::NativeExpertLayout> wl;
+            const auto& wlay = strata::kernels::cpu::expert_layout();
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                const auto& f = wlay.fmt[(size_t) l];
+                auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                if (f.had_d) L.had_block = f.had_block;   // as expert_pool_dispatch_multi builds it
+                if (f.had_gu) L.had_gu_block = f.had_block;
+                wl.push_back(L);
+            }
+            const auto tw = Clock::now();
+            if (!secondary_runner.enable_window(wl, err)) {
+                std::fprintf(stderr, "strata generate: 4070 window graph: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: 4070 window graph (#227): one launch per verify window, %lld layers, "
+                                 "token counts 1-%d captured in %.0f ms\n", (long long) g.n_layers,
+                         (int) strata::kernels::cpu::MAXT, std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
         }
         secondary_runner.set_breach_warn(o.secondary_breach_warn);   // xeno #208
         if (!secondary_runner.start_monitor(100, err, nullptr, nullptr, nullptr,
@@ -6954,6 +7157,27 @@ int main(int argc, char** argv) {
         drive.d.secondary_runner = &secondary_runner;
         drive.d.secondary_weights = &secondary_arena;
         drive.d.secondary_res = secondary_residency.data();
+        // #228 STRATA_PIN_CPU_HOT_MIB=N (default 0): page-lock the profile's hottest CPU-owned experts in place for the
+        // 4070 (device 1, not portable unless STRATA_PIN_CPU_HOT_PORTABLE=1), so a staged copy needs no host memcpy
+        const char* hot_v = std::getenv("STRATA_PIN_CPU_HOT_MIB");
+        const long long hot_mib = hot_v != nullptr ? std::atoll(hot_v) : 0;
+        if (hot_mib > 0 && srcp == &arena_src) {
+            const char* pv = std::getenv("STRATA_PIN_CPU_HOT_PORTABLE");
+            const bool portable = pv != nullptr && pv[0] == '1';
+            int prev = -1;
+            cudaGetDevice(&prev);
+            cudaSetDevice(1);
+            std::string pin_err;
+            const bool pinned_ok = arena_src.pin_cpu_hot(profile, (uint64_t) hot_mib << 20, portable, pin_err);
+            cudaSetDevice(prev);
+            const auto st = arena_src.hot_pin_stats();
+            std::fprintf(stderr, "strata generate: hot CPU experts page-locked for the 4070 (#228): %lld experts in %lld "
+                                 "runs, %.2f GiB (%s), in %.0f ms; %d staging slots%s%s\n",
+                         (long long) st.experts, (long long) st.runs, (double) st.bytes / 1073741824.0,
+                         portable ? "portable" : "device 1 only", st.ms, secondary_runner.stage_slots(),
+                         pin_err.empty() ? "" : "; ", pin_err.c_str());
+            if (!pinned_ok) return 1;
+        }
     }
     drive.d.jobs.resize((size_t) K);
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
@@ -9588,9 +9812,18 @@ int main(int argc, char** argv) {
                        ") - a GPU hang; on Windows the driver is then reset";
             return false;
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
+        // #188: the GDN-state buffer of the last evicted checkpoint, reused by the next save.  A fresh 118 MB std::vector
+        // costs its zero fill and first-touch page faults, 17.5-18.4 ms of a 36 ms save (gyro-record/gemm_bench/
+        // ckpt_bench.cu); a reused one of the same size resizes to nothing.  One is kept, so the RAM in use never passes
+        // what the cache held before that eviction.  STRATA_CKPT_REUSE=0 frees it at once (the A/B arm).
+        static const bool ckpt_reuse = [] { const char* v = std::getenv("STRATA_CKPT_REUSE"); return !v || v[0] != '0'; }();
+        std::vector<std::vector<uint8_t>> gdn_spare;
+        // synced: the caller has run gpu_sync_ok() (#188: the save then runs on a helper thread beside the refill)
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 bool synced = false) -> bool {
             ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
+            strata::timeline::Span ckpt_span("checkpoint save", L);   // #188: a conversation checkpoint after a part
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
                     c.used = ++check_clock;
@@ -9609,7 +9842,11 @@ int main(int argc, char** argv) {
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else {
-                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
+                if (!gdn_spare.empty()) {
+                    c.gdn = std::move(gdn_spare.back());
+                    gdn_spare.pop_back();
+                }
+                if ((!synced && !gpu_sync_ok()) || !checkpoint_save(c, ss, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
@@ -9650,6 +9887,8 @@ int main(int argc, char** argv) {
                     }
                 const size_t victim = strata::program::conv_cache::eviction_victim(
                     stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get());
+                if (ckpt_reuse && gdn_spare.empty() && checks[victim].stage_parts.empty())
+                    gdn_spare.push_back(std::move(checks[victim].gdn));
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
             return true;
@@ -11626,8 +11865,10 @@ int main(int argc, char** argv) {
                 // a request reads its prompt through every stage: the groups in flight finish first
                 if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return serve_fatal();
             } else if (!next_line(line)) {
+                g_hot_repin.finish();   // #228 v3
                 break;
             }
+            g_hot_repin.finish();   // #228 v3: a line came: the idle hot-pin refresh ends after its current change
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
             if (line.rfind("BSTOP ", 0) == 0) {
@@ -12732,6 +12973,7 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const auto t_ln = Clock::now();
+                strata::timeline::Span lend_span("lend slots", tokens);   // #188: the part's loan, before its batched read
                 // what this segment needs, capped by the configured chunk (STRATA_PREFILL_EQUAL=1: equal chunks, upstream
                 // PR #693; unset it is the fork's min(chunk, tokens rounded up to 256))
                 const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
@@ -13015,12 +13257,21 @@ int main(int argc, char** argv) {
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
+            // #188: the checkpoint after a batched part copies the GDN state (~118 MB on Gyro-M) to the host over the x4
+            // while the refill copies the lent experts the other way; it is joined before the next part reads (which
+            // moves that state) and before decode.  Measured 34-41 ms per save, on the host, before.
+            std::future<bool> ckpt_pending;
+            auto join_ckpt = [&]() -> bool { return !ckpt_pending.valid() || ckpt_pending.get(); };
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                    return serve_fatal();
+                }
+                if (!join_ckpt()) {
+                    std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return serve_fatal();
                 }
                 if (!win && !lend(to - at, n - 1, err)) {   // the last part ends at n - 1
@@ -13061,11 +13312,24 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at || to == shared_at || to == message_at || to == pin_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != shared_at &&
-                                                    to != pin_at)) {   // the tail kind leaves first
-                    std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
-                    return serve_fatal();
+                if (to == turn_at || to == root_at || to == shared_at || to == message_at || to == pin_at) {
+                    const bool as_tail = to == message_at && to != turn_at && to != root_at && to != shared_at &&
+                                         to != pin_at;   // the tail kind leaves first
+                    // #188: after a batched part the save goes beside the refill (one GPU, no pin to follow)
+                    // STRATA_CKPT_BESIDE=0 keeps the save on this thread before the refill (the A/B arm)
+                    static const bool beside_on = [] { const char* v = std::getenv("STRATA_CKPT_BESIDE"); return !v || v[0] != '0'; }();
+                    const bool beside = beside_on && !win && to != pin_at && stages.empty() && o.prompt_cache > 0;
+                    if (beside && gpu_sync_ok()) {
+                        int dev = 0;
+                        cudaGetDevice(&dev);   // the helper copies on its own stream on the session's card
+                        ckpt_pending = std::async(std::launch::async, [&checkpoint_at, to, as_tail, dev] {
+                            cudaSetDevice(dev);
+                            return checkpoint_at(to, nullptr, as_tail, true);
+                        });
+                    } else if (!checkpoint_at(to, nullptr, as_tail)) {
+                        std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                        return serve_fatal();
+                    }
                 }
                 if (to == pin_at && !pin_checkpoint(pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
@@ -13075,6 +13339,10 @@ int main(int argc, char** argv) {
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                return serve_fatal();
+            }
+            if (!join_ckpt()) {
+                std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                 return serve_fatal();
             }
             tr("prompt done (slots refilled)");
@@ -14245,7 +14513,8 @@ int main(int argc, char** argv) {
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             if (strata::timeline::enabled()) {
                 strata::timeline::complete("request", tl_req0, strata::timeline::now_us(), n, produced_n);
-                strata::timeline::flush();
+                // #248: on the timeline's writer thread - inline, a 55 MB flush to a slow drive held the next GEN 13 s
+                strata::timeline::flush_async();
             }
             // "12288 of 98179" when cancelled mid-read (#471), the rate from what was read
             char read_txt[64];
@@ -14269,6 +14538,21 @@ int main(int argc, char** argv) {
                              (long long) (arena_src.nvme_loads() - nvme0), private_commit_bytes() / 1073741824.0);
                 std::fprintf(stderr, "strata serve: adaptive swaps since start: 5060 %lld, 4070 %lld\n",
                              (long long) paired_swaps, (long long) sec_swaps);   // xeno #229
+                secondary_runner.end_window();   // #227: nothing of this request's last window waits on the 4070
+                if (secondary_runner.stage_slots() > 0 && arena_src.hot_pin_stats().runs > 0) {
+                    // #228 v3 STRATA_PIN_CPU_HOT_REPIN (default on with the hot pins): between requests no window
+                    // spins, so the runs the swaps emptied go back to RAM and the next CPU-owned experts are pinned
+                    // (on a thread of its own while the server is idle: it ends at the next request line, so a request
+                    // that comes at once waits for one registration change at most, not the ~0.1-0.2 s of the refresh)
+                    static const bool repin = [] { const char* v = std::getenv("STRATA_PIN_CPU_HOT_REPIN"); return v == nullptr || std::atoi(v) != 0; }();
+                    if (repin) g_hot_repin.start(arena_src);
+                }
+                if (secondary_runner.stage_slots() > 0) {   // #228
+                    const auto hp = arena_src.hot_pin_stats();
+                    std::fprintf(stderr, "strata serve: 4070 staged experts since start: %lld; hot pins %lld experts "
+                                         "(%.2f GiB), %lld of them GPU-owned now\n", (long long) drive.d.secondary_staged,
+                                 (long long) hp.experts, (double) hp.bytes / 1073741824.0, (long long) hp.gpu_owned);
+                }
                 if (dec_windows > 0) {   // #11 acceptance 7: per verify window and per emitted token
                     const double w = (double) dec_windows, tk = produced_n > 0 ? (double) produced_n : 1.0;
                     const double all = sum > 0 ? (double) sum : 1.0;
@@ -14485,7 +14769,7 @@ int main(int argc, char** argv) {
         // #35 D7: with the wave, two lanes of half the chunk, each with half the borrowed region and its own stream
         const bool wave = wave_on(o.prefill_chunk);
         cudaStream_t lane0_cs = (cudaStream_t) main_cs;
-        if (wave) make_lane_streams(lane0_cs, wave_cs);   // #35 D7: the chunk ahead (lane 0) goes first on this card
+        if (wave) make_lane_streams(lane0_cs, wave_cs);   // #35 D7: the two lanes' streams (#188: equal priority)
         const int64_t lane_chunk = wave ? strata::prefill::Prefill::wave_lane_chunk(o.prefill_chunk) : o.prefill_chunk;
         uint64_t lane_bytes = borrow_bytes;
         if (wave && borrow != nullptr) {
@@ -15691,6 +15975,18 @@ int main(int argc, char** argv) {
         if (rounds > 0 && o.secondary_expert_mib > 0)
             std::printf("%-24s launch %.3f  wait %.3f ms/round (wait > 0: the 4070 SUPER finished after the CPU pool)\n",
                         "secondary timing", secondary_runner.ms_launch() / rounds, secondary_runner.ms_wait() / rounds);
+        secondary_runner.end_window();   // #227
+        if (rounds > 0 && secondary_runner.window_on())
+            std::printf("%-24s %llu windows, one 4070 launch each\n", "secondary window graph",
+                        (unsigned long long) secondary_runner.windows());
+        if (rounds > 0 && secondary_runner.stage_slots() > 0)   // #228
+            std::printf("%-24s %lld experts (%.2f per round); hot pins %lld experts, %lld of them GPU-owned now\n",
+                        "secondary staged", (long long) drive.d.secondary_staged,
+                        (double) drive.d.secondary_staged / rounds, (long long) arena_src.hot_pin_stats().experts,
+                        (long long) arena_src.hot_pin_stats().gpu_owned);
+        if (double wb = 0, wg = 0, wc = 0; rounds > 0 && secondary_runner.window_cost(wb, wg, wc))   // #228 v3
+            std::printf("%-24s base %.1f + %.1f per resident group + %.1f per staged blob us (fitted per layer)\n",
+                        "secondary window cost", wb, wg, wc);
         if (rounds > 0 && o.secondary_async_launch)
             std::printf("%-24s helper enqueue %.3f  finish waited for it %.3f ms/round\n", "secondary async",
                         secondary_runner.ms_async_enqueue() / rounds, secondary_runner.ms_async_wait() / rounds);

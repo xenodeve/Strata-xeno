@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def records(path: Path) -> list[dict]:
+    timeline.flush()   # #248: the records are written by the timeline's writer thread
     text = path.read_text(encoding="utf-8").rstrip().rstrip(",")
     return json.loads(text + "\n]")
 
@@ -52,6 +53,28 @@ class ServerTimeline(unittest.TestCase):
         self.assertTrue(t0 <= xs[0]["ts"] <= t1)
         self.assertEqual(sum(1 for r in rs if r.get("name") == "thread_name"), 1)
         self.assertEqual(sum(1 for r in rs if r["ph"] == "i"), 1)
+
+    def test_a_record_does_not_wait_for_the_disk(self):
+        # #248: on a slow drive (F:, a USB stick) every synchronous append held the request thread - 2.3 s before one
+        # request's queue wait.  A record is handed to the writer thread; the caller returns at once.
+        import builtins
+        real_open = builtins.open
+
+        def slow_open(*args, **kwargs):
+            if str(args[0]) == str(self.path):
+                time.sleep(0.4)
+            return real_open(*args, **kwargs)
+
+        builtins.open = slow_open
+        try:
+            t0 = time.perf_counter()
+            for i in range(3):
+                timeline.complete("r", timeline.now_us(), timeline.now_us(), i)
+            took = time.perf_counter() - t0
+        finally:
+            builtins.open = real_open
+        self.assertLess(took, 0.2)
+        self.assertEqual([r["args"]["a"] for r in records(self.path) if r["ph"] == "X"], [0, 1, 2])
 
     def test_off_writes_nothing(self):
         timeline.configure(None)

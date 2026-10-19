@@ -37,11 +37,59 @@ public:
     SecondaryRunner(const SecondaryRunner&) = delete;
     SecondaryRunner& operator=(const SecondaryRunner&) = delete;
 
+    /// #228: `stage_slots` (0..kMaxStageSlots) device-1 slots of `stage_blob_bytes` each, carved in the workspace, for
+    /// experts that are not resident on the 4070: launch() copies them in from pinned host memory first.
+    static constexpr int kMaxStageSlots = 16;
     bool init(int max_tokens, int max_entries, int n_embd, int n_ff, std::string& err,
-              uint64_t free_floor_bytes = 2560ull << 20, bool profile_timing = false);
+              uint64_t free_floor_bytes = 2560ull << 20, bool profile_timing = false,
+              int stage_slots = 0, uint64_t stage_blob_bytes = 0);
+    /// `selected_slots[i]` is a resident slot (>= 0), -1 (not on the 4070), or #228 a staged blob -(s + 2): staging slot
+    /// s, filled from `staged[s]` (`staged_bytes` each, pinned host memory for an asynchronous copy) before the kernels.
     bool launch(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
                 const float* x, const int32_t* selected_slots, int n_tokens, int k,
-                std::string& err);
+                std::string& err, const uint8_t* const* staged = nullptr, int n_staged = 0,
+                size_t staged_bytes = 0);
+    /// #228: staging slots launch() and launch_layer() take (0 when none were carved, or once the async launcher is
+    /// on: refused there).  In the window graph (v2) the layer's segment fetches them itself from mapped host memory.
+    int stage_slots() const { return async_ ? 0 : stage_slots_; }
+
+    /// #227 STRATA_SECONDARY_WINDOW_GRAPH=1: one CUDA graph per verify window instead of one launch per layer.  The
+    /// graph (one per token count, captured here for 1..max_tokens) holds a segment per layer: wait until the layer's
+    /// go flag (mapped host memory) is raised, copy its plan and activations from that layer's pinned buffers, run the
+    /// experts, copy the claimed rows to mapped host memory and raise its done flag.  launch_layer() then makes no CUDA
+    /// call except at layer 0 (the graph launch); finish() spins on the done flag.  `layouts` has one entry per layer
+    /// (its formats and folding, as the dispatch builds them).  Call once, after init(), before any launch.
+    bool enable_window(const std::vector<kernels::NativeExpertLayout>& layouts, std::string& err);
+    /// The window graph needs every layer dispatched once per window, in order.  The reason it cannot run with these
+    /// options (a split verify window dispatches each layer twice; a layer split, pipelined windows and batch groups
+    /// interleave two windows' layers), or null when it can.
+    static const char* window_refusal(bool spec_split, bool layer_split, int pipeline_windows, int batch_groups,
+                                      bool batch_groups_auto);
+    bool window_on() const { return window_; }
+    /// The window mode's per-layer publish: every layer of every window, claimed or not (`selected_slots` all -1 when
+    /// not; a layer that is not published is filled with an empty plan at the next layer 0 or end_window).
+    /// #228 v2: `staged_dev[s]` (s < n_staged) is the device pointer of a page-locked, mapped host blob of
+    /// `staged_bytes` (16-byte aligned) for slot code -(s + 2); the segment fetches it into staging slot s first.
+    bool launch_layer(int layer, const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
+                      const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err,
+                      const uint8_t* const* staged_dev = nullptr, int n_staged = 0, size_t staged_bytes = 0);
+    /// Publish an empty plan for every layer of the open window not published yet, so its graph runs to the end and
+    /// no segment keeps spinning on the display card (between requests, before teardown).
+    void end_window();
+    /// #267: raise every go flag past any count, so no segment of a window graph spins after the engine ends.
+    void release_window();
+    /// #245: open the next window for `n_tokens` before its layer 0 is dispatched: close the last window and hand the
+    /// graph launch to a helper thread on device 1, so the ~0.6 ms cudaGraphLaunch overlaps the host's wait for layer
+    /// 0's router instead of sitting between layer 0's plan and its CPU pool.  launch_layer(0) then publishes into the
+    /// open window without launching.  On by default with the window graph; STRATA_SECONDARY_WINDOW_EARLY=0 keeps the
+    /// launch at layer 0 (for A/B).  A failed launch is reported by the next launch_layer or finish.
+    void begin_window(int n_tokens);
+    uint64_t windows() const { return win_seq_; }
+    /// #228 v3: the window segment's cost on the 4070, fitted from its own %globaltimer stamps over the claimed layers
+    /// (us = base + group * resident groups + copy * staged blobs, exponentially weighted); false until enough
+    /// layers were seen (or STRATA_SECONDARY_STAGE_LIVE=0).
+    bool window_cost(double& base, double& group, double& copy) const;
+    uint64_t staged_experts() const { return staged_experts_; }
     bool finish(float* output, std::string& err);
     /// Opt-in: from now on launch() hands its enqueue to a helper thread that stays on device 1 (pinned to
     /// `core` when >= 0), so the host thread goes straight on to the CPU pool; finish() first waits for the
@@ -76,11 +124,15 @@ public:
 
 private:
     bool launch_now(const kernels::NativeExpertLayout& layout, const SecondaryArena& weights,
-                    const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err);
+                    const float* x, const int32_t* selected_slots, int n_tokens, int k, std::string& err,
+                    const uint8_t* const* staged = nullptr, int n_staged = 0, size_t staged_bytes = 0);
     void launcher_loop(int core);
     void stop_launcher();
     void close();
     void record_free(uint64_t bytes);
+    bool capture_window(int n_tokens, std::string& err);
+    bool publish_empty(int layer, std::string& err);
+    bool wait_consumed(int layer, std::string& err);
     SecondaryArena workspace_;
     int max_tokens_ = 0, max_entries_ = 0, n_embd_ = 0, n_ff_ = 0;
     void* stream_ = nullptr;
@@ -92,8 +144,59 @@ private:
     float* host_out_ = nullptr;
     uint8_t* host_meta_ = nullptr;
     size_t meta_start_off_ = 0, meta_count_off_ = 0, meta_dst_off_ = 0, meta_tok_off_ = 0;
+    size_t meta_stage_n_off_ = 0, meta_stage_src_off_ = 0, meta_stage_bytes_off_ = 0;   ///< #228 v2 (window plans)
     size_t meta_bytes_ = 0;
     float* device_x_ = nullptr;
+    uint8_t* device_stage_ = nullptr;   ///< #228: stage_slots_ x stage_stride_ bytes
+    int32_t* device_stage_n_ = nullptr;                ///< #228 v2: the layer plan's staged count, sources and bytes
+    unsigned long long* device_stage_src_ = nullptr;
+    long long* device_stage_bytes_ = nullptr;
+    int stage_slots_ = 0;
+    uint64_t stage_stride_ = 0;
+    uint64_t staged_experts_ = 0;
+    // #227 window graph
+    bool window_ = false;
+    int win_layers_ = 0, win_next_ = 0, win_tokens_ = 0, win_layer_ = -1;
+    uint32_t win_seq_ = 0;
+    std::atomic<bool> win_released_{false};   ///< release_window ran: nothing is launched or published after it
+    // #241 / #228 v3: per layer the segment's %globaltimer start and end (mapped), and the fit of its cost
+    volatile unsigned long long* host_wstamp_ = nullptr;
+    unsigned long long* dev_wstamp_ = nullptr;
+    int win_groups_ = 0, win_staged_ = 0;     ///< the published layer's resident groups and staged blobs
+    double fit_[3][4] = {};                   ///< decayed normal equations of [1, groups, staged] -> us (+ the rhs)
+    uint64_t fit_n_ = 0;
+    bool fit_live_ = true;
+    double fit_cost_[3] = {0, 0, 0};          ///< solved every 256 layers
+    bool fit_ok_ = false;
+    long long tl_off_ns_ = 0;                 ///< steady_clock ns - %globaltimer ns (the smallest seen): the lane's clock
+    bool tl_off_set_ = false;
+    void window_sample(int layer, std::chrono::steady_clock::time_point seen);
+    // #245 begin_window: a helper thread on device 1 launches each window's graph, in the order the windows open
+    bool win_early_ = false;                  ///< STRATA_SECONDARY_WINDOW_EARLY (default on with the window graph)
+    uint32_t win_opened_ = 0;                 ///< win_seq_ of the window begin_window opened and layer 0 has not taken
+    std::thread win_launcher_;
+    std::mutex win_mu_;
+    std::condition_variable win_cv_;
+    int win_req_tokens_ = 0;                  ///< (win_mu_) the token count of a launch not yet taken, 0 when none
+    uint32_t win_req_seq_ = 0;                ///< (win_mu_) its window
+    bool win_stop_ = false;                   ///< (win_mu_)
+    uint32_t win_requested_ = 0;              ///< host thread: the last window handed to the helper
+    std::atomic<uint32_t> win_launched_{0};   ///< the last window the helper launched (or failed to)
+    std::atomic<bool> win_launch_failed_{false};
+    std::string win_launch_err_;              ///< written before win_launch_failed_ is raised
+    void win_launcher_loop();
+    void stop_win_launcher();
+    bool wait_win_launched(std::string& err);
+    std::vector<kernels::NativeExpertLayout> win_layout_;
+    uint8_t* host_wmeta_ = nullptr;      ///< win_layers_ x meta_bytes_, pinned
+    float* host_wx_ = nullptr;           ///< win_layers_ x max_tokens_ x n_embd_, pinned
+    float* host_wout_ = nullptr;         ///< max_entries_ x n_embd_, mapped
+    float* dev_wout_ = nullptr;
+    volatile uint32_t* host_go_ = nullptr;     ///< win_layers_, mapped
+    volatile uint32_t* host_done_ = nullptr;   ///< win_layers_, mapped
+    uint32_t *dev_go_ = nullptr, *dev_done_ = nullptr;
+    uint32_t* dev_count_ = nullptr;      ///< win_layers_, device: how often each segment has run
+    std::vector<void*> win_graph_;       ///< per token count
     // APR (prism.hadamard): this device's copies of the gate/up (n_embd) and down (n_ff) sign vectors, nullptr for
     // identity signs or a pack without folded experts (hadamard_device_signs owns them)
     const float* device_sx_ = nullptr;

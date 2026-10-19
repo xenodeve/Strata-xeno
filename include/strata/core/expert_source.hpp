@@ -175,6 +175,12 @@ public:
     /// Plan v0.3 P5: whether `blob(layer, expert)` lies in page-locked, CUDA-registered memory, so an
     /// asynchronous host-to-device copy can DMA it directly (no staging copy on the CPU).
     virtual bool pinned(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// #228: the host bytes of a CPU-owned expert that the 4070 can copy asynchronously (page-locked for device 1 by
+    /// pin_cpu_hot), else nullptr.  Counts no use, unlike blob().
+    virtual const uint8_t* stage_blob(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+    /// #228 v2: the same blob's device-1 pointer (the pages are registered mapped), for the 4070's window graph to
+    /// fetch itself; nullptr when it has none.
+    virtual const uint8_t* stage_blob_device(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
 
     /// Called once before the first expert of a layer.  A source that reads from disk wants to start the read
     /// here so it overlaps the quantisation, and a prefetching source in Phase 3 wants the ids.
@@ -285,7 +291,10 @@ public:
     void enable_stats(int64_t n_layers);
     bool stats_on() const { return stats_on_; }
     void stats_window_start() { gen_.fetch_add(1, std::memory_order_relaxed); }
-    void stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num = 0);
+    /// `sec_res` (#228 v3, STRATA_LOOKAHEAD_STATS=2): also leave out the 4070-resident experts, so the predictor is
+    /// scored against the CPU misses only
+    void stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num = 0,
+                     const int32_t* sec_res = nullptr);
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
     double busy_ms() const { return (double) busy_us_.load(std::memory_order_relaxed) / 1000.0; }
@@ -475,6 +484,7 @@ struct ExpertDispatch {
     const SecondaryArena* secondary_weights = nullptr;
     const int32_t* secondary_res = nullptr; ///< n_layers x n_expert, -1 when not resident
     int64_t secondary_entries = 0, secondary_groups = 0;
+    int64_t secondary_staged = 0;   ///< #228: CPU-missed experts the dispatch staged on the 4070 (STRATA_SECONDARY_STAGE_SLOTS)
     /// Verify-window routed entries by where they were computed: [0] primary VRAM hit, [1] secondary (4070 SUPER)
     /// tier, [2] GPU PCIe read, [3] CPU pool.  Their sum is every routed (token, expert) entry of those windows.
     int64_t tier_entries[4] = {0, 0, 0, 0};
@@ -1051,6 +1061,24 @@ public:
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     int64_t reads() const { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
+    const uint8_t* stage_blob(int64_t layer, int64_t expert) const override;
+    const uint8_t* stage_blob_device(int64_t layer, int64_t expert) const override;
+    /// #228 STRATA_PIN_CPU_HOT_MIB: page-lock, in place, the host-owned experts of `ranked` (layer, expert; best first)
+    /// up to `budget_bytes`, for the device current at the call (device 1; `portable` registers for every device).
+    /// Blobs that share a page are registered as one run.  After the load (never while pages are written); refused
+    /// in capacity mode (the slab moves experts).  A release_host_copy (a swap to a GPU tier) keeps the pages and only
+    /// clears the expert's bit (`gpu_owned` counts those now); publish_host_copy sets it again.  Unregistered at close.
+    struct HotPinStats { int64_t experts = 0, runs = 0, gpu_owned = 0; uint64_t bytes = 0; double ms = 0; };
+    bool pin_cpu_hot(const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t budget_bytes, bool portable,
+                     std::string& err);
+    /// #228 v3: between requests only (no GPU work may wait on a host flag: cudaHostUnregister waits for every
+    /// device).  Unregisters the hot runs whose experts all went to a GPU and decommits them (their RAM comes back),
+    /// then pins the next CPU-owned experts of pin_cpu_hot's ranking up to its budget, at most `max_new_runs` runs.
+    struct RepinResult { int64_t unpinned_runs = 0, unpinned_experts = 0, pinned_experts = 0; uint64_t returned_bytes = 0;
+                         double ms = 0; };
+    /// `stop` (may be null): checked before every registration change; the refresh ends early when it is raised.
+    bool repin_hot(int max_new_runs, RepinResult& out, std::string& err, const std::atomic<bool>* stop = nullptr);
+    HotPinStats hot_pin_stats() const { return hot_stats_; }
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     void prefetch(int64_t layer, int64_t expert) override;
     uint64_t release(int64_t layer, int64_t expert) override;
@@ -1162,6 +1190,20 @@ private:
         std::vector<int32_t> idle;         ///< committed, no expert in it
         std::vector<int32_t> cold;         ///< decommitted again (reused before `next` grows)
     };
+    // #228 pin_cpu_hot: registered page runs; per expert its run (-1 none) and a bit the dispatch reads without the lock
+    struct HotRun { uint8_t* base = nullptr; size_t bytes = 0; int32_t layer = 0, e0 = 0, e1 = 0; uint8_t* dev = nullptr; };
+    std::vector<HotRun> hot_runs_;
+    std::vector<int32_t> hot_run_of_;
+    std::unique_ptr<std::atomic<uint8_t>[]> hot_;
+    HotPinStats hot_stats_{};
+    int hot_device_ = 1;
+    std::vector<std::pair<int32_t, int32_t>> hot_rank_;   ///< pin_cpu_hot's ranking, for repin_hot
+    uint64_t hot_budget_ = 0;
+    bool hot_portable_ = false;
+    size_t hot_rank_at_ = 0;                              ///< repin_hot resumes the ranking here
+    std::vector<uint8_t> homing_;   ///< (host_mu_) recommit_host_copy .. publish_host_copy: its pages are being filled
+    void unpin_hot_run(size_t idx);   ///< the expert's run, if any: bits cleared, then unregistered (close only)
+    void unpin_all_hot();
     bool slab_ = false;
     std::vector<SlabClass> classes_;
     std::vector<int16_t> class_of_layer_;

@@ -1198,6 +1198,81 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     check("wait_flag_ge");
 }
 
+namespace {
+__global__ void window_wait_kernel(const volatile uint32_t* go, const uint32_t* count, unsigned long long* stamp) {
+    const uint32_t want = *count + 1u;
+    while (*go < want) strata_spin_pause();
+    __threadfence_system();
+    if (stamp != nullptr) {   // #241: the segment's start
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        *(volatile unsigned long long*) stamp = t;
+    }
+}
+__global__ void window_signal_kernel(volatile uint32_t* done, uint32_t* count, unsigned long long* stamp) {
+    const uint32_t c = *count + 1u;
+    *count = c;
+    if (stamp != nullptr) {   // #241: the segment's end, visible before its done flag
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        *(volatile unsigned long long*) stamp = t;
+    }
+    __threadfence_system();
+    *done = c;
+    __threadfence_system();
+}
+__global__ void window_rows_kernel(const float4* __restrict__ src, float4* dst, const int32_t* start,
+                                   const int32_t* n_groups, int n4_per_row, int max_rows) {
+    const int groups = *n_groups;
+    int rows = groups > 0 ? start[groups] : 0;
+    rows = rows < max_rows ? rows : max_rows;
+    const long long n4 = (long long) rows * n4_per_row;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (long long) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+    __threadfence_system();
+}
+}  // namespace
+
+void window_wait(const uint32_t* go, const uint32_t* count, void* stream, unsigned long long* stamp) {
+    window_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(go, count, stamp);
+    check("window_wait");
+}
+
+void window_signal(uint32_t* done, uint32_t* count, void* stream, unsigned long long* stamp) {
+    window_signal_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(done, count, stamp);
+    check("window_signal");
+}
+
+namespace {
+// blockIdx.y = the staged blob, blockIdx.x strides its 16-byte words; 16 blocks a blob read a 1.3 MB expert over x16
+// at 57-63 us for 1-4 blobs (gyro-record/h2d/zc4070.cu, 2026-10-17), the rate of cudaMemcpyAsync (55-56 us)
+__global__ void window_fetch_kernel(const int32_t* n, const unsigned long long* src, const long long* bytes,
+                                    uint8_t* dst, unsigned long long stride) {
+    if ((int) blockIdx.y >= *n) return;
+    const uint4* s = (const uint4*) src[blockIdx.y];
+    uint4* d = (uint4*) (dst + stride * blockIdx.y);
+    const long long b = *bytes, words = b / 16;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < words; i += (long long) gridDim.x * blockDim.x)
+        d[i] = s[i];
+    if (blockIdx.x == 0 && threadIdx.x < b - words * 16)
+        ((uint8_t*) d)[words * 16 + threadIdx.x] = ((const uint8_t*) s)[words * 16 + threadIdx.x];
+}
+}  // namespace
+
+void window_fetch_blobs(const int32_t* n, const unsigned long long* src, const long long* bytes, uint8_t* dst,
+                        unsigned long long stride, int max_slots, void* stream) {
+    window_fetch_kernel<<<dim3(16, (unsigned) max_slots), 256, 0, (cudaStream_t) stream>>>(n, src, bytes, dst, stride);
+    check("window_fetch_blobs");
+}
+
+void window_rows_to_host(const float* src, float* dst_mapped, const int32_t* start, const int32_t* n_groups,
+                         int n_embd, int max_rows, void* stream) {
+    // a few blocks: a 2,048-float row is 512 float4s; 40 rows of a 4-token window are 20K float4s
+    window_rows_kernel<<<32, 256, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst_mapped, start,
+                                                              n_groups, n_embd / 4, max_rows);
+    check("window_rows_to_host");
+}
+
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
                           int n_tok, int64_t n, int code_bits, int code_bias, int group_elems, uint64_t row_codes,
                           uint64_t row_groups, float* out, void* stream) {

@@ -30,6 +30,14 @@
 namespace strata::kernels::cpu {
 
 namespace {
+// A sleeping worker waits on `epoch_` itself (std::atomic::wait: WaitOnAddress on Windows, a futex on Linux), so the
+// publish's notify_all lets every sleeper out at once.  Before, they slept on sleep_cv_ under one mutex and left it one
+// at a time: in a decode round the k-th worker out woke ~4 us after the (k-1)-th (30 us first, 88 us twelfth,
+// pool_wake.py on tl-227-TW).  STRATA_POOL_WAKE_CV=1 keeps the condition variable (the A/B arm).
+bool wake_on_address() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_POOL_WAKE_CV"); return e == nullptr || *e != '1'; }();
+    return v;
+}
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
@@ -476,6 +484,13 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int spin_us, Po
         n_ = (int) topo_.worker_cores.size();
     }
     if (n_ < 1) n_ = 1;
+    // #220 A5: the workers take topo_.worker_cores in order, the P-cores first (the host, when it took a core, the
+    // first P-core); with no pinning the classes are unknown and every worker counts as a P-core
+    n_fast_workers_ = n_;
+    if (pin && topo_.is_hybrid)
+        n_fast_workers_ = (std::min)(n_, (std::max)(0, topo_.p_cores - (topo_.host_core >= 0 ? 1 : 0)));
+    if (const char* v = std::getenv("STRATA_POOL_ECORE_SKIP_TAIL"); v != nullptr && *v && n_fast_workers_ < n_)
+        ecore_skip_tail_ = (std::max)(0, std::atoi(v));
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
@@ -515,9 +530,16 @@ void ExpertPool::publish() {
     rest_.store(false, std::memory_order_relaxed);   // ordered before the epoch bump below (seq_cst)
     if (timeline::enabled()) publish_us_.store(timeline::now_us(), std::memory_order_relaxed);
     epoch_.fetch_add(1, std::memory_order_seq_cst);
-    if (sleepers_.load(std::memory_order_seq_cst) != 0) {
-        std::lock_guard<std::mutex> lk(sleep_mu_);
-        sleep_cv_.notify_all();
+    if (const uint32_t asleep = sleepers_.load(std::memory_order_seq_cst); asleep != 0) {
+        // #249: the host's own time in the wake call (WakeByAddressAll readies the sleepers one by one on this thread)
+        const double tn0 = timeline::enabled() ? timeline::now_us() : 0;
+        if (wake_on_address()) {
+            epoch_.notify_all();   // the sleepers compare epoch_ inside wait(), so none can miss this bump
+        } else {
+            std::lock_guard<std::mutex> lk(sleep_mu_);
+            sleep_cv_.notify_all();
+        }
+        if (tn0 > 0) timeline::complete("pool notify", tn0, timeline::now_us(), (int64_t) asleep);
     }
 }
 
@@ -553,6 +575,17 @@ void ExpertPool::worker(int id) {
             if ((++spins & 1023u) != 0) continue;
             if (!rest_.load(std::memory_order_relaxed) &&
                 std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
+            if (wake_on_address()) {
+                // the same lost-wakeup argument as publish(): sleepers_++ then the compare inside wait(); stop_ is
+                // always followed by a publish, so waiting on epoch_ alone covers it
+                wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
+                sleepers_.fetch_add(1, std::memory_order_seq_cst);
+                while (epoch_.load(std::memory_order_seq_cst) == seen && !stop_.load(std::memory_order_relaxed))
+                    epoch_.wait(seen, std::memory_order_seq_cst);
+                sleepers_.fetch_sub(1, std::memory_order_relaxed);
+                wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
+                continue;
+            }
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
@@ -584,12 +617,18 @@ void ExpertPool::worker(int id) {
     }
 }
 
-int ExpertPool::claim(uint32_t epoch) {
+int ExpertPool::claim(uint32_t epoch, bool ecore) {
     uint64_t h = head_.load(std::memory_order_acquire);
     for (;;) {
         if ((uint32_t) (h >> 32) != epoch) return -1;               // not the batch this thread woke for
         const uint32_t n = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
         if (i >= n) return -1;                                       // exhausted
+        // #220 A5: an E-core leaves the batch's tail to the P-cores; they (and the host) claim until `n`, so every
+        // task is still claimed and `done_` still reaches `n`
+        if (ecore && !may_claim(i, n, true, ecore_skip_tail_, fast_threads())) {
+            ecore_skips_.fetch_add(1, std::memory_order_relaxed);
+            return -1;
+        }
         if (head_.compare_exchange_weak(h, h + 1, std::memory_order_acq_rel, std::memory_order_acquire))
             return (int) i;
     }
@@ -652,7 +691,7 @@ void ExpertPool::wait_done(int n) {
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
     for (;;) {
-        const int ci = claim(epoch);
+        const int ci = claim(epoch, id >= n_fast_workers_);
         if (ci < 0) break;
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);

@@ -689,6 +689,27 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
     return true;
 }
 
+bool ExpertCache::fill_slot_async(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
+#if defined(STRATA_USE_HIP)
+    (void) stream;
+    return fill_slot_blocking(slot, host_blob, err, bytes);
+#else
+    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    uint8_t* dst = device_slot(slot);
+    if (dst == nullptr || host_blob == nullptr) {
+        err = dst == nullptr ? "ExpertCache::fill_slot_async: slot outside the arena" : "ExpertCache::fill_slot_async: the host blob is null";
+        return false;
+    }
+    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::fill_slot_async: ") + cudaGetErrorString(e);
+        return false;
+    }
+    ++fills_;
+    return true;
+#endif
+}
+
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);

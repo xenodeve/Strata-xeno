@@ -243,6 +243,24 @@ def test_one_layer_is_laid_out_across_every_lane(tmp_path):
     assert (w[0]["t0"], w[0]["t1"], w[0]["busy"], w[0]["n"]) == (pytest.approx(10), pytest.approx(121), pytest.approx(5), 3)
 
 
+
+def test_the_4070_window_segments_are_a_gpu_lane_of_their_layer(tmp_path):
+    # #241: in window mode (#227) the 4070 records one "4070 segment" per layer on its own lane, a = the layer, b =
+    # resident groups * 1000 + staged blobs (SecondaryRunner::window_sample); it must read as GPU work of that layer
+    # beside the host's spans, as the per-layer lane did: busy 0.10 + 0.08 = 0.18 ms, layer 1's segment after its
+    # cpu pool started
+    lanes = {23: "gpu1 4070 window"}
+    ev = [{"ph": "M", "pid": PID, "tid": t, "name": "thread_name", "args": {"name": n}} for t, n in lanes.items()]
+    ev += [X(23, "4070 segment", 0.0, 0.10, a=0, b=12003), X(23, "4070 segment", 0.50, 0.58, a=1, b=8000),
+           X(1, "cpu pool", 0.45, 0.80, a=1, b=3)]
+    tl = timeline.load(write(tmp_path, ev))
+    assert timeline.utilisation(tl)["gpu1 4070 window"]["busy_ms"] == pytest.approx(0.18)
+    assert timeline.gpu_phase_report(tl)["gpu1 4070 window"] == {"4070 segment": pytest.approx(0.18)}
+    w = timeline.layer_window(tl, 1)
+    assert [(r["lane"], r["name"]) for r in w] == [("main", "cpu pool"), ("gpu1 4070 window", "4070 segment")]
+    assert [s.b for s in tl.lane("gpu1 4070 window")] == [12003, 8000]
+
+
 def wave_trace():
     """#178: two wave lanes reading at once (lane 1 on "main", lane 2 on "prompt wave lane 2", the engine's names), each with its own CUDA0
     compute lane, and the split issuer feeding the 4070's copy engine; its own lanes, not LANES."""

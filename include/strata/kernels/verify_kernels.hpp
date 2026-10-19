@@ -41,6 +41,21 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// #227 the 4070's window graph: a layer's segment waits until *go (mapped host memory) reaches *count + 1, where
+/// *count (device memory) is how many times this segment has run - so the value is not baked into the graph and a
+/// graph replayed every window needs no parameter update.  window_signal then advances *count and writes it to
+/// *done (mapped) after a system fence.  window_rows_to_host copies the layer's claimed rows (start[*n_groups] of
+/// them, n_embd floats each) from device to mapped host memory, then fences.
+/// `stamp` (#241, may be null): the GPU's %globaltimer (ns) once the go flag is seen / just before the done flag.
+void window_wait(const uint32_t* go, const uint32_t* count, void* stream, unsigned long long* stamp = nullptr);
+void window_signal(uint32_t* done, uint32_t* count, void* stream, unsigned long long* stamp = nullptr);
+void window_rows_to_host(const float* src, float* dst_mapped, const int32_t* start, const int32_t* n_groups,
+                         int n_embd, int max_rows, void* stream);
+/// #228 v2: the window segment's staged experts.  Copies *n blobs of *bytes each from src[s] (device pointers of
+/// page-locked, mapped host memory; 16-byte aligned) to dst + s * stride, for s < *n <= max_slots.  The counts are read
+/// from device memory (the layer's plan), so the captured graph needs no update; *n = 0 costs one empty launch.
+void window_fetch_blobs(const int32_t* n, const unsigned long long* src, const long long* bytes, uint8_t* dst,
+                        unsigned long long stride, int max_slots, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
