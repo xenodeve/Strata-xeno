@@ -46,6 +46,34 @@ int dense_req_type() {
     }();
     return t;
 }
+// #256: a list of name parts from an environment variable, split at ',' or '|' (empty: none)
+std::vector<std::string> name_parts(const char* var) {
+    std::vector<std::string> parts;
+    const char* v = std::getenv(var);
+    for (std::string s = v != nullptr ? v : ""; !s.empty();) {
+        const size_t c = s.find_first_of(",|");
+        if (c != 0) parts.push_back(s.substr(0, c));
+        s = c == std::string::npos ? std::string() : s.substr(c + 1);
+    }
+    return parts;
+}
+// #256: the type a matrix is uploaded as under STRATA_DENSE_REQ, or -1 to keep the GGUF's.  Only Q8_0 matrices with
+// whole 256-column blocks, never the PLE key (its own kernel).  STRATA_DENSE_REQ_ONLY=a|b requantizes only the names
+// that contain one of the parts ("=name" matches the whole name), STRATA_DENSE_REQ_SKIP=a|b keeps the ones that do
+// (per-group quality, #256).
+int dense_req_for(const std::string& name, int type, int64_t ne0) {
+    static const std::vector<std::string> only = name_parts("STRATA_DENSE_REQ_ONLY");
+    static const std::vector<std::string> skip = name_parts("STRATA_DENSE_REQ_SKIP");
+    const int req = dense_req_type();
+    if (req <= 0 || type != 8 || name == "blk.1.ple_key.weight" || ne0 % 256 != 0) return -1;
+    const auto has = [&](const std::vector<std::string>& parts) {   // "=name": the whole name, else a part of it
+        for (const auto& p : parts)
+            if (p[0] == '=' ? name == p.substr(1) : name.find(p) != std::string::npos) return true;
+        return false;
+    };
+    if (!only.empty() && !has(only)) return -1;
+    return has(skip) ? -1 : req;
+}
 // rows of a Q8_0 matrix (ne0 a multiple of 256) to `type`, through float, on several threads
 bool requant_q8_0(const void* src, int ne0, int ne1, int type, std::vector<uint8_t>& out) {
 #ifdef STRATA_NATIVE_EXPERTS
@@ -207,9 +235,8 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                     return false;
                 }
                 // #256: priced as `load` uploads it (requantized under STRATA_DENSE_REQ)
-                const int req = dense_req_type();
-                const int type = req > 0 && tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" && ref.ne0 % 256 == 0
-                                     ? req : (int) tensor.type;
+                const int req = dense_req_for(tensor.name, (int) tensor.type, ref.ne0);
+                const int type = req > 0 ? req : (int) tensor.type;
                 total += alloc_bytes(strata::kernels::native_mmvq_weight_bytes(type, (int) ref.ne0, (int) ref.ne1));
             }
         }
@@ -250,6 +277,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         std::set<std::string> seen;
         int max_in = 0;
         uint64_t total = 0, hc_q8_bytes = 0, allocated = 0, req_saved = 0;
+        size_t req_count = 0;
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
@@ -337,16 +365,18 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 // #256 (opt-in STRATA_DENSE_REQ=q6_k|q5_k|q4_k): a Q8_0 matrix requantized to that type at load, so
                 // the decode GEMV and the prompt's dequant read fewer bytes (changes the outputs)
-                const int req = dense_req_type();
+                const int req = dense_req_for(tensor.name, (int) tensor.type, ref.ne0);
                 std::vector<uint8_t> requant;
-                const bool requantize = req > 0 && tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&
-                                        ref.ne0 % 256 == 0;
+                const bool requantize = req > 0;
                 if (requantize && !requant_q8_0(gguf.tensor_data(tensor), (int) ref.ne0, (int) ref.ne1, req, requant)) {
                     err = "native dense (STRATA_DENSE_REQ): cannot requantize " + tensor.name; return false;
                 }
                 const int type = requantize ? req : (int) tensor.type;
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(type, (int) ref.ne0, (int) ref.ne1);
-                if (requantize) req_saved += strata::kernels::native_mmvq_weight_bytes(8, (int) ref.ne0, (int) ref.ne1) - bytes;
+                if (requantize) {
+                    ++req_count;
+                    req_saved += strata::kernels::native_mmvq_weight_bytes(8, (int) ref.ne0, (int) ref.ne1) - bytes;
+                }
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
@@ -434,8 +464,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
                          packed_count, packed_bytes / 1048576.0);
         if (req_saved > 0)
-            std::fprintf(stderr, "native dense: STRATA_DENSE_REQ: Q8_0 matrices requantized to type %d, %.1f MiB fewer\n",
-                         dense_req_type(), req_saved / 1048576.0);
+            std::fprintf(stderr, "native dense: STRATA_DENSE_REQ: %zu Q8_0 matrices requantized to type %d, %.1f MiB fewer\n",
+                         req_count, dense_req_type(), req_saved / 1048576.0);
         scratch_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
         allocated_ = allocated;

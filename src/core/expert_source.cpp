@@ -3983,13 +3983,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     static thread_local std::vector<int8_t> best_rank;
     static thread_local std::vector<int32_t> def_list;
     def_list.clear();
+    // STRATA_DEFER_MAXW=w (#254 quality): defer only an expert whose largest router weight in the window is below w
+    // (unset or 0: by rank alone).  STRATA_DEFER_STATS=1 (diagnostic): stderr every 4096 steps, the deferred entries'
+    // share of the router mass, and how their weights and each token's deferred mass are spread.
+    static const float defer_maxw = [] { const char* v = std::getenv("STRATA_DEFER_MAXW"); return v ? (float) std::atof(v) : 0.0f; }();
+    static const bool defer_stats = [] { const char* v = std::getenv("STRATA_DEFER_STATS"); return v != nullptr && std::atoi(v) == 1; }();
+    static thread_local std::vector<float> best_w;
+    static thread_local std::vector<float> tok_def;
     if (dh.active) {
         if ((int64_t) best_rank.size() < d.n_expert) best_rank.assign((size_t) d.n_expert, (int8_t) 99);
+        if (defer_maxw > 0 && (int64_t) best_w.size() < d.n_expert) best_w.assign((size_t) d.n_expert, 0.0f);
         for (int64_t i = 0; i < n_tok * k; ++i) {
             const int64_t e = ids[i];
-            if (e >= 0 && e < d.n_expert && (int8_t) (i % k) < best_rank[(size_t) e]) best_rank[(size_t) e] = (int8_t) (i % k);
+            if (e < 0 || e >= d.n_expert) continue;
+            if ((int8_t) (i % k) < best_rank[(size_t) e]) best_rank[(size_t) e] = (int8_t) (i % k);
+            if (defer_maxw > 0 && dh.w[i] > best_w[(size_t) e]) best_w[(size_t) e] = dh.w[i];
         }
         std::memset(dh.out, 0, (size_t) n_tok * H * sizeof(float));
+        if (defer_stats) tok_def.assign((size_t) n_tok, 0.0f);
     }
     // #255 control (diagnostic STRATA_DROP_MATCH, changes outputs): 1 = every CPU-tier entry is dropped (the cold set,
     // computed nowhere); 2 = those are computed and, for each, the 4070-tier entry of the same token nearest in rank is
@@ -4060,9 +4071,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 dm_drop(i);
                 continue;
             }
-            if (dh.active && best_rank[(size_t) e] >= dh.rank && d.src->resident(d.layers, e)) {   // #254
+            if (dh.active && best_rank[(size_t) e] >= dh.rank && (defer_maxw <= 0 || best_w[(size_t) e] < defer_maxw) &&
+                d.src->resident(d.layers, e)) {   // #254
                 std::memset(row, 0, (size_t) H * sizeof(float));
                 def_list.push_back((int32_t) i);
+                if (defer_stats) tok_def[(size_t) (i / k)] += dh.w[i];
                 continue;
             }
             // #95: still in flight (or past the batch's 128): after materialize_end, in the second pass - a
@@ -4076,7 +4089,31 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     if (dh.active)   // #254: the ranks are this window's only
         for (int64_t i = 0; i < n_tok * k; ++i)
-            if (ids[i] >= 0 && ids[i] < d.n_expert) best_rank[(size_t) ids[i]] = (int8_t) 99;
+            if (ids[i] >= 0 && ids[i] < d.n_expert) {
+                best_rank[(size_t) ids[i]] = (int8_t) 99;
+                if (defer_maxw > 0) best_w[(size_t) ids[i]] = 0.0f;
+            }
+    if (dh.active && defer_stats) {   // the pool's caller is one host thread: plain statics
+        static const float edge[] = {0.02f, 0.05f, 0.1f, 0.2f};
+        static double mass_all = 0, mass_cpu = 0, mass_def = 0;
+        static int64_t steps = 0, n_all = 0, n_cpu = 0, n_def = 0, w_bin[5] = {}, t_bin[5] = {};
+        const auto bin = [&](float x) { int b = 0; while (b < 4 && x >= edge[b]) ++b; return b; };
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            mass_all += dh.w[i];
+            if (kind[i] == -1) { ++n_cpu; mass_cpu += dh.w[i]; }
+        }
+        n_all += n_tok * k;
+        for (const int32_t i : def_list) { ++n_def; mass_def += dh.w[i]; ++w_bin[bin(dh.w[i])]; }
+        for (int64_t t = 0; t < n_tok; ++t) ++t_bin[bin(tok_def[(size_t) t])];
+        if (++steps % 4096 == 0)
+            std::fprintf(stderr, "strata defer stats: %lld of %lld entries deferred (%lld on the CPU), router mass deferred %.2f %% "
+                                 "(CPU %.2f %%); deferred weights <.02 %lld <.05 %lld <.1 %lld <.2 %lld >=.2 %lld; tokens by "
+                                 "deferred mass <.02 %lld <.05 %lld <.1 %lld <.2 %lld >=.2 %lld\n",
+                         (long long) n_def, (long long) n_all, (long long) n_cpu, 100.0 * mass_def / (mass_all > 0 ? mass_all : 1.0),
+                         100.0 * mass_cpu / (mass_all > 0 ? mass_all : 1.0), (long long) w_bin[0], (long long) w_bin[1],
+                         (long long) w_bin[2], (long long) w_bin[3], (long long) w_bin[4], (long long) t_bin[0],
+                         (long long) t_bin[1], (long long) t_bin[2], (long long) t_bin[3], (long long) t_bin[4]);
+    }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     const auto pool_start = std::chrono::steady_clock::now();
