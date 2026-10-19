@@ -120,12 +120,14 @@ STRATA_TQ_ROWS_FN void rows_t(const uint8_t* w, size_t row_bytes, int n, const T
     constexpr bool q64 = Q && KB == 8 && !G && !CB;
     const long long* tab = (const long long*) tq_state_table();
     const uint32_t* cb = (const uint32_t*) tq_codebook_i16();
+    const int pf = tq_prefetch_bytes();
     for (int r = r0; r < r1; ++r) {
         const uint8_t* x = w + (size_t) r * row_bytes;
         __m128 acc[kTqMaxTokens];
         for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
         for (int i = 0; i < nb; ++i) {
             const uint8_t* blk = x + (size_t) i * bsz;
+            if (pf > 0) _mm_prefetch((const char*) blk + pf, _MM_HINT_T0);   // #272 (the rows are contiguous)
             const uint8_t* qs = blk + 2;
             const uint64_t wr = tq_wrap<KB>(qs);
             __m256i wv[8];   // wv[m] = weights 16m .. 16m+15 (states 4m .. 4m+3)

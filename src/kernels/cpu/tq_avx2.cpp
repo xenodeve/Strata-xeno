@@ -42,6 +42,13 @@
 namespace strata::kernels::cpu::tq_detail {
 namespace {
 
+// #272: software prefetch of the expert rows this many bytes ahead of the decode (STRATA_TQ_PREFETCH; unset or 0: off,
+// the A/B default until measured).  The IQ rows' 2048 B measured -1.3 % ms/round on a Zen 3 (iq_avx2.cpp).
+int tq_prefetch_bytes() {
+    static const int d = [] { const char* v = std::getenv("STRATA_TQ_PREFETCH"); return v ? std::atoi(v) : 0; }();
+    return d;
+}
+
 namespace plain {
 #define STRATA_TQ_ROWS_VNNI 0
 #define STRATA_TQ_ROWS_FN
