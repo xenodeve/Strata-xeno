@@ -6066,7 +6066,11 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
-        const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
+        // xeno #266: without the loan (--no-prefill-borrow) the prompt path's own buffers come after the cache, so
+        // they are held back here as the split placement prices them (split_pf_mib); before, the cache took the
+        // VRAM and the first prompt failed at cublasCreate
+        const size_t own_pf = pf_borrow ? 0 : (size_t) split_pf_mib << 20;
+        const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first + own_pf;
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         std::fprintf(stderr, "strata generate: expert cache sizing: %.2f GiB free, %d MiB reserve, budget %.2f GiB -> cap %.2f GiB%c", (double) free_b / 1073741824.0, o.vram_reserve_mib, (double) budget / 1073741824.0, (double) cap / 1073741824.0, 10);
