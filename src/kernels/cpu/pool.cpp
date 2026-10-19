@@ -493,6 +493,11 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int spin_us, Po
         ecore_skip_tail_ = (std::max)(0, std::atoi(v));
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
+    if (worker_stats_on()) {   // #267
+        wtasks_.reset(new std::atomic<uint64_t>[(size_t) n_ + 1]);
+        wns_.reset(new std::atomic<uint64_t>[(size_t) n_ + 1]);
+        for (int i = 0; i <= n_; ++i) { wtasks_[(size_t) i].store(0); wns_[(size_t) i].store(0); }
+    }
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
     g_diag_pool.store(this);
@@ -688,11 +693,37 @@ void ExpertPool::wait_done(int n) {
     }
 }
 
+bool ExpertPool::worker_stats_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_POOL_WORKER_STATS"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
+void ExpertPool::take_worker_stats(std::vector<uint64_t>& tasks, std::vector<uint64_t>& ns) {
+    tasks.clear();
+    ns.clear();
+    if (!wtasks_) return;
+    for (int i = 0; i <= n_; ++i) {
+        tasks.push_back(wtasks_[(size_t) i].exchange(0, std::memory_order_relaxed));
+        ns.push_back(wns_[(size_t) i].exchange(0, std::memory_order_relaxed));
+    }
+}
+
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
+    const size_t wslot = id >= 0 ? (size_t) id : (size_t) n_;   // #267: the host's stats slot is n_
     for (;;) {
         const int ci = claim(epoch, id >= n_fast_workers_);
         if (ci < 0) break;
+        const auto w_t0 = wtasks_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        struct WStat {   // #267: this task's time, counted however the branch below leaves the loop body
+            ExpertPool* p; size_t s; std::chrono::steady_clock::time_point t0;
+            ~WStat() {
+                if (!p->wtasks_) return;
+                p->wtasks_[s].fetch_add(1, std::memory_order_relaxed);
+                p->wns_[s].fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+            }
+        } w_stat{this, wslot, w_t0};
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }

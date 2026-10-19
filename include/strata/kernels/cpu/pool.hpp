@@ -140,6 +140,10 @@ void set_current_thread_priority(int priority);
 
 class ExpertPool {
 public:
+    /// #267 STRATA_POOL_WORKER_STATS=1: per thread (the workers, then the host) the tasks run and their total ns since
+    /// the last call, which resets them.  Empty when the switch is off.
+    void take_worker_stats(std::vector<uint64_t>& tasks, std::vector<uint64_t>& ns);
+    static bool worker_stats_on();
     /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores
     /// (minus core 0 by default) and each owns one `ExpertScratch`, so nothing in the token path allocates.
     ///
@@ -313,6 +317,9 @@ private:
     static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kIdle = -10, kWaitParked = -11,
                              kWaitDone = -12;
     std::unique_ptr<std::atomic<int32_t>[]> wstate_;
+    // #267 STRATA_POOL_WORKER_STATS=1 (diagnostic): each thread's tasks and their time since the last take (slot n_ is
+    // the host); off: never touched
+    std::unique_ptr<std::atomic<uint64_t>[]> wtasks_, wns_;
     std::atomic<int32_t> hstate_{kIdle};
     std::atomic<int64_t> hstate_ms_{0};
     alignas(64) std::atomic<uint64_t> head_{0};   // epoch << 32 | njobs << 16 | next index (issue #29)

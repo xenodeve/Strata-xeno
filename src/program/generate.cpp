@@ -14461,6 +14461,18 @@ int main(int argc, char** argv) {
                             d1.wait - ds0.wait, d1.pool - ds0.pool, d1.plan - ds0.plan, d1.actq - ds0.actq,
                             d1.jobs - ds0.jobs, d1.run - ds0.run, d1.host - ds0.host, dt_commit, dt_draft);
             }
+            if (strata::kernels::cpu::ExpertPool::worker_stats_on() && drive.d.pool != nullptr) {   // #267
+                std::vector<uint64_t> wt, wn;
+                drive.d.pool->take_worker_stats(wt, wn);
+                std::string line = "strata pool threads (this request: tasks, us per task):";
+                char buf[64];
+                for (size_t i = 0; i < wt.size(); ++i) {
+                    std::snprintf(buf, sizeof buf, " %s%zu %llu/%.1f", i + 1 == wt.size() ? "host" : "w", i + 1 == wt.size() ? (size_t) 0 : i,
+                                  (unsigned long long) wt[i], wt[i] ? (double) wn[i] / 1000.0 / (double) wt[i] : 0.0);
+                    line += buf;
+                }
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
             const int64_t req_offload = drive.d.offload_entries - offload0;
             // #471: the prompt tokens this request read - all the fresh ones, or as far as the prompt pass got when a
             // cancel stopped it part-way (a cancelled request used to be logged and counted as having read them all)
