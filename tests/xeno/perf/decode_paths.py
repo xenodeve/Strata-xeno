@@ -135,6 +135,25 @@ def fetch_overlap(w: dict, fetch_us: float, group_us: float, base_us: float = 0.
                      for s, g, st in w["steps"] if st > 0) / 1000 / w["rounds"], 6)
 
 
+def mtp_gaps(events: list[dict]) -> dict:
+    """The MTP draft chain on the primary GPU: each "mtp round" (the catch-up and draft 0) and the "mtp step" spans
+    after it, and the idle time between them - with --spec-min-p > 0 the host reads each draft before it launches the
+    next step, so that gap is the host's round trip, which a device-side loop would remove."""
+    xs = sorted((e for e in events if e.get("ph") == "X" and e["name"] in ("mtp round", "mtp step")), key=lambda e: e["ts"])
+    rounds = max(1, sum(1 for e in events if e.get("ph") == "X" and e["name"] == "decode round"))
+    gaps, steps, busy = [], 0, 0.0
+    for a, b in zip(xs, xs[1:]):
+        busy += a["dur"]
+        if b["name"] == "mtp step":   # a step follows the round or the step before it in the same chain
+            gaps.append(b["ts"] - (a["ts"] + a["dur"]))
+            steps += 1
+    if xs:
+        busy += xs[-1]["dur"]
+    med = sorted(gaps)[len(gaps) // 2] if gaps else 0.0
+    return {"steps per round": round(steps / rounds, 3), "gap ms": round(sum(gaps) / 1000 / rounds, 6),
+            "gap median us": med, "busy ms": round(busy / 1000 / rounds, 6)}
+
+
 SHAVE_US = (5, 10, 20, 40)
 GPU_DECODE = ("verify graph", "commit graph", "mtp round", "mtp step")   # the "gpu0 decode" lane (#44)
 EDGE_HOST = ("verify stage", "verify launch", "verify tail", "head sampling", "verify commit", "mtp draft", "emit tokens",
@@ -196,6 +215,10 @@ def main(argv: list[str]) -> int:
             print(f"  4070 sync, GPU still running: {s['running']['n'] / n:.0%} of waits, "
                   f"{s['running']['ms_per_round']:.2f} ms/round (median GPU left {s['running'].get('gpu_left_us', 0):.1f} us, "
                   f"median wake-up after it {s['running'].get('overshoot_us', 0):.1f} us)")
+        m = mtp_gaps(ev)
+        if m["steps per round"]:
+            print(f"  mtp draft on the GPU: busy {m['busy ms']:.2f} ms/round, {m['steps per round']:.2f} steps/round, "
+                  f"idle between them {m['gap ms']:.2f} ms/round (median {m['gap median us']:.1f} us)")
         g = edge(ev)
         if g["gpu busy"]:
             print(f"  primary GPU at the round edge: busy " +

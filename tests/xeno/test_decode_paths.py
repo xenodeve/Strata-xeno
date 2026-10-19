@@ -76,6 +76,15 @@ def test_a_window_graph_layer_without_a_segment_is_skipped():
     assert dp.window_split(ev)["layers"] == 0
 
 
+def test_the_mtp_chain_gaps_are_the_idle_time_before_each_step():
+    # one round: the round 0..100, step 1 at 130..230 (gap 30), step 2 at 250..350 (gap 20); the next round's chain
+    # starts with a round, so the verify between the chains is not counted
+    ev = [_x("decode round", 0, 1000), _x("mtp round", 0, 100), _x("mtp step", 130, 100), _x("mtp step", 250, 100),
+          _x("mtp round", 900, 50)]
+    m = dp.mtp_gaps(ev)
+    assert m["steps per round"] == 2 and m["gap ms"] == 0.05 and m["busy ms"] == 0.35
+
+
 def test_layers_without_a_4070_share_are_skipped():
     ev = [_x("decode round", 0, 100), _x("cpu experts", 10, 50), _x("dispatch plan", 10, 5), _x("cpu pool", 20, 10),
           _x("4070 experts", 70, 5)]
