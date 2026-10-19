@@ -465,6 +465,7 @@ private:
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
     // #254 (STRATA_DEFER_RANK): the deferred experts' weighted sums, two layer slots of T * n_embd, and their flag
     float* h_def_ = nullptr;     float* m_def_ = nullptr;
+    uint16_t* h_ymiss16_ = nullptr;  uint16_t* m_ymiss16_ = nullptr;   // #265 STRATA_ROWS_F16: the rows as fp16
     uint32_t* h_flagD_ = nullptr; uint32_t* m_flagD_ = nullptr;
     int defer_rank_ = -1;
     bool defer_same_ = false;   // #254 diagnostic STRATA_DEFER_SAME=1: the deferred sum added in its own layer

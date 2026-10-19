@@ -3525,6 +3525,10 @@ DeferHook& defer_hook() {
     static thread_local DeferHook h;
     return h;
 }
+RowsF16Hook& rows_f16_hook() {
+    static thread_local RowsF16Hook h;
+    return h;
+}
 int defer_rank_env() {
     static const int r = [] {
         const char* v = std::getenv("STRATA_DEFER_RANK");
@@ -4169,7 +4173,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (secondary_claims) {
         std::string secondary_err;
         const auto finish_start = std::chrono::steady_clock::now();
-        const bool finished = d.secondary_runner->finish(out, secondary_err);
+        const bool finished = d.secondary_runner->finish(out, secondary_err, rows_f16_hook().out16);
         secondary_finish_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - finish_start).count();
         if (!finished) {
@@ -4195,6 +4199,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (drop_match == 2)   // #255 control: the matched 4070-tier rows, now that every GPU's rows are in
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (warm_drop[(size_t) i]) { std::memset(out + (size_t) i * H, 0, (size_t) H * sizeof(float)); dm_drop(i); }
+    if (uint16_t* o16 = rows_f16_hook().out16) {   // #265: every row the GPU reads, as fp16 (round to nearest even)
+        const bool w16 = secondary_claims && d.secondary_runner->rows_f16_written();
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            if (kind[i] == 0 || kind[i] == 1) continue;                       // GPU hits: never read from here
+            if (w16 && d.secondary_runner != nullptr && secondary_slots[i] != -1) continue;   // the 4070 wrote them
+            const float* src = out + (size_t) i * H;
+            uint16_t* dst = o16 + (size_t) i * H;
+            int64_t x = 0;
+            for (; x + 8 <= H; x += 8)
+                _mm_storeu_si128((__m128i*) (dst + x), _mm256_cvtps_ph(_mm256_loadu_ps(src + x), _MM_FROUND_TO_NEAREST_INT));
+            for (; x < H; ++x) dst[x] = (uint16_t) _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(src[x]), _MM_FROUND_TO_NEAREST_INT), 0);
+        }
+    }
     const auto c_imm = std::chrono::steady_clock::now();   // #254: the immediate rows are in (the deferred run follows)
     if (dh.active && !def_list.empty()) {   // #254: the GPU may go on; the deferred experts' sum lands next layer
         // the ids and weights first: once the flag is up the GPU's next layer publishes its own into the same rows

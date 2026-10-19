@@ -90,7 +90,10 @@ public:
     /// layers were seen (or STRATA_SECONDARY_STAGE_LIVE=0).
     bool window_cost(double& base, double& group, double& copy) const;
     uint64_t staged_experts() const { return staged_experts_; }
-    bool finish(float* output, std::string& err);
+    /// #265: `out16` (may be null): with the window graph's fp16 rows (STRATA_ROWS_F16=1) the layer's rows go there
+    /// as fp16 instead of into `output`; rows_f16_written() then says so for the last finish
+    bool finish(float* output, std::string& err, uint16_t* out16 = nullptr);
+    bool rows_f16_written() const { return rows16_written_; }
     /// Opt-in: from now on launch() hands its enqueue to a helper thread that stays on device 1 (pinned to
     /// `core` when >= 0), so the host thread goes straight on to the CPU pool; finish() first waits for the
     /// helper. Arithmetic and outputs are unchanged. Call once, after init().
@@ -156,6 +159,8 @@ private:
     void* fetch_fork_ = nullptr;
     void* fetch_join_ = nullptr;
     uint8_t* dev_wmeta_ = nullptr;   ///< #262: the plans and activations, mapped (the fetch overlap copies them by kernel)
+    bool rows16_ = false;            ///< #265 STRATA_ROWS_F16: the window graph writes its rows as fp16
+    bool rows16_written_ = false;
     float* dev_wx_ = nullptr;
     size_t meta_bytes_ = 0;
     float* device_x_ = nullptr;

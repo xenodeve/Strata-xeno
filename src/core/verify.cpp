@@ -454,7 +454,7 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_ymiss16_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -560,7 +560,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_) &&
               mapped(64, (void**) &h_flagD_, (void**) &m_flagD_) &&
-              mapped(2 * T * N * 4, (void**) &h_def_, (void**) &m_def_);
+              mapped(2 * T * N * 4, (void**) &h_def_, (void**) &m_def_) &&
+              (!rows_f16_env() || mapped(T * K * N * 2, (void**) &h_ymiss16_, (void**) &m_ymiss16_));
     defer_rank_ = defer_rank_env();
     { const char* v = std::getenv("STRATA_DEFER_SAME"); defer_same_ = v != nullptr && std::atoi(v) == 1; }   // #254 diagnostic
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
@@ -1609,8 +1610,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
                 } else {
                     // (xeno) H2: read only the rows that are not GPU hits over the link (bitwise copy + moe_hit_add)
-                    moe_hit_merge_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst,
-                                         p_counts + 1, (int64_t) n * K, N, cs);
+                    if (m_ymiss16_ != nullptr)   // #265: the rows as fp16
+                        moe_hit_merge_mapped16(parts_out, m_ymiss16_ + (size_t) tb * K * N, hit_out, p_dst,
+                                               p_counts + 1, (int64_t) n * K, N, cs);
+                    else
+                        moe_hit_merge_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst,
+                                             p_counts + 1, (int64_t) n * K, N, cs);
                 }
             }
         }
@@ -2178,9 +2183,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         } else if (defer_win) {
             std::memset(def_slot, 0, (size_t) n * g.n_embd * sizeof(float));
         }
+        rows_f16_hook().out16 = h_ymiss16_ != nullptr && !device_plan_ && !remote_opt_ ? h_ymiss16_ + (size_t) tb * ss.k * g.n_embd : nullptr;
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        rows_f16_hook().out16 = nullptr;
         dh.active = false;
         if (remote_opt_) remote_opt_->end();
         VDBG("layer %lld served\n", (long long) l);
@@ -3268,9 +3275,11 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window (pipelined): the CPU experts of layer", l);
+        rows_f16_hook().out16 = h_ymiss16_ != nullptr && !device_plan_ && !remote_opt_ ? h_ymiss16_ + (size_t) tb * ss.k * g.n_embd : nullptr;
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        rows_f16_hook().out16 = nullptr;
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", fl_k_, l,
                               (int64_t) ms_since(b));
         progress_tick();

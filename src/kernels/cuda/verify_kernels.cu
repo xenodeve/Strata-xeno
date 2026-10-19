@@ -1350,6 +1350,29 @@ void window_copy_in(const void* src_a, void* dst_a, size_t bytes_a, const void* 
     check("window_copy_in");
 }
 
+namespace {
+__global__ void window_rows16_kernel(const float4* __restrict__ src, uint2* dst, const int32_t* start,
+                                     const int32_t* n_groups, int n4_per_row, int max_rows) {
+    const int groups = *n_groups;
+    int rows = groups > 0 ? start[groups] : 0;
+    rows = rows < max_rows ? rows : max_rows;
+    const long long n4 = (long long) rows * n4_per_row;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (long long) gridDim.x * blockDim.x) {
+        const float4 v = src[i];
+        const __half2 a = __floats2half2_rn(v.x, v.y), b = __floats2half2_rn(v.z, v.w);
+        dst[i] = make_uint2(*(const unsigned int*) &a, *(const unsigned int*) &b);
+    }
+    __threadfence_system();
+}
+}  // namespace
+
+void window_rows_to_host16(const float* src, uint16_t* dst_mapped, const int32_t* start, const int32_t* n_groups,
+                           int n_embd, int max_rows, void* stream) {
+    window_rows16_kernel<<<32, 256, 0, (cudaStream_t) stream>>>((const float4*) src, (uint2*) dst_mapped, start,
+                                                                n_groups, n_embd / 4, max_rows);
+    check("window_rows_to_host16");
+}
+
 void window_fetch_blobs(const int32_t* n, const unsigned long long* src, const long long* bytes, uint8_t* dst,
                         unsigned long long stride, int max_slots, void* stream) {
     window_fetch_kernel<<<dim3(16, (unsigned) max_slots), 256, 0, (cudaStream_t) stream>>>(n, src, bytes, dst, stride);

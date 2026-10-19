@@ -728,6 +728,45 @@ __global__ void merge_mapped_kernel(float4* __restrict__ parts, const volatile f
 }
 }  // namespace
 
+namespace {
+__global__ void merge_mapped16_kernel(float4* __restrict__ parts, const volatile uint2* ymiss,
+                                      const float4* __restrict__ hit_out, const int32_t* __restrict__ dst,
+                                      const int32_t* __restrict__ count, int n4) {
+    const int row = blockIdx.y;
+    const int c = *count;
+    bool hit = false;
+    for (int h = 0; h < c; ++h) hit |= dst[h] == row;
+    const size_t base = (size_t) row * (size_t) n4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) {
+        float4 v;
+        if (hit) {
+            const float4 h = hit_out[base + i];
+            v = make_float4(__fadd_rn(0.0f, h.x), __fadd_rn(0.0f, h.y), __fadd_rn(0.0f, h.z), __fadd_rn(0.0f, h.w));
+        } else {
+            const uint2 u = const_cast<const uint2*>(ymiss)[base + i];
+            const float2 a = __half22float2(*(const __half2*) &u.x), b = __half22float2(*(const __half2*) &u.y);
+            v = make_float4(a.x, a.y, b.x, b.y);
+        }
+        parts[base + i] = v;
+    }
+}
+}  // namespace
+
+void moe_hit_merge_mapped16(float* parts, const uint16_t* ymiss16_mapped, const float* hit_out, const int32_t* dst,
+                            const int32_t* count, int64_t rows, int64_t n_embd, void* stream) {
+    if (rows <= 0) return;
+    if ((n_embd & 3) != 0 || ((uintptr_t) parts & 15) != 0 || ((uintptr_t) ymiss16_mapped & 7) != 0 ||
+        ((uintptr_t) hit_out & 15) != 0) {
+        std::fprintf(stderr, "moe_hit_merge_mapped16: n_embd must be a multiple of 4 and pointers aligned\n");
+        std::exit(1);
+    }
+    const int n4 = (int) (n_embd / 4);
+    const dim3 grid((unsigned) ((n4 + 255) / 256), (unsigned) rows);
+    merge_mapped16_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>((float4*) parts, (const volatile uint2*) ymiss16_mapped,
+                                                                   (const float4*) hit_out, dst, count, n4);
+    check("moe_hit_merge_mapped16", stream);
+}
+
 void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_expert, int32_t* slot, int32_t* dst,
                     int32_t* count, void* stream) {
     if (k < 1 || k > 32) { std::fprintf(stderr, "moe_hit_select: k must be 1..32\n"); std::exit(1); }

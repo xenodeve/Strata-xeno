@@ -4,6 +4,7 @@
 // and its weighted output is added one layer later, so the GPU runs the next layer while the CPU pool still works.
 // R = 0 defers every CPU-missed expert; unset (or negative) is off and the window is byte-identical.
 #include <cstdint>
+#include <cstdlib>
 
 namespace strata::core {
 
@@ -19,6 +20,18 @@ struct DeferHook {
 };
 
 DeferHook& defer_hook();
+
+/// #265 (opt-in STRATA_ROWS_F16=1): the verify window's CPU / 4070 rows also as fp16, which the 5060 reads over its
+/// x4 link instead of the fp32 rows (half the bytes).  Set per step by the verify window's host loop (thread-local).
+struct RowsF16Hook {
+    uint16_t* out16 = nullptr;             // [n_tok * k][n_embd] fp16 (mapped); null: off for this step
+};
+RowsF16Hook& rows_f16_hook();
+/// STRATA_ROWS_F16, read once (inline: the 4070 runner's library reads it too)
+inline bool rows_f16_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROWS_F16"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 /// STRATA_DEFER_RANK, read once: -1 when unset or invalid
 int defer_rank_env();
 

@@ -1,5 +1,6 @@
 #include <chrono>
 #include "strata/core/secondary_runner.hpp"
+#include "strata/core/defer.hpp"
 #include "strata/core/end_engine.hpp"
 #include "strata/core/secondary_budget.hpp"
 #include "strata/core/secondary_vram.hpp"
@@ -610,6 +611,7 @@ bool SecondaryRunner::enable_window(const std::vector<kernels::NativeExpertLayou
         !cuda_ok(cudaMalloc((void**) &dev_count_, (size_t) win_layers_ * sizeof(uint32_t)), "window counts", err) ||
         !cuda_ok(cudaMemset(dev_count_, 0, (size_t) win_layers_ * sizeof(uint32_t)), "window counts clear", err))
         return false;
+    rows16_ = rows_f16_env();   // #265
     if (fetch_overlap_) {
         cudaStream_t fs = nullptr;
         cudaEvent_t fork = nullptr, join = nullptr;
@@ -683,7 +685,11 @@ bool SecondaryRunner::capture_window(int n_tokens, std::string& err) {
             kernels::native_expert_grouped(layout, device_ptr_, device_start_, device_count_, device_dst_, device_tok_,
                                            entries, entries, device_xq_, device_scratch_, device_out_, stream, xs_q2);
         }
-        kernels::window_rows_to_host(device_out_, dev_wout_, device_start_, device_count_, n_embd_, max_entries_, stream);
+        if (rows16_)   // #265: half the bytes over the x16 link, and the 5060 reads them as they are
+            kernels::window_rows_to_host16(device_out_, (uint16_t*) dev_wout_, device_start_, device_count_, n_embd_,
+                                           max_entries_, stream);
+        else
+            kernels::window_rows_to_host(device_out_, dev_wout_, device_start_, device_count_, n_embd_, max_entries_, stream);
         kernels::window_signal(dev_done_ + l, dev_count_ + l, stream, dev_wstamp_ ? dev_wstamp_ + 2 * l + 1 : nullptr);
     }
     cudaGraph_t graph = nullptr;
@@ -1013,7 +1019,8 @@ bool SecondaryRunner::launch_layer(int layer, const kernels::NativeExpertLayout&
     return true;
 }
 
-bool SecondaryRunner::finish(float* output, std::string& err) {
+bool SecondaryRunner::finish(float* output, std::string& err, uint16_t* out16) {
+    rows16_written_ = false;
     if (window_) {   // #227: the layer's done flag, then its rows from mapped memory - no CUDA call
         if (!pending_) { err.clear(); return true; }
         if (output == nullptr) { err = "secondary runner: output is null"; return false; }
@@ -1039,9 +1046,23 @@ bool SecondaryRunner::finish(float* output, std::string& err) {
         window_sample(win_layer_, w1);
         ms_wait_ += std::chrono::duration<double, std::milli>(w1 - wait_t0).count();
         if (timeline::enabled()) timeline::complete("4070 wait", wait_t0, w1, win_layer_);
-        for (size_t dense = 0; dense < selected_rows_.size(); ++dense)
-            std::memcpy(output + (size_t) selected_rows_[dense] * n_embd_, host_wout_ + dense * n_embd_,
-                        (size_t) n_embd_ * sizeof(float));
+        if (rows16_) {   // #265: fp16 rows; without a destination for them they are widened back into `output`
+            const uint16_t* w16 = (const uint16_t*) host_wout_;
+            for (size_t dense = 0; dense < selected_rows_.size(); ++dense) {
+                if (out16 != nullptr) {
+                    std::memcpy(out16 + (size_t) selected_rows_[dense] * n_embd_, w16 + dense * n_embd_,
+                                (size_t) n_embd_ * sizeof(uint16_t));
+                } else {
+                    float* o = output + (size_t) selected_rows_[dense] * n_embd_;
+                    for (int x = 0; x < n_embd_; ++x) o[x] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(w16[dense * n_embd_ + x])));
+                }
+            }
+            rows16_written_ = out16 != nullptr;
+        } else {
+            for (size_t dense = 0; dense < selected_rows_.size(); ++dense)
+                std::memcpy(output + (size_t) selected_rows_[dense] * n_embd_, host_wout_ + dense * n_embd_,
+                            (size_t) n_embd_ * sizeof(float));
+        }
         served_entries_ += selected_rows_.size();
         served_groups_ += group_slots_.size();
         pending_ = false;

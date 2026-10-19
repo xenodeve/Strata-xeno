@@ -58,6 +58,9 @@ void window_rows_to_host(const float* src, float* dst_mapped, const int32_t* sta
 /// from device memory (the layer's plan), so the captured graph needs no update; *n = 0 costs one empty launch.
 void window_fetch_blobs(const int32_t* n, const unsigned long long* src, const long long* bytes, uint8_t* dst,
                         unsigned long long stride, int max_slots, void* stream);
+/// #265: window_rows_to_host with each value written as fp16 (round to nearest even) - half the bytes
+void window_rows_to_host16(const float* src, uint16_t* dst_mapped, const int32_t* start, const int32_t* n_groups,
+                           int n_embd, int max_rows, void* stream);
 /// #262: the window segment's plan and activations in one kernel: bytes_a from src_a to dst_a and bytes_b from src_b
 /// to dst_b (sources in mapped host memory; 16-byte aligned, sizes multiples of 16).  It replaces two memcpy nodes,
 /// which in a graph with a side branch started ~25 us after the node before them (nsys, gyro-record/nsys_seg.py).
