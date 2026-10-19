@@ -2379,6 +2379,8 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(tq_cpu_parity PRIVATE strata_kernels_cpu)
     add_test(NAME tq_cpu_parity COMMAND tq_cpu_parity)
     add_test(NAME tq_cpu_parity_avx2 COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_AVX2=1 $<TARGET_FILE:tq_cpu_parity>)
+    # xeno: skipped (77) on a ggml without the trellis types (the default ggml of the D2x build)
+    set_tests_properties(native_hadamard_test tq_cpu_parity tq_cpu_parity_avx2 PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(tq_cpu_parity tq_cpu_parity_avx2 PROPERTIES TIMEOUT 300)
   endif()
 
