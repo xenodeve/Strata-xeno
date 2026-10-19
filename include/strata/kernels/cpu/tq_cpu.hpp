@@ -35,13 +35,17 @@ enum class TqIsa : int { scalar = 0, avx2 = 1, avx512 = 2 };
 bool tq_supported(int ggml_type) noexcept;
 /// Bits per step: 8, 6, 7 (0 for any other type).
 int tq_kbits(int ggml_type) noexcept;
+/// Values per block of the trellis types, and bytes per block (2 + 4 * bits: 34, 26, 30).
+constexpr int kTqBlock = 128;
+inline size_t tq_block_bytes(int ggml_type) noexcept { return (size_t) (2 + 4 * tq_kbits(ggml_type)); }
 /// The best ISA this CPU runs (capped by STRATA_TQ_ISA).
 TqIsa tq_isa();
 /// Whether this CPU can run `isa` at all (scalar: always).
 bool tq_isa_ok(TqIsa isa);
-/// Whether the engine's native expert rows take these kernels for the trellis types: on an AVX2 or AVX-512 CPU
-/// unless STRATA_NO_TQ_KERNELS=1; the scalar kernel only when STRATA_TQ_ISA=scalar asks for it (otherwise a CPU
-/// without AVX2 keeps ggml-cpu's vec_dot, compiled for the build's floor).
+/// Whether STRATA_NO_TQ_KERNELS=1 is absent.  The engine's native expert rows take these kernels for the trellis types
+/// on every CPU (AVX-512 or AVX2 where the CPU has them, else the scalar kernel: a ggml from upstream has no trellis
+/// type to fall back to, and the AVX code is only reached behind tq_isa_ok).  STRATA_NO_TQ_KERNELS=1 asks for
+/// ggml-cpu's vec_dot instead, honoured only by a ggml that has the types (the agentionai fork; tests, A/B).
 bool tq_kernels_enabled();
 const char* tq_isa_name(TqIsa isa);
 

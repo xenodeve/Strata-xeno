@@ -35,7 +35,10 @@ int main(int argc, char** argv) {
     const int preferred = highest == 0 ? (int) classes.size() :
                           (int) std::count(classes.begin(), classes.end(), highest);
     const int p_only = std::max(1, preferred - 1); // first high-class core reserved for the host
-    const int expected_auto = (int) classes.size() - 1;
+    // v0.2.0: the default count is the pool plan's (pool_plan.hpp; P-cores + half the E-cores on a hybrid CPU with
+    // more E-cores than P-cores), no longer every physical core but the host's
+    const int expected_auto = strata::kernels::cpu::plan_pool_workers(
+        strata::kernels::cpu::pool_plan_input(strata::kernels::cpu::detect_cpu_topology(true))).workers;
     const auto all = strata::kernels::cpu::physical_cores(false);
     const auto workers = strata::kernels::cpu::physical_cores(true);
     bool ordered = all.size() == classes.size() && workers.size() + 1 == all.size();

@@ -1,19 +1,42 @@
 # Gyro (agentionai rotor quants) on Strata-xeno
 
-Gyro is agentionai's quantization of Qwen3.8-Flash-Next: the experts in trellis ("rotor") types, the activations
-rotated by a block-128 Hadamard transform. The fork's `main` runs both published files (merged from agentionai's `rc2`
-on 2026-10-13, #217), and its setup installs them.
+Gyro-S and Gyro-M are Qwen3.8-Flash-Next quantizations by agentionai
+([agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)): the routed
+experts are stored as trellis-coded blocks (ggml types TQ2_T, TQK6, TQK7) in a Hadamard-rotated basis. Strata reads the
+published files unchanged. **Setup lists them as a model family of their own** ("Qwen3.8-Flash-Next (Gyro)"); neither
+is anybody's default.
 
-The targets are the published files of `agentionai/Qwen3.8-Flash-Next-Gyro-GGUF`, used unchanged:
+| | Gyro-S | Gyro-M |
+| --- | --- | --- |
+| File | `Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf` | `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf` |
+| **Download** (the n-gram table is inside the file) | **58.5 GB** | **92.0 GB** |
+| **Memory it needs** (VRAM + RAM together) | **27.6 GB** | **35 GB** |
+| Experts (trellis) | TQK6 gate/up, TQK7 down | TQ2_T |
+| In plain words | the smallest option, for PCs with little memory; lower quality than the 2-3-bit sizes | about IQ3_XXS quality with about 20% less GPU memory; decodes about 20% slower than Q2_0 on 12 GB cards |
 
-| File | Experts | GPU memory for the experts | Status |
+About half of each file is the n-gram (PLE) table: it stays on the SSD and is read row by row for every token, so keep
+the file on a fast local drive. The memory figure is what the weights take once loaded.
+
+Not defaults, by measurement (upstream's evaluation, 2026-10): against Q2_0 at the same GPU bytes Gyro-M halves the KL
+divergence (0.159 against 0.312 on 128 chunks) and is level with IQ3_XXS (0.157), but decodes 17-21% slower on a 12 GB
+card (RTX 3060) and an R9700, and its reasoning set scored lower than Q2_0's (49/60 against 57/60). Gyro-S is 13% worse
+in KL than IQ2_XS (0.268 against 0.236) with 24% fewer bytes. So: pick Gyro-S where nothing bigger fits, Gyro-M when
+the 20% memory saving over IQ3_XXS matters. Setup and the MCP server mention them only where the other sizes do not
+fit the PC; they warn, never refuse. Gyro-L (agentionai's 50 GiB file, 2026-10-12) is not supported: it uses another
+trellis family (types 147-149) that the engine does not have.
+
+**On this fork.** The fork's `main` runs both published files: merged from agentionai's `rc2` on 2026-10-13 (#217),
+with the fork's own CPU-kernel and tier work since (#220, #229), and on upstream's port of the same rc2 commits since
+the merge of upstream v0.2.0 (#268). **The fork builds its Gyro engine against agentionai's ggml today**
+(`AGENTION_LLAMA_COMMIT` in `setup.py`, the engine in `engine-gyro/`), not against upstream ggml with the trellis
+overlay described under "Prompt speed and the ggml build" below: the overlay came with v0.2.0 and has not been built or
+measured on the fork's PC yet. Unlike upstream's evaluation above, the fork's setup labels Gyro-M recommended, from the
+developer's own tests (below).
+
+| File | Experts | GPU memory for the experts | Status on the fork |
 |---|---|---:|---|
 | `Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf` (58.5 GB) | TQK6 gate/up, TQK7 down, block-128 Hadamard | 24.0 GiB | supported by agentionai's rc2 code and validated by agentionai (Linux, RTX 5090, RTX 3090); on the fork it runs on the same code without Gyro-M's TQ2_T tuning, and has not been measured on the fork's PC yet |
 | `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf` (92.0 GB) | TQ2_T, block-128 Hadamard | 29.9 GiB | validated by agentionai (Linux, RTX 5090, RTX 3090); **served daily on the fork's PC** (Windows, two cards) since 2026-10-13 |
-
-Both files carry their own experts in the trellis types TQ2_T/TQK6/TQK7 and record the activation rotation in
-`prism.hadamard.*` metadata. Strata reads both natively. About half of each file is the
-n-gram (PLE) table, which stays on disk and is read row by row; it is not loaded into RAM or VRAM.
 
 The draft head is Strata's own MTP runtime, prepared from the original model's MTP weights as for the other
 Qwen3.8-Flash-Next models. It is not the GGUF draft file from the Gyro repository.
@@ -74,13 +97,67 @@ Not offered by setup for Gyro yet:
 - **AMD.** Use `tools/gyro_setup.sh --backend hip` on Linux; it is experimental (below).
 - **The CUDA 12 engine** (Pascal / Volta).
 - **The low-RAM mode.** `--experts-bin` / `--mmap-experts` have not been tried with the trellis types.
-- **Images.** The vision encoder's text side cannot read the Gyro GGUF.
+- **Images.** Not turned on by the fork's setup path yet (upstream's picture reader opens the file; see "Pictures"
+  below).
 
 The fork's measured two-card profile is not written by setup; see the README.
 
+### Upstream's setup path and engine notes (v0.2.0)
+
+Upstream's own install line:
+
+```sh
+./setup.sh --setup --family gyro --model Gyro-S      # or Gyro-M;  Windows: START-HERE.bat --setup ...
+```
+
+Setup downloads the pinned revision of the file (size and SHA-256 checked), prepares the pack (`tools/iq_pack.py
+--compat-bf16`: the Hadamard table and the dense weights, 1.5 GB), the draft head (Strata's own MTP head, prepared from
+the original model as for every Qwen3.8-Flash-Next file) and the start script. Needs engine 0.1.45.1 or newer: the pack is native_experts.txt v5 (Hadamard-folded), which the engine reads since the
+APR port, and the released 0.1.45 stops at v4. A ready-made engine that is older is replaced by one compiled from this source
+(setup), or the app says the model needs a newer engine and offers Update engine.
+
+**Supported:** NVIDIA (CUDA, Linux and Windows) and AMD (HIP, experimental: the authors validated gfx1151; we ran
+gfx1201 with identical output to rc2). **Not supported:** Intel Arc (SYCL) and Apple Metal: the engines there have no
+trellis kernels; the Metal engine refuses the file at load with the reason.
+
+**Pictures.** Gyro reads pictures with the original model's picture reader file (the same one every Qwen3.8-Flash-Next
+model uses; setup downloads it with the model). The reader opens only the vocabulary and the header of the Gyro file, so
+the trellis tensors do not matter to it. Pictures are on by default, with the CPU reader under 24 GB of graphics memory and
+the card's reader from 24 GB. This needs engine 0.1.45.1 or newer, like the Gyro files themselves. (The fork's setup path
+above does not turn pictures on for Gyro yet.)
+
+**RTX 50 cards (sm_120).** Gyro gives correct output on them with engine 0.1.45.3. The fused gate/up SwiGLU kernel, which
+is the default on compute capability 12.0 cards, handles only rows of 80 dot products; Gyro's trellis rows have 160, and
+before the fix they went through it anyway. Gyro-S then answered with loops, garbage or nothing: on an RTX PRO 5000, 0 of
+8 test questions were answered right before the fix and 8 of 8 after it (greedy and with the app's sampling). Now those
+rows use the full-warp kernel, and the identity gate (10 prompts, 4K and 20K prompts) is identical to the run with the fused
+kernel off. If Gyro misbehaves on an RTX 50 card, update the engine.
+
+**Prompt speed and the ggml build.** The trellis prompt kernels (MMQ) are agentionai's, from their llama.cpp fork (MIT).
+Strata builds against upstream ggml, which does not have them, so it adds them itself at configure time:
+`cmake/strata_ggml_tq_overlay.cmake` writes a copy of the pinned ggml-cuda headers into the build folder with the three
+trellis types routed like IQ2_XS (the tile loader is the fork's, `third_party/ggml-tq/`); only Strata's own MMQ library sees
+the copy, every other type is compiled from the untouched files (identity gate below). The ready-made engines read Gyro
+prompts through it as fast as rc2 does, and bit for bit the same. If the pinned ggml changes and an anchor of the script
+no longer matches, the overlay switches itself off with a message and prompts take the slower FP16 path. A build against the
+fork (`-DSTRATA_GGML_DIR=<agentionai/llama.cpp>`, as rc2 does) uses the fork's own instances instead.
+
+## Credit and licenses
+
+The trellis types, the Hadamard rotation, the CPU and GPU kernels and the pack step were written by Laurent Zuijdwijk
+(agentionai) in agentionai/Strata `rc2` (9ff02c9, MIT, Strata v0.1.40.3 plus Gyro) and ported here commit by commit with
+his authorship kept; `third_party/ggml/ggml-common-tq.h` and the MMQ instances come from agentionai/llama.cpp (MIT, the
+ggml authors). The weights are agentionai's quantization of Qwen3.8-Flash-Next under the Qwen Community License 1.0
+(<https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF/blob/main/LICENSE>).
+
 ## Install by hand (Linux): `tools/gyro_setup.sh`
 
-`tools/gyro_setup.sh` does every step below on Linux:
+The rest of this page is the authors' own guide for a manual install and their measurements on their machines (RTX 5090,
+3090, 4090 and a Strix Halo, with Strata rc2). The numbers are theirs; the fork's and upstream's are in "Measured on
+the fork's PC" and "Measured by upstream" below.
+
+`tools/gyro_setup.sh` (rc2's script; upstream replaced it by setup, the fork keeps it) does every step below on
+Linux:
 
 ```sh
 tools/gyro_setup.sh --model S --backend cuda --cuda-arch 120       # RTX 50 series
@@ -93,7 +170,7 @@ It prints the command that starts the server. The steps, by hand:
 
 ## 1. Build
 
-From this repository. Strata's GGML dependency must be the agentionai llama.cpp fork, which has the trellis types:
+Setup does these steps for you; by hand, from this checkout. For the fast prompt path Strata's GGML dependency is the agentionai llama.cpp fork, which has the trellis types:
 
 ```sh
 git clone --depth 1 https://github.com/agentionai/llama.cpp ../agention-llama.cpp
@@ -114,7 +191,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/pip install huggingface_hub hf_transfer
 HF_HUB_ENABLE_HF_TRANSFER=1 .venv/bin/hf download agentionai/Qwen3.8-Flash-Next-Gyro-GGUF \
   Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf --local-dir models
-STRATA_GGUF_PY=../agention-llama.cpp/gguf-py .venv/bin/python tools/iq_pack.py \
+.venv/bin/python tools/iq_pack.py \
   --gguf models/Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf --out packs/gyro-s --compat-bf16
 build/native_expert_parity --load-check packs/gyro-s models/Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf
 ```
@@ -189,10 +266,40 @@ bit-exact against the reference decode (`tq_cpu_parity`). They took a one-token 
 P-core (#220). Where the rest of a decode round goes: #220 and its critical-path page.
 
 **Not measured on the fork:** Gyro-S; setup's single-card Gyro config; a fresh `START-HERE.bat --family gyro` run end to
-end (the setup path was added on 2026-10-14 and checked with its unit tests only); AMD; the stock-GGML build (it runs
-decode, but the prompt path then has no MMQ for the trellis types); token parity against llama.cpp.
+end (the setup path was added on 2026-10-14 and checked with its unit tests only); AMD; the stock-GGML build, with or without
+upstream's trellis MMQ overlay (#268); token parity against llama.cpp.
 
-## Measured by agentionai
+## Measured by upstream (the port, 2026-10-15/16)
+
+One AMD Radeon AI PRO R9700 (gfx1201, ROCm 7), one card of four, exclusive box lock, `--prefill auto --spec 4 --spec-min-p 0.5
+--mtp --kv int8`, 22K context, interleaved pairs (the arm that goes first alternates), medians, the files of the first
+Gyro release (2026-10-07). A = agentionai/Strata rc2 9ff02c9, B = this port.
+
+| B, ggml of | file | decode tok/s A / B (B/A) | pairs B faster | prompt 4K ms A / B | prompt 20K ms A / B |
+| --- | --- | ---: | --- | ---: | ---: |
+| agentionai fork | Gyro-S | 85.4 / 89.7 (1.051) | 5/5 | 5418 / 5313 (0.98) | 14358 / 13859 (0.97) |
+| agentionai fork | Gyro-M | 72.7 / 82.7 (1.136) | 5/5 | 5183 / 5520 (1.07) | 13421 / 14164 (1.06) |
+| upstream + overlay (the ready-made engine) | Gyro-S | 85.3 / 89.6 (1.050) | 5/5 | 5413 / 5298 (0.98) | 14372 / 13854 (0.96) |
+| upstream + overlay | Gyro-M | 72.6 / 82.6 (1.138) | 5/5 | 5682 / 5524 (0.97) | 15005 / 14160 (0.94) |
+| upstream, no overlay (FP16 prompt path) | Gyro-S | 85.3 / 89.6 (1.050) | 5/5 | 5425 / 6939 (1.28) | 14364 / 21677 (1.51) |
+
+Decode is faster than rc2's because the port sits on the newer Strata (0.1.45); the same engine change makes IQ3_XXS 7% faster
+(rc2 86.9, port 93.1 tok/s, 2 pairs). Prompts of the ISTA files gained 11-16% from it too (IQ3_XXS 4K 6184 to 5480 ms, 20K
+16587 to 13864 ms). Gyro-M's first run against rc2 showed its prompts 5-7% slower; in the second rc2's own Gyro-M prompts
+took 15.0 s instead of 13.4 s (the 92 GB file's page-cache state), the port's stayed at 14.2 s, and Gyro-M's prompts are 3-6%
+faster than rc2's: that difference was rc2's baseline, not a regression. Without the overlay (plain upstream ggml) the trellis
+prompt kernels are missing and prompts go through the FP16 path: 28% (4K) to 51% (20K) slower than rc2, and a different
+rounding. Decode is unaffected either way.
+
+Identity (the fixed gate flags, 10 prompts, exact_pp 4096 and 20000 tokens, same card for both arms):
+
+- Q2_0 and IQ3_XXS, f-split against the port (upstream ggml): 10/10 identical, residual dumps and outputs IDENTICAL.
+- Gyro-S and Gyro-M, rc2 against the port with the fork's ggml and with upstream + overlay: 10/10 identical; exact_pp 4096 /
+  20000 residual dumps and outputs IDENTICAL (run alone; a run beside other engines on the box once showed a different dump).
+- Q2_0 and IQ3_XXS, f-split against the port with the overlay on, on AMD gfx1201 and on NVIDIA sm_86: IDENTICAL.
+- The pack step (`tools/iq_pack.py --compat-bf16`) writes byte-identical files to rc2's tools for Gyro-S.
+
+## Measured (the authors', rc2)
 
 All runs: greedy or the stated sampling, same prompt tokens as llama.cpp, MTP draft `--spec 4 --spec-min-p 0.5`,
 int8 KV. "llama.cpp" is the agentionai fork with the CUDA trellis fixes (in its `main` since 2026-10-04).
@@ -205,7 +312,7 @@ Decode tokens/s, single prompts of 34-177 tokens, 384 new tokens, `--max-context
 |---|---:|---:|---:|
 | Strata | 139.9 | 221.3 | 209.0 |
 
-Server, `tools/gyro_setup.sh` config (128k context, 23,463 experts cached), thinking off, temperature 0.7,
+Server, rc2's `gyro_setup.sh` config (128k context, 23,463 experts cached), thinking off, temperature 0.7,
 top-k 20, top-p 0.95, min-p 0.05, 512 new tokens, 3 repetitions:
 
 | | prose | JSON | code | copy |
@@ -280,6 +387,12 @@ Single RTX 4090 smoke run (Gyro-S, MTP draft, greedy): code 107.5, prose 84.3, J
   kernels with each other, not with a float reference.
 
 ## Known limits
+
+- **Not in this port** (rc2 has them; see the list at the end of this page): the prompt helper on a second GPU for a Gyro
+  pack. Setup of two cards still runs the layer split and the decode peer; the prompt peer says it is not used for a
+  Hadamard-folded pack and the prompt stays on the first card. Gyro-L, Intel Arc (SYCL) and Apple Metal are not supported.
+- **Source builds:** the SYCL tree builds with these sources (P1006, 0 errors) but has no trellis GPU kernels; the Metal
+  engine builds and refuses the file at load (`native_expert_supported`).
 
 - **Not measured yet:** token parity against llama.cpp.
 - **Benchmark mode only:** `strata --tokens-file ... --max-new N` decodes N tokens past the end of the answer;
