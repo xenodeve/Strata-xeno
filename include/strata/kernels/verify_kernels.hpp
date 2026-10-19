@@ -41,6 +41,8 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// #254: dst[i] += src[i] for i < n (src may be mapped host memory)
+void add_rows(float* dst, const float* src, int64_t n, void* stream);
 /// #227 the 4070's window graph: a layer's segment waits until *go (mapped host memory) reaches *count + 1, where
 /// *count (device memory) is how many times this segment has run - so the value is not baked into the graph and a
 /// graph replayed every window needs no parameter update.  window_signal then advances *count and writes it to
@@ -56,6 +58,14 @@ void window_rows_to_host(const float* src, float* dst_mapped, const int32_t* sta
 /// from device memory (the layer's plan), so the captured graph needs no update; *n = 0 costs one empty launch.
 void window_fetch_blobs(const int32_t* n, const unsigned long long* src, const long long* bytes, uint8_t* dst,
                         unsigned long long stride, int max_slots, void* stream);
+/// #265: window_rows_to_host with each value written as fp16 (round to nearest even) - half the bytes
+void window_rows_to_host16(const float* src, uint16_t* dst_mapped, const int32_t* start, const int32_t* n_groups,
+                           int n_embd, int max_rows, void* stream);
+/// #262: the window segment's plan and activations in one kernel: bytes_a from src_a to dst_a and bytes_b from src_b
+/// to dst_b (sources in mapped host memory; 16-byte aligned, sizes multiples of 16).  It replaces two memcpy nodes,
+/// which in a graph with a side branch started ~25 us after the node before them (nsys, gyro-record/nsys_seg.py).
+void window_copy_in(const void* src_a, void* dst_a, size_t bytes_a, const void* src_b, void* dst_b, size_t bytes_b,
+                    void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
@@ -74,6 +84,11 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
 /// wait_flag_ge that also returns when *skip == value (device memory).
+/// #254 STRATA_VERIFY_HIT_PLAN: the plan of a window group's resident entries (the host's format and order; misses
+/// left to the host, no PCIe share), n_entries <= 128
+void resident_hits_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                        const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                        long long capx, void* stream);
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,

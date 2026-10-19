@@ -493,6 +493,11 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int spin_us, Po
         ecore_skip_tail_ = (std::max)(0, std::atoi(v));
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
+    if (worker_stats_on()) {   // #267
+        wtasks_.reset(new std::atomic<uint64_t>[(size_t) n_ + 1]);
+        wns_.reset(new std::atomic<uint64_t>[(size_t) n_ + 1]);
+        for (int i = 0; i <= n_; ++i) { wtasks_[(size_t) i].store(0); wns_[(size_t) i].store(0); }
+    }
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
     g_diag_pool.store(this);
@@ -688,11 +693,37 @@ void ExpertPool::wait_done(int n) {
     }
 }
 
+bool ExpertPool::worker_stats_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_POOL_WORKER_STATS"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
+void ExpertPool::take_worker_stats(std::vector<uint64_t>& tasks, std::vector<uint64_t>& ns) {
+    tasks.clear();
+    ns.clear();
+    if (!wtasks_) return;
+    for (int i = 0; i <= n_; ++i) {
+        tasks.push_back(wtasks_[(size_t) i].exchange(0, std::memory_order_relaxed));
+        ns.push_back(wns_[(size_t) i].exchange(0, std::memory_order_relaxed));
+    }
+}
+
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
+    const size_t wslot = id >= 0 ? (size_t) id : (size_t) n_;   // #267: the host's stats slot is n_
     for (;;) {
         const int ci = claim(epoch, id >= n_fast_workers_);
         if (ci < 0) break;
+        const auto w_t0 = wtasks_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        struct WStat {   // #267: this task's time, counted however the branch below leaves the loop body
+            ExpertPool* p; size_t s; std::chrono::steady_clock::time_point t0;
+            ~WStat() {
+                if (!p->wtasks_) return;
+                p->wtasks_[s].fetch_add(1, std::memory_order_relaxed);
+                p->wns_[s].fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+            }
+        } w_stat{this, wslot, w_t0};
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
@@ -793,6 +824,19 @@ void ExpertPool::native_rows(int mode, int64_t g0, int64_t g1) {
 void ExpertPool::wait_quantized(int e) {
     // the host may be the one waiting here, inside its drain: it does not reach wait_done's clock, so this one has
     // its own - a gate/up task that never ends is the same stall (issue #29)
+    if (gu_left_[e].load(std::memory_order_acquire) < 0) return;
+    // timeline "pool wait quantized" (a = expert, b = the gate/up tasks still left): a down task that waited for its
+    // expert's last gate/up task (#187 R3); only waits that happened, so the span's total is the spin
+    struct WaitSpan {
+        bool on;
+        std::chrono::steady_clock::time_point t;
+        int e, left;
+        ~WaitSpan() { if (on) timeline::complete("pool wait quantized", t, std::chrono::steady_clock::now(), e, left); }
+    } wait_span{timeline::enabled(), {}, e, 0};
+    if (wait_span.on) {
+        wait_span.t = std::chrono::steady_clock::now();
+        wait_span.left = gu_left_[e].load(std::memory_order_relaxed);
+    }
     uint32_t spins = 0;
     std::chrono::steady_clock::time_point t0{};
     int seen = 0;
@@ -940,6 +984,48 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+bool ExpertPool::run_split_multi_native_begin(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
+    if (n <= 0 || n > kMaxSplitMulti || !fused_ || n_ <= 0 || async_on_) return false;
+    async_t0_ = std::chrono::steady_clock::now();
+    mjobs_ = jobs;
+    nfmt_ = &f;
+    fgu_rows_ = (int64_t) n * FF;   // the one-phase setup of run_split_multi_native, for one batch
+    fd_rows_ = (int64_t) n * H;
+    ftasks_gu_ = phase_tasks(fgu_rows_);
+    ftasks_d_ = phase_tasks(fd_rows_);
+    for (int e = 0; e < n; ++e) gu_left_[e].store(0, std::memory_order_relaxed);
+    for (int i = 0; i < ftasks_gu_; ++i) {
+        const int64_t g0 = fgu_rows_ * i / ftasks_gu_, g1 = fgu_rows_ * (i + 1) / ftasks_gu_;
+        if (g1 > g0)
+            for (int e = (int) (g0 / FF); e <= (int) ((g1 - 1) / FF); ++e) gu_left_[e].fetch_add(1, std::memory_order_relaxed);
+    }
+    wait_parked("before a deferred phase");
+    mode_ = 7;
+    njobs_ = ftasks_gu_ + ftasks_d_;
+    async_tasks_ = njobs_;
+    async_n_ = n;
+    async_bytes_ = f.bytes;
+    async_on_ = true;
+    async_epoch_ = begin_batch(njobs_);
+    return true;
+}
+
+void ExpertPool::run_async_end() {
+    if (!async_on_) return;
+    if (host_works_) drain(-1, host_scratch_, async_epoch_);
+    wait_done(async_tasks_);
+    wait_parked("after a deferred phase");
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    const auto d = std::chrono::steady_clock::now();
+    timeline::complete("pool one phase", async_t0_, d, async_n_);
+    ms_multi_gu += std::chrono::duration<double, std::milli>(d - async_t0_).count();
+    multi_bytes += (int64_t) async_n_ * (int64_t) async_bytes_;
+    ms_drain_ += std::chrono::duration<double, std::milli>(d - async_t0_).count();
+    mode_ = 0;
+    async_on_ = false;
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {

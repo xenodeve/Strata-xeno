@@ -1,6 +1,8 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/defer.hpp"
+#include "strata/core/expert_source.hpp"   // tail_skip_rank (#254 STRATA_VERIFY_HIT_PLAN)
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -323,7 +325,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
-    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, h_flagD_})
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
@@ -452,7 +454,7 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_ymiss16_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -556,7 +558,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
-              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_) &&
+              mapped(64, (void**) &h_flagD_, (void**) &m_flagD_) &&
+              mapped(2 * T * N * 4, (void**) &h_def_, (void**) &m_def_) &&
+              (!rows_f16_env() || mapped(T * K * N * 2, (void**) &h_ymiss16_, (void**) &m_ymiss16_));
+    defer_rank_ = defer_rank_env();
+    { const char* v = std::getenv("STRATA_DEFER_SAME"); defer_same_ = v != nullptr && std::atoi(v) == 1; }   // #254 diagnostic
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
@@ -734,6 +741,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
         device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
     }
+    {   // #254: the resident share of every layer planned on the device, so the graph never waits for the host's
+        // plan (flag A); not beside E-6 or set_always_publish, nor with Foresight's swap slots (the host plans those)
+        const char* v = std::getenv("STRATA_VERIFY_HIT_PLAN");
+        const char* fs = std::getenv("STRATA_FS_SLOTS");
+        hit_plan_ = !all_resident_ && !always_publish_ && !device_plan_ && hits.d_res != nullptr &&
+                    (fs == nullptr || std::atoi(fs) <= 0) && strata::core::tail_skip_rank() == 0 &&
+                    (v != nullptr && std::atoi(v) != 0);
+    }
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
         if (cudaMalloc((void**) &qcnt_, sizeof(unsigned) * (size_t) (g.n_embd / 32)) != cudaSuccess ||
@@ -743,7 +758,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             qcnt_ = nullptr;
         }
     }
-    if (all_resident_ || device_plan_) {
+    if (all_resident_ || device_plan_ || hit_plan_) {
         bool ok2 = true;
         if (device_plan_)
             ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
@@ -752,7 +767,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                   cudaMemcpy(slot_off_d_, hits.slot_off, (size_t) hits.n_slots * sizeof(unsigned long long),
                              cudaMemcpyHostToDevice) == cudaSuccess;
         }
-        if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
+        if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; hit_plan_ = false; }
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
@@ -885,6 +900,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     }
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
+    const bool defer_on = defer_active(G, g.n_layers);   // #254
+    const bool hit_plan_on = hit_plan_ && !remote_opt_ && !pcie_share_;   // #254 STRATA_VERIFY_HIT_PLAN
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         stamp(l, 0, grp);
@@ -916,8 +933,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       ple_native_postops_enabled();
             // S25 (STRATA_PLE_BATCH=1): the key and value projections depend only on each row's n-gram embedding, so
             // the group's rows run through the multi-row forms of the same kernels (the weights read once); every
-            // row's arithmetic is the single-row call's. The history-dependent rest stays row by row.
-            static const bool ple_batch = [] { const char* e = std::getenv("STRATA_PLE_BATCH"); return e && e[0] == '1'; }();
+            // row's arithmetic is the single-row call's. The history-dependent rest stays row by row.  xeno #263: the
+            // default (=0 for the per-row reads): Gyro-M's GGUF-native key takes this path, one token at a time it
+            // re-read the key per row; generate 74.9 -> 75.5 tok/s, outputs identical
+            static const bool ple_batch = [] { const char* e = std::getenv("STRATA_PLE_BATCH"); return !e || e[0] != '0'; }();
             PleWeights pw = ss.ple.w;
             const bool nkey = pw.key_native_data != nullptr && pw.key_bf16 == nullptr;
             const bool batched = !ple_batch_kv && ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16_enabled();
@@ -1428,6 +1447,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #endif
             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
             // whatever the device's residency table says (pipelined windows)
+            // #254: deferral weights the deferred rows on the host, so it needs this layer's routing weights there
+            if (defer_on && !(remote_opt_ || always_publish_))
+                cudaMemcpyAsync(m_w_ + tb * K, w_ + tb * K, (size_t) n * K * sizeof(float), cudaMemcpyDeviceToDevice, cs);
             if (remote_opt_ || always_publish_)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
@@ -1440,6 +1462,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 cudaEventRecord(ev_fork_, cs);
                 cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
             }
+            if (hit_plan_on)   // #254: this group's resident share, planned here instead of waiting for the host's
+                resident_hits_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                                   hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                                   plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, cs);
         }
         stamp(l, 17, grp);
         bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
@@ -1544,7 +1570,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
         } else {
-            if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+            if (hit_plan_on) {
+                // #254: the plan is the device's own (resident_hits_plan after the doorbell): no wait for flag A
+            } else if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
                 wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
                 copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
             } else {
@@ -1582,8 +1610,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
                 } else {
                     // (xeno) H2: read only the rows that are not GPU hits over the link (bitwise copy + moe_hit_add)
-                    moe_hit_merge_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst,
-                                         p_counts + 1, (int64_t) n * K, N, cs);
+                    if (m_ymiss16_ != nullptr)   // #265: the rows as fp16
+                        moe_hit_merge_mapped16(parts_out, m_ymiss16_ + (size_t) tb * K * N, hit_out, p_dst,
+                                               p_counts + 1, (int64_t) n * K, N, cs);
+                    else
+                        moe_hit_merge_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst,
+                                             p_counts + 1, (int64_t) n * K, N, cs);
                 }
             }
         }
@@ -1606,6 +1638,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             MoEBuffers mb = ss.moe;
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
+        }
+        if (defer_on && defer_same_) {   // #254 diagnostic: this layer's own deferred sum, waited for (no overlap)
+            wait_flag_ge(m_flagD_, ring, cs);
+            add_rows(bo_ + tb * N, m_def_ + (size_t) (l & 1) * max_t_ * N + (size_t) tb * N, (int64_t) n * N, cs);
+        } else if (defer_on && l > lb_) {   // #254: the previous layer's deferred experts, once the host has summed them
+            wait_flag_ge(m_flagD_, ring - 1, cs);
+            add_rows(bo_ + tb * N, m_def_ + (size_t) ((l - 1) & 1) * max_t_ * N + (size_t) tb * N, (int64_t) n * N, cs);
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
@@ -1963,6 +2002,8 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_flagD_ != nullptr) *(volatile uint32_t*) h_flagD_ = 0;
+    if (defer_rank_ >= 0 && h_def_ != nullptr) std::memset(h_def_, 0, (size_t) 2 * max_t_ * g_->n_embd * sizeof(float));
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -2068,6 +2109,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
+    const bool defer_win = defer_active(G, g.n_layers);   // #254: the same switch the graph was captured with
     if (ar_on() && !test_stall) {
         if (do_ple) {
             timeline::Span ple_span("ple gather", T);   // #44: the PLE rows of the window's tokens
@@ -2126,9 +2168,27 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
+        // #254: this step's deferral - never the first layer (its PLE rows are published behind its flag) nor the
+        // last (nothing reads a later slot); a step that does not defer leaves zeros in its slot
+        DeferHook& dh = defer_hook();
+        float* def_slot = defer_win ? h_def_ + (size_t) (l & 1) * max_t_ * g.n_embd + (size_t) tb * g.n_embd : nullptr;
+        dh.active = defer_win && k > 0 && l + 1 < g.n_layers;
+        dh.w = h_w_ + (size_t) tb * ss.k;   // read only when active, or by the #255 diagnostic STRATA_DROP_MATCH
+        if (dh.active) {
+            dh.rank = defer_rank_;
+            dh.flag = (volatile uint32_t*) flag;
+            dh.want = want;
+            dh.w = h_w_ + (size_t) tb * ss.k;
+            dh.out = def_slot;
+        } else if (defer_win) {
+            std::memset(def_slot, 0, (size_t) n * g.n_embd * sizeof(float));
+        }
+        rows_f16_hook().out16 = h_ymiss16_ != nullptr && !device_plan_ && !remote_opt_ ? h_ymiss16_ + (size_t) tb * ss.k * g.n_embd : nullptr;
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        rows_f16_hook().out16 = nullptr;
+        dh.active = false;
         if (remote_opt_) remote_opt_->end();
         VDBG("layer %lld served\n", (long long) l);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
@@ -2159,6 +2219,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             ms_host += ms_since(tp);
         }
         if (!(test_stall && k + 1 == steps)) *flag = want;
+        if (defer_win) {   // #254: the deferred sum (or zeros) is in its slot
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            _mm_sfence();
+            *(volatile uint32_t*) h_flagD_ = want;
+        }
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
         if (timeline::enabled()) {
@@ -2739,6 +2804,8 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_flagD_ != nullptr) *(volatile uint32_t*) h_flagD_ = 0;
+    if (defer_rank_ >= 0 && h_def_ != nullptr) std::memset(h_def_, 0, (size_t) 2 * max_t_ * g_->n_embd * sizeof(float));
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
@@ -2842,6 +2909,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             raise_flag(h_flagB_, want);
         }
         *flag = want;
+        if (h_flagD_ != nullptr) *(volatile uint32_t*) h_flagD_ = want;   // #254: nothing deferred here
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
@@ -2996,6 +3064,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             raise_flag(h_flagB_, want);
         }
         *(volatile uint32_t*) h_flag_ = want;
+        if (h_flagD_ != nullptr) *(volatile uint32_t*) h_flagD_ = want;   // #254: nothing deferred here
         ms_pool += ms_since(b);
         b_last_ = Clock::now();
         ++b_k_;
@@ -3206,9 +3275,11 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window (pipelined): the CPU experts of layer", l);
+        rows_f16_hook().out16 = h_ymiss16_ != nullptr && !device_plan_ && !remote_opt_ ? h_ymiss16_ + (size_t) tb * ss.k * g.n_embd : nullptr;
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        rows_f16_hook().out16 = nullptr;
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", fl_k_, l,
                               (int64_t) ms_since(b));
         progress_tick();
@@ -3226,6 +3297,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         }
         if (fl_k_ == 0 && !gather_ple()) return -1;
         *(volatile uint32_t*) h_flag_ = want;
+        if (h_flagD_ != nullptr) *(volatile uint32_t*) h_flagD_ = want;   // #254: nothing deferred here
         ++fl_k_;
         ms_pool += ms_since(b);
         fl_since_ms_ = fl_flush_ms_ = now_ms();

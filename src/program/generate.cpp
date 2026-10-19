@@ -6066,7 +6066,11 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
-        const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
+        // xeno #266: without the loan (--no-prefill-borrow) the prompt path's own buffers come after the cache, so
+        // they are held back here as the split placement prices them (split_pf_mib); before, the cache took the
+        // VRAM and the first prompt failed at cublasCreate
+        const size_t own_pf = pf_borrow ? 0 : (size_t) split_pf_mib << 20;
+        const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first + own_pf;
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         std::fprintf(stderr, "strata generate: expert cache sizing: %.2f GiB free, %d MiB reserve, budget %.2f GiB -> cap %.2f GiB%c", (double) free_b / 1073741824.0, o.vram_reserve_mib, (double) budget / 1073741824.0, (double) cap / 1073741824.0, 10);
@@ -13252,10 +13256,16 @@ int main(int argc, char** argv) {
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
             std::vector<int64_t> cuts = {reread_to, root_at, shared_at, message_at, turn_at, n - 1};
-            if (pin_at >= 0) {
-                cuts.push_back(pin_at);
-                std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
-            }
+            if (pin_at >= 0) cuts.push_back(pin_at);
+            // #260: a part also ends at every periodic checkpoint position, so its on_chunk save runs with no wave lane
+            // past it.  Inside a part the other lane's next chunk had already moved the GDN state, the PLE history, the
+            // indexer and the KV page past the position: a request resuming from such a checkpoint started from a
+            // wrong state.  The cut leaves a full read byte-identical (+0.6 % read time at 33K).  STRATA_CKPT_CUTS=0:
+            // the old in-part save (the A/B arm)
+            static const bool ckpt_cuts = [] { const char* v = std::getenv("STRATA_CKPT_CUTS"); return v == nullptr || std::atoi(v) != 0; }();
+            if (ckpt_cuts && sp_wave && o.prompt_cache_every > 0)
+                for (int64_t p = pp_next_check; p < n - 1 && p != INT64_MAX; p += o.prompt_cache_every) cuts.push_back(p);
+            std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             int64_t at = read_from;
             // #188: the checkpoint after a batched part copies the GDN state (~118 MB on Gyro-M) to the host over the x4
             // while the refill copies the lent experts the other way; it is joined before the next part reads (which
@@ -13373,6 +13383,9 @@ int main(int argc, char** argv) {
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
+            // STRATA_MTP_TOP2 by the draft's own probability (< 0.6, < 0.8, < 0.95, >= 0.95): drafts verified, rejected,
+            // runner-up right - what a sibling added only below a confidence threshold would cost and catch
+            int64_t t2b_tested[4] = {}, t2b_rej[4] = {}, t2b_hit[4] = {};
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
             strata::spec::PromptLookupSource lookup_src(sfx);
@@ -14177,6 +14190,13 @@ int main(int argc, char** argv) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
+                if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window)
+                    for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) {
+                        const float pd = dprob[(size_t) d];
+                        const int b = pd < 0.6f ? 0 : pd < 0.8f ? 1 : pd < 0.95f ? 2 : 3;
+                        ++t2b_tested[b];
+                        if (d == a) { ++t2b_rej[b]; t2b_hit[b] += mtp.top2(a) == outv[(size_t) a]; }
+                    }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
@@ -14441,6 +14461,18 @@ int main(int argc, char** argv) {
                             d1.wait - ds0.wait, d1.pool - ds0.pool, d1.plan - ds0.plan, d1.actq - ds0.actq,
                             d1.jobs - ds0.jobs, d1.run - ds0.run, d1.host - ds0.host, dt_commit, dt_draft);
             }
+            if (strata::kernels::cpu::ExpertPool::worker_stats_on() && drive.d.pool != nullptr) {   // #267
+                std::vector<uint64_t> wt, wn;
+                drive.d.pool->take_worker_stats(wt, wn);
+                std::string line = "strata pool threads (this request: tasks, us per task):";
+                char buf[64];
+                for (size_t i = 0; i < wt.size(); ++i) {
+                    std::snprintf(buf, sizeof buf, " %s%zu %llu/%.1f", i + 1 == wt.size() ? "host" : "w", i + 1 == wt.size() ? (size_t) 0 : i,
+                                  (unsigned long long) wt[i], wt[i] ? (double) wn[i] / 1000.0 / (double) wt[i] : 0.0);
+                    line += buf;
+                }
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
             const int64_t req_offload = drive.d.offload_entries - offload0;
             // #471: the prompt tokens this request read - all the fresh ones, or as far as the prompt pass got when a
             // cancel stopped it part-way (a cancelled request used to be logged and counted as having read them all)
@@ -14683,6 +14715,13 @@ int main(int argc, char** argv) {
                                      "of %lld windows\n", (long long) t2_rej[0], (long long) t2_hit[0], (long long) t2_rej[1],
                              (long long) t2_hit[1], (long long) t2_rej[2], (long long) t2_hit[2], (long long) t2_rej[3],
                              (long long) t2_hit[3], (long long) dec_windows);
+            if (strata::core::MtpDrafter::top2_env())
+                std::fprintf(stderr, "strata serve: mtp top2 by draft p (<0.6 <0.8 <0.95 >=0.95): tested/rejected/runner-up "
+                                     "%lld/%lld/%lld %lld/%lld/%lld %lld/%lld/%lld %lld/%lld/%lld\n",
+                             (long long) t2b_tested[0], (long long) t2b_rej[0], (long long) t2b_hit[0],
+                             (long long) t2b_tested[1], (long long) t2b_rej[1], (long long) t2b_hit[1],
+                             (long long) t2b_tested[2], (long long) t2b_rej[2], (long long) t2b_hit[2],
+                             (long long) t2b_tested[3], (long long) t2b_rej[3], (long long) t2b_hit[3]);
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
                 std::fprintf(stderr, "strata serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "
@@ -15693,17 +15732,19 @@ int main(int argc, char** argv) {
             }
             if (first_window) T = 1;
             bool from_sfx = false;
-            int sfx_match = 0;
+            int sfx_match = 0, sfx_k = 0;
             const Clock::time_point t_sfx = Clock::now();   // #44: the suffix drafter's search
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
                 if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
+                    sfx_k = k;
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
-            if (strata::timeline::enabled()) strata::timeline::complete("suffix propose", t_sfx, Clock::now(), T);
+            // b: the drafts the lookup offered the policy (0: none, or its first token disagreed with the MTP's)
+            if (strata::timeline::enabled()) strata::timeline::complete("suffix propose", t_sfx, Clock::now(), T, sfx_k);
             // The window's rows sit at p .. p + T - 1, and past the context there is no cell to verify them in: near
             // its end the window takes only the rows that fit (the admission checked the prompt and max_new, which a
             // full window can overrun)

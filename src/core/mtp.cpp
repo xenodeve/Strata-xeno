@@ -1355,6 +1355,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
         };
         wait_step(0);
+        // STRATA_MTP_TOP2: the step's runner-up, read from its head logits before the next step overwrites them.  The
+        // diagnostic used to be declared and never called, so every runner-up compared as -1 (0 hits by construction)
+        const bool top2 = top2_env();
+        if (top2) record_top2(0);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
         if (on_draft && pj >= min_p) on_draft(drafts[0]);   // #44 D4: only a draft the next window will verify
@@ -1370,6 +1374,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             if (gc) decode_gpu_span("mtp step", se0, gc->record(cs_), j);
             (void) cudaStreamQuery(cs_);
             wait_step(j);
+            if (top2) record_top2(j);
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (on_draft && pj >= min_p) on_draft(drafts[j]);

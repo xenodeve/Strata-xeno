@@ -140,6 +140,10 @@ void set_current_thread_priority(int priority);
 
 class ExpertPool {
 public:
+    /// #267 STRATA_POOL_WORKER_STATS=1: per thread (the workers, then the host) the tasks run and their total ns since
+    /// the last call, which resets them.  Empty when the switch is off.
+    void take_worker_stats(std::vector<uint64_t>& tasks, std::vector<uint64_t>& ns);
+    static bool worker_stats_on();
     /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores
     /// (minus core 0 by default) and each owns one `ExpertScratch`, so nothing in the token path allocates.
     ///
@@ -218,6 +222,12 @@ public:
     /// (the worker that finishes them quantizes the SwiGLU output) - instead of two phases with a barrier and a
     /// host quantize between them.  Bit-identical either way.  On by default; STRATA_POOL_FUSED=0 turns it off.
     void set_fused(bool on) { fused_ = on; }
+    /// #254: run_split_multi_native's one-phase batch started without the host.  False (nothing started) unless the
+    /// fused path takes all `n` jobs in one batch; then the workers run it while the host does other work, and
+    /// run_async_end() joins it (the host drains what is left, then waits).  No other pool call in between.
+    bool run_split_multi_native_begin(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    void run_async_end();
+    bool async_running() const { return async_on_; }
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.  #147: a
     /// native batch run in one phase counts all of it under ms_multi_gu.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -307,6 +317,9 @@ private:
     static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kIdle = -10, kWaitParked = -11,
                              kWaitDone = -12;
     std::unique_ptr<std::atomic<int32_t>[]> wstate_;
+    // #267 STRATA_POOL_WORKER_STATS=1 (diagnostic): each thread's tasks and their time since the last take (slot n_ is
+    // the host); off: never touched
+    std::unique_ptr<std::atomic<uint64_t>[]> wtasks_, wns_;
     std::atomic<int32_t> hstate_{kIdle};
     std::atomic<int64_t> hstate_ms_{0};
     alignas(64) std::atomic<uint64_t> head_{0};   // epoch << 32 | njobs << 16 | next index (issue #29)
@@ -350,6 +363,12 @@ private:
     int ftasks_gu_ = 0, ftasks_d_ = 0;
     int64_t fgu_rows_ = 0, fd_rows_ = 0;
     std::atomic<int> gu_left_[kMaxSplitMulti];
+    // #254: the batch run_split_multi_native_begin started (run_async_end joins it)
+    bool async_on_ = false;
+    uint32_t async_epoch_ = 0;
+    int async_tasks_ = 0, async_n_ = 0;
+    size_t async_bytes_ = 0;
+    std::chrono::steady_clock::time_point async_t0_{};
     void native_rows(int mode, int64_t g0, int64_t g1);   // mode 5: gate/up rows, 6: down rows
     void native_quant(int e);                             // expert e's SwiGLU output, for its down rows
     void wait_quantized(int e);                           // a down task's wait, bounded by kStall

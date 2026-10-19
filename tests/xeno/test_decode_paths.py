@@ -36,6 +36,55 @@ def test_the_4070_sync_is_split_by_whether_its_gpu_had_already_finished():
     assert s["running"] == {"n": 1, "ms_per_round": 0.05, "gpu_left_us": 40.0, "overshoot_us": 10.0}
 
 
+def _xa(name, ts, dur, a, tid=1):
+    return {"ph": "X", "name": name, "ts": ts, "dur": dur, "tid": tid, "args": {"a": a, "b": 0}}
+
+
+def test_the_window_graph_4070_is_split_into_late_start_and_straggling_compute():
+    # #227 window graph, one round, two layers.  Layer 3: plan done at 15, the segment runs 40..90, the CPU part ends at
+    # 60, the host waits 60..95 -> the 4070 started 25 late and ran 30 past the CPU.  Layer 4: the segment ends at 140,
+    # before the CPU part ends at 150; the host's wait (150..152) is all readback
+    ev = [_x("decode round", 0, 300),
+          _xa("cpu experts", 10, 90, 0), _xa("plan 4070 launch", 12, 3, 3), _xa("4070 finish", 60, 38, 3),
+          _xa("4070 wait", 60, 35, 3), _xa("4070 segment", 40, 50, 3, tid=9),
+          _xa("cpu experts", 105, 50, 0), _xa("plan 4070 launch", 107, 3, 4), _xa("4070 finish", 150, 4, 4),
+          _xa("4070 wait", 150, 2, 4), _xa("4070 segment", 112, 28, 4, tid=9)]
+    w = dp.window_split(ev)
+    assert w["layers"] == 2 and w["rounds"] == 1
+    assert w["4070 after cpu"] == 0.5
+    assert w["ms"]["4070 straggle past cpu"] == 0.030      # layer 3 only: 90 - 60
+    assert w["ms"]["4070 wait"] == 0.037
+    assert w["ms"]["wait with the 4070 done"] == 0.007     # layer 3's 5 after its end at 90, layer 4's 2
+    assert w["ms"]["plan -> segment start"] == 0.027       # 25 + 2
+    assert w["ms"]["segment"] == 0.078
+    # a shorter segment helps only where the 4070 straggled: layer 3's 30, capped at d; layer 4 gives nothing
+    assert w["shave ms"] == {5: 0.005, 10: 0.01, 20: 0.02, 40: 0.03}
+
+
+def test_the_fetch_overlap_counts_only_steps_that_staged_capped_by_compute_and_straggle():
+    w = {"rounds": 1, "steps": [(30.0, 2, 1), (100.0, 0, 3), (500.0, 10, 2), (80.0, 5, 0)]}
+    # step 1: min(57, 14, 30) = 14; step 2: no resident group to hide under -> 0; step 3: min(114, 70, 500) = 70;
+    # step 4 staged nothing
+    assert dp.fetch_overlap(w, 57.0, 7.0) == 0.084
+    # with a fixed 40 us of kernel time: step 1 min(57, 54, 30) = 30; step 3 min(114, 110, 500) = 110
+    assert dp.fetch_overlap(w, 57.0, 7.0, 40.0) == 0.14
+
+
+def test_a_window_graph_layer_without_a_segment_is_skipped():
+    ev = [_x("decode round", 0, 100), _xa("cpu experts", 10, 50, 0), _xa("plan 4070 launch", 12, 3, 3),
+          _xa("4070 finish", 40, 5, 3), _xa("4070 wait", 40, 4, 3)]
+    assert dp.window_split(ev)["layers"] == 0
+
+
+def test_the_mtp_chain_gaps_are_the_idle_time_before_each_step():
+    # one round: the round 0..100, step 1 at 130..230 (gap 30), step 2 at 250..350 (gap 20); the next round's chain
+    # starts with a round, so the verify between the chains is not counted
+    ev = [_x("decode round", 0, 1000), _x("mtp round", 0, 100), _x("mtp step", 130, 100), _x("mtp step", 250, 100),
+          _x("mtp round", 900, 50)]
+    m = dp.mtp_gaps(ev)
+    assert m["steps per round"] == 2 and m["gap ms"] == 0.05 and m["busy ms"] == 0.35
+
+
 def test_layers_without_a_4070_share_are_skipped():
     ev = [_x("decode round", 0, 100), _x("cpu experts", 10, 50), _x("dispatch plan", 10, 5), _x("cpu pool", 20, 10),
           _x("4070 experts", 70, 5)]

@@ -16,7 +16,12 @@
 #include <set>
 #include <cmath>
 #include <cstring>
+#include <string>
+#include <thread>
 #include <vector>
+#ifdef STRATA_NATIVE_EXPERTS
+#include "ggml.h"
+#endif
 
 namespace strata::core {
 namespace {
@@ -26,6 +31,46 @@ namespace {
 // MiB or more, the payload for the rest - prices the iq3_s pack's 300 matrices at 2255 MiB where they
 // really take 2238 (+0.8%).  It over-prices, which is the safe side.  (Pricing every matrix at a granule is
 // far worse, 2378 MiB: the driver packs the sub-MiB matrices into the slack of the rounded ones.)
+// #256 STRATA_DENSE_REQ: the GGML type the Q8_0 trunk matrices are requantized to at load (q6_k 14, q5_k 13,
+// q4_k 12), or -1 (unset: the GGUF's bytes, as before)
+int dense_req_type() {
+    static const int t = [] {
+        const char* v = std::getenv("STRATA_DENSE_REQ");
+        if (v == nullptr || *v == '\0') return -1;
+        const std::string s(v);
+        if (s == "q6_k") return 14;
+        if (s == "q5_k") return 13;
+        if (s == "q4_k") return 12;
+        std::fprintf(stderr, "native dense: STRATA_DENSE_REQ=%s is not q6_k, q5_k or q4_k; ignored\n", v);
+        return -1;
+    }();
+    return t;
+}
+// rows of a Q8_0 matrix (ne0 a multiple of 256) to `type`, through float, on several threads
+bool requant_q8_0(const void* src, int ne0, int ne1, int type, std::vector<uint8_t>& out) {
+#ifdef STRATA_NATIVE_EXPERTS
+    const auto* q8 = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    if (q8 == nullptr || q8->to_float == nullptr || ne0 % 256 != 0) return false;
+    const size_t in_row = (size_t) ne0 / 32 * 34;
+    const size_t out_row = ggml_row_size((ggml_type) type, ne0);
+    out.assign((size_t) ne1 * out_row, 0);
+    const int nt = (std::max)(1, (std::min)(16, (int) std::thread::hardware_concurrency() / 2));
+    std::vector<std::thread> th;
+    for (int w = 0; w < nt; ++w)
+        th.emplace_back([&, w] {
+            std::vector<float> row((size_t) ne0);
+            for (int r = w; r < ne1; r += nt) {
+                q8->to_float((const uint8_t*) src + (size_t) r * in_row, row.data(), ne0);
+                ggml_quantize_chunk((ggml_type) type, row.data(), out.data() + (size_t) r * out_row, 0, 1, ne0, nullptr);
+            }
+        });
+    for (auto& t : th) t.join();
+    return true;
+#else
+    (void) src; (void) ne0; (void) ne1; (void) type; (void) out;
+    return false;
+#endif
+}
 constexpr uint64_t kAllocGranule = 2ull << 20;
 constexpr uint64_t kSmallAlloc = 1ull << 20;
 uint64_t alloc_bytes(uint64_t bytes) {
@@ -161,7 +206,11 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                     err = "native dense: incompatible matrix " + tensor.name;
                     return false;
                 }
-                total += alloc_bytes(strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1));
+                // #256: priced as `load` uploads it (requantized under STRATA_DENSE_REQ)
+                const int req = dense_req_type();
+                const int type = req > 0 && tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" && ref.ne0 % 256 == 0
+                                     ? req : (int) tensor.type;
+                total += alloc_bytes(strata::kernels::native_mmvq_weight_bytes(type, (int) ref.ne0, (int) ref.ne1));
             }
         }
         out = total;
@@ -200,7 +249,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         std::vector<Pending> pending;
         std::set<std::string> seen;
         int max_in = 0;
-        uint64_t total = 0, hc_q8_bytes = 0, allocated = 0;
+        uint64_t total = 0, hc_q8_bytes = 0, allocated = 0, req_saved = 0;
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
@@ -286,13 +335,24 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
-                const auto bytes = strata::kernels::native_mmvq_weight_bytes(
-                    tensor.type, (int) ref.ne0, (int) ref.ne1);
+                // #256 (opt-in STRATA_DENSE_REQ=q6_k|q5_k|q4_k): a Q8_0 matrix requantized to that type at load, so
+                // the decode GEMV and the prompt's dequant read fewer bytes (changes the outputs)
+                const int req = dense_req_type();
+                std::vector<uint8_t> requant;
+                const bool requantize = req > 0 && tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&
+                                        ref.ne0 % 256 == 0;
+                if (requantize && !requant_q8_0(gguf.tensor_data(tensor), (int) ref.ne0, (int) ref.ne1, req, requant)) {
+                    err = "native dense (STRATA_DENSE_REQ): cannot requantize " + tensor.name; return false;
+                }
+                const int type = requantize ? req : (int) tensor.type;
+                const auto bytes = strata::kernels::native_mmvq_weight_bytes(type, (int) ref.ne0, (int) ref.ne1);
+                if (requantize) req_saved += strata::kernels::native_mmvq_weight_bytes(8, (int) ref.ne0, (int) ref.ne1) - bytes;
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
                 if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+                    status = cudaMemcpy(data.get(), requantize ? (const void*) requant.data() : gguf.tensor_data(tensor), bytes,
+                                        cudaMemcpyHostToDevice);
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
@@ -302,7 +362,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 // STRATA_Q8_PACKED=1: a second, packed copy of an eligible Q8_0 matrix for the decode MMVQ (the GGUF
                 // copy stays: the prompt path's GEMMs read it).
                 DevicePtr packed;
-                if (tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&   // the PLE has its own kernel
+                if (type == 8 && tensor.name != "blk.1.ple_key.weight" &&   // the PLE has its own kernel
                     strata::kernels::native_q8_0_packed_enabled() &&
                     strata::kernels::native_q8_0_packed_eligible((int) ref.ne0, (int) ref.ne1)) {
                     std::vector<uint8_t> host(bytes);
@@ -318,7 +378,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         return false;
                     }
                 }
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)});
+                pending.push_back(Pending{&ref, type, bytes, std::move(data), std::move(packed)});
             }
             if (hc_q8_requested())
                 for (const auto& tensor : gguf.tensors()) {
@@ -373,6 +433,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
                          packed_count, packed_bytes / 1048576.0);
+        if (req_saved > 0)
+            std::fprintf(stderr, "native dense: STRATA_DENSE_REQ: Q8_0 matrices requantized to type %d, %.1f MiB fewer\n",
+                         dense_req_type(), req_saved / 1048576.0);
         scratch_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
         allocated_ = allocated;

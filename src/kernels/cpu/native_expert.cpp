@@ -307,4 +307,33 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
 }
 
+// #255 diagnostic: one expert's output for one token in float from ggml's own dequantizer (native_expert_parity's
+// (a), the same Hadamard rule); the relative L1 error of `got` against it, and the reference's L1 norm in *ref_l1
+double native_expert_ref_rel(const NativeFmt& f, const uint8_t* blob, const float* x, const float* got, double* ref_l1) {
+    const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
+    const auto* td = ggml_get_type_traits((ggml_type) f.d_type);
+    const int64_t H = f.n_embd, FF = f.n_ff;
+    std::vector<float> row((size_t) (H > FF ? H : FF)), xr(x, x + H), h((size_t) FF);
+    if (f.had_gu) hadamard_rotate(xr.data(), (int) H, f.had_block, f.gu_signs);
+    for (int64_t r = 0; r < FF; ++r) {
+        double g = 0, u = 0;
+        tg->to_float(blob + r * f.gu_row, row.data(), H);
+        for (int64_t i = 0; i < H; ++i) g += (double) row[(size_t) i] * xr[(size_t) i];
+        tg->to_float(blob + f.up_off + r * f.gu_row, row.data(), H);
+        for (int64_t i = 0; i < H; ++i) u += (double) row[(size_t) i] * xr[(size_t) i];
+        h[(size_t) r] = (float) (g / (1.0 + std::exp(-g)) * u);
+    }
+    if (f.had_d) hadamard_rotate(h.data(), (int) FF, f.had_block, f.d_signs);
+    double num = 0, den = 0;
+    for (int64_t r = 0; r < H; ++r) {
+        td->to_float(blob + f.down_off + r * f.d_row, row.data(), FF);
+        double o = 0;
+        for (int64_t i = 0; i < FF; ++i) o += (double) row[(size_t) i] * h[(size_t) i];
+        num += std::fabs(o - (double) got[r]);
+        den += std::fabs(o);
+    }
+    if (ref_l1 != nullptr) *ref_l1 = den;
+    return num / (den + 1e-30);
+}
+
 }  // namespace strata::kernels::cpu

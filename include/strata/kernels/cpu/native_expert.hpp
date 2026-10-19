@@ -54,5 +54,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1).
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);
+/// #255 diagnostic: `got` (one token's expert output) against ggml's float dequantization of the same blob and x
+double native_expert_ref_rel(const NativeFmt& f, const uint8_t* blob, const float* x, const float* got, double* ref_l1);
 
 }  // namespace strata::kernels::cpu

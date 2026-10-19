@@ -1148,6 +1148,63 @@ __global__ void resident_plan_par_kernel(const int32_t* __restrict__ ids, int n,
     __syncthreads();
     if (i == 0) *skip = ring;
 }
+// #254 STRATA_VERIFY_HIT_PLAN: the resident entries' plan (the host's: distinct resident experts in order of first
+// occurrence, each group's entries in increasing i; the misses left out, no PCIe share) in one block, thread i =
+// entry i (n <= 128)
+__global__ void resident_hits_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
+                                          int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                                          long long blob, int32_t* __restrict__ pl, long long capx) {
+    __shared__ int32_t s_id[128];
+    __shared__ int s_first[128], s_size[128];
+    const int i = threadIdx.x;
+    int32_t e = -1;
+    bool hit = false;
+    if (i < n) {
+        e = ids[i];
+        hit = e >= 0 && e < n_expert && res[e] >= 0;
+        s_id[i] = hit ? e : -1;
+    }
+    __syncthreads();
+    int first = i, rank = 0, size = 0;
+    if (i < n && hit)
+        for (int j = 0; j < n; ++j) {
+            const bool same = s_id[j] == e;
+            if (same && j < first) first = j;
+            if (same && j < i) ++rank;
+            size += same;
+        }
+    if (i < n) { s_first[i] = hit ? first : -1; s_size[i] = hit ? size : 0; }
+    __syncthreads();
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+    if (i < n && hit) {
+        int group = 0, gstart = 0;
+        for (int j = 0; j < first; ++j)
+            if (s_first[j] == j) { ++group; gstart += s_size[j]; }
+        if (i == first) {
+            const int32_t slot = res[e];
+            ptr[group] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+            start[group] = gstart;
+        }
+        dst[gstart + rank] = i;
+        tok[gstart + rank] = i / k;
+    }
+    if (i == 0) {
+        int groups = 0, entries = 0;
+        for (int j = 0; j < n; ++j)
+            if (s_first[j] == j) { ++groups; entries += s_size[j]; }
+        start[groups] = entries;
+        start2[0] = entries;
+        counts[0] = groups;
+        counts[1] = entries;
+        counts[2] = 0;
+    }
+}
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
     while (*flag < value) strata_spin_pause();
@@ -1173,6 +1230,14 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                                                               blob, plan, capx, skip, ring, plan_err);
     check("resident_plan");
 }
+void resident_hits_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                        const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                        long long capx, void* stream) {
+    if (n_entries > 128) { std::fprintf(stderr, "resident_hits_plan: %d entries (at most 128)\n", n_entries); std::exit(1); }
+    resident_hits_plan_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base,
+                                                                     slot_off, blob, plan, capx);
+    check("resident_hits_plan");
+}
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);
     check("wait_flag_ge_or");
@@ -1193,6 +1258,15 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     check("copy_or_zero_from_mapped");
 }
 
+// #254: dst[i] += src[i] (the previous layer's deferred experts into this layer's MoE output; src is mapped)
+__global__ void add_rows_kernel(float* __restrict__ dst, const float* __restrict__ src, long long n) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+void add_rows(float* dst, const float* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    add_rows_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(dst, src, (long long) n);
+}
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");
@@ -1258,6 +1332,46 @@ __global__ void window_fetch_kernel(const int32_t* n, const unsigned long long* 
         ((uint8_t*) d)[words * 16 + threadIdx.x] = ((const uint8_t*) s)[words * 16 + threadIdx.x];
 }
 }  // namespace
+
+namespace {
+__global__ void window_copy_in_kernel(const uint4* a, uint4* da, long long na, const uint4* b, uint4* db, long long nb) {
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < na + nb; i += (long long) gridDim.x * blockDim.x) {
+        if (i < na) da[i] = a[i];
+        else db[i - na] = b[i - na];
+    }
+}
+}  // namespace
+
+void window_copy_in(const void* src_a, void* dst_a, size_t bytes_a, const void* src_b, void* dst_b, size_t bytes_b,
+                    void* stream) {
+    window_copy_in_kernel<<<16, 256, 0, (cudaStream_t) stream>>>((const uint4*) src_a, (uint4*) dst_a,
+                                                                 (long long) (bytes_a / 16), (const uint4*) src_b,
+                                                                 (uint4*) dst_b, (long long) (bytes_b / 16));
+    check("window_copy_in");
+}
+
+namespace {
+__global__ void window_rows16_kernel(const float4* __restrict__ src, uint2* dst, const int32_t* start,
+                                     const int32_t* n_groups, int n4_per_row, int max_rows) {
+    const int groups = *n_groups;
+    int rows = groups > 0 ? start[groups] : 0;
+    rows = rows < max_rows ? rows : max_rows;
+    const long long n4 = (long long) rows * n4_per_row;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (long long) gridDim.x * blockDim.x) {
+        const float4 v = src[i];
+        const __half2 a = __floats2half2_rn(v.x, v.y), b = __floats2half2_rn(v.z, v.w);
+        dst[i] = make_uint2(*(const unsigned int*) &a, *(const unsigned int*) &b);
+    }
+    __threadfence_system();
+}
+}  // namespace
+
+void window_rows_to_host16(const float* src, uint16_t* dst_mapped, const int32_t* start, const int32_t* n_groups,
+                           int n_embd, int max_rows, void* stream) {
+    window_rows16_kernel<<<32, 256, 0, (cudaStream_t) stream>>>((const float4*) src, (uint2*) dst_mapped, start,
+                                                                n_groups, n_embd / 4, max_rows);
+    check("window_rows_to_host16");
+}
 
 void window_fetch_blobs(const int32_t* n, const unsigned long long* src, const long long* bytes, uint8_t* dst,
                         unsigned long long stride, int max_slots, void* stream) {

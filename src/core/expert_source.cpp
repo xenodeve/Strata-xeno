@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/defer.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -24,6 +25,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <immintrin.h>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -3518,6 +3521,23 @@ namespace {
 // explicit environment value is read once; the serve start-up (generate.cpp) sets the CUDA default where it applies.
 std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
 }  // namespace
+DeferHook& defer_hook() {
+    static thread_local DeferHook h;
+    return h;
+}
+RowsF16Hook& rows_f16_hook() {
+    static thread_local RowsF16Hook h;
+    return h;
+}
+int defer_rank_env() {
+    static const int r = [] {
+        const char* v = std::getenv("STRATA_DEFER_RANK");
+        if (v == nullptr || *v == '\0') return -1;
+        const int x = std::atoi(v);
+        return x >= 0 && x < 10 ? x : -1;
+    }();
+    return r;
+}
 int tail_skip_rank() {
     int r = g_tail_skip_rank.load(std::memory_order_relaxed);
     if (r < 0) {
@@ -3920,9 +3940,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         ~EndBatch() { std::string e; src->materialize_end(e); }
     } end_batch{d.src};
     int njobs = 0;
+    // #254: the routed ids this dispatch reads - the caller's mapped ids, or this thread's copy once a deferral has let
+    // the GPU go on (its next layer's doorbell rewrites the mapped ids and weights)
+    const int32_t* id_src = ids;
     // routed entry i onto its expert's job, made at the expert's first entry; false: the dispatch failed
-    auto add_entry = [&](int64_t i) -> bool {
-        const int64_t t = i / k, e = ids[i];
+    auto add_entry = [&](int64_t i, float* row_out = nullptr) -> bool {
+        const int64_t t = i / k, e = id_src[i];
         int16_t& jo = d.job_of[(size_t) e];
         if (jo < 0) {
             const uint8_t* b = d.src->blob(d.layers, e);
@@ -3943,7 +3966,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
         jb.act[jb.nt] = &d.act_multi[(size_t) t];
         jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-        jb.out[jb.nt] = out + (size_t) i * H;
+        jb.out[jb.nt] = row_out != nullptr ? row_out : out + (size_t) i * H;
         ++jb.nt;
         ++d.multi_entries;
         ++d.tier_entries[3];
@@ -3955,6 +3978,53 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     };
     static thread_local std::vector<int32_t> deferred;   // #95: routed entries whose expert is still being read
     deferred.clear();
+    // #254: expert deferral - the window's best rank per expert, and the CPU entries that wait for the next layer
+    DeferHook& dh = defer_hook();
+    static thread_local std::vector<int8_t> best_rank;
+    static thread_local std::vector<int32_t> def_list;
+    def_list.clear();
+    if (dh.active) {
+        if ((int64_t) best_rank.size() < d.n_expert) best_rank.assign((size_t) d.n_expert, (int8_t) 99);
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            const int64_t e = ids[i];
+            if (e >= 0 && e < d.n_expert && (int8_t) (i % k) < best_rank[(size_t) e]) best_rank[(size_t) e] = (int8_t) (i % k);
+        }
+        std::memset(dh.out, 0, (size_t) n_tok * H * sizeof(float));
+    }
+    // #255 control (diagnostic STRATA_DROP_MATCH, changes outputs): 1 = every CPU-tier entry is dropped (the cold set,
+    // computed nowhere); 2 = those are computed and, for each, the 4070-tier entry of the same token nearest in rank is
+    // dropped instead (the warm set, a matched count).  Dropped rows stay zero: the router weights are not renormalized.
+    // stderr every 4096 steps: the dropped entries and their share of the router mass so far.
+    static const int drop_match = [] { const char* v = std::getenv("STRATA_DROP_MATCH"); return v ? std::atoi(v) : 0; }();
+    static double dm_mass_all = 0, dm_mass_drop = 0;
+    static int64_t dm_entries = 0, dm_dropped = 0, dm_unmatched = 0, dm_steps = 0;
+    static thread_local std::vector<char> warm_drop;
+    auto dm_drop = [&](int64_t i) { ++dm_dropped; if (dh.w != nullptr) dm_mass_drop += dh.w[i]; };
+    if (drop_match != 0) {
+        dm_entries += n_tok * k;
+        if (dh.w != nullptr) for (int64_t i = 0; i < n_tok * k; ++i) dm_mass_all += dh.w[i];
+        if (drop_match == 2) {
+            warm_drop.assign((size_t) (n_tok * k), 0);
+            for (int64_t t = 0; t < n_tok; ++t)
+                for (int64_t j = 0; j < k; ++j) {
+                    const int64_t i = t * k + j, e = ids[i];
+                    if (kind[i] != -1 || e < 0 || e >= d.n_expert || !d.src->resident(d.layers, e)) continue;
+                    int64_t best = -1;
+                    for (int64_t j2 = 0; j2 < k; ++j2) {
+                        const int64_t i2 = t * k + j2;
+                        if (kind[i2] != 2 || warm_drop[(size_t) i2]) continue;
+                        if (best < 0 || std::llabs(j2 - j) < std::llabs(best - j)) best = j2;
+                    }
+                    if (best >= 0) warm_drop[(size_t) (t * k + best)] = 1;
+                    else ++dm_unmatched;
+                }
+        }
+        if (++dm_steps % 4096 == 0)
+            std::fprintf(stderr, "strata drop-match %d: %lld of %lld entries dropped (%.2f %%), %.2f %% of the router mass, "
+                                 "%lld CPU entries with no 4070 entry to match\n", drop_match, (long long) dm_dropped,
+                         (long long) dm_entries, 100.0 * (double) dm_dropped / (double) (std::max)(dm_entries, (int64_t) 1),
+                         100.0 * dm_mass_drop / (dm_mass_all > 0 ? dm_mass_all : 1.0), (long long) dm_unmatched);
+    }
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
@@ -3985,6 +4055,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 continue;
             }
             ++d.cache_refused;
+            if (drop_match == 1 && d.src->resident(d.layers, e)) {   // #255 control: the cold set dropped
+                std::memset(row, 0, (size_t) H * sizeof(float));
+                dm_drop(i);
+                continue;
+            }
+            if (dh.active && best_rank[(size_t) e] >= dh.rank && d.src->resident(d.layers, e)) {   // #254
+                std::memset(row, 0, (size_t) H * sizeof(float));
+                def_list.push_back((int32_t) i);
+                continue;
+            }
             // #95: still in flight (or past the batch's 128): after materialize_end, in the second pass - a
             // materialize here would wait on the host tier this thread holds.  resident(), not blob(): blob() counts a
             // use, and add_entry's lookup is the one use
@@ -3994,11 +4074,77 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             if (!add_entry(i)) return;
         }
+    if (dh.active)   // #254: the ranks are this window's only
+        for (int64_t i = 0; i < n_tok * k; ++i)
+            if (ids[i] >= 0 && ids[i] < d.n_expert) best_rank[(size_t) ids[i]] = (int8_t) 99;
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     const auto pool_start = std::chrono::steady_clock::now();
     if (njobs > 0) run_jobs(0, njobs);
     const auto pool_end = std::chrono::steady_clock::now();
+    // #254: the deferred experts' batch starts here, on the workers, while this thread waits for the 4070 below
+    // (STRATA_DEFER_ASYNC=0: after the early flag, on this thread, as before)
+    static thread_local std::vector<float> def_rows;
+    int def_first = -1;
+    bool def_async = false;
+    static const bool defer_async = [] { const char* v = std::getenv("STRATA_DEFER_ASYNC"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool defer_drop = [] { const char* v = std::getenv("STRATA_DEFER_DROP"); return v != nullptr && std::atoi(v) == 1; }();
+    if (dh.active && !def_list.empty() && !defer_drop) {
+        if (def_rows.size() < (size_t) (n_tok * k * H)) def_rows.resize((size_t) (n_tok * k * H));
+        def_first = njobs;
+        for (const int32_t i : def_list)
+            if (!add_entry(i, def_rows.data() + (size_t) i * H)) return;
+        if (defer_async && native && !nvme_pending && njobs > def_first)
+            def_async = d.pool->run_split_multi_native_begin(lay.fmt[(size_t) d.layers], d.jobs_multi.data() + def_first,
+                                                             njobs - def_first);
+    }
+    // a failure return between the start and the join must not leave the batch running
+    struct DeferJoin {
+        decltype(d.pool) p;
+        ~DeferJoin() { if (p != nullptr && p->async_running()) p->run_async_end(); }
+    } defer_join{def_async ? d.pool : nullptr};
+    {   // #255 diagnostic STRATA_CPU_ROW_CHECK=L: layer L's CPU rows against ggml's float reference, 8 windows
+        static const int64_t chk = [] { const char* v = std::getenv("STRATA_CPU_ROW_CHECK"); return v ? (int64_t) std::atoll(v) : (int64_t) -1; }();
+        static int checked = 0;
+        if (chk >= 0 && d.layers == chk && native && checked < 8) {
+            ++checked;
+            int shown = 0;
+            for (int64_t i = 0; i < n_tok * k && shown < 3; ++i) {
+                const int64_t e = ids[i];
+                if (kind[i] != -1 || e < 0 || e >= d.n_expert || d.job_of[(size_t) e] < 0) continue;
+                const ExpertJobMulti& jb = d.jobs_multi[(size_t) d.job_of[(size_t) e]];
+                double l1 = 0;
+                const double r = strata::kernels::cpu::native_expert_ref_rel(lay.fmt[(size_t) d.layers], jb.blob,
+                                                                             x_f + (size_t) (i / k) * H, out + (size_t) i * H, &l1);
+                std::fprintf(stderr, "strata cpu row check: layer %lld expert %lld token %lld rank %lld: rel %.3e (ref L1 %.3e)\n",
+                             (long long) d.layers, (long long) e, (long long) (i / k), (long long) (i % k), r, l1);
+                static const char* gpath = std::getenv("STRATA_CPU_ROW_CHECK_GGUF");
+                static std::unique_ptr<strata::GgufModel> gm;
+                if (gpath != nullptr && gm == nullptr) gm = std::make_unique<strata::GgufModel>(strata::gguf_split_paths(gpath));
+                if (gm != nullptr) {
+                    const auto& f = lay.fmt[(size_t) d.layers];
+                    const char* roles[3] = {"gate", "up", "down"};
+                    const size_t off[3] = {0, f.up_off, f.down_off};
+                    const size_t len[3] = {f.up_off, f.down_off - f.up_off, f.bytes - f.down_off};
+                    for (int q = 0; q < 3; ++q) {
+                        size_t at = 0;
+                        const strata::TensorInfo* ti = gm->find("blk." + std::to_string(d.layers) + ".ffn_" + roles[q] + "_exps.weight", &at);
+                        if (ti == nullptr) { std::fprintf(stderr, "strata cpu row check:   %s: no tensor\n", roles[q]); continue; }
+                        const uint8_t* g0 = gm->shard(at).tensor_data(*ti);
+                        const bool same = std::memcmp(g0 + (size_t) e * len[q], jb.blob + off[q], len[q]) == 0;
+                        int64_t match = -1;
+                        if (!same)
+                            for (int64_t e2 = 0; e2 < d.n_expert && match < 0; ++e2)
+                                if (std::memcmp(g0 + (size_t) e2 * len[q], jb.blob + off[q], len[q]) == 0) match = e2;
+                        std::fprintf(stderr, "strata cpu row check:   %s bytes %s the GGUF's expert %lld%s%lld\n", roles[q],
+                                     same ? "equal" : "DIFFER from", (long long) e, same ? "" : "; they are expert ",
+                                     (long long) (same ? e : match));
+                    }
+                }
+                ++shown;
+            }
+        }
+    }
     if (nvme_pending) {   // #95: the reads have had the resident run to land; publish them, then run their jobs
         std::string ne;
         if (!d.src->materialize_end(ne)) { fail_nvme(ne); return; }
@@ -4027,7 +4173,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (secondary_claims) {
         std::string secondary_err;
         const auto finish_start = std::chrono::steady_clock::now();
-        const bool finished = d.secondary_runner->finish(out, secondary_err);
+        const bool finished = d.secondary_runner->finish(out, secondary_err, rows_f16_hook().out16);
         secondary_finish_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - finish_start).count();
         if (!finished) {
@@ -4050,6 +4196,48 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return;
         }
     }
+    if (drop_match == 2)   // #255 control: the matched 4070-tier rows, now that every GPU's rows are in
+        for (int64_t i = 0; i < n_tok * k; ++i)
+            if (warm_drop[(size_t) i]) { std::memset(out + (size_t) i * H, 0, (size_t) H * sizeof(float)); dm_drop(i); }
+    if (uint16_t* o16 = rows_f16_hook().out16) {   // #265: every row the GPU reads, as fp16 (round to nearest even)
+        const bool w16 = secondary_claims && d.secondary_runner->rows_f16_written();
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            if (kind[i] == 0 || kind[i] == 1) continue;                       // GPU hits: never read from here
+            if (w16 && d.secondary_runner != nullptr && secondary_slots[i] != -1) continue;   // the 4070 wrote them
+            const float* src = out + (size_t) i * H;
+            uint16_t* dst = o16 + (size_t) i * H;
+            int64_t x = 0;
+            for (; x + 8 <= H; x += 8)
+                _mm_storeu_si128((__m128i*) (dst + x), _mm256_cvtps_ph(_mm256_loadu_ps(src + x), _MM_FROUND_TO_NEAREST_INT));
+            for (; x < H; ++x) dst[x] = (uint16_t) _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(src[x]), _MM_FROUND_TO_NEAREST_INT), 0);
+        }
+    }
+    const auto c_imm = std::chrono::steady_clock::now();   // #254: the immediate rows are in (the deferred run follows)
+    if (dh.active && !def_list.empty()) {   // #254: the GPU may go on; the deferred experts' sum lands next layer
+        // the ids and weights first: once the flag is up the GPU's next layer publishes its own into the same rows
+        static thread_local std::vector<int32_t> def_ids;
+        static thread_local std::vector<float> def_w;
+        def_ids.assign(ids, ids + n_tok * k);
+        def_w.assign(dh.w, dh.w + n_tok * k);
+        id_src = def_ids.data();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        *dh.flag = dh.want;
+        // diagnostic STRATA_DEFER_DROP=1: the deferred experts are dropped (their slot stays zero)
+        if (defer_drop) def_list.clear();
+        const auto q0 = std::chrono::steady_clock::now();
+        if (def_async) d.pool->run_async_end();
+        else if (def_first >= 0 && njobs > def_first) run_jobs(def_first, njobs - def_first);
+        for (const int32_t i : def_list) {   // entry order: the same sum every time
+            const float wv = def_w[(size_t) i];
+            const float* r = def_rows.data() + (size_t) i * H;
+            float* o = dh.out + (size_t) (i / k) * H;
+            for (int64_t x = 0; x < H; ++x) o[x] = std::fmaf(r[x], wv, o[x]);
+        }
+        dh.deferred_entries += (int64_t) def_list.size();
+        if (timeline::enabled())
+            timeline::complete("cpu pool deferred", q0, std::chrono::steady_clock::now(), d.layers, (int64_t) def_list.size());
+    }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -4069,10 +4257,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         timeline::complete("dispatch jobs", c2, c3, d.layers, njobs);
         timeline::complete("cpu pool", pool_start, pool_end, d.layers, njobs);
         if (secondary_claims)
-            timeline::complete("4070 finish", cpu_end, c4, d.layers, (int64_t) d.secondary_runner->served_entries());
+            timeline::complete("4070 finish", cpu_end, c_imm, d.layers, (int64_t) d.secondary_runner->served_entries());
     }
     for (int64_t i = 0; i < n_tok * k; ++i) {
-        const int64_t e = ids[i];
+        const int64_t e = id_src[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
     }
     d.multi_misses += njobs;

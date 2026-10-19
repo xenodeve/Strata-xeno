@@ -18,6 +18,8 @@ from collections import defaultdict
 
 def load(path: str) -> list[dict]:
     text = open(path, encoding="utf-8").read().rstrip().rstrip(",")
+    if not text.endswith("]") and not text.endswith("}"):   # a server stopped mid-write: drop the partial event
+        text = text[:text.rfind("},") + 1]
     return json.loads(text if text.endswith("]") else text + "]")   # the engine leaves the array open
 
 
@@ -73,6 +75,86 @@ def sync_split(events: list[dict]) -> dict:
     return out
 
 
+def window_split(events: list[dict]) -> dict:
+    """#227 window graph: the 4070 runs one graph per window and has no "4070 experts" span; each layer's work is a
+    "4070 segment" on the gpu1 lane (args a = layer), tied to the host clock by the runner.  Per host "cpu experts"
+    stage with a 4070 share, pair its "plan 4070 launch", "4070 finish" (starts when the CPU part is done) and
+    "4070 wait" with the segment of the same layer, and split the wait: the 4070 starting late after the plan, the
+    4070 still computing when the CPU part ended (the straggle a deferral of its output could hide at most), and
+    the wait left after the segment had ended (the done flag's readback)."""
+    xs = [e for e in events if e.get("ph") == "X"]
+    rounds = max(1, sum(1 for e in xs if e["name"] == "decode round"))
+    seg: dict[int, list] = defaultdict(list)
+    for e in xs:
+        if e["name"] == "4070 segment":
+            seg[e["args"]["a"]].append((e["ts"], e["ts"] + e["dur"], e["args"].get("b", 0)))
+    for v in seg.values():
+        v.sort()
+    stages = sorted((e for e in xs if e["name"] == "cpu experts"), key=lambda e: e["ts"])
+    starts = [e["ts"] for e in stages]
+    inner: list[dict] = [{} for _ in stages]
+    for e in xs:
+        if e["name"] in ("plan 4070 launch", "4070 finish", "4070 wait"):
+            i = bisect.bisect_right(starts, e["ts"]) - 1
+            if i >= 0 and e["ts"] <= stages[i]["ts"] + stages[i]["dur"]:
+                inner[i][e["name"]] = e
+    acc: dict[str, float] = defaultdict(float)
+    straggles: list[float] = []
+    steps: list[tuple] = []
+    n = later = 0
+    for st, sp in zip(stages, inner):
+        if not all(k in sp for k in ("plan 4070 launch", "4070 finish", "4070 wait")):
+            continue
+        plan, fin, wait = sp["plan 4070 launch"], sp["4070 finish"], sp["4070 wait"]
+        lay = seg.get(wait["args"]["a"], [])
+        wend = wait["ts"] + wait["dur"]
+        k = bisect.bisect_right([s[0] for s in lay], wend) - 1   # the layer's last segment to start before the wait ended
+        if k < 0 or lay[k][1] < st["ts"]:
+            continue
+        g0, g1, gb = lay[k]
+        cpu_end = fin["ts"]
+        n += 1
+        later += g1 > cpu_end
+        straggles.append(max(0.0, g1 - cpu_end))
+        steps.append((max(0.0, g1 - cpu_end), gb // 1000, gb % 1000))   # straggle, resident groups, staged blobs
+        for key, v in (("plan -> segment start", g0 - (plan["ts"] + plan["dur"])), ("segment", g1 - g0),
+                       ("4070 straggle past cpu", max(0.0, g1 - cpu_end)), ("4070 wait", wait["dur"]),
+                       ("wait with the 4070 done", wend - max(g1, wait["ts"])), ("4070 finish", fin["dur"])):
+            acc[key] += v
+    # the most a segment shorter by d us could take off the host's wait: each step's straggle, capped at d
+    shave = {d: round(sum(min(d, s) for s in straggles) / 1000 / rounds, 6) for d in SHAVE_US}
+    return {"layers": n, "rounds": rounds, "4070 after cpu": later / n if n else 0.0,
+            "ms": {k: round(v / 1000 / rounds, 6) for k, v in acc.items()}, "shave ms": shave, "steps": steps}
+
+
+def fetch_overlap(w: dict, fetch_us: float, group_us: float, base_us: float = 0.0) -> float:
+    """The most hiding the staged blobs' fetch under the resident groups' compute could take off the host's wait, in
+    ms/round: per step that staged, min(the fetch, the resident compute (base_us + group_us per group, nothing without
+    a resident group), the step's straggle)."""
+    return round(sum(min(fetch_us * st, base_us + group_us * g if g > 0 else 0.0, s)
+                     for s, g, st in w["steps"] if st > 0) / 1000 / w["rounds"], 6)
+
+
+def mtp_gaps(events: list[dict]) -> dict:
+    """The MTP draft chain on the primary GPU: each "mtp round" (the catch-up and draft 0) and the "mtp step" spans
+    after it, and the idle time between them - with --spec-min-p > 0 the host reads each draft before it launches the
+    next step, so that gap is the host's round trip, which a device-side loop would remove."""
+    xs = sorted((e for e in events if e.get("ph") == "X" and e["name"] in ("mtp round", "mtp step")), key=lambda e: e["ts"])
+    rounds = max(1, sum(1 for e in events if e.get("ph") == "X" and e["name"] == "decode round"))
+    gaps, steps, busy = [], 0, 0.0
+    for a, b in zip(xs, xs[1:]):
+        busy += a["dur"]
+        if b["name"] == "mtp step":   # a step follows the round or the step before it in the same chain
+            gaps.append(b["ts"] - (a["ts"] + a["dur"]))
+            steps += 1
+    if xs:
+        busy += xs[-1]["dur"]
+    med = sorted(gaps)[len(gaps) // 2] if gaps else 0.0
+    return {"steps per round": round(steps / rounds, 3), "gap ms": round(sum(gaps) / 1000 / rounds, 6),
+            "gap median us": med, "busy ms": round(busy / 1000 / rounds, 6)}
+
+
+SHAVE_US = (5, 10, 20, 40)
 GPU_DECODE = ("verify graph", "commit graph", "mtp round", "mtp step")   # the "gpu0 decode" lane (#44)
 EDGE_HOST = ("verify stage", "verify launch", "verify tail", "head sampling", "verify commit", "mtp draft", "emit tokens",
              "adapt join", "adapt apply", "verify capture", "ple gather", "suffix propose")
@@ -115,6 +197,17 @@ def main(argv: list[str]) -> int:
         for k, v in r["ms"].items():
             print(f"  {k:32}{v:8.2f}")
         print(f"  the 4070 ended after the CPU pool in {r['4070 after pool']:.0%} of those layers")
+        w = window_split(ev)
+        if w["layers"]:
+            print(f"  window graph: {w['layers']} layers with a 4070 segment; the 4070 ended after the CPU part in "
+                  f"{w['4070 after cpu']:.0%} of them (ms per round)")
+            for k, v in w["ms"].items():
+                print(f"    {k:30}{v:8.2f}")
+            print(f"    hiding the staged fetch (57 us/blob) under the resident groups (7 us/group) takes at most "
+                  f"{fetch_overlap(w, 57.0, 7.0):.2f} ms/round, {fetch_overlap(w, 57.0, 7.0, 40.0):.2f} with the "
+                  f"expert kernels' own 40 us")
+            print("    a segment shorter by d us takes at most (ms/round): " +
+                  ", ".join(f"{d} us {v:.2f}" for d, v in w["shave ms"].items()))
         s = sync_split(ev)
         n = s["done"]["n"] + s["running"]["n"]
         if n:
@@ -122,6 +215,10 @@ def main(argv: list[str]) -> int:
             print(f"  4070 sync, GPU still running: {s['running']['n'] / n:.0%} of waits, "
                   f"{s['running']['ms_per_round']:.2f} ms/round (median GPU left {s['running'].get('gpu_left_us', 0):.1f} us, "
                   f"median wake-up after it {s['running'].get('overshoot_us', 0):.1f} us)")
+        m = mtp_gaps(ev)
+        if m["steps per round"]:
+            print(f"  mtp draft on the GPU: busy {m['busy ms']:.2f} ms/round, {m['steps per round']:.2f} steps/round, "
+                  f"idle between them {m['gap ms']:.2f} ms/round (median {m['gap median us']:.1f} us)")
         g = edge(ev)
         if g["gpu busy"]:
             print(f"  primary GPU at the round edge: busy " +

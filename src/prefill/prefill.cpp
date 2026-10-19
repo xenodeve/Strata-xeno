@@ -1629,8 +1629,12 @@ bool split_run(Impl& m, int64_t l, int64_t T, size_t unit, const std::vector<int
                 if (pn == 0) return;
                 if (k_wait >= 0) { cudaStreamWaitEvent(sp.s, xs.copied[k_wait % xs.RING], 0); k_wait = -1; }   // same card
                 sp.clk_s.mark(sp.tl_s, "gather", sp.s, l, sb.grp);
-                mmq::gather_native_group(blobs, (int) pn, f.up_off, f.down_off, gub / 2, db, sp.grp_gu + (p0 - a) * gub,
-                                         gub, sp.grp_d + (p0 - a) * db, db, sp.s);
+                // STRATA_SPLIT_NO_GATHER=1 (a timing diagnostic: the products read stale group buffers, the output is
+                // garbage): bounds what multiplying straight from the slots and the ring, without this repack, could give
+                static const bool no_gather = [] { const char* v = std::getenv("STRATA_SPLIT_NO_GATHER"); return v != nullptr && std::atoi(v) != 0; }();
+                if (!no_gather)
+                    mmq::gather_native_group(blobs, (int) pn, f.up_off, f.down_off, gub / 2, db, sp.grp_gu + (p0 - a) * gub,
+                                             gub, sp.grp_d + (p0 - a) * db, db, sp.s);
                 int64_t k_last = -1;
                 for (size_t i = 0; i < pn; ++i)
                     if (ents[i] >= 0) { cudaEventRecord(my_used[ents[i] % xs.RING], sp.s); k_last = ents[i]; }
@@ -1675,7 +1679,11 @@ bool split_run(Impl& m, int64_t l, int64_t T, size_t unit, const std::vector<int
         a.bounds = sp.bounds + sb.boff; a.ids = sp.ids; a.n_embd = N; a.n_ff = 640; a.interleaved = false;
         a.xq = sp.xq; a.gu_out = sp.gu; a.h = sp.h; a.hq = sp.hq; a.dst = sp.dm + sb.r0 * N;
         sp.clk_s.mark(sp.tl_s, "products", sp.s, l, sb.grp);
-        if (f.had_d) {   // APR: folded down weights take H (s * h), with the 4070's copy of the n_ff signs
+        // STRATA_SPLIT_NO_PRODUCTS=1 (a timing diagnostic, the output is garbage): the 4070 skips its expert products,
+        // which bounds what any faster 4070 expert kernel could give the prompt read
+        static const bool no_products = [] { const char* v = std::getenv("STRATA_SPLIT_NO_PRODUCTS"); return v != nullptr && std::atoi(v) != 0; }();
+        if (no_products) {
+        } else if (f.had_d) {   // APR: folded down weights take H (s * h), with the 4070's copy of the n_ff signs
             mmq::expert_rows_gate_up(*sp.ctx, a, sp.s);
             strata::kernels::hadamard_rows(a.h, a.h, a.nr, 640, f.had_block, sp.had_sh, sp.s);
             mmq::expert_rows_down(*sp.ctx, a, sp.s);
@@ -2557,11 +2565,12 @@ namespace {
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfWaitHost, kPfCount };
+               kPfWaitHost, kPfSplitSend, kPfTables, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "wait host"};
+                                        "gdn recurrence", "gdn out proj", "wait host", "split send",
+                                        "mmq tables"};
 // "wait host" (#31): marked after the last kernel an expert enqueues, so the time until the next expert's work reaches
 // the stream is the GPU idle while the launching thread is elsewhere (a stager or issuer wait, a copy issue); it used
 // to land on "dequant", the phase before it.
@@ -3104,9 +3113,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     cudaStreamWaitEvent(t.c, t.used[rs], 0);   // the group that read this slot has gathered it
                     if (t.lanes_expected == 2) cudaStreamWaitEvent(t.c, t.used1[rs], 0);   // and lane 2's (#35 D7)
                     cudaEvent_t c0 = nullptr;
+                    // #259 Step 0, STRATA_SPLIT_NO_COPY=1 (a timing diagnostic: the 4070 computes on stale slots, the output
+                    // is garbage): the issuer publishes every entry without its host-to-device copy, which bounds what
+                    // copying each expert once per part (layer-major) could give
+                    static const bool no_copy = [] { const char* v = std::getenv("STRATA_SPLIT_NO_COPY"); return v != nullptr && std::atoi(v) != 0; }();
                     if (en.kind == 2) {
                         c0 = t.clk_c.record(t.c);
-                        cudaMemcpyAsync(dst, m.src->blob(en.l, en.e), bb, cudaMemcpyHostToDevice, t.c);
+                        if (!no_copy) cudaMemcpyAsync(dst, m.src->blob(en.l, en.e), bb, cudaMemcpyHostToDevice, t.c);
                     } else {
                         const uint8_t* hb = nullptr;
                         {
@@ -3114,7 +3127,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             hb = t.stager->wait(en.job);
                         }
                         c0 = t.clk_c.record(t.c);
-                        cudaMemcpyAsync(dst, hb, bb, cudaMemcpyHostToDevice, t.c);
+                        if (!no_copy) cudaMemcpyAsync(dst, hb, bb, cudaMemcpyHostToDevice, t.c);
                         t.stager->issued_one(en.job, t.c);
                     }
                     cudaEventRecord(t.copied[rs], t.c);
@@ -4140,10 +4153,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 mmq::quantize(xsrc, nullptr, m.Xtok, mmq_gt, N, N, T, m.cs);
                             }
+                            // #259: "gather" is the activations' Hadamard + q8_1 quantize; the 4070's inputs and the
+                            // tables follow as phases of their own
                             if (split_l) {   // #133: the 4070's inputs first, then CUDA0's tables for its own experts
+                                pt.mark(kPfSplitSend, cs);
                                 if (!split_send(m, l, T, chunk_i, order_4070, err)) return false;
                                 m.split->n_local += (int64_t) order.size();
+                                pt.mark(kPfTables, cs);
                                 upload_tables();
+                            } else {
+                                pt.mark(kPfTables, cs);
                             }
                             // the layer's rows per expert (absolute), then each group's sub-products: at most mmq_rows
                             // rows each, with a 0-based bounds block that gate/up and down both read
