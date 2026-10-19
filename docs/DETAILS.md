@@ -873,13 +873,14 @@ print(r.choices[0].message.content)
   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
   Anthropic's `"thinking": {"budget_tokens": N}` chooses the level, as above, and since 0.1.45 is also the budget (a
   `reasoning_budget_tokens` in the same request wins).
-- **max_tokens counts the thinking, so the answer keeps its room (0.1.45).** A client that caps the whole reply (the
+- **max_tokens counts the thinking, so the answer keeps its room (0.1.45; opt-in on the fork with `"answer_room": true`).**
+  A client that caps the whole reply (the
   desktop agent's harness sends `max_completion_tokens: 8192` on every request) and a task the model thinks long about
   used to be cut off in the middle of the thinking, with no answer. Now a request with thinking on, no budget of its
   own and `max_tokens` of 1,024 or more gets one: the thinking is wrapped up when only a quarter of the cap (at least
   512 tokens) is left, and the model answers in that room (8,192: thinking up to 6,144, answer 2,048). Requests without
-  `max_tokens` (the rest of the context) get a budget of three quarters of it. `"answer_room": false` in
-  `strata-<model>.json` turns it off. Qwen recommends up to 262,144 tokens of reasoning and 131,072 of answer: a client
+  `max_tokens` (the rest of the context) get a budget of three quarters of it. Upstream turns it on by default; the
+  fork keeps it off unless `"answer_room": true` is in `strata-<model>.json`, since it changes served outputs. Qwen recommends up to 262,144 tokens of reasoning and 131,072 of answer: a client
   should not cap the reply far below what the context allows.
 - **A reply that ends inside its thinking (#1053, opt-in).** Some turns write a sentence of reasoning and then the
   end-of-turn token with no `</think>`: the content is empty and an agent stops. `"reasoning_close_retry": true` in
@@ -1405,7 +1406,8 @@ there (`finish_reason` "stop"; `stop_reason` "stop_sequence" with `stop_sequence
 is not reproducible run to run - for seed-reproducible output add `--adapt-every 100000` (static residency) to the
 engine arguments. The run config's optional `sampling` block sets the defaults for requests that leave the fields out
 (`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`); a request's own fields always win. **With no
-block at all (0.1.45) a request without sampling keys gets the sampling the model card recommends**, picked by the
+block at all, upstream 0.1.45 gives a request without sampling keys the sampling the model card recommends** (on the
+fork only with `"model_card_sampling": true` in the run config; otherwise greedy, as before), picked by the
 request's thinking state: Qwen3.8-Flash-Next (and Gyro) thinking temperature 1.0, top_p 0.95, top_k 20; not thinking temperature 0.7,
 top_p 0.8, top_k 20, presence_penalty 1.5. Qwen3.6-35B-A3B thinking 1.0 / 0.95 / 20 with presence_penalty 1.5, not thinking
 0.7 / 0.8 / 20 with 1.5 (min_p 0 and repetition_penalty 1 are "off"). Order of precedence: the request, the web page's shared Chat settings,

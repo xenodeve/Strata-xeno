@@ -240,10 +240,10 @@ Upstream v0.1.43 to v0.1.45 added these to the installer. The fork has not run t
 - **It answers one request at a time.** A conversation's first prompt is read in full; follow-ups reuse the cached
   part. Upstream's `"parallel": 2` answers several at once ([BATCHING.md](docs/BATCHING.md)); the fork has not
   measured it with its two-card profile.
-- **Sampling:** since upstream v0.1.45 a request without sampling settings, on a config without a `"sampling"` block,
-  gets the model card's recommended sampling, not greedy decoding (greedy made the model loop, upstream #2685). Send
-  `temperature: 0`, or put `"sampling": {"temperature": 0}` in the config, for greedy
-  ([details](docs/DETAILS.md#using-it)).
+- **Sampling:** a request without sampling settings, on a config without a `"sampling"` block, is decoded greedily,
+  as before. Upstream v0.1.45 gives it the model card's recommended sampling instead (greedy made the model loop,
+  upstream #2685); on the fork that is opt-in with `"model_card_sampling": true` in the config, because it changes
+  the served outputs ([details](docs/DETAILS.md#using-it)).
 - **Is it fast on your PC?** Upstream's `BENCH.bat` (`./bench.sh`) measures chat, 4K/16K prompts and an agent-style
   session through the HTTP API and writes a report to share
   ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)). The fork has not run it with its two-card profile.

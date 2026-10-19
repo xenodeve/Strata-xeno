@@ -234,7 +234,7 @@ bool run_device(int dev, int reps, int groups_req, const std::vector<uint8_t>& p
     auto* dpool = (uint8_t*) mem.alloc(pool.size());
     auto* dx = (float*) mem.alloc(xh.size() * sizeof(float));
     void* dxq = mem.alloc((size_t) kMaxT * kEmbd / 32 * 36);
-    void* dscr = mem.alloc(K::native_expert_scratch_bytes(kMaxEntries, kFf));
+    void* dscr = mem.alloc(K::native_expert_scratch_bytes(kMaxEntries, kFf, kEmbd));
     auto* dout = (float*) mem.alloc((size_t) kMaxEntries * kEmbd * sizeof(float));
     auto* dptr = (unsigned long long*) mem.alloc(P * (size_t) gmax * sizeof(unsigned long long));
     auto* dstart = (int32_t*) mem.alloc((size_t) (gmax + 1) * sizeof(int32_t));

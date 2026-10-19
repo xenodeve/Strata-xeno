@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
         ck(cudaMalloc(&dxq, (size_t) T * N / 32 * 36), "xq");
         ck(cudaMalloc(&dout, (size_t) T * N * 4), "out");
-        ck(cudaMalloc(&scr, k::native_expert_scratch_bytes(T, FF)), "scratch");
+        ck(cudaMalloc(&scr, k::native_expert_scratch_bytes(T, FF, N)), "scratch");
         const unsigned long long ptr = (unsigned long long) db;
         const int32_t start[2] = {0, T}, ng = 1, ids[T] = {0, 1, 2, 3, 4, 5, 6, 7};
         ck(cudaMalloc(&dptr, 8), "p"); ck(cudaMemcpy(dptr, &ptr, 8, cudaMemcpyHostToDevice), "p");

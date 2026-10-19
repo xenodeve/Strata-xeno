@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
     ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
     ck(cudaMalloc(&dxq, (size_t) T * N / 32 * 36), "xq");
     ck(cudaMalloc(&dout, (size_t) E * N * 4), "out");
-    ck(cudaMalloc(&scr, k::native_expert_scratch_bytes(E, FF)), "scratch");
+    ck(cudaMalloc(&scr, k::native_expert_scratch_bytes(E, FF, N)), "scratch");
     ck(cudaMalloc(&dptr, 8 * G), "p");
     ck(cudaMemcpy(dptr, ptr.data(), 8 * G, cudaMemcpyHostToDevice), "p");
     ck(cudaMalloc(&dstart, 4 * (G + 1)), "s");
