@@ -11,6 +11,7 @@
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/direct_file.hpp"
 
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -509,6 +510,59 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
 
 }  // namespace
 
+// #247: the prompt path's two wave lanes call gather_batch on one PleTable at once (each lane's PLE read-ahead), and
+// the first gather of a request drains the read-ahead the last request's drafts left (PleTable::prefetch).  Two
+// threads drain and gather together after leftovers, many rounds: no crash, and every row equals a plain gather.
+int concurrent_check(const std::string& dir, int rounds) {
+    const k::PleFormatInfo& f = k::ple_formats()[0];
+    const std::string path = write_format_table(dir, f, 20000);
+    if (path.empty()) return 1;
+    k::PleIoOptions plain, ahead;
+    plain.cache_rows = 0;
+    ahead.cache_rows = 1 << 20;
+    k::PleTable a, b;
+    std::string err;
+    if (!a.open(path, err, plain) || !b.open(path, err, ahead)) { std::fprintf(stderr, "open: %s\n", err.c_str()); return 2; }
+    std::mt19937_64 rng(247);
+    const size_t T = 4;
+    for (int r = 0; r < rounds && !g_fail; ++r) {
+        for (int w = 0; w < 24; ++w) {   // a request's drafts read ahead and never gathered: the leftovers
+            std::vector<uint32_t> left(16);
+            for (auto& x : left) x = (uint32_t) (rng() % a.rows());
+            CHECK(b.prefetch(left.data(), 16), "prefetch refused");
+        }
+        std::vector<uint32_t> rows[2];
+        std::vector<float> want[2], got[2];
+        for (int l = 0; l < 2; ++l) {
+            rows[l].resize(T * 16);
+            for (auto& x : rows[l]) x = (uint32_t) (rng() % a.rows());
+            want[l].resize(T * k::NG_N_EMBD);
+            got[l].resize(T * k::NG_N_EMBD);
+            CHECK(a.gather_batch(rows[l].data(), T, want[l].data(), err), "plain gather: %s", err.c_str());
+        }
+        std::atomic<int> ready{0};
+        bool ok[2] = {false, false};
+        std::string e2[2];
+        auto lane = [&](int l) {
+            ready.fetch_add(1);
+            while (ready.load() < 2) {}
+            ok[l] = b.gather_batch(rows[l].data(), T, got[l].data(), e2[l]);
+        };
+        std::thread t1(lane, 1);
+        lane(0);
+        t1.join();
+        for (int l = 0; l < 2; ++l) {
+            CHECK(ok[l], "round %d lane %d: gather failed: %s", r, l, e2[l].c_str());
+            CHECK(!std::memcmp(want[l].data(), got[l].data(), got[l].size() * sizeof(float)), "round %d lane %d: rows differ", r, l);
+        }
+    }
+    a.close();
+    b.close();
+    std::filesystem::remove(path);
+    std::printf("ple concurrent gather check (%d rounds): %s\n", rounds, g_fail ? "FAILED" : "OK");
+    return g_fail ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     std::string gguf, dir = std::filesystem::temp_directory_path().string(), tokens;
     int rows = 20000;
@@ -533,6 +587,7 @@ int main(int argc, char** argv) {
         else if (a == "--direct-only") direct_only = true;
         else if (a == "--sync") sync_submit = true;
         else if (a == "--prefetch") prefetch = true;
+        else if (a == "--concurrent") return concurrent_check(dir, 2000);   // #247
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
     }
     if (self) {

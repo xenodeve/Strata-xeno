@@ -13010,10 +13010,16 @@ int main(int argc, char** argv) {
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
             std::vector<int64_t> cuts = {reread_to, root_at, shared_at, message_at, turn_at, n - 1};
-            if (pin_at >= 0) {
-                cuts.push_back(pin_at);
-                std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
-            }
+            if (pin_at >= 0) cuts.push_back(pin_at);
+            // #260: a part also ends at every periodic checkpoint position, so its on_chunk save runs with no wave lane
+            // past it.  Inside a part the other lane's next chunk had already moved the GDN state, the PLE history, the
+            // indexer and the KV page past the position: a request resuming from such a checkpoint started from a
+            // wrong state.  The cut leaves a full read byte-identical (+0.6 % read time at 33K).  STRATA_CKPT_CUTS=0:
+            // the old in-part save (the A/B arm)
+            static const bool ckpt_cuts = [] { const char* v = std::getenv("STRATA_CKPT_CUTS"); return v == nullptr || std::atoi(v) != 0; }();
+            if (ckpt_cuts && sp_wave && o.prompt_cache_every > 0)
+                for (int64_t p = pp_next_check; p < n - 1 && p != INT64_MAX; p += o.prompt_cache_every) cuts.push_back(p);
+            std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             int64_t at = read_from;
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
