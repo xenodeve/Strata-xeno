@@ -932,8 +932,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       ple_native_postops_enabled();
             // S25 (STRATA_PLE_BATCH=1): the key and value projections depend only on each row's n-gram embedding, so
             // the group's rows run through the multi-row forms of the same kernels (the weights read once); every
-            // row's arithmetic is the single-row call's. The history-dependent rest stays row by row.
-            static const bool ple_batch = [] { const char* e = std::getenv("STRATA_PLE_BATCH"); return e && e[0] == '1'; }();
+            // row's arithmetic is the single-row call's. The history-dependent rest stays row by row.  xeno #263: the
+            // default (=0 for the per-row reads): Gyro-M's GGUF-native key takes this path, one token at a time it
+            // re-read the key per row; generate 74.9 -> 75.5 tok/s, outputs identical
+            static const bool ple_batch = [] { const char* e = std::getenv("STRATA_PLE_BATCH"); return !e || e[0] != '0'; }();
             PleWeights pw = ss.ple.w;
             const bool nkey = pw.key_native_data != nullptr && pw.key_bf16 == nullptr;
             const bool batched = !ple_batch_kv && ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16_enabled();
