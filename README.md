@@ -12,7 +12,7 @@ Qwen3.8-Flash-Next (125B parameters) on a gaming PC · NVIDIA · Windows · free
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), a large mixture-of-experts model that normally
 needs a server, on one graphics card plus system RAM.
 
-**Strata-xeno** follows upstream (last merged: v0.1.42) and changes it for one goal: **the lowest latency in a real
+**Strata-xeno** follows upstream (last merged: v0.1.45) and changes it for one goal: **the lowest latency in a real
 coding-agent turn** on a PC with two cards. Those turns are a long cached conversation, then short new parts and
 answers. The fork changes:
 - how the experts are spread over the GPUs and RAM;
@@ -160,7 +160,9 @@ One card works. The second-GPU tier and the two-card prompt path need a second N
 AMD and Linux support comes from upstream's code. The fork has not built, measured or tested it. The same holds for
 upstream's experimental hardware, written and tested by its community: [older GPUs](docs/OLDER_GPUS.md) (Tesla P40 /
 V100, GTX 10, Radeon VII / MI50, through a second CUDA 12 engine), [Intel Arc](docs/INTEL_ARC.md),
-[Strix Halo](docs/STRIX_HALO.md) and [CPUs without AVX2](docs/INSTALL.md#older-cpus-experimental).
+[Strix Halo](docs/STRIX_HALO.md), [CPUs without AVX2](docs/INSTALL.md#older-cpus-experimental) and
+[Apple Silicon Macs](docs/MAC.md) (M1 to M5, macOS 15 or newer: `./setup.sh` builds upstream's Metal engine on the Mac
+after Apple's Command Line Tools are installed with `xcode-select --install`).
 
 ## Install
 
@@ -215,6 +217,17 @@ engine with agentionai's llama.cpp, in `engine-gyro/` (NVIDIA, CUDA 13).
   for it (an estimate) and recommends it below 48 GB.
 - The setup path has only been checked with its unit tests so far. Details: [docs/GYRO.md](docs/GYRO.md).
 
+### Other models in setup's menu (upstream's, not measured by the fork)
+
+Upstream v0.1.43 to v0.1.45 added these to the installer. The fork has not run them:
+- **[Unsloth's UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0](docs/MODELS.md#unsloths-files-ud-iq4_xs-to-q8_0)**,
+  4- to 8-bit. They are fast only where every expert fits in RAM (~88 GB for UD-Q4_K_XL up to ~136 GB for Q8_0); with
+  less RAM part of them is read from the SSD while it answers. UD-Q4_K_XL is no longer experimental.
+- **NVFP4 packs** (`--family nvfp4`, NVIDIA cards only, ~80 GB of RAM to keep every expert in RAM):
+  [docs/NVFP4.md](docs/NVFP4.md).
+- **Qwen3.6-35B-A3B** (`--family qwen36`), a smaller model with an engine path of its own, pictures and several
+  requests at once: [docs/QWEN36.md](docs/QWEN36.md).
+
 ## Using it
 
 - **In the browser:** `http://127.0.0.1:8080` opens the web app.
@@ -227,8 +240,23 @@ engine with agentionai's llama.cpp, in `engine-gyro/` (NVIDIA, CUDA 13).
 - **It answers one request at a time.** A conversation's first prompt is read in full; follow-ups reuse the cached
   part. Upstream's `"parallel": 2` answers several at once ([BATCHING.md](docs/BATCHING.md)); the fork has not
   measured it with its two-card profile.
+- **Sampling:** since upstream v0.1.45 a request without sampling settings, on a config without a `"sampling"` block,
+  gets the model card's recommended sampling, not greedy decoding (greedy made the model loop, upstream #2685). Send
+  `temperature: 0`, or put `"sampling": {"temperature": 0}` in the config, for greedy
+  ([details](docs/DETAILS.md#using-it)).
+- **Is it fast on your PC?** Upstream's `BENCH.bat` (`./bench.sh`) measures chat, 4K/16K prompts and an agent-style
+  session through the HTTP API and writes a report to share
+  ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)). The fork has not run it with its two-card profile.
 
 More: [the API and every setting](docs/DETAILS.md#using-it), [where chats are stored](docs/INSTALL.md#where-things-are-stored).
+
+### Upstream's opt-in settings for one card
+
+Upstream added two opt-in settings (by RubenTorney, #1904 and #1905) for one graphics card whose PC holds every expert
+in RAM: `"--adapt-async", "1"` in the config's `"args"` (the expert cache updates on a helper thread instead of pausing
+the answer; answers can differ slightly from the default) and `"STRATA_PIN_BY_NEED": "1"` in its `"env"` (Windows: the
+experts the card needs are page-locked first). Their measurements are upstream's
+([docs/DETAILS.md](docs/DETAILS.md)); the fork has not measured them with its two-card profile.
 
 ## Something went wrong?
 

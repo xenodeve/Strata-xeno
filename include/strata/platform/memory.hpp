@@ -22,8 +22,11 @@ struct LockResult {
 /// Lock [p, p + bytes) into physical memory. Partial success is reported, not hidden.
 LockResult lock_resident(void* p, uint64_t bytes);
 
-/// Lock many disjoint regions: the working-set minimum is raised once by their page-rounded total (plus a
-/// margin), then each region is VirtualLocked. Regions are rounded out to whole 4 KiB pages.
+/// Lock many disjoint regions: the working-set minimum is raised ONCE by their page-rounded total plus one margin
+/// (lock_resident per region would add its margin every time), then each region is VirtualLocked in 1 GiB pieces.
+/// Regions are rounded out to whole 4 KiB pages; a null or empty one is skipped.  Stops at the first refusal and
+/// reports the bytes locked so far.  Undo each region with unlock_resident.  Callers: the fork's lock of the CPU
+/// pool's experts (generate.cpp) and upstream 0.1.45's pin by need (the holes between an arena's registered ranges).
 LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& ranges);
 
 /// Undo lock_resident for the same region (best effort).

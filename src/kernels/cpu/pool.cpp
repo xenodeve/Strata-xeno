@@ -11,6 +11,9 @@
 #include <cmath>
 #include <chrono>
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>   // __cpuidex, __rdtsc (STRATA_POOL_UMWAIT)
+#endif
 
 #include <cstdio>
 #include <utility>
@@ -30,6 +33,41 @@
 namespace strata::kernels::cpu {
 
 namespace {
+// STRATA_POOL_UMWAIT=<TSC cycles> (experimental, x86 WAITPKG only): a parked worker waits with UMONITOR/UMWAIT on the
+// epoch's cache line instead of spinning on _mm_pause.  It wakes when the host publishes (a write to that line) or
+// after the cycles, in the light C0.1 state; on a laptop the CPU then gives back the power the spin took, which the
+// GPU's share of the budget gets.  0 or unset (or no WAITPKG): the spin, unchanged.  STRATA_POOL_UMWAIT_C02=1: the
+// deeper C0.2 state (slower wake).  MSVC x64 only for now (the intrinsics need no target flag there); other builds spin.
+uint64_t umwait_cycles() {
+    static const uint64_t c = [] {
+        const char* e = std::getenv("STRATA_POOL_UMWAIT");
+        if (e == nullptr || std::atoll(e) <= 0) return (uint64_t) 0;
+#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
+        int r[4] = {0, 0, 0, 0};
+        __cpuidex(r, 7, 0);
+        if (((r[2] >> 5) & 1) == 0) {
+            std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
+            return (uint64_t) 0;
+        }
+        std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::atoll(e));
+        return (uint64_t) std::atoll(e);
+#else
+        return (uint64_t) 0;
+#endif
+    }();
+    return c;
+}
+unsigned umwait_state() {
+    static const unsigned s = [] { const char* e = std::getenv("STRATA_POOL_UMWAIT_C02"); return e && *e == '1' ? 0u : 1u; }();
+    return s;   // 1 = C0.1 (light), 0 = C0.2
+}
+// STRATA_POOL_UMWAIT_ESC=<TSC cycles> (experimental): an escalating wait - C0.1 for the first cycles of a park, C0.2 after
+// (a wait that has lasted that long is a GPU phase, a draft or a prompt read, where a slower wake costs little).
+uint64_t umwait_escalate() {
+    static const uint64_t c = [] { const char* e = std::getenv("STRATA_POOL_UMWAIT_ESC"); return e ? (uint64_t) (std::max)(0LL, std::atoll(e)) : (uint64_t) 0; }();
+    return c;
+}
+
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
@@ -53,6 +91,13 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         topo.worker_cores.pop_back();
         topo.worker_cores.insert(topo.worker_cores.begin(), topo.host_core);
         topo.host_core = last;
+    }
+    // --host-core sibling: the host on its core's other hardware thread; the first logical processor stays to the
+    // interrupts and to nothing else (a worker on it would share the host's core)
+    if (skip_first && host_core_setting() == HostCore::Sibling && topo.host_sibling >= 0) {
+        topo.worker_cores.erase(std::remove(topo.worker_cores.begin(), topo.worker_cores.end(), topo.host_sibling),
+                                topo.worker_cores.end());
+        topo.host_core = topo.host_sibling;
     }
     return topo;
 }
@@ -154,6 +199,7 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
             if (skip_first && !topo.worker_cores.empty()) {
                 topo.host_core = topo.worker_cores.front();
                 topo.worker_cores.erase(topo.worker_cores.begin());
+                if (descs.front().lps.size() > 1) topo.host_sibling = descs.front().lps[1];
             }
             if (!descs.empty()) return topo;
         } else {
@@ -180,6 +226,11 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
             if (skip_first && !p_primaries.empty()) {
                 topo.host_core = p_primaries.front();
                 p_primaries.erase(p_primaries.begin());
+                for (const auto& c : descs)   // upstream 0.1.45 (--host-core sibling): the host core's SMT sibling
+                    if (c.lps[0] == topo.host_core) {
+                        if (c.lps.size() > 1) topo.host_sibling = c.lps[1];
+                        break;
+                    }
             }
 
             for (int cpu : p_primaries) topo.worker_cores.push_back(cpu);
@@ -308,6 +359,15 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
         topo.p_threads = (int) all_cpus.size();
     }
 
+    // the host core's SMT sibling, an allowed CPU of the same (package, core) (--host-core sibling)
+    auto sibling_of = [&](int cpu) {
+        for (const auto& h : all_cpus)
+            if (h.cpu == cpu && h.pkg >= 0 && h.core >= 0)
+                for (const auto& cl : all_cpus)
+                    if (cl.cpu != cpu && cl.pkg == h.pkg && cl.core == h.core) return cl.cpu;
+        return -1;
+    };
+
     if (affinity == PoolAffinity::All || !topo.is_hybrid) {
         if (topo.is_hybrid)   // #642: the P-cores first (see the Windows branch)
             std::stable_sort(all_cpus.begin(), all_cpus.end(),
@@ -320,6 +380,7 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
         if (skip_first && !topo.worker_cores.empty()) {
             topo.host_core = topo.worker_cores.front();
             topo.worker_cores.erase(topo.worker_cores.begin());
+            topo.host_sibling = sibling_of(topo.host_core);
         }
         return topo;
     }
@@ -341,6 +402,7 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
     if (skip_first && !p_primaries.empty()) {
         topo.host_core = p_primaries.front();
         p_primaries.erase(p_primaries.begin());
+        topo.host_sibling = sibling_of(topo.host_core);
     }
 
     for (int cpu : p_primaries) topo.worker_cores.push_back(cpu);
@@ -547,10 +609,27 @@ void ExpertPool::worker(int id) {
         // every 1024 pauses, so the spin itself is unchanged.
         const auto parked_at = std::chrono::steady_clock::now();
         uint32_t spins = 0;
+        const uint64_t um = umwait_cycles();
+#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
+        const uint64_t um_esc = umwait_escalate();
+        const uint64_t um_t0 = um != 0 && um_esc != 0 ? __rdtsc() : 0;
+#endif
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
-            if ((++spins & 1023u) != 0) continue;
+#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
+            if (um != 0) {   // STRATA_POOL_UMWAIT: wake on the publish's write to epoch_, or after `um` cycles
+                _umonitor((void*) &epoch_);
+                if (epoch_.load(std::memory_order_acquire) != seen) break;
+                const uint64_t now = __rdtsc();
+                const unsigned st = um_esc != 0 ? (now - um_t0 < um_esc ? 1u : 0u) : umwait_state();
+                _umwait(st, now + um);
+                if ((++spins & 15u) != 0) continue;   // each wait is ~um cycles: look at the clock more often
+            } else
+#endif
+            {
+                _mm_pause();
+                if ((++spins & 1023u) != 0) continue;
+            }
             if (!rest_.load(std::memory_order_relaxed) &&
                 std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
@@ -675,7 +754,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int64_t g0 = fgu_rows_ * (int64_t) i / ftasks_gu_, g1 = fgu_rows_ * (int64_t) (i + 1) / ftasks_gu_;
                 native_rows(5, g0, g1);
                 if (g1 > g0)
-                    for (int e = (int) (g0 / FF); e <= (int) ((g1 - 1) / FF); ++e)
+                    for (int e = (int) (g0 / nfmt_->n_ff); e <= (int) ((g1 - 1) / nfmt_->n_ff); ++e)
                         if (gu_left_[e].fetch_sub(1, std::memory_order_acq_rel) == 1) {
                             native_quant(e);
                             gu_left_[e].store(-1, std::memory_order_release);
@@ -684,11 +763,12 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int64_t j = (int64_t) i - ftasks_gu_;
                 const int64_t g0 = fd_rows_ * j / ftasks_d_, g1 = fd_rows_ * (j + 1) / ftasks_d_;
                 if (g1 > g0)
-                    for (int e = (int) (g0 / H); e <= (int) ((g1 - 1) / H); ++e) wait_quantized(e);
+                    for (int e = (int) (g0 / nfmt_->n_embd); e <= (int) ((g1 - 1) / nfmt_->n_embd); ++e) wait_quantized(e);
                 native_rows(6, g0, g1);
             }
         } else if (mode_ >= 5) {
-            // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
+            // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows (the layer's own n_ff / n_embd: Flash-Next's
+            // FF / H, or another family's smaller expert)
             native_rows(mode_, mrows_ * (int64_t) i / mtasks_, mrows_ * (int64_t) (i + 1) / mtasks_);
         } else {
             // plan v0.3 P6: an equal range of the phase's rows across ALL its experts (a range may span two)
@@ -715,7 +795,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
 }
 
 void ExpertPool::native_rows(int mode, int64_t g0, int64_t g1) {
-    const int per = mode == 5 ? FF : H;
+    const int per = mode == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
     for (int64_t r = g0; r < g1;) {
         const int e = (int) (r / per), r0 = (int) (r % per);
         const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
@@ -864,15 +944,15 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         nfmt_ = &f;
         if (fused_ && n_ > 0) {   // #147: one phase, the same row ranges
             const auto a = std::chrono::steady_clock::now();
-            fgu_rows_ = (int64_t) nb * FF;
-            fd_rows_ = (int64_t) nb * H;
+            fgu_rows_ = (int64_t) nb * f.n_ff;   // the layer's own expert geometry (upstream 0.1.45)
+            fd_rows_ = (int64_t) nb * f.n_embd;
             ftasks_gu_ = phase_tasks(fgu_rows_);   // the two phases' task counts (upstream's --pool-tasks)
             ftasks_d_ = phase_tasks(fd_rows_);
             for (int e = 0; e < nb; ++e) gu_left_[e].store(0, std::memory_order_relaxed);
             for (int i = 0; i < ftasks_gu_; ++i) {
                 const int64_t g0 = fgu_rows_ * i / ftasks_gu_, g1 = fgu_rows_ * (i + 1) / ftasks_gu_;
                 if (g1 > g0)
-                    for (int e = (int) (g0 / FF); e <= (int) ((g1 - 1) / FF); ++e) gu_left_[e].fetch_add(1, std::memory_order_relaxed);
+                    for (int e = (int) (g0 / f.n_ff); e <= (int) ((g1 - 1) / f.n_ff); ++e) gu_left_[e].fetch_add(1, std::memory_order_relaxed);
             }
             run_phase(7, ftasks_gu_ + ftasks_d_);
             const auto d = std::chrono::steady_clock::now();
@@ -880,14 +960,14 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
             ms_multi_gu += std::chrono::duration<double, std::milli>(d - a).count();
             continue;
         }
-        mrows_ = (int64_t) nb * FF;
+        mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e) native_quant(e);
         const auto c = std::chrono::steady_clock::now();
-        mrows_ = (int64_t) nb * H;
+        mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = phase_tasks(mrows_);
         run_phase(6, mtasks_);
         const auto d = std::chrono::steady_clock::now();

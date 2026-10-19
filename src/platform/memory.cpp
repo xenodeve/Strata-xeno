@@ -79,6 +79,7 @@ LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& r
         r.note = "GetProcessWorkingSetSizeEx failed (error " + std::to_string(GetLastError()) + ")";
         return r;
     }
+    // same growth as lock_resident, but for the sum of the regions and with ONE margin
     const SIZE_T margin = (SIZE_T) 512 << 20;
     const SIZE_T new_min = min_ws + (SIZE_T) total + margin;
     const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
@@ -88,19 +89,23 @@ LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& r
                  " MiB) failed (error " + std::to_string(GetLastError()) + ")";
         return r;
     }
+    const uint64_t chunk = 1ull << 30;   // (upstream 0.1.45) VirtualLock in 1 GiB pieces, as lock_resident
     for (const auto& [p, n] : pages) {
-        if (!VirtualLock(p, (SIZE_T) n)) {
-            r.note = "VirtualLock stopped after " + std::to_string((unsigned long long) (r.locked_bytes >> 20)) +
-                     " of " + std::to_string((unsigned long long) (total >> 20)) + " MiB (error " +
-                     std::to_string(GetLastError()) + ")";
-            r.ok = r.locked_bytes > 0;
-            return r;
+        for (uint64_t off = 0; off < n; off += chunk) {
+            const uint64_t c = n - off < chunk ? n - off : chunk;
+            if (!VirtualLock(p + off, (SIZE_T) c)) {
+                r.note = "VirtualLock stopped after " + std::to_string((unsigned long long) (r.locked_bytes >> 20)) +
+                         " of " + std::to_string((unsigned long long) (total >> 20)) + " MiB (error " +
+                         std::to_string(GetLastError()) + ")";
+                r.ok = r.locked_bytes > 0;
+                return r;
+            }
+            r.locked_bytes += c;
         }
-        r.locked_bytes += n;
     }
     r.ok = true;
     r.note = "locked " + std::to_string((unsigned long long) (total >> 20)) + " MiB in " +
-             std::to_string(pages.size()) + " ranges via working-set minimum + VirtualLock";
+             std::to_string(pages.size()) + " regions via working-set minimum + VirtualLock";
     return r;
 }
 
@@ -181,7 +186,7 @@ LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& r
         r.locked_bytes += n;
     }
     r.ok = r.locked_bytes > 0;
-    r.note = "mlock";
+    r.note = r.ok ? "mlock of " + std::to_string(ranges.size()) + " regions" : "nothing to lock";
     return r;
 }
 
@@ -223,7 +228,14 @@ void advise_willneed(const void* p, uint64_t bytes) {
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
     if (fd < 0 || !read_ahead_enabled()) return;
     for (uint64_t at = 0; at < bytes; at += kAdviseStep)
+#if defined(__APPLE__)   // macOS: F_RDADVISE is the read-ahead hint
+    {
+        radvisory ra{(off_t) (offset + at), (int) std::min(kAdviseStep, bytes - at)};
+        (void) fcntl(fd, F_RDADVISE, &ra);
+    }
+#else
         (void) posix_fadvise(fd, (off_t) (offset + at), (off_t) std::min(kAdviseStep, bytes - at), POSIX_FADV_WILLNEED);
+#endif
 }
 #endif
 

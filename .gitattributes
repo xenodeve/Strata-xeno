@@ -12,3 +12,5 @@ tests/data/native_experts/** -text
 
 # #169: applied by git apply to the fetched llama.cpp checkout - its bytes must not be converted
 third_party/ggml/patches/*.patch -text
+# the quant yardstick's text set: tokenized byte for byte (set.ids.json), never convert its line endings
+data/quant_quality/** -text
