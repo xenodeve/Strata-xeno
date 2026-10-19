@@ -454,6 +454,28 @@ MODELS = {
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth",), "budget": True,
              "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf", "engine": (0, 1, 38),
              "vision": True},
+    # agentionai's Gyro (upstream 0.2.0's catalog entries, one catalog since the v0.2.0-beta merge, #268): "ram_gb" is the
+    # memory the weights need in total, VRAM and RAM together ("mem_total"): Gyro-S 27.6 GB, Gyro-M 35 GB (the rest of the
+    # download is the n-gram table, read from the SSD).  The fork's earlier names "M" / "S" are accepted by --model
+    # (GYRO_ALIASES) and its pack / config names stay gyro-m / gyro-s (install_tag).  Fork fields kept on top of
+    # upstream's: "low_ram": False (no low-RAM mode: untested with the trellis types), "recommended" (Gyro-M, the
+    # developer's tests 2026-10-14: quality about ISTA-DASLab's IQ3_S with 36% fewer bytes of experts, about IQ3_S's speed;
+    # served daily on the fork's 48 GB PC at 131-262K context) and "vision": False (upstream: True; the fork's Gyro engine
+    # is compiled here with agentionai's ggml in engine-gyro/ and its picture reader has not been tried - xeno).
+    # Gyro-S on this fork has the MSVC unroll and AVX-VNNI of the CPU trellis kernel, not Gyro-M's TQ2_T-only decode tuning
+    # (#220); agentionai's model card: KLD 0.401 / top-1 75.29 % against ISTA-DASLab's IQ2_XS 0.420 / 74.22 %.
+    "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (35 GB of VRAM + RAM together); decodes "
+                        "about 20% slower than Q2_0 on 12 GB cards; the fork's tests: quality close to IQ3_S, at about "
+                        "IQ3_S's speed on two cards",
+               "download_gb": 92.0, "ram_gb": 35.0, "arena_gb": 32.1, "families": ("gyro",), "mem_total": True,
+               "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "engine": GYRO_ENGINE, "vision": False,
+               "low_ram": False, "recommended": True},
+    "Gyro-S": {"about": "the smallest option, for PCs with little memory (27.6 GB of VRAM + RAM together); lower quality "
+                        "than the 2-3-bit sizes, and the 2-bit Q2_0 decodes faster; on par with IQ2_XS by agentionai's "
+                        "model card (KLD)",
+               "download_gb": 58.5, "ram_gb": 27.6, "arena_gb": 25.8, "families": ("gyro",), "mem_total": True,
+               "file": "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "engine": GYRO_ENGINE, "vision": False,
+               "low_ram": False},
     # MODEL-UPDATE Phase 4: NVFP4 experts, ready-made packs (NVFP4_REPOS).  63.3 GiB (68.0 GB) of experts in the
     # pack's experts.bin; the low-RAM mode reads them from there on a PC whose RAM does not hold them.  NVIDIA only
     # (the HIP and SYCL engines have no NVFP4 kernels).  Images: both packs keep Qwen's vision tower unquantized, so the
@@ -480,28 +502,6 @@ MODELS = {
                   "license": "NVIDIA Open Model Agreement (Licensed by NVIDIA Corporation under the NVIDIA Open Model "
                              "Agreement) with Qwen3.8-Flash-Next's Qwen Community License 1.0: "
                              "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local"},
-    # agentionai's Gyro (upstream 0.2.0's catalog entries, one catalog since the v0.2.0-beta merge, #268): "ram_gb" is the
-    # memory the weights need in total, VRAM and RAM together ("mem_total"): Gyro-S 27.6 GB, Gyro-M 35 GB (the rest of the
-    # download is the n-gram table, read from the SSD).  The fork's earlier names "M" / "S" are accepted by --model
-    # (GYRO_ALIASES) and its pack / config names stay gyro-m / gyro-s (install_tag).  Fork fields kept on top of
-    # upstream's: "low_ram": False (no low-RAM mode: untested with the trellis types), "recommended" (Gyro-M, the
-    # developer's tests 2026-10-14: quality about ISTA-DASLab's IQ3_S with 36% fewer bytes of experts, about IQ3_S's speed;
-    # served daily on the fork's 48 GB PC at 131-262K context) and "vision": False (upstream: True; the fork's Gyro engine
-    # is compiled here with agentionai's ggml in engine-gyro/ and its picture reader has not been tried - xeno).
-    # Gyro-S on this fork has the MSVC unroll and AVX-VNNI of the CPU trellis kernel, not Gyro-M's TQ2_T-only decode tuning
-    # (#220); agentionai's model card: KLD 0.401 / top-1 75.29 % against ISTA-DASLab's IQ2_XS 0.420 / 74.22 %.
-    "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (35 GB of VRAM + RAM together); decodes "
-                        "about 20% slower than Q2_0 on 12 GB cards; the fork's tests: quality close to IQ3_S, at about "
-                        "IQ3_S's speed on two cards",
-               "download_gb": 92.0, "ram_gb": 35.0, "arena_gb": 32.1, "families": ("gyro",), "mem_total": True,
-               "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "engine": GYRO_ENGINE, "vision": False,
-               "low_ram": False, "recommended": True},
-    "Gyro-S": {"about": "the smallest option, for PCs with little memory (27.6 GB of VRAM + RAM together); lower quality "
-                        "than the 2-3-bit sizes, and the 2-bit Q2_0 decodes faster; on par with IQ2_XS by agentionai's "
-                        "model card (KLD)",
-               "download_gb": 58.5, "ram_gb": 27.6, "arena_gb": 25.8, "families": ("gyro",), "mem_total": True,
-               "file": "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "engine": GYRO_ENGINE, "vision": False,
-               "low_ram": False},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -610,13 +610,6 @@ FAMILIES = {
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": True, "pack_args": ["--compat-bf16"],
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS}},
-    # MODEL-UPDATE Phase 4: the original model with NVFP4 experts, as ready-made packs (NVFP4_REPOS): the files come
-    # as the engine reads them (no GGUF to pack), each size has its own repository ("repo" in MODELS)
-    "nvfp4": {"title": "Qwen3.8-Flash-Next (NVFP4)", "by": "NVFP4 packs by sergqwer (strata-nvfp4)",
-              "about": "4-bit NVFP4 experts, NVIDIA cards; a 128 GB download, ~80 GB of RAM to keep every expert in RAM",
-              "tag": "nvfp4-", "name": "qwen3.8-flash-next-nvfp4", "ready": True,
-              "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"), "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
-              "mmproj_sha256": (907543008, "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0")},
     # agentionai's Gyro quantizations (see GYRO_FILES): upstream 0.2.0's entry, with the fork's "vision": False, "smaller"
     # and "recommended" (#268); the engine is compiled on this PC with agentionai's ggml (engine-gyro/)
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "by": "Gyro quantizations by agentionai",
@@ -629,6 +622,13 @@ FAMILIES = {
              "sha256": GYRO_FILES, "smaller": "Gyro-S, --model Gyro-S", "recommended": "Gyro-M",
              "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro files are agentionai's quantization): "
                         "https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"},
+    # MODEL-UPDATE Phase 4: the original model with NVFP4 experts, as ready-made packs (NVFP4_REPOS): the files come
+    # as the engine reads them (no GGUF to pack), each size has its own repository ("repo" in MODELS)
+    "nvfp4": {"title": "Qwen3.8-Flash-Next (NVFP4)", "by": "NVFP4 packs by sergqwer (strata-nvfp4)",
+              "about": "4-bit NVFP4 experts, NVIDIA cards; a 128 GB download, ~80 GB of RAM to keep every expert in RAM",
+              "tag": "nvfp4-", "name": "qwen3.8-flash-next-nvfp4", "ready": True,
+              "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"), "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+              "mmproj_sha256": (907543008, "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0")},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # Qwen3.6-35B-A3B (GGUF architecture qwen35moe), Unsloth's GGUFs with the MTP block: a family with an engine path of its
@@ -6401,7 +6401,7 @@ def refresh_shared_draft_vocab(cfg: dict, done: set) -> None:
     """update_install's draft subset of one config, for configs taken most recently used first (installed_configs'
     order): an MTP folder already in `done` is left alone.  Several configs can name one MTP folder (a second config of
     the same model: another GPU mode, another context), each with its own "draft_vocab".  Refreshed once per config,
-    the folder ended with the subset of the config used LONGEST ago: a config without the key (cjk) put the default
+    the folder ended with the subset of the config used LONGEST ago: a config without the key (thai) put the default
     subset over the cyrillic one of the config in use, and its Russian answers were drafted without Cyrillic tokens.
     The folder takes the subset of the most recently used config that names it; a start still installs its own
     config's."""
@@ -6413,7 +6413,7 @@ def refresh_shared_draft_vocab(cfg: dict, done: set) -> None:
     if key in done:
         return
     done.add(key)
-    refresh_draft_vocab(rt, cfg.get("draft_vocab", "cjk"))
+    refresh_draft_vocab(rt, cfg.get("draft_vocab", "thai"))      # the fork's default subset (upstream's: cjk)
 
 
 def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
@@ -7120,7 +7120,7 @@ def mac_control_setup(a) -> int:
              "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
     if use_mtp:
         rt.mkdir(parents=True, exist_ok=True)          # the Metal engine reads mtp-q2_0.gguf beside it (no rt pack)
-        refresh_draft_vocab(rt, a.draft_vocab or "cjk")
+        refresh_draft_vocab(rt, a.draft_vocab or "thai")       # the fork's default subset (upstream's: cjk)
         ok(f"MTP draft layer: {mtp / 'mtp-q2_0.gguf'}")
 
     step(7, "writing the run settings")

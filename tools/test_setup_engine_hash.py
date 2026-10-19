@@ -295,6 +295,15 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         (Path(self.tmp.name) / "engine").mkdir(parents=True, exist_ok=True)
+        # Hermetic: get_prebuilt's HEAD probe of the release asset is answered here, and engine/ is this temporary
+        # folder.  Unpatched, the probe went to GitHub for v{source_version()} and then "latest"; it passed only while
+        # such a release carried PREBUILT_ASSET (v0.1.42 did; v0.1.45.3 and the latest release answer 404), and a 404
+        # returned None before the refusal path these tests are about was reached.
+        for name, value in (("_urlopen", lambda req, timeout=None: mock.MagicMock()),
+                            ("engine_dir", lambda toolkit=13, gyro=False: Path(self.tmp.name) / "engine")):
+            p = mock.patch.object(setup, name, value)
+            p.start()
+            self.addCleanup(p.stop)
 
     def fake_download(self, url, dst, what=None):
         with zipfile.ZipFile(dst, "w") as z:

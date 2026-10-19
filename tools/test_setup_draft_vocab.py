@@ -83,11 +83,13 @@ class Refresh(unittest.TestCase):
 
 class SharedFolder(unittest.TestCase):
     """setup.py --update refreshes the draft subset of every installed config, most recently used first.  Two configs
-    that name one MTP folder: the folder keeps the subset of the one used last, not of the one used longest ago."""
+    that name one MTP folder: the folder keeps the subset of the one used last, not of the one used longest ago.
+    The fork's default subset is "thai" (data/draft_vocab.bin: English, code and Thai; xeno #55 / #56), where upstream's
+    is "cjk": DRAFT_VOCABS has no "cjk" key here, so this class names the default "thai"."""
 
     def setUp(self):
         self.data = ROOT / "data"
-        if not all((self.data / setup.DRAFT_VOCABS[c]).exists() for c in ("cjk", "cyrillic", "en")):
+        if not all((self.data / setup.DRAFT_VOCABS[c]).exists() for c in ("thai", "cyrillic", "en")):
             self.skipTest("the shipped draft subsets are not in this checkout")
         self.sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()   # noqa: E731
 
@@ -102,16 +104,16 @@ class SharedFolder(unittest.TestCase):
             rt = Path(d)
             (rt / "draft_vocab.bin").write_bytes((self.data / setup.DRAFT_VOCABS["cyrillic"]).read_bytes())
             in_use = {"args": ["--mtp", str(rt), "--spec", "4"], "draft_vocab": "cyrillic"}
-            older = {"args": ["--mtp", str(rt), "--spec", "4"]}             # no key: the default subset (cjk)
+            older = {"args": ["--mtp", str(rt), "--spec", "4"]}             # no key: the default subset (the fork's thai)
             self.assertEqual(self.run_update(rt, [in_use, older]), self.sha(self.data / setup.DRAFT_VOCABS["cyrillic"]))
-            self.assertEqual(self.run_update(rt, [older, in_use]), self.sha(self.data / setup.DRAFT_VOCABS["cjk"]))
+            self.assertEqual(self.run_update(rt, [older, in_use]), self.sha(self.data / setup.DRAFT_VOCABS["thai"]))
 
     def test_separate_folders_each_keep_their_own(self):
         with tempfile.TemporaryDirectory() as d:
             a, b = Path(d) / "a", Path(d) / "b"
             for rt in (a, b):
                 rt.mkdir()
-                (rt / "draft_vocab.bin").write_bytes((self.data / setup.DRAFT_VOCABS["cjk"]).read_bytes())
+                (rt / "draft_vocab.bin").write_bytes((self.data / setup.DRAFT_VOCABS["thai"]).read_bytes())
             done: set = set()
             setup.refresh_shared_draft_vocab({"args": ["--mtp", str(a), "--spec", "4"], "draft_vocab": "cyrillic"}, done)
             setup.refresh_shared_draft_vocab({"args": ["--mtp", str(b), "--spec", "4"], "draft_vocab": "en"}, done)
