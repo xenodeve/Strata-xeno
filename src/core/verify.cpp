@@ -2462,13 +2462,16 @@ bool Verifier::capture_commit(std::string& err) {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        // engine-latency (STRATA_COMMIT_BATCH, default on; =0 keeps the per-layer loop): every GDN layer's conv history and
+        // engine-latency (STRATA_COMMIT_BATCH; upstream's default is on, the fork's off, see below): every GDN layer's conv history and
         // state in two launches instead of two per layer (~70 graph nodes fewer; the same arithmetic per layer, bitwise).
         // The commit runs between a window and the draft round, which on HIP waits for it.
 #if defined(STRATA_GPU_METAL)   // no batched commit kernels on Metal: the per-layer loop (the Mac engine's gated path)
         static const bool commit_batch = false;
 #else
-        static const bool commit_batch = [] { const char* e = std::getenv("STRATA_COMMIT_BATCH"); return !e || e[0] != '0'; }();
+        // xeno (#268): opt-in on the fork (STRATA_COMMIT_BATCH=1).  With it on, the served D2x drafter accepted 160 of 247
+        // MTP drafts against 194 of 250 per-layer (the same 400-token answer, 5 boots each) and decode fell ~9 %; the
+        // main model's replies were identical.  Where the drafter's input differs is not measured yet.
+        static const bool commit_batch = [] { const char* e = std::getenv("STRATA_COMMIT_BATCH"); return e != nullptr && e[0] == '1'; }();
 #endif
         bool gdn_batched = false;
         if (commit_batch) {
