@@ -641,6 +641,22 @@ def main() -> int:
                                          g.metadata["prism.hadamard.sign_mode"]))
     if any(t.type_name == "NVFP4" for *_, ts in layout for t in ts):
         a.experts_bin = True   # the GGUF holds the weights without the scale tails: the engine must read experts.bin
+    # ---- prism.hadamard: rotated experts need hadamard.txt beside native_experts.txt, which becomes v5 so an engine
+    # that cannot rotate refuses the pack (instead of running the folded experts on unrotated activations)
+    t0 = layout[0][5]
+    had = hadamard_spec(g.metadata, layout, int(t0[0].shape[0]), int(t0[2].shape[0]))
+    if isinstance(had, str) and not had.startswith("# strata hadamard"):
+        print("prism.hadamard: " + had)
+        return 1
+    if had is not None:
+        text = native_experts_v5(text)
+        if not text.startswith("# strata native experts v5:"):
+            print("prism.hadamard: " + text)
+            return 1
+        print("prism.hadamard: %d layer(s) of Hadamard-folded experts (block %s, %s signs): hadamard.txt, "
+              "native_experts.txt v5" % (sum(1 for ln in had.splitlines() if ln.startswith("layer ")),
+                                         g.metadata["prism.hadamard.block_size"],
+                                         g.metadata["prism.hadamard.sign_mode"]))
     path = out / "experts.bin"
     sidecar = out / "experts.bin.src.json"
     want = experts_source(model, text, offset)

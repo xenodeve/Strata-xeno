@@ -467,12 +467,9 @@ inline int ring_budget_slots() {
 inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
 #if defined(STRATA_USE_HIP)
-    // S6: with the opt-in RDNA4 matrix-core attention (STRATA_HIP_WMMA=1) a 96-slot ring: measured with it, 9070 XT
-    // 4K prompts 718 -> 1,211 tok/s (16K 1,949 -> 2,032), R9700 4K 2,426 -> 2,483 (16K the same)
-    static const bool wmma = [] {
-        const char* e = std::getenv("STRATA_HIP_WMMA");
-        return e != nullptr && e[0] == '1';
-    }();
+    // S6: with the matrix-core attention (the gfx12 default since 148-amd; STRATA_HIP_WMMA=1 or auto elsewhere / forced, on a card that
+    // has it) a 96-slot ring: measured with it, 9070 XT 4K prompts 718 -> 1,211 tok/s (16K 1,949 -> 2,032), R9700 4K 2,426 -> 2,483 (16K the same)
+    static const bool wmma = strata::kernels::qsa_prompt_attn_matrix_cores_requested();
     // (xeno: the split layout's threshold, as below)
     if (!v && g_ring_override <= 0 && wmma)
         return (int64_t) T >= (g_split_layout ? split_min() : stream_all_min()) ? 96 : STAGE;
@@ -1312,6 +1309,7 @@ struct Prefill::Impl {
           *shared = nullptr, *sg = nullptr;
     int32_t *ids = nullptr, *slot_dev = nullptr, *src_dev = nullptr;
     uint16_t *Xs = nullptr, *Hh = nullptr, *sh_h = nullptr;
+    float* Xr = nullptr;   // APR: Hadamard-rotated copy of `mixed` for the MMQ path
     // step 2b (MMQ): the activations quantized per layer, H in FP32 and its group's quantized rows, the identity
     // row map, the group bounds, the group buffers of gathered experts
     void *Xq = nullptr, *Hq = nullptr;
@@ -1929,6 +1927,7 @@ inline int64_t mmq_rows_cap(int64_t T) { return std::min<int64_t>(T * K, 2 * T);
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
+    std::vector<char> wmma_only;               // per layer: in the MMQ grouping for the WMMA tiles only (pf_wmma: IQ1_M)
     std::vector<char> fo;                      // per layer: no MMQ here but the native fused kernels cover its formats
                                                // (gfx11: UD-Q4_K_XL's Q4_K / Q5_K and Q5_1 / Q8_0 experts, STRATA_PF_FUSED=1)
     size_t gu_max = 0, d_max = 0;
@@ -1940,6 +1939,27 @@ struct MmqPlan {
     // launches run whole tiles on every visible GPU (mmq::whole_tiles), so its full groups may be taken in row-count order
     std::vector<char> group_sort;
 };
+// Volta (sm_70): MMQ runs on dp4a there (no int8 tensor cores).  pf_wmma(): the layers MMQ would take, and the IQ1_M
+// ones the FP16 path would, run as one launch per expert group on FP16 tensor-core tiles instead
+// (strata::kernels::gemm_iq_f16_grouped: each weight superblock dequantized once into shared memory by the FP16 path's
+// own formulas, FP16 activations, FP32 sums).  OPT-IN: STRATA_PF_WMMA=1 (the activations are FP16 rather than MMQ's
+// q8_1, so the answers differ from the default).  Only when EVERY visible CUDA card is compute capability 7.0 or
+// newer: the tiles need tensor cores, and a Volta + Pascal rig (one process, one decision) keeps MMQ.
+// xeno (merge 0.2.0): the WMMA products are part of upstream's per-group gather and products (gemm_iq_f16_grouped in its
+// `flush`), which the fork's walk (#29 group gather, #34 sub-products, the expert split, the wave) does not have, so
+// STRATA_PF_WMMA is ignored here and says so (as STRATA_MMQ_DIRECT in mmq_plan).  Porting it is a follow-up; it would
+// also apply to D2x's cards (sm_120 + sm_89 are both cc 7+), so it would need an opt-in A/B there first.
+bool pf_wmma() {
+    static const bool warned = [] {
+        const char* e = std::getenv("STRATA_PF_WMMA");
+        if (e != nullptr && e[0] == '1')
+            std::fprintf(stderr, "strata: STRATA_PF_WMMA is ignored: the fork's prompt expert walk has no WMMA tile path "
+                                 "(merge 0.2.0)\n");
+        return true;
+    }();
+    (void) warned;
+    return false;
+}
 const MmqPlan& mmq_plan() {
     static const MmqPlan plan = [] {
         MmqPlan p;
@@ -1949,6 +1969,7 @@ const MmqPlan& mmq_plan() {
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fo.assign(p.layer.size(), 0);
+        p.wmma_only.assign(p.layer.size(), 0);
         p.fallback = !on || layers <= 0;
         for (int64_t l = 0; on && l < layers; ++l) {
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
@@ -1958,6 +1979,15 @@ const MmqPlan& mmq_plan() {
             // split sends to the 4070 as is, and H is rotated between gate/up and down on either card.
             // #420: a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
             if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
+                // pf_wmma: a format dq_dispatch takes (IQ1_M, an IQ4_NL down) rides the MMQ grouping, computed by the WMMA tiles only
+                if (pf_wmma() && lay.native && (dt == 42 || dt == 20) && strata::kernels::iq_row_bytes(gt, N) > 0) {
+                    p.layer[(size_t) l] = 1;
+                    p.wmma_only[(size_t) l] = 1;
+                    p.any = true;
+                    p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
+                    p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
+                    continue;
+                }
                 p.fallback = true;
                 // the fused path's buffers (Xq, H) exist for it; a chunk it does not take (a small one) keeps the FP16 path
                 if (on && lay.native && fused::native_supported(gt, dt)) { p.fo[(size_t) l] = 1; p.any = true; }
@@ -2007,6 +2037,8 @@ void split_group_bytes(int64_t n_layers, size_t& gub, size_t& db) {
         db = std::max(db, mmq::matrix_bytes(lay0.fmt[(size_t) l].d_type, N, 640));
     }
 }
+// the FP16 buffers (Xs, Hh): the FP16 path's, or pf_wmma's activations and down input
+bool fp16_bufs(const MmqPlan& mp) { return mp.fallback || pf_wmma(); }
 // #136 P3: a layout whose chunks run the fused experts (STRATA_PF_FUSED=1, the Q2_0 pack, a streamed chunk of
 // stream_all_min() tokens or more).  `src`: the layout streams experts (Prefill::init got an ExpertSource; without one
 // no chunk takes the streamed walk, so no chunk is fused).  The fork's layout gates are fused_ring()'s.
@@ -2038,9 +2070,9 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
     const MoeBufs mb = moe_bufs(T, n_expert, fused);
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
-    if (mp.fallback) a.take<uint16_t>(T * K * N, ok);
+    if (fp16_bufs(mp)) a.take<uint16_t>(T * K * N, ok);
     a.take<float>(mb.gu, ok);
-    if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
+    if (fp16_bufs(mp)) a.take<uint16_t>(T * K * 640, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
     if (mp.any) {
@@ -2053,6 +2085,58 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
     }
     return a.used;
 }
+}
+
+// The first BF16 and the first FP16 GEMM of a process each pay a one-time library / code-object load in hipBLAS (1.2 s and
+// 1.0 s on an R9700, hipBLASLt 1.2.0: STRATA_COLD_TRACE), which the first prompt then carries (a 700-token prompt: 5.9 s,
+// 3.5 s of it these).  One tiny product of each type, on a handle and stream of its own, moves that cost out of the first
+// request; generate.cpp starts it on a thread before the expert arena loads, so it costs no start-up time, and
+// Prefill::init waits for it.  The outputs go to scratch buffers of their own, so no later result changes.
+// STRATA_PREFILL_WARM=0 turns it off.
+void warm_gemm_libraries(int device) {
+    static const bool off = [] { const char* e = std::getenv("STRATA_PREFILL_WARM"); return e != nullptr && e[0] == '0'; }();
+    if (off) return;
+#if defined(STRATA_USE_HIP)
+    static std::mutex mu;
+    static unsigned done_mask = 0;   // per device: each card loads its own code objects
+    if (device < 0 || device >= 32) return;
+    std::lock_guard<std::mutex> lk(mu);
+    if (done_mask & (1u << device)) return;
+    done_mask |= 1u << device;
+    int prev = 0;
+    if (cudaGetDevice(&prev) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    if (prev != device && cudaSetDevice(device) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr int64_t T = 64, Nn = 64, K = 320;
+    uint16_t *x = nullptr, *w = nullptr;
+    float* y = nullptr;
+    cudaStream_t st = nullptr;
+    bool ok = cudaStreamCreate(&st) == cudaSuccess && cudaMalloc((void**) &x, (size_t) T * K * 2) == cudaSuccess &&
+              cudaMalloc((void**) &w, (size_t) Nn * K * 2) == cudaSuccess && cudaMalloc((void**) &y, (size_t) T * Nn * 4) == cudaSuccess;
+    if (ok) {
+        Gemm gm;
+        std::string err;
+        ok = gm.init((void*) st, T * K, err);
+        if (ok) {
+            cudaMemsetAsync(x, 0, (size_t) T * K * 2, st);
+            cudaMemsetAsync(w, 0, (size_t) Nn * K * 2, st);
+            gm.bf16(x, w, y, T, Nn, K);
+            gm.f16(x, w, y, T, Nn, K);
+            cudaStreamSynchronize(st);
+        }
+    }
+    (void) cudaGetLastError();
+    if (x) cudaFree(x);
+    if (w) cudaFree(w);
+    if (y) cudaFree(y);
+    if (st) cudaStreamDestroy(st);
+    if (prev != device) cudaSetDevice(prev);
+    if (ok)
+        std::fprintf(stderr, "strata prefill: warmed the BF16 and FP16 GEMM libraries on GPU %d in %.0f ms (STRATA_PREFILL_WARM=0 skips)\n",
+                     device, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+#else
+    (void) device;
+#endif
 }
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
@@ -2274,6 +2358,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     std::fprintf(stderr, "strata prefill: chunk %lld, %.0f MiB of device buffers (%s), %d ring slots, laid out in %.0f ms\n",
                  (long long) chunk, (double) o.used / 1048576.0, borrow ? "borrowed" : "own", m.ring, ms_since(t_alloc));
+    { int wd = 0; if (cudaGetDevice(&wd) == cudaSuccess) warm_gemm_libraries(wd); else (void) cudaGetLastError(); }
     return true;
 }
 
@@ -2333,10 +2418,10 @@ bool Prefill::carve(size_t T, void* alloc, int64_t kv_end) {
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
-        m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
+        m.Xs = fp16_bufs(mp) ? c.take<uint16_t>(T * K * N, ok) : nullptr;
         m.mmq_rows = mmq_rows_cap((int64_t) T);
         m.GU = c.take<float>(mb.gu, ok);
-        m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
+        m.Hh = fp16_bufs(mp) ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
@@ -2858,10 +2943,32 @@ const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::s
     if (!r) err = v.name(suffix) + " is missing";
     return r;
 }
+// STRATA_COLD_TRACE=1 (diagnostic): the wall time of the first 80 dense projections of the process, each synchronized, to show
+// which first calls pay a one-time cost (library / code object loads).
+struct ColdTrace {
+    bool on; int n = 0; std::chrono::steady_clock::time_point t0;
+    ColdTrace() { const char* e = std::getenv("STRATA_COLD_TRACE"); on = e != nullptr && e[0] == '1'; }
+    bool begin() {
+        if (!on || n >= 80) return false;
+        cudaDeviceSynchronize();
+        t0 = std::chrono::steady_clock::now();
+        return true;
+    }
+    void end(const char* what, const std::string& name, int64_t T, int64_t N, int64_t K) {
+        cudaDeviceSynchronize();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++n;
+        std::fprintf(stderr, "strata cold-trace: #%d %s %s T=%lld N=%lld K=%lld %.2f ms\n", n, what, name.c_str(), (long long) T,
+                     (long long) N, (long long) K, ms);
+    }
+};
+ColdTrace g_cold;
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                  std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
+    const bool ct = g_cold.begin();
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
+    if (ct) g_cold.end("native", name, T, w->ne1, w->ne0);
     return true;
 }
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
@@ -2883,7 +2990,9 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
         strata::kernels::hc_q8_to_bf16(w->data, w->q8_scale, scratch, (long long) w->elements, stream);
         wb = scratch;
     }
+    const bool ct = g_cold.begin();
     gm.bf16(X, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 0.0f, ldx, x_f16);
+    if (ct) g_cold.end("bf16", name, T, w->ne1, w->ne0);
     if (X_lo) gm.bf16(X_lo, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f);
     return true;
 }
@@ -2897,14 +3006,15 @@ namespace {
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfWaitHost, kPfCount };
+               kPfWaitHost, kPfHcWrite, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "wait host"};
+                                        "gdn recurrence", "gdn out proj", "wait host", "hc write"};
 // "wait host" (#31): marked after the last kernel an expert enqueues, so the time until the next expert's work reaches
 // the stream is the GPU idle while the launching thread is elsewhere (a stager or issuer wait, a copy issue); it used
-// to land on "dequant", the phase before it.
+// to land on "dequant", the phase before it.  "hc write" (upstream 0.2.0, aef32e22): the hyper-connection write-back
+// (and the next half's norm), which used to be charged to the phase before it.
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
@@ -3675,8 +3785,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 timeline::Span ws("wave wait", l, chunk_i);
                 if (!wave->wait_attn(chunk_i - 1, l, m.cs)) { err = "prefill: the other wave lane failed"; return false; }
             }
-            // this chunk's PLE rows, uploaded (upstream 0.1.38: at the stage's first layer from 1 on)
-            if (l == std::max<int64_t>(LB, 1) && ple_on && ple_ahead_on && !ple_take()) return false;
+            // this chunk's PLE rows, uploaded (upstream 0.1.38: at the stage's first layer from 1 on); upstream 0.2.0: a
+            // wait for the first chunk's rows lands on STRATA_PREFILL_TIMING's "ple" line
+            if (l == std::max<int64_t>(LB, 1) && ple_on && ple_ahead_on) {
+                pt.mark(kPfPle, cs);
+                if (!ple_take()) return false;
+            }
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
@@ -4335,6 +4449,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             cudaStreamSynchronize(m.cs);
                             core::progress_at("reading the prompt (batched): layer", l, p0);
                         }
+                        // 149-prefetch (upstream 0.2.0): the RAM policy's prompt seed (STRATA_RAM_ADAPT2); the ids are on the
+                        // host now (grp_host or ids_host); a wave's lane 2 has no callback (lane 0 sets it), so it seeds nothing
+                        if (on_routes) on_routes(l, m.ids_h(), T * K);
                         if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
                             const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
                             if (m.cpu_rows_n < cap) {
@@ -4597,6 +4714,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return true;
                             });
                         }
+                        // (xeno, merge 0.2.0: upstream's pf_wmma - a layer's groups on FP16 tensor-core tiles, STRATA_PF_WMMA=1 -
+                        // lives in upstream's group gather and products, which the fork's walk replaced; pf_wmma() is false here,
+                        // so no layer is wmma_only and the fork's MMQ / FP16 paths below run as before)
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         const double tl_pre = timeline::enabled() ? timeline::now_us() : 0;
@@ -4831,9 +4951,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // APR, deliberately in place on the fp16 H: hadamard_rows_f16 reads fp16, runs the
                             // butterflies in fp32 and rounds once on the store, so against an fp32 rotation the only
                             // extra error is the one fp16 rounding of the SwiGLU output before it (~2^-11 relative per
-                            // value; the GEMM reads fp16 either way).  native_expert_parity bounds the fp16 rotation
-                            // against the float one at relative L1 error < 2e-3.  The gate/up input (Xs above) is
-                            // handled the same way.
+                            // value; the GEMM reads fp16 either way).  An fp32 rotation would need a T*K*640 float
+                            // buffer (~200 MiB at an 8k chunk) or a fused SwiGLU + rotation kernel, for the fallback
+                            // of types and builds without MMQ (the MMQ path rotates fp32 H).  native_expert_parity
+                            // bounds the fp16 rotation against the float one at relative L1 error < 2e-3.  The
+                            // gate/up input (Xs above) is handled the same way.
                             if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
                             pt.mark(kPfGemmD, cs);
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
@@ -5055,6 +5177,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                 }
+                pt.mark(kPfHcWrite, cs);   // the write-back (and the next half's norm) on its own line; it used to be charged to the phase before
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
                 // touches R in between (not the stage's last half (upstream layer split), not before the PLE block of layer 1, not under a
                 // control vector)

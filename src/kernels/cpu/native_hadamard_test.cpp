@@ -296,6 +296,7 @@ int fwht_check() {
 
 // #220: the AVX2 block-128 transform gives the scalar transform's bits, with and without signs, over several blocks
 int fwht_avx2_check() {
+#if defined(__x86_64__) || defined(_M_X64)
     if (!cpu_avx2_ok()) { std::printf("FWHT AVX2 vs scalar: no AVX2 here, skipped\n"); return 0; }
     std::mt19937 rng(11);
     std::normal_distribution<float> nd(0.f, 3.f);
@@ -313,6 +314,10 @@ int fwht_avx2_check() {
     }
     std::printf("FWHT AVX2 vs scalar (2560 values, with and without signs): %s\n", bad ? "FAILED" : "bit-exact");
     return bad ? 1 : 0;
+#else
+    std::printf("FWHT AVX2 vs scalar: not an x86-64 build, skipped\n");
+    return 0;
+#endif
 }
 
 }  // namespace

@@ -12,7 +12,7 @@ Qwen3.8-Flash-Next (125B parameters) on a gaming PC · NVIDIA · Windows · free
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), a large mixture-of-experts model that normally
 needs a server, on one graphics card plus system RAM.
 
-**Strata-xeno** follows upstream (last merged: v0.1.45) and changes it for one goal: **the lowest latency in a real
+**Strata-xeno** follows upstream (last merged: v0.2.0-beta) and changes it for one goal: **the lowest latency in a real
 coding-agent turn** on a PC with two cards. Those turns are a long cached conversation, then short new parts and
 answers. The fork changes:
 - how the experts are spread over the GPUs and RAM;
@@ -182,6 +182,18 @@ on upstream's engine. With `--build`:
 The fork itself is built with VS2022, CUDA 13.3 and Ninja ([docs/BLUEPRINT.md](docs/BLUEPRINT.md)). The `--build`
 path through setup has not been run end to end on a fresh PC for the fork.
 
+**Upstream 0.2.0 is also an app, a Terminal (`strata`) and ready-made engine packages.** Their installers and update
+feed carry upstream's engine, not the fork's, so the fork is installed from source as above. What changed in setup
+(upstream's, untested by the fork on a fresh PC):
+- A start never downloads, installs or compiles anything. After a `git pull`, `UPDATE.bat` (`./update.sh`) compiles
+  the engine again.
+- Model files come over 8 connections at once and continue where they stopped (`STRATA_DL_CONNECTIONS=1`: one
+  stream). Every file has a fixed size and SHA-256, and a download stops when the pinned version is gone from Hugging
+  Face (`STRATA_ALLOW_UNPINNED=1` takes the current file, unchecked).
+- CMake and Ninja are installed only when setup compiles something (`requirements-build.txt`).
+- Setup writes no CPU worker count on an ordinary CPU: the engine picks one from the physical cores (at most 32), and
+  setup warns when a config asks for more. The fork's served config sets its own `--pool-workers`.
+
 Setup asks which model to use and writes `strata-<model>.json`. **The two-card profile is not written by setup.** The
 fork's served configuration ("D2x") adds flags to that file's `args`, among them:
 - `--secondary-expert-mib 6400`, `--exclusive-primary-experts`;
@@ -198,33 +210,43 @@ measured profile is in the [benchmark's matrix](bench/results/2026-10-04-speed-x
 
 Models, sizes and what fits in how much RAM are upstream's ([docs/MODELS.md](docs/MODELS.md)), with one family
 added: **agentionai's Gyro**.
+- **Setup's pre-selected size follows upstream 0.2.0's memory tiers** (RAM and VRAM together: 64 GB and up IQ3_S,
+  48 GB IQ3_XXS, 40 GB Swift 1.5's IQ2_XS). The fork's recommendation for a 48 GB PC stays Gyro-M, marked
+  `[recommended]` in the menu.
+- **Pictures are on by default** where the model reads them (upstream 0.2.0): the picture reader runs on the CPU for a
+  card under 24 GB and on the GPU from 24 GB. `--vision no` keeps a model text-only. Gyro stays text-only on the fork.
 
 ### Gyro: recommended on 48 GB
 
 ```text
-START-HERE.bat --build --family gyro --model M        (Linux: ./setup.sh --build --family gyro --model M)
+START-HERE.bat --build --family gyro --model Gyro-M   (Linux: ./setup.sh --build --family gyro --model Gyro-M)
 ```
 
-**On a PC with 48 GB of RAM, Gyro-M is the recommended model.** It asks for 48 GB of RAM: the fork's 48 GB PC serves
-it daily at 262K context. Setup shows it as `[recommended]`. For Gyro, setup compiles a second
+**On a PC with 48 GB of RAM, Gyro-M is the recommended model.** The fork's 48 GB PC serves it daily at 262K context.
+Setup shows it as `[recommended]`. Since v0.2.0 setup counts Gyro's memory as RAM and VRAM together (upstream's
+figures: 35 GB for Gyro-M, 27.6 GB for Gyro-S). For Gyro, setup compiles a second
 engine with agentionai's llama.cpp, in `engine-gyro/` (NVIDIA, CUDA 13).
 - **Gyro-M is labelled recommended.** By the developer's own tests its quality is close to ISTA's IQ3_S, at about
   IQ3_S's speed, with 36 % fewer bytes of experts (32.1 against 50.3 GB). It is what the fork serves daily (60-71
   tokens/s on agent turns, two cards).
 - **Gyro-S's quality is on par with ISTA's IQ2_XS** in 24 % less GPU memory (KLD 0.401 against 0.420 on
   [agentionai's model card](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)). It runs on the same code
-  (agentionai's rc2) without Gyro-M's TQ2_T tuning, and has not been measured here yet. Setup asks for 36 GB of RAM
-  for it (an estimate) and recommends it below 48 GB.
+  (agentionai's rc2) without Gyro-M's TQ2_T tuning, and has not been measured here yet. Setup recommends it when RAM
+  and VRAM together are below Gyro-M's 35 GB.
 - The setup path has only been checked with its unit tests so far. Details: [docs/GYRO.md](docs/GYRO.md).
+- Since v0.2.0 the sizes are named `Gyro-M` and `Gyro-S`, as upstream names them. The fork's earlier `--model M` /
+  `--model S` still work, and an install made before keeps its `strata-gyro-m.json` and pack. The engine is still
+  compiled here; Gyro stays text-only on the fork.
 
 ### Other models in setup's menu (upstream's, not measured by the fork)
 
-Upstream v0.1.43 to v0.1.45 added these to the installer. The fork has not run them:
+Upstream v0.1.43 to v0.2.0 added these to the installer. The fork has not run them:
 - **[Unsloth's UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0](docs/MODELS.md#unsloths-files-ud-iq4_xs-to-q8_0)**,
   4- to 8-bit. They are fast only where every expert fits in RAM (~88 GB for UD-Q4_K_XL up to ~136 GB for Q8_0); with
   less RAM part of them is read from the SSD while it answers. UD-Q4_K_XL is no longer experimental.
 - **NVFP4 packs** (`--family nvfp4`, NVIDIA cards only, ~80 GB of RAM to keep every expert in RAM):
-  [docs/NVFP4.md](docs/NVFP4.md).
+  [docs/NVFP4.md](docs/NVFP4.md). Upstream 0.2.0 adds **NVFP4-QAD**, NVIDIA's own FP4 checkpoint, which setup turns
+  into a Strata pack on your PC (a 102 GB download and about 110 GB more disk).
 - **Qwen3.6-35B-A3B** (`--family qwen36`), a smaller model with an engine path of its own, pictures and several
   requests at once: [docs/QWEN36.md](docs/QWEN36.md).
 
@@ -232,11 +254,12 @@ Upstream v0.1.43 to v0.1.45 added these to the installer. The fork has not run t
 
 - **In the browser:** `http://127.0.0.1:8080` opens the web app.
 - **Claude Code:** `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`. Other apps that use Anthropic's API:
-  `http://127.0.0.1:8080/v1/messages`.
+  `http://127.0.0.1:8080/v1/messages`. A base URL that ends in `/v1` works too (upstream 0.2.0).
 - **OpenAI-compatible apps:** base URL `http://127.0.0.1:8080/v1`, any API key and any model name. Codex CLI and other
   apps on the OpenAI Responses API: `/v1/responses` ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
 - **Thinking:** off, low, medium or high, in the chat menu or as your app's "reasoning effort".
-- **From another device:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always use a key.
+- **From another device:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Since upstream 0.2.0 the server
+  will not listen beyond this PC without a key.
 - **It answers one request at a time.** A conversation's first prompt is read in full; follow-ups reuse the cached
   part. Upstream's `"parallel": 2` answers several at once ([BATCHING.md](docs/BATCHING.md)); the fork has not
   measured it with its two-card profile.
@@ -244,6 +267,9 @@ Upstream v0.1.43 to v0.1.45 added these to the installer. The fork has not run t
   as before. Upstream v0.1.45 gives it the model card's recommended sampling instead (greedy made the model loop,
   upstream #2685); on the fork that is opt-in with `"model_card_sampling": true` in the config, because it changes
   the served outputs ([details](docs/DETAILS.md#using-it)).
+- **Max tokens:** a request whose prompt plus `max_tokens` does not fit the context is refused with 400, as llama.cpp
+  does. Upstream 0.2.0 shortens `max_tokens` to the room left instead; on the fork that stays opt-in with
+  `"fit_max_tokens": true` in the config (`--fit-max-tokens`). The D2x profile has it on.
 - **Is it fast on your PC?** Upstream's `BENCH.bat` (`./bench.sh`) measures chat, 4K/16K prompts and an agent-style
   session through the HTTP API and writes a report to share
   ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)). The fork has not run it with its two-card profile.
@@ -260,10 +286,16 @@ experts the card needs are page-locked first). Their measurements are upstream's
 
 ## Something went wrong?
 
-- **The PC freezes while the model loads.** That is normal for 1-3 minutes, longest the first time.
+- **The PC freezes while the model loads.** That is normal for 1-3 minutes, longest the first time. Still frozen after
+  10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
+- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where it
+  stopped.
 - **It is very slow and the disk light keeps blinking.** Not enough free RAM. Close other programs, or pick a smaller
   size.
 - **Port 8080 is already in use.** Strata is already running.
+- **It says the engine is older than this Strata expects.** Since upstream 0.2.0 a start never downloads or compiles
+  anything. After a `git pull`, run `UPDATE.bat` (or `./update.sh`) to compile the engine again, the Gyro engine
+  (`engine-gyro/`) too.
 
 More: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 

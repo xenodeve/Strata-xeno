@@ -91,13 +91,15 @@ bool hadamard_parse(const std::string& path, int64_t n_layers, HadamardSpec& h, 
 }
 
 void hadamard_rotate(float* x, int n, int block, const float* signs) {
+#if defined(__x86_64__) || defined(_M_X64)
     // #220: block 128 (APR) in AVX2 where the CPU has it, the same bits (native_hadamard_test checks); the scalar
-    // transform with STRATA_HADAMARD_SCALAR=1 (A/B)
+    // transform with STRATA_HADAMARD_SCALAR=1 (A/B).  x86-64 only: the AVX2 unit (tq_avx2.cpp) is not in an arm64 build.
     static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_HADAMARD_SCALAR") == nullptr;
     if (avx2 && block == 128 && n % 128 == 0) {
         hadamard_rotate128_avx2(x, n, signs);
         return;
     }
+#endif
     hadamard_rotate_scalar(x, n, block, signs);
 }
 
