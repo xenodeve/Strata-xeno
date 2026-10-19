@@ -335,8 +335,11 @@ class Install(unittest.TestCase):
 
     def test_the_default_size_follows_the_ram(self):
         """Gyro-M from 35 GB of RAM + VRAM together (upstream 0.2.0's figure, mem_total), Gyro-S below it (the test's card
-        has 11.9 GB: 20 GB of RAM makes 31.9 GB)."""
-        self.main([], ram=20.0, answers={"Context": "1"}, model=None)
+        has 11.9 GB: 20 GB of RAM makes 31.9 GB).  Step 1's RAM floor (the smallest model that is not counted as RAM +
+        VRAM, the Coder's 32 GB, less 4) asks "Go on anyway?" below 28 GB of RAM, and no RAM is both >= 28 and below
+        35 - 11.9 = 23.1 GB, so the Gyro-S case answers it with y (upstream's step 1, unchanged by the fork)."""
+        self.main([], ram=20.0, answers={"Context": "1", "Go on anyway": "y"}, model=None)
+        self.assertEqual([q for q in self.asked if q.startswith("  Go on anyway?")], ["  Go on anyway? [n]: "])
         self.assertEqual([q for q in self.asked if q.startswith("Which size?")], ["Which size? [2]: "])   # 2 = S
         self.asked = []
         self.main([], ram=63.7, answers={"Context": "1"}, model=None)
@@ -397,7 +400,7 @@ class GyroCatalog(unittest.TestCase):
 
     def test_mcp_table_matches(self):
         for m in ("Gyro-S", "Gyro-M"):
-            for k in ("download_gb", "ram_gb", "arena_gb", "mem_total", "engine"):   # not "vision": the fork's False
+            for k in ("download_gb", "ram_gb", "arena_gb", "mem_total", "engine", "vision"):   # vision: False in both
                 self.assertEqual(setup.MODELS[m][k], M.FALLBACK_MODELS[m][k], (m, k))
         self.assertEqual(setup.FAMILIES["gyro"]["tag"], M.FALLBACK_FAMILIES["gyro"]["tag"])
 
@@ -422,7 +425,9 @@ class GyroCatalog(unittest.TestCase):
         by = {x["model"]: x for x in fam["sizes"]}
         self.assertEqual(by["Gyro-S"]["on_this_pc"], "fits")
         self.assertEqual(by["Gyro-M"]["on_this_pc"], "tight")
-        self.assertTrue(by["Gyro-S"]["images"])
+        # the fork's Gyro reads no pictures ("vision": False in setup.py and the MCP table; upstream's: True)
+        self.assertFalse(by["Gyro-S"]["images"])
+        self.assertFalse(fam["images"])
 
     def test_mcp_table_gives_ram_plus_vram_without_the_ngram_table(self):
         """The Models page shows what a version needs of RAM + VRAM together, the n-gram table (on the SSD) not counted."""

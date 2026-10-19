@@ -925,8 +925,9 @@ print(r.choices[0].message.content)
   answers from there (the engine continues from what it already holds, so nothing is read again). The wrap-up is
   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
-  Anthropic's `"thinking": {"budget_tokens": N}` chooses the level, as above, and since 0.1.45 is also the budget (a
-  `reasoning_budget_tokens` in the same request wins).
+  Anthropic's `"thinking": {"budget_tokens": N}` chooses the level, as above. Upstream 0.1.45 also makes it the
+  budget; the fork does not (its own S3 budget closes the thinking; #268), and `reasoning_budget_tokens` in the
+  request still sets one.
 - **max_tokens counts the thinking, so the answer keeps its room (0.1.45; opt-in on the fork with `"answer_room": true`).**
   A client that caps the whole reply (the
   desktop agent's harness sends `max_completion_tokens: 8192` on every request) and a task the model thinks long about

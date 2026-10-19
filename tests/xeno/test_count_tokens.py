@@ -12,17 +12,10 @@ from serve.server import IMAGE_PAD, ByteTokenizer, MockEngine, Service, serve
 
 
 class ImageTokenizer(ByteTokenizer):
-    image_token = 1_000_000
-
-    def encode(self, text, parse_special=False):
-        if not parse_special or IMAGE_PAD not in text:
-            return super().encode(text, parse_special=parse_special)
-        parts = text.split(IMAGE_PAD)
-        ids = []
-        for i, part in enumerate(parts):
-            ids.extend(super().encode(part, parse_special=parse_special))
-            if i + 1 < len(parts): ids.append(self.image_token)
-        return ids
+    """The image marker as one token.  Merge #268: upstream's ByteTokenizer (0.1.45) already encodes <|image_pad|>
+    (and <|vision_start|>, which prepare()'s #554 rule needs right before it) as one special id, and it has
+    encode_marked(), so Service encodes through PromptEncoder (#567), which never called an encode() override here.
+    The old override (the marker as id 1_000_000 in encode() only) left the prompt with no image marker at all."""
 
 
 class CountTokensTest(unittest.TestCase):
