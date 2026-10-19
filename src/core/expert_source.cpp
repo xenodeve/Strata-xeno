@@ -4036,6 +4036,26 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                          (long long) dm_entries, 100.0 * (double) dm_dropped / (double) (std::max)(dm_entries, (int64_t) 1),
                          100.0 * dm_mass_drop / (dm_mass_all > 0 ? dm_mass_all : 1.0), (long long) dm_unmatched);
     }
+    // STRATA_DEFER_TOKMASS=m (#254 quality): a token's deferred entries carry at most m of its router mass.  Its
+    // CPU candidates are taken from the lowest weight up while they fit; the rest run now (unset or 0: no cap).  An
+    // expert can then run in both batches, for different tokens.
+    static const float defer_tokmass = [] { const char* v = std::getenv("STRATA_DEFER_TOKMASS"); return v ? (float) std::atof(v) : 0.0f; }();
+    static thread_local std::vector<char> def_ok;
+    if (dh.active && defer_tokmass > 0) {
+        def_ok.assign((size_t) (n_tok * k), 0);
+        for (int64_t t = 0; t < n_tok; ++t) {
+            float mass = 0.0f;
+            for (int64_t j = k - 1; j >= 0; --j) {
+                const int64_t i = t * k + j, e = ids[i];
+                if (kind[i] != -1 || e < 0 || e >= d.n_expert || best_rank[(size_t) e] < dh.rank ||
+                    (defer_maxw > 0 && best_w[(size_t) e] >= defer_maxw) || mass + dh.w[i] > defer_tokmass ||
+                    !d.src->resident(d.layers, e))
+                    continue;
+                mass += dh.w[i];
+                def_ok[(size_t) i] = 1;
+            }
+        }
+    }
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
@@ -4072,7 +4092,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 continue;
             }
             if (dh.active && best_rank[(size_t) e] >= dh.rank && (defer_maxw <= 0 || best_w[(size_t) e] < defer_maxw) &&
-                d.src->resident(d.layers, e)) {   // #254
+                (defer_tokmass <= 0 || def_ok[(size_t) i]) && d.src->resident(d.layers, e)) {   // #254
                 std::memset(row, 0, (size_t) H * sizeof(float));
                 def_list.push_back((int32_t) i);
                 if (defer_stats) tok_def[(size_t) (i / k)] += dh.w[i];
