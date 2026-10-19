@@ -38,6 +38,12 @@ int dense_req_type() {
         const char* v = std::getenv("STRATA_DENSE_REQ");
         if (v == nullptr || *v == '\0') return -1;
         const std::string s(v);
+        // #256: said once at start-up, since it changes what the model answers
+        if (s == "q6_k" || s == "q5_k" || s == "q4_k")
+            std::fprintf(stderr, "strata: STRATA_DENSE_REQ=%s - the requantized trunk changes the outputs and CAN LOWER "
+                                 "ANSWER QUALITY (q5_k on every matrix: teacher-forced KL up to 0.27 on code, HumanEval loses "
+                                 "one problem in 2 of 2 served runs; STRATA_DENSE_REQ_ONLY=attn_qkv|attn_gate|ssm_out scored "
+                                 "like no requant in 2 runs; #256). Off by default.\n", v);
         if (s == "q6_k") return 14;
         if (s == "q5_k") return 13;
         if (s == "q4_k") return 12;

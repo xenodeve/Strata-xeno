@@ -3534,6 +3534,10 @@ int defer_rank_env() {
         const char* v = std::getenv("STRATA_DEFER_RANK");
         if (v == nullptr || *v == '\0') return -1;
         const int x = std::atoi(v);
+        if (x >= 0 && x < 10)   // #254: said once at start-up, since it changes what the model answers
+            std::fprintf(stderr, "strata: STRATA_DEFER_RANK=%d - expert deferral changes the outputs and CAN LOWER ANSWER "
+                                 "QUALITY (served HumanEval: it alone loses one problem in 2 of 2 runs; with q5_k, 2-3 of 164 "
+                                 "in 6 of 6; #254). Off by default.\n", x);
         return x >= 0 && x < 10 ? x : -1;
     }();
     return r;
