@@ -6616,9 +6616,12 @@ int main(int argc, char** argv) {
         // engine allocates after it (the verify window's staging: "mapped staging allocation failed", exit 1).  Keep a
         // reserve while the arena pins and hand it back after (pin_budget.hpp).  (xeno) The fork's open order
         // (pin_for_cuda, place_first, ...).  The placement-first reserve (reserve_only) and a pageable arena (pin_for_cuda
-        // false: the 4070 tier, exclusive primary experts, STRATA_ARENA_PIN=0) register nothing, so there the reserve only
-        // holds 640 + 160 MiB of pinned RAM through the open (160 MiB of it until READY); STRATA_PIN_RESERVE_MIB=0 skips it.
-        strata::core::pin_reserve_take();
+        // false: the 4070 tier, exclusive primary experts, STRATA_ARENA_PIN=0) register nothing, so the reserve is not
+        // taken there (#275): it protected nothing, and held through the open it left 7 of 29 served Gyro-M boots with
+        // every CPU expert task 1.1-1.6x slower (one boot 3.2x) for the whole boot, 0 of 16 with it skipped.  Why it
+        // slows the pool is not measured.  STRATA_PIN_RESERVE_MIB set explicitly still takes it on any arena.
+        if ((pin_for_cuda && !place_first) || std::getenv("STRATA_PIN_RESERVE_MIB") != nullptr)
+            strata::core::pin_reserve_take();
         const bool arena_ok = arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_for_cuda, place_first,
                                              pin_limit, o.shared_expert_arena);
         strata::core::pin_note_arena(arena_src.pinned_arena_bytes());
