@@ -7,6 +7,7 @@
 #include "tq_states.hpp"
 #include "ggml-common-tq.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -89,10 +90,25 @@ void rows_scalar_t(const uint8_t* w, size_t row_bytes, int n, const tq_detail::T
 
 }  // namespace
 
+// #275 (a diagnostic): the table the kernels read, g_table unless tq_state_table_relocate moved it
+std::atomic<const int16_t*> g_table_at{nullptr};
+
 const int16_t* tq_state_table() {
     static std::once_flag once;
     std::call_once(once, fill_table);
-    return g_table;
+    const int16_t* p = g_table_at.load(std::memory_order_acquire);
+    return p != nullptr ? p : g_table;
+}
+
+const int16_t* tq_state_table_relocate() {
+    tq_state_table();
+    // a fresh copy in newly allocated pages; the old copies are kept (a kernel may still be reading one)
+    auto* p = static_cast<int16_t*>(std::malloc(sizeof g_table + 4096));
+    if (p == nullptr) return tq_state_table();
+    auto* a = reinterpret_cast<int16_t*>((reinterpret_cast<uintptr_t>(p) + 4095) & ~(uintptr_t) 4095);
+    std::memcpy(a, g_table, sizeof g_table);
+    g_table_at.store(a, std::memory_order_release);
+    return a;
 }
 
 const int16_t* tq_codebook_i16() {
