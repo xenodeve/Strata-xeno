@@ -18,11 +18,14 @@ Standalone structural command exit 0: 11 layers, 2,679 dims, 99 heads, 42,014 FF
 
 | Input/ผล | Identity |
 |---|---|
-| Compiler manifest | `69cb09356ea256f3094173779b7ee6391b8f3906f403d394f7107929e43d55c8` |
+| Compiler manifest used by bootstrap-01 (historical CRLF metadata) | `69cb09356ea256f3094173779b7ee6391b8f3906f403d394f7107929e43d55c8` |
+| Current canonical LF compiler manifest | `a5519351051213218a2236f1a4737af0e26e310fe3fb74d3f9269ef5bfd8c7c5` |
 | Firmware | `b643ad61291a947fa6c7498de9170b1d4da062dc1f34810feba9c4eebdec862d` |
 | Gyro tokenizer binding | `889964f986b93c35102f25f5e396efeed65fcb180429c35d97536fb7f6b72106` |
 | Logical boot state | `c2b9b2715f83a186c9c7b84a8559cad78f40fb8703a0c3591a277af833b72843` |
 | Boot trace | `f93d8e46ce0697518d9f025cf0ff4bdcc65d197742ce14b4ee15a6ca9482d779` |
+
+Metadata correction after checkpoint `0217dc22`: `git diff --cached --check` reported CRLF whitespace in the task-owned README and manifest. The commit was made before that nonzero result was handled. Only these two metadata files are normalized to LF, with explicit Git attributes; all 13 pinned upstream source files retain their original bytes and hashes. Raw bootstrap-01 evidence retains its historical manifest digest. The source verifier now pins the canonical LF digest above.
 
 Reference arithmetic smoke: input `17*23`, expected response body `\n391\n`, actual `\n391\n`, PASS บน pinned firmware จาก boot state ได้ 1,505 trace tokens / 912 instructions ใช้ 3.786 ms เฉพาะ Machine.record loop บน i5-13500 ไม่รวม imports/tokenization/boot-state load นี่เป็น offline upstream/reference result ไม่ใช่ native CUDA, integrated model, end-to-end latency หรือ speed comparison
 

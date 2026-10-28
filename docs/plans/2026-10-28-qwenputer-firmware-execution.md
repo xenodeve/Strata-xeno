@@ -7,7 +7,7 @@
 ## Inputs ที่ตรวจแล้ว
 
 - Source: divagr18/qwenputer revision `ca13310e2f9f788d1dd3feeea8213c1b0c23913c`
-- Vendored source: 13 ไฟล์ที่ไม่แก้จาก upstream รวม MIT notice; `UPSTREAM.json` SHA256 `69cb09356ea256f3094173779b7ee6391b8f3906f403d394f7107929e43d55c8` ตัว verifier ตรวจ Git blob/SHA256 ทุกไฟล์และปฏิเสธ extra .pyd/.pyc ก่อน import
+- Vendored source: 13 ไฟล์ที่ไม่แก้จาก upstream รวม MIT notice; `UPSTREAM.json` SHA256 `a5519351051213218a2236f1a4737af0e26e310fe3fb74d3f9269ef5bfd8c7c5` ตัว verifier ตรวจ Git blob/SHA256 ทุกไฟล์และปฏิเสธ extra .pyd/.pyc ก่อน import
 - Imports: Python standard library, NumPy และ Torch ที่ติดตั้งอยู่แล้ว; `chipformer` package initializers, `dsl.graph`, `q35.ir`, `q35.prims`, `rv.core`, `rv.spec`, `rv.ref`, `rv.asm`, `rv.elf` ไม่มี Transformers/HF loader/Triton หรือ language model
 - Firmware: `experimental/riscv/tests/data/rv/calc-bridge.elf`, 29,932 bytes, Git blob `6698dd454c677ce2759610e9c5fed4eb9e1959eb`, SHA256 `b643ad61291a947fa6c7498de9170b1d4da062dc1f34810feba9c4eebdec862d`
 - Gyro-M tokenizer: 248,320 IDs, binding SHA256 `889964f986b93c35102f25f5e396efeed65fcb180429c35d97536fb7f6b72106` จาก descriptor, vocab, merges, types และ chat template
@@ -34,3 +34,5 @@ Outputs อยู่ใน task-owned `p1-bootstrap-01`: validated firmware copy
 Explicit execution branch รันผ่าน offline boot แล้ว และ reference arithmetic `17*23` ได้ `391` ตรง expected ทั้งคู่ยังไม่ใช่ native CUDA arithmetic Code ของ preflight, byte adapter, ELF validator และ source trust checks มี tests แยกที่ไม่ execute upstream
 
 Firmware build script อ้าง picolibc และ libgcc; ELF ระบุ GCC 13.2.0 แต่ยังไม่ยืนยัน build/toolchain provenance และ notices ของ linked runtime ครบ จึงยังไม่เผยแพร่ generated binaries การทดสอบในเครื่องนี้ไม่ใช่การอนุมัติ redistribute, push, merge, deploy หรือแก้ served defaults
+
+Metadata note: the current canonical LF manifest digest above supersedes the historical CRLF metadata digest 69cb09356ea256f3094173779b7ee6391b8f3906f403d394f7107929e43d55c8 used by bootstrap-01. All 13 upstream source file bytes are unchanged; old run evidence is retained verbatim.
