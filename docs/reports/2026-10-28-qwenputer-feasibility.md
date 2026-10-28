@@ -4,58 +4,70 @@ P0 is the only authorized implementation phase. The compiled arithmetic circuit,
 
 ## ปิด private cap ตามที่อนุญาต — inference smoke ผ่านแล้ว
 
-สรุป: startup failure รอบก่อนเกิดจาก hard process cap ที่ harness ตั้งไว้จากงบ 42GB ไม่ใช่หลักฐานว่าเครื่องมี RAM ไม่พอ เมื่อผู้ใช้สั่งให้เอา cap ของการทดสอบออก รัน workload เดิมบน main ได้สำเร็จโดยไม่แก้ engine, model, context, workers หรือ cache settings ไม่มีการเพิ่ม --ram-cache-gib, เปลี่ยน pagefile, security หรือ served defaults
+สาเหตุของ startup failure รอบก่อนคือ hard process cap ของ harness เมื่อผู้ใช้สั่งให้ปิด cap เฉพาะการทดสอบ workload เดิมบน main ก็โหลดและสร้าง output ได้ โดยไม่ต้องแก้ engine หรือเปลี่ยน Gyro-M, context 262K, workers 5 และ cache settings ไม่มีการเพิ่ม --ram-cache-gib หรือเปลี่ยน pagefile, security และ served defaults
 
-อ่าน /t4-afk จริงจาก C:/Users/xenod/.agents/skills/t4-afk/SKILL.md และทำงานในขอบเขต startup diagnosis นี้ ไม่ขยายไป P1 Native circuit
+อ่าน /t4-afk จาก C:/Users/xenod/.agents/skills/t4-afk/SKILL.md แล้ว ขอบเขต AFK รอบนี้คือแก้ startup diagnosis และเก็บหลักฐาน ส่วน P1 Native circuit ยังไม่เริ่ม
 
-### Root cause และการแก้
+### กลไกและการแก้
 
-OwnedJob เดิมเปิด JOB_OBJECT_LIMIT_PROCESS_MEMORY=0x100 และตั้ง 41,999,998,976bytes Windows จึงปฏิเสธ host expert commit ก่อนโหลดครบ ทั้งก่อนและหลัง reboot มี event9 กับ process peak ชิด cap ขณะที่ system ยังมี headroom การแก้ใช้ explicit None ใน JobMemoryMonitor.set_process_limit: ล้างเฉพาะ process-memory flag/value ของ job ที่งานนี้เป็นเจ้าของ แล้ว query ยืนยัน None ไม่แตะ job อื่นหรือ policy ระดับระบบ
+OwnedJob เดิมตั้ง JOB_OBJECT_LIMIT_PROCESS_MEMORY (0x100) ไว้ที่ 41,999,998,976 bytes ทั้งก่อนและหลัง reboot พบ event 9 ของ Strata กับ process peak ชิด cap ขณะที่ system commit ยังมี headroom จึงระบุ guard rejection ได้โดยไม่ต้องเดาจาก free RAM
 
-JobMemoryMonitor(job,None,40,000,000,000) ใน controller ใหม่ยังจับ soft notification40GB เพื่อการสังเกตเท่านั้น ไม่ kill หรือจำกัด privatecommit ไม่มี supervisor เงียบที่ 42GB อยู่ใน loop การหยุดยังมี timeout60s, systemcommitfloor2GiB, physicalfloor1GiB และ kill-on-close ก่อน launchpreflight ต้องมี commitheadroom55GB+4GiB และ physical available26GiB ซึ่งเป็น safetyallowance ไม่ใช่ processcap
+JobMemoryMonitor.set_process_limit รับ explicit None สำหรับข้อยกเว้นนี้ ล้างเฉพาะ process-memory flag/value ของ task-owned job แล้ว query ยืนยันว่า limit เป็น None โดยยังรักษา kill-on-close ไว้ Controller ไม่มีเงื่อนไขอื่นที่หยุดตาม private commit 42 GB ส่วน soft notification 40 GB มีไว้เก็บข้อมูล ไม่จำกัดหรือ kill process
+
+ยังคง timeout 60 วินาที, system commit floor 2 GiB, physical floor 1 GiB และ process-tree cleanup ก่อน launch ต้องมี system headroom อย่างน้อย 55 GB + 4 GiB และ physical available 26 GiB ตัวเลข preflight นี้เป็น safety allowance ไม่ใช่ process cap
 
 ### ผล run05
 
-| รายการ | ค่าที่วัด/อ่านกลับ |
+| รายการ | ค่าที่วัดหรืออ่านกลับ |
 |---|---|
 | Tag | gyro-no-private-cap-05 |
 | Main baseline exe SHA256 | 3948784248ce3193ddd636792ce6f377fdb5e727eea5b241dcb279b8b8e46042 |
-| Job flags ก่อน/หลัง | 8192 (0x2000, KILL_ON_JOB_CLOSE เท่านั้น) |
-| Process / job hard commit limit | null / null ก่อนและหลัง |
+| Job flags ก่อนและหลัง | 8192 (0x2000, KILL_ON_JOB_CLOSE) |
+| Process / job hard commit limit | null / null ทั้งก่อนและหลัง |
 | Exit / controller stop | 0 / null |
-| Whole-run process lifetime private peak | 46,740,692,992bytes (46.7407 GB) |
-| Whole-run sampled system commitment peak | 63,456,198,656bytes |
-| Minimum sampled system commitment headroom | 24,507,371,520bytes |
-| Minimum sampled physical available | 12,529,254,400bytes |
-| Hard limit event9/10 | ไม่มี |
-| Output | 16tokens, first ID15968 |
-| Secondary compute | 1773entries/1449groups, stage-only=0 |
-| MTP | accepted7/14drafts |
-| Cleanup | owned_job_drain_verified=true, ไม่พบ task-owned model ค้าง |
+| Process lifetime private peak ตลอด run | 46,740,692,992 bytes (46.7407 GB) |
+| Sampled system commitment peak | 63,456,198,656 bytes |
+| Sampled system commitment headroom ต่ำสุด | 24,507,371,520 bytes |
+| Sampled physical available ต่ำสุด | 12,529,254,400 bytes |
+| Hard limit events 9/10 | ไม่มี |
+| Output | 16 tokens, first ID 15968 |
+| Secondary compute | 1773 entries / 1449 groups, stage-only=0 |
+| MTP | ยอมรับ 7 จาก 14 drafts |
+| Cleanup | owned_job_drain_verified=true; ไม่พบ task-owned model process ค้าง |
 
-ตัว loader รายงาน hostexperts loaded และ privatecommit26.08→42.29GiB ที่ arrival16.187s; sample ใกล้กัน 16.172s มี jobpeak45,493,002,240bytes เป็นหลักฐาน checkpoint ช่วง load ส่วน 46.7407GB เป็น peak ตลอด startup+prefill+decode ไม่ปนชื่อสองช่วงนี้เป็นค่าเดียว
+หลัง host experts โหลดครบ loader รายงาน private commit 26.08 → 42.29 GiB ที่เวลา arrival 16.187 วินาที Sample ใกล้กันที่ 16.172 วินาทีมี job peak 45,493,002,240 bytes ค่านี้เป็น checkpoint ช่วงโหลด ส่วน 46.7407 GB เป็น peak รวม startup, prefill และ decode ไม่เรียกสองช่วงนี้แทนกัน
 
-Output ก่อน EOS ถอดด้วย project tools.strata_tokenizer.Tokenizer จาก GGUFmetadata ได้ว่า “Testing software ensures reliability and prevents bugs before deployment.” Prompt คือขอหนึ่งประโยคเกี่ยวกับ testing software RawIDs และ prompt/output ที่ถอดแล้วอยู่ใน inference-evidence.json CLI ยังเขียน specialtokens ต่อจนถึง max-new16 จึงไม่ใช่หลักฐานว่า servedresponse จะส่ง specialtokens เหล่านี้ออกไป ไม่มี per-tokenarrival timestamp โดยตรง; program มี TTFTcounter แต่ไม่ใช้ single diagnostic run อ้าง performance win หรือ nativearithmeticaccuracy
+ถอด raw IDs ด้วย project reference tools.strata_tokenizer.Tokenizer จาก GGUF metadata ได้ข้อความก่อน EOS ว่า “Testing software ensures reliability and prevents bugs before deployment.” ซึ่งตรงกับ prompt ที่ขอหนึ่งประโยคเกี่ยวกับ testing software Raw IDs กับข้อความอยู่ใน inference-evidence.json
 
-Preflight ก่อน run: system headroom71,357,169,664bytes, physical available36,422,467,584bytes ไม่มี stale process และ hash ของ exe/profile/learnedprofile ตรงเดิม ทั้ง 21input files ได้รับ fullrehash หลัง reboot แล้วและ metadata ยังตรงก่อน run ไม่มี allocationerror หรือ telemetry/postrunerror ในรอบสำเร็จนี้ Wall39.078s เป็น diagnosticobservation ไม่ใช่ ABBA benchmark
+CLI เขียน special tokens ต่อจนถึง max-new 16 จึงไม่ใช้ผลนี้อ้างว่า served response จะส่ง special tokens เหล่านั้น ไม่มี per-token arrival timestamp โดยตรง และไม่ใช้เวลาใน diagnostic run เดียวอ้าง performance win หรือ arithmetic accuracy
 
-### ขอบเขต side effects และการยืนยันผล
+ก่อน run มี system headroom 71,357,169,664 bytes และ physical available 36,422,467,584 bytes ไม่มี stale task process Exe, profile และ learned-profile hashes ตรงเดิม Input 21 ไฟล์ได้รับ full rehash หลัง reboot แล้ว และ metadata ยังตรงก่อนเริ่มรอบนี้ Run จบใน 39.078 วินาทีโดยไม่มี allocation error, telemetry error หรือ post-run error
 
-served JSON และต้นฉบับ learnedprofilehash ยังตรงเดิม Permanentmodel/pack/tokenizer/MTP ไฟล์ไม่เปลี่ยน metadata แต่ engine ได้ regenerate derivedtailcache ตามพฤติกรรมเดิมของ setup_tail_file: สร้าง packs/gyro-m/tail-232775360fcd05ab.bin ขนาด 4,144,615,424bytes/3172slots และลบ stale tail-0f52493d0054a5fe.bin ที่เคยอยู่ใน manifest Sourcegenerate.cpp1330–1375 แยก cache ตาม key และลบ key เก่าอยู่แล้ว ไม่ได้แก้ behavior นี้หรือเรียก cleanup ด้วยมือ จึงไม่อ้างว่า packtree ทั้งต้นไม่เปลี่ยนหลัง run ข้อมูล weights/config ยังเดิม และ tailcache เป็น artifact ที่ engine สร้างคืนได้
+### Side effects และการทวนผล
 
-ทดสอบใหม่แบบ red→green ให้ explicitNone ปิด cap แล้วเปิด 64MiB และปิดกลับได้ โดย kill-on-close ยังอยู่ Memory tests14 ข้อผ่าน; ชุดรวม 23tests ผ่าน 21 และ skip2GPUtests,3.380s,DONE0 ผู้ตรวจอิสระอ่าน Nonepath/test และ controller แล้วไม่พบ Critical/Importantfinding ไม่ได้ให้ reviewer รัน model ซ้ำ
+Served JSON กับ learned profile ต้นฉบับยังมี hash เดิม ไฟล์ model, pack weights, tokenizer และ MTP ไม่เปลี่ยน metadata แต่ engine สร้าง derived tail cache ใหม่ตามพฤติกรรมเดิมของ setup_tail_file: tail-232775360fcd05ab.bin มี 3172 slots ขนาด 4,144,615,424 bytes และลบ stale tail-0f52493d0054a5fe.bin ที่เคยอยู่ใน manifest
 
-เคยลอง Rust tokenizers.Tokenizer.from_file กับ pack tokenizer.json แล้ว parser ปฏิเสธ เพราะไฟล์นี้เป็น descriptor ของ Strata ไม่ใช่ Hugging Face Tokenizer JSON จึงใช้ projectreferenceTokenizer.from_gguf ตาม source แทนและถอด rawoutput ได้ ไม่แก้ tokenizer/model จาก error ของเครื่องมือที่เลือกผิด
+Source generate.cpp:1330–1375 ตั้ง cache key และลบ key เก่าอยู่แล้ว รอบนี้ไม่ได้แก้พฤติกรรมดังกล่าวหรือเรียก cleanup เอง จึงไม่อ้างว่า pack directory ทั้งต้นไม่เปลี่ยนหลัง run ข้อมูล weights/config ยังเดิม ส่วน tail cache เป็น artifact ที่ engine สร้างคืนได้
 
-ภาพ TaskManager: prepare_materialize ของ Library สำเร็จ แต่ helper บน Windows ไม่มี os.setxattr หลัง download จึงไม่จบ materialization และไม่เหลือไฟล์ PNG ให้ view ไม่ได้ตรวจ pixels จริง ไม่ claim ว่าเห็นภาพหรือ persistLibrary metadata แล้ว ไม่ retry ซ้ำอีก ข้อมูล 13.7/47.7GB,available34GB,committed15.4/81.9GB จึงยังอ้างเฉพาะ OCR ที่ parent ส่งมา ค่าระบบหลัง process จบไม่ใช่ joblimit ของ process ระหว่าง run
+Test ใหม่เห็น red ก่อนแก้ explicit None แล้วผ่านหลังแก้ โดยตรวจ disabled → 64 MiB → disabled และยืนยัน kill-on-close คงอยู่ Memory tests ผ่าน 14 ข้อ ชุดรวมผ่าน 21 จาก 23 tests อีก 2 GPU tests ถูก skip ใช้ 3.380 วินาทีและ DONE exit=0 ผู้ตรวจอิสระตรวจ None path, test และ controller แล้วไม่พบ Critical หรือ Important finding
 
-### สิ่งที่ยืนยันและสิ่งที่ยังเปิดอยู่
+ตอนถอดข้อความได้ลอง Rust tokenizers.Tokenizer.from_file กับ pack tokenizer.json ก่อน แต่ไฟล์นั้นเป็น Strata descriptor จึงไม่ใช่รูปแบบที่ parser นี้รับ จากนั้นใช้ project Tokenizer.from_gguf ตาม source และถอด output สำเร็จ ไม่ได้แก้ model/tokenizer เพราะ error จากการเลือกเครื่องมือผิด
 
-Startup และ component inference ของ baseline ผ่าน ภายใต้ข้อยกเว้นการทดสอบที่ผู้ใช้สั่งให้ถอด private cap เท่านั้น Standing42GBbudget ของ repo ยังไม่เปลี่ยนและ actualprivate peak เกินงบ 4.7407GB ต้องรายงานต่อ resourcegate ไม่มี raw-token parity กับ candidate, ABBA, arithmetic circuit, ownership integration หรือ P1+implementation ผ่านจากรอบนี้ MMQ/expert-splitwarning ยังเป็นเส้นทาง performance แยก ไม่ใช่ startupblocker
+สำหรับภาพ Task Manager: Library preparation สำเร็จ แต่ Windows helper จบไม่ได้เพราะ os.setxattr ไม่พร้อมใช้งาน และไม่เหลือ PNG ที่อ่านได้ จึงยังไม่ได้ตรวจ pixels หรือยืนยันการเก็บ Library metadata ไม่ลอง transfer ซ้ำอีก ตัวเลข RAM 13.7/47.7 GB, available 34 GB, committed 15.4/81.9 GB อ้างเฉพาะ OCR ที่ parent ส่งมา ค่าระบบหลัง process จบไม่ได้แสดง job limit ของ process ตอนกำลังรัน
 
-Raw run05/result.json SHA256 a2ae15b6eb44354a25fb547aef66981b35d08c3fe8490c273144c2c2155e4f3d; controller08a9a0a8fdfd56e43ddb4379da04db85056ee4f77b400f7977b0de92a4773cfc; telemetryf0a2f092301ebfe78361070ecb4668b94a647e402f5760a34601e065b9fb4305 หลักฐานอยู่ใน gyro-no-private-cap-05/{result.json,on.stdout,on.stderr,stderr-events.json,inference-evidence.json,input-postcheck.json} พร้อม no-private-cap-preflight.json และ p0-no-cap-unit-suite.log
+### ขอบเขตที่ยืนยัน
 
-Local public-safe PRD เป็น R6 แล้วและเก็บ exactR5pendingpayload เดิมไว้ Public issue#276 ยังเป็น R4 และรอ Submit ของ formR5 ไม่มีการ retry หรือ bypass สิทธิ์นี้ จึงไม่ claimR6sync
+Startup และ component inference ของ baseline ผ่านภายใต้ข้อยกเว้นการทดสอบที่ผู้ใช้สั่งให้ปิด private cap เท่านั้น งบ 42 GB ของ repo ยังไม่เปลี่ยน และ peak ที่วัดได้สูงกว่างบ 4.7407 GB ต้องคงข้อค้นพบนี้ไว้ใน resource gate
+
+ยังไม่มี candidate raw-token parity, ABBA, arithmetic circuit หรือ ownership integration ที่ผ่านจากรอบนี้ คำเตือน MMQ/expert split เป็นข้อจำกัดของเส้นทาง performance ที่แยกจาก startup ส่วน P1+ ยังไม่ implement
+
+Raw run05 result.json SHA256: a2ae15b6eb44354a25fb547aef66981b35d08c3fe8490c273144c2c2155e4f3d
+Controller SHA256: 08a9a0a8fdfd56e43ddb4379da04db85056ee4f77b400f7977b0de92a4773cfc
+Telemetry SHA256: f0a2f092301ebfe78361070ecb4668b94a647e402f5760a34601e065b9fb4305
+
+หลักฐานอยู่ใน gyro-no-private-cap-05/{result.json,on.stdout,on.stderr,stderr-events.json,inference-evidence.json,input-postcheck.json}, no-private-cap-preflight.json และ p0-no-cap-unit-suite.log
+
+Public-safe PRD ในเครื่องเป็น R6 แล้วและเก็บ exact R5 payload เดิมไว้ Issue #276 ยังเป็น R4 และรอ Submit ของ R5 ไม่มีการ retry หรือ bypass และยังไม่อ้างว่า R6 sync สำเร็จ
 
 ## หลัง restart — กลไกการปฏิเสธยังเดิม
 
