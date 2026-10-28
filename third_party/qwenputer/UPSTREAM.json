@@ -1,0 +1,85 @@
+{
+  "files": [
+    {
+      "bytes": 1191,
+      "git_blob": "ccdbffd15bbbf20bc8127e113326cae649e8059f",
+      "path": "LICENSE",
+      "sha256": "7e0b399bba31458734e2f87b27d3d76d5d8a128631a8fba67a9b4e57444a786f"
+    },
+    {
+      "bytes": 68,
+      "git_blob": "35172ecba0f9c51bfdca25675bcfc9acbe30dd7a",
+      "path": "experimental/riscv/chipformer/__init__.py",
+      "sha256": "4786ed47ead298c2a1bd5f0cca502016e70d6a6f91642ccadf35fcbdcdf100e6"
+    },
+    {
+      "bytes": 88,
+      "git_blob": "a5941b503e0ec1460ed16deed5ff2937e860fa98",
+      "path": "experimental/riscv/chipformer/dsl/__init__.py",
+      "sha256": "a4193f3b1414f14885aed791df7e6461edd781fcbba2e9ca7e4bef703bb795be"
+    },
+    {
+      "bytes": 6100,
+      "git_blob": "cf2e3412ed508a9b12bcf18a8ac088475feef987",
+      "path": "experimental/riscv/chipformer/dsl/graph.py",
+      "sha256": "d8837ddcd34d3d63af475e3dfda1b592a04ec330e29f1f69dac462464e8f635c"
+    },
+    {
+      "bytes": 334,
+      "git_blob": "ff50fefc1cd0658b3a54aedfea2ef7bcecf5ed4d",
+      "path": "experimental/riscv/chipformer/q35/__init__.py",
+      "sha256": "789fb1c89aca2b3882fb036345594aba6c87ef829d5a9ed5f95c108d59e2fc1b"
+    },
+    {
+      "bytes": 22607,
+      "git_blob": "63e8d18922ffc3dc98c7d7c0923196edb7709bd9",
+      "path": "experimental/riscv/chipformer/q35/ir.py",
+      "sha256": "cde724f0d85c180dfcf4c5bc2a4c4deeca04cd4e76874b512f17ffa5a5419a7b"
+    },
+    {
+      "bytes": 9989,
+      "git_blob": "93cb165774d1726dbe924968f59a2b35030033a0",
+      "path": "experimental/riscv/chipformer/q35/prims.py",
+      "sha256": "17646632e68711d2f13faf25c7ea1ff1429364c51d744d835ece00353f3bba01"
+    },
+    {
+      "bytes": 88,
+      "git_blob": "021b19742d2cded326f4cbc62c780f8887429cb1",
+      "path": "experimental/riscv/chipformer/rv/__init__.py",
+      "sha256": "82c2a6b806f6debb9c1f5eb7d6cb8004b88788f763963458aa4f254670b114b1"
+    },
+    {
+      "bytes": 11339,
+      "git_blob": "e99a9381c8ee6201cfbd613d8cb89486076fa8f1",
+      "path": "experimental/riscv/chipformer/rv/asm.py",
+      "sha256": "1e5c972a3441524ac1861d50e008dd3817a7c621f79d72abeb32a7b14887c6a2"
+    },
+    {
+      "bytes": 63917,
+      "git_blob": "679480f8cbc4f07156c7b59ba37ee62db0b738e5",
+      "path": "experimental/riscv/chipformer/rv/core.py",
+      "sha256": "2205b32147b9fd8e17819934ace20b0cf33336c2b98c51ddc760b95788c54210"
+    },
+    {
+      "bytes": 2200,
+      "git_blob": "ccd3c571877783f3f137d201f972938ad963a7f1",
+      "path": "experimental/riscv/chipformer/rv/elf.py",
+      "sha256": "0bd591b7a7c6c4d9595e775767f603b2e9697005fd9b949f30ff84bb440a3b50"
+    },
+    {
+      "bytes": 25235,
+      "git_blob": "5ffb64b9e910eb3a92c667e03fc9497daa4bf56b",
+      "path": "experimental/riscv/chipformer/rv/ref.py",
+      "sha256": "b06a3e07313ed409a8bab66e0cbb75f5e9dd99acda0f1b8dc147355400ba9638"
+    },
+    {
+      "bytes": 7251,
+      "git_blob": "b8a5aed35ca8d8b1a7ec77db629fffece1222ae7",
+      "path": "experimental/riscv/chipformer/rv/spec.py",
+      "sha256": "30b0095b23d2c9b963a25ff60cff6d21281f100e777adb8b99e024201af600ad"
+    }
+  ],
+  "local_patches": [],
+  "repository": "https://github.com/divagr18/qwenputer",
+  "revision": "ca13310e2f9f788d1dd3feeea8213c1b0c23913c"
+}

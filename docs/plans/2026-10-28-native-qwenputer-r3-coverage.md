@@ -1,3 +1,5 @@
+R8 updates evidence for P1 input/bootstrap implementation and the explicitly approved pinned firmware/reference run. It preserves all 24 user stories, 10 gates, 9 phases, five normative-reference overrides and the three unchanged Mermaid diagrams. Native artifact/CUDA/model integration remain unfinished. Public synchronization has not completed; no new issue write was attempted.
+
 R7 adds the explicit actual-hub operational-baseline contract and the separately identified real server/executable smoke. It preserves a source-matched development control for feature attribution. P0 evidence is ready for review; the architecture, 24 user stories, G0–G9 and P0–P8 remain intact. The normative-reference exceptions now enumerate five items, adding this baseline contract. Public issue synchronization is parked on the already pending R5 Submit form; no R7 publication is claimed.
 
 R6 adds the user-approved diagnostic cap-removal exception and verified 16-token component smoke. The repository budget and all Native requirements remain unchanged.
