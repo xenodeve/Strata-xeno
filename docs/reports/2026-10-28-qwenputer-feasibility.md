@@ -2,6 +2,152 @@
 
 P0 is the only authorized implementation phase. The compiled arithmetic circuit, model bridge and decoder integration are not implemented by this diagnostic. PRD: [#276](https://github.com/xenodeve/Strata-xeno/issues/276), approved R2; the English/Thai published body was read back exactly (62,037 characters, SHA256 `066617000239adb3708d2b7fc2d5e0220dbcf0feb6f57fb4c07dfe1ea0e3d59e`). No implementation issue breakdown, PR, push or merge was performed.
 
+## ปิด private cap ตามที่อนุญาต — inference smoke ผ่านแล้ว
+
+สรุป: startup failure รอบก่อนเกิดจาก hard process cap ที่ harness ตั้งไว้จากงบ 42GB ไม่ใช่หลักฐานว่าเครื่องมี RAM ไม่พอ เมื่อผู้ใช้สั่งให้เอา cap ของการทดสอบออก รัน workload เดิมบน main ได้สำเร็จโดยไม่แก้ engine, model, context, workers หรือ cache settings ไม่มีการเพิ่ม --ram-cache-gib, เปลี่ยน pagefile, security หรือ served defaults
+
+อ่าน /t4-afk จริงจาก C:/Users/xenod/.agents/skills/t4-afk/SKILL.md และทำงานในขอบเขต startup diagnosis นี้ ไม่ขยายไป P1 Native circuit
+
+### Root cause และการแก้
+
+OwnedJob เดิมเปิด JOB_OBJECT_LIMIT_PROCESS_MEMORY=0x100 และตั้ง 41,999,998,976bytes Windows จึงปฏิเสธ host expert commit ก่อนโหลดครบ ทั้งก่อนและหลัง reboot มี event9 กับ process peak ชิด cap ขณะที่ system ยังมี headroom การแก้ใช้ explicit None ใน JobMemoryMonitor.set_process_limit: ล้างเฉพาะ process-memory flag/value ของ job ที่งานนี้เป็นเจ้าของ แล้ว query ยืนยัน None ไม่แตะ job อื่นหรือ policy ระดับระบบ
+
+JobMemoryMonitor(job,None,40,000,000,000) ใน controller ใหม่ยังจับ soft notification40GB เพื่อการสังเกตเท่านั้น ไม่ kill หรือจำกัด privatecommit ไม่มี supervisor เงียบที่ 42GB อยู่ใน loop การหยุดยังมี timeout60s, systemcommitfloor2GiB, physicalfloor1GiB และ kill-on-close ก่อน launchpreflight ต้องมี commitheadroom55GB+4GiB และ physical available26GiB ซึ่งเป็น safetyallowance ไม่ใช่ processcap
+
+### ผล run05
+
+| รายการ | ค่าที่วัด/อ่านกลับ |
+|---|---|
+| Tag | gyro-no-private-cap-05 |
+| Main baseline exe SHA256 | 3948784248ce3193ddd636792ce6f377fdb5e727eea5b241dcb279b8b8e46042 |
+| Job flags ก่อน/หลัง | 8192 (0x2000, KILL_ON_JOB_CLOSE เท่านั้น) |
+| Process / job hard commit limit | null / null ก่อนและหลัง |
+| Exit / controller stop | 0 / null |
+| Whole-run process lifetime private peak | 46,740,692,992bytes (46.7407 GB) |
+| Whole-run sampled system commitment peak | 63,456,198,656bytes |
+| Minimum sampled system commitment headroom | 24,507,371,520bytes |
+| Minimum sampled physical available | 12,529,254,400bytes |
+| Hard limit event9/10 | ไม่มี |
+| Output | 16tokens, first ID15968 |
+| Secondary compute | 1773entries/1449groups, stage-only=0 |
+| MTP | accepted7/14drafts |
+| Cleanup | owned_job_drain_verified=true, ไม่พบ task-owned model ค้าง |
+
+ตัว loader รายงาน hostexperts loaded และ privatecommit26.08→42.29GiB ที่ arrival16.187s; sample ใกล้กัน 16.172s มี jobpeak45,493,002,240bytes เป็นหลักฐาน checkpoint ช่วง load ส่วน 46.7407GB เป็น peak ตลอด startup+prefill+decode ไม่ปนชื่อสองช่วงนี้เป็นค่าเดียว
+
+Output ก่อน EOS ถอดด้วย project tools.strata_tokenizer.Tokenizer จาก GGUFmetadata ได้ว่า “Testing software ensures reliability and prevents bugs before deployment.” Prompt คือขอหนึ่งประโยคเกี่ยวกับ testing software RawIDs และ prompt/output ที่ถอดแล้วอยู่ใน inference-evidence.json CLI ยังเขียน specialtokens ต่อจนถึง max-new16 จึงไม่ใช่หลักฐานว่า servedresponse จะส่ง specialtokens เหล่านี้ออกไป ไม่มี per-tokenarrival timestamp โดยตรง; program มี TTFTcounter แต่ไม่ใช้ single diagnostic run อ้าง performance win หรือ nativearithmeticaccuracy
+
+Preflight ก่อน run: system headroom71,357,169,664bytes, physical available36,422,467,584bytes ไม่มี stale process และ hash ของ exe/profile/learnedprofile ตรงเดิม ทั้ง 21input files ได้รับ fullrehash หลัง reboot แล้วและ metadata ยังตรงก่อน run ไม่มี allocationerror หรือ telemetry/postrunerror ในรอบสำเร็จนี้ Wall39.078s เป็น diagnosticobservation ไม่ใช่ ABBA benchmark
+
+### ขอบเขต side effects และการยืนยันผล
+
+served JSON และต้นฉบับ learnedprofilehash ยังตรงเดิม Permanentmodel/pack/tokenizer/MTP ไฟล์ไม่เปลี่ยน metadata แต่ engine ได้ regenerate derivedtailcache ตามพฤติกรรมเดิมของ setup_tail_file: สร้าง packs/gyro-m/tail-232775360fcd05ab.bin ขนาด 4,144,615,424bytes/3172slots และลบ stale tail-0f52493d0054a5fe.bin ที่เคยอยู่ใน manifest Sourcegenerate.cpp1330–1375 แยก cache ตาม key และลบ key เก่าอยู่แล้ว ไม่ได้แก้ behavior นี้หรือเรียก cleanup ด้วยมือ จึงไม่อ้างว่า packtree ทั้งต้นไม่เปลี่ยนหลัง run ข้อมูล weights/config ยังเดิม และ tailcache เป็น artifact ที่ engine สร้างคืนได้
+
+ทดสอบใหม่แบบ red→green ให้ explicitNone ปิด cap แล้วเปิด 64MiB และปิดกลับได้ โดย kill-on-close ยังอยู่ Memory tests14 ข้อผ่าน; ชุดรวม 23tests ผ่าน 21 และ skip2GPUtests,3.380s,DONE0 ผู้ตรวจอิสระอ่าน Nonepath/test และ controller แล้วไม่พบ Critical/Importantfinding ไม่ได้ให้ reviewer รัน model ซ้ำ
+
+เคยลอง Rust tokenizers.Tokenizer.from_file กับ pack tokenizer.json แล้ว parser ปฏิเสธ เพราะไฟล์นี้เป็น descriptor ของ Strata ไม่ใช่ Hugging Face Tokenizer JSON จึงใช้ projectreferenceTokenizer.from_gguf ตาม source แทนและถอด rawoutput ได้ ไม่แก้ tokenizer/model จาก error ของเครื่องมือที่เลือกผิด
+
+ภาพ TaskManager: prepare_materialize ของ Library สำเร็จ แต่ helper บน Windows ไม่มี os.setxattr หลัง download จึงไม่จบ materialization และไม่เหลือไฟล์ PNG ให้ view ไม่ได้ตรวจ pixels จริง ไม่ claim ว่าเห็นภาพหรือ persistLibrary metadata แล้ว ไม่ retry ซ้ำอีก ข้อมูล 13.7/47.7GB,available34GB,committed15.4/81.9GB จึงยังอ้างเฉพาะ OCR ที่ parent ส่งมา ค่าระบบหลัง process จบไม่ใช่ joblimit ของ process ระหว่าง run
+
+### สิ่งที่ยืนยันและสิ่งที่ยังเปิดอยู่
+
+Startup และ component inference ของ baseline ผ่าน ภายใต้ข้อยกเว้นการทดสอบที่ผู้ใช้สั่งให้ถอด private cap เท่านั้น Standing42GBbudget ของ repo ยังไม่เปลี่ยนและ actualprivate peak เกินงบ 4.7407GB ต้องรายงานต่อ resourcegate ไม่มี raw-token parity กับ candidate, ABBA, arithmetic circuit, ownership integration หรือ P1+implementation ผ่านจากรอบนี้ MMQ/expert-splitwarning ยังเป็นเส้นทาง performance แยก ไม่ใช่ startupblocker
+
+Raw run05/result.json SHA256 a2ae15b6eb44354a25fb547aef66981b35d08c3fe8490c273144c2c2155e4f3d; controller08a9a0a8fdfd56e43ddb4379da04db85056ee4f77b400f7977b0de92a4773cfc; telemetryf0a2f092301ebfe78361070ecb4668b94a647e402f5760a34601e065b9fb4305 หลักฐานอยู่ใน gyro-no-private-cap-05/{result.json,on.stdout,on.stderr,stderr-events.json,inference-evidence.json,input-postcheck.json} พร้อม no-private-cap-preflight.json และ p0-no-cap-unit-suite.log
+
+Local public-safe PRD เป็น R6 แล้วและเก็บ exactR5pendingpayload เดิมไว้ Public issue#276 ยังเป็น R4 และรอ Submit ของ formR5 ไม่มีการ retry หรือ bypass สิทธิ์นี้ จึงไม่ claimR6sync
+
+## หลัง restart — กลไกการปฏิเสธยังเดิม
+
+ผู้ใช้ยืนยัน restart แล้ว ตรวจ boot time ได้ 2026-10-28T20:47:44.891043Z ก่อนเริ่มไม่พบ task-owned model/controller ค้าง exe/profile/learned profile/prompt hashes ตรงเดิม และ rehash model/pack/tokenizer/MTP inputs21 ไฟล์ รวม 98,025,159,488bytes ตรง manifest เดิมทั้งหมด ใช้ 73.109s การอ่านนี้อุ่น filesystem cache จึงไม่ใช้เวลา startup รอบนี้อ้าง speed win/loss
+
+รันเพียงหนึ่งครั้งด้วย main baseline เดิมและ corrected v3 controller: `gyro-memory-after-reboot-04` ก่อน launch system headroom71,977,607,168bytes และ available physical37,120,352,256bytes ผ่าน preflight เดิม ไม่มีการผ่อน guard หรือเงื่อนไขความปลอดภัย
+
+| หลักฐาน | ก่อน restart run03 | หลัง restart run04 |
+|---|---:|---:|
+| Applied per-process guard bytes | 41,999,998,976 | 41,999,998,976 |
+| Job process peak bytes | 41,999,466,496 | 41,999,060,992 |
+| เหลือถึง guard bytes | 532,480 | 937,984 |
+| Minimum sampled system commitment headroom bytes | 9,409,363,968 | 30,002,733,056 |
+| Minimum sampled physical available bytes | 20,670,574,592 | 31,733,825,536 |
+| Hard limit notification | 9, PID51164 | 9, PID33900 |
+| Terminal outcome | error1455 ก่อน token แรก | error1455 ก่อน token แรก |
+
+run04 รับบรรทัด error ที่ 13.078s และอ่าน event9 ที่ 13.109s ของ controller นี่เป็นเวลา arrival/dequeue ไม่ใช่เวลาของ CPU instruction ที่เรียก VirtualAlloc Sampling gaps สูงสุด 32ms Process private lifetime peak ที่อ่านและ job peak ตรงกัน; system limit จริงของรอบ 04 คือ 87,963,570,176bytes ไม่สมมติว่าเท่ารอบ 03 ซึ่งเป็น 90,968,305,664bytes ไม่มี telemetry/post-run error และ owned_job_drain_verified=true ไม่พบ task-owned model process หลังจบ
+
+การ restart เพิ่ม system headroom แต่ไม่ได้เปลี่ยนกลไก: process guard ยังปฏิเสธ commit ก่อน token แรก ไม่ใช้ผลนี้อ้างว่า physical RAM หมด, main ใช้ Gyro ไม่ได้ หรือเปลี่ยน branch แล้วจะหาย ไม่ถอดหรือเพิ่ม guard และไม่รันซ้ำอีก
+
+หลักฐานใหม่: `after-reboot-preflight.json`, `after-reboot-input-hashes.json`, `after-reboot-comparison.json` และ `gyro-memory-after-reboot-04/` ใน evidence directory เดิม SHA256 ของ run04 result.json คือ `4d6ce2a6a7a7b4ddc00e0d697ff64abf71b8bb88215ec998390609289ac2c41f` Controller SHA256 `4d261fac840933b9ddd64158975d727af605cb5ec3fee60245db256f20fef916`; telemetry SHA256 `a836bdff1fdccd7494f5c2ed9b65b17ef8e83d7f8391b442d92c38952c499e80`
+
+### Host arena และทางเลือกที่ยังต้องตัดสินใจ
+
+Pack มี 24,576 experts ×1,305,600bytes =32,086,425,600bytes ตรวจ profile ตาม source-defined STRP v1 uint16 pair region แล้วครบ 24,576 คู่และไม่ซ้ำ primary5,695 กับ secondary5,607 เป็นคนละคู่ ดังนั้น host-owned13,274 experts มี logical payload17,330,534,400bytes (16.1403GiB) ซึ่ง load_rest5214–5228 จะ commit ทั้งหมด เพราะ profile นี้ไม่ตั้ง --ram-cache-gib
+
+sample ใกล้ก่อนข้อความ secondary staging สำเร็จมี process private28,044,435,456bytes บวก payloadhost ทั้งชุดได้ 45,374,969,856bytes นี่เป็น additive estimate ของ startup ไม่ใช่ peak ที่เปิดสำเร็จ ไม่รวม page rounding และ allocations หลังจากนั้น แต่สอดคล้องกับ guard failure ที่วัดจริง Source ไม่มี automatic42GBcap สำหรับโหมดนี้
+
+--expert-cache/--vram-reserve-mib กับ secondary/displaybudgets กำหนด GPUslots; exclusive primary/secondary และ tail-file ช่วยไม่เก็บ host copy ซ้ำและเปิดอยู่แล้ว ลด GPUcache ไม่ได้รับประกันว่าจะลด totalcommit เพราะ expert ที่ GPU ไม่ถือจะกลับไป host และบน Windowsdeviceallocation ยังมี commitcharge (generate.cpp5997–6018) ไม่เปลี่ยน cache จากการเดาว่าจะประหยัด
+
+--ram-cache-gib เป็นกลไกเดิมที่จำกัด logicalhostexpertcache และให้ส่วนเกินอยู่ NVMe (generate.cpp6576–6588; expert_source.cpp5248–5305) ยังคง model/context/workers และ GPU tiers ได้ แต่เปลี่ยน D2x จากไม่มี NVMe tier เป็น capacity mode มี I/O miss latency และต้องวัดใหม่ อีกทั้ง cache cap ไม่ใช่ hard process cap มี slabslack และ in-flight/heldexperts จึงต้องเหลืองบสำหรับ graph/requestpeaks ไม่เลือกค่าแทนผู้ใช้
+
+ถ้าต้องรักษาทั้ง 42GBhardguard และ D2xresidency เดิม ยังไม่มี existingknob ที่พิสูจน์ว่าทำให้ fit ต้องแยกงานวัด allocationcategories และลด commit ที่ไม่จำเป็นโดยไม่เปลี่ยน semantics หรือให้ผู้ใช้เลือก capacity mode อย่างชัดเจน --mmap-experts ไม่ใช่ drop-in เพราะขัดกับ explicitexclusive-primary path (generate.cpp3569–3577) และ pinningcap ไม่ได้จำกัด pageable arena นี้ (5604–5608) ไม่มีการใช้ทางเลือกใดจริงในรอบนี้
+
+### Final helper verification และ GitHub form
+
+หลังเพิ่มสอง assertions สุดท้าย รันครบ 22tests อีกครั้ง:20 ผ่าน,2GPUskipped,3.398s,DONE0 (`p0-memory-suite-assertions-final.log`) ไม่มี code เปลี่ยนหลังจากนั้น
+
+อ่าน issue#276 หลัง reboot แบบ read-only แล้วยังเป็น R4, updated_at2026-10-28T20:02:21Z,48291characters การเขียน R5 ผ่าน mcp__github__issue_write ยังเป็น pendinginteractiveSubmit ไม่ได้ retry หรือเปลี่ยนช่องทาง Returnedmetadata มีเพียง isError=true และข้อความว่าแสดง interactiveform แล้ว/issue ยังไม่ updated/ให้รอ Submit ไม่มี approval/requestID หรือ formURL ส่งกลับมา Public-safeR5Markdown และ Mermaid sources ไม่ได้แก้เพิ่มในรอบ reboot นี้
+
+## ผลวินิจฉัยล่าสุด — guard ของการทดสอบเป็นข้อจำกัดที่พบจริง
+
+ใช้ `/debug-mantra` จาก `C:/Users/xenod/.agents/skills/debug-mantra/SKILL.md` และคง main e5737a27 ใน worktree Native เดิม ไม่มีการเปลี่ยน served profile, branch, pagefile หรือ security settings และไม่ผ่อน hard process guard 42,000,000,000 bytes
+
+รอบ `gyro-memory-diagnosis-03` ใช้ baseline exe SHA256 `3948784248ce3193ddd636792ce6f377fdb5e727eea5b241dcb279b8b8e46042` พร้อม Gyro-M 262K/5 workers และ frozen expert profile เดิม เครื่องมือใหม่อ่าน system commitment ด้วย GetPerformanceInfo, process private commit ด้วย GetProcessMemoryInfo และ job limits/peaks ด้วย QueryInformationJobObject พร้อม completion-port notifications ก่อนเริ่ม process
+
+ผล: engine ออก 1 ก่อน token แรก error1455 เหมือนรอบ02 แต่คราวนี้จับ JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT (9) ของ PID51164 ได้ที่ controller11.610s ใกล้กับการรับบรรทัด error11.594s ซึ่งเป็นเวลา arrival ไม่ใช่เวลาเรียก VirtualAlloc แบบเจาะจง PeakProcessMemoryUsed เท่ากับ41,999,466,496 bytes เทียบ guard ที่ Windows ปัดแล้ว41,999,998,976 bytes เหลือ532,480 bytes รอบนี้จึงชน hard process guard จริง ไม่ใช้การคาดเดาจาก free RAM หรือ error code อย่างเดียว
+
+system commitment ที่เก็บด้วย API ถูกต้องมี peak81,558,941,696 bytes จาก limit90,968,305,664 bytes; headroom ต่ำสุด9,409,363,968 bytes ส่วน physical available ต่ำสุด20,670,574,592 bytes ค่าเหล่านี้ยังเป็น samples ไม่ใช่ภาพ ณ instruction ที่ allocation ล้มเหลว แต่ positive process-limit event และ peak ชิด guard เป็นหลักฐานของ guard ที่ผูกกับ run นี้ ตัว controller ไม่ส่ง timeout/physical-floor stop
+
+trace source ของ e573: generate.cpp6598 → ArenaExpertSource::load_rest5226 → host_commit5702 → PinnedArena::commit_interior599 เป็น pageable host expert commit ทีละ expert ก่อนอ่าน payload Layout ทั้ง48 layers กำหนด1,305,600 bytes ต่อ expert สอดคล้องกับ TQ2_T ของสาม matrices คำขอแบบปัดครอบหน้าเป็น1,306,624 หรือ1,310,720 bytes ไม่ใช่29.88GiB ก้อนเดียว ไม่มี debugger แบบ console ที่เข้าถึงได้ใน PATH/Windows Kits Debuggers/WindowsApps/VS Community ที่ตรวจ จึงยังไม่มี layer/expert identity หรือ exact page-rounded choice ของคำขอที่ล้มเหลว ไม่อ้างว่า instrument ได้แล้ว
+
+สมมติฐานและผลตรวจ:
+
+| สมมติฐาน | หลักฐาน/ผล |
+|---|---|
+| H1 task process guard ปฏิเสธ commit | ยืนยันว่าเกิด guard rejection: event9 ตรง PID, peak เหลือ532,480 bytes ก่อน cap; small control สร้าง1455+event9 ได้โดย system ยังมี headroom |
+| H2 system commitment หมดเป็นคำอธิบายที่จำเป็น | ไม่รองรับในรอบนี้: system headroom samples ยังเหลืออย่างน้อย9.409GB และพบ process guard ที่มีผลจริง ไม่อ้างว่าได้วัด OS ณ instruction ที่ผิดพลาด |
+| H3 allocation size ผิดหรือ overflow | ไม่พบหลักฐาน: logical blob1,305,600 bytes ตรง format/layout; exact failed index ยังไม่เก็บ |
+| H4 MMQ warning ทำให้ startup ออก | ไม่ใช่ terminal path: หลัง warning engine ยังโหลด dense/MTP และ staging ทั้งสอง GPU ก่อนออกจาก host commit |
+
+main ยังเป็น baseline ที่เป็นไปได้ การเปิด TQ MMQ/expert split ขึ้นกับ build dependency/configuration และต้องวัดแยก ไม่ใช้เปลี่ยน branch เป็นวิธีแก้1455 ข้อมูลนี้ยังไม่พิสูจน์ว่าเปิดได้เมื่อไม่มี guard หรือทรัพยากรเพียงพอตลอด inference จึงไม่ผ่อน cap ไม่แก้ production behavior และไม่ข้ามไป P1 ขั้นต่อไปต้องให้ผู้ใช้ตัดสินใจเรื่อง resource-fit gate หรือขอบเขตงานลด commit จากหลักฐาน โดยยังไม่เปลี่ยน context/quantization/profile แทนผู้ใช้
+
+### การแก้เครื่องมือวัดและการทวนผล
+
+field system_commit/commit_limit ของ controller รุ่นแรกมาจาก GlobalMemoryStatusEx และไม่ใช่ system-wide commitment ที่รับรองแล้ว ตัวเลข78,573,899,776/90,968,305,664 ของรอบ02จึงเป็น legacy non-authoritative evidence เก็บ run02 JSON/controller เดิมไว้ ไม่เขียนทับและไม่ใช้ค่านั้นวินิจฉัย system exhaustion
+
+`tools/qwenputer/memory.py` แยก field/source/unit ของ system, process และ job; bootstrap ของ owned job จับ notifications ก่อนเริ่มเครื่องมือ การไม่มี event9/10 และ soft event11 ไม่กลายเป็นคำตัดสินว่า OS limit หมด Small control ใช้ child guard ไม่เกิน64MiB, commit สำเร็จเพิ่ม1MiB แล้วคำขอ8MiBถูกปฏิเสธ จับ9/11ได้จริงโดยไม่ต้องใช้โมเดล
+
+ผู้ตรวจอิสระตรวจ ABI กับ Windows SDK และพบช่องโหว่ใน error paths: dequeued events อาจหายถ้า query ถัดไปผิดพลาด, telemetry failure อาจข้าม cleanup และ post-run probe อาจข้ามการเขียนรายงาน แก้ด้วยการเก็บ event ทันที, nested cleanup และ persist partial report ก่อน optional probes Tests ทำให้ข้อบกพร่องเกิดก่อนแก้และผ่านหลังแก้ ไม่มี model rerun หลังแก้ error paths นี้ สคริปต์v2ที่ใช้รอบ03เก็บเดิม; v3เตรียมและตรวจ syntax ไว้สำหรับครั้งหน้าเท่านั้น
+
+ชุดสุดท้าย:22 tests,20ผ่าน,2 GPU probe tests skipped (ไม่ได้ตั้ง QWENPUTER_PROBE ใน suite นี้), DONE0; log p0-memory-suite-final.log ชุด GPU/control-flow เดิม9 tests และ10 cases ยังคง identity เดิม ไม่อ้างว่ารันใหม่ HIP/SYCL ไม่ได้รัน เพราะไม่มี engine/backend source ที่เปลี่ยนในรอบ telemetry นี้
+
+การตรวจ persistence พบว่า default virtualized sandbox TEMP สร้างไฟล์ได้แต่ atomic replace ถูกปฏิเสธ WinError5 ทดสอบ differential แล้ว workspace และ explicit allowed Temp replace ผ่าน จึงให้ test fixture สร้างใน workspace writable root ไม่เปลี่ยน runtime persistence เพื่อซ่อน error
+
+### Reproducer และ breadcrumbs
+
+Exact executed argv (no production source changes):
+
+```text
+python -B -X utf8 tools/qwenputer/headless.py --log C:/Users/xenod/AppData/Local/Temp/strata-qwenputer-p0-20261028/gyro-memory-diagnosis-03.log --timeout 90 -- python -B -X utf8 C:/Users/xenod/AppData/Local/Temp/strata-qwenputer-p0-20261028/run_gyro_smoke_v2.py baseline --tag gyro-memory-diagnosis-03
+```
+
+Controller preflight ต้องมี system headroom >=42GB+2GiB และ physical available>=22GiB; คืนผลก่อน launch ถ้าไม่ผ่าน ใช้ hard guard42GB, soft notification40GB (ไม่ block), bound60s, system commit floor2GiB, physical floor1GiB และ sample target20ms (จริง15–47ms) ไม่มีงานหนักอื่นเริ่มระหว่าง repro
+
+Evidence directory เดิมมี `memory-small-control.json`, `debug-mantra-preflight.json`, `gyro-memory-diagnosis-03/{command.json,result.json,stderr-events.json,on.stderr,test-config.json}` และ raw run02เดิม SHA256 ของ result.json รอบ03:9e67faf7c37d104dd502e10b144d47eae8bd5c4aa35e18722a50f19c69983985
+
+Original model smoke ยัง FAIL ภายใต้ guard ไม่ใช่ model inference PASS; diagnostic attribution และ helper fixes ผ่านแล้ว P0 รวมยังไม่จบ ไม่มีงานหนักค้าง และไม่มีการทดสอบ performance/ABBA เพิ่ม
+
+## Earlier component and discovery evidence — historical
+
 ## Source, isolation and instructions
 
 - Baseline `e5737a27f485773a7ce22784fef6af7b480dcc9a`; branch `xeno/native-qwenputer-p0`, isolated under `D:/Github/Strata/.worktrees/native-qwenputer-p0`. Main's unrelated files remain outside this worktree.

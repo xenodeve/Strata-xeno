@@ -1,4 +1,8 @@
-# R3/R4 requirements coverage
+R6 adds the user-approved diagnostic cap-removal exception and verified 16-token component smoke. The repository budget and all Native requirements remain unchanged. Public issue synchronization is parked on the already pending R5 Submit form; no R6 publication is claimed.
+
+R5 adds the corrected P0 startup evidence and telemetry limitations. US01–US24, G0–G9, P0–P8, the three Mermaid sources and the normative R2 companion remain unchanged. The old 9-test GPU/helper result remains historical; new memory/helper test results are reported with their own run identity.
+
+# R3/R4/R5 requirements coverage
 
 R3/R4 change presentation and the test model, not the approved Native architecture. R4 adds Mermaid and the authorized public-safe PRD synchronization.
 

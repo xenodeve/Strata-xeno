@@ -1,6 +1,10 @@
+> R6 evidence update: startup/inference component smoke succeeds on unchanged main with the explicitly authorized diagnostic removal of the task's private-commit cap. Job readback confirms no process/job memory cap; system safety, timeout and process-tree cleanup remain. This is not a change to the repository's 42 GB budget policy. Actual private commit exceeds that budget. No served/model/cache settings were changed, and P1+ remains outside this debugging scope. Local public-safe R6 is prepared; GitHub still holds R4 and the earlier R5 Submit form is pending. Do not bypass or duplicate that write.
+
+> P0 diagnosis update: keep the unchanged main baseline e5737a27. A bounded startup reproduction hit the test-owned 42 GB process guard (matching Windows limit event and near-limit job peak); this does not rule out Gyro inference on main. The source-base switch remains unapproved and is not a remedy established by this failure. Memory fit, actual inference, parity and performance gates remain open. Original GlobalMemoryStatusEx-derived system_commit samples are historical/non-authoritative; corrected GetPerformanceInfo telemetry and job-event evidence are retained separately. No guard, served setting or production behavior was changed.
+
 # Native Qwenputer Implementation Plan
 
-> Local R3 amendment, 2026-10-28: use Gyro-M for model-dependent validation. The actual GGUF exists (91,965,774,272 bytes), metadata qwen4exp / 48 layers / hidden 2560 / 512 experts, routed TQ2_T tensors. The user selected strata-gyro-m-d2x.json:262K context,5 workers. The512K YaRN profile is not this test baseline. Do not restore Swift for this baseline. Preserve current served configuration; pin chosen inputs before model tests. The user subsequently authorized public-safe PRD synchronization; R4 is synchronized toissue#276. Detailed local evidence remains private; no library upload or repository push is authorized. All Native, numerical, state and offload contracts below remain in force.
+> Local R3 amendment, 2026-10-28: use Gyro-M for model-dependent validation. The actual GGUF exists (91,965,774,272 bytes), metadata qwen4exp / 48 layers / hidden 2560 / 512 experts, routed TQ2_T tensors. The user selected strata-gyro-m-d2x.json:262K context,5 workers. The512K YaRN profile is not this test baseline. Do not restore Swift for this baseline. Preserve current served configuration; pin chosen inputs before model tests. The user subsequently authorized public-safe PRD synchronization; R4 was synchronized to issue #276; later revisions remain local while the Submit form is pending. Detailed local evidence remains private; no library upload or repository push is authorized. All Native, numerical, state and offload contracts below remain in force.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. The parent reviews each evidence checkpoint before work proceeds. P0 diagnostics are authorized; do not advance to P1 or production integration without the next review gate.
 
@@ -16,7 +20,7 @@
 **Revision:** R2 หลัง parent review: ขัดเกลาภาษา, ยืนยัน D2x compatibility, เพิ่ม policy references, dual-architecture build และ numerical/measurement gates
 **Baseline:** `e5737a27f485773a7ce22784fef6af7b480dcc9a`
 **Upstream pin:** `ca13310e2f9f788d1dd3feeea8213c1b0c23913c`
-**Tracking:** PRD R2 เผยแพร่และตรวจกลับที่ #276 แล้ว ฉบับ R4 แบบ public-safe sync กับ issue #276 ตามที่อนุญาตแล้ว รายงานและ inventory ในเครื่องยังเป็นข้อมูลส่วนตัว
+**Tracking:** PRD R2 เผยแพร่และตรวจกลับที่ #276 แล้ว ฉบับ public-safe R6 เตรียมในเครื่องแล้ว แต่ issue ยังเป็น R4 และรอ Submit ของ R5 ห้ามอ้างว่า sync ฉบับใหม่แล้ว รายงานและ inventory ในเครื่องยังเป็นข้อมูลส่วนตัว
 
 ## Global Constraints
 

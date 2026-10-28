@@ -1,6 +1,6 @@
-# PRD R4: ให้ Strata คำนวณด้วย Native Qwenputer
+# PRD R6: ให้ Strata คำนวณด้วย Native Qwenputer
 
-ฉบับ R4 สำหรับ PRD issue #276 — 28 ตุลาคม 2026
+ฉบับ R6 สำหรับ PRD issue #276 — 28 ตุลาคม 2026
 
 สถาปัตยกรรมและแผน R2 อนุมัติแล้ว ขณะนี้อยู่ใน P0 ส่วน P1 ขึ้นไปต้องผ่าน review gates ก่อน เอกสารนี้ใช้ Gyro-M 262K context, 5 workers เป็น baseline และแยกคำอธิบายที่อ่านก่อนออกจากข้อกำหนดทางเทคนิคฉบับเต็ม
 
@@ -224,11 +224,19 @@ v1 ยังไม่รับทุก execution mode ต้องรองร�
 
 Gyro-M ใช้ routed experts แบบ TQ2_T การมี geometry หรือจำนวน vocabulary เท่ากันยังไม่ยืนยันว่า tokenizer หรือ artifact ใช้ร่วมกันได้ ต้องตรวจเนื้อหา vocabulary, merges, token types และ special IDs แล้วผูก artifact identity กับข้อมูลชุดนั้น การทดสอบ Q2 เดิมยังต้องรักษาไว้ แต่ใช้แทนหลักฐาน TQ2_T หรือ MTP runtime compatibility ของ Gyro-M ไม่ได้
 
-ผล build และ conditional probe ยืนยันได้เฉพาะส่วนที่ทดสอบ ชุด probe มี 10 cases ส่วนชุดทดสอบรวมมี 9 tests และรวมการตรวจ negative control ด้วย ยังไม่ถือว่า model inference, ownership correctness, การลงตัวกับงบทรัพยากร หรือ performance readiness ผ่านแล้ว ก่อนเทียบโมเดลต้องยืนยัน code baseline และ build dependencies ให้ตรงกับเส้นทาง daily use ด้วย
+หลักฐานเดิมของ build และ conditional probe ยืนยันได้เฉพาะส่วนที่ทดสอบ ชุด probe มี 10 cases ส่วนชุดทดสอบเดิมมี 9 tests และรวม negative control ด้วย ยังไม่ถือว่า model inference, ownership correctness, การลงตัวกับงบทรัพยากร หรือ performance readiness ผ่านแล้ว การเทียบโมเดลยังต้องตรึง code baseline และ build dependencies ให้ตรงกัน
+
+การตรวจ startup เพิ่มเติมบน main เดิมจับ `JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT` ของ process โมเดลได้ตรงช่วง error 1455 และ peak อยู่ชิด hard process guard 42 GB ของการทดสอบ ขณะเดียวกันตัววัด `GetPerformanceInfo` ยังรายงาน system commit headroom จึงยืนยันได้ว่ารอบนี้ชน guard การทดสอบ ยังไม่ใช่หลักฐานว่า Gyro-M inference บน main มี bug หรือเครื่อง RAM หมด ไม่มีการผ่อน guard หรือเปลี่ยน branch และข้อความว่า expert split ใช้ไม่ได้ยังเป็นข้อจำกัดของเส้นทาง performance ที่แยกตรวจต่างหาก
+
+เมื่อผู้ใช้อนุญาตให้ปิด private-commit cap เฉพาะการทดสอบ จึงรัน workload เดิมโดยคง main, Gyro-M 262K, 5 workers และ cache settings เดิม อ่าน job configuration กลับแล้วไม่พบ process/job memory limit และยังมี kill-on-close รอบนี้โหลดสำเร็จและสร้าง 16 output tokens ได้จริง พร้อม counters ของ secondary compute และ MTP ผลนี้ยืนยัน component inference smoke และอธิบายสาเหตุของ startup failure ที่เกิดจาก cap ของ harness ไม่ได้ยืนยัน raw-token parity, คุณภาพเลขคำนวณ หรือ performance readiness
+
+ข้อยกเว้นนี้ใช้กับ diagnostic run เท่านั้น ไม่เปลี่ยนกติกางบ 42 GB ของ repo หรือ served settings ค่า private commit ที่วัดได้เกินงบเดิมจึงยังต้องรายงานต่อ resource gate ส่วนวงจร Native Qwenputer และ integration ใน P1 ขึ้นไปยังไม่ได้ implement
+
+ค่า `system_commit` จาก controller รุ่นแรกติดป้ายผิด เพราะคำนวณจาก `GlobalMemoryStatusEx` เก็บ raw evidence เดิมไว้เป็นประวัติและไม่ใช้ค่านั้นยืนยัน system-wide commit รุ่นที่แก้แล้วแยก system commitment, process private commit, job limits และ peaks พร้อม limit notifications การไม่มี notification ยังใช้สรุปว่าเป็น OS limit ไม่ได้ ส่วนการระบุ expert และขนาด page-rounded ของคำขอที่ล้มเหลวแบบเจาะจงยังไม่ได้ instrument จึงไม่อ้างว่าได้ข้อมูลนั้นแล้ว
 
 รายละเอียดระดับ schema, state, token bridge, module inventory และ primary sources อยู่ใน [ข้อกำหนด R2 ทั้งอังกฤษและไทย](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) ซึ่งเป็นส่วนหนึ่งของ PRD นี้ อ้างอิงเป็น R2-public-technical โดยมี payload SHA256 `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`
 
-ถ้า R2 กับ R4 ต่างกัน ให้ใช้ R4 แทนเฉพาะสี่รายการนี้:
+ถ้า R2 กับ R6 ต่างกัน ให้ใช้ R6 แทนเฉพาะสี่รายการนี้:
 
 1. โมเดลทดสอบเปลี่ยนจาก Swift เป็น Gyro-M
 2. ใช้ 262K context, 5 workers ที่เลือกแล้ว โดยตรึง RoPE และ runtime settings เดิมในการเทียบแต่ละ arm
@@ -248,19 +256,27 @@ Gyro-M ใช้ routed experts แบบ TQ2_T การมี geometry หร�
 <details>
 <summary>English requirements and source references</summary>
 
-## R4 status and precedence
+## R6 status and precedence
 
 Native compiled computation for Strata Flash-Next remains the approved architecture. Gyro-M at 262K context and five CPU workers is the selected test baseline. P0 is in progress; later phases remain review-gated. The diagrams above distinguish offline preparation, production GPU execution, transactional shadow evaluation, and result replay. They never imply a host calculator.
 
-The bilingual [R2-public-technical companion](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) is normative except for four R4 overrides: the Gyro-M test model, the selected 262K/five-worker profile, removal of the obsolete missing-Swift-file blocker, and current evidence status. Its payload SHA256 is `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`. Preserve historical test identities; current component evidence does not establish inference, ownership correctness, resource fit or performance readiness.
+The bilingual [R2-public-technical companion](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) is normative except for four R6 overrides: the Gyro-M test model, the selected 262K/five-worker profile, removal of the obsolete missing-Swift-file blocker, and current evidence status. Its payload SHA256 is `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`. Preserve historical test identities; current component evidence does not establish inference, ownership correctness, resource fit or performance readiness.
 
 Controlled baseline/candidate arms use identical 262K context, original RoPE settings, five workers, model/tokenizer/MTP inputs and runtime configuration. Only executable and task-owned evidence/output paths differ. Learned expert profiles start from byte-identical copies and cannot mutate the serving profile or each other's initial inputs.
 
 Matching model geometry or vocabulary count is insufficient: validate exact tokenizer contents, special IDs and artifact identity, and separately prove TQ2_T and MTP runtime compatibility. Existing Q2 regression gates remain required but do not establish Gyro correctness. Pin the code baseline and dependencies appropriate to daily use before model comparisons.
 
-The real control-flow probe covers 10 cases; the final helper/GPU suite contains 9 tests including a meaningful negative control. Neither is a compiled-arithmetic, model-parity or latency result.
+The earlier real control-flow probe covers 10 cases; its earlier helper/GPU suite contains 9 tests including a meaningful negative control. Neither is a compiled-arithmetic, model-parity or latency result.
 
-The English requirements below retain the detailed Native contracts; apply the four R4 overrides above wherever older test-baseline assumptions occur.
+A subsequent startup reproduction on unchanged main captured JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT for the model process at terminal error 1455, with its peak immediately below the test's 42 GB hard process guard. Concurrent GetPerformanceInfo samples retained system commit headroom. This establishes a binding test guard in that run, not a Gyro-M inference bug on main or exhausted physical RAM. The guard and source baseline were not changed; unavailable expert splitting remains a separate performance-path limitation.
+
+After explicit user authorization to disable the task's private-commit cap for a diagnostic run, the same workload ran on unchanged main, Gyro-M at 262K, five workers and the original cache settings. Job configuration readback confirmed no process/job memory limit while kill-on-close remained. Loading and generation succeeded with 16 output tokens and observed secondary-compute and MTP counters. This establishes component inference smoke and explains the harness-cap startup failure; it does not establish raw-token parity, arithmetic quality or performance readiness.
+
+This exception applies only to the diagnostic run. It changes neither the repository's 42 GB budget policy nor served settings. Measured private commitment exceeded the original budget and remains a resource-gate finding. The Native Qwenputer circuit and P1+ integration are not implemented.
+
+The first controller's system_commit label was incorrect because it was calculated from GlobalMemoryStatusEx. Preserve that raw historical evidence but do not treat it as authoritative system-wide commitment. Corrected telemetry separates system commitment, process private commitment, job limits, peaks and limit notifications. Missing notifications cannot prove an OS limit. The exact failed expert and page-rounded request identity were not instrumented and are not claimed.
+
+The English requirements below retain the detailed Native contracts; apply the four R6 overrides above wherever older test-baseline assumptions occur.
 
 ## Problem Statement
 
@@ -405,7 +421,7 @@ Each phase is test-first, ends with its own evidence and blueprint update, and r
 ## Evidence Index
 
 - R1: [Strata blueprint](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/docs/BLUEPRINT.md) baseline/revision log and elastic-cache refusal; [ADR 0001](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/docs/adr/0001-q2-exp-baseline.md) Q2 correctness contract.
-- R4: Existing local policy at [AGENTS.md:44](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L44) (backend builds), [295-299](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L295) (42 GB private commit), [320-321](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L320) (13.6% noise heuristic), [323-324](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L323) (2.5 GB total display headroom); [CMakeLists.txt:9,156-159](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/CMakeLists.txt#L9) (dual architecture configuration). These constraints are not newly proposed thresholds.
+- R6: Existing local policy at [AGENTS.md:44](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L44) (backend builds), [295-299](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L295) (42 GB private commit), [320-321](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L320) (13.6% noise heuristic), [323-324](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L323) (2.5 GB total display headroom); [CMakeLists.txt:9,156-159](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/CMakeLists.txt#L9) (dual architecture configuration). These constraints are not newly proposed thresholds.
 - R3: [Pinned verifier contract](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/include/strata/core/verify.hpp#L1), [commit](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/src/core/verify.cpp#L2407), [snapshot](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/include/strata/core/conversation_snapshot.hpp#L50), [sampling counters](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/include/strata/core/coupled_draft.hpp#L19).
 - U1: [Pinned RV chat](https://github.com/divagr18/qwenputer/blob/ca13310e2f9f788d1dd3feeea8213c1b0c23913c/experimental/riscv/chipformer/rv/chat.py#L100) full merged loader; lines 172-184 host token selection; 324-426 ownership.
 - U2: [Pinned sparse executor](https://github.com/divagr18/qwenputer/blob/ca13310e2f9f788d1dd3feeea8213c1b0c23913c/experimental/riscv/chipformer/rv/tritonexec.py#L47) atomic scatter, rounded normalization and state layout.
