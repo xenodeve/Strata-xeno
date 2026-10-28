@@ -1,8 +1,8 @@
-# PRD R6: ให้ Strata คำนวณด้วย Native Qwenputer
+# PRD R7: ให้ Strata คำนวณด้วย Native Qwenputer
 
-ฉบับ R6 สำหรับ PRD issue #276 — 28 ตุลาคม 2026
+ฉบับ R7 สำหรับ PRD issue #276 — 28 ตุลาคม 2026
 
-สถาปัตยกรรมและแผน R2 อนุมัติแล้ว ขณะนี้อยู่ใน P0 ส่วน P1 ขึ้นไปต้องผ่าน review gates ก่อน เอกสารนี้ใช้ Gyro-M 262K context, 5 workers เป็น baseline และแยกคำอธิบายที่อ่านก่อนออกจากข้อกำหนดทางเทคนิคฉบับเต็ม
+สถาปัตยกรรมและแผน R2 อนุมัติแล้ว ผล P0 พร้อมให้ทบทวน ส่วน P1 ขึ้นไปต้องผ่าน review gates ก่อน เอกสารนี้ใช้ Gyro-M 262K context, 5 workers ตามเส้นทาง hub ที่ใช้จริงเป็น operational baseline และแยกคำอธิบายที่อ่านก่อนออกจากข้อกำหนดทางเทคนิคฉบับเต็ม
 
 ## Problem Statement — ปัญหาที่ต้องแก้
 
@@ -161,6 +161,8 @@ native call/result เป็นเรื่องภายใน เครื่
 
 เมื่อเทียบ baseline กับ candidate ให้ใช้ Gyro-M ชุดเดียวกันที่ 262K context, 5 workers และค่า RoPE เดิมของ profile/GGUF ต้องตรึง model inputs, tokenizer, MTP และ runtime settings ให้เหมือนกัน ต่างเฉพาะ executable กับ paths สำหรับหลักฐานของแต่ละ arm ส่วน learned expert profile ให้เริ่มจากสำเนาที่มีเนื้อหาเดียวกัน เพื่อไม่ให้การรัน arm หนึ่งเปลี่ยน input ของอีก arm
 
+Operational baseline ต้องตามเส้นทาง hub จริง ทั้ง executable, backend/dependencies, cache/offload และ process settings ห้ามเติม private-commit cap หรือข้อจำกัดที่ hub ไม่ใช้แล้วเรียกผลนั้นว่า production baseline ให้บันทึก instrumentation, timeout และ cleanup ของ test wrapper แยกไว้ ส่วน unchanged build ที่ใช้ source เดียวกับ candidate เป็น development control อีกตัวสำหรับแยกผลของ feature ห้ามสลับตัวควบคุมสองแบบนี้หรือเทียบ timing ข้าม build แล้วอ้างว่าเกิดจาก Native circuit
+
 ชุดเลขต้องมี signed add/sub/mul, rational division, negative floor/modulo, gcd, precedence, powers, decimals, ขอบเขต 62 หลัก, divide-by-zero, capacity/complexity errors และการคำนวณต่อเนื่อง Oracle เลขต้องเป็นอิสระจาก parser/compiler ของ firmware เพื่อไม่ให้ผิดแบบเดียวกันทั้งคู่
 
 ### Gates ที่ต้องผ่านก่อนนำไปใช้
@@ -232,16 +234,19 @@ Gyro-M ใช้ routed experts แบบ TQ2_T การมี geometry หร�
 
 ข้อยกเว้นนี้ใช้กับ diagnostic run เท่านั้น ไม่เปลี่ยนกติกางบ 42 GB ของ repo หรือ served settings ค่า private commit ที่วัดได้เกินงบเดิมจึงยังต้องรายงานต่อ resource gate ส่วนวงจร Native Qwenputer และ integration ใน P1 ขึ้นไปยังไม่ได้ implement
 
+หลังจากนั้นได้รัน server และ executable ตัวเดียวกับ hub โดยใช้ profile เดิม ไม่มี hard private-commit cap และ API สร้าง reasoning ได้ 16 tokens ก่อนถึงขีดจำกัดของคำขอทดสอบ ผลนี้แยกจาก main component control เพราะ executable และ expert placement ต่างกัน ยืนยันเพียง startup/inference smoke ไม่ใช่คุณภาพคำตอบ, disabled parity, Native memory fit หรือ performance readiness จึงปิดงานตรวจของ P0 เพื่อส่งทบทวน โดยยังไม่เริ่ม P1
+
 ค่า `system_commit` จาก controller รุ่นแรกติดป้ายผิด เพราะคำนวณจาก `GlobalMemoryStatusEx` เก็บ raw evidence เดิมไว้เป็นประวัติและไม่ใช้ค่านั้นยืนยัน system-wide commit รุ่นที่แก้แล้วแยก system commitment, process private commit, job limits และ peaks พร้อม limit notifications การไม่มี notification ยังใช้สรุปว่าเป็น OS limit ไม่ได้ ส่วนการระบุ expert และขนาด page-rounded ของคำขอที่ล้มเหลวแบบเจาะจงยังไม่ได้ instrument จึงไม่อ้างว่าได้ข้อมูลนั้นแล้ว
 
 รายละเอียดระดับ schema, state, token bridge, module inventory และ primary sources อยู่ใน [ข้อกำหนด R2 ทั้งอังกฤษและไทย](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) ซึ่งเป็นส่วนหนึ่งของ PRD นี้ อ้างอิงเป็น R2-public-technical โดยมี payload SHA256 `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`
 
-ถ้า R2 กับ R6 ต่างกัน ให้ใช้ R6 แทนเฉพาะสี่รายการนี้:
+ถ้า R2 กับ R7 ต่างกัน ให้ใช้ R7 แทนเฉพาะห้ารายการนี้:
 
 1. โมเดลทดสอบเปลี่ยนจาก Swift เป็น Gyro-M
 2. ใช้ 262K context, 5 workers ที่เลือกแล้ว โดยตรึง RoPE และ runtime settings เดิมในการเทียบแต่ละ arm
 3. ไฟล์ Swift ที่หายเป็นผลสำรวจในอดีต ไม่ต้อง restore เพื่อ baseline ใหม่
 4. ใช้สถานะหลักฐานปัจจุบันข้างต้นแทนสถานะก่อนรันใน R2 โดยไม่เปลี่ยน identity ของผลทดสอบเก่า
+5. ใช้ operational baseline ตาม hub จริง และเก็บ source-matched development control แยกกัน ไม่เพิ่ม test-only private cap ให้ production baseline
 
 ข้อกำหนดอื่นของ R2 ยังมีผลครบ แผนภาพอธิบายการทำงานและ dependencies ไม่ได้ลด acceptance gates
 
@@ -256,13 +261,15 @@ Gyro-M ใช้ routed experts แบบ TQ2_T การมี geometry หร�
 <details>
 <summary>English requirements and source references</summary>
 
-## R6 status and precedence
+## R7 status and precedence
 
-Native compiled computation for Strata Flash-Next remains the approved architecture. Gyro-M at 262K context and five CPU workers is the selected test baseline. P0 is in progress; later phases remain review-gated. The diagrams above distinguish offline preparation, production GPU execution, transactional shadow evaluation, and result replay. They never imply a host calculator.
+Native compiled computation for Strata Flash-Next remains the approved architecture. Gyro-M at 262K context and five CPU workers through the actual hub path is the operational baseline. P0 results are ready for review; later phases remain review-gated. The diagrams above distinguish offline preparation, production GPU execution, transactional shadow evaluation, and result replay. They never imply a host calculator.
 
-The bilingual [R2-public-technical companion](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) is normative except for four R6 overrides: the Gyro-M test model, the selected 262K/five-worker profile, removal of the obsolete missing-Swift-file blocker, and current evidence status. Its payload SHA256 is `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`. Preserve historical test identities; current component evidence does not establish inference, ownership correctness, resource fit or performance readiness.
+The bilingual [R2-public-technical companion](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) is normative except for five R7 overrides: the Gyro-M test model, the selected 262K/five-worker profile, removal of the obsolete missing-Swift-file blocker, current evidence status, and the actual-hub operational-baseline contract below. Its payload SHA256 is `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`. Preserve historical test identities. Startup/inference smoke is established, while Native ownership correctness, resource fit and performance readiness remain unproved.
 
 Controlled baseline/candidate arms use identical 262K context, original RoPE settings, five workers, model/tokenizer/MTP inputs and runtime configuration. Only executable and task-owned evidence/output paths differ. Learned expert profiles start from byte-identical copies and cannot mutate the serving profile or each other's initial inputs.
+
+The operational reference must use the actual hub executable, backend/dependencies, cache/offload and process settings. A private-commit cap or behavioral restriction absent from the hub cannot be introduced into a production baseline. Disclose passive instrumentation and emergency cleanup/time bounds separately. Keep an unchanged source-matched development control for feature attribution; do not substitute it for the operational reference or attribute cross-build timing differences to the Native feature.
 
 Matching model geometry or vocabulary count is insufficient: validate exact tokenizer contents, special IDs and artifact identity, and separately prove TQ2_T and MTP runtime compatibility. Existing Q2 regression gates remain required but do not establish Gyro correctness. Pin the code baseline and dependencies appropriate to daily use before model comparisons.
 
@@ -274,9 +281,11 @@ After explicit user authorization to disable the task's private-commit cap for a
 
 This exception applies only to the diagnostic run. It changes neither the repository's 42 GB budget policy nor served settings. Measured private commitment exceeded the original budget and remains a resource-gate finding. The Native Qwenputer circuit and P1+ integration are not implemented.
 
+A subsequent smoke used the actual hub server/executable and unchanged profile settings without a hard private-commit cap. Its API produced 16 reasoning tokens before the test request's token limit. It is distinct from the main component control because the executable and observed expert placement differ. This establishes startup/inference smoke only, not final-answer quality, disabled parity, Native memory fit or performance readiness. P0 evidence is ready for review; P1 has not started.
+
 The first controller's system_commit label was incorrect because it was calculated from GlobalMemoryStatusEx. Preserve that raw historical evidence but do not treat it as authoritative system-wide commitment. Corrected telemetry separates system commitment, process private commitment, job limits, peaks and limit notifications. Missing notifications cannot prove an OS limit. The exact failed expert and page-rounded request identity were not instrumented and are not claimed.
 
-The English requirements below retain the detailed Native contracts; apply the four R6 overrides above wherever older test-baseline assumptions occur.
+The English requirements below retain the detailed Native contracts; apply the five R7 overrides above wherever older test-baseline assumptions occur.
 
 ## Problem Statement
 

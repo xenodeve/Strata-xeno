@@ -111,14 +111,18 @@ flowchart LR
 
 **Interfaces:** standalone `qwenputer_conditional_probe --device <uuid-or-resolved-primary> --json <path>`; preflight คืน model-input existence/size/hash manifest โดยไม่เปิด server
 
-- [ ] อ่าน PRD กับแผนนี้ และยืนยันขอบเขต/primary seam จาก review เมื่อเริ่ม execution ให้สร้าง isolated worktree ผ่าน using-git-worktrees โดยเก็บ main และ untracked work เดิมไว้ ใช้ build directory ใหม่ ห้าม rebuild baseline directory เดิม
-- [ ] สร้าง compiling probe fixture พร้อม semantic assertions: while limit 0 ให้ steps=0, limit 1 ให้ steps=1 และ limit 5 ให้ steps=5 การ launch ซ้ำต้อง reset condition เพิ่ม intentional wrong-limit negative control เพื่อให้ test fail จาก observed step count ไม่ใช่ missing binary
-- [ ] บันทึก CUDA runtime/driver/device UUID, WDDM mode, toolkit และ host compiler จากนั้นทดสอบ create/instantiate/launch/relaunch จริงบน primary ตรวจ cancel/full-output bounds และยืนยันว่า context switch/rebuilt graph ไม่มี stale state
-- [ ] สร้าง unchanged baseline จาก e5737a27 และ candidate ใน directories ใหม่ด้วย `-DCMAKE_CUDA_ARCHITECTURES="89;120"` พร้อม source/config/toolchain hashes ตรวจ cubin/PTX architecture coverage ตาม target ที่ต้องรันบนแต่ละ GPU และ smoke secondary expert tier จริงก่อน ABBA หาก model inputs ยังไม่พร้อมให้ระบุ smoke ว่า blocked ไม่ใช้ primary-only probe อ้างแทน ตรวจ exe ก่อนและหลังทุก run และเก็บ executable ไว้ immutable ระหว่าง ABBA
-- [ ] Preflight ตรวจ `--pack`, `--native`, `--ple-gguf`, `--mtp` และ tokenizer ทุก role ของ Gyro-M ที่ผู้ใช้เลือก ตรึง config/model hashes และใช้ profile 262K/5 workers ที่ผู้ใช้เลือกสำหรับ model-dependent runs ไม่ต้อง restore Swift และห้ามแก้ served profile หรือดาวน์โหลดแทนโดยไม่ได้รับอนุญาต
-- [ ] รัน smoke ผ่าน detached/no-window helper ที่ใส่ CUDA bin และ bin/x64 ใน PATH คืนผล probe และ feasibility report ก่อน P1/P4 หาก unsupported ให้ส่ง native regular-graph chunk fallback ให้ผู้ใช้พิจารณา
-- [ ] Build ด้วย `cmake --build build-qwenputer --target qwenputer_conditional_probe` ผลตรวจต้องเป็น probe JSON ที่ระบุทุก case พร้อม counts และ exit 0 ห้ามอนุมานว่าผ่านจาก header/version
-- [ ] สรุป probe/preflight/blueprint ใน commit แยกจาก production feature โดยจัดทำ evidence ก่อน commit และไม่ push
+- [x] อ่าน PRD กับแผนนี้ และยืนยันขอบเขต/primary seam จาก review เมื่อเริ่ม execution ให้สร้าง isolated worktree ผ่าน using-git-worktrees โดยเก็บ main และ untracked work เดิมไว้ ใช้ build directory ใหม่ ห้าม rebuild baseline directory เดิม
+- [x] สร้าง compiling probe fixture พร้อม semantic assertions: while limit 0 ให้ steps=0, limit 1 ให้ steps=1 และ limit 5 ให้ steps=5 การ launch ซ้ำต้อง reset condition เพิ่ม intentional wrong-limit negative control เพื่อให้ test fail จาก observed step count ไม่ใช่ missing binary
+- [x] บันทึก CUDA runtime/driver/device UUID, WDDM mode, toolkit และ host compiler จากนั้นทดสอบ create/instantiate/launch/relaunch จริงบน primary ตรวจ cancel/full-output bounds และยืนยันว่า context switch/rebuilt graph ไม่มี stale state
+- [x] สร้าง unchanged baseline จาก e5737a27 และ candidate ใน directories ใหม่ด้วย `-DCMAKE_CUDA_ARCHITECTURES="89;120"` พร้อม source/config/toolchain hashes ตรวจ cubin/PTX architecture coverage ตาม target ที่ต้องรันบนแต่ละ GPU และ smoke secondary expert tier จริงก่อน ABBA หาก model inputs ยังไม่พร้อมให้ระบุ smoke ว่า blocked ไม่ใช้ primary-only probe อ้างแทน ตรวจ exe ก่อนและหลังทุก run และเก็บ executable ไว้ immutable ระหว่าง ABBA
+- [x] Preflight ตรวจ `--pack`, `--native`, `--ple-gguf`, `--mtp` และ tokenizer ทุก role ของ Gyro-M ที่ผู้ใช้เลือก ตรึง config/model hashes และใช้ profile 262K/5 workers ที่ผู้ใช้เลือกสำหรับ model-dependent runs ไม่ต้อง restore Swift และห้ามแก้ served profile หรือดาวน์โหลดแทนโดยไม่ได้รับอนุญาต
+- [x] รัน smoke ผ่าน detached/no-window helper ที่ใส่ CUDA bin และ bin/x64 ใน PATH คืนผล probe และ feasibility report ก่อน P1/P4 หาก unsupported ให้ส่ง native regular-graph chunk fallback ให้ผู้ใช้พิจารณา
+- [x] Build ด้วย `cmake --build build-qwenputer --target qwenputer_conditional_probe` ผลตรวจต้องเป็น probe JSON ที่ระบุทุก case พร้อม counts และ exit 0 ห้ามอนุมานว่าผ่านจาก header/version
+- [x] สรุป probe/preflight/blueprint ใน commit แยกจาก production feature โดยจัดทำ evidence ก่อน commit และไม่ push
+
+**ผลปิด P0:** ดู [รายการตรวจและหลักฐาน](../../reports/2026-10-28-qwenputer-p0-closeout.md) การ build, probe และ smoke ผ่านแล้ว แต่ยังไม่ได้ทำ ABBA, candidate raw-token parity หรือพิสูจน์ว่า Native circuit จะใช้ทรัพยากรพอ ข้อความเรื่อง immutable executable เป็นข้อกำหนดสำหรับ ABBA ใน P8 ไม่ใช่คำกล่าวว่าได้รัน ABBA แล้ว
+
+**Baseline ตามการใช้งานจริง:** ให้ตรึง hub launcher → server → profile → executable และ dependencies ที่ใช้อยู่จริง พร้อม model, context, workers, cache/offload และ process settings เดิม ห้ามเพิ่ม private-commit cap แล้วเรียกผลนั้นว่า production baseline ผล run03/04 เป็น capped diagnostics ส่วน run05 เป็น component control ของ unchanged main และ run07 ใช้ server/executable ของ hub จริงบน loopback port แยก พร้อม task-only no-window shim หลัง review พบ missing child flag ใน run06 ขอบเขตและความต่างของ wrapper ต้องอยู่ในรายงาน Main ยังเป็น source base ของ Native worktree; ยังไม่ได้ย้าย base หรือแก้ served setup
 
 ## P1 — Pinned compiler, tokenizer adapter และ artifact/oracles
 

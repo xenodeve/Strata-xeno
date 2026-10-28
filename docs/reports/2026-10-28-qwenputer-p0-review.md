@@ -42,3 +42,11 @@ Verdict: the local diagnostic correction is verified. This is not Native feature
 | Task Manager image inspection | n-a: bundled helper unchanged | not-run: no readable PNG remains after Windows xattr failure | n-a | not-run: actual pixels unavailable | n-a: no sharing/publication |
 
 No push, PR, merge, deployment or unrelated tracker item was authorized or performed. The existing GitHub Submit form is parked; it was not retried or bypassed.
+
+## Actual-hub follow-up review
+
+Spec axis: no material findings in the actual-hub controller, result and closeout. The daily executable and unchanged-main control remain distinct. Sixteen reasoning tokens do not establish a final answer, parity or performance.
+
+Standards axis found one Important issue in the first hub controller: the unchanged deployed server launches console children without CREATE_NO_WINDOW. Outer Python flags alone did not satisfy the repository rule. Run06's no-window claim was withdrawn. A task-only server_no_window_shim.py now wraps subprocess.Popen before runpy loads the unchanged server, ORs CREATE_NO_WINDOW and preserves other flags. Static reproduction plus a real small child control returned GetConsoleWindow=false. The reviewer found no remaining hard violation in this correction.
+
+Run07 through that shim completed with an API response containing 16 reasoning tokens, null hard/notification limits, no emergency stop, no telemetry errors and verified owned-job drain. The source server, served config and original learned profile remain unchanged. This is a corrected diagnostic launcher, not a production engine or serving-default change. The operational-baseline contract is prepared in local PRD R7; public synchronization remains pending and is not claimed.
