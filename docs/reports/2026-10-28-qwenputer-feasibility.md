@@ -101,8 +101,8 @@ No revised PRD or local model/profile details were published. Parent reports tha
 | Negative control | PASS detector: real GPU increment2 produces one.steps2/expected1, ok=false, exit1 as intended |
 | Final full helper/GPU suite | PASS9 tests,3.814s,0 failures, DONE exit0 |
 | Gyro input inventory/full hashes | PASS, all configured engine/model/tokenizer/pack/MTP/profile inputs exist |
-| Profile selection | PENDING user choice:262K/5 workers or512K YaRN/13 workers |
-| Model/secondary tier inference smoke, greedy parity, ABBA | NOT RUN pending profile choice; no token/speed claim |
+| Profile selection | RESOLVED:Gyro-M262K/5workers selected by user |
+| Model/secondary tier inference smoke, greedy parity, ABBA | Baseline startup attempted and failed before token0; actual secondary execution/candidate/parity/ABBA unpassed; see current attempt below |
 | Full model resource gate | NOT RUN; inventory snapshots and diagnostic process metrics are not full model peaks |
 | HIP/SYCL | NOT RUN: toolchains unavailable; explicit validation debt |
 
@@ -120,3 +120,24 @@ Deferred minor: the probe source comment says recreated allocations have fresh a
 The reviewer set aside P1+ production arithmetic/integration because outside authorized P0; final-source GPU/provenance checks because then pending (now executed above); Gyro model runs because profile selection remains pending; HIP/SYCL because unavailable (still release-validation debt). None is silently counted as passed.
 
 R3 local reading draft applies the actual installed kien-thai skill (technical explainer, topic-first/condition-first structure, clear paragraphs, consistent developer terms, no polite padding or recap). Its full24/10/9 coverage and verbatim preserved R2 contracts are recorded separately. Native-model availability check contacted localhost11434 only and was refused; no model/service was started or downloaded. The skill's direct drafting fallback was used.
+
+Follow-up requested by parent: corrected the probe comment to describe destruction/recreation and reset only; allocator addresses may be reused, so this is not an address-relocation test. The diff changes comments only and no rebuild/runtime result is claimed for that wording edit.
+
+
+## Selected 262K model smoke attempt (2026-10-28, private evidence)
+
+The user selected the native262K/five-worker profile. Its SHA256 remained06ef847e063bb9643c7bf3f486e2ffdadc29737493268238c21f59188d5f6c5b. Runtime test copies redirect both learned-profile paths to task-owned files; source profile and original learned-profile hashes were unchanged afterward. Exact tokenizer vocabulary, merges and token types matched the GGUF; special IDs were checked, not inferred from count. Details are in gyro-tokenizer-binding.json.
+
+Attempt01 stopped before launching the engine because Windows rounded the requested job commit limit to page size. Attempt02 verified the actual41999998976-byte limit (requested42,000,000,000), then ran the unchanged baseline with the selected profile, identical engine arguments/env and a21-token greedy smoke prompt, max-new16. No server, vision encoder, MCP or API listener was launched; vision accounting settings were retained. This is component smoke, not a full served-turn benchmark.
+
+Attempt02 exited1 after14.641s, before any generated token, with placement-first load: VirtualAlloc(MEM_COMMIT) failed with Windows error1455. The resource controller itself did not signal its physical-floor/timeout stop. Sampled engine private peak33,921,974,272bytes, working-set peak5,388,955,648bytes; system commit peak78,573,899,776 of90,968,305,664bytes; minimum available physical19,596,664,832bytes. The job's committed-memory guard and sampled PrivateUsage are not interchangeable evidence; this attempt does not prove that the repo's private-commit budget is inherently exceeded. Do not silently increase limits or shrink the selected profile.
+
+The startup loaded MTP weights and staged5607 secondary experts/6.82GiB in SECONDARY COMPUTE mode. This proves secondary-tier setup, not executed secondary compute or TQ2_T/MTP numerical correctness. No inference/parity/ABBA pass is claimed. Stock-vendor baseline logs also state no layers onMMQ and expert split cannot run, so this binary cannot be presented as validating the daily-use Gyro prefill split.
+
+The selected profile's deployment comment records run-gyro-d145r/sha8fbf47992bb7 as xeno/defer-m145@9c3f16f8949473fbd3b3531608b4d2c930040308, defaultggml plus trellis overlay. That commit/branch exists locally. This differs from plan baselinee573 and its stock vendor. No exact matching deployed binary was found among top-levelbuild*/strata.exe candidates; profile comments are provenance evidence, not a reproducible binary-source proof by themselves. A user choice between the daily-use branch and the originalmain baseline has been requested; no source checkout switch, merge or further model retry was done while pending.
+
+No task-owned model process remains running. Candidate model inference, actual secondary execution, greedy parity, resource fit and performance gates remain unpassed. Existing component build/probe evidence retains its original identity.
+
+## Authorized R4 public synchronization
+
+The later user authorization superseded the earlier public-PRD restriction. Existingissue#276 now matches the public-safe R4 Markdown exactly; bodySHA256 1dcf885081d171b87e8f07026877a3a81bd9ca713e492bcd8bdf1126515f8dba. Its bilingual normativeR2 technical appendix is https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682. No private paths/UUIDs/local resource logs were included. Three Mermaid diagrams passedMermaid11.16.0 parse pluslocalheadlessChrome render and visual inspection; actualGitHub renderedSVGs were not verified. No unrelated issue, repositorypush,PR,merge,deployment orlibraryupload occurred.

@@ -174,7 +174,8 @@ int main(int argc, char** argv) {
                 context_switch_checked = true;
             }
         }
-        // Destroy and rebuild the standalone graph/state at fresh addresses. Handles
+        // Destroy and recreate the standalone graph/state, checking reset behavior.
+        // Allocator addresses may be reused; this does not test relocation. Handles
         // are never cloned or reused across independently instantiated graphs.
         {
             Executor rebuilt; rebuilt.build();

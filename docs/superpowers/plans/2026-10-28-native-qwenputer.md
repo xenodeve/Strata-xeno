@@ -1,8 +1,8 @@
 # Native Qwenputer Implementation Plan
 
-> Local R3 amendment, 2026-10-28: use Gyro-M for model-dependent validation. The actual GGUF exists (91,965,774,272 bytes), metadata qwen4exp / 48 layers / hidden 2560 / 512 experts, routed TQ2_T tensors. Two local D2x profiles (262K/5 workers and 512K YaRN/13 workers) share the model/tokenizer/MTP; selection is pending. Do not restore Swift for this baseline. Preserve current served configuration; pin chosen inputs before model tests. R3 PRD/coverage are local only; GitHub/library updates are not authorized. All Native, numerical, state and offload contracts below remain in force.
+> Local R3 amendment, 2026-10-28: use Gyro-M for model-dependent validation. The actual GGUF exists (91,965,774,272 bytes), metadata qwen4exp / 48 layers / hidden 2560 / 512 experts, routed TQ2_T tensors. The user selected strata-gyro-m-d2x.json:262K context,5 workers. The512K YaRN profile is not this test baseline. Do not restore Swift for this baseline. Preserve current served configuration; pin chosen inputs before model tests. The user subsequently authorized public-safe PRD synchronization; R4 is synchronized toissue#276. Detailed local evidence remains private; no library upload or repository push is authorized. All Native, numerical, state and offload contracts below remain in force.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. The parent reviews each evidence checkpoint before work proceeds; this draft authorizes no production implementation.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. The parent reviews each evidence checkpoint before work proceeds. P0 diagnostics are authorized; do not advance to P1 or production integration without the next review gate.
 
 **Goal:** เพิ่มวงจร FFN/GDN จริงภายใน decoder ของ Qwen3.8 Flash-Next ให้ GPU หลักควบคุม bounded trace และคืนผลให้โมเดลใช้ต่อ พร้อมหลักฐาน correctness, memory และ latency บนเครื่องจริง
 
@@ -12,11 +12,11 @@
 
 **Spec:** [Native Qwenputer PRD](../../plans/2026-10-28-native-qwenputer-prd.md)
 
-**Status:** Draft สำหรับ parent research/review ก่อนเสนอผู้ใช้; architecture อนุมัติแล้ว แต่ยังไม่อนุมัติให้เริ่ม implementation ตามแผนนี้  
-**Revision:** R2 หลัง parent review: ขัดเกลาภาษา, ยืนยัน D2x compatibility, เพิ่ม policy references, dual-architecture build และ numerical/measurement gates  
-**Baseline:** `e5737a27f485773a7ce22784fef6af7b480dcc9a`  
-**Upstream pin:** `ca13310e2f9f788d1dd3feeea8213c1b0c23913c`  
-**Tracking:** ยังไม่ publish ผู้ใช้เรียก /to-prd โดยตรงและให้ทำก่อน workflow เดิม
+**Status:** อนุมัติสถาปัตยกรรมและแผน R2 ให้ทำ P0 แล้ว ส่วน build/probe ของ P0 มีหลักฐานผ่าน; model-dependent runs ใช้ Gyro-M 262K/5 workers ที่ผู้ใช้เลือกแล้ว ยังไม่เริ่ม P1
+**Revision:** R2 หลัง parent review: ขัดเกลาภาษา, ยืนยัน D2x compatibility, เพิ่ม policy references, dual-architecture build และ numerical/measurement gates
+**Baseline:** `e5737a27f485773a7ce22784fef6af7b480dcc9a`
+**Upstream pin:** `ca13310e2f9f788d1dd3feeea8213c1b0c23913c`
+**Tracking:** PRD R2 เผยแพร่และตรวจกลับที่ #276 แล้ว ฉบับ R4 แบบ public-safe sync กับ issue #276 ตามที่อนุญาตแล้ว รายงานและ inventory ในเครื่องยังเป็นข้อมูลส่วนตัว
 
 ## Global Constraints
 
@@ -65,7 +65,7 @@
 | P7 | API/internal ownership, live UI และ reconnect | P5/P6 |
 | P8 | Full parity/backend gates พร้อม D2x ABBA/report | P0-P7 และ model inputs ที่พร้อม |
 
-หาก conditional probe ใน P0 ไม่ผ่าน ให้หยุดและส่งทางเลือก fixed-count graph chunks ให้ผู้ใช้เลือก ห้ามเปลี่ยน runtime เงียบ ๆ หากหา configured Swift GGUF ไม่พบ ยังทำ component phases ที่ไม่ต้องใช้โมเดลต่อได้ แต่ P5 real-model และ P8 ยังไม่ผ่าน
+หาก conditional probe ใน P0 ไม่ผ่าน ให้หยุดและส่งทางเลือก fixed-count graph chunks ให้ผู้ใช้เลือก ห้ามเปลี่ยน runtime เงียบ ๆ สำหรับ model-dependent runs ให้ใช้ Gyro-M profile 262K/5 workers ที่ผู้ใช้เลือก ไม่กู้ Swift เพื่อ baseline นี้ และไม่ข้าม gate ไป P1
 
 ## จุดเชื่อมต่อและ interfaces ที่เสนอ
 
@@ -111,7 +111,7 @@ flowchart LR
 - [ ] สร้าง compiling probe fixture พร้อม semantic assertions: while limit 0 ให้ steps=0, limit 1 ให้ steps=1 และ limit 5 ให้ steps=5 การ launch ซ้ำต้อง reset condition เพิ่ม intentional wrong-limit negative control เพื่อให้ test fail จาก observed step count ไม่ใช่ missing binary
 - [ ] บันทึก CUDA runtime/driver/device UUID, WDDM mode, toolkit และ host compiler จากนั้นทดสอบ create/instantiate/launch/relaunch จริงบน primary ตรวจ cancel/full-output bounds และยืนยันว่า context switch/rebuilt graph ไม่มี stale state
 - [ ] สร้าง unchanged baseline จาก e5737a27 และ candidate ใน directories ใหม่ด้วย `-DCMAKE_CUDA_ARCHITECTURES="89;120"` พร้อม source/config/toolchain hashes ตรวจ cubin/PTX architecture coverage ตาม target ที่ต้องรันบนแต่ละ GPU และ smoke secondary expert tier จริงก่อน ABBA หาก model inputs ยังไม่พร้อมให้ระบุ smoke ว่า blocked ไม่ใช้ primary-only probe อ้างแทน ตรวจ exe ก่อนและหลังทุก run และเก็บ executable ไว้ immutable ระหว่าง ABBA
-- [ ] Preflight ตรวจ `--pack`, `--native`, `--ple-gguf`, `--mtp` และ tokenizer ทุก role ของ Gyro-M ที่ผู้ใช้เลือก ตรึง config/model hashes และยืนยัน profile 262K หรือ 512K ก่อน model-dependent runs ไม่ต้อง restore Swift และห้ามแก้ served profile หรือดาวน์โหลดแทนโดยไม่ได้รับอนุญาต
+- [ ] Preflight ตรวจ `--pack`, `--native`, `--ple-gguf`, `--mtp` และ tokenizer ทุก role ของ Gyro-M ที่ผู้ใช้เลือก ตรึง config/model hashes และใช้ profile 262K/5 workers ที่ผู้ใช้เลือกสำหรับ model-dependent runs ไม่ต้อง restore Swift และห้ามแก้ served profile หรือดาวน์โหลดแทนโดยไม่ได้รับอนุญาต
 - [ ] รัน smoke ผ่าน detached/no-window helper ที่ใส่ CUDA bin และ bin/x64 ใน PATH คืนผล probe และ feasibility report ก่อน P1/P4 หาก unsupported ให้ส่ง native regular-graph chunk fallback ให้ผู้ใช้พิจารณา
 - [ ] Build ด้วย `cmake --build build-qwenputer --target qwenputer_conditional_probe` ผลตรวจต้องเป็น probe JSON ที่ระบุทุก case พร้อม counts และ exit 0 ห้ามอนุมานว่าผ่านจาก header/version
 - [ ] สรุป probe/preflight/blueprint ใน commit แยกจาก production feature โดยจัดทำ evidence ก่อน commit และไม่ push
@@ -120,7 +120,7 @@ flowchart LR
 
 **Files:** สร้าง `tools/qwenputer/export.py`, `tools/qwenputer/tokenizer.py`, `tools/qwenputer/oracle.py` และ `tools/test_qwenputer_export.py`; เพิ่ม reviewed subset/pin/notices/patches ใน `third_party/qwenputer/`; เพิ่ม `docs/QWENPUTER_FORMAT.md` และอัปเดต blueprint
 
-**Consumes:** P0 tool/model/tokenizer manifest, approved source pin และ approval เฉพาะสำหรับ compiler/firmware execution  
+**Consumes:** P0 tool/model/tokenizer manifest, approved source pin และ approval เฉพาะสำหรับ compiler/firmware execution
 **Produces:** `export_artifact(source_dir, tokenizer_dir, firmware_path, limits, output_dir) -> ExportManifest` พร้อม `manifest.json`, `native.qput`, `oracle.jsonl` และ license/provenance bundle
 
 - [ ] ก่อน source execution ขอ approval โดยระบุ exact commit, file/import list, command, expected output directories และ memory/disk estimate ห้ามรัน uv sync/pip/HF download แบบเหมารวม ให้ audit offline dependency closure ก่อนตัดสินใจ install
@@ -140,7 +140,7 @@ flowchart LR
 
 **Files:** สร้าง `include/strata/artifact/qwenputer.hpp`, `src/artifact/qwenputer.cpp`, `tests/qwenputer/artifact_test.cpp` และ `tests/qwenputer/feature_test.cpp`; อัปเดต CMake/format/blueprint
 
-**Consumes:** P1 schema/oracle bundle  
+**Consumes:** P1 schema/oracle bundle
 **Produces:** `Artifact`, `Binding`, `LoadLimits`, `MemoryPlan`, `load_artifact(...)` และ CPU token-feature expansion สำหรับ tests เท่านั้น
 
 - [ ] สร้าง linked test harness และ minimal unsupported boundary ก่อน red โดย malformed fixture ต้อง fail ด้วยชื่อ field/violation ที่ implementation รายงาน ไม่ใช่ compiler/link/import error
@@ -155,7 +155,7 @@ flowchart LR
 
 **Files:** สร้าง `include/strata/kernels/qwenputer.hpp`, `src/kernels/qwenputer.cu` และ `tests/qwenputer/step_test.cu`; เพิ่ม executor storage ใน `include/strata/core/qwenputer.hpp` กับ `src/core/qwenputer.cpp`; อัปเดต CMake/blueprint
 
-**Consumes:** validated Artifact/MemoryPlan กับ oracle vectors  
+**Consumes:** validated Artifact/MemoryPlan กับ oracle vectors
 **Produces:** `Executor::init(...)`, `Executor::enqueue_step(...)`, device weights, mutable state และ retained-code output
 
 - [ ] เขียน FFN/head/lag/state tests จาก exported real reachable traces และ synthetic cases ที่พิสูจน์ reduction collisions, ties, decay 1/0.5/0, beta=0/1, no-key/no-query และ normalized zero state
@@ -171,7 +171,7 @@ flowchart LR
 
 **Files:** เพิ่มใน `src/core/qwenputer.cpp` กับ `src/kernels/qwenputer.cu`; สร้าง `tests/qwenputer/runner_test.cu`; อัปเดต CMake/native guide/blueprint
 
-**Consumes:** P0 runtime pass และ P3 exact step  
+**Consumes:** P0 runtime pass และ P3 exact step
 **Produces:** `Runtime::enqueue_chunk(...)`, `collect_chunk()`, `ChunkResult` และ `RuntimeLimits`
 
 - [ ] เขียน state-machine tests สำหรับ text-to-GO, trace family/payload decoding, BYTE/echo, HALT/newline ownership, fault, zero-work chunk, FIFO-full pause, global step cap, cancel และ repeated launches ที่ใช้ buffer เดิม
@@ -188,7 +188,7 @@ flowchart LR
 
 **Files:** แก้ `include/strata/core/verify.hpp`, `src/core/verify.cpp` และ `src/program/generate.cpp`; เพิ่ม Runtime; สร้าง `tests/qwenputer/ownership_test.cpp` กับ `tests/qwenputer/decode_test.cu`; อัปเดต blueprint
 
-**Consumes:** P4 runner, P3 step และ Verifier::run/commit/wait_commit semantics เดิม  
+**Consumes:** P4 runner, P3 step และ Verifier::run/commit/wait_commit semantics เดิม
 **Produces:** `prepare_window(...)`, `decision(normal_keep)`, `commit_window(consumed_inputs,...)` และ optional verifier hook ที่ default เป็น null
 
 - [ ] เขียน ownership arithmetic tests ก่อน: no takeover ให้ normal_keep; takeover_after=0 ให้ consumed input ได้ไม่เกิน 1; takeover_after=T-1 ให้ได้ไม่เกิน T; takeover บน rejected draft ต้องไม่เริ่ม burst ทดสอบ ENTER ทุก r ใน T และ normal_keep ทุกค่า
@@ -206,7 +206,7 @@ flowchart LR
 
 **Files:** แก้ conversation_cache/file/snapshot headers/sources; สร้าง `serve/native_transcript.py`, `tests/qwenputer/session_test.cpp` และ `serve/test_native_transcript.py`; เพิ่ม server cold SAVE/RESTORE metadata handling; อัปเดต blueprint
 
-**Consumes:** P5 coherent Native state กับ internal-span events  
+**Consumes:** P5 coherent Native state กับ internal-span events
 **Produces:** `NativeImage`, save_quiescent/restore, `NativeTranscript` และ versioned metadata ใน atomic snapshot publication เดียวกัน
 
 - [ ] เพิ่ม tests สลับสองบทสนทนา, matching visible prefix, altered/stale/untrusted prefix, history ที่ไม่ส่ง hidden native fragments กลับมา, slot eviction และ cold restart ต้อง reuse canonical prefix เมื่อพิสูจน์ match หรือ cold-read โดยไม่ splice จากการเดา
@@ -222,7 +222,7 @@ flowchart LR
 
 **Files:** แก้ `serve/server.py`, `serve/frontend.py`, `serve/runs.py` และ engine event sites; แก้ UI status/i18n/event consumers/tests; สร้าง `serve/test_native_qwenputer.py`; อัปเดต blueprint
 
-**Consumes:** P5 ownership และ P6 canonical map/snapshots  
+**Consumes:** P5 ownership และ P6 canonical map/snapshots
 **Produces:** versioned native capability/events, internal calc declaration/filter และ user status ที่ต่อเนื่อง
 
 - [ ] กำหนด native protocol capability ที่ engine/server ต้องตกลงก่อน serve-native รวม GEN key/handshake ที่จำเป็น หาก mismatch ต้อง refuse ก่อน claim native เพื่อไม่ให้ old server dispatch calc ภายนอกโดยไม่ตั้งใจ ส่วน feature-off ยังคง protocol เดิม
@@ -238,7 +238,7 @@ flowchart LR
 
 **Files:** สร้าง `tests/xeno/perf/qwenputer.py`, `tests/qwenputer/corpus.jsonl` และ tests; เพิ่ม timeline analyzer/tests กับ latency breakdown เฉพาะ new counters; อัปเดต native guide/report/blueprint
 
-**Consumes:** P0-P7, approved model inputs ที่พร้อม, unchanged baseline/candidate builds และ experimental config copies  
+**Consumes:** P0-P7, approved model inputs ที่พร้อม, unchanged baseline/candidate builds และ experimental config copies
 **Produces:** raw logs, source/exe hashes, corpus results, paired stage/memory tables, unsupported list และข้อมูลให้ผู้ใช้ตัดสินใจ rollout
 
 - [ ] เพิ่ม analyzer tests ก่อน spans ใหม่ โดยชื่อ span เป็น string literals และตัวเลขใช้ integer arguments ตาม timeline API เก็บ bridge/trial/commit/entry/trace/result replay/host wait กับ terminal reasons ใน timeline เดียว
@@ -291,4 +291,18 @@ racecheck ตรวจ hazards เฉพาะที่เครื่องม�
 
 **Current evidence:** มีเพียง baseline protocol/session/timeline ที่รันแล้วได้ 65 passed, 1 skipped และ 19 subtests passed รวม source/header/config inspection ยังไม่ได้รัน conditional probe, compiler, native kernels, model parity หรือ ABBA ตามแผนนี้
 
-**Execution blockers/debt:** ยังไม่พบ configured Swift GGUF shards, conditional runtime capability ยังไม่พิสูจน์ และยังไม่มี third-party execution approval ส่วน HIP/SYCL toolchains ไม่พบใน PATH และ browser policy เดิมอาจบล็อก UI verification ทั้งสองเป็น validation debt ที่ต้องมีทางตรวจตาม policy ก่อนอ้างว่าผ่านครบ ไม่ใช่หลักฐานว่า plan review ทำต่อไม่ได้ ไม่มี process ค้างจาก planning
+**Current P0 gates:** พบไฟล์ Gyro-M และตรวจ full hashes แล้ว conditional probe กับ final suite มีหลักฐานผ่าน ส่วน model smoke, parity, ABBA และ model memory peaks ยังไม่รัน โดยให้ใช้ Gyro-M 262K/5 workers ที่ผู้ใช้เลือกแล้ว การอนุมัติ third-party compiler/reference/firmware ยังต้องพิจารณาเมื่อจะรันจริง HIP/SYCL toolchains ยังไม่มี จึงคงเป็น validation debt ไม่ใช่ check ที่ผ่าน
+
+## Historical R2 planning findings — superseded test baseline
+
+ข้อความต่อไปนี้เก็บผลสำรวจ ณ ตอนวางแผน R2 ไว้เป็นประวัติ ไม่ใช่คำสั่งทดสอบหรือสถานะปัจจุบัน ผู้ใช้เปลี่ยน baseline เป็น Gyro-M แล้ว และ P0 ได้พิสูจน์ conditional graph ภายหลัง:
+
+> **Execution blockers/debt:** ยังไม่พบ configured Swift GGUF shards, conditional runtime capability ยังไม่พิสูจน์ และยังไม่มี third-party execution approval ส่วน HIP/SYCL toolchains ไม่พบใน PATH และ browser policy เดิมอาจบล็อก UI verification ทั้งสองเป็น validation debt ที่ต้องมีทางตรวจตาม policy ก่อนอ้างว่าผ่านครบ ไม่ใช่หลักฐานว่า plan review ทำต่อไม่ได้ ไม่มี process ค้างจาก planning
+
+เดิม R2 ให้หา configured Swift GGUF ก่อน real-model gates ข้อจำกัดนั้นถูกแทนด้วย Gyro-M ที่ผู้ใช้เลือก ไม่ต้อง restore Swift และไม่ได้ลบผลสำรวจเก่าออกจาก frozen R2 reference หรือรายงานประวัติ
+
+## P0 checkpoint after selected-model smoke
+
+Gyro-M262K/5workers ถูกเลือกแล้ว การลอง baseline จากe573/stockvendor หยุดก่อนสร้างtoken ด้วยVirtualAlloc MEM_COMMIT error1455 ภายใต้ task-owned job cap42,000,000,000bytes ค่า sampled PrivateUsage ไม่ใช่หลักฐานว่า job cap และ private-commit budget หมายถึงตัวเดียวกัน ขณะนี้ยังไม่ผ่าน inference/parity/resource gates
+
+profile ที่เลือกบันทึกdailyexeจากxeno/defer-m145@9c3f16f8 พร้อมtrellisoverlay ส่วนbaselineของแผนคือe573 และbuildที่ลองไม่มีMMQexpert split ของGyro ต้องให้ผู้ใช้เลือกฐานโค้ดก่อนเปลี่ยนcheckoutหรือbuildstrategy ไม่ใช้ผลนี้แทนความพร้อมของdaily-use ทั้งหมด และไม่เพิ่มbudgetหรือลดprofileเอง

@@ -1,8 +1,8 @@
-# PRD R3: ให้ Strata คำนวณด้วย Native Qwenputer
+# PRD R4: ให้ Strata คำนวณด้วย Native Qwenputer
 
-ฉบับร่างในเครื่องสำหรับตรวจเนื้อหา — 28 ตุลาคม 2026
+ฉบับ R4 สำหรับ PRD issue #276 — 28 ตุลาคม 2026
 
-สถาปัตยกรรมและแผน R2 อนุมัติแล้ว ขณะนี้ทำได้ถึง P0 เท่านั้น ฉบับ R3 จัดเนื้อหาใหม่ตาม `/kien-thai` และเปลี่ยนโมเดลทดสอบเป็น Gyro-M ตามคำสั่งล่าสุด ยังไม่แก้ GitHub #276 หรืออัปโหลดฉบับนี้
+สถาปัตยกรรมและแผน R2 อนุมัติแล้ว ขณะนี้อยู่ใน P0 ส่วน P1 ขึ้นไปต้องผ่าน review gates ก่อน เอกสารนี้ใช้ Gyro-M 262K context, 5 workers เป็น baseline และแยกคำอธิบายที่อ่านก่อนออกจากข้อกำหนดทางเทคนิคฉบับเต็ม
 
 ## Problem Statement — ปัญหาที่ต้องแก้
 
@@ -20,17 +20,41 @@ Native ในแผนนี้หมายถึงวงจร FFN/GDN ที�
 
 เมื่อปิด feature เส้นทางเดิมต้องให้ผลเหมือน baseline เมื่อเปิดใช้ ระบบยัง offload experts ได้ตามเดิม แต่ต้องวัด RAM/VRAM ที่วงจรใช้เพิ่ม รวมถึงผลต่อ expert cache และ latency ของข้อความทั่วไปด้วย
 
-## ขอบเขตที่ตกลงแล้วและเรื่องที่ยังต้องเลือก
+### เส้นทางจากโมเดลสู่วงจรและกลับมาคิดต่อ
+
+ส่วนบนของภาพเตรียม artifact นอกเส้นทางตอบจริง ส่วน runtime ใช้ tensor ที่โหลดไว้แล้ว จึงไม่มี host calculator อยู่ในเส้นทางนี้
+
+```mermaid
+flowchart TD
+  subgraph Offline["Offline preparation - not serving"]
+    C["Pinned compiler and audited firmware"] --> A["Versioned circuit artifact"]
+  end
+  subgraph Runtime["Production runtime"]
+    A --> L["Validate and load resident tensors once"]
+    D["Language decoder and verifier"] --> E{"Accepted internal ENTER?"}
+    E -->|No| N["Continue ordinary language decode"]
+    E -->|Yes| F["Fence accepted commit and transfer ownership"]
+    F --> G["Primary-GPU FFN/GDN trace<br/>Language KV/GDN/PLE, positions, RNG and penalties frozen"]
+    L -.->|Resident tensors| G
+    G --> T{"Terminal reason"}
+    T -->|Success| B["Completed machine text - buffered"]
+    B --> R["Replay result text once through language decoder"]
+    R --> H["Resume language generation and MTP"]
+    T -->|Cancel, limit or fault| X["Discard partial output<br/>Restore coherent boundary or invalidate session"]
+  end
+```
+
+## ขอบเขตที่ตกลงแล้วและเรื่องที่ต้องยืนยันก่อนเดินต่อ
 
 - ทำ Native สำหรับ Strata Flash-Next ก่อน ส่วน Universal เป็นงานระยะถัดไป
 - ใช้ Gyro-M เป็นโมเดลทดสอบ ไม่ต้องกู้ Swift กลับมาเพื่อ baseline นี้
-- ใช้ GPU หลัก RTX 5060 Ti รันวงจร ส่วน RTX 4070 SUPER ยังทำหน้าที่ offload experts และแสดงผลตาม profile เดิม
+- ใช้ GPU หลักรันวงจร ส่วน GPU รองยังทำหน้าที่ offload experts และแสดงผลตาม profile เดิม
 - เก็บ weights ของวงจรเป็น artifact แยก ใช้ standalone conditional WHILE graph และจำกัดงานต่อรอบ
 - ไม่เปลี่ยน profile ที่เสิร์ฟอยู่ ไม่เปิด feature เป็นค่าเริ่มต้น และไม่ deploy จากแผนนี้
 
-เรื่องที่รอเลือกคือ profile ทดสอบของ Gyro-M พบทั้งแบบ 262K กับแบบ 512K ที่ใช้ YaRN ทั้งคู่ใช้ไฟล์โมเดลเดียวกัน แต่จำนวน CPU workers และภาระหน่วยความจำต่างกัน จึงต้องตรึงตัวเลือกก่อนเทียบ baseline กับ candidate
+ผู้ใช้เลือก Gyro-M 262K context, 5 workers เป็น baseline แล้ว ให้ตรึงไฟล์และ settings ชุดนี้สำหรับเทียบ baseline กับ candidate ไม่ใช้ profile 512K/YaRN แทน
 
-ถ้า conditional graph ใช้ไม่ได้ หรือวงจรเกินงบหน่วยความจำ ต้องเสนอทางเลือกพร้อมหลักฐานให้ตัดสินใจ ไม่เปลี่ยนสถาปัตยกรรมหรือย้ายไปคำนวณบน CPU เอง ส่วนการเผยแพร่ R3 และรายละเอียด profile ต้องรอคำอนุญาตแยก
+ถ้า conditional graph ใช้ไม่ได้ หรือวงจรเกินงบหน่วยความจำ ต้องเสนอทางเลือกพร้อมหลักฐานให้ตัดสินใจ ไม่เปลี่ยนสถาปัตยกรรมหรือย้ายไปคำนวณบน CPU เอง
 
 ## User Stories — สิ่งที่ต้องทำได้
 
@@ -85,6 +109,20 @@ graph ของวงจรเป็น standalone graph บน GPU หลัก
 
 จุด ENTER ต้องอิงจำนวน **input tokens ที่ commit แล้ว** ถ้าอยู่แถว `r` ของ verifier window ต้องคิดขอบเขต `r + 1` ให้ถูก ต้องรอ commit fence และทิ้ง speculative suffix ที่ใช้ไม่ได้ก่อนข้าม stream หรือ snapshot
 
+ให้ลองเดิน candidate window บนสถานะวงจรสำรอง (shadow state) ก่อน แล้วจำกัด input prefix ตามผลยอมรับของ verifier และจุดรับช่วงแรกที่ใช้ได้ จากสถานะฐานที่เก็บไว้ (base state) ให้ replay เฉพาะ prefix ที่ยอมรับแล้ว และทิ้ง shadow state ของส่วนที่ถูกปฏิเสธ
+
+```mermaid
+flowchart TD
+  B["Retained base circuit state"] --> S["Speculative shadow trial<br/>Candidate input window"]
+  S --> C["Clamp accepted input prefix"]
+  V["Verifier acceptance and<br/>first valid takeover"] --> C
+  C --> R["Replay only accepted prefix<br/>from retained base state"]
+  B --> R
+  R --> K["Commit coherent circuit state"]
+  K --> H["Fence before ownership handoff"]
+  C --> X["Discard rejected shadow suffix and state"]
+```
+
 ระหว่าง machine-only steps ห้ามขยับ language KV/GDN/PLE, logical position, RNG counters หรือ penalty history ข้อความผลลัพธ์ที่เสร็จแล้วจึงผ่าน exact language replay ครั้งเดียว แล้วค่อยให้ MTP และการตอบปกติทำงานต่อ
 
 ต้องทดสอบ ENTER ทุกตำแหน่งใน window รวมแถวแรก แถวสุดท้าย rejected drafts และการสลับซ้ำ ส่วน execution modes ที่ยังไม่รองรับต้องปฏิเสธเมื่อเปิด feature โดยคงเส้นทางตอนปิดไว้
@@ -120,6 +158,8 @@ native call/result เป็นเรื่องภายใน เครื่
 จุดทดสอบหลักคือหนึ่ง conversation ที่เข้า native call ได้ รับผล แล้วให้โมเดลตอบต่อ จากจุดนี้ต้องตรวจ API, ประวัติ, session และภาษาได้ครบ ส่วน circuit replay และ kernel tests ใช้พิสูจน์รายละเอียดที่จำเป็น
 
 ทดสอบการบังคับเรียกวงจรแยกจากการดูว่าโมเดลเลือกเรียกเองได้ดีแค่ไหน ต้องตรึง compiler, corpus และ seeds แล้วแยก development fixtures ออกจาก held-out free-running acceptance cases ด้วย
+
+เมื่อเทียบ baseline กับ candidate ให้ใช้ Gyro-M ชุดเดียวกันที่ 262K context, 5 workers และค่า RoPE เดิมของ profile/GGUF ต้องตรึง model inputs, tokenizer, MTP และ runtime settings ให้เหมือนกัน ต่างเฉพาะ executable กับ paths สำหรับหลักฐานของแต่ละ arm ส่วน learned expert profile ให้เริ่มจากสำเนาที่มีเนื้อหาเดียวกัน เพื่อไม่ให้การรัน arm หนึ่งเปลี่ยน input ของอีก arm
 
 ชุดเลขต้องมี signed add/sub/mul, rational division, negative floor/modulo, gcd, precedence, powers, decimals, ขอบเขต 62 หลัก, divide-by-zero, capacity/complexity errors และการคำนวณต่อเนื่อง Oracle เลขต้องเป็นอิสระจาก parser/compiler ของ firmware เพื่อไม่ให้ผิดแบบเดียวกันทั้งคู่
 
@@ -158,6 +198,20 @@ G8 ห้ามรวม oracle, reference หรือ checksum verification �
 | **P7** | API, internal tool handling, status และ reconnect | ตรวจผ่าน API/UI จริง |
 | **P8** | หลักฐาน correctness, resources, latency และข้อเสนอ rollout | ผ่าน gates และให้ผู้ใช้เลือกก่อนนำไปใช้ |
 
+```mermaid
+flowchart TD
+  P0["P0: feasibility and baseline"] --> P1["P1: compiler, artifact and oracles"]
+  P1 --> P2["P2: safe loader"]
+  P2 --> P3["P3: exact circuit step"]
+  P3 --> P4["P4: bounded GPU trace"]
+  P4 --> P5["P5: verifier ownership"]
+  P5 --> P6["P6: history and snapshots"]
+  P5 --> P7["P7: API, status and reconnect"]
+  P6 --> P7
+  P6 --> P8["P8: full validation and rollout review"]
+  P7 --> P8
+```
+
 P2–P4 ใช้ artifact/ABI จาก P1; P5 ต้องได้ circuit runner ที่ผ่านการตรวจแล้ว; P6–P7 ใช้สัญญา ownership จาก P5 ส่วน P8 ตรวจระบบที่รวมครบ ไม่ใช้ผล microbenchmark แทนผลของหนึ่ง turn
 
 ## Out of Scope — งานที่ยังไม่รวม
@@ -166,14 +220,199 @@ Universal adapters, การรับโมเดลทุกตระกูล
 
 v1 ยังไม่รับทุก execution mode ต้องรองรับหรือปฏิเสธแต่ละชุดอย่างชัดเจน การใช้ storage เก็บไฟล์ไม่ได้ทำให้ working state ที่วงจรต้องใช้บน GPU หายไป
 
-## Further Notes — หลักฐานปัจจุบันและรายละเอียดสำหรับ implementation
+## Further Notes — ข้อกำหนดอ้างอิงและสถานะหลักฐาน
 
-พบ Gyro-M GGUF v3 จริง ขนาด 91,965,774,272 bytes ชื่อ metadata คือ `Qwen3.8-Flash-Next Gyro-M`, architecture `qwen4exp`, 48 layers, hidden size 2560 และ 512 experts เลือกใช้ 10 ตัว Tensor experts เป็น `TQ2_T`; ยังมี `Q8_0`, `BF16` และ `F32` ในไฟล์ด้วย จึงไม่ใช้สมมติฐาน IQ2_XS ของ Swift แทน
+Gyro-M ใช้ routed experts แบบ TQ2_T การมี geometry หรือจำนวน vocabulary เท่ากันยังไม่ยืนยันว่า tokenizer หรือ artifact ใช้ร่วมกันได้ ต้องตรวจเนื้อหา vocabulary, merges, token types และ special IDs แล้วผูก artifact identity กับข้อมูลชุดนั้น การทดสอบ Q2 เดิมยังต้องรักษาไว้ แต่ใช้แทนหลักฐาน TQ2_T หรือ MTP runtime compatibility ของ Gyro-M ไม่ได้
 
-tokenizer ที่พบมี vocabulary 248,320 ใช้ descriptor แบบ `gpt2`/`qwen35` และมีไฟล์ vocabulary/merges แยก ชื่อ MTP และ offload flags ปรากฏในสอง profile แล้ว แต่การมีไฟล์และ metadata ตรงยังไม่พิสูจน์ numerical compatibility หรือ runtime parity
+ผล build และ conditional probe ยืนยันได้เฉพาะส่วนที่ทดสอบ ชุด probe มี 10 cases ส่วนชุดทดสอบรวมมี 9 tests และรวมการตรวจ negative control ด้วย ยังไม่ถือว่า model inference, ownership correctness, การลงตัวกับงบทรัพยากร หรือ performance readiness ผ่านแล้ว ก่อนเทียบโมเดลต้องยืนยัน code baseline และ build dependencies ให้ตรงกับเส้นทาง daily use ด้วย
 
-P0 build baseline และ candidate ครบแล้ว Probe รุ่นสุดท้ายสร้างและ instantiate graph จริง ผ่าน zero/one/N, relaunch, output bound, cancel, current-device switch และการสร้าง graph ใหม่ ชุดทดสอบสองข้อรวม negative control ผ่าน ส่วนการโหลด Gyro-M, greedy parity, ABBA และยอดใช้หน่วยความจำของโมเดลยังไม่รัน
+รายละเอียดระดับ schema, state, token bridge, module inventory และ primary sources อยู่ใน [ข้อกำหนด R2 ทั้งอังกฤษและไทย](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) ซึ่งเป็นส่วนหนึ่งของ PRD นี้ อ้างอิงเป็น R2-public-technical โดยมี payload SHA256 `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`
 
-รายละเอียดระดับ schema, state, token bridge, module inventory, primary sources และข้อจำกัด CUDA อยู่ใน [ข้อกำหนด R2 ที่เก็บไว้ครบ](2026-10-28-native-qwenputer-r2-reference.md) เอกสารนั้นยังเป็นสัญญาสำหรับ implementation ยกเว้น baseline ทดสอบที่ฉบับนี้เปลี่ยนเป็น Gyro-M และสถานะงานที่อัปเดตข้างต้น รายการ Swift ที่หายเป็นประวัติการสำรวจ ไม่ใช่ blocker ที่ต้องแก้สำหรับ baseline ใหม่
+ถ้า R2 กับ R4 ต่างกัน ให้ใช้ R4 แทนเฉพาะสี่รายการนี้:
 
-ใช้ [แผน P0–P8](../superpowers/plans/2026-10-28-native-qwenputer.md) คู่กับ [รายงาน P0](../reports/2026-10-28-qwenputer-feasibility.md) ก่อนเริ่มแต่ละ phase ส่วน [coverage checklist](2026-10-28-native-qwenputer-r3-coverage.md) ใช้ตรวจว่าการเขียนให้อ่านง่ายไม่ได้ตัดข้อกำหนด R2 ออก
+1. โมเดลทดสอบเปลี่ยนจาก Swift เป็น Gyro-M
+2. ใช้ 262K context, 5 workers ที่เลือกแล้ว โดยตรึง RoPE และ runtime settings เดิมในการเทียบแต่ละ arm
+3. ไฟล์ Swift ที่หายเป็นผลสำรวจในอดีต ไม่ต้อง restore เพื่อ baseline ใหม่
+4. ใช้สถานะหลักฐานปัจจุบันข้างต้นแทนสถานะก่อนรันใน R2 โดยไม่เปลี่ยน identity ของผลทดสอบเก่า
+
+ข้อกำหนดอื่นของ R2 ยังมีผลครบ แผนภาพอธิบายการทำงานและ dependencies ไม่ได้ลด acceptance gates
+
+| รายการที่ตรวจความครอบคลุม | ครบ |
+|---|---|
+| User stories US01–US24 | 24/24 |
+| Acceptance gates G0–G9 | 10/10 |
+| Delivery phases P0–P8 | 9/9 |
+| ข้อกำหนดทางเทคนิคและ citations ของ R2 | อยู่ในเอกสารอ้างอิงที่ลิงก์ไว้ครบ |
+
+
+<details>
+<summary>English requirements and source references</summary>
+
+## R4 status and precedence
+
+Native compiled computation for Strata Flash-Next remains the approved architecture. Gyro-M at 262K context and five CPU workers is the selected test baseline. P0 is in progress; later phases remain review-gated. The diagrams above distinguish offline preparation, production GPU execution, transactional shadow evaluation, and result replay. They never imply a host calculator.
+
+The bilingual [R2-public-technical companion](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) is normative except for four R4 overrides: the Gyro-M test model, the selected 262K/five-worker profile, removal of the obsolete missing-Swift-file blocker, and current evidence status. Its payload SHA256 is `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`. Preserve historical test identities; current component evidence does not establish inference, ownership correctness, resource fit or performance readiness.
+
+Controlled baseline/candidate arms use identical 262K context, original RoPE settings, five workers, model/tokenizer/MTP inputs and runtime configuration. Only executable and task-owned evidence/output paths differ. Learned expert profiles start from byte-identical copies and cannot mutate the serving profile or each other's initial inputs.
+
+Matching model geometry or vocabulary count is insufficient: validate exact tokenizer contents, special IDs and artifact identity, and separately prove TQ2_T and MTP runtime compatibility. Existing Q2 regression gates remain required but do not establish Gyro correctness. Pin the code baseline and dependencies appropriate to daily use before model comparisons.
+
+The real control-flow probe covers 10 cases; the final helper/GPU suite contains 9 tests including a meaningful negative control. Neither is a compiled-arithmetic, model-parity or latency result.
+
+The English requirements below retain the detailed Native contracts; apply the four R4 overrides above wherever older test-baseline assumptions occur.
+
+## Problem Statement
+
+Strata serves Qwen3.8 Flash-Next with GPU/RAM/NVMe expert placement, but has no compiled-computation circuit in its decoder. The user wants accurate arithmetic produced by a real circuit inside inference, with the least practical latency, then a possible Universal phase. A host calculator, an emulator answering production requests, or downloading the merged Qwen3.5 model would not satisfy this Native stage.
+
+The user approved a primary-GPU native C++/CUDA sparse FFN/GDN executor, separate circuit weights, GPU-driven trace/token selection, and frozen language state during machine-only steps. This approves the architecture, not an unmeasured speed claim.
+
+## Solution
+
+Load a versioned circuit artifact once, validate it before device allocation, and execute its compiled FFN/GDN operations within Strata's decode controller. A bounded standalone CUDA conditional graph generates internal trace tokens and machine-owned text. Only text enters the language model; trace steps do not advance its cache, sampling position, penalty history or PLE history. Feed the machine's completed response into the exact language decode path, then resume normal generation and MTP.
+
+The production path is compiled sparse tensor arithmetic, not instruction emulation. Python and a RISC-V reference may compile artifacts or generate test oracles offline only. Artifact packaging is independent of steady-state latency when both loaders produce identical resident tensors, placement and graphs.
+
+Keep the feature opt-in. Disabled execution retains the previous prompt, expert budgeting, protocol and token behavior. Enabling it preserves offloading mechanisms but reserves real additional GPU state; any resulting expert-slot/latency cost must be measured and reported.
+
+## User Stories
+
+1. As a Strata user, I want exact supported arithmetic so that the answer is computed rather than guessed.
+2. As a user, I want the model to use the circuit internally so that no external calculator service is needed.
+3. As a user, I want the model to continue reasoning after the result so that calculation is part of one answer.
+4. As a user, I want ordinary text generation to retain its behavior when the feature is disabled.
+5. As a user, I want normal text overhead with the feature enabled measured separately from calculation time.
+6. As a user, I want existing GPU/RAM/NVMe expert offloading preserved so that my large model remains usable.
+7. As a user, I want computation status shown immediately so that I know the model is working.
+8. As a user, I want refresh/reconnection to retain that status and the running answer.
+9. As an API client, I want native calls kept internal so that my application does not receive an external calc tool request.
+10. As an API client, I want non-native tools to keep their existing dispatch behavior.
+11. As a user, I want previous tool-call text and quoted text to be read as history, not executed on prefill.
+12. As a user, I want overlong or unsupported input rejected explicitly so that truncation cannot produce a plausible wrong answer.
+13. As a user, I want cancellation and limits to stop computation without publishing a partial number as success.
+14. As a user, I want errors distinguished from arithmetic results and from a broken engine.
+15. As a user, I want consecutive calculations to retain correct machine state and return ownership correctly.
+16. As a user, I want conversation switching and prefix reuse to preserve the correct internal calculation history.
+17. As a user, I want saved sessions to restore both model and circuit state or refuse incompatible data before mutation.
+18. As an operator, I want artifacts bound to the correct tokenizer, firmware and semantics so that incompatible packs fail clearly.
+19. As an operator, I want malformed artifact/firmware files refused before large allocation or GPU upload.
+20. As an operator, I want bounded GPU work that keeps Windows responsive without changing TDR or security settings.
+21. As an operator, I want startup, peak memory and expert-hit changes reported on the actual serving hardware.
+22. As a developer, I want exact circuit replay against an independent oracle and tests for every ownership transition.
+23. As a developer, I want disabled parity and same-session latency evidence before any rollout decision.
+24. As a developer, I want the Native contract documented so that a later Universal phase does not weaken it.
+
+## Implementation Decisions
+
+1. **Native scope and ownership.** Support the existing single-decoder Flash-Next D2x path, including secondary expert offload, MTP and suffix drafting. GPU-generated internal trace IDs use a separate token kind, never an extension exposed to client token IDs. Explicitly refuse feature-on decoder layer-split, multi-request batch and pipelined-window modes before allocation in v1; this does not refuse the current D2x secondary expert tier or STRATA_PREFILL_EXPERT_SPLIT path. Feature-off support remains unchanged.
+2. **Offline compiler.** Reuse the pinned RV32IM/Zba/bignum FFN/GDN compiler with a Strata vocabulary adapter and a reviewed native-call eligibility change. Preserve the circuit's arithmetic parser. Compile/park firmware offline and export a ready snapshot; production startup never runs a host emulator. Preserve provenance and required notices. A 29,932-byte pinned calc-bridge ELF fixture exists upstream, but matching source/build/provenance must be verified before use.
+3. **Artifact ABI.** Propose little-endian `STQPUT01`, schema 1.0, checked section directory and typed FP32/int32 arrays. Include compiler commit plus local patch digest, numeric ABI, model contract/tokenizer digests, firmware SHA256, op ordering, dimensions, CSR/scatter arrays, feature-slot descriptors, byte/printable maps, initial state and declared resource limits. No pickle, executable payload or arbitrary Python callback is accepted.
+4. **Feature lowering.** Export 16-byte text rows plus original byte lengths and special/printable maps, and lower only known circuit feature kinds. Do not materialize a dense vocabulary-by-residual embedding matrix. Prove all exported token-feature values against the compiler over the supported trace vocabulary and all 248,320 text IDs.
+5. **Loader.** Validate magic/version/endian, file/section integrity, overflow-safe sizes, indices, row pointers, finite coefficients, head layout and configured memory caps before GPU allocation/upload. Firmware ingestion also checks ELF32 little-endian RISC-V, entry, segment bounds/overlaps and filesz/memsz. Limit auxiliary host memory during validation. Reject unsupported ABI/binding before state mutation.
+6. **Exact operations.** Preserve coefficient bits, sparse products, ReLU, decay, beta/write/read rules, argmax tie rules, lag history, normalization and rounded sqrt/division. Start with deterministic per-output reductions and fixed dot-product trees. Upstream FP32 atomics do not establish determinism. No quantization, TF32, fast-math, lossy state, or reduction reordering without an exactness proof and oracle gate.
+7. **Device control.** Use a standalone top-level conditional WHILE graph on the primary device, with an initialized condition every launch and a finite chunk step/output budget. No host callback, allocation/free, CDP or device-graph launch occurs in its body. Do not clone the conditional graph or graft it as a child of the verifier graph. v1 serializes the active executor; parked sessions own separate saved states and graph addresses are rebound/rebuilt when storage changes.
+8. **Feasibility gate.** Before relying on conditional graphs, run real Windows create/instantiate/launch/relaunch tests for zero/one/N trips, stop conditions and repeated sessions on the installed driver. If unsupported, stop and ask the user about a fixed-count regular graph with GPU active/done masks and host supervision per bounded chunk. That fallback remains native arithmetic but is not silently substituted for the approved runtime.
+9. **Transactional decode.** Define ENTER after a consumed input row r, where the circuit owns the next token. Commit at most r+1 input rows, not the emitted-token count. A speculative shadow circuit evaluates the candidate window; normal acceptance and the first valid takeover clamp the prefix. Commit the circuit by replaying only that accepted prefix from its retained base state; discard the rejected shadow suffix. Validate this correctness-first cost before replacing it with a journal optimization. Fence outstanding commit/cross-stream work before handoff, snapshot or host access.
+10. **Language state.** Machine-only trace steps do not change language KV/GDN/PLE, logical positions, RNG counters or penalty history. Machine-owned text advances language state once in its original order. Initially consume that text through exact verifier windows; ordinary batched prefill is allowed only after equivalence is proved. Keep the machine output unpublished until complete success, then resume language sampling/MTP at the correct position.
+11. **Bridge contract.** V1 uses the existing model's native XML call syntax, with an explicitly enrolled internal calc capability and eligibility/role gates. Other tool names and historical/quoted examples cannot start a machine burst. Preserve upstream expression semantics, including Python floor division/modulo, rational division, limited non-negative powers, gcd and decimal +/−/* where supported. The pinned source has 80 capture tokens, 16 bytes per row, a 255-byte expression payload and MAXD=62; reject any overflowing/truncated input, unsupported operand/operator or embedded NUL before it can be treated as successful arithmetic. Any extension changes the compiler ABI and oracle corpus.
+12. **API and canonical history.** Internal call/result syntax must never leak into external tool dispatch. Preserve a verified mapping from visible assistant messages to the canonical internal token transcript per cache slot. Bind it to message-prefix hashes, artifact identity and session identity. Matching continuations reuse canonical tokens; ambiguous/untrusted histories cold-read safely and never splice guessed internals. Prefill history updates bridge history without replaying earlier calculations. This map must survive the session persistence modes supported in v1.
+13. **Sessions and failures.** Save only at a coherent quiescent boundary in v1; an active burst save is explicitly busy/refused or waits within an existing bounded queue. Saved identity includes artifact/numeric ABI, compiler patch, tokenizer, firmware and state geometry. Store RAM/PC/registers/counters, lag history, bridge/ownership and canonical-history metadata; never graph handles. A partial device restore invalidates the entire context. Limit/cancel/fault discards unpublished output and restores the retained coherent transaction boundary or invalidates the session; it never silently continues from partial state.
+14. **Scheduling and resources.** Compute actual resident weights, committed/shadow/init states, histories, FIFO, scratch, graphs and transient restore peaks before reserving GPU memory and filling expert caches. Active execution stays on the primary GPU; NVMe holds artifacts and cold snapshots only. Preserve the display card's 2.5 GB total headroom and the existing offload mechanism. Report against the existing 42 GB private-commit budget (AGENTS.md:295-299) and measured baseline, explicitly noting a baseline already over budget. The 2.5 GB rule is total display headroom, including current desktop use (AGENTS.md:323-324), not a requirement for 2.5 GB free VRAM. Do not edit served profiles/launchers.
+15. **Observability and rollout.** Reuse the existing engine protocol, timeline and live-run status path. Emit computing/return/error transitions when they begin; refresh must show the current step. Add timeline spans and paired counters for bridge, trial/commit, entry, trace, result replay and host waits. Keep native enabled only in an experimental test config until user approval of evidence; disabled behavior remains unchanged.
+
+## Testing Decisions and Proposed Primary Seam
+
+The primary behavioral seam is one consumed text window plus its next-token ownership decision: accepted text in, language/circuit ownership and visible output/state out. Test it through the existing verifier/commit and service request boundaries, rather than exposing many new public APIs. User review of this PRD includes checking that this seam matches the expected native behavior; no additional architecture interview is presumed.
+
+Two lower seams are necessary evidence, not substitutes for the feature: artifact validation must prove refusal before GPU mutation, and circuit replay must prove that real native tensor operations produce the trace/result. HTTP tests alone cannot prove either. Prefer existing conversation validation/transfer, protocol, tokenizer, timeline and slots patterns.
+
+Good tests assert outputs, state ownership/fingerprints, counters or explicit refusal reasons. A deliberate negative control must fail for the named semantic reason; missing scripts/imports or unexecuted tests are not red/green evidence. Oracle calculators/emulators are test-only and must be visibly separate from the production executable's dispatch path. Freeze compiler/patch/corpus digests and seeds, separate development fixtures from held-out free-running acceptance cases, and use an independent integer/Fraction arithmetic oracle not derived from upstream firmware/IR. Exclude oracle/reference/checksum verification from timed turn intervals and compare results offline after timing; assert that the production benchmark path never invokes host arithmetic/reference.
+
+## Change Inventory and Search Boundary
+
+Paths below are proposed change sites, not existing implementation claims; baseline anchors refer to e5737a27.
+| Path | Responsibility/change | Verification |
+|---|---|---|
+| `tools/qwenputer/{export,tokenizer,oracle}.py` (new), `third_party/qwenputer/` (new) | Pinned compiler/provenance, Strata adapter, artifact and test-only oracle | G1/G2 |
+| `include/strata/artifact/qwenputer.hpp`, `src/artifact/qwenputer.cpp` (new) | Bounded ABI parser, binding, resource estimate | G1 malformed fixtures/no-allocation |
+| `include/strata/kernels/qwenputer.hpp`, `src/kernels/qwenputer.cu` (new) | Exact deterministic sparse FFN/GDN and device token features/control | G2 native step/state replay |
+| `include/strata/core/qwenputer.hpp`, `src/core/qwenputer.cpp` (new) | Session/transaction ownership, top-level graph, limits | G0/G3/G5 |
+| `include/strata/core/verify.hpp:1-23,66-96`, `src/core/verify.cpp:2012,2407-2433` | Accepted input boundary and async commit dependencies | G3 every ENTER row |
+| `src/program/generate.cpp:12672-12679,13903-13928,15509-15543` | Prompt, serve/generate loops, draft suffix discard/replay | G3/G6; no missed loop |
+| `src/program/generate.cpp:5919-5935`, cache budget/init sites | Static reserve before expert placement; no elastic assumption | G8 slots/peak/hit split |
+| `include/strata/core/{conversation_cache,conversation_file,conversation_snapshot}.hpp`, corresponding `src/core/` sources | Native identity/state, coherent save/restore limits | G4; invalid/partial restore |
+| `include/strata/core/coupled_draft.hpp:19-35`, MTP/penalty callers | Preserve counters/history; change only if integration requires it | G3 seeded continuation |
+| `serve/native_transcript.py` (new), `serve/server.py:1723-1854,3913-3972,4328` | Native event protocol, canonical prefix mapping, internal ownership | G4/G5/G6 |
+| `serve/frontend.py:622-637,832`, `serve/runs.py` | Internal/native vs external calls; reconnect metadata | G5 streaming fragmentation |
+| `serve/ui/src/lib/status.ts:37`, i18n/event consumers and tests | Immediate continuous computing/return/error status | G5 real rendered refresh |
+| `include/strata/timeline*.hpp`, `serve/timeline.py`, `tests/xeno/perf/timeline.py`, `tests/xeno/test_timeline.py` | Extend analyzer first; spans/counters at new stages | G8 timeline fixtures/off-cost |
+| `tests/qwenputer/` (new), `serve/test_native_qwenputer.py` (new), `tests/xeno/perf/qwenputer.py` (new) | Component, ownership, service and measurement gates | G0-G8 |
+| `CMakeLists.txt`, `docs/BLUEPRINT.md`, new native guide and reports | Opt-in build/flag/protocol docs, backend guards, evidence | G6/G7/G9 |
+
+Search used git grep/git ls-files across engine, headers, serving, tokenizer, tests, CMake and blueprint (rg unavailable), plus pinned upstream compiler/runtime/bridge/firmware source and primary CUDA/Windows docs. Dynamic imports, all remote issue history, other drives/caches and unavailable backend toolchains were not exhaustively surveyed. Existing unrelated untracked reports/builds/profiles were not incorporated into baseline code.
+
+## Acceptance Gates
+
+| ID | Required evidence; no invented speed target |
+|---|---|
+| G0 Feasibility | Actual conditional graph probe on primary: 0, 1, N, relaunch/reset, full-buffer, stop and bounded cancel; runtime/driver/device/OS recorded. Unsupported runtime stops the selected path. |
+| G1 Artifact | Reproducible schema/export hashes; all feature-map values match compiler; license/provenance manifest; malformed/oversize/incompatible packs rejected before device allocation. |
+| G2 Native exactness | Zero semantic trace/result mismatches against the pinned IR/reference corpus and an independent exact arithmetic oracle; every instruction family/error path, repeated runs and frozen held-out free-running cases/seeds are covered separately from development fixtures. Deterministic reduction proof/tests cover colliding outputs. Compute Sanitizer memcheck/initcheck/synccheck and applicable racecheck must run; unsupported paths are reported. Racecheck does not prove global-atomic determinism. |
+| G3 Ownership | ENTER at every input-window position, rejected drafts, first/last rows, suffix and MTP transitions; no machine trace advances language state/RNG/penalties/PLE; completed result replays once. |
+| G4 History/session | Two interleaved conversations, cached continuation, cold history, history without hidden fragments, save/restore identity mismatch and partial transfer failure; no stale circuit state or hidden-prefix corruption. |
+| G5 Safety/status | Bounds, cancel, malformed UTF-8/NUL/overlong/nested/reserved tokens, unsupported syntax, huge powers, fault and GPU failure produce explicit terminal reasons; no partial numeric success; immediate status and refresh are verified. |
+| G6 Disabled parity | Fresh unchanged baseline vs candidate disabled, same session greedy raw-token parity over code/Thai/ordinary/long-prefix turns; disabled prompt/budget/protocol/snapshot serialization and no circuit allocation match. |
+| G7 Backend/build | Full D2x builds include sm_89 and sm_120, verified binary coverage and an actual secondary-tier smoke before ABBA. Build every backend touched by shared files and preserve Q2 parity (AGENTS.md:44). CUDA real tests come first; unavailable HIP/SYCL execution is explicit implementation-validation debt, not a passed check or a blocker to plan review. |
+| G8 Performance | Timeline first; profiler-off ABBA for disabled parity/ordinary enabled overhead and native arithmetic turns. Record same-run stage counters, hashes, priorities, hit split, draft acceptance, startup/peak RAM/VRAM, entry/exit/host waits, disturbed runs and DONE. Timed intervals exclude oracle/reference/checksum verification; compare results offline and assert no host arithmetic/reference in the production path. Report distributions; the existing 13.6% rule (AGENTS.md:320-321) is a repo heuristic, not statistical significance, and under-gate effects remain unproved without consistent paired repetition. |
+| G9 Release | No served config/default/deployment change from this PRD. User reviews correctness, resource costs and measured latency before opt-in rollout. Universal remains deferred. |
+
+Arithmetic corpus includes signed add/sub/mul, exact rational division, negative floor/modulo, gcd, precedence/powers, decimals within firmware support, 62-digit capacity boundaries, divide-by-zero, capacity/complexity errors, and multi-call continuation. Separate a forced native-call proof from spontaneous model call-use evaluation; neither implies general coding/3D quality improvement.
+
+## Delivery Order and Dependencies
+
+| Phase | Deliverable | Depends on |
+|---|---|---|
+| P0 | Preflight, real conditional-graph smoke probe, frozen baseline manifest and model-input inventory | Plan review; task-owned probe only |
+| P1 | Pinned licensed compiler adapter, fixture/oracle bundle and reproducible artifact export | P0; specific third-party execution approval |
+| P2 | CPU artifact loader/validator and exact token-feature lowering | P1 schema and fixtures |
+| P3 | Deterministic single-step CUDA FFN/GDN executor | P2; compiler oracles |
+| P4 | Bounded standalone GPU trace/token-selection graph | P0 runtime capability, P3 |
+| P5 | Transactional verifier/commit integration, MTP/suffix ownership and prompt-history mode | P4 |
+| P6 | Snapshot identity, save/restore and canonical transcript storage | P5 |
+| P7 | API-native ownership, live status, refresh and ordinary-tool compatibility | P5/P6 |
+| P8 | Full backend/parity/quality tests, D2x timelines and profiler-off ABBA; review report | P0-P7 and available model inputs |
+
+Each phase is test-first, ends with its own evidence and blueprint update, and remains local until publishing is separately authorized. The companion implementation plan names proposed files, exact seams and per-phase tests; this PRD's decisions describe contracts rather than unstable file locations.
+
+## Out of Scope
+
+- Universal model adapters, learned model training, arbitrary architecture loading, a merged Qwen3.5 runtime, and general 3D/coding benchmark claims.
+- Host calculator/emulator production fallback, arbitrary C/Python execution, filesystem/network tools or additional privileges.
+- Dynamic D2x expert-cache resizing, a circuit on the display GPU, active working-state paging during bursts, or a default change justified by estimates.
+- V1 concurrent batch/layer-split/pipelined machine execution and mid-burst session serialization; supported combinations must be explicit.
+- Changing serving configs/launchers, TDR/driver/security settings, installing large dependencies/models, publishing tracker entries, push/PR or deployment during this planning/review phase.
+
+## Risks, Approvals and Further Notes
+
+- **Conditional graph gate:** require actual runtime feasibility; failure needs a reviewed native chunk fallback, never silent CPU execution.
+- **Third-party execution:** before running the pinned compiler/reference/firmware or a downloaded binary, present the exact commit/paths, audited imports/commands, purpose, expected writes and resource requirements for action-time approval. Reading source and writing this plan did not execute it.
+- **Dependencies:** use existing minimal NumPy-based export where viable. Any install, RISC-V toolchain/WSL use, firmware rebuild or model download is separately reviewed; the existence of wsl.exe does not prove a working Linux toolchain.
+- **Resource decisions:** actual artifact/shadow/graph sizes and ordinary-text overhead are unknown. If a reserve cannot fit the approved memory/headroom constraints, report the measured alternatives; do not silently shrink context, change experts/defaults or move the circuit.
+- **Licensing:** source MIT notice is verified. Check firmware/libc/libgcc and binary provenance separately; any checkpoint-derived tensors must retain their applicable weight license. Do not assume all generated/binary inputs inherit one license.
+- **Rollback:** feature disabled restores the original runtime path; damaged contexts are discarded, not resumed. Removing the experimental config/artifact leaves served profiles untouched. No roll-forward/default promise follows from a component benchmark.
+
+## Evidence Index
+
+- R1: [Strata blueprint](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/docs/BLUEPRINT.md) baseline/revision log and elastic-cache refusal; [ADR 0001](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/docs/adr/0001-q2-exp-baseline.md) Q2 correctness contract.
+- R4: Existing local policy at [AGENTS.md:44](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L44) (backend builds), [295-299](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L295) (42 GB private commit), [320-321](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L320) (13.6% noise heuristic), [323-324](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/AGENTS.md#L323) (2.5 GB total display headroom); [CMakeLists.txt:9,156-159](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/CMakeLists.txt#L9) (dual architecture configuration). These constraints are not newly proposed thresholds.
+- R3: [Pinned verifier contract](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/include/strata/core/verify.hpp#L1), [commit](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/src/core/verify.cpp#L2407), [snapshot](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/include/strata/core/conversation_snapshot.hpp#L50), [sampling counters](https://github.com/xenodeve/Strata-xeno/blob/e5737a27f485773a7ce22784fef6af7b480dcc9a/include/strata/core/coupled_draft.hpp#L19).
+- U1: [Pinned RV chat](https://github.com/divagr18/qwenputer/blob/ca13310e2f9f788d1dd3feeea8213c1b0c23913c/experimental/riscv/chipformer/rv/chat.py#L100) full merged loader; lines 172-184 host token selection; 324-426 ownership.
+- U2: [Pinned sparse executor](https://github.com/divagr18/qwenputer/blob/ca13310e2f9f788d1dd3feeea8213c1b0c23913c/experimental/riscv/chipformer/rv/tritonexec.py#L47) atomic scatter, rounded normalization and state layout.
+- U3: [Pinned bridge](https://github.com/divagr18/qwenputer/blob/ca13310e2f9f788d1dd3feeea8213c1b0c23913c/experimental/riscv/chipformer/rv/bridge.py#L45), [core features](https://github.com/divagr18/qwenputer/blob/ca13310e2f9f788d1dd3feeea8213c1b0c23913c/experimental/riscv/chipformer/rv/core.py#L109), [ELF loader](https://github.com/divagr18/qwenputer/blob/ca13310e2f9f788d1dd3feeea8213c1b0c23913c/experimental/riscv/chipformer/rv/elf.py).
+- U4: [Pinned calc firmware](https://github.com/divagr18/qwenputer/blob/ca13310e2f9f788d1dd3feeea8213c1b0c23913c/experimental/riscv/chipformer/rv/env/calc/calc.c#L1), [firmware build](https://github.com/divagr18/qwenputer/blob/ca13310e2f9f788d1dd3feeea8213c1b0c23913c/experimental/riscv/chipformer/rv/env/calc/build_calc.sh), [MIT license](https://github.com/divagr18/qwenputer/blob/ca13310e2f9f788d1dd3feeea8213c1b0c23913c/LICENSE).
+- C1: [CUDA 13.3 conditional graph requirements](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/04-special-topics/cuda-graphs.html#conditional-node-body-graph-requirements) and installed `driver_types.h`; header presence is not a runtime pass.
+- C2: [CUDA conditional-node API restrictions](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/structcudaConditionalNodeParams.html).
+- W1: [Microsoft WDDM TDR](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/timeout-detection-and-recovery): the default two seconds concerns scheduling/preemption timeout; it is not a blanket per-graph duration guarantee. Do not change TDR settings.
+
+</details>
