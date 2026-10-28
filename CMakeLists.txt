@@ -1992,3 +1992,12 @@ if(STRATA_HIP_GFX906)
   add_executable(gfx906_qsa_query_swizzle_probe bench/gfx906_qsa_query_swizzle_probe.cpp)
   target_link_libraries(gfx906_qsa_query_swizzle_probe PRIVATE strata_kernels ${_strata_gpu_runtime_target})
 endif()
+
+# P0 capability diagnostic only; no source or definition enters the engine target.
+option(STRATA_BUILD_QWENPUTER_PROBE "Build the standalone primary-GPU CUDA conditional-graph diagnostic" OFF)
+if(STRATA_BUILD_QWENPUTER_PROBE)
+  if(NOT STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)
+    message(FATAL_ERROR "STRATA_BUILD_QWENPUTER_PROBE requires the CUDA backend")
+  endif()
+  add_subdirectory(tests/qwenputer EXCLUDE_FROM_ALL)
+endif()
