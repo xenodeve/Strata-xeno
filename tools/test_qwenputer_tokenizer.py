@@ -82,6 +82,20 @@ class BindingTests(unittest.TestCase):
         self.error('capture_limits', lambda: text.capture_payload([49], max_tokens=81))
         self.error('capture_reserved_token', lambda: text.capture_payload([256]))
 
+    def test_full_capture_rows_and_expression_payload_have_separate_budgets(self):
+        text = self.load()
+        # Capture includes XML scaffolding. Its total can exceed the firmware's
+        # 255-byte expression payload, while every individual row stays bounded.
+        text.bytes = text.bytes[:265] + (b'0123456789abcdef',)
+        ids = [265] * 20
+        try:
+            actual = text.capture_rows(ids)
+        except NativeInputError as error:
+            self.fail('valid full capture refused by expression budget: ' + error.code)
+        self.assertEqual(actual, b'0123456789abcdef' * 20)
+        self.error('capture_byte_count', lambda: text.capture_payload(ids))
+        self.error('capture_token_count', lambda: text.capture_rows([265] * 81))
+
     def test_invalid_ids_never_become_padding(self):
         text = self.load()
         for qid in (-1, 266, True, 1.0):

@@ -139,6 +139,9 @@ class NativeText:
         if (type(max_tokens) is not int or not 1 <= max_tokens <= 80
                 or type(max_bytes) is not int or not 1 <= max_bytes <= 255):
             raise NativeInputError('capture_limits')
+        return self._capture(qids, max_tokens, max_bytes)
+
+    def _capture(self, qids, max_tokens, max_bytes):
         result = bytearray()
         for count, qid in enumerate(qids, 1):
             if count > max_tokens:
@@ -159,3 +162,6 @@ class NativeText:
         except UnicodeDecodeError as error:
             raise NativeInputError('capture_utf8') from error
         return bytes(result)
+
+    def capture_rows(self, qids):
+        return self._capture(qids, 80, 80 * 16)

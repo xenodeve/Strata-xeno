@@ -1,14 +1,22 @@
-# PRD R8: ให้ Strata คำนวณด้วย Native Qwenputer
+# PRD R9: ให้ Strata คำนวณด้วย Native Qwenputer
 
-ฉบับ R8 สำหรับ PRD issue #276 — 28 ตุลาคม 2026
+ฉบับ R9 สำหรับ PRD issue #276 — 28 ตุลาคม 2026
 
-สถาปัตยกรรมและแผน R2 อนุมัติแล้ว P0 ผ่านการตรวจและ P1 อยู่ระหว่าง implement โดยทุกช่วงยังต้องผ่าน evidence/review gates เอกสารนี้ใช้ Gyro-M 262K context, 5 workers ตามเส้นทาง hub ที่ใช้จริงเป็น operational baseline และแยกคำอธิบายที่อ่านก่อนออกจากข้อกำหนดทางเทคนิคฉบับเต็ม
+สถาปัตยกรรมและแผน R2 อนุมัติแล้ว P0 และ P1 offline export/oracles ผ่าน gates ของตัวเองแล้ว กำลังทำ P2 loader โดยทุกช่วงถัดไปยังต้องผ่าน evidence/review gates เอกสารนี้ใช้ Gyro-M 262K context, 5 workers ตามเส้นทาง hub ที่ใช้จริงเป็น operational baseline และแยกคำอธิบายที่อ่านก่อนออกจากข้อกำหนดทางเทคนิคฉบับเต็ม
 
 ## Problem Statement — ปัญหาที่ต้องแก้
 
 เมื่อคำตอบต้องใช้เลขคำนวณ โมเดลภาษายังมีโอกาสสร้างตัวเลขผิด แม้จะอธิบายวิธีคิดได้ถูกต้อง Strata จึงต้องมีวงจรคำนวณที่โมเดลใช้ระหว่างตอบ แล้วนำผลกลับไปคิดต่อได้ในคำตอบเดียวกัน
 
+เป้าหมายทั้งหมดต้องเดินด้วยกัน: sandbox ภายในสำหรับทดสอบสมมุติฐาน/logic/บัค, ผลคณิตศาสตร์และโค้ดที่ตรวจแล้วถูกต้องขึ้น, reasoning tokens และ feedback prefill/context ที่ลดลง, external tools และข้อมูลที่ไม่จำเป็นน้อยลง, งานที่แก้สำเร็จต่อ token มากขึ้น, เวลาจนได้คำตอบถูกลดลง, การปรับความสามารถ upstream และการ optimize/offload จนใช้จริงได้ ใช้การ execute แทนการทำนายผลการทดลอง แล้วให้โมเดลนำผลไปปรับและทดสอบต่อ วัดทุกเป้าหมายตาม [goal traceability matrix](2026-10-28-qwenputer-capability-roadmap.md) ด้วย task ที่แก้สำเร็จและ held-out tests
+
 เป้าหมายคือความถูกต้องของเลขที่รองรับ และ latency ต่ำที่สุดที่พิสูจน์ได้บนเครื่องจริง งานนี้ยังไม่รับประกันว่าการเขียนโค้ดหรืองาน 3D จะดีขึ้น ต้องทดสอบประโยชน์เหล่านั้นแยกภายหลัง
+
+P0–P8 เป็น foundation ของเป้าหมายที่กว้างกว่านี้: นำความสามารถที่ upstream มีมาปรับให้ใช้กับ Strata-xeno ได้ แล้ว optimize จนใช้งานจริงได้ เริ่ม Native ก่อนแล้วจึง Universal ต้องวัดว่าโมเดลเลือกใช้เองได้หรือไม่ ลด external tools ต่อ task ที่แก้สำเร็จได้เท่าไร และช่วยแก้โจทย์คณิตศาสตร์หลายขั้นอย่างไร การรัน calc ผ่านอย่างเดียวยังไม่พอให้ประกาศว่าเป้าหมายทั้งหมดสำเร็จ
+
+[Capability roadmap](2026-10-28-qwenputer-capability-roadmap.md) แยกต้นแบบที่ integrated, standalone, experimental และยังเป็นแผน พร้อมงานต่อสำหรับ store/filesystem, bounded programs/debug loop, geometry และ Universal สถานะเหล่านี้ไม่ใช่ผลทดสอบของ Strata และ approval สำหรับ calc firmware เดิมไม่ครอบคลุม firmware ใหม่
+
+กรณีหลักคือ agent อ่าน source หรือ reuse cached prefix ที่ยังถูกต้อง แล้ววนตั้งสมมุติฐาน → รัน sandbox → รับผลสั้นที่พอใช้แก้บัค → ปรับและทดสอบซ้ำ ส่งกลับเพียงค่า, expected/actual, failed assertion, counterexample หรือ state location ที่เกี่ยวข้อง และขอรายละเอียดเพิ่มแบบมีขอบเขตได้ เมื่อ source เปลี่ยนต้องตรวจ identity และแก้หรือ invalidate prefix ให้ถูก การเทียบ external-tool baseline ต้องให้ใช้ prefix caching ตามปกติด้วย แยก initial prefill, feedback prefill, reasoning decode, execution, bridge และ orchestration พร้อมนับจำนวนรอบ, fresh-feedback tokens, retained context, circuit steps/time และเวลาจนผ่าน held-out tests
 
 ## Solution — เมื่อเปิดใช้แล้วควรทำงานอย่างไร
 
@@ -50,7 +58,7 @@ flowchart TD
 - ใช้ Gyro-M เป็นโมเดลทดสอบ ไม่ต้องกู้ Swift กลับมาเพื่อ baseline นี้
 - ใช้ GPU หลักรันวงจร ส่วน GPU รองยังทำหน้าที่ offload experts และแสดงผลตาม profile เดิม
 - เก็บ weights ของวงจรเป็น artifact แยก ใช้ standalone conditional WHILE graph และจำกัดงานต่อรอบ
-- ไม่เปลี่ยน profile ที่เสิร์ฟอยู่ ไม่เปิด feature เป็นค่าเริ่มต้น และไม่ deploy จากแผนนี้
+- ยังไม่เปลี่ยน profile ที่เสิร์ฟอยู่ระหว่างพิสูจน์ระบบ ถ้าทดสอบ intended usage ครบแล้วดีขึ้นโดยไม่พบ trade-off ผู้ใช้อนุญาตให้เปิด default ใน hub ได้แบบย้อนกลับได้ ถ้ามีต้นทุนหรือหลักฐานยังไม่ครบ ให้เป็น opt-in/non-default พร้อมข้อมูลประโยชน์และข้อเสีย
 
 ผู้ใช้เลือก Gyro-M 262K context, 5 workers เป็น baseline แล้ว ให้ตรึงไฟล์และ settings ชุดนี้สำหรับเทียบ baseline กับ candidate ไม่ใช้ profile 512K/YaRN แทน
 
@@ -151,6 +159,8 @@ native call/result เป็นเรื่องภายใน เครื่
 
 เริ่มจาก static reserve สำหรับวงจรบน GPU หลัก ไม่ใช้ elastic VRAM ในเส้นทางที่รองรับ D2x ไม่ได้ แยกไฟล์ cold storage บน NVMe ออกจาก working state ที่ต้อง resident ระหว่าง burst
 
+static reserve เป็น correctness baseline ให้ทดลอง lean all-resident เทียบ whole-module on-demand และ per-layer paging/prefetch ตาม dependency ที่มีจริง แยก immutable weights, active GDN/lag/bridge state, scratch, shadow/committed state และ cold snapshots ถ้าผลทดลองดี ให้ implement adapter/cache/graph lifecycle ที่ Strata ยังขาด ไม่หยุดเพียงเพราะระบบ offload เดิมรับวงจรชนิดนี้ไม่ได้ และไม่ย้าย active state ระหว่างรันโดยไม่มี exactness/address-stability tests
+
 ยังต้องรักษา D2x expert/prefill offload บนสอง GPU การไม่รองรับ decoder layer split ใน v1 ไม่ได้แปลว่าตัด secondary expert tier ออก ต้องวัดผลของ reserve ต่อ expert slots, hit split และ latency ด้วย
 
 ## Testing Decisions — จะพิสูจน์ว่าใช้ได้อย่างไร
@@ -178,7 +188,7 @@ Operational baseline ต้องตามเส้นทาง hub จริง
 | **G6** | unchanged baseline กับ candidate ที่ปิด feature ให้ greedy raw tokens ตรงกันใน session เดียว รวมข้อความไทย โค้ด และ long-prefix turns; prompt, budget, protocol, snapshot และการไม่ allocate วงจรต้องตรง |
 | **G7** | full D2x builds มี sm_89 และ sm_120 ตรวจ binary จริงและรัน secondary tier ก่อน ABBA; build ทุก backend ที่แตะและรักษา Q2 parity งาน HIP/SYCL ที่ยังทำไม่ได้ต้องระบุเป็นหนี้ validation |
 | **G8** | ใช้ timeline อธิบายกลไก แล้ววัด ABBA แบบปิด profiler พร้อม counters จาก run เดียวกัน, hashes, priorities, resources, hit split, acceptance, entry/exit และ DONE แยกงานที่ถูกรบกวนออกมา |
-| **G9** | ผู้ใช้ตรวจความถูกต้อง ต้นทุนทรัพยากร และ latency ก่อนเลือก rollout แบบ opt-in; ไม่แก้ served defaults หรือ deploy จาก PRD นี้ |
+| **G9** | ผ่าน correctness/quality, compatibility, ordinary/computation latency, cold/warm/tail, RAM/VRAM/cache, startup, repeated sessions และ cancellation/stability ก่อน rollout ถ้าดีขึ้นโดยไม่พบ trade-off ใน coverage ที่เพียงพอ ให้เปิด hub default แบบย้อนกลับได้ ถ้ามี trade-off หรือยังไม่แน่ชัด ให้เป็น opt-in/non-default |
 
 G2 ต้องรัน memcheck, initcheck, synccheck และ racecheck ในส่วนที่ใช้ได้ ถ้าเครื่องมือไม่รองรับก็ต้องบอกไว้ ผล racecheck อย่างเดียวไม่พิสูจน์ว่า global atomics ให้ผลแน่นอน
 
@@ -218,7 +228,7 @@ P2–P4 ใช้ artifact/ABI จาก P1; P5 ต้องได้ circuit ru
 
 ## Out of Scope — งานที่ยังไม่รวม
 
-Universal adapters, การรับโมเดลทุกตระกูล, การดาวน์โหลด merged Qwen3.5, host calculator สำหรับคำตอบจริง, การเปลี่ยน quantization หรือขนาด context เงียบ ๆ, การปรับ TDR/ความปลอดภัย, การเปลี่ยน defaults/deploy และข้ออ้างว่าคุณภาพโค้ดหรือ 3D ดีขึ้นโดยยังไม่ทดสอบ
+ขอบเขต foundation P0–P8 ยังไม่รวม Universal adapters, การรับโมเดลทุกตระกูล หรือข้ออ้างว่าคุณภาพโค้ด/3D ดีขึ้นโดยยังไม่ทดสอบ งานต่ออยู่ใน capability roadmap ห้ามใช้ host calculator สำหรับคำตอบจริง เปลี่ยน quantization/context เงียบ ๆ ดาวน์โหลด merged Qwen3.5 หรือปรับ TDR/ความปลอดภัย การเปลี่ยน hub default ทำได้เฉพาะเมื่อผ่าน G9 ตามคำสั่งล่าสุด
 
 v1 ยังไม่รับทุก execution mode ต้องรองรับหรือปฏิเสธแต่ละชุดอย่างชัดเจน การใช้ storage เก็บไฟล์ไม่ได้ทำให้ working state ที่วงจรต้องใช้บน GPU หายไป
 
@@ -232,23 +242,25 @@ Gyro-M ใช้ routed experts แบบ TQ2_T การมี geometry หร�
 
 เมื่อผู้ใช้อนุญาตให้ปิด private-commit cap เฉพาะการทดสอบ จึงรัน workload เดิมโดยคง main, Gyro-M 262K, 5 workers และ cache settings เดิม อ่าน job configuration กลับแล้วไม่พบ process/job memory limit และยังมี kill-on-close รอบนี้โหลดสำเร็จและสร้าง 16 output tokens ได้จริง พร้อม counters ของ secondary compute และ MTP ผลนี้ยืนยัน component inference smoke และอธิบายสาเหตุของ startup failure ที่เกิดจาก cap ของ harness ไม่ได้ยืนยัน raw-token parity, คุณภาพเลขคำนวณ หรือ performance readiness
 
-ข้อยกเว้นนี้ใช้กับ diagnostic run เท่านั้น ไม่เปลี่ยนกติกางบ 42 GB ของ repo หรือ served settings ค่า private commit ที่วัดได้เกินงบเดิมจึงยังต้องรายงานต่อ resource gate ส่วนวงจร Native Qwenputer และ integration ใน P1 ขึ้นไปยังไม่ได้ implement
+ข้อยกเว้นนี้ใช้กับ diagnostic run เท่านั้น ไม่เปลี่ยนกติกางบ 42 GB ของ repo หรือ served settings ค่า private commit ที่วัดได้เกินงบเดิมจึงยังต้องรายงานต่อ resource gate ณ การทดสอบ startup รอบนั้นยังไม่ได้ implement P1 ปัจจุบัน P1 กำลังทำ exporter/oracles ส่วน Native CUDA และ integration ยังไม่ผ่าน
 
 หลังจากนั้นได้รัน server และ executable ตัวเดียวกับ hub โดยใช้ profile เดิม ไม่มี hard private-commit cap และ API สร้าง reasoning ได้ 16 tokens ก่อนถึงขีดจำกัดของคำขอทดสอบ ผลนี้แยกจาก main component control เพราะ executable และ expert placement ต่างกัน ยืนยันเพียง startup/inference smoke ไม่ใช่คุณภาพคำตอบ, disabled parity, Native memory fit หรือ performance readiness จึงปิดงานตรวจของ P0 แล้วเดิน P1 ต่อ โดยยังไม่อ้างว่า Native runtime ผ่าน
 
 ค่า `system_commit` จาก controller รุ่นแรกติดป้ายผิด เพราะคำนวณจาก `GlobalMemoryStatusEx` เก็บ raw evidence เดิมไว้เป็นประวัติและไม่ใช้ค่านั้นยืนยัน system-wide commit รุ่นที่แก้แล้วแยก system commitment, process private commit, job limits และ peaks พร้อม limit notifications การไม่มี notification ยังใช้สรุปว่าเป็น OS limit ไม่ได้ ส่วนการระบุ expert และขนาด page-rounded ของคำขอที่ล้มเหลวแบบเจาะจงยังไม่ได้ instrument จึงไม่อ้างว่าได้ข้อมูลนั้นแล้ว
 
-P1 เพิ่ม byte-exact tokenizer adapter, bounded ELF/source validation และ offline bootstrap แล้ว หลังอนุมัติ pinned compiler/firmware จึง boot ได้ 62 trace tokens จาก 50 instructions Reference arithmetic `17*23` ให้ `391` ตรง expected ส่วนชุดตรวจล่าสุดมี 63 tests: 60 pass / 3 skip ผลเหล่านี้เป็น input/bootstrap/reference evidence ยังไม่มี exported native artifact, CUDA arithmetic หรือ model integration ที่ผ่านการตรวจ
+P1 มี tokenizer/source/ELF guards, STQPUT01 artifact และ oracle bundle แล้ว Export ซ้ำได้ไฟล์ตรงกันทุก byte; features 550 ตัวเทียบครบ 263,254,200 ค่า ผ่านทั้งหมด ชุด IR arithmetic มี 29 cases รวม 74,406 tokens: ได้คำตอบเลข 21 cases และ explicit errors 8 cases รวม known conservative-capacity refusals 3 cases อีกชุดมี synthetic instruction/fault fixtures 50 cases ผ่านในระดับ IR Held-out acceptance spec 64 cases แยกและยังไม่ execute ชุด regression ก่อนเพิ่ม spec มี 88 pass / 3 skip และ unit spec เพิ่มอีก 1 pass ส่วน tools suite กว้างมี 748 pass / 14 skip / 2 fail ซึ่งยืนยันว่าล้มเหมือนกันบน main เดิม ผลทั้งหมดนี้เป็น offline/compiler/IR evidence ยังไม่มี Native CUDA arithmetic หรือ model integration ที่ผ่านการตรวจ
 
 รายละเอียดระดับ schema, state, token bridge, module inventory และ primary sources อยู่ใน [ข้อกำหนด R2 ทั้งอังกฤษและไทย](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) ซึ่งเป็นส่วนหนึ่งของ PRD นี้ อ้างอิงเป็น R2-public-technical โดยมี payload SHA256 `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`
 
-ถ้า R2 กับ R8 ต่างกัน ให้ใช้ R8 แทนเฉพาะห้ารายการนี้:
+ถ้า R2 กับ R9 ต่างกัน ให้ใช้ R9 แทนเฉพาะเจ็ดรายการนี้:
 
 1. โมเดลทดสอบเปลี่ยนจาก Swift เป็น Gyro-M
 2. ใช้ 262K context, 5 workers ที่เลือกแล้ว โดยตรึง RoPE และ runtime settings เดิมในการเทียบแต่ละ arm
 3. ไฟล์ Swift ที่หายเป็นผลสำรวจในอดีต ไม่ต้อง restore เพื่อ baseline ใหม่
 4. ใช้สถานะหลักฐานปัจจุบันข้างต้นแทนสถานะก่อนรันใน R2 โดยไม่เปลี่ยน identity ของผลทดสอบเก่า
 5. ใช้ operational baseline ตาม hub จริง และเก็บ source-matched development control แยกกัน ไม่เพิ่ม test-only private cap ให้ production baseline
+6. เพิ่มเป้าหมาย capability/residency ตาม roadmap โดยคง P0–P8 เป็น foundation และแยกความสามารถ upstream ที่มีจริงออกจากงานวิจัยหรือแผน
+7. ใช้ rollout policy ล่าสุด: เปิด hub default ได้เมื่อวัดแล้วดีขึ้นโดยไม่พบ trade-off ใน coverage ที่เพียงพอ ถ้ามีต้นทุนหรือยังไม่แน่ชัด ให้เป็น opt-in/non-default พร้อมหลักฐาน
 
 ข้อกำหนดอื่นของ R2 ยังมีผลครบ แผนภาพอธิบายการทำงานและ dependencies ไม่ได้ลด acceptance gates
 
@@ -263,11 +275,11 @@ P1 เพิ่ม byte-exact tokenizer adapter, bounded ELF/source validation �
 <details>
 <summary>English requirements and source references</summary>
 
-## R8 status and precedence
+## R9 status and precedence
 
-Native compiled computation for Strata Flash-Next remains the approved architecture. Gyro-M at 262K context and five CPU workers through the actual hub path is the operational baseline. P0 feasibility passed and P1 implementation is in progress; all later evidence/review gates remain required. The diagrams above distinguish offline preparation, production GPU execution, transactional shadow evaluation, and result replay. They never imply a host calculator.
+Native compiled computation for Strata Flash-Next remains the approved architecture. Gyro-M at 262K context and five CPU workers through the actual hub path is the operational baseline. P0 feasibility and P1 offline export/oracle gates passed; P2 loader work has started and later gates remain required. The diagrams distinguish offline preparation, production GPU execution, transactional shadow evaluation and replay, without a host calculator.
 
-The bilingual [R2-public-technical companion](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) is normative except for five R8 overrides: the Gyro-M test model, the selected 262K/five-worker profile, removal of the obsolete missing-Swift-file blocker, current evidence status, and the actual-hub operational-baseline contract below. Its payload SHA256 is `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`. Preserve historical test identities. Startup/inference smoke is established, while Native ownership correctness, resource fit and performance readiness remain unproved.
+The bilingual [R2-public-technical companion](https://github.com/xenodeve/Strata-xeno/issues/276#issuecomment-6479163682) is normative except for seven R9 overrides: the Gyro-M test model, the selected 262K/five-worker profile, removal of the obsolete missing-Swift-file blocker, current evidence status, the actual-hub operational-baseline contract below, the overarching capability/residency roadmap, and the latest conditional rollout authority. Its payload SHA256 is `e2b47234a3767b95eb838c7380d5f6d9d4d657f6e460bac4a4276edf5de54204`. Preserve historical test identities. Startup/inference smoke is established, while Native ownership correctness, resource fit and performance readiness remain unproved.
 
 Controlled baseline/candidate arms use identical 262K context, original RoPE settings, five workers, model/tokenizer/MTP inputs and runtime configuration. Only executable and task-owned evidence/output paths differ. Learned expert profiles start from byte-identical copies and cannot mutate the serving profile or each other's initial inputs.
 
@@ -285,11 +297,19 @@ This exception applies only to the diagnostic run. It changes neither the reposi
 
 A subsequent smoke used the actual hub server/executable and unchanged profile settings without a hard private-commit cap. Its API produced 16 reasoning tokens before the test request's token limit. It is distinct from the main component control because the executable and observed expert placement differ. This establishes startup/inference smoke only, not final-answer quality, disabled parity, Native memory fit or performance readiness. P0 evidence is complete and P1 is underway; Native runtime is not yet validated.
 
-P1 now includes the byte-exact tokenizer adapter, bounded ELF/source validation and offline bootstrap. After approval of the pinned compiler/firmware, boot completed in 62 trace tokens and 50 instructions. Reference arithmetic `17*23` returned the expected `391`; the latest suite has 63 tests: 60 passed and three skipped. These are input/bootstrap/reference results; an exported native artifact, CUDA arithmetic and model integration are not yet validated.
+P1 includes tokenizer/source/ELF guards, a reproducible STQPUT01 artifact and oracle bundle. Repeated exports match byte for byte; 550 features passed 263,254,200 complete-domain comparisons. Checked original-IR arithmetic covers 29 cases/74,406 tokens: 21 solved math cases and eight explicit errors, including three known conservative-capacity refusals. Fifty first-party synthetic instruction/fault cases passed original IR. A separate 64-case held-out acceptance specification remains unexecuted. Regression before that added spec passed 88 tests with three skips; its additional unit test passed. The broader tools unit suite had 748 passes/14 skips/two failures, both reproduced on unchanged main. These are offline/compiler/IR results; Native CUDA arithmetic and integrated-model behavior remain unverified.
 
 The first controller's system_commit label was incorrect because it was calculated from GlobalMemoryStatusEx. Preserve that raw historical evidence but do not treat it as authoritative system-wide commitment. Corrected telemetry separates system commitment, process private commitment, job limits, peaks and limit notifications. Missing notifications cannot prove an OS limit. The exact failed expert and page-rounded request identity were not instrumented and are not claimed.
 
-The English requirements below retain the detailed Native contracts; apply the five R8 overrides above wherever older test-baseline assumptions occur.
+The English requirements below retain the detailed Native foundation contracts; apply the seven R9 overrides above wherever older assumptions occur. P0–P8 are not completion of the entire upstream-capability goal.
+
+R9 adds the [capability roadmap](2026-10-28-qwenputer-capability-roadmap.md): adapt real upstream capabilities with their maturity clearly stated, Native first and Universal later. Evaluate spontaneous model selection/arguments/execution/incorporation, unnecessary and unsupported calls, external tools per successfully solved task, and multi-step math formulation/execution/interpretation separately. Coding/debug means bounded compiled programs, test generation, execution, state/output inspection, revision and reruns against independent held-out tests; it does not establish self-editing learned weights or a general debugger. Model-addressable store/filesystem is distinct from P6 snapshots. Geometry/advanced math need numerical contracts and task tests; proposed upstream skills are not released functionality. Source and capability evidence, remaining adapters and C0–C5/research milestones are recorded in the roadmap. Current calc firmware approval does not cover new firmware.
+
+All outcomes remain joint goals: an internal hypothesis/logic/debug sandbox; exact execution and improved verified math/code results; fewer reasoning tokens, feedback-prefill tokens and retained context; fewer external tools and irrelevant feedback; more successful tasks per token; lower time to correct results; upstream capability adaptation; and practical optimization/residency/offload. The roadmap maps every goal to milestones and evidence. The central loop reads source once or reuses a valid canonical cached prefix, formulates a hypothesis, executes supported logic/tests internally, observes compact useful feedback and revises/reruns. Return values, expected/actual, failed assertions, minimal counterexamples or relevant state locations, with bounded detail on demand. Source edits update/invalidate prefix identity. The external-tool baseline also uses normal valid prefix caching. Separate initial/feedback prefill, reasoning decode, execution, bridge and orchestration; record iterations, fresh-feedback tokens, context growth, circuit steps/time and latency to a held-out-test-verified fix, including complex multi-iteration tasks.
+
+Optimize from measured mechanisms without reducing correctness or workload. Compare lean all-resident circuits, whole-module on-demand and justified per-layer strategies, separating immutable weights, active GDN/lag/bridge state, scratch, committed/shadow state and cold snapshots. Implement missing residency/cache/graph-lifecycle support when evidence justifies it; existing expert offload is neither automatic circuit support nor a permanent restriction. V1 static reservation remains the correctness baseline. Profile first and validate exactness/address stability, first-call/warm/tail latency, memory peaks and expert-cache impact.
+
+Use actual hub/Gyro-M262K/five-worker end-to-end task latency, first result, trace/entry/replay, ordinary-text overhead, cold/warm/tail, startup, RAM/VRAM/transient peaks, expert hits, cancellation/UI responsiveness and repeated-session stability. Reference/oracle/checksum work is outside timed intervals. A reversible hub default is authorized only after measured benefit with no observed trade-off over adequately covered intended usage. Memory cost, slow first call, narrower compatibility or other trade-offs stay opt-in; incomplete coverage or uncertain downside stays non-default. Do not interrupt active user sessions casually. No result yet qualifies for default activation.
 
 ## Problem Statement
 
@@ -394,7 +414,7 @@ Search used git grep/git ls-files across engine, headers, serving, tokenizer, te
 | G6 Disabled parity | Fresh unchanged baseline vs candidate disabled, same session greedy raw-token parity over code/Thai/ordinary/long-prefix turns; disabled prompt/budget/protocol/snapshot serialization and no circuit allocation match. |
 | G7 Backend/build | Full D2x builds include sm_89 and sm_120, verified binary coverage and an actual secondary-tier smoke before ABBA. Build every backend touched by shared files and preserve Q2 parity (AGENTS.md:44). CUDA real tests come first; unavailable HIP/SYCL execution is explicit implementation-validation debt, not a passed check or a blocker to plan review. |
 | G8 Performance | Timeline first; profiler-off ABBA for disabled parity/ordinary enabled overhead and native arithmetic turns. Record same-run stage counters, hashes, priorities, hit split, draft acceptance, startup/peak RAM/VRAM, entry/exit/host waits, disturbed runs and DONE. Timed intervals exclude oracle/reference/checksum verification; compare results offline and assert no host arithmetic/reference in the production path. Report distributions; the existing 13.6% rule (AGENTS.md:320-321) is a repo heuristic, not statistical significance, and under-gate effects remain unproved without consistent paired repetition. |
-| G9 Release | No served config/default/deployment change from this PRD. User reviews correctness, resource costs and measured latency before opt-in rollout. Universal remains deferred. |
+| G9 Release | Validate correctness/quality, compatibility, ordinary/computation cold/warm/tail latency, memory/cache, startup, repeated sessions and cancellation/stability. Enable a reversible hub default only for demonstrated benefit with no observed trade-off and adequate coverage; otherwise opt-in/non-default with measured costs. Universal remains a later milestone. |
 
 Arithmetic corpus includes signed add/sub/mul, exact rational division, negative floor/modulo, gcd, precedence/powers, decimals within firmware support, 62-digit capacity boundaries, divide-by-zero, capacity/complexity errors, and multi-call continuation. Separate a forced native-call proof from spontaneous model call-use evaluation; neither implies general coding/3D quality improvement.
 
@@ -414,13 +434,13 @@ Arithmetic corpus includes signed add/sub/mul, exact rational division, negative
 
 Each phase is test-first, ends with its own evidence and blueprint update, and remains local until publishing is separately authorized. The companion implementation plan names proposed files, exact seams and per-phase tests; this PRD's decisions describe contracts rather than unstable file locations.
 
-## Out of Scope
+## Outside the P0–P8 foundation
 
-- Universal model adapters, learned model training, arbitrary architecture loading, a merged Qwen3.5 runtime, and general 3D/coding benchmark claims.
-- Host calculator/emulator production fallback, arbitrary C/Python execution, filesystem/network tools or additional privileges.
-- Dynamic D2x expert-cache resizing, a circuit on the display GPU, active working-state paging during bursts, or a default change justified by estimates.
+- Universal, model-addressable store/filesystem, allowlisted program/debug loops and geometry are later roadmap milestones, not claims of foundation completion. No unapproved learned-model training, arbitrary architecture loading, merged Qwen3.5 runtime or untested coding/3D benefit claims.
+- No host calculator/emulator production fallback, arbitrary C/Python/OS filesystem/network execution or additional privileges. New upstream firmware/program digests still need their applicable action-time approval.
+- V1 static primary residency is a correctness baseline. Investigate and implement justified circuit residency/cache adaptations with exactness/address stability and resource/performance evidence. No display-GPU circuit migration, silent active-state paging or default changes justified by estimates.
 - V1 concurrent batch/layer-split/pipelined machine execution and mid-burst session serialization; supported combinations must be explicit.
-- Changing serving configs/launchers, TDR/driver/security settings, installing large dependencies/models, publishing tracker entries, push/PR or deployment during this planning/review phase.
+- Latest G9 permits a reversible hub default only for a demonstrated win without observed trade-off and adequate coverage. Preserve active sessions. TDR/driver/security changes, large installs/downloads, unrelated publication, push/PR and unrelated deployment remain unauthorized.
 
 ## Risks, Approvals and Further Notes
 

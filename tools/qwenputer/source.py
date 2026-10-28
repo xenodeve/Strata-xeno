@@ -1,14 +1,22 @@
 """Verify the complete importable compiler subset before any upstream import."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
+import sys
 
 from tools.qwenputer.tokenizer import NativeInputError
 
 
 REVISION = 'ca13310e2f9f788d1dd3feeea8213c1b0c23913c'
 MANIFEST_SHA256 = 'a5519351051213218a2236f1a4737af0e26e310fe3fb74d3f9269ef5bfd8c7c5'
+
+
+def require_compiler_environment():
+    # Setting the variable after Python starts does not fix its hash seed.
+    if os.environ.get('PYTHONHASHSEED') != '0' or sys.flags.hash_randomization != 0:
+        raise NativeInputError('compiler_hash_seed')
 
 
 def verify_source(root: Path) -> dict:
