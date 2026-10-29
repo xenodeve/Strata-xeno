@@ -19,6 +19,7 @@
 #include "strata/program/igc_observation.hpp"
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
 #include "strata/program/igc_output_diagnostic.hpp"
+#include "strata/program/igc_learned_diagnostic.hpp"
 #endif
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -451,7 +452,7 @@ struct Options {
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
     std::string dump_mixed;
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
-    std::string igc_output_artifact,igc_output_fixture;
+    std::string igc_output_artifact,igc_output_fixture,igc_learned_bundle;
 #endif
     /// One residual snapshot per layer per position: `n_layers * hc * n_embd` floats per position, appended in
     /// position order.  This is the C1 BISECTION LADDER - it is what `llama-debug --tensor-filter l_last` prints
@@ -948,6 +949,7 @@ void usage() {
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
                  "  --igc-output-diagnostic-artifact PATH  controlled I3 native mapper (not production)\n"
                  "  --igc-output-diagnostic-fixture PATH   exact-prefix checked-result fixture\n"
+                 "  --igc-learned-diagnostic-bundle PATH  learned first-anchor controller (not production)\n"
 #endif
                  "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
                  "                       event interval includes host gaps, so run with --gpu-only-full first\n"
@@ -2534,6 +2536,7 @@ int main(int argc, char** argv) {
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
         else if (a == "--igc-output-diagnostic-artifact") o.igc_output_artifact = next("--igc-output-diagnostic-artifact");
         else if (a == "--igc-output-diagnostic-fixture") o.igc_output_fixture = next("--igc-output-diagnostic-fixture");
+        else if (a == "--igc-learned-diagnostic-bundle") o.igc_learned_bundle = next("--igc-learned-diagnostic-bundle");
 #endif
         else if (a == "--dump-layers") o.dump_layers = next("--dump-layers");
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
@@ -2908,6 +2911,17 @@ int main(int argc, char** argv) {
         }   // if (!matched)
         }   // if (!parsed)
     }
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    if(!o.igc_learned_bundle.empty()) {
+        if(!o.igc_output_artifact.empty() || !o.igc_output_fixture.empty()) {
+            std::fprintf(stderr,"IGC learned diagnostic cannot combine with controlled output fixtures\n");return 2;
+        }
+        if(!o.serve || o.batch!=0 || !o.layer_split.empty() || !o.split_device.empty()
+                || o.pipeline_windows>0 || o.native_preset.empty() || !o.cvec_files.empty()) {
+            std::fprintf(stderr,"IGC learned diagnostic requires native serve, one session, no layer/pipeline split or control vectors\n");return 2;
+        }
+    }
+#endif
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
@@ -3266,6 +3280,24 @@ int main(int argc, char** argv) {
         // Plan v0.3 (24 Sep): the CPU experts stay on the VNNI kernel.  The llama.cpp-CPU-exact q8_0 contract
         // cost 27.0 vs 17.2 ms/token of pool time and G-C does not need it; `--cpu-oracle-q8-0` still selects it.
     }
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    if(!o.igc_learned_bundle.empty()) {
+        // Preset expansion has now resolved every native shard and default
+        // dense/head source. Never bind model A then execute an override from B.
+        auto bound_source=[&](const std::string& path) {
+            if(path.empty())return true;
+            for(const auto& native:o.native_shards) {
+                std::error_code ignored;
+                if(std::filesystem::equivalent(path,native,ignored))return true;
+            }
+            return false;
+        };
+        if(o.native_shards.empty() || !bound_source(o.embd_gguf) || !bound_source(o.native_head_gguf)
+                || !bound_source(o.ple_gguf) || !std::all_of(o.native_dense_gguf.begin(),o.native_dense_gguf.end(),bound_source)) {
+            std::fprintf(stderr,"IGC learned diagnostic requires bound model sources for embedding, dense, head and PLE\n");return 2;
+        }
+    }
+#endif
     if (o.logits_stride > 1 && (o.max_new != 1 || o.dump_logits.empty())) {
         std::fprintf(stderr, "strata generate: --logits-stride > 1 requires --max-new 1 and --dump-logits\n");
         return 2;
@@ -3489,6 +3521,18 @@ int main(int argc, char** argv) {
 
     std::string err;
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    std::unique_ptr<strata::program::IgcLearnedDiagnostic> igc_learned;
+    if(!o.igc_learned_bundle.empty()) {
+        igc_learned=std::make_unique<strata::program::IgcLearnedDiagnostic>();
+        std::vector<std::filesystem::path> model_paths;
+        for(const auto& path:o.native_shards)model_paths.emplace_back(path);
+        std::fprintf(stderr,"strata IGC learned: validating bundle and content-binding model/tokenizer before allocation\n");
+        if(!igc_learned->load_host(o.igc_learned_bundle,err)
+                || !igc_learned->bind(std::filesystem::path(o.pack)/"tokenizer",model_paths,err)) {
+            std::fprintf(stderr,"strata IGC learned: %s\n",err.c_str());return 2;
+        }
+        std::fprintf(stderr,"strata IGC learned: first-anchor diagnostic; batched-missing features bypass, no oracle operands\n");
+    }
     std::unique_ptr<strata::program::IgcOutputDiagnostic> igc_output;
     if(!o.igc_output_artifact.empty() || !o.igc_output_fixture.empty()) {
         if(o.igc_output_artifact.empty() || o.igc_output_fixture.empty() || !o.serve || o.batch!=0 ||
@@ -8413,6 +8457,12 @@ int main(int argc, char** argv) {
         }
         strata::prefill::Prefill sp;
         strata::prefill::Prefill sp2;   // #35 D7: the wave's second lane
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+        if(igc_learned) {
+            sp.igc_early_consumer=igc_learned->prefill_consumer();
+            sp2.igc_early_consumer=igc_learned->prefill_consumer();
+        }
+#endif
         std::shared_ptr<strata::prefill::Prefill::WaveLink> sp_wave;
         bool sp_layout_wave = false;   // #35 D7: the lanes are laid out as a wave (else lane 1 alone over the region)
         bool sp_part_wave = false;     // this part of the prompt runs through both lanes
@@ -9154,7 +9204,11 @@ int main(int argc, char** argv) {
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
         ver.set_remote_expert_opt(remote_opt.get());
-        const bool early_observing = !o.dump_mixed.empty() && !pipe && !multi_gpu && !batch_mtp;
+        const bool early_observing = (!o.dump_mixed.empty()
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+            || igc_learned
+#endif
+            ) && !pipe && !multi_gpu && !batch_mtp;
         if (early_observing && !ver.enable_early_observation(true)) {
             std::fprintf(stderr, "strata serve: early observation must be configured before verifier init\n");
             return 1;
@@ -9163,6 +9217,9 @@ int main(int argc, char** argv) {
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
         if(igc_output && !ver.set_diagnostic_head_transform(igc_output->hook())) {
             std::fprintf(stderr,"strata IGC diagnostic: hook configuration failed\n");return 2;
+        }
+        if(igc_learned && !ver.set_diagnostic_head_transform(igc_learned->hook())) {
+            std::fprintf(stderr,"strata IGC learned: hook configuration failed\n");return 2;
         }
 #endif
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
@@ -12212,6 +12269,10 @@ int main(int argc, char** argv) {
                     if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+            const bool igc_same_live = igc_learned && live_ok && req_slot==active_slot
+                && req_imgs.empty() && starts_with(live,live_imgs);
+#endif
             if (req_slot < 0 || req_slot > 3) {
                 std::printf("ERR cache_slot must be 0 through 3\n"); std::fflush(stdout); continue;
             }
@@ -12553,6 +12614,12 @@ int main(int argc, char** argv) {
             const double tl_req0 = strata::timeline::now_us();
             if (use_mtp) mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+            if(igc_learned && !igc_learned->begin(cur,read_from,igc_same_live && from_live && reread_to<=0,
+                    req_imgs.empty(),err)) {
+                std::printf("ERR %s\n",err.c_str());return serve_fatal();
+            }
+#endif
             conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
@@ -12764,6 +12831,9 @@ int main(int argc, char** argv) {
                         return false;
                     trace_commit(drive, T, T - 1, strata::core::routing_trace::kPhasePrompt);   // #85: prompt windows commit every position
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                    if(igc_learned && !igc_learned->capture(ver,q,std::span<const int64_t>(cur.data()+q,T),e))return false;
+#endif
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -12913,11 +12983,20 @@ int main(int argc, char** argv) {
                 }();
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
-                if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                if (piece <= 0) {
+                    if(!sp.run(ids.data()+a0,b0-a0,a0,e))return false;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                    if(igc_learned && !igc_learned->accept_prefill(a0,std::span<const int64_t>(ids.data()+a0,b0-a0),e))return false;
+#endif
+                    return true;
+                }
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + piece);
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                    if(igc_learned && !igc_learned->accept_prefill(q,std::span<const int64_t>(ids.data()+q,r-q),e))return false;
+#endif
                     q = r;
                     if (q >= b0) continue;
                     int ys = -1;
@@ -13124,7 +13203,13 @@ int main(int argc, char** argv) {
                 auto run_prompt = [&](int64_t a, int64_t b, std::string& e) -> bool {
                     if (!sp_wave || !sp_part_wave) return read_part(a, b, e);   // (upstream: BYIELD pieces beside batch slots)
                     // #35 D7: both lanes over this part, the second on its own thread
-                    return strata::prefill::Prefill::run_wave(sp, sp2, *sp_wave, ids.data() + a, b - a, a, g.n_layers, e);
+                    if(!strata::prefill::Prefill::run_wave(sp,sp2,*sp_wave,ids.data()+a,b-a,a,g.n_layers,e))return false;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                    // This branch bypasses read_part(): publishing snapshots is
+                    // not accepted-input ownership. Advance it only on success.
+                    if(igc_learned && !igc_learned->accept_prefill(a,std::span<const int64_t>(ids.data()+a,b-a),e))return false;
+#endif
+                    return true;
                 };
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
                 const bool sp_ok = win ? read_windows(at, to, err) : run_prompt(at, to, err);
@@ -13972,6 +14057,9 @@ int main(int argc, char** argv) {
                 if(first_window && igc_output && !igc_output->stage(ids,err)) {
                     std::printf("ERR %s\n",err.c_str());return serve_fatal();
                 }
+                if(first_window && igc_learned && !igc_learned->stage(err)) {
+                    std::printf("ERR %s\n",err.c_str());return serve_fatal();
+                }
 #endif
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -14117,6 +14205,16 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return serve_fatal();
                 }
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                if(igc_learned) {
+                    std::array<int64_t,64> accepted;
+                    std::copy_n(window.begin(),a+1,accepted.begin());
+                    if(!igc_learned->capture(ver,p,std::span<const int64_t>(accepted.data(),a+1),err)) {
+                        if(adapt_thr.joinable())adapt_thr.join();
+                        std::printf("ERR %s\n",err.c_str());return serve_fatal();
+                    }
+                }
+#endif
                 ple_ahead.start(ss, o.ple_ahead > 0);   // #44 D4: the next window starts with outv[a]
                 ple_ahead.push(outv[(size_t) a]);
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
@@ -14196,6 +14294,20 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return serve_fatal();   // xeno #53: never unwind main from the serve loop
             }
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+            if(igc_learned) {
+                strata::igc::Invocation record;uint32_t status=0;
+                if(!igc_learned->audit(record,status,err)) {
+                    std::printf("ERR %s\n",err.c_str());return serve_fatal();
+                }
+                // Request-end diagnostic only. The model consumes device state;
+                // this hex receipt is never fed back as language-model context.
+                std::fprintf(stderr,"strata IGC learned audit: head_status=%u record=",status);
+                const auto* bytes=reinterpret_cast<const unsigned char*>(&record);
+                for(std::size_t j=0;j<sizeof(record);++j)std::fprintf(stderr,"%02x",bytes[j]);
+                std::fputc('\n',stderr);
+            }
+#endif
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;

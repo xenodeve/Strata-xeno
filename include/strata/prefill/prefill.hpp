@@ -15,6 +15,9 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+#include "strata/core/early_activations.hpp"
+#endif
 
 #include <cstdint>
 #include <functional>
@@ -209,6 +212,11 @@ public:
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
     /// K/V from them.  The prefill stream is synchronized before the call.
     std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    // First-party diagnostic only; set before init. Two bounded early tails are
+    // consumed at the existing ordered wave tail, before this lane reuses them.
+    core::EarlyActivationConsumer igc_early_consumer;
+#endif
 
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
     /// is still at that chunk's end (its stream synchronized; the last stage calls it just before `on_chunk`).  An

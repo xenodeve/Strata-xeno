@@ -1,6 +1,6 @@
 """Offline native teacher-forced output positions, not a trained adapter or benchmark."""
+from tools.igc.hub_contract import validate_launcher_env,current_job
 import argparse
-import ctypes
 import hashlib
 import importlib.util
 import json
@@ -18,7 +18,7 @@ from tools.igc.output_corpus import dataset
 from tools.igc.output_examples import position_examples,wrapped_prefix
 from tools.igc.observation import load_observation,_read
 from tools.igc.provenance import verify_sources
-from tools.qwenputer.memory import system_snapshot,process_snapshot,ExtendedLimit,job_fields
+from tools.qwenputer.memory import system_snapshot,process_snapshot
 from tools.qwenputer.tokenizer import NativeText
 
 
@@ -26,11 +26,6 @@ def digest(path):
     with Path(path).open('rb') as source:return hashlib.file_digest(source,'sha256').hexdigest()
 
 
-def validate_launcher_env(env):
-    # Actual selected launcher, strata-hub.bat:131-132. Profile JSON alone does
-    # not carry these settings; refusing here avoids allocating on the wrong GPU.
-    if env.get('CUDA_VISIBLE_DEVICES')!='1,0' or env.get('CUDA_DEVICE_ORDER','')!='':
-        raise ValueError('output collector requires selected Hub launcher CUDA_VISIBLE_DEVICES=1,0 and default CUDA_DEVICE_ORDER')
 
 
 def operand(value):
@@ -59,13 +54,6 @@ def checked_results(rows,examples,executable,output,env):
     return values
 
 
-def current_job():
-    info=ExtendedLimit();query=ctypes.WinDLL('kernel32',use_last_error=True).QueryInformationJobObject
-    query.argtypes=[ctypes.c_void_p,ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32,ctypes.c_void_p]
-    if not query(None,9,ctypes.byref(info),ctypes.sizeof(info),None):raise ctypes.WinError(ctypes.get_last_error())
-    value=job_fields(info)
-    if value['limit_flags']&0x300:raise RuntimeError('output collection must not have a private/job commit cap')
-    return value
 
 
 def collect(profile,server,executable,exact_executable,pack,reference,sources,protocol,output,readiness_anchors=False,readiness_augmentation=False):

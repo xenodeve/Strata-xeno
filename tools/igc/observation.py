@@ -9,7 +9,14 @@ import json
 from pathlib import Path
 import stat
 import struct
-import numpy as np
+
+
+def load_prefix(root, index):
+    """Bounded original input tokens only; no tensor/array runtime allocation."""
+    _, _, meta, meta_raw, tokens_raw, tokens = _prefix_parts(root, index)
+    return {**meta, 'prefix_tokens':list(tokens),
+            'prefix_sha256':hashlib.sha256(tokens_raw).hexdigest(),
+            'metadata_sha256':hashlib.sha256(meta_raw).hexdigest()}
 
 
 def _read(path, size=None, limit=1 << 20):
@@ -27,7 +34,7 @@ def _read(path, size=None, limit=1 << 20):
         raise ValueError('observation file unavailable') from error
 
 
-def load_observation(root, index):
+def _prefix_parts(root, index):
     if type(index) is not int or not 0 <= index < 1024:
         raise ValueError('observation index')
     root = Path(root)
@@ -48,9 +55,16 @@ def load_observation(root, index):
     if not 1 <= count <= 262144 or meta['position'] != count-1 or not 0 <= meta['token'] < 248320:
         raise ValueError('observation boundary')
     tokens_raw = _read(root / (prefix + '.tokens.bin'), count*4)
-    tokens = np.frombuffer(tokens_raw, dtype='<i4')
-    if np.any(tokens < 0) or np.any(tokens >= 248320) or tokens[-1] != meta['token']:
+    tokens = struct.unpack('<'+'i'*count, tokens_raw)
+    if any(token < 0 or token >= 248320 for token in tokens) or tokens[-1] != meta['token']:
         raise ValueError('observation token prefix')
+    return root,prefix,meta,meta_raw,tokens_raw,tokens
+
+
+def load_observation(root, index):
+    import numpy as np
+    root,prefix,meta,meta_raw,tokens_raw,_ = _prefix_parts(root,index)
+    tokens = np.frombuffer(tokens_raw, dtype='<i4')
     mixed_raw = _read(root / prefix, 2560*4)
     logits_raw = _read(root / f'logits.{index}', 248320*4)
     mixed = np.frombuffer(mixed_raw, dtype='<f4')
@@ -66,6 +80,7 @@ def load_observation(root, index):
 
 def load_preanchor(root,index,stage='final'):
     """Only observed F32 rows; absence in a valid prefix cache is explicit."""
+    import numpy as np
     anchor=load_observation(root,index)
     contracts={'final':(b'IGCPREA1','preanchor','head_mixed_after_final_hc'),
                'embedding':(b'IGCEMB01','embedding','native_embedding_broadcast'),

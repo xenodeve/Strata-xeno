@@ -2,6 +2,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import subprocess
+import sys
+import os
 import numpy as np
 from tools.igc.observation import load_observation
 
@@ -28,6 +31,17 @@ class Observation(unittest.TestCase):
         self.assertEqual(record['mixed'].shape,(2560,))
         self.assertEqual(record['logits'].shape,(248320,))
         self.assertEqual(len(record['prefix_sha256']),64)
+
+    def test_prefix_only_reader_does_not_load_array_runtime(self):
+        script = ('import sys,json;from tools.igc.observation import load_prefix;'
+                  'r=load_prefix(sys.argv[1],0);'
+                  'assert r["prefix_tokens"]==[10,20,271];'
+                  'assert "numpy" not in sys.modules;print(r["prefix_sha256"])')
+        result = subprocess.run([sys.executable,'-B','-c',script,str(self.root)],
+                                capture_output=True,timeout=30,
+                                creationflags=0x08000000 if os.name=='nt' else 0)
+        self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
+        self.assertEqual(result.stdout.decode().strip(),load_observation(self.root,0)['prefix_sha256'])
 
     def test_wrong_boundary_or_prefix_is_rejected(self):
         for key,value in [('position',1),('token',272),('row',1),('n_embd',2561),('version',2)]:

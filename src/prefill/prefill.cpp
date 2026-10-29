@@ -1,5 +1,8 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+#include "strata/core/igc_prefill_snapshot.hpp"
+#endif
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
@@ -1118,6 +1121,9 @@ struct SplitTier {
 };
 
 struct Prefill::Impl {
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    std::unique_ptr<igc::PrefillSnapshot> igc_early;
+#endif
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -1435,6 +1441,9 @@ void Prefill::release() {
     auto T_ = [&](const char* w) { if (tr) { std::fprintf(stderr, "exit trace: ~Prefill %s\n", w); std::fflush(stderr); } };
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    impl_->igc_early.reset();
+#endif
     T_("cs synced");
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     T_("copy synced");
@@ -1899,6 +1908,16 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    if(igc_early_consumer.consume) {
+        if(!igc_early_consumer.user || stage_lb_!=0){err="prefill: IGC early consumer requires stage0 ownership";return false;}
+        if(!m.igc_early) {
+            auto snapshot=std::make_unique<igc::PrefillSnapshot>();
+            if(!snapshot->allocate(m.cs,err))return false;
+            m.igc_early=std::move(snapshot);
+        }
+    }else m.igc_early.reset();
+#endif
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
     for (int b = 0; next_ != nullptr && b < 2; ++b)
@@ -2786,6 +2805,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
         }
         if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);   // (upstream) a later layer-split stage has R
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+        if(m.igc_early && !m.igc_early->stage(core::EarlyActivationTap::Embedding,m.R,p0,T,m.cs,err))return false;
+#endif
         if (tl_embed > 0) timeline::complete("embed (host)", tl_embed, timeline::now_us(), c0, T);
         // ---- the PLE rows of the whole chunk, one batched SSD request, read on a thread (see ple_gather).  Only the
         // PLE block at layer 1 reads them, so the chunk waits for them there (ple_take below).  #31: the first chunk's
@@ -4629,6 +4651,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (wave && half == 0 && !(split_on && split_layer(l))) wave->publish_attn(chunk_i, l, m.cs);
                 if (steered && !cv_fused)   // --control-vector-scaled (S23 STRATA_CVEC_FUSE: applied in the write)
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                if(m.igc_early && l==0 && half==0
+                        && !m.igc_early->stage(core::EarlyActivationTap::FirstAttention,m.R,p0,T,m.cs,err))return false;
+#endif
             }
         }
         if (!ple_take()) return false;   // upstream 0.1.38: a stage that ends before layer 1 - the rows land anyway, the next gather starts
@@ -4696,7 +4722,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fclose(f);
             }
         }
-        if (on_chunk || on_stage_chunk) {
+        if (on_chunk || on_stage_chunk
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                || m.igc_early
+#endif
+                ) {
             const auto toc = Clock::now();
             {
                 timeline::Span sync_span("chunk tail (sync)", c0, T);   // the GPU finishing the chunk's last layers
@@ -4707,6 +4737,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             const auto toc2 = Clock::now();
             if (wave && chunk_i > 0 && !wave->wait_tail(chunk_i - 1)) { err = "prefill: the other wave lane failed"; return false; }
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+            if(m.igc_early && !m.igc_early->emit(igc_early_consumer,err))return false;
+#endif
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             timeline::Span on_chunk_span("on_chunk (drafter)", c0, T);
             if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
