@@ -68,5 +68,14 @@ inline constexpr std::array<Tensor,15> tensors2 {{
     {"gate.bias",1,{1,0,0,0},1},
 }};
 inline constexpr Schema schema2 {2,{142,68,48,20,234,147,222,36,14,204,195,47,199,161,150,250,7,50,28,221,89,75,47,2,53,8,83,193,108,222,35,149},tensors2};
-inline Schema get(uint32_t kind) { if(kind==1)return schema1; if(kind==2)return schema2; return {}; }
+inline constexpr std::array<Tensor,6> tensors3 {{
+    {"mean",1,{2560,0,0,0},2560},
+    {"scale",1,{2560,0,0,0},2560},
+    {"0.weight",2,{128,2560,0,0},327680},
+    {"0.bias",1,{128,0,0,0},128},
+    {"2.weight",2,{2,128,0,0},256},
+    {"2.bias",1,{2,0,0,0},2},
+}};
+inline constexpr Schema schema3 {3,{168,205,254,64,102,24,14,44,244,18,227,194,209,57,188,138,185,76,51,163,193,209,62,146,236,160,117,228,39,184,64,250},tensors3};
+inline Schema get(uint32_t kind) { if(kind==1)return schema1; if(kind==2)return schema2; if(kind==3)return schema3; return {}; }
 } // namespace strata::igc::adapter_schema

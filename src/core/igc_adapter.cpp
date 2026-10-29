@@ -43,7 +43,7 @@ bool parse(std::span<const uint8_t> bytes,const Binding& binding,bool allow_diag
        definition.kind==0 || scalar<uint32_t>(bytes,16)!=1 || count==0 || count>128 ||
        count!=definition.tensors.size() || scalar<uint32_t>(bytes,24)!=2560 ||
        scalar<uint32_t>(bytes,28)!=4 || scalar<uint32_t>(bytes,32)!=(kind==1?80u:0u) ||
-       scalar<uint32_t>(bytes,36)!=(kind==1?2u:62u) || scalar<uint32_t>(bytes,40)!=1 ||
+       scalar<uint32_t>(bytes,36)!=(kind==2?62u:2u) || scalar<uint32_t>(bytes,40)!=1 ||
        scalar<uint32_t>(bytes,44)!=1 || scalar<uint32_t>(bytes,48)!=7 || scalar<uint32_t>(bytes,52)!=0 ||
        !zeros(bytes.subspan(224,32)) || digest_at(bytes,64)!=binding.model ||
        digest_at(bytes,96)!=binding.tokenizer || digest_at(bytes,192)!=definition.digest)
@@ -70,13 +70,16 @@ bool parse(std::span<const uint8_t> bytes,const Binding& binding,bool allow_diag
                 return fail(error,"igc_adapter_tensor_shape");
         if(!zeros(bytes.subspan(start+static_cast<std::size_t>(cursor),static_cast<std::size_t>(offset-cursor))))
             return fail(error,"igc_adapter_tensor_padding");
-        for(uint64_t j=0;j<elements;++j)
+        for(uint64_t j=0;j<elements;++j) {
             if((scalar<uint32_t>(bytes,start+static_cast<std::size_t>(offset+j*4))&0x7f800000u)==0x7f800000u)
                 return fail(error,"igc_adapter_nonfinite");
+            if(kind==3 && expected.name=="scale" && scalar<float>(bytes,start+static_cast<std::size_t>(offset+j*4))<0.0001f)
+                return fail(error,"igc_adapter_readiness_scale");
+        }
         cursor=offset+elements*4;
     }
     if(cursor!=payload_bytes)return fail(error,"igc_adapter_unused_payload");
-    Artifact candidate;candidate.kind=kind;candidate.max_digits=kind==1?2u:62u;
+    Artifact candidate;candidate.kind=kind;candidate.max_digits=kind==2?62u:2u;
     candidate.state=digest_at(bytes,128);candidate.protocol=digest_at(bytes,160);candidate.schema=definition.digest;
     candidate.offsets.reserve(count);candidate.payload.resize(static_cast<std::size_t>(payload_bytes/4));
     std::memcpy(candidate.payload.data(),bytes.data()+start,static_cast<std::size_t>(payload_bytes));

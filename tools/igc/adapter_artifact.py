@@ -48,6 +48,12 @@ def schema(kind):
             semantics=dict(name='late-gated-integer-result-v1',width=2560,result_digits=62,
                            features=12,attention_width=128,attention_scale='sqrt(128)',
                            layernorm_eps=1e-5,gate='sigmoid',non_success='hard-bypass',max_digits=62)
+        elif kind==3:
+            from tools.igc.readiness_mapping import ReadinessMapper
+            model=ReadinessMapper()
+            semantics=dict(name='final-state-binary-readiness-v1',width=2560,hidden=128,classes=2,
+                           activation='gelu-exact',normalization='fit-only-mean-scale',min_scale=0.0001,
+                           decision='argmax-tie-to-zero',max_digits=2)
         else:raise ValueError('unknown neural adapter kind')
         tensors=[dict(name=name,shape=list(value.shape)) for name,value in model.state_dict().items()]
     record=dict(kind=kind,semantics=semantics,tensors=tensors,
@@ -66,13 +72,15 @@ def pack_state(kind,weights,model_sha256,tokenizer_sha256,state_sha256,protocol_
         if (not isinstance(tensor,torch.Tensor) or tensor.dtype!=torch.float32 or tensor.device.type!='cpu'
                 or list(tensor.shape)!=shape or not bool(torch.isfinite(tensor).all())):
             raise ValueError('adapter tensor dtype/shape/finite values')
+        if kind==3 and record['name']=='scale' and not bool((tensor>=0.0001).all()):
+            raise ValueError('readiness normalization scale')
         payload+=bytes((-len(payload))%16);offset=len(payload)
         data=tensor.detach().contiguous().numpy().astype('<f4',copy=False).tobytes()
         dimensions=shape+[0]*(4-len(shape))
         descriptors+=DESCRIPTOR.pack(index,len(shape),*dimensions,offset,tensor.numel())
         payload+=data
     header=HEADER.pack(b'STIGCM01',1,kind,1,len(expected),2560,4,80 if kind==1 else 0,
-                       2 if kind==1 else 62,1,1,7,0,len(payload),
+                       62 if kind==2 else 2,1,1,7,0,len(payload),
                        _digest(model_sha256),_digest(tokenizer_sha256),_digest(state_sha256),
                        _digest(protocol_sha256),_digest(definition['sha256']),bytes(32))
     body=header+descriptors;body+=bytes((-len(body))%16);body+=payload
@@ -89,8 +97,8 @@ def read_artifact(raw,model_sha256,tokenizer_sha256,artifact_sha256,production=F
     fields=HEADER.unpack_from(raw)
     (magic,version,kind,flags,count,width,hc,window,max_digits,abi,domain,operations,reserved,
      payload_bytes,model,tokenizer,state,protocol,schema_hash,tail_reserved)=fields
-    if (magic!=b'STIGCM01' or version!=1 or kind not in (1,2) or flags!=1 or not 1<=count<=128
-            or (width,hc,window,max_digits,abi,domain,operations,reserved)!=(2560,4,80 if kind==1 else 0,2 if kind==1 else 62,1,1,7,0)
+    if (magic!=b'STIGCM01' or version!=1 or kind not in (1,2,3) or flags!=1 or not 1<=count<=128
+            or (width,hc,window,max_digits,abi,domain,operations,reserved)!=(2560,4,80 if kind==1 else 0,62 if kind==2 else 2,1,1,7,0)
             or tail_reserved!=bytes(32) or model!=expected_model or tokenizer!=expected_tokenizer):
         raise ValueError('adapter header/model/numerical compatibility')
     if production:raise ValueError('diagnostic-only adapter cannot be enabled in production')
@@ -113,6 +121,7 @@ def read_artifact(raw,model_sha256,tokenizer_sha256,artifact_sha256,production=F
         if not np.isfinite(value).all():raise ValueError('adapter tensor nonfinite')
         result[record['name']]=value;cursor=offset+elements*4
     if cursor!=payload_bytes:raise ValueError('adapter unused payload bytes')
+    if kind==3 and not np.all(result['scale']>=np.float32(.0001)):raise ValueError('readiness normalization scale')
     return dict(kind=kind,diagnostic_only=True,max_digits=max_digits,model_sha256=model.hex(),
                 tokenizer_sha256=tokenizer.hex(),state_sha256=state.hex(),protocol_sha256=protocol.hex(),
                 schema_sha256=schema_hash.hex(),tensors=result)
@@ -141,7 +150,7 @@ def read_file(path,model_sha256,tokenizer_sha256,artifact_sha256,production=Fals
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--kind',type=int,choices=(1,2),required=True)
+    parser.add_argument('--kind',type=int,choices=(1,2,3),required=True)
     for name in ('state','output'):parser.add_argument('--'+name,type=Path,required=True)
     for name in ('model-sha256','tokenizer-sha256','protocol-sha256'):parser.add_argument('--'+name,required=True)
     print(json.dumps(export(**vars(parser.parse_args())),indent=2))

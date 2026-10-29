@@ -10,7 +10,7 @@ def render():
            'namespace strata::igc::adapter_schema {',
            'struct Tensor { std::string_view name; uint32_t rank; std::array<uint32_t,4> dimensions; uint64_t count; };',
            'struct Schema { uint32_t kind; std::array<uint8_t,32> digest; std::span<const Tensor> tensors; };']
-    for kind in (1,2):
+    for kind in (1,2,3):
         definition=schema(kind);tensors=definition['tensors']
         lines.append(f'inline constexpr std::array<Tensor,{len(tensors)}> tensors{kind} {{{{')
         for tensor in tensors:
@@ -19,7 +19,7 @@ def render():
             dimensions=','.join(map(str,shape+[0]*(4-len(shape))))
             lines.append(f'    {{"{tensor["name"]}",{len(shape)},{{{dimensions}}},{count}}},')
         lines+=['}};',f'inline constexpr Schema schema{kind} {{{kind},{{'+','.join(str(b) for b in bytes.fromhex(definition['sha256']))+f'}},tensors{kind}'+'};']
-    lines+=['inline Schema get(uint32_t kind) { if(kind==1)return schema1; if(kind==2)return schema2; return {}; }','} // namespace strata::igc::adapter_schema','']
+    lines+=['inline Schema get(uint32_t kind) { if(kind==1)return schema1; if(kind==2)return schema2; if(kind==3)return schema3; return {}; }','} // namespace strata::igc::adapter_schema','']
     return '\n'.join(lines)
 
 
