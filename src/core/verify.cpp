@@ -3021,6 +3021,19 @@ bool Verifier::copy_logits(int t, float* host) const {
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
+bool Verifier::copy_head_input(int t, float* residual, float* mixed) const {
+    if (next_ != nullptr) return next_->copy_head_input(t, residual, mixed);
+    if ((!residual && !mixed) || !g_ || !R_ || !cs_ || device_ < 0 || t < 0 || t >= last_t_ ||
+            (mixed && !head_mixed_)) return false;
+    const OnDevice on_device(device_);
+    const size_t width = static_cast<size_t>(g_->n_embd), hc_width = width * static_cast<size_t>(g_->hc);
+    if (residual && cudaMemcpyAsync(residual, R_ + static_cast<size_t>(t) * hc_width,
+                                   hc_width * sizeof(float), cudaMemcpyDeviceToHost, cs_) != cudaSuccess) return false;
+    if (mixed && cudaMemcpyAsync(mixed, head_mixed_ + static_cast<size_t>(t) * width,
+                                width * sizeof(float), cudaMemcpyDeviceToHost, cs_) != cudaSuccess) return false;
+    return cudaStreamSynchronize(cs_) == cudaSuccess;
+}
+
 
 // ================================ PIPELINED WINDOWS (see verify.hpp) ================================
 //

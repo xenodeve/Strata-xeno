@@ -135,6 +135,23 @@ distractors, quoted arithmetic และ non-arithmetic tasks จาก training
 ไม่มีการดาวน์โหลดโมเดล ติดตั้ง training stack รัน code จากแหล่งใหม่ หรือเปิด training ที่ไม่กำหนด
 ขอบเขตจากแผนนี้โดยอัตโนมัติ งานที่ต้องใช้สิทธิ์เฉพาะยังต้องผ่านขั้นตอนอนุมัติของ action นั้น
 
+## หลักฐาน I0 ที่ได้แล้ว
+
+candidate บน main เก็บ residual และ head input ของ Gyro-M จริงได้แล้ว การรันส่วน head
+ซ้ำให้ logits ทั้ง 248,320 ค่าตรงกันทุกบิต รวมทั้งมี negative control ที่จับไฟล์ผิดได้
+แก้ diagnostics เดิมให้คัดลอกจาก verifier แทน session buffer ที่ไม่ได้ใช้ใน native path
+การแก้นี้ยังไม่ได้เปลี่ยน executable ที่ hub เสิร์ฟอยู่
+
+ทดลอง late head-input variant โดยใช้ native forward และ gradient `W_dequant.T @ delta`
+พร้อม STE ผ่าน Q8_1 หนึ่งก้าวบน capture เดียวทำให้ diagnostic loss ลดลง แต่ยังไม่มี learned
+result mapper หรือการประเมิน generalization ส่วน early-layer variant ยังไม่มี backward suffix
+ที่พิสูจน์แล้ว เก็บทั้งสองสถานะแยกกัน ไม่ใช้ผลนี้ปิด I3 หรืออ้างว่าเหมือนตำแหน่งใน paper
+
+ชุดทดสอบที่เลือกผ่าน 7 tests และ regular head/VJP ผ่าน sanitizer ทั้งสี่ตัว คู่ A/B แรกให้
+8 token ตรงกัน แต่ ABBA ยังไม่ครบเพราะ B2 หยุดที่ guard ของ display GPU ก่อน inference
+ไม่มีการผ่อน guard หรือเปลี่ยน profile ดู hashes, resource observations และช่องว่างที่เหลือใน
+[รายงาน I0](../reports/2026-10-29-igc-i0.md)
+
 ## References
 
 - [IGC paper v1](https://arxiv.org/html/2501.00684v1): method §§3–4, limitations and Appendix B

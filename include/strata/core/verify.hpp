@@ -92,6 +92,10 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
+    /// Diagnostics only: copy a completed window row's actual final HC residual
+    /// and/or head input. Host buffers are hc*n_embd and n_embd floats. Call after
+    /// run(), before another window; synchronizes this verifier's explicit stream.
+    bool copy_head_input(int t, float* residual, float* mixed) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its

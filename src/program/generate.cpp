@@ -7299,6 +7299,8 @@ int main(int argc, char** argv) {
     // position before the last prompt one, the next input is the PROMPT's next token, and after that it is the
     // sampled one.
     std::vector<int64_t> produced;
+    // Opt-in diagnostics: the native verifier owns different buffers from ss.block.
+    std::vector<float> diagnostic_residual, diagnostic_mixed;
     double total_ms = 0;
     double prefill_ms = 0;   // positions 0 .. n_prompt-2: prompt tokens that only condition
     const Clock::time_point t_start = Clock::now();
@@ -15507,6 +15509,15 @@ int main(int argc, char** argv) {
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
             trace_commit(drive, T, a, strata::core::routing_trace::kPhaseDecode);   // #85
+            if (!o.dump_residual.empty() || !o.dump_mixed.empty()) {
+                if (!o.dump_residual.empty()) diagnostic_residual.resize((size_t) g.hc * g.n_embd);
+                if (!o.dump_mixed.empty()) diagnostic_mixed.resize((size_t) g.n_embd);
+                if (!ver.copy_head_input(a, diagnostic_residual.empty() ? nullptr : diagnostic_residual.data(),
+                                          diagnostic_mixed.empty() ? nullptr : diagnostic_mixed.data())) {
+                    std::fprintf(stderr, "strata generate: copying the verifier's diagnostic head input failed\n");
+                    return 1;
+                }
+            }
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -15804,8 +15815,9 @@ int main(int argc, char** argv) {
                     prefill_ms > 0 ? 1000.0 * (double) (n_prompt - 1) / prefill_ms : 0.0, ttft_ms);
     if (!o.dump_mixed.empty()) {
         std::vector<float> mx((size_t) g.n_embd);
-        if (cudaMemcpy(mx.data(), ss.block.mixed, mx.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
-            cudaSuccess) {
+        if (!diagnostic_mixed.empty()) mx = diagnostic_mixed;
+        else if (cudaMemcpy(mx.data(), ss.block.mixed, mx.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
+                 cudaSuccess) {
             std::fprintf(stderr, "strata generate: reading mixed back failed\n");
             return 1;
         }
@@ -15825,7 +15837,8 @@ int main(int argc, char** argv) {
     // ---- the residual, for bisecting the head against the layers (see `dump_residual`'s note)
     if (!o.dump_residual.empty()) {
         std::vector<float> R((size_t) g.hc * g.n_embd);
-        if (cudaMemcpy(R.data(), ss.R, R.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (!diagnostic_residual.empty()) R = diagnostic_residual;
+        else if (cudaMemcpy(R.data(), ss.R, R.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: reading R back failed\n");
             return 1;
         }
