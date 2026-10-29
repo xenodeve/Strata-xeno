@@ -1,4 +1,4 @@
-"""Offline native CUDA replay checks; never imported by the serving runtime."""
+"""Offline native CUDA replay/free-running checks; never serving code."""
 import argparse
 import hashlib
 import json
@@ -10,6 +10,10 @@ import subprocess
 
 from tools.qwenputer.format import decode_sections
 from tools.qwenputer.bundle import file_digest
+
+
+def fault_cases(cases):
+    return {c['name']: c['fault'] for c in cases if c.get('fault') is not None}
 
 
 def inputs_data(stream, text_count):
@@ -73,9 +77,13 @@ def main(argv=None):
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--case', action='append')
     p.add_argument('--group', choices=('oracle', 'isa', 'all'), default='all')
+    p.add_argument('--runner', action='store_true', help='prefix/seed-only autonomous CUDA runner')
+    p.add_argument('--chunk', type=int, default=128)
     args = p.parse_args(argv)
     if args.output.exists():
         p.error('output must be new')
+    if not 1 <= args.chunk <= 256:
+        p.error('chunk must be 1..256')
     args.output.mkdir(parents=True)
     binary_digest = file_digest(args.binary, 64 << 20)['sha256']
     manifest_path = args.bundle / 'manifest.json'
@@ -95,6 +103,10 @@ def main(argv=None):
     text_count = struct.unpack('<16I', decode_sections(artifact.read_bytes())['config'][1])[2]
     selected = set(args.case or [])
     groups = ('oracle', 'isa') if args.group == 'all' else (args.group,)
+    faults = {}
+    if 'isa' in groups and args.runner:
+        verify(args.bundle / 'isa/cases.json')
+        faults = fault_cases(json.loads((args.bundle / 'isa/cases.json').read_bytes()))
     results = []
     for group in groups:
         root = args.bundle / group
@@ -114,8 +126,10 @@ def main(argv=None):
             final = root / (name + ('.final-state.f32' if group == 'oracle' else '.final.f32'))
             verify(root / (name + '.residual.f32'))
             verify(final)
-            command = [str(args.binary), str(artifact), str(args.binding), str(inputs),
-                       str(root / (name + '.residual.f32')), str(final)]
+            command = [str(args.binary), str(artifact), str(args.binding), str(inputs)]
+            command += [str(final), str(args.chunk)] if args.runner else [str(root / (name + '.residual.f32')), str(final)]
+            if args.runner and name in faults:
+                command += ['--expect', '6']
             dump = args.output / (label + '.lags.f32')
             if group == 'oracle':
                 verify(root / (name + '.final-lags.json'))
@@ -129,9 +143,19 @@ def main(argv=None):
             if run.returncode:
                 print(run.stdout + run.stderr, flush=True)
                 raise RuntimeError('native_step_failed:' + label)
+            if args.runner and name in faults:
+                reason = re.search(r'terminal=6 error=(\d+)', run.stdout)
+                if not reason or int(reason[1]) != 0x100 + faults[name]:
+                    raise ValueError('native_fault_reason:' + name)
             checked = check_lags(artifact, root / (name + '.final-lags.json'), dump) if group == 'oracle' else 0
-            result = {'case': label, 'steps': len(stream), 'lag_values': checked, 'passed': True,
-                      'level': 'native CUDA compiled FFN/GDN; supplied trace replay'}
+            actual_steps = re.search(r'free_running_steps=(\d+)', run.stdout) if args.runner else None
+            if args.runner and not actual_steps:
+                raise ValueError('native_runner_evidence')
+            result = {'case': label, 'steps': int(actual_steps[1]) if args.runner else len(stream),
+                      'expected_stream_steps': len(stream), 'lag_values': checked, 'passed': True,
+                      'expected_terminal': 'fault' if args.runner and name in faults else 'success',
+                      'level': ('native CUDA compiled FFN/GDN; autonomous from prefix/seed' if args.runner
+                                else 'native CUDA compiled FFN/GDN; supplied trace replay')}
             results.append(result)
             print(json.dumps(result), flush=True)
     if not results or (selected and not selected.issubset({r['case'].split('-', 1)[1] for r in results})):
@@ -140,9 +164,9 @@ def main(argv=None):
         raise ValueError('binary_changed_during_validation')
     report = {'results': results, 'binary_sha256': binary_digest,
               'artifact_sha256': hashlib.sha256(artifact.read_bytes()).hexdigest(),
-              'free_running': False, 'language_model_integrated': False}
+              'free_running': args.runner, 'language_model_integrated': False}
     (args.output / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
-    print(f'PASS {len(results)} native CUDA development replays', flush=True)
+    print(f'PASS {len(results)} native CUDA development ' + ('autonomous runs' if args.runner else 'replays'), flush=True)
     return 0
 
 

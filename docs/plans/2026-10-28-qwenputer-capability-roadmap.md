@@ -102,6 +102,12 @@ independent checker และขอบเขตที่ตรวจครบ �
 เดิมจนถึงคำตอบสุดท้าย ตรวจ final-answer consistency และจำนวนครั้งที่ลอง
 ควบคู่กับ held-out task success เพื่อแยกคุณภาพการตั้งสมมุติฐานจากผล execute
 
+เมื่อทดลองแล้วล้ม ชน limit หรือยังตรวจไม่พอ ต้องส่งสถานะที่ยังหาคำตอบไม่ได้
+ให้โมเดลรับรู้ แยก execution success, assertion failure, resource limit และ
+unknown วัด unsupported verification claims และ calibrated abstention ด้วย
+สำหรับกรณีที่ specification และการตรวจครบขอบเขตแล้ว ต้องรักษาหลักฐานนั้น
+จนถึงคำตอบสุดท้าย และทดสอบว่าโมเดลใช้ผลที่ตรวจจริงโดยไม่เปลี่ยนความหมาย
+
 เริ่มจาก reviewed allowlisted programs แล้วขยายเป็น model-generated logic
 ภายใต้ interpreter/program module ที่ตรวจแล้วเมื่อ bridge รองรับ ไม่กำหนดว่า
 ต้องใช้ภาษาใดก่อนเห็น instruction/firmware support จริง ห้ามเปลี่ยนไปใช้

@@ -242,6 +242,7 @@ __global__ void predict(View v) {
 
 struct Executor::Impl {
     View v{};
+    Digest artifact{};
     int device = -1, lag_slots = 0;
     std::uint64_t bytes = 0;
     std::vector<void*> allocations;
@@ -356,6 +357,7 @@ bool Executor::init(const Artifact& a, cudaStream_t stream, std::string& error) 
     if (impl_) { error = "already_initialized"; return false; }
     if (a.binding.digests[0] != arithmetic_abi()) { error = "numeric_abi"; return false; }
     auto p = std::make_unique<Impl>();
+    p->artifact = a.digest;
     p->schedule(a); // No GPU allocation before schedule validation.
     check(cudaGetDevice(&p->device));
     auto& v = p->v;
@@ -421,6 +423,7 @@ float* Executor::device_residual() const {return impl_?impl_->v.residual:nullptr
 float* Executor::device_state() const {return impl_?impl_->v.state:nullptr;}
 float* Executor::device_lags() const {return impl_?impl_->v.lags:nullptr;}
 std::uint64_t Executor::allocated_bytes() const {return impl_?impl_->bytes:0;}
+const Digest* Executor::artifact_digest() const {return impl_?&impl_->artifact:nullptr;}
 bool Executor::enqueue_feature_probe(std::uint32_t index,TokenKind kind,std::uint32_t base,
                                     std::uint32_t count,float* output,cudaStream_t stream,std::string& error) try {
     if(!impl_) {error="uninitialized";return false;}

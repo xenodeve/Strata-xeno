@@ -1,10 +1,14 @@
 """Boundary checks for offline native test inputs, without CUDA or firmware."""
 import struct
 import unittest
-from tools.qwenputer.step_validation import inputs_data
+from tools.qwenputer.step_validation import inputs_data, fault_cases
 
 
 class NativeReplayInputs(unittest.TestCase):
+    def test_positive_isa_cases_can_omit_fault_metadata(self):
+        self.assertEqual(fault_cases([{'name': 'add'}, {'name': 'fault-2', 'fault': 2},
+                                     {'name': 'other', 'fault': None}]), {'fault-2': 2})
+
     def test_tag_and_payload_are_distinct(self):
         self.assertEqual(inputs_data([230323, (1 << 24) + 248319], 248320),
                          struct.pack('<4I', 0, 230323, 1, 248319))

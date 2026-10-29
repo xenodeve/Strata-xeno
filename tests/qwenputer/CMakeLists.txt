@@ -10,6 +10,10 @@ add_executable(qwenputer_conditional_probe conditional_probe.cu)
 set_target_properties(qwenputer_conditional_probe PROPERTIES
   CXX_STANDARD 17 CUDA_STANDARD 17 CXX_STANDARD_REQUIRED YES CUDA_STANDARD_REQUIRED YES)
 target_link_libraries(qwenputer_conditional_probe PRIVATE CUDA::cudart)
+add_executable(qwenputer_conditional_barrier_probe conditional_barrier_probe.cu)
+set_target_properties(qwenputer_conditional_barrier_probe PROPERTIES
+  CXX_STANDARD 17 CUDA_STANDARD 17 CXX_STANDARD_REQUIRED YES CUDA_STANDARD_REQUIRED YES)
+target_link_libraries(qwenputer_conditional_barrier_probe PRIVATE CUDA::cudart)
 if(WIN32)
   target_link_libraries(qwenputer_conditional_probe PRIVATE Psapi)
 endif()

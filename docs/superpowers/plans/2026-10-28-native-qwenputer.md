@@ -18,7 +18,7 @@
 
 **Spec:** [Native Qwenputer PRD](../../plans/2026-10-28-native-qwenputer-prd.md)
 
-**Status:** P0, P1 offline export/oracles, P2 CPU-loader and P3 NVIDIA CUDA-step gates passed. P4 bounded free-running execution is next; model integration and performance gates remain open.
+**Status:** P0, P1 offline export/oracles, P2 CPU-loader and P3 NVIDIA CUDA-step gates passed. P4 bounded free-running execution is underway: development79 and frozen held-out64 pass. WHILE instrumentation has an isolated toolchain limitation; final limit/resource checks are running. Model integration and performance gates remain open.
 **Revision:** R2 หลัง parent review: ขัดเกลาภาษา, ยืนยัน D2x compatibility, เพิ่ม policy references, dual-architecture build และ numerical/measurement gates
 **Baseline:** `e5737a27f485773a7ce22784fef6af7b480dcc9a`
 **Upstream pin:** `ca13310e2f9f788d1dd3feeea8213c1b0c23913c`
@@ -184,15 +184,18 @@ flowchart LR
 **Consumes:** P0 runtime pass และ P3 exact step
 **Produces:** `Runtime::enqueue_chunk(...)`, `collect_chunk()`, `ChunkResult` และ `RuntimeLimits`
 
-- [ ] เขียน state-machine tests สำหรับ text-to-GO, trace family/payload decoding, BYTE/echo, HALT/newline ownership, fault, zero-work chunk, FIFO-full pause, global step cap, cancel และ repeated launches ที่ใช้ buffer เดิม
-- [ ] สร้าง standalone top-level WHILE graph ที่ผูก device token selection/embedding กับ circuit step ให้ GPU feed token ต่อเอง และ initialize condition/counters ทุก launch ตาม ABI ห้าม host อ่านผลเพื่อเลือก token ต่อ instruction
-- [ ] ให้ loop หยุดตาม min(chunk budget, remaining global steps, output capacity) หรือเมื่อ termination/fault/cancel โดย bounded chunk เป็นหน่วยที่ host กำกับ ไม่ใช่รอโปรแกรมที่อาจไม่สิ้นสุด ต้องแยก terminal reason เป็น success/cancel/limit/fault/gpu_error
-- [ ] Stage machine text จน response สำเร็จครบก่อนเผยแพร่ หาก FIFO เต็มให้หยุด chunk แล้วเก็บข้อความใน bounded staging โดยไม่ตัดผล หากถึง max-output ก่อนสำเร็จต้อง error ไม่ใช่ partial success
-- [ ] ทดสอบ graph lifetime serialization, state address เปลี่ยนแล้ว rebuild, ไม่มี stale condition/epoch, context ownership และไม่มี allocation/callback ใน body หาก P0 runtime ไม่รองรับต้องกลับไปให้ผู้ใช้ตัดสินใจทางสำรองที่บันทึกไว้
-- [ ] รัน `qwenputer_runner_test --artifact ... --oracle ...` ต้องได้ trace/output/final state เหมือน one-step P3/reference รวม chunk sizes 1/2/5 และการแบ่ง chunks หลายแบบ เมื่อ poison old outputs ต้องไม่มีข้อมูลรั่วเข้ารอบใหม่
+- [x] เขียน state-machine tests สำหรับ text-to-GO, trace family/payload decoding, BYTE/echo, HALT/newline ownership, fault, zero-work chunk, FIFO-full pause, global step cap, cancel และ repeated launches ที่ใช้ buffer เดิม
+- [x] สร้าง standalone top-level WHILE graph ที่ผูก device token selection/embedding กับ circuit step ให้ GPU feed token ต่อเอง และ initialize condition/counters ทุก launch ตาม ABI ห้าม host อ่านผลเพื่อเลือก token ต่อ instruction
+- [x] ให้ loop หยุดตาม min(chunk budget, remaining global steps, output capacity) หรือเมื่อ termination/fault/cancel โดย bounded chunk เป็นหน่วยที่ host กำกับ ไม่ใช่รอโปรแกรมที่อาจไม่สิ้นสุด ต้องแยก terminal reason เป็น success/cancel/limit/fault/gpu_error
+- [x] Stage machine text จน response สำเร็จครบก่อนเผยแพร่ หาก FIFO เต็มให้หยุด chunk แล้วเก็บข้อความใน bounded staging โดยไม่ตัดผล หากถึง max-output ก่อนสำเร็จต้อง error ไม่ใช่ partial success
+- [x] ทดสอบ graph lifetime serialization, state address เปลี่ยนแล้ว rebuild, ไม่มี stale condition/epoch, context ownership และไม่มี allocation/callback ใน body หาก P0 runtime ไม่รองรับต้องกลับไปให้ผู้ใช้ตัดสินใจทางสำรองที่บันทึกไว้
+- [x] รัน `qwenputer_runner_test --artifact ... --oracle ...` ต้องได้ trace/output/final state เหมือน one-step P3/reference รวม chunk sizes 1/2/5 และการแบ่ง chunks หลายแบบ เมื่อ poison old outputs ต้องไม่มีข้อมูลรั่วเข้ารอบใหม่
 - [ ] รัน free-running held-out traces โดย executor เลือก token ถัดไปเอง ห้าม teacher-force oracle tokens เพื่อผ่าน acceptance ทดสอบ conditional runner ด้วย memcheck/initcheck/synccheck และ applicable racecheck หากเครื่องมือไม่รองรับ conditional graph path ให้บันทึกข้อจำกัดและตรวจ single-step path ที่รองรับ แต่อย่าอ้างว่า runner path ผ่าน sanitizer แล้ว
-- [ ] วัด chunk duration/cancel completion บน driver จริงและรายงาน WDDM behavior โดยไม่แก้ TDR ระบุค่าจำกัดทดลองจริงใน log แต่ยังไม่สรุป default ก่อน P8
+- [x] วัด chunk duration/cancel completion บน driver จริงและรายงาน WDDM behavior โดยไม่แก้ TDR ระบุค่าจำกัดทดลองจริงใน log แต่ยังไม่สรุป default ก่อน P8
 - [ ] Commit runner/limits/diagnostics/blueprint พร้อมหลักฐานว่า math อยู่ใน native GPU path
+
+
+**P4 validation debt:** final held-out64 and repeat pass; actual WHILE initcheck passes. Memcheck/synccheck/racecheck remain blocked by the standalone unconditional-barrier reproducer. These checks are not passed, and P4 is not fully closed. See the P4 report.
 
 ## P5 — Verifier, commit, MTP/suffix และ prompt history
 

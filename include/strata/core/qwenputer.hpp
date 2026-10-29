@@ -30,6 +30,7 @@ public:
     float* device_state() const;
     float* device_lags() const;
     std::uint64_t allocated_bytes() const;
+    const Digest* artifact_digest() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

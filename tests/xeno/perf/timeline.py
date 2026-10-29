@@ -553,6 +553,18 @@ def render(tl: Timeline, top: int) -> str:
     return "\n".join(out)
 
 
+def qwenputer_report(tl: Timeline) -> dict:
+    """Native graph work and host costs overlap: report them separately, never add them."""
+    chunks = tl.find("qwenputer.chunk")
+    host = {name: sum(s.dur for s in tl.find("qwenputer." + name))
+            for name in ("prepare", "enqueue", "wait", "collect", "cancel")}
+    if not chunks and not any(host.values()):
+        return {}
+    return {"chunks": len(chunks), "steps": sum(max(s.a, 0) for s in chunks),
+            "gpu_ms": sum(s.dur for s in chunks),
+            "max_chunk_ms": max((s.dur for s in chunks), default=0), "host_ms": host}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("trace")
@@ -563,6 +575,11 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     tl = load(a.trace)
     print(render(tl, a.top))
+    native = qwenputer_report(tl)
+    if native:
+        print(f"\n== Native Qwenputer: {native['chunks']} chunks, {native['steps']} steps ==")
+        print(f"GPU {native['gpu_ms']:.3f} ms; maximum chunk {native['max_chunk_ms']:.3f} ms")
+        print("Host ms (overlap GPU work): " + ", ".join(f"{k} {v:.3f}" for k, v in native["host_ms"].items()))
     if a.layer is not None:
         w = layer_window(tl, a.layer)
         if w:
@@ -573,7 +590,8 @@ def main(argv: list[str] | None = None) -> int:
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"prefill": prefill_report(tl, a.top), "decode": decode_report(tl), "lanes": utilisation(tl),
-                       "threads": thread_report(tl), "server": server_report(tl)},
+                       "threads": thread_report(tl), "server": server_report(tl),
+                       "qwenputer": native},
                       f, indent=1, default=str)
     if a.perfetto:
         export_perfetto(a.trace, a.perfetto)

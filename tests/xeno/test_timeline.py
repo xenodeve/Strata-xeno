@@ -16,6 +16,30 @@ LANES = {1: "main", 2: "gpu0 copy engine (prefill)", 3: "gpu0 compute (prefill)"
          5: "pool worker 0", 6: "pool worker 1", 7: "pool worker 2", 8: "gpu1 4070 experts"}
 
 
+def test_qwenputer_budget_keeps_gpu_work_separate_from_overlapping_host_wait(tmp_path):
+    events = [X(1, "qwenputer.prepare", 0, 1),
+              X(1, "qwenputer.enqueue", 1, 1.1),
+              X(3, "qwenputer.chunk", 1.1, 4.1, 16, 1),
+              X(1, "qwenputer.wait", 1.1, 4.3),
+              X(1, "qwenputer.collect", 4.3, 4.5),
+              X(1, "qwenputer.enqueue", 5, 5.2),
+              X(3, "qwenputer.chunk", 5.2, 7.2, 8, 1),
+              X(1, "qwenputer.wait", 5.2, 7.4),
+              X(1, "qwenputer.collect", 7.4, 7.7),
+              X(1, "qwenputer.cancel", 8, 8.4)]
+    r = timeline.qwenputer_report(timeline.load(write(tmp_path, events)))
+    assert r["chunks"] == 2 and r["steps"] == 24
+    assert r["gpu_ms"] == pytest.approx(5)
+    assert r["max_chunk_ms"] == pytest.approx(3)
+    assert r["host_ms"] == {"prepare": pytest.approx(1), "enqueue": pytest.approx(.3),
+                             "wait": pytest.approx(5.4), "collect": pytest.approx(.5),
+                             "cancel": pytest.approx(.4)}
+
+
+def test_qwenputer_budget_is_absent_from_an_unmodified_trace(tmp_path):
+    assert timeline.qwenputer_report(timeline.load(write(tmp_path, [X(1, "unrelated", 0, 2)]))) == {}
+
+
 def X(tid, name, t0_ms, t1_ms, a=-1, b=-1):
     e = {"ph": "X", "pid": PID, "tid": tid, "ts": t0_ms * 1000.0, "dur": (t1_ms - t0_ms) * 1000.0, "name": name}
     if a != -1 or b != -1:
