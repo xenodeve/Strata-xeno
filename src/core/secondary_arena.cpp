@@ -1,6 +1,7 @@
 #include "strata/core/secondary_arena.hpp"
 #include "strata/core/secondary_budget.hpp"
 #include "strata/core/secondary_vram.hpp"
+#include "strata/timeline.hpp"
 
 #include <cuda_runtime.h>
 #include <cstddef>
@@ -20,7 +21,8 @@ struct RestoreDevice {
     ~RestoreDevice() { cudaSetDevice(previous); }
 };
 
-bool free_snapshot(int ordinal, uint64_t& lower, std::string& err) {
+bool free_snapshot(int ordinal, uint64_t& lower, std::string& err,
+                   uint64_t* cuda_bytes = nullptr, uint64_t* nvml_bytes = nullptr) {
     size_t cuda_free = 0, cuda_total = 0;
     int current = -1;
     (void) cudaGetDevice(&current);
@@ -44,6 +46,8 @@ bool free_snapshot(int ordinal, uint64_t& lower, std::string& err) {
     }
     uint64_t nvml_free = 0;
     if (!secondary_nvml_free_bytes(ordinal, nvml_free, err)) return false;
+    if (cuda_bytes) *cuda_bytes = static_cast<uint64_t>(cuda_free);
+    if (nvml_bytes) *nvml_bytes = nvml_free;
     lower = secondary_effective_free((uint64_t) cuda_free, nvml_free);
     if (lower == 0) { err = "secondary free-memory query returned zero"; return false; }
     return true;
@@ -220,7 +224,8 @@ bool SecondaryArena::fill_slot(uint64_t slot, const uint8_t* blob, uint64_t byte
     uint64_t lower = 0;
     if (!free_snapshot(ordinal_, lower, err)) return false;
     if (lower < free_floor_bytes_) {
-        err = "secondary fill crossed the display free floor";
+        err = "secondary fill crossed the display free floor: effective_free_bytes=" + std::to_string(lower) +
+              " floor_bytes=" + std::to_string(free_floor_bytes_) + " arena_bytes=" + std::to_string(this->bytes());
         return false;
     }
     lower_free_after_ = lower;
@@ -232,12 +237,27 @@ bool SecondaryArena::check_free_floor(std::string& err) {
     uint64_t lower = 0;
     if (!free_snapshot(ordinal_, lower, err)) return false;
     if (lower < free_floor_bytes_) {
-        err = "secondary fill crossed the display free floor";
+        err = "secondary fill crossed the display free floor: effective_free_bytes=" + std::to_string(lower) +
+              " floor_bytes=" + std::to_string(free_floor_bytes_) + " arena_bytes=" + std::to_string(this->bytes());
         return false;
     }
     lower_free_after_ = lower;
     err.clear();
     return true;
+}
+
+bool SecondaryArena::trace_free(const char* label) const {
+    if (!strata::timeline::enabled()) return true;
+    if (!label || !base_ || ordinal_ < 0) return false;
+    strata::timeline::Span query("secondary.memory.query", ordinal_);
+    strata::timeline::instant("secondary.memory.policy", static_cast<int64_t>(free_floor_bytes_),
+                              static_cast<int64_t>(bytes()));
+    uint64_t lower = 0, cuda_bytes = 0, nvml_bytes = 0;
+    std::string error;
+    const bool ok = free_snapshot(ordinal_, lower, error, &cuda_bytes, &nvml_bytes);
+    strata::timeline::instant(label, ok ? static_cast<int64_t>(cuda_bytes) : -1,
+                              ok ? static_cast<int64_t>(nvml_bytes) : -1);
+    return ok;
 }
 
 bool SecondaryArena::verify_slot(uint64_t slot, const uint8_t* blob, uint64_t bytes, std::string& err) {

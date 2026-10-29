@@ -16,6 +16,34 @@ LANES = {1: "main", 2: "gpu0 copy engine (prefill)", 3: "gpu0 compute (prefill)"
          5: "pool worker 0", 6: "pool worker 1", 7: "pool worker 2", 8: "gpu1 4070 experts"}
 
 
+def test_secondary_memory_uses_both_readers_and_preserves_stage_order():
+    def event(name, t, a, b):
+        return {"ph": "i", "pid": PID, "tid": 1, "name": name, "ts": t * 1000,
+                "args": {"a": a, "b": b}}
+    trace = timeline.Timeline([
+        event("secondary.memory.policy", 0, 100, 800),
+        event("secondary.memory.after_open", 1, 250, 240),
+        event("secondary.memory.after_staging", 2, 150, 130),
+        event("secondary.memory.after_copy", 3, 80, 90),
+    ])
+    rows = timeline.secondary_memory_report(trace)
+    assert [r["stage"] for r in rows] == ["after_open", "after_staging", "after_copy"]
+    assert [r["effective_free_bytes"] for r in rows] == [240, 130, 80]
+    assert [r["headroom_bytes"] for r in rows] == [140, 30, -20]
+    assert all(r["floor_bytes"] == 100 and r["arena_bytes"] == 800 for r in rows)
+
+
+def test_secondary_memory_does_not_invent_a_missing_reader_or_policy():
+    trace = timeline.Timeline([{"ph": "i", "pid": PID, "tid": 1, "name": "secondary.memory.after_open",
+                                "ts": 1000, "args": {"a": -1, "b": 200}}])
+    rows = timeline.secondary_memory_report(trace)
+    assert len(rows) == 1
+    assert rows[0]["cuda_free_bytes"] is None
+    assert rows[0]["nvml_free_bytes"] == 200
+    assert rows[0]["effective_free_bytes"] is None
+    assert rows[0]["floor_bytes"] is None and rows[0]["headroom_bytes"] is None
+
+
 def test_qwenputer_budget_keeps_gpu_work_separate_from_overlapping_host_wait(tmp_path):
     events = [X(1, "qwenputer.prepare", 0, 1),
               X(1, "qwenputer.enqueue", 1, 1.1),

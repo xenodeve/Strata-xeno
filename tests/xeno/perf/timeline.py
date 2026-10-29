@@ -569,6 +569,27 @@ def qwenputer_report(tl: Timeline) -> dict:
             "max_chunk_ms": max((s.dur for s in chunks), default=0), "host_ms": host}
 
 
+def secondary_memory_report(tl: Timeline) -> list[dict]:
+    """Boot resource observations in bytes; missing samples are not free memory."""
+    rows = []
+    floor = arena = None
+    prefix = "secondary.memory."
+    stages = {"after_open", "after_staging", "after_copy", "after_release"}
+    for point in sorted(tl.instants, key=lambda s: s.t0):
+        if point.name == prefix + "policy":
+            floor = point.a if point.a >= 0 else None
+            arena = point.b if point.b >= 0 else None
+        elif point.name.startswith(prefix) and point.name[len(prefix):] in stages:
+            cuda_free = point.a if point.a >= 0 else None
+            nvml_free = point.b if point.b >= 0 else None
+            effective = min(cuda_free, nvml_free) if cuda_free is not None and nvml_free is not None else None
+            rows.append({"stage": point.name[len(prefix):], "t_ms": point.t0,
+                         "cuda_free_bytes": cuda_free, "nvml_free_bytes": nvml_free,
+                         "effective_free_bytes": effective, "floor_bytes": floor, "arena_bytes": arena,
+                         "headroom_bytes": effective - floor if effective is not None and floor is not None else None})
+    return rows
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("trace")
@@ -580,6 +601,12 @@ def main(argv: list[str] | None = None) -> int:
     tl = load(a.trace)
     print(render(tl, a.top))
     native = qwenputer_report(tl)
+    secondary_memory = secondary_memory_report(tl)
+    if secondary_memory:
+        print("\n== Secondary boot memory (bytes; CUDA/NVML samples are sequential) ==")
+        print(table([(r["stage"], r["cuda_free_bytes"], r["nvml_free_bytes"], r["floor_bytes"],
+                      r["headroom_bytes"]) for r in secondary_memory],
+                    ("stage", "CUDA free", "NVML free", "floor", "headroom")))
     if native:
         print(f"\n== Native Qwenputer: {native['chunks']} chunks, {native['steps']} steps ==")
         print(f"GPU {native['gpu_ms']:.3f} ms; maximum chunk {native['max_chunk_ms']:.3f} ms")
@@ -595,7 +622,7 @@ def main(argv: list[str] | None = None) -> int:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"prefill": prefill_report(tl, a.top), "decode": decode_report(tl), "lanes": utilisation(tl),
                        "threads": thread_report(tl), "server": server_report(tl),
-                       "qwenputer": native},
+                       "qwenputer": native, "secondary_memory": secondary_memory},
                       f, indent=1, default=str)
     if a.perfetto:
         export_perfetto(a.trace, a.perfetto)

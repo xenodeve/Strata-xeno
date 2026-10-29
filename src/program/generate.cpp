@@ -6429,6 +6429,7 @@ int main(int argc, char** argv) {
                          (double) display_floor / 1073741824.0, (double) split / 1073741824.0,
                          (long long) o.prefill_chunk, (double) secondary_arena.bytes() / 1073741824.0,
                          o.secondary_expert_mib);
+        (void) secondary_arena.trace_free("secondary.memory.after_open");
         secondary_residency.assign((size_t) (g.n_layers * g.n_expert), -1);
         if (place_first) {
             // the same pipeline as the primary fill: a reader thread reads the next batch from the pack while this
@@ -6450,6 +6451,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: placement-first 4070 fill buffers could not be allocated\n");
                 return 1;
             }
+            (void) secondary_arena.trace_free("secondary.memory.after_staging");
             std::string rd_err;
             auto read_batch = [&](uint64_t k, uint8_t* dst) -> bool {
                 int32_t ls[B], es[B];
@@ -6499,11 +6501,13 @@ int main(int argc, char** argv) {
                 if (rd.joinable()) rd.join();
                 rd_ok = next_ok;
             }
+            (void) secondary_arena.trace_free("secondary.memory.after_copy");
             cudaStreamDestroy(fs);
             cudaFreeHost(rbuf[0]);
             cudaFreeHost(rbuf[1]);
             cudaFreeHost(vbuf);
             cudaSetDevice(prev_dev);
+            (void) secondary_arena.trace_free("secondary.memory.after_release");
             if (!secondary_arena.check_free_floor(err)) {
                 std::fprintf(stderr, "strata generate: secondary fill: %s\n", err.c_str());
                 return 1;
@@ -13898,6 +13902,67 @@ int main(int argc, char** argv) {
                         if (f == nullptr || std::fwrite(row.data(), sizeof(float), row.size(), f) != row.size())
                             std::fprintf(stderr, "strata serve: STRATA_DUMP_FIRST_LOGITS: cannot write %s\n", path.c_str());
                         if (f) std::fclose(f);
+                    }
+                    // Paired first-window observations for offline mapper data.
+                    // Only the collector's successful response publishes a dataset
+                    // record; these raw files alone do not establish commit success.
+                    if (!o.dump_mixed.empty() || !o.dump_residual.empty()) {
+                        static int input_n = 0;
+                        const std::string suffix = "." + std::to_string(input_n++);
+                        std::vector<float> mixed, residual;
+                        if (!o.dump_mixed.empty()) mixed.resize((size_t) g.n_embd);
+                        if (!o.dump_residual.empty()) residual.resize((size_t) g.hc * g.n_embd);
+                        if (!ver.copy_head_input(0, residual.empty() ? nullptr : residual.data(),
+                                                  mixed.empty() ? nullptr : mixed.data())) {
+                            std::printf("ERR copying first-window diagnostic head input failed\n");
+                            return serve_fatal();
+                        }
+                        auto write_input = [&](const std::string& base, const std::vector<float>& values, bool header) {
+                            if (base.empty()) return true;
+                            const std::string path = base + suffix;
+                            std::FILE* file = std::fopen(path.c_str(), "wb");
+                            if (!file) return false;
+                            const int32_t shape[2] = {(int32_t) g.hc, (int32_t) g.n_embd};
+                            bool ok = !header || std::fwrite(shape, sizeof(shape), 1, file) == 1;
+                            ok = ok && std::fwrite(values.data(), sizeof(float), values.size(), file) == values.size();
+                            if (std::fclose(file) != 0) ok = false;
+                            return ok;
+                        };
+                        if (!write_input(o.dump_mixed, mixed, false) || !write_input(o.dump_residual, residual, true)) {
+                            std::printf("ERR writing first-window diagnostic head input failed\n");
+                            return serve_fatal();
+                        }
+                        if (!o.dump_mixed.empty()) {
+                            // Canonical token identity for offline data, not KV-as-source storage.
+                            std::vector<int32_t> prompt_ids;
+                            prompt_ids.reserve(ids.size());
+                            for (int64_t id : ids) prompt_ids.push_back((int32_t) id);
+                            const std::string prefix = o.dump_mixed + suffix;
+                            std::FILE* tokens_file = std::fopen((prefix + ".tokens.bin").c_str(), "wb");
+                            bool ok = tokens_file != nullptr;
+                            if (tokens_file) {
+                                ok = std::fwrite(prompt_ids.data(), sizeof(int32_t), prompt_ids.size(), tokens_file) == prompt_ids.size();
+                                if (std::fclose(tokens_file) != 0) ok = false;
+                            }
+                            char meta[512];
+                            const int count = std::snprintf(meta, sizeof(meta),
+                                "{\"version\":1,\"kind\":\"first_window_observation\","
+                                "\"stage\":\"head_mixed_after_final_hc\",\"row\":0,\"position\":%lld,"
+                                "\"token\":%d,\"prompt_tokens\":%llu,\"n_embd\":%lld,\"hc\":%lld,\"n_vocab\":%lld}\n",
+                                (long long) p, (int) window[0], (unsigned long long) prompt_ids.size(),
+                                (long long) g.n_embd, (long long) g.hc, (long long) ver.vocab());
+                            if (count <= 0 || (size_t) count >= sizeof(meta)) ok = false;
+                            std::FILE* meta_file = ok ? std::fopen((prefix + ".meta.json").c_str(), "wb") : nullptr;
+                            if (!meta_file) ok = false;
+                            else {
+                                ok = std::fwrite(meta, 1, (size_t) count, meta_file) == (size_t) count;
+                                if (std::fclose(meta_file) != 0) ok = false;
+                            }
+                            if (!ok) {
+                                std::printf("ERR writing first-window observation identity failed\n");
+                                return serve_fatal();
+                            }
+                        }
                     }
                 }
                 int a = 0;
