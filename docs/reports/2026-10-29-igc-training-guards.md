@@ -45,3 +45,5 @@ checkpoint only, 1,800 s fit / 1,920 s outer bounds. Before any backward batch, 
 8 GiB physical, 12 GiB commitment, 2 GiB GPU and 16 MiB output plus 4 GiB disk reserve.
 These are disclosed offline admission checks, not a Hub private-commit cap.
 No acceptance64, second tap, threshold/model default, pagefile, push or backup change.
+
+Follow-up: the separately run [single fixed fit](2026-10-29-igc-matched-fixed-fit.md) completed numerically but failed the development operand gate; no model was promoted.
