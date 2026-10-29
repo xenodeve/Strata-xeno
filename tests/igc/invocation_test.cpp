@@ -39,6 +39,7 @@ int main()try{
     auto verify=[&]{
         for(int i=0;i<count;++i){const auto& s=out[i];require(s.id==id[i] && s.position==pos[i],"retained_owner");
             require(s.armed==0 && s.attempts==(i%8==6?0u:1u),"attempt_once");
+            if(i%8!=6){require(!std::memcmp(&s.request,&q[i],sizeof(q[i])),"retained_attempted_request");require(s.selection_status==code[i],"retained_selection_reason");}
             const bool success=i%8==0 || i%8==7,called=success || i%8==5;
             require(s.evaluations==unsigned(called),"actual_evaluations");
             auto terminal=success?InvocationStatus::Applied:i%8==1?InvocationStatus::NoCall:i%8==3||i%8==4?InvocationStatus::OwnerMismatch:InvocationStatus::Rejected;

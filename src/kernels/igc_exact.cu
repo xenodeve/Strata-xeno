@@ -138,6 +138,7 @@ __global__ void invocation_kernel(Invocation* states,const ExactRequest* request
     if(i>=count || !states[i].armed)return;
     auto state=states[i];state.armed=0;state.attempts=1;
     const auto& request=requests[i];
+    state.request=request;state.selection_status=selected[i];
     if(request.invocation!=state.id || request.position!=state.position){
         state.terminal=InvocationStatus::OwnerMismatch;
     }else if(selected[i]!=0){

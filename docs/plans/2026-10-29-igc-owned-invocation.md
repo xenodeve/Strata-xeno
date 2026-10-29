@@ -20,6 +20,12 @@ count is separate from attempts. Later graph replays preserve the terminal
 result. Broadcasting a retained result does not execute it again. Hard off
 returns before pointer validation/device work and preserves bytes.
 
+Live-controller follow-up: retain the first attempted typed request and selection
+reason with that result. Later graph launches overwrite dispatcher scratch, so it
+cannot serve as execution provenance. This internal state is288 bytes and has no
+serialized/external ABI. Test tuple/reason retention through changed scratch,
+re-arm and shadow isolation before the pipeline uses it.
+
 Tests must first fail on a built behavioral stub, then pass with real kernels:
 64-row signed/zero calculations, no-call, invalid selection/owner/input, terminal
 reason, exact count, repeated graph launches after operand mutation, re-arm with

@@ -9,9 +9,11 @@ struct Invocation {
     uint64_t id=0, position=0;
     uint32_t armed=0, attempts=0, evaluations=0;
     InvocationStatus terminal=InvocationStatus::Rejected;
+    uint32_t selection_status=~uint32_t{0},reserved=0;
+    ExactRequest request{}; // retained attempted tuple, not a later graph's scratch request
     ExactResult result{};
 };
-static_assert(std::is_trivially_copyable_v<Invocation>);
+static_assert(std::is_trivially_copyable_v<Invocation> && sizeof(Invocation)==288);
 // Start a fresh owned attempt, clearing any previous answer. One created stream,
 // stable caller-owned device addresses, count1..64; no allocation or host sync.
 bool arm_invocations(Invocation*,const uint64_t* ids,const uint64_t* positions,
