@@ -32,6 +32,28 @@ public:
     std::uint64_t allocated_bytes() const;
     const Digest* artifact_digest() const;
 private:
+    friend class StateImage;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// An immutable checkpoint until capture() replaces it. Only circuit S, lag,
+// current input and prediction status are copied; no language-model state or
+// graph handles are present. All operations enqueue copies on one explicit
+// created stream that outlives the image; default-stream aliases are refused.
+// The caller fences completion before committing state. A failed capture cannot
+// be restored. Any restore failure invalidates the caller's circuit session.
+class StateImage {
+public:
+    StateImage();
+    ~StateImage();
+    StateImage(const StateImage&) = delete;
+    StateImage& operator=(const StateImage&) = delete;
+    bool init(const Executor&, cudaStream_t, std::string& error);
+    bool capture(const Executor&, cudaStream_t, std::string& error);
+    bool restore(Executor&, cudaStream_t, std::string& error) const;
+    std::uint64_t allocated_bytes() const;
+private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

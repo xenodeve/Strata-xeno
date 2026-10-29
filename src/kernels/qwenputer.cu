@@ -435,4 +435,68 @@ bool Executor::enqueue_feature_probe(std::uint32_t index,TokenKind kind,std::uin
     probe_features<<<(count+255)/256,256,0,stream>>>(v,index,kind,base,count,output);
     check(cudaGetLastError());error.clear();return true;
 }catch(const std::exception& e){error=e.what();return false;}
+
+struct StateImage::Impl {
+    std::uint8_t* data=nullptr;
+    std::uint64_t state=0,lags=0,total=0;
+    Digest artifact{};
+    int device=-1;
+    cudaStream_t stream=nullptr;
+    bool bound=false,valid=false;
+    ~Impl() {
+        if(!data)return;
+        int previous=-1;cudaGetDevice(&previous);
+        if(previous!=device)cudaSetDevice(device);
+        if(bound)cudaStreamSynchronize(stream);
+        cudaFree(data);
+        if(previous>=0&&previous!=device)cudaSetDevice(previous);
+    }
+    void guard(const View& view,const Digest& digest,int owner,std::uint64_t lag_bytes,cudaStream_t ordered)const {
+        if(artifact!=digest||state!=std::uint64_t(view.config[6])*sizeof(float)||lags!=lag_bytes)
+            throw std::runtime_error("state_image_artifact_mismatch");
+        int current;check(cudaGetDevice(&current));
+        if(current!=device||owner!=device)throw std::runtime_error("state_image_device_mismatch");
+        if(ordered!=stream)throw std::runtime_error("state_image_stream_mismatch");
+    }
+    void transfer(const View& view,bool capture)const {
+        std::size_t offset=0;
+        auto copy=[&](void* target,std::size_t size) {
+            if(size)check(cudaMemcpyAsync(capture?data+offset:target,capture?target:data+offset,size,cudaMemcpyDeviceToDevice,stream));
+            offset+=size;
+        };
+        copy(view.state,std::size_t(state));copy(view.lags,std::size_t(lags));
+        copy(view.input,sizeof(Input));copy(view.status,sizeof(StepStatus));
+    }
+};
+StateImage::StateImage()=default;
+StateImage::~StateImage()=default;
+bool StateImage::init(const Executor& executor,cudaStream_t stream,std::string& error)try {
+    if(impl_){error="state_image_initialized";return false;}
+    if(!executor.impl_){error="state_image_uninitialized_executor";return false;}
+    if(!stream||stream==cudaStreamLegacy||stream==cudaStreamPerThread){error="state_image_explicit_stream_required";return false;}
+    const auto& e=*executor.impl_;auto p=std::make_unique<Impl>();
+    p->device=e.device;p->artifact=e.artifact;p->stream=stream;
+    int current,stream_device;check(cudaGetDevice(&current));check(cudaStreamGetDevice(stream,&stream_device));
+    if(current!=p->device||stream_device!=p->device){error="state_image_device_mismatch";return false;}
+    p->state=std::uint64_t(e.v.config[6])*sizeof(float);
+    p->lags=std::uint64_t(e.lag_slots)*3*e.v.config[0]*sizeof(float);
+    p->total=p->state+p->lags+sizeof(Input)+sizeof(StepStatus);
+    if(!p->state||p->total>(256ull<<20)){error="state_image_budget";return false;}
+    check(cudaMalloc(&p->data,std::size_t(p->total)));p->bound=true;
+    p->transfer(e.v,true);p->valid=true;impl_=std::move(p);error.clear();return true;
+}catch(const std::exception& e){error=e.what();return false;}
+bool StateImage::capture(const Executor& executor,cudaStream_t stream,std::string& error)try {
+    if(!impl_||!executor.impl_){error="state_image_uninitialized";return false;}
+    const auto& e=*executor.impl_;
+    impl_->guard(e.v,e.artifact,e.device,std::uint64_t(e.lag_slots)*3*e.v.config[0]*sizeof(float),stream);
+    impl_->valid=false;impl_->transfer(e.v,true);impl_->valid=true;error.clear();return true;
+}catch(const std::exception& e){error=e.what();return false;}
+bool StateImage::restore(Executor& executor,cudaStream_t stream,std::string& error)const try {
+    if(!impl_||!executor.impl_){error="state_image_uninitialized";return false;}
+    if(!impl_->valid){error="state_image_invalid";return false;}
+    const auto& e=*executor.impl_;
+    impl_->guard(e.v,e.artifact,e.device,std::uint64_t(e.lag_slots)*3*e.v.config[0]*sizeof(float),stream);
+    impl_->transfer(e.v,false);error.clear();return true;
+}catch(const std::exception& e){error=e.what();return false;}
+std::uint64_t StateImage::allocated_bytes()const{return impl_?impl_->total:0;}
 }
