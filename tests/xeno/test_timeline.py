@@ -16,6 +16,17 @@ LANES = {1: "main", 2: "gpu0 copy engine (prefill)", 3: "gpu0 compute (prefill)"
          5: "pool worker 0", 6: "pool worker 1", 7: "pool worker 2", 8: "gpu1 4070 experts"}
 
 
+def test_igc_observation_accounts_host_scopes_without_calling_them_gpu_time(tmp_path):
+    events=[X(1,"igc.preanchor.observe",1,1.2,3,10240),
+            X(1,"igc.preanchor.observe",2,2.4,4,10240),
+            X(1,"igc.preanchor.write",3,3.1,7,10240),
+            X(3,"unrelated GPU work",0,5)]
+    report=timeline.igc_observation_report(timeline.load(write(tmp_path,events)))
+    assert report['observe_calls']==2 and report['selected_row_attempts']==7
+    assert report['host_ms']=={'observe':pytest.approx(.6),'write':pytest.approx(.1)}
+    assert 'gpu_ms' not in report
+
+
 def test_secondary_memory_uses_both_readers_and_preserves_stage_order():
     def event(name, t, a, b):
         return {"ph": "i", "pid": PID, "tid": 1, "name": name, "ts": t * 1000,

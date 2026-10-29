@@ -16,6 +16,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/platform/memory.hpp"
+#include "strata/program/igc_observation.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
@@ -9298,6 +9299,7 @@ int main(int argc, char** argv) {
             cudaStreamSynchronize(mtp.stream());
         };
         std::vector<int64_t> cur;
+        strata::program::igc_observation::Capture preanchor_capture;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
         // saved points; every one of them is a prefix of `live` (the loop drops the rest), so they form a chain -
@@ -9667,6 +9669,17 @@ int main(int argc, char** argv) {
         // #48: per wave lane - each lane batches the drafter's K/V through its own prompt path (see the generate path)
         auto serve_chunk = [&](strata::prefill::Prefill& lane) -> std::function<bool(const float*, int64_t, int64_t, std::string&)> {
           return [&, lp = &lane](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+            if (!o.dump_mixed.empty() && preanchor_capture.active()) {
+                const int64_t selected = std::max<int64_t>(0, std::min(p0 + T, preanchor_capture.anchor()) -
+                                                             std::max(p0, preanchor_capture.first()));
+                strata::timeline::Span observation("igc.preanchor.observe", selected, g.hc * g.n_embd);
+                // on_chunk has fenced the owning prefill stream. Record actual
+                // F32 rows only; cached-prefix rows not read here stay missing.
+                if (!preanchor_capture.observe(p0, T, 2, [&](int64_t offset, std::span<float> row) {
+                        return cudaMemcpy(row.data(), R_rows + offset * g.hc * g.n_embd,
+                                          row.size_bytes(), cudaMemcpyDeviceToHost) == cudaSuccess;
+                    }, e)) return false;
+            }
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
@@ -12134,6 +12147,13 @@ int main(int argc, char** argv) {
                 wait_before[(size_t) r] = remote_experts[(size_t) r].ms_wait();
             }
             cur = ids;
+            if (!o.dump_mixed.empty()) {
+                std::string observation_error;
+                if (g.hc != 4 || g.n_embd != 2560 || !preanchor_capture.begin(cur, observation_error)) {
+                    std::printf("ERR unsupported or malformed pre-anchor diagnostic input: %s\n", observation_error.c_str());
+                    std::fflush(stdout);continue;
+                }
+            }
             const Clock::time_point r0 = Clock::now();
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
@@ -12660,6 +12680,17 @@ int main(int argc, char** argv) {
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
+                    }
+                    if (!o.dump_mixed.empty() && preanchor_capture.active()) {
+                        const int64_t selected = std::max<int64_t>(0, std::min(q + T, preanchor_capture.anchor()) -
+                                                                     std::max(q, preanchor_capture.first()));
+                        strata::timeline::Span observation("igc.preanchor.observe", selected, g.hc * g.n_embd);
+                        // Copy before commit/reuse, on the verifier's explicit
+                        // owning stream. Head sampling is disabled on this path;
+                        // only the completed residual rows are requested.
+                        if (!preanchor_capture.observe(q, T, 1, [&](int64_t offset, std::span<float> row) {
+                                return ver.copy_head_input((int) offset, row.data(), nullptr);
+                            }, e)) return false;
                     }
                     // STRATA_LOGPOS=<path>: the teacher-forced log-probability of every token read here (every
                     // token is committed and nxt[t] is the prompt's own next token), appended to <path>; the last
@@ -13938,6 +13969,14 @@ int main(int argc, char** argv) {
                             prompt_ids.reserve(ids.size());
                             for (int64_t id : ids) prompt_ids.push_back((int32_t) id);
                             const std::string prefix = o.dump_mixed + suffix;
+                            {
+                                strata::timeline::Span observation("igc.preanchor.write", preanchor_capture.count(), g.hc * g.n_embd);
+                                std::string observation_error;
+                                if (!preanchor_capture.write(prefix + ".preanchor.bin", observation_error)) {
+                                    std::printf("ERR %s\n", observation_error.c_str());
+                                    return serve_fatal();
+                                }
+                            }
                             std::FILE* tokens_file = std::fopen((prefix + ".tokens.bin").c_str(), "wb");
                             bool ok = tokens_file != nullptr;
                             if (tokens_file) {
@@ -13948,9 +13987,11 @@ int main(int argc, char** argv) {
                             const int count = std::snprintf(meta, sizeof(meta),
                                 "{\"version\":1,\"kind\":\"first_window_observation\","
                                 "\"stage\":\"head_mixed_after_final_hc\",\"row\":0,\"position\":%lld,"
-                                "\"token\":%d,\"prompt_tokens\":%llu,\"n_embd\":%lld,\"hc\":%lld,\"n_vocab\":%lld}\n",
+                                "\"token\":%d,\"prompt_tokens\":%llu,\"n_embd\":%lld,\"hc\":%lld,\"n_vocab\":%lld,"
+                                "\"preanchor_format\":1,\"preanchor_rows\":%llu,\"preanchor_capacity\":80}\n",
                                 (long long) p, (int) window[0], (unsigned long long) prompt_ids.size(),
-                                (long long) g.n_embd, (long long) g.hc, (long long) ver.vocab());
+                                (long long) g.n_embd, (long long) g.hc, (long long) ver.vocab(),
+                                (unsigned long long) preanchor_capture.count());
                             if (count <= 0 || (size_t) count >= sizeof(meta)) ok = false;
                             std::FILE* meta_file = ok ? std::fopen((prefix + ".meta.json").c_str(), "wb") : nullptr;
                             if (!meta_file) ok = false;

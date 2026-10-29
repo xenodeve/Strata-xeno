@@ -119,3 +119,51 @@ Private evidence names: `igc-i2-source-identities.json`, `igc-i2-source-hash.log
 and `igc-i2-readout.log`. Collection and fit wrappers both end `DONE exit=0`.
 The full project still includes I1b, I3/I4/I5 and programmable sandbox/debug,
 geometry, store and later-model capability gates; this probe closes none of them.
+
+## Follow-up: bounded F32 pre-anchor observation
+
+The new opt-in collector uses both the existing fenced prefill callback and
+`Verifier::copy_head_input` before prompt-window commit/reuse. The latter matters:
+the selected Hub's `short-read=256` reads these short prompts through verifier
+windows. No short-read/cache/offload setting was changed to obtain observations.
+
+`igc_observation.hpp` retains at most 80 selected rows immediately preceding the
+anchor, four HC streams × 2560 F32 values per row. The largest wire payload is
+3,278,124 bytes. Metadata binds each row's absolute position, actual token and
+source path. Missing cached-prefix rows are omitted and exposed explicitly by
+the reader; they are not reconstructed from KV, filled from old requests or
+silently treated as observed zeros. The archive is a versioned data-only format,
+not a program or adapter artifact. Default serving allocates no row buffers;
+the existing dump flag opts into copying/writing. These diagnostics do not inject
+activations, alter arithmetic or establish default-path token parity.
+
+CPU contract RED failed on the initially absent header, then the `/W4 /WX` host
+build and runtime contract passed. The independent Python wire fixture matches
+the C++ output byte-for-byte. Four reader tests pass for sparse/missing rows,
+header/position/token/source corruption, nonfinite data, duplicates and lengths.
+The host contract also tests reset isolation, failed owner copy and out-of-range
+prefixes. Timeline analyzer RED/GREEN adds host `igc.preanchor.observe/write`
+accounting, explicitly separate from GPU time; all 25 analyzer tests pass.
+
+Real-model two-request smoke on unchanged Hub settings passes:
+
+| Request | Prompt tokens | Observed pre-anchor rows | Paths | Missing rows |
+|---|---:|---:|---|---:|
+| Calculate `17*23` | 65 | 64, positions 0–63 | serial verifier | 0 |
+| Quoted arithmetic, do not calculate | 72 | 71, positions 0–70 | serial verifier | 0 |
+
+All rows are finite and nonzero, F32, position/token-bound; both owned requests
+complete. This verifies the real short-read path, **not** the batched/pipelined/
+layer-split path or a real cached-missing-row case. Those coverage gaps remain.
+The source callback path is implemented but has not been exercised in this smoke.
+
+Candidate SHA256 `f8030aa2d26e48e8383e58a15fb12d49a468bb94bdc66495caa6b1ed46f483a0`;
+first archive `d69a8cafe7f2e4cae65be5c05f1f093d88d745aa75004baec1523e1f6c91e733`;
+second `ebcd2294a0fe7cd15300012687057567d5db18375425a163810e5a1580302108`.
+Evidence: `igc-preanchor-smoke-01/`, `igc-preanchor-{host-red,host-green,host-test,engine-build,smoke}.log`.
+The D2x `89;120` build and smoke end `DONE exit=0`; owned cleanup and served/original
+learned-profile checks pass. Smoke wall 29.375 seconds, ready 20.203 seconds;
+sampled private peak 46,575,521,792 bytes, min commit headroom 14,366,564,352 bytes,
+min physical available 9,971,019,776 bytes. These instrumented values are not
+paired speed or memory-win claims. No mapper training on these new rows is claimed
+yet; I2 remains open and the next ablation needs its own frozen protocol.

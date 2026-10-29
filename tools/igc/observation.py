@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import stat
+import struct
 import numpy as np
 
 
@@ -61,3 +62,37 @@ def load_observation(root, index):
             'mixed_sha256':hashlib.sha256(mixed_raw).hexdigest(),
             'logits_sha256':hashlib.sha256(logits_raw).hexdigest(),
             'metadata_sha256':hashlib.sha256(meta_raw).hexdigest()}
+
+
+def load_preanchor(root,index):
+    """Only observed F32 rows; absence in a valid prefix cache is explicit."""
+    anchor=load_observation(root,index)
+    raw=_read(Path(root)/f'mixed.{index}.preanchor.bin',limit=4*1024**2)
+    header=struct.Struct('<8sIIIIIQQ')
+    if len(raw)<header.size:
+        raise ValueError('preanchor header size')
+    magic,version,hc,dim,cap,n,position,count=header.unpack_from(raw)
+    if (magic!=b'IGCPREA1' or (version,hc,dim,cap)!=(1,4,2560,80)
+            or position!=anchor['position'] or count!=anchor['prompt_tokens']
+            or n>min(position,cap) or anchor.get('preanchor_format')!=1
+            or anchor.get('preanchor_rows')!=n or anchor.get('preanchor_capacity')!=cap):
+        raise ValueError('preanchor geometry or boundary')
+    row_bytes=16+hc*dim*4
+    if len(raw)!=header.size+n*row_bytes:
+        raise ValueError('preanchor record bytes')
+    positions=[];sources=[];values=[]
+    first=max(0,position-cap)
+    for i in range(n):
+        offset=header.size+i*row_bytes
+        p,token,source=struct.unpack_from('<qII',raw,offset)
+        if (not first<=p<position or source not in (1,2) or token!=anchor['prefix_tokens'][p]
+                or (positions and p<=positions[-1])):
+            raise ValueError('preanchor row identity or order')
+        row=np.frombuffer(raw,dtype='<f4',count=hc*dim,offset=offset+16).reshape(hc,dim)
+        if not np.isfinite(row).all():
+            raise ValueError('preanchor nonfinite')
+        positions.append(p);sources.append(source);values.append(row.copy())
+    return dict(anchor=anchor,positions=positions,sources=sources,
+                residuals=np.stack(values) if values else np.empty((0,hc,dim),dtype=np.float32),
+                missing_positions=[p for p in range(first,position) if p not in positions],
+                preanchor_sha256=hashlib.sha256(raw).hexdigest())

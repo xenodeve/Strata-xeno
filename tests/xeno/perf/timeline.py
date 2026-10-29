@@ -569,6 +569,14 @@ def qwenputer_report(tl: Timeline) -> dict:
             "max_chunk_ms": max((s.dur for s in chunks), default=0), "host_ms": host}
 
 
+def igc_observation_report(tl: Timeline) -> dict:
+    """Host diagnostic scopes; do not relabel owning-stream waits as GPU time."""
+    rows = [s for spans in tl.lanes.values() for s in spans if s.name == 'igc.preanchor.observe']
+    writes = [s for spans in tl.lanes.values() for s in spans if s.name == 'igc.preanchor.write']
+    return {'observe_calls': len(rows), 'selected_row_attempts': sum(max(0, s.a) for s in rows),
+            'host_ms': {'observe': sum(s.dur for s in rows), 'write': sum(s.dur for s in writes)}}
+
+
 def secondary_memory_report(tl: Timeline) -> list[dict]:
     """Boot resource observations in bytes; missing samples are not free memory."""
     rows = []
@@ -602,6 +610,10 @@ def main(argv: list[str] | None = None) -> int:
     print(render(tl, a.top))
     native = qwenputer_report(tl)
     secondary_memory = secondary_memory_report(tl)
+    observations = igc_observation_report(tl)
+    if observations['observe_calls']:
+        print("\n== IGC observation host scopes (diagnostic copies/waits, not GPU time) ==")
+        print(observations)
     if secondary_memory:
         print("\n== Secondary boot memory (bytes; CUDA/NVML samples are sequential) ==")
         print(table([(r["stage"], r["cuda_free_bytes"], r["nvml_free_bytes"], r["floor_bytes"],
@@ -622,7 +634,8 @@ def main(argv: list[str] | None = None) -> int:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"prefill": prefill_report(tl, a.top), "decode": decode_report(tl), "lanes": utilisation(tl),
                        "threads": thread_report(tl), "server": server_report(tl),
-                       "qwenputer": native, "secondary_memory": secondary_memory},
+                       "qwenputer": native, "secondary_memory": secondary_memory,
+                       "igc_observation": observations},
                       f, indent=1, default=str)
     if a.perfetto:
         export_perfetto(a.trace, a.perfetto)
