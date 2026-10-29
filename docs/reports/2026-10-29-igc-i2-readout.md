@@ -167,3 +167,62 @@ sampled private peak 46,575,521,792 bytes, min commit headroom 14,366,564,352 by
 min physical available 9,971,019,776 bytes. These instrumented values are not
 paired speed or memory-win claims. No mapper training on these new rows is claimed
 yet; I2 remains open and the next ablation needs its own frozen protocol.
+
+## Frozen activation-attention experiment outcome
+
+The new cohort completes 64 requests in 242.187 seconds (ready 19.422 seconds),
+with 4,120 observed F32 pre-anchor rows, no missing rows and source path 1 only
+(the actual verifier short-read route). Owned cleanup, enumerated source-stat
+checks and served/original learned-profile hashes all pass. Its source manifest
+retains the previous full model/pack/MTP hashes for unchanged size/timestamps and
+rehashes the new executable; this is explicit incremental provenance, not another
+fresh full hash of the 91.97 GB model. Original manifests/data are preserved.
+
+Protocol/code were committed before fitting (`aab9555f`, `e3ad3d92`). The new
+evaluation-only 64-row manifest, seed20261102, SHA256
+`0b6158b0df2ce66edca7bad158b75e32b36e93543a40230891d8d761933bc5ef`,
+has not been collected or evaluated. The sixteen former held-out cases are now
+known diagnostic data. They are not relabeled as unseen after tuning.
+
+| Variant, same new cohort | Train operator | Train exact positive tuples | Diagnostic operator | Diagnostic exact positive tuples |
+|---|---:|---:|---:|---:|
+| Final-vector MLP, 334,516 params | 48/48 | 36/36 | 14/16 | 0/12 |
+| Activation attention, 227,396 params | 48/48 | 36/36 | 12/16 | 0/12 |
+
+Both have zero false calls on the four diagnostic negatives; the denominator is
+too small for a deployment bound. Attention fits in 17.672 seconds on four CPU
+threads, 300 fixed epochs, loss13.834379→0.003129. It has no gradient through
+frozen Gyro and no output mapper. Its preregistered development stop rule fires:
+do not consume the new evaluation set when diagnostic joint tuples remain zero.
+Neither variant passes I2 or is eligible for integration/rollout.
+
+Attention state SHA256 `61783ba2088a76ebc11fd4775f6cce22bde99c2027cb7b1f1f88a7b20bf3c4c5`;
+same-cohort baseline state `e4b504dbd73ce590e47f4dd328ff2b63cbf0305baa015ae255c35597d0180b1f`;
+protocol SHA256 `d6e2d8117d911c0428b0613825a7b8a4dcfb67fcaae55840a83571ea1fdccbc8`;
+source manifest `8feeca33e405f189684ae448b8c365f8fcdc327040a302ae09a9d745e4efd2fc`.
+Evidence: `igc-i2-preanchor-fit-01/`, `igc-preanchor-experiment-01/`,
+`igc-preanchor-{fit-collection,final-vector-baseline,attention-fit}.log`, all DONE0.
+Three input-head mask/refusal/gradient tests pass; they concern readout autograd,
+not a native frozen-model backward path.
+
+### Diagnosis before the next change
+
+Only 47 distinct absolute operand values occur among 36 positive fit examples;
+12 absolute values in the diagnostic set were not seen as numbers in training.
+Per-positive attention field correctness (n=12): operator8, lhs/rhs sign9/10,
+lhs/rhs length11/9, lhs ones/tens2/0, rhs ones/tens0/1. This localizes the failure
+to digit extraction as well as routing; it does not prove data coverage is the
+sole cause. Exact causal-prefix comparisons among early prompt positions also
+show final-HC residual variation (756 comparisons; relative-L2 median0.07833,
+max0.18141) under the adaptive profile. Its cause is not established; do not call
+this a model/capture bug or explain it from an unrelated run.
+
+[IGC §3.3](https://arxiv.org/html/2501.00684v1#S3.SS3) reports best results at early
+layer1 and a left-aligned digit representation. Our successful capture seam is
+currently final HC, not that early seam. The actual Gyro tokenizer separately
+encodes each digit (`17`→`1`,`7`; `123456`→six digit tokens), unlike the paper's
+Llama grouping. Its alignment result cannot simply be transferred as a proven
+fix. Next investigate an explicitly named early native activation boundary
+without disabling actual engine fusion, and keep learned digit layout separate
+from the unchanged little-endian exact-executor ABI. No new speed benchmark is
+scheduled ahead of usable integrated IGC.
