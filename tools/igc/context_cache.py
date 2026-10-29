@@ -16,6 +16,7 @@ import time
 import numpy as np
 import torch
 from tools.igc.balanced_corpus import expanded_dataset
+from tools.igc.input_manifest import load_manifest, validate_manifest, native_prompt_rows, cache_shapes, binding, check_cache_header, storage_budget
 from tools.igc.observation import load_observation,_read
 from tools.igc.provenance import verify_sources
 from tools.qwenputer.memory import system_snapshot,process_snapshot
@@ -129,16 +130,14 @@ class ContextInputs:
 
 def load_cache(root,sources,protocol):
     report=json.loads(_read(root/'report.json',limit=256*1024))
-    if (report.get('success') is not True or report.get('rows')!=10624
-            or report.get('protocol_sha256')!=digest(protocol)
-            or report.get('source_manifest_sha256')!=digest(sources)):
-        raise ValueError('context preparation identity/incomplete cache')
-    verify_sources(sources)
     corpus=json.loads(_read(root/'corpus.json',limit=16*1024**2))
-    if corpus!=expanded_dataset() or corpus['rows_sha256']!=report['rows_sha256']:
-        raise ValueError('context frozen corpus')
+    count=validate_manifest(corpus);manifest_binding=binding(corpus)
+    check_cache_header(report,count=count,rows_sha=corpus['rows_sha256'],protocol_sha=digest(protocol),
+                       sources_sha=digest(sources),matched_sha=manifest_binding.get('input_manifest_sha256'))
+    verify_sources(sources)
     arrays=[]
-    for name,expected_dtype,shape in [('states',np.float32,(10624,80,4,2560)),('valid',np.bool_,(10624,80))]:
+    state_shape,mask_shape=cache_shapes(count)
+    for name,expected_dtype,shape in [('states',np.float32,state_shape),('valid',np.bool_,mask_shape)]:
         path=root/f'{name}.npy';info=regular(path);expected=int(np.prod(shape))*np.dtype(expected_dtype).itemsize
         if not expected<info.st_size<=expected+1024 or digest(path)!=report[name+'_sha256']:
             raise ValueError('context cache bytes/content identity')
@@ -156,7 +155,13 @@ def load_cache(root,sources,protocol):
     return states,valid,corpus['rows'],report
 
 
-def prepare(executable,model,pack,reference,sources,protocol,output,resume_from=0,prior_log=None):
+def prepare(executable,model,pack,reference,sources,protocol,output,resume_from=0,prior_log=None,corpus_manifest=None):
+    # Refuse an unrecognized explicit corpus before source hashing or model I/O.
+    corpus=load_manifest(corpus_manifest) if corpus_manifest is not None else expanded_dataset()
+    validate_manifest(corpus);manifest_binding=binding(corpus)
+    manifest_file_hash=digest(corpus_manifest) if corpus_manifest is not None else None
+    adapter_paths=[Path(__file__).with_name(name) for name in ('input_manifest.py','matched_corpus.py')]
+    adapter_hashes={p.name:digest(p) for p in adapter_paths}
     started=time.monotonic();verified=verify_sources(sources)
     protocol_hash=digest(protocol);source_hash=digest(sources)
     manifest=json.loads(_read(sources,limit=256*1024))
@@ -174,8 +179,8 @@ def prepare(executable,model,pack,reference,sources,protocol,output,resume_from=
         if prefix is None:prefix,suffix=raw[:at],raw[at+len(prompt):]
         if raw!=prefix+prompt+suffix or tokenizer.encode(raw.decode('utf-8'))!=tokens:
             raise ValueError('context actual native wrapper fidelity')
-    corpus=expanded_dataset();rows=corpus['rows'];encoded=[]
-    for row in rows:
+    rows=corpus['rows'];encoded=[]
+    for row in native_prompt_rows(rows):
         prompt=row['prompt'].encode('utf-8');tokens=tokenizer.encode((prefix+prompt+suffix).decode('utf-8'))
         if not 2<=len(tokens)<=256:raise ValueError('context prefix bounds')
         offsets=np.cumsum([0]+[len(tokenizer.bytes[token]) for token in tokens])
@@ -185,8 +190,9 @@ def prepare(executable,model,pack,reference,sources,protocol,output,resume_from=
             raise ValueError('context expression outside observed window')
         encoded.append(tokens)
     # Price before creating the large output or launching the owned child.
-    system=system_snapshot();payload=len(rows)*80*4*2560*4
-    if (shutil.disk_usage(output.parent).free<(payload+4*1024**3 if not resume_from else 4*1024**3)
+    system=system_snapshot()
+    budget=storage_budget(len(rows),len(json.dumps(corpus,ensure_ascii=False,indent=2).encode('utf-8'))+1)
+    if (shutil.disk_usage(output.parent).free<(budget['fresh_free_bytes'] if not resume_from else 4*1024**3)
             or system['system_commit_available_bytes']<12*1024**3
             or system['physical_available_bytes']<8*1024**3):
         raise RuntimeError('offline contextual collection preflight; no model launched')
@@ -239,7 +245,7 @@ def prepare(executable,model,pack,reference,sources,protocol,output,resume_from=
         states=NpyRows.create(output/'states.npy',len(rows))
         valid=np.zeros((len(rows),80),dtype=np.bool_)
     (output/'identity.json').write_text(json.dumps(dict(protocol_sha256=protocol_hash,source_manifest_sha256=source_hash,
-        rows_sha256=corpus['rows_sha256'],exe_sha256=exe_hash,recovery=recovery),indent=2),encoding='utf-8')
+        rows_sha256=corpus['rows_sha256'],exe_sha256=exe_hash,recovery=recovery,**manifest_binding),indent=2),encoding='utf-8')
     for start in range(resume_from,len(rows),64):
         if time.monotonic()-started>1200:raise TimeoutError('context collection deadline; incomplete cache')
         subset=encoded[start:start+64];chunk=output/(f'chunk-{start:05}' if not resume_from else f'chunk-{start:05}-resume');chunk.mkdir()
@@ -289,6 +295,9 @@ def prepare(executable,model,pack,reference,sources,protocol,output,resume_from=
         print('context captured',start+len(subset),'/',len(rows),'seconds',round(time.monotonic()-started,2),flush=True)
     if (digest(executable)!=exe_hash or digest(protocol)!=protocol_hash or digest(sources)!=source_hash):
         raise RuntimeError('context binary/protocol/source changed during capture')
+    if ({p.name:digest(p) for p in adapter_paths}!=adapter_hashes
+            or (corpus_manifest is not None and digest(corpus_manifest)!=manifest_file_hash)):
+        raise RuntimeError('context input manifest/adapter changed during capture')
     verify_sources(sources)
     states.close();del states,valid
     (output/'records.json').write_text(json.dumps(records,indent=2),encoding='utf-8')
@@ -299,6 +308,7 @@ def prepare(executable,model,pack,reference,sources,protocol,output,resume_from=
                 tokenizer_binding_sha256=tokenizer.binding_sha256,preflight=system,elapsed_seconds=time.monotonic()-started,
                 chunks=chunks,recovery=recovery,source_resolution=verified,collection_source_sha256=digest(Path(__file__)),
                 records_sha256=digest(output/'records.json'),cache_sha256=state_hash)
+    report.update(manifest_binding,input_manifest_source_sha256=adapter_hashes,storage_budget=budget)
     (output/'report.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
     print('context cache complete',report['states_sha256'],'seconds',report['elapsed_seconds'],flush=True)
 
@@ -309,4 +319,5 @@ if __name__=='__main__':
         parser.add_argument('--'+name,type=Path,required=True)
     parser.add_argument('--resume-from',type=int,default=0)
     parser.add_argument('--prior-log',type=Path)
+    parser.add_argument('--corpus-manifest',type=Path)
     args=parser.parse_args();prepare(**vars(args))

@@ -11,7 +11,8 @@ import numpy as np
 import torch
 
 from tools.igc.attention_readout import InputReadout
-from tools.igc.balanced_corpus import dataset,expanded_dataset
+from tools.igc.balanced_corpus import dataset
+from tools.igc.input_manifest import MATCHED, EXPANDED, validate_manifest, binding, check_cache_header
 from tools.igc.diagnostics import analyze
 from tools.igc.observation import _read
 from tools.igc.provenance import verify_sources
@@ -72,12 +73,19 @@ def load_cache(root,sources,protocol):
             or report.get('protocol_sha256')!=hashlib.sha256(protocol.read_bytes()).hexdigest()
             or report.get('source_manifest_sha256')!=hashlib.sha256(sources.read_bytes()).hexdigest()):
         raise ValueError('cache preparation/protocol identity')
-    verify_sources(sources)
     corpus=json.loads(_read(root/'corpus.json',limit=16*1024**2))
-    expected=(dataset() if corpus.get('kind')=='balanced-native-embedding-input-development' else
-              expanded_dataset() if corpus.get('kind')=='expanded-native-embedding-input-development' else None)
-    if corpus!=expected or corpus['rows_sha256']!=report['rows_sha256']:
+    if corpus.get('kind') in (MATCHED,EXPANDED):
+        count=validate_manifest(corpus);manifest_binding=binding(corpus)
+        if manifest_binding:
+            check_cache_header(report,count=count,rows_sha=corpus['rows_sha256'],
+                protocol_sha=hashlib.sha256(protocol.read_bytes()).hexdigest(),
+                sources_sha=hashlib.sha256(sources.read_bytes()).hexdigest(),
+                matched_sha=manifest_binding['input_manifest_sha256'])
+    elif corpus.get('kind')!='balanced-native-embedding-input-development' or corpus!=dataset():
         raise ValueError('frozen balanced corpus identity')
+    if corpus['rows_sha256']!=report['rows_sha256']:
+        raise ValueError('frozen corpus rows identity')
+    verify_sources(sources)
     count=report.get('unique_tokens')
     if type(count) is not int or not 1<=count<=1024:raise ValueError('bounded native row count')
     raw=_read(root/'native-embeddings.bin',size=count*4*2560*4,limit=40*1024**2)
@@ -101,7 +109,8 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
     import os
     timeout=fit_budget(activation_cache,fit_timeout)
     output.mkdir(parents=True,exist_ok=False)
-    source_paths=[Path(__file__),Path(__file__).with_name('attention_readout.py'),Path(__file__).with_name('balanced_corpus.py')]
+    source_paths=[Path(__file__),Path(__file__).with_name('attention_readout.py'),Path(__file__).with_name('balanced_corpus.py'),
+                  Path(__file__).with_name('input_manifest.py'),Path(__file__).with_name('matched_corpus.py')]
     source_hashes={path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}
     if activation_cache=='embedding':
         table,indices,valid,rows,cache=load_cache(root,sources,cache_protocol or protocol)

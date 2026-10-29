@@ -57,11 +57,12 @@ The current generated file occupies857,013 bytes. No existing dataset is changed
 
 ## Later execution, not run in this preparation
 
-The current `context_cache.prepare/load_cache` and embedding fitter recognize
-the old expanded-v2 corpus, not this manifest. Before capture/fit, add a separately
-versioned matched-manifest adapter with identity/shape/split tests; do not retag
-this file as expanded-v2, import acceptance to rebuild it, or relax the old
-loader's identity checks. That adapter is not implemented by this generator.
+The separately versioned `input_manifest` adapter now binds this manifest and
+the old expanded-v2 corpus without regenerating acceptance data. Collector uses
+`--corpus-manifest`; cache/fitter loading verifies count, geometry, protocol,
+sources and the matched manifest fingerprint. Do not retag data as expanded-v2
+or relax identity checks. This metadata qualification is not a completed capture
+or full-array load of the new dataset; see the adapter report.
 
 First capture the new prompts' actual native first-attention states,80 x4 x2560
 F32 tail and mask, preserving actual Hub profile and identity/accepted-prefix
@@ -110,7 +111,9 @@ No gating-policy adoption follows from the old first-attention-only counterfactu
 
 Preparation is stdlib metadata plus the existing NumPy label tests, no GPU/model.
 Raw fixed-size one-tap cache for1,536 rows is5,033,164,800 bytes (4.6875GiB),
-plus122,880 mask bytes; this excludes archive/log/metadata and temporary storage.
+plus122,880 mask bytes. The fresh collector budget is9,329,114,037 bytes including
+2,048 header bytes,857,013 manifest bytes and the existing4GiB transient reserve.
+This is an offline collector budget, not a Hub process cap or a measured peak.
 Keeping both embedding and attention doubles the raw-state figure. These are
 calculated storage, not measured peak RAM/VRAM. Start with one tap; do not collect
 until the output drive has room for data, transient archives and retained evidence.
