@@ -29,7 +29,11 @@ operand pairs and prompt templates from the known 64. Signed magnitudes remain
 Never optimize, normalize, select epochs or tune thresholds on these new rows.
 Frozen canonical evaluation-row SHA256:
 `0b6158b0df2ce66edca7bad158b75e32b36e93543a40230891d8d761933bc5ef`.
-After candidate weights are frozen, collect/evaluate them once. A failed new gate
+After candidate weights are frozen, collect/evaluate them once if the candidate
+fits its training positives and obtains at least one exact joint tuple on the
+known diagnostic positives. If it cannot do either, stop the failed candidate and
+retain the new evaluation unconsumed. This development stop rule is fixed before
+fitting. A failed new gate
 is retained; further changes require a fresh declared experiment/evaluation set.
 
 ## Fixed variants and learning budget
