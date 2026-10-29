@@ -20,6 +20,7 @@
 // Requires the default native decode configuration (native projections, fused GR, fused GDN, fast attention and
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
+#include "strata/core/early_activations.hpp"
 
 #include <cstdio>
 
@@ -110,7 +111,7 @@ public:
     /// and/or head input. Host buffers are hc*n_embd and n_embd floats. Call after
     /// run(), before another window; synchronizes this verifier's explicit stream.
     bool copy_head_input(int t, float* residual, float* mixed) const;
-    enum class ObservationTap { Embedding, FirstAttention };
+    using ObservationTap = EarlyActivationTap;
     // Offline diagnostics only, configured before init. These copy actual native
     // tensors, preserving fusion: initial HC embedding broadcast and the first
     // attention output after pre(layer0), before its MoE result is combined.
@@ -121,6 +122,10 @@ public:
     // Plain run() only; caller fences/consumes before another window. This first
     // stage owns the buffers; a later stage must not stand in for it.
     bool copy_observation_tap(ObservationTap tap, int t, float* host) const;
+    // Plain completed run only. Consumer receives only the retained INPUT prefix
+    // [last_pos0,last_pos0+kept), never the rejected speculative suffix. Source
+    // buffers remain owned by this verifier; enqueue consumption on their stream.
+    bool visit_early_activations(int kept,const EarlyActivationConsumer&,std::string&) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its

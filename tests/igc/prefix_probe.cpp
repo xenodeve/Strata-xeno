@@ -3,12 +3,14 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/igc_context.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/program/igc_observation.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -128,6 +130,21 @@ int main(int argc,char** argv) try {
     verifier.set_stream(owner.stream);verifier.set_stage(0,1,nullptr,hand);
     require(verifier.enable_early_observation(true),"prefix_observation_configuration");
     require(verifier.init(owner.weights,g,owner.session,hits,nullptr,8,error),error);
+    strata::igc::ContextWindow history;require(history.allocate(owner.stream,error),error);
+    struct DeviceRows {
+        float* data[2]{};cudaStream_t stream=nullptr;int64_t position=0;int count=0,seen=0;
+        strata::igc::ContextWindow* history=nullptr;
+    } copied;
+    copied.stream=owner.stream;copied.history=&history;
+    for(auto& p:copied.data)p=static_cast<float*>(owner.allocate(8*10240*4));
+    EarlyActivationConsumer consumer{&copied,[](void* user,const EarlyActivationRows& row,std::string& error){
+        auto& c=*static_cast<DeviceRows*>(user);const int kind=static_cast<int>(row.tap);
+        if(kind<0 || kind>1 || row.count!=c.count || row.width!=10240 || row.pos0!=c.position || row.stream!=c.stream || !row.device){error="prefix_device_tap_descriptor";return false;}
+        c.seen|=1<<kind;
+        const auto status=cudaMemcpyAsync(c.data[kind],row.device,row.count*row.width*4,cudaMemcpyDeviceToDevice,c.stream);
+        if(status!=cudaSuccess){error=cudaGetErrorString(status);return false;}
+        return c.history->observe(static_cast<strata::igc::ContextTap>(kind),row.pos0,row.count,row.device,row.stream,error);
+    }};
     std::vector<float> buffer(10240);
     for (std::size_t i=0;i<requests.size();++i) {
         const auto& tokens=requests[i];std::vector<int64_t> prefix(tokens.begin(),tokens.end());
@@ -135,19 +152,42 @@ int main(int argc,char** argv) try {
         for (int repetition=0;repetition<2;++repetition) {
             require(verifier.wait_commit(error),error);
             session_zero(owner.session,g,nullptr,owner.stream);check(cudaStreamSynchronize(owner.stream));
+            require(history.begin(prefix,0,false,error),error);
             Capture capture;require(capture.begin(prefix,error),error);
             std::vector<float> current;
             for (int p=0;p<static_cast<int>(tokens.size())-1;) {
                 const int n=std::min(window,static_cast<int>(tokens.size())-1-p);int32_t unused[8]{};
                 require(verifier.run(n,tokens.data()+p,p,nullptr,nullptr,unused,error),error);
+                copied.position=p;copied.count=n;copied.seen=0;
+                require(verifier.visit_early_activations(n,consumer,error),"prefix_device_tap_visit");
+                require(copied.seen==3,"prefix_device_both_taps");
+                for(auto tap:{Verifier::ObservationTap::Embedding,Verifier::ObservationTap::FirstAttention}){
+                    std::vector<float> device_copy(static_cast<size_t>(n)*10240),legacy(10240);
+                    check(cudaMemcpyAsync(device_copy.data(),copied.data[static_cast<int>(tap)],device_copy.size()*4,cudaMemcpyDeviceToHost,owner.stream));
+                    check(cudaStreamSynchronize(owner.stream));
+                    for(int t=0;t<n;++t){require(verifier.copy_observation_tap(tap,t,legacy.data()),"prefix_legacy_tap");
+                        require(!std::memcmp(legacy.data(),device_copy.data()+t*10240,10240*4),"prefix_device_vs_host_bitwise");}
+                }
+                require(!verifier.visit_early_activations(n+1,consumer,error),"prefix_rejected_suffix_bound");
+                require(!verifier.visit_early_activations(0,consumer,error),"prefix_empty_retention_bound");
+                if(n>1){copied.count=n-1;copied.seen=0;require(verifier.visit_early_activations(n-1,consumer,error),"prefix_clamped_tap_visit");require(copied.seen==3,"prefix_clamped_both_taps");}
                 require(capture.observe(p,n,1,[&](int64_t row,std::span<float> values){
                     return verifier.copy_observation_tap(Verifier::ObservationTap::FirstAttention,static_cast<int>(row),values.data());},error),error);
                 for (int t=0;t<n;++t) {
                     require(verifier.copy_observation_tap(Verifier::ObservationTap::FirstAttention,t,buffer.data()),"prefix_tap_copy");
                     current.insert(current.end(),buffer.begin(),buffer.end());
                 }
-                require(verifier.commit(n,error) && verifier.wait_commit(error),error);p+=n;
+                require(verifier.commit(n,error) && verifier.wait_commit(error),error);
+                std::vector<int64_t> accepted(tokens.begin()+p,tokens.begin()+p+n);
+                require(history.accept(p,accepted,error),error);p+=n;
             }
+            require(history.gather(static_cast<int64_t>(tokens.size())-1,owner.stream,error),error);
+            std::vector<float> ring(80ull*10240);std::array<uint8_t,80> mask{};
+            check(cudaMemcpyAsync(ring.data(),history.states(strata::igc::ContextTap::FirstAttention),ring.size()*4,cudaMemcpyDeviceToHost,owner.stream));
+            check(cudaMemcpyAsync(mask.data(),history.mask(),80,cudaMemcpyDeviceToHost,owner.stream));check(cudaStreamSynchronize(owner.stream));
+            const size_t valid=std::min<size_t>(80,tokens.size()-1),pad=80-valid;
+            for(size_t r=0;r<80;++r)require(mask[r]==(r>=pad),"prefix_ring_valid_mask");
+            require(!std::memcmp(ring.data()+pad*10240,current.data()+current.size()-valid*10240,valid*10240*4),"prefix_ring_native_bitwise");
             if (repetition==0) first=std::move(current);
             else require(current.size()==first.size() && !std::memcmp(current.data(),first.data(),current.size()*sizeof(float)),"prefix_reset_repeat");
             if (repetition==1) require(capture.write((output/(std::to_string(i)+".attention.bin")).string(),error,Capture::Stage::FirstAttention),error);
@@ -155,8 +195,9 @@ int main(int argc,char** argv) try {
         std::cout<<"prefix request="<<i<<" tokens="<<tokens.size()<<" reset_repeat=bitwise\n"<<std::flush;
     }
     require(verifier.wait_commit(error),error);check(cudaStreamSynchronize(owner.stream));
-    std::cout<<"PASS native prefix requests="<<requests.size()<<" window="<<window
+    std::cout<<"PASS native prefix device_taps=bitwise context_ring=bitwise retained_input_bounds=pass requests="<<requests.size()<<" window="<<window
              <<" geometry_layers="<<g.n_layers<<" stage=[0,1) owned_device_bytes="<<owner.device_bytes
-             <<" native_dense_bytes="<<owner.dense.weight_bytes()<<" embedding_mapped_bytes="<<owner.embedding.bytes()<<'\n';
+             <<" native_dense_bytes="<<owner.dense.weight_bytes()<<" embedding_mapped_bytes="<<owner.embedding.bytes()
+             <<" context_device_bytes="<<history.device_bytes()<<'\n';
     return 0;
 } catch (const std::exception& e) {std::cerr<<e.what()<<'\n';return 2;}

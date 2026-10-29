@@ -3073,6 +3073,24 @@ bool Verifier::copy_observation_tap(ObservationTap tap, int t, float* host) cons
     return cudaStreamSynchronize(cs_) == cudaSuccess;
 }
 
+bool Verifier::visit_early_activations(int kept,const EarlyActivationConsumer& consumer,std::string& error) const {
+    if(!observe_early_ || !consumer.user || !consumer.consume || !g_ || !cs_ || device_<0 || lb_!=0 || fl_active_
+            || kept<1 || kept>last_t_ || !observation_embedding_ || !observation_attention_){
+        error="early_activation_visit_arguments";return false;
+    }
+    const OnDevice on_device(device_);
+    const int64_t width=g_->hc*g_->n_embd;
+    for(const auto tap:{EarlyActivationTap::Embedding,EarlyActivationTap::FirstAttention}){
+        const auto* data=tap==EarlyActivationTap::Embedding?observation_embedding_:observation_attention_;
+        const EarlyActivationRows rows{tap,data,kept,width,last_pos0_,cs_};
+        if(!consumer.consume(consumer.user,rows,error)){
+            if(error.empty())error="early_activation_consumer_failed";
+            return false;
+        }
+    }
+    error.clear();return true;
+}
+
 
 // ================================ PIPELINED WINDOWS (see verify.hpp) ================================
 //
