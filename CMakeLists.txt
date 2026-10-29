@@ -2024,6 +2024,8 @@ if(STRATA_BUILD_IGC_HEAD_PROBE)
   target_link_libraries(igc_head_probe PRIVATE strata_engine)
   add_executable(igc_embedding_probe tests/igc/embedding_probe.cpp)
   target_link_libraries(igc_embedding_probe PRIVATE strata_engine)
+  add_library(igc_head_bridge SHARED tests/igc/head_bridge.cpp tests/igc/head_vjp.cu)
+  target_link_libraries(igc_head_bridge PRIVATE strata_engine)
 endif()
 
 option(STRATA_BUILD_IGC_EXACT_TESTS "Build isolated typed exact GPU executor tests" OFF)
