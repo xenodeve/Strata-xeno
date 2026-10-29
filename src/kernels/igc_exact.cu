@@ -1,4 +1,4 @@
-#include "strata/core/igc_exact.hpp"
+#include "strata/core/igc_invocation.hpp"
 #include <cuda_runtime.h>
 
 namespace strata::igc {
@@ -122,5 +122,65 @@ bool broadcast_exact_result(ExactResult* output,uint32_t count,void* stream,std:
     const auto status=cudaPeekAtLastError();
     if(status!=cudaSuccess){error=cudaGetErrorString(status);return false;}
     error.clear();return true;
+}
+namespace {
+__global__ void arm_kernel(Invocation* states,const uint64_t* ids,const uint64_t* positions,uint32_t count){
+    const uint32_t i=threadIdx.x;
+    if(i>=count)return;
+    Invocation state{};state.id=ids[i];state.position=positions[i];
+    state.result.invocation=state.id;state.result.position=state.position;state.result.status=Status::Fault;
+    state.armed=state.id!=0;
+    state.terminal=state.armed?InvocationStatus::Pending:InvocationStatus::Rejected;
+    states[i]=state;
+}
+__global__ void invocation_kernel(Invocation* states,const ExactRequest* requests,const uint32_t* selected,uint32_t count){
+    const uint32_t i=threadIdx.x;
+    if(i>=count || !states[i].armed)return;
+    auto state=states[i];state.armed=0;state.attempts=1;
+    const auto& request=requests[i];
+    if(request.invocation!=state.id || request.position!=state.position){
+        state.terminal=InvocationStatus::OwnerMismatch;
+    }else if(selected[i]!=0){
+        state.terminal=selected[i]==1?InvocationStatus::NoCall:InvocationStatus::Rejected;
+    }else{
+        state.evaluations=1;state.result=calculate(request);
+        state.terminal=state.result.status==Status::Success?InvocationStatus::Applied:InvocationStatus::Rejected;
+    }
+    states[i]=state;
+}
+__global__ void invocation_broadcast_kernel(const Invocation* state,ExactResult* output,uint32_t rows){
+    const uint32_t row=threadIdx.x;if(row<rows)output[row]=state->result;
+}
+bool invocation_launch(bool arguments,void* stream,std::string& error){
+    const auto s=static_cast<cudaStream_t>(stream);
+    if(!arguments || !s || s==cudaStreamLegacy || s==cudaStreamPerThread){error="invocation_launch_arguments";return false;}
+    return true;
+}
+bool invocation_launched(std::string& error){
+    const auto status=cudaPeekAtLastError();
+    if(status!=cudaSuccess){error=cudaGetErrorString(status);return false;}
+    error.clear();return true;
+}
+}
+bool arm_invocations(Invocation* states,const uint64_t* ids,const uint64_t* positions,uint32_t count,
+                     void* stream,bool enabled,std::string& error){
+    if(!enabled){error.clear();return true;}
+    if(!invocation_launch(states && ids && positions && count && count<=kMaxBatch,stream,error))return false;
+    arm_kernel<<<1,64,0,static_cast<cudaStream_t>(stream)>>>(states,ids,positions,count);
+    return invocation_launched(error);
+}
+bool execute_invocations(Invocation* states,const ExactRequest* requests,const uint32_t* selected,uint32_t count,
+                         void* stream,bool enabled,std::string& error){
+    if(!enabled){error.clear();return true;}
+    if(!invocation_launch(states && requests && selected && count && count<=kMaxBatch,stream,error))return false;
+    invocation_kernel<<<1,64,0,static_cast<cudaStream_t>(stream)>>>(states,requests,selected,count);
+    return invocation_launched(error);
+}
+bool broadcast_invocation(const Invocation* state,ExactResult* output,uint32_t rows,void* stream,
+                          bool enabled,std::string& error){
+    if(!enabled){error.clear();return true;}
+    if(!invocation_launch(state && output && rows && rows<=kMaxBatch,stream,error))return false;
+    invocation_broadcast_kernel<<<1,64,0,static_cast<cudaStream_t>(stream)>>>(state,output,rows);
+    return invocation_launched(error);
 }
 } // namespace strata::igc

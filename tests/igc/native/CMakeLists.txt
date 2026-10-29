@@ -54,3 +54,6 @@ set_target_properties(igc_dispatch PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQ
 add_executable(igc_dispatch_test "${IGC_ROOT}/tests/igc/dispatch_test.cpp")
 target_compile_features(igc_dispatch_test PRIVATE cxx_std_20)
 target_link_libraries(igc_dispatch_test PRIVATE igc_dispatch)
+add_executable(igc_invocation_test "${IGC_ROOT}/tests/igc/invocation_test.cpp")
+target_compile_features(igc_invocation_test PRIVATE cxx_std_20)
+target_link_libraries(igc_invocation_test PRIVATE igc_exact)
