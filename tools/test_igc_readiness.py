@@ -2,7 +2,7 @@
 import unittest
 from collections import Counter
 import numpy as np
-from tools.igc.readiness_corpus import dataset, anchor_examples
+from tools.igc.readiness_corpus import dataset, augmentation_dataset, anchor_examples
 
 
 class BytesTokenizer:
@@ -10,6 +10,18 @@ class BytesTokenizer:
 
 
 class ReadinessCorpus(unittest.TestCase):
+    def test_prospective_augmentation_is_fit_only_and_disjoint(self):
+        old=dataset()['rows'];new=augmentation_dataset()['rows']
+        self.assertEqual(len(new),416);self.assertEqual({r['split'] for r in new},{'train'})
+        self.assertEqual(sum(r['ready'] for r in new),192)
+        old_pairs={(r['lhs'],r['rhs']) for r in old if r['pair'] is not None}
+        new_pairs={(r['lhs'],r['rhs']) for r in new if r['pair'] is not None}
+        self.assertEqual(len(new_pairs),192);self.assertFalse(old_pairs&new_pairs)
+        dev_templates={r['template'] for r in old if r['split']=='development'}
+        self.assertFalse(dev_templates&{r['template'] for r in new})
+        positive=[r for r in new if r['ready']]
+        self.assertEqual(sum(r['lhs']==r['rhs'] for r in positive),24)
+        self.assertEqual(sum(r['lhs']==0 or r['rhs']==0 for r in positive),24)
     def test_matched_pairs_split_as_a_unit_without_answer_targets(self):
         data=dataset();rows=data['rows']
         self.assertEqual(len(rows),320)

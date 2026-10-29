@@ -9,7 +9,7 @@ from tools.igc.observation import _read,load_observation
 from tools.igc.output_data import validate_record
 from tools.igc.output_examples import wrapped_prefix
 from tools.igc.provenance import verify_sources
-from tools.igc.readiness_corpus import dataset,anchor_examples
+from tools.igc.readiness_corpus import dataset,augmentation_dataset,anchor_examples
 from tools.igc.readout import standardize
 from tools.qwenputer.tokenizer import NativeText
 
@@ -37,10 +37,12 @@ def metrics(predicted,rows):
     return result
 
 
-def load_dataset(root,reference,pack,sources,protocol):
-    raw=_read(root/'report.json',limit=256*1024);report=json.loads(raw);corpus=dataset()
+def load_dataset(root,reference,pack,sources,protocol,augmentation=False):
+    raw=_read(root/'report.json',limit=256*1024);report=json.loads(raw)
+    corpus=augmentation_dataset() if augmentation else dataset();count=len(corpus['rows'])
     if (report.get('success') is not True or report.get('readiness_anchors') is not True
-            or report.get('positions')!=320 or report.get('samples')!=320
+            or bool(report.get('readiness_augmentation',False))!=augmentation
+            or report.get('positions')!=count or report.get('samples')!=count
             or report.get('rows_sha256')!=corpus['rows_sha256']
             or report.get('source_manifest_sha256')!=hashlib.sha256(_read(sources,limit=256*1024)).hexdigest()
             or report.get('protocol_sha256')!=hashlib.sha256(_read(protocol,limit=256*1024)).hexdigest()
@@ -66,11 +68,18 @@ def load_dataset(root,reference,pack,sources,protocol):
     return np.stack(vectors),corpus['rows'],report,hashlib.sha256(raw).hexdigest(),resolution
 
 
-def train(root,reference,pack,sources,protocol,output,linear=False,fit_protocol=None):
+def train(root,reference,pack,sources,protocol,output,linear=False,fit_protocol=None,augmentation_root=None):
     import torch
     from safetensors.torch import save_file
     source_hash=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     x,rows,collection,collection_hash,resolution=load_dataset(root,reference,pack,sources,protocol)
+    augmentation_hash=None
+    if augmentation_root is not None:
+        if fit_protocol is None or linear:raise ValueError('augmentation requires its separate MLP fit protocol')
+        added,added_rows,_,augmentation_hash,_=load_dataset(augmentation_root,reference,pack,sources,fit_protocol,True)
+        if any(r['split']!='train' for r in added_rows) or {r['id'] for r in rows}&{r['id'] for r in added_rows}:
+            raise ValueError('augmentation must be disjoint fit only')
+        x=np.concatenate([x,added]);rows=rows+added_rows
     train_mask=np.array([r['split']=='train' for r in rows]);x,mean,scale=standardize(x,train_mask)
     truth=np.array([r['ready'] for r in rows],dtype=np.int64)
     torch.set_num_threads(4);torch.manual_seed(20261107);torch.use_deterministic_algorithms(True)
@@ -105,6 +114,8 @@ def train(root,reference,pack,sources,protocol,output,linear=False,fit_protocol=
         training_seconds=time.monotonic()-start,train=metrics(predictions[train_mask],[r for r in rows if r['split']=='train']),
         development=metrics(predictions[~train_mask],[r for r in rows if r['split']=='development']),
         source_sha256=source_hash,collection_sha256=collection_hash,source_resolution=resolution,
+        augmentation_collection_sha256=augmentation_hash,
+        combined_rows_sha256=hashlib.sha256(json.dumps(rows,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')).hexdigest(),
         rows_sha256=dataset()['rows_sha256'],trained_state_sha256=hashlib.sha256(state.read_bytes()).hexdigest(),
         collection_source_sha256=collection['source_sha256'],protocol_sha256=collection['protocol_sha256'],
         acceptance64_consumed=False,promoted=False)
@@ -122,4 +133,5 @@ if __name__=='__main__':
     for name in ('root','reference','pack','sources','protocol','output'):parser.add_argument('--'+name,type=Path,required=True)
     parser.add_argument('--linear',action='store_true')
     parser.add_argument('--fit-protocol',type=Path)
+    parser.add_argument('--augmentation-root',type=Path)
     args=parser.parse_args();train(**vars(args))

@@ -74,6 +74,64 @@ def dataset():
                             'not dynamic reasoning-time readiness','no serving eligibility'])
 
 
+def augmentation_dataset():
+    rng=random.Random(20261108)
+    old=dataset()['rows']
+    reserved={(r['lhs'],r['rhs']) for r in (small_input()['rows']+expanded_dataset()['rows']
+              +old_input()+evaluation_manifest()['rows']+old_output()['rows']+old) if 'lhs' in r}
+    patterns=[
+        ('en','Compute the integer result of {expr}.','Preserve the literal string "{expr}" without arithmetic.'),
+        ('th','หาผลคำนวณของ {expr} แล้วตอบเป็นจำนวนเต็ม','พิมพ์สตริง "{expr}" ตามเดิม ห้ามหาผลคำนวณ'),
+        ('en','Solve the arithmetic problem {expr}.','Only copy {expr}; it is a label, not a problem to solve.'),
+        ('th','โจทย์เลขคือ {expr} ช่วยตอบค่าที่คำนวณได้','นี่คือป้ายข้อความ "{expr}" ให้ตอบว่าเห็นแล้ว ไม่ต้องคำนวณ')]
+    rows=[]
+    for op,symbol in [(1,'+'),(2,'-'),(3,'*')]:
+        for i in range(64):
+            if i<8:
+                choices=[v for v in range(-99,100) if (v,v) not in reserved and v!=0]
+                if not choices:raise ValueError('insufficient disjoint equal operands')
+                a=b=rng.choice(choices)
+            elif i<16:
+                choices=[pair for v in range(-99,100) if v!=0
+                         for pair in ((0,v),(v,0)) if pair not in reserved]
+                if not choices:raise ValueError('insufficient disjoint zero operands')
+                a,b=rng.choice(choices)
+            else:
+                while True:
+                    a,b=rng.randrange(-99,100),rng.randrange(-99,100)
+                    if a and b and a!=b and (a,b) not in reserved:break
+            reserved.add((a,b));expr=f'({a}) {symbol} ({b})';language,yes,no=patterns[i%len(patterns)]
+            pair=f'augmentation-op{op}-{i:02}'
+            for ready,pattern in [(1,yes),(0,no)]:
+                prompt=pattern.format(expr=expr)
+                rows.append(dict(id=f'{pair}-ready{ready}',pair=pair,split='train',ready=ready,
+                    lhs=a,rhs=b,operation=op,expression=expr,prompt=prompt,
+                    template=f'augmentation-{language}-intent{i%len(patterns)}-{ready}',language=language,
+                    prompt_sha256=hashlib.sha256(prompt.encode('utf-8')).hexdigest()))
+    unsupported=[
+        ('en-divide','Divide {a} by {b} and return the quotient.'),
+        ('th-divide','นำ {a} หารด้วย {b} แล้วตอบผลหาร'),
+        ('en-root','Find the square root of {a}.'),('th-root','หาค่ารากที่สองของ {a}'),
+        ('en-power','Calculate {a} raised to the power {b}.'),('th-power','คำนวณ {a} ยกกำลัง {b}'),
+        ('en-function','What is sin({a})?'),('th-function','หาค่า log({a})'),
+        ('en-decimal','Calculate {a}.5 + {b}.25.'),('th-decimal','คำนวณ {a}.5 - {b}.25'),
+        ('en-variable','Solve for x in x + {a} = {b}.'),('th-variable','หาค่า x ในสมการ x * {a} = {b}'),
+        ('en-modulo','Compute {a} modulo {b}.'),('th-modulo','คำนวณเศษจาก {a} หาร {b}'),
+        ('en-factorial','Evaluate {a}! as an integer.'),('th-factorial','หาค่าแฟกทอเรียลของ {a}')]
+    for i in range(32):
+        name,pattern=unsupported[i%len(unsupported)];a,b=rng.randrange(2,20),rng.randrange(2,10)
+        prompt=pattern.format(a=a,b=b)
+        rows.append(dict(id=f'augmentation-unsupported-{i:02}',pair=None,split='train',ready=0,
+            prompt=prompt,template='augmentation-'+name,language=name[:2],
+            prompt_sha256=hashlib.sha256(prompt.encode('utf-8')).hexdigest()))
+    rng.shuffle(rows)
+    raw=json.dumps(rows,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')
+    return dict(version=1,seed=20261108,kind='matched-intent-fit-only-readiness-augmentation',
+        rows=rows,rows_sha256=hashlib.sha256(raw).hexdigest(),
+        scope='additional fit coverage for the initial signed integer +,-,* readiness module',
+        exclusions=['not development or acceptance','no expected result','not dynamic triggers'])
+
+
 def anchor_examples(rows,tokenizer,prefix,suffix):
     result=[];seen=set()
     for invocation,row in enumerate(rows,1):

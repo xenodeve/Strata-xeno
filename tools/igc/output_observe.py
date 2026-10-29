@@ -68,7 +68,8 @@ def current_job():
     return value
 
 
-def collect(profile,server,executable,exact_executable,pack,reference,sources,protocol,output,readiness_anchors=False):
+def collect(profile,server,executable,exact_executable,pack,reference,sources,protocol,output,readiness_anchors=False,readiness_augmentation=False):
+    if readiness_augmentation:readiness_anchors=True
     validate_launcher_env(os.environ)
     started=time.monotonic();resolution=verify_sources(sources)
     pinned={Path(r['path']).resolve() for r in json.loads(_read(sources,limit=256*1024))['files']}
@@ -86,7 +87,8 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
     before={str(p):digest(p) for p in source_paths}
     tokenizer=NativeText.from_pack(pack/'tokenizer');prefix,suffix=wrapped_prefix(reference,tokenizer)
     if readiness_anchors:
-        corpus=readiness_corpus.dataset();examples=readiness_corpus.anchor_examples(corpus['rows'],tokenizer,prefix,suffix)
+        corpus=(readiness_corpus.augmentation_dataset() if readiness_augmentation else readiness_corpus.dataset())
+        examples=readiness_corpus.anchor_examples(corpus['rows'],tokenizer,prefix,suffix)
     else:
         corpus=dataset();examples=position_examples(corpus['rows'],tokenizer,prefix,suffix)
     system=system_snapshot()
@@ -187,6 +189,7 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
     report=dict(success=True,kind=('native fixed-anchor readiness observations; no trained use or speed claim' if readiness_anchors else
                                   'native teacher-forced output positions; no trained result-use or speed claim'),
                 readiness_anchors=readiness_anchors,
+                readiness_augmentation=readiness_augmentation,
                 positions=len(record),samples=len(corpus['rows']),rows_sha256=corpus['rows_sha256'],job=limits,
                 records_sha256=digest(output/'records.json'),source_manifest_sha256=digest(sources),
                 source_resolution=resolution,protocol_sha256=before[str(protocol)],source_sha256=before,
@@ -206,4 +209,5 @@ if __name__=='__main__':
     for name in ('profile','server','executable','exact-executable','pack','reference','sources','protocol','output'):
         parser.add_argument('--'+name,type=Path,required=True)
     parser.add_argument('--readiness-anchors',action='store_true')
+    parser.add_argument('--readiness-augmentation',action='store_true')
     args=parser.parse_args();collect(**vars(args))
