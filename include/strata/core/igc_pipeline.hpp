@@ -19,6 +19,12 @@ public:
     // Graph-capturable. Reads actual final-HC mixed row0 for readiness, selects
     // typed fields, executes once, retains result, maps it into all mixed rows.
     bool head(float* mixed,uint32_t rows,void* stream,bool enabled,std::string&);
+    // Optional module-only trial, outside capture on the owning stream. Lazy
+    // bounded checkpoint storage is retained for reuse; never touches LM state.
+    // Caller discards rejected output rows and fences borrowed inputs. Partial
+    // acceptance requires abort, then replay only the accepted input prefix.
+    bool begin_trial(void* stream,bool enabled,std::string&);
+    bool finish_trial(bool keep,void* stream,bool enabled,std::string&);
     // Offline/diagnostic request-end readback only, never a per-step decision.
     bool audit(Invocation&,uint32_t& head_status,void* stream,std::string&);
     std::size_t device_bytes()const;
