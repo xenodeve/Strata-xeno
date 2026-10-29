@@ -12,7 +12,7 @@ from tools.igc.readout import SIZES, load_dataset, metrics, standardize, targets
 
 
 class InputReadout(torch.nn.Module):
-    def __init__(self,use_final_query=True):
+    def __init__(self,use_final_query=True,contextual=False):
         super().__init__()
         self.norm=torch.nn.LayerNorm(2560)
         self.stream=torch.nn.Linear(2560,16)
@@ -24,6 +24,10 @@ class InputReadout(torch.nn.Module):
         self.heads=torch.nn.ModuleList(torch.nn.Linear(64,size) for size in SIZES)
         torch.nn.init.normal_(self.position.weight,std=0.02)
         torch.nn.init.normal_(self.queries,std=0.02)
+        # Initialize after shared modules so a declared contextual comparison
+        # starts every common parameter at exactly the baseline value.
+        self.encoder=(torch.nn.TransformerEncoderLayer(64,4,128,dropout=0,activation='gelu',
+                      batch_first=True,norm_first=True) if contextual else None)
 
     def forward(self,states,valid,positions,query):
         if (states.ndim!=4 or states.shape[2:]!=(4,2560) or states.shape[1]>80
@@ -35,6 +39,8 @@ class InputReadout(torch.nn.Module):
         # Padding and missing cache rows carry no evidence or gradient.
         safe=states.masked_fill(~valid[:,:,None,None],0)
         tokens=self.stream(self.norm(safe)).flatten(2)+self.position(positions)
+        if self.encoder is not None:
+            tokens=self.encoder(tokens,src_key_padding_mask=~valid)
         q=self.queries[None,:,:].expand(len(states),-1,-1)
         if self.context is not None:
             q=q+self.context(query)[:,None,:]

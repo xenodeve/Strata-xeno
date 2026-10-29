@@ -11,6 +11,21 @@ from tools.igc.readout import SIZES
 
 
 class AttentionContract(unittest.TestCase):
+    def test_context_block_preserves_common_initialization_and_masks_padding(self):
+        torch.manual_seed(20261030)
+        baseline=InputReadout(use_final_query=False)
+        torch.manual_seed(20261030)
+        model=InputReadout(use_final_query=False,contextual=True)
+        for key,value in baseline.state_dict().items():
+            torch.testing.assert_close(value,model.state_dict()[key],rtol=0,atol=0)
+        states,valid,positions,query=self.inputs()
+        model.eval()
+        original=model(states,valid,positions,query)
+        changed=states.clone();changed[~valid]=100000
+        torch.testing.assert_close(original,model(changed,valid,positions,query),rtol=0,atol=0)
+        original.square().mean().backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
+
     def test_query_free_variant_cannot_recover_labels_from_final_query(self):
         states,valid,positions,query=self.inputs()
         model=InputReadout(use_final_query=False).eval()
