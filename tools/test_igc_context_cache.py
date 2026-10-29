@@ -1,12 +1,26 @@
 """Context archive identity and bounded minibatches are not inferred from filenames."""
 import struct
 import unittest
+import tempfile
+from pathlib import Path
 import numpy as np
 import torch
-from tools.igc.context_cache import decode_archive,ContextInputs
+from tools.igc.context_cache import decode_archive,ContextInputs,NpyRows
 
 
 class ContextCache(unittest.TestCase):
+    def test_file_rows_use_bounded_io_and_refuse_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'states.npy'
+            writer=NpyRows.create(path,2)
+            expected=np.ones((80,4,2560),dtype=np.float32)
+            writer[0]=expected;writer[1]=expected*3;writer.flush();writer.close()
+            reader=NpyRows(path)
+            self.assertFalse(isinstance(reader,np.memmap))
+            np.testing.assert_array_equal(reader[np.array([1,0])][:,0,0,0],[3,1])
+            reader.close()
+            with path.open('r+b') as stream:stream.truncate(path.stat().st_size-1)
+            with self.assertRaises(ValueError):NpyRows(path)
     def archive(self):
         tokens=np.arange(84,dtype=np.int32)
         raw=b'IGCATN01'+struct.pack('<IIIIIQQ',1,4,2560,80,80,83,84)
