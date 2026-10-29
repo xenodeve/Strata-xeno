@@ -87,14 +87,21 @@ def load_cache(root,sources,protocol):
     return table,indices,valid,corpus['rows'],report
 
 
-def train(root,sources,protocol,output,cache_protocol=None,contextual=False,device='cpu',epochs=30,seed=20261030,schedule='constant'):
+def train(root,sources,protocol,output,cache_protocol=None,contextual=False,device='cpu',epochs=30,seed=20261030,schedule='constant',activation_cache='embedding'):
     from safetensors.torch import save_file
     from tools.qwenputer.memory import process_snapshot,system_snapshot
     import os
     output.mkdir(parents=True,exist_ok=False)
     source_paths=[Path(__file__),Path(__file__).with_name('attention_readout.py'),Path(__file__).with_name('balanced_corpus.py')]
     source_hashes={path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}
-    table,indices,valid,rows,cache=load_cache(root,sources,cache_protocol or protocol)
+    if activation_cache=='embedding':
+        table,indices,valid,rows,cache=load_cache(root,sources,cache_protocol or protocol)
+    elif activation_cache=='context':
+        from tools.igc.context_cache import load_cache as load_context,ContextInputs
+        table,valid,rows,cache=load_context(root,sources,cache_protocol or protocol)
+        source_paths.append(Path(__file__).with_name('context_cache.py'))
+        source_hashes={path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}
+    else:raise ValueError('unknown activation cache kind')
     if device not in ('cpu','cuda') or not 1<=epochs<=100:raise ValueError('bounded training recipe')
     labels=targets(rows)
     fit=np.array([i for i,r in enumerate(rows) if r['split']=='train'],dtype=np.int64)
@@ -107,10 +114,11 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
         torch.backends.cuda.matmul.allow_tf32=False;torch.backends.cudnn.allow_tf32=False
         torch.backends.cuda.enable_flash_sdp(False);torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cuda.enable_math_sdp(True);torch.backends.mha.set_fastpath_enabled(False)
-        tensor_inputs=TensorInputs(table,indices,valid,'cuda')
+        tensor_inputs=(TensorInputs(table,indices,valid,'cuda') if activation_cache=='embedding'
+                       else ContextInputs(table,valid,'cuda'))
         inputs=tensor_inputs.batch
     else:
-        inputs=lambda selection:batch_inputs(table,indices,valid,selection)
+        inputs=(lambda selection:batch_inputs(table,indices,valid,selection)) if activation_cache=='embedding' else ContextInputs(table,valid,'cpu').batch
     random=torch.Generator().manual_seed(seed)
     model=InputReadout(use_final_query=False,contextual=contextual).to(device)
     optimizer=torch.optim.AdamW(model.parameters(),lr=0.001,weight_decay=0.01,foreach=False,fused=False)
@@ -120,7 +128,7 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
         order=fit[torch.randperm(len(fit),generator=random).numpy()]
         total=0.
         for offset in range(0,len(order),64):
-            if time.monotonic()-started>600:raise RuntimeError('bounded fit deadline; no completed model')
+            if time.monotonic()-started>(1200 if activation_cache=='context' else 600):raise RuntimeError('bounded fit deadline; no completed model')
             rate=training_lr(schedule,epoch*steps_per_epoch+offset//64,total_steps)
             for group in optimizer.param_groups:group['lr']=rate
             selection=order[offset:offset+64]
@@ -151,10 +159,11 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
     eligible=all(item['metrics']['positive_exact_routed']==item['metrics']['positive_count']
                  and item['metrics']['negative_false_calls']==0 for item in summaries.values())
     save_file({k:v.detach().cpu().contiguous() for k,v in model.state_dict().items()},str(output/'input.safetensors'))
-    report=dict(kind='balanced native-embedding neural input readout; not deployed IGC',
+    report=dict(kind='balanced frozen-activation neural input readout; not deployed IGC',
                 seed=seed,epochs=epochs,batch=64,threads=4,device=device,torch_version=torch.__version__,
                 parameters=sum(p.numel() for p in model.parameters()),training_seconds=time.monotonic()-started,
-                query_mode='learned_queries_only',activation_stage='native_embedding_broadcast',
+                query_mode='learned_queries_only',activation_stage='native_embedding_broadcast' if activation_cache=='embedding' else 'native_first_attention_output',
+                activation_cache=activation_cache,
                 learning_rate_schedule=schedule,final_learning_rate=rate,global_steps=total_steps,
                 contextual_block=contextual,
                 gradient_scope='input readout only; frozen activation cache, no Gyro or output-mapper backward',
@@ -187,5 +196,6 @@ if __name__=='__main__':
     parser.add_argument('--epochs',type=int,default=30)
     parser.add_argument('--seed',type=int,default=20261030)
     parser.add_argument('--schedule',choices=('constant','cosine'),default='constant')
+    parser.add_argument('--activation-cache',choices=('embedding','context'),default='embedding')
     args=parser.parse_args();train(args.dataset,args.sources,args.protocol,args.output,args.cache_protocol,args.contextual,
-                                 args.device,args.epochs,args.seed,args.schedule)
+                                 args.device,args.epochs,args.seed,args.schedule,args.activation_cache)
