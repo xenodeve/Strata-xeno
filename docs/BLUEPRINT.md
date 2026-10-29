@@ -79,6 +79,7 @@ upstream file we modified (45 files). Source: `git diff --name-status 4c68013 5c
 
 | path | responsibility | owner |
 |---|---|---|
+| `xeno/native-qwenputer-p0` (#276; I2 contextual training preparation) | optional native first-stage observation executable | `igc_prefix_probe`, under the existing optional CUDA probe switch, runs the unchanged 48-layer geometry through the genuine `[0,1)` verifier stage with actual native dense/embedding and every layer-zero expert. It records the existing pre-MoE first-attention seam, fences commits and resets independent prefixes. Bounded input/refusal, window-one/eight full-model captured-row fidelity and A/B/A reset tests pass. This is an offline feature extractor, not a complete transformer-layer/paper reproduction, a changed Hub baseline or passed input mapper. [Protocol](plans/2026-10-29-igc-prefix-observation.md). HIP/SYCL and dedicated sanitizer coverage remain unrun. |
 | `src/program/generate.cpp` (6,969 lines) | engine driver: options, boot and placement, `--serve` loop, generate loop, adaptive tiers, checkpoints | MIXED +1,964/−111 |
 | `src/prefill/prefill.cpp` (3,231) | batched prompt path: GEMMs, MMQ experts, streamed ring, stager, split, wave, Dm frontier, E-9 drafter K/V | MIXED +1,548/−205 |
 | `src/prefill/frontier.cu` + `.hpp` | #41 Dm frontier | XENO (`78f373e`) |
