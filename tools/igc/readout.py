@@ -8,6 +8,7 @@ import numpy as np
 
 from tools.igc.mapper_corpus import manifest
 from tools.igc.observation import load_observation
+from tools.igc.provenance import verify_sources
 
 SIZES=[4,2,2,2,2,10,10,10,10]
 
@@ -58,13 +59,7 @@ def load_dataset(root,source_manifest):
         raise ValueError('collection not completed successfully')
     if hashlib.sha256(source_manifest.read_bytes()).hexdigest()!=report['source_manifest_sha256']:
         raise ValueError('source manifest identity')
-    identities=json.loads(source_manifest.read_text(encoding='utf-8'))
-    if not identities.get('verified'):
-        raise ValueError('source manifest not verified')
-    for entry in identities['files']:
-        st=Path(entry['path']).stat()
-        if (st.st_size,st.st_mtime_ns)!=(entry['bytes'],entry['mtime_ns']):
-            raise ValueError('enumerated source changed since collection hash')
+    report['captured_source_resolution']=verify_sources(source_manifest)
     expected=manifest()
     observed=json.loads((root/'corpus.json').read_text(encoding='utf-8'))
     if expected!=observed:

@@ -226,3 +226,13 @@ fix. Next investigate an explicitly named early native activation boundary
 without disabling actual engine fusion, and keep learned digit layout separate
 from the unchanged little-endian exact-executor ABI. No new speed benchmark is
 scheduled ahead of usable integrated IGC.
+
+The reused build folder also needs an archival distinction. Exact f803 executable
+bytes are now retained in a private content-addressed cache before another build.
+Offline source resolution verifies historical cached content by SHA256; a cache
+name alone is insufficient. It is not permission to use a different current Hub
+baseline. Three RED/GREEN tests cover changed live files, exact frozen fallback,
+wrong cache bytes and content-identical timestamp changes. The earlier 813 PE was
+not archived before replacement; its original logs/source commit/data remain,
+but exact-binary replay of that earlier cohort is unavailable. This does not
+retroactively alter its observed run or invent a replacement executable identity.
