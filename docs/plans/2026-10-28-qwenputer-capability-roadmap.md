@@ -24,6 +24,7 @@ upstream มีให้ใช้กับ Strata-xeno ได้ แล้วว
 | H optimize/residency/offload จนใช้จริง | C0–C5 | cold/warm/tail, memory/cache, startup, cancellation, stability และ paired quality-preserving runs |
 | I Native ก่อน Universal | C0–C5 | Native gates ผ่านก่อน model-adapter/compatibility gates ของ Universal |
 | J default เมื่อดีขึ้นโดยไม่มี trade-off | G9 ทุก milestone | intended coverage ครบ, measured no-trade-off win, reversible default; ไม่ครบหรือมีต้นทุนเป็น opt-in |
+| K protocol ภายในมี overhead น้อยลง | C1/C3 | invocation syntax tokens, dispatch, result-envelope tokens และ feedback prefill ต่อรอบ โดยยังเรียกถูกและใช้ผลได้ถูก |
 
 - **ใช้การคำนวณภายในได้เอง:** วัดตั้งแต่เลือกใช้ ส่ง arguments รันสำเร็จ
   ไปจนถึงนำผลไปตอบ รวมการเรียกเกินจำเป็นและการรับมือโจทย์ที่ไม่รองรับ
@@ -93,6 +94,13 @@ program/test inputs, assertions, seed และ limits แล้วส่งใ�
 circuit รัน ผลตอบกลับต้องแยก assertion pass/fail, output, terminal reason
 และ state trace ที่จำกัดขนาดไว้ ก่อนให้ agent แก้สมมุติฐานและรันใหม่
 ข้อความที่โมเดลเล่าว่าได้ทดลองแล้วไม่ใช่หลักฐานการ execute
+
+ผลแต่ละครั้งต้องระบุระดับหลักฐาน: ผลที่ execute แล้ว, ผ่าน tests ที่เลือกไว้
+หรือผ่านการตรวจครบโดเมน/พิสูจน์ภายใน bounded specification ที่ระบุชัด
+เก็บ spec/test identity, coverage/domain, assertions ที่ผ่านและล้ม รวมถึงสถานะ
+independent checker และขอบเขตที่ตรวจครบ ผลตัวเลขและ state ต้องผูกกับ evidence
+เดิมจนถึงคำตอบสุดท้าย ตรวจ final-answer consistency และจำนวนครั้งที่ลอง
+ควบคู่กับ held-out task success เพื่อแยกคุณภาพการตั้งสมมุติฐานจากผล execute
 
 เริ่มจาก reviewed allowlisted programs แล้วขยายเป็น model-generated logic
 ภายใต้ interpreter/program module ที่ตรวจแล้วเมื่อ bridge รองรับ ไม่กำหนดว่า
@@ -359,3 +367,37 @@ precision only when legitimately available and feasible. Hold prompts, corpus,
 lineage and success criteria fixed, separate quantization from capability effects,
 and report hardware/latency differences independently. This hypothesis grants no
 large model download or paid provisioning authority.
+
+## Compact internal invocation and feedback
+
+The XML calc bridge is a compatibility foundation. Count generated invocation
+syntax separately from useful expression/program inputs, and result-envelope
+tokens separately from useful outputs. Measure request/dispatch time, language
+positions, feedback prefill and cumulative repeated-call costs. Hiding tool UI
+does not remove generated syntax. Profile the existing path before implementing
+a compact internal invocation/result representation; retain a change only with
+measured gains and unchanged eligibility, invocation reliability, semantics and
+task quality. Keep compact value/assertion/counterexample feedback bounded, with
+additional diagnostic evidence available when needed.
+
+## Research rationale and evaluation controls
+
+[Qwen2.5-Math](https://qwenlm.github.io/blog/qwen2.5-math/) reports improved precise
+computation with tool-integrated reasoning. This supports testing execution as a
+capability, but is not a result for Gyro-M or native circuits.
+[Chen et al., ICML 2025](https://proceedings.mlr.press/v267/chen25bx.html) reduce
+overthinking through self-training while preserving performance; the method
+differs from this project's runtime execution.
+[ThinkBrake](https://arxiv.org/html/2510.00546v1) studies redundant tool reasoning
+and reports token reductions with a decoding heuristic; its oracle stopping
+figures are not deployable reductions.
+[LLMThinkBench, Table 15](https://aclanthology.org/2026.findings-acl.1285.pdf)
+reports that tool access can improve accuracy while increasing output tokens.
+These motivate joint correctness/token/latency measurement, not a universal
+reasoning-share percentage or a promised Native speedup.
+
+Compare no execution, cached local external execution and native execution with
+matched semantics, task budgets and normal prefix caching in every applicable
+arm. Report reasoning, final answer, invocation syntax, result content/envelope,
+feedback-prefill tokens and internal trace steps/time separately, with explicit
+denominators. A first-correct-token ratio is not reasoning's share of output.

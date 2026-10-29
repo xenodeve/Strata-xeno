@@ -18,7 +18,7 @@
 
 **Spec:** [Native Qwenputer PRD](../../plans/2026-10-28-native-qwenputer-prd.md)
 
-**Status:** P0, P1 offline export/oracles and P2 CPU-loader gates passed; P3 deterministic CUDA step is next. Later Native integration/performance gates remain open.
+**Status:** P0, P1 offline export/oracles, P2 CPU-loader and P3 NVIDIA CUDA-step gates passed. P4 bounded free-running execution is next; model integration and performance gates remain open.
 **Revision:** R2 หลัง parent review: ขัดเกลาภาษา, ยืนยัน D2x compatibility, เพิ่ม policy references, dual-architecture build และ numerical/measurement gates
 **Baseline:** `e5737a27f485773a7ce22784fef6af7b480dcc9a`
 **Upstream pin:** `ca13310e2f9f788d1dd3feeea8213c1b0c23913c`
@@ -168,14 +168,14 @@ flowchart LR
 **Consumes:** validated Artifact/MemoryPlan กับ oracle vectors
 **Produces:** `Executor::init(...)`, `Executor::enqueue_step(...)`, device weights, mutable state และ retained-code output
 
-- [ ] เขียน FFN/head/lag/state tests จาก exported real reachable traces และ synthetic cases ที่พิสูจน์ reduction collisions, ties, decay 1/0.5/0, beta=0/1, no-key/no-query และ normalized zero state
-- [ ] Implement sparse dot/relu/product/scatter ด้วย canonical deterministic reductions โดยกำหนด output-grouped segment order ใน exporter/ABI แทนการเชื่อว่า atomic_add deterministic เอง ใช้ rounded operations ตาม reference และรักษา coefficient bits
-- [ ] Implement head write/read, QHOT selection, decay rows, gate, rounded sqrt/div และ history shift ตามลำดับเดิม ห้าม reuse LM fused GDN kernels จนกว่าสมการ/rounding จะพิสูจน์เท่ากัน
-- [ ] กำหนด kernel flags เฉพาะไฟล์ใหม่ ห้ามเปลี่ยน global compiler math flags หรือ Q2 kernels ตรวจ FTZ/FMA/fast-math behavior ตาม numeric ABI หาก chosen reduction ไม่ตรง oracle ต้องแก้ก่อน fuse
-- [ ] Upload/init ครั้งเดียว โดย diagnostic one-step launches ไม่ใช่ production trace path ระหว่าง capture warmup ต้อง save/restore ทั้ง S และ history เพื่อไม่ให้ boot state ขยับ
-- [ ] รัน `qwenputer_step_test --artifact <approved-export>/native.qput --oracle <approved-export>/oracle.jsonl` ต้องมี retained-dimension/state/trace mismatches เป็นศูนย์ ทำ repeated collision/replay ข้าม fresh sessions และ relaunches และตรวจ negative control ที่เปลี่ยน coefficient ว่าถูกจับได้
-- [ ] รัน Compute Sanitizer memcheck, initcheck และ synccheck กับ isolated single-step tests และ racecheck ใน paths ที่รองรับ บันทึก tool/runtime support กับ unsupported cases ชัดเจน racecheck ไม่ได้พิสูจน์ว่าไม่มี global-atomic nondeterminism จึงยังต้องใช้ deterministic reduction และ semantic repeated-run gate ห้ามนำ sanitizer runs ไปใช้เป็น speed measurement
-- [ ] รายงาน arithmetic kernel/resource evidence โดยยังไม่อ้าง end-to-end speed แล้ว commit kernels/storage/blueprint
+- [x] เขียน FFN/head/lag/state tests จาก exported real reachable traces และ synthetic cases ที่พิสูจน์ reduction collisions, ties, decay 1/0.5/0, beta=0/1, no-key/no-query และ normalized zero state
+- [x] Implement sparse dot/relu/product/scatter ด้วย canonical deterministic reductions โดยกำหนด output-grouped segment order ใน exporter/ABI แทนการเชื่อว่า atomic_add deterministic เอง ใช้ rounded operations ตาม reference และรักษา coefficient bits
+- [x] Implement head write/read, QHOT selection, decay rows, gate, rounded sqrt/div และ history shift ตามลำดับเดิม ห้าม reuse LM fused GDN kernels จนกว่าสมการ/rounding จะพิสูจน์เท่ากัน
+- [x] กำหนด kernel flags เฉพาะไฟล์ใหม่ ห้ามเปลี่ยน global compiler math flags หรือ Q2 kernels ตรวจ FTZ/FMA/fast-math behavior ตาม numeric ABI หาก chosen reduction ไม่ตรง oracle ต้องแก้ก่อน fuse
+- [x] Upload/init ครั้งเดียว โดย diagnostic one-step launches ไม่ใช่ production trace path ระหว่าง capture warmup ต้อง save/restore ทั้ง S และ history เพื่อไม่ให้ boot state ขยับ
+- [x] รัน `python -B -m tools.qwenputer.step_validation --binary <build>/qwenputer_step_test.exe --bundle <approved-bundle> --binding <binding.bin> --output <new-output>` ต้องมี retained-dimension/state/trace mismatches เป็นศูนย์ ทำ repeated collision/replay ข้าม fresh sessions และ relaunches และตรวจ negative control ที่เปลี่ยน coefficient ว่าถูกจับได้
+- [x] รัน Compute Sanitizer memcheck, initcheck และ synccheck กับ isolated single-step tests และ racecheck ใน paths ที่รองรับ บันทึก tool/runtime support กับ unsupported cases ชัดเจน racecheck ไม่ได้พิสูจน์ว่าไม่มี global-atomic nondeterminism จึงยังต้องใช้ deterministic reduction และ semantic repeated-run gate ห้ามนำ sanitizer runs ไปใช้เป็น speed measurement
+- [x] รายงาน arithmetic kernel/resource evidence โดยยังไม่อ้าง end-to-end speed แล้ว commit kernels/storage/blueprint
 
 ## P4 — Bounded device-driven trace runner
 

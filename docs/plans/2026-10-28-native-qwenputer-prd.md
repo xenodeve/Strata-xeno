@@ -2,7 +2,7 @@
 
 ฉบับ R9 สำหรับ PRD issue #276 — 28 ตุลาคม 2026
 
-สถาปัตยกรรมและแผน R2 อนุมัติแล้ว P0, P1 offline export/oracles และ P2 CPU loader ผ่าน gates ของตัวเองแล้ว กำลังเริ่ม P3 CUDA circuit step โดยทุกช่วงถัดไปยังต้องผ่าน evidence/review gates เอกสารนี้ใช้ Gyro-M 262K context, 5 workers ตามเส้นทาง hub ที่ใช้จริงเป็น operational baseline และแยกคำอธิบายที่อ่านก่อนออกจากข้อกำหนดทางเทคนิคฉบับเต็ม
+สถาปัตยกรรมและแผน R2 อนุมัติแล้ว P0, P1 offline export/oracles และ P2 CPU loader และ P3 CUDA circuit step ผ่าน gates ของตัวเองแล้ว กำลังเริ่ม P4 bounded runner โดยทุกช่วงถัดไปยังต้องผ่าน evidence/review gates เอกสารนี้ใช้ Gyro-M 262K context, 5 workers ตามเส้นทาง hub ที่ใช้จริงเป็น operational baseline และแยกคำอธิบายที่อ่านก่อนออกจากข้อกำหนดทางเทคนิคฉบับเต็ม
 
 ผล P2: loader C++ ตรวจ artifact จริงและปฏิเสธไฟล์ผิดรูปแบบก่อน GPU upload ชุดตรวจล่าสุดผ่าน 19 tests กับ 47 subtests และ feature ครบ 263,254,200 ค่าตรงกับ compiler เดิม ดู [หลักฐาน P2](../reports/2026-10-28-qwenputer-p2-closeout.md) ผลเหล่านี้ยังไม่ใช่การรันคณิตศาสตร์บน CUDA หรือผลของโมเดลที่เชื่อมวงจรแล้ว
 
