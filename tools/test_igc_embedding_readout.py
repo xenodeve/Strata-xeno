@@ -2,10 +2,16 @@
 import unittest
 import numpy as np
 import torch
-from tools.igc.embedding_readout import batch_inputs,TensorInputs,training_lr
+from tools.igc.embedding_readout import batch_inputs,TensorInputs,training_lr,fit_budget
 
 
 class EmbeddingInputs(unittest.TestCase):
+    def test_fit_budget_is_explicit_without_changing_historical_defaults(self):
+        self.assertEqual(fit_budget('embedding',None),600)
+        self.assertEqual(fit_budget('context',None),1200)
+        self.assertEqual(fit_budget('context',1800),1800)
+        for kind,value in [('embedding',1800),('context',0),('context',3601),('context',True)]:
+            with self.assertRaises(ValueError):fit_budget(kind,value)
     def test_cosine_decay_is_global_bounded_and_reaches_its_declared_floor(self):
         self.assertEqual(training_lr('constant',999,11200),0.001)
         self.assertEqual(training_lr('cosine',0,11200),0.001)

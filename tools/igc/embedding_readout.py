@@ -26,6 +26,14 @@ def training_lr(schedule,step,total_steps):
     return 0.001*(0.01+0.99*0.5*(1+math.cos(math.pi*step/(total_steps-1))))
 
 
+def fit_budget(kind,seconds):
+    if kind not in ('embedding','context'):raise ValueError('unknown activation cache kind')
+    if seconds is None:return 1200 if kind=='context' else 600
+    if kind!='context' or type(seconds) is not int or not 600<=seconds<=3600:
+        raise ValueError('bounded explicit contextual fit budget')
+    return seconds
+
+
 def batch_inputs(table,indices,valid,selection):
     if (table.dtype!=np.float32 or table.ndim!=3 or table.shape[1:]!=(4,2560)
             or indices.dtype!=np.int32 or indices.ndim!=2 or indices.shape[1]!=80
@@ -87,10 +95,11 @@ def load_cache(root,sources,protocol):
     return table,indices,valid,corpus['rows'],report
 
 
-def train(root,sources,protocol,output,cache_protocol=None,contextual=False,device='cpu',epochs=30,seed=20261030,schedule='constant',activation_cache='embedding'):
+def train(root,sources,protocol,output,cache_protocol=None,contextual=False,device='cpu',epochs=30,seed=20261030,schedule='constant',activation_cache='embedding',fit_timeout=None):
     from safetensors.torch import save_file
     from tools.qwenputer.memory import process_snapshot,system_snapshot
     import os
+    timeout=fit_budget(activation_cache,fit_timeout)
     output.mkdir(parents=True,exist_ok=False)
     source_paths=[Path(__file__),Path(__file__).with_name('attention_readout.py'),Path(__file__).with_name('balanced_corpus.py')]
     source_hashes={path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}
@@ -128,7 +137,7 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
         order=fit[torch.randperm(len(fit),generator=random).numpy()]
         total=0.
         for offset in range(0,len(order),64):
-            if time.monotonic()-started>(1200 if activation_cache=='context' else 600):raise RuntimeError('bounded fit deadline; no completed model')
+            if time.monotonic()-started>timeout:raise RuntimeError('bounded fit deadline; no completed model')
             rate=training_lr(schedule,epoch*steps_per_epoch+offset//64,total_steps)
             for group in optimizer.param_groups:group['lr']=rate
             selection=order[offset:offset+64]
@@ -164,6 +173,7 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
                 parameters=sum(p.numel() for p in model.parameters()),training_seconds=time.monotonic()-started,
                 query_mode='learned_queries_only',activation_stage='native_embedding_broadcast' if activation_cache=='embedding' else 'native_first_attention_output',
                 activation_cache=activation_cache,
+                fit_timeout_seconds=timeout,
                 learning_rate_schedule=schedule,final_learning_rate=rate,global_steps=total_steps,
                 contextual_block=contextual,
                 gradient_scope='input readout only; frozen activation cache, no Gyro or output-mapper backward',
@@ -197,5 +207,6 @@ if __name__=='__main__':
     parser.add_argument('--seed',type=int,default=20261030)
     parser.add_argument('--schedule',choices=('constant','cosine'),default='constant')
     parser.add_argument('--activation-cache',choices=('embedding','context'),default='embedding')
+    parser.add_argument('--fit-timeout',type=int)
     args=parser.parse_args();train(args.dataset,args.sources,args.protocol,args.output,args.cache_protocol,args.contextual,
-                                 args.device,args.epochs,args.seed,args.schedule,args.activation_cache)
+                                 args.device,args.epochs,args.seed,args.schedule,args.activation_cache,args.fit_timeout)
