@@ -19,6 +19,7 @@ from tools.igc.observation import _read
 from tools.igc.provenance import verify_sources
 from tools.igc.readout import SIZES,metrics,targets
 from tools.igc.training_guards import admission,progress,state_fingerprint,checked_backward,checked_update,categorical_loss,finite_parameters,verify_reset
+from tools.igc.initial_state import initialize,initialization_options,fresh_optimizer
 
 
 def matched_analysis(rows,predicted):
@@ -122,10 +123,13 @@ def load_cache(root,sources,protocol):
     return table,indices,valid,corpus['rows'],report
 
 
-def train(root,sources,protocol,output,cache_protocol=None,contextual=False,device='cpu',epochs=30,seed=20261030,schedule='constant',activation_cache='embedding',fit_timeout=None,price_only=False,pricing_receipt=None):
+def train(root,sources,protocol,output,cache_protocol=None,contextual=False,device='cpu',epochs=30,seed=20261030,schedule='constant',activation_cache='embedding',fit_timeout=None,price_only=False,pricing_receipt=None,initial_state=None,initial_state_sha256=None):
     from safetensors.torch import save_file
     from tools.qwenputer.memory import process_snapshot,system_snapshot
     import os
+    initialization_options(initial_state,initial_state_sha256)
+    if initial_state is not None and (activation_cache!='context' or not contextual):
+        raise ValueError('explicit initialization is qualified only for contextual native-state readout')
     timeout=fit_budget(activation_cache,fit_timeout)
     preflight=system_snapshot()
     if activation_cache=='context':admission(preflight,shutil.disk_usage(output.parent).free)
@@ -133,6 +137,7 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
     source_paths=[Path(__file__),Path(__file__).with_name('attention_readout.py'),Path(__file__).with_name('balanced_corpus.py'),
                   Path(__file__).with_name('input_manifest.py'),Path(__file__).with_name('matched_corpus.py'),
                   Path(__file__).with_name('training_guards.py'),Path(__file__).with_name('matched_evaluate.py'),
+                  Path(__file__).with_name('initial_state.py'),Path(__file__).with_name('observation.py'),
                   Path(__file__).with_name('readout.py'),Path(__file__).with_name('development_audit.py'),
                   Path(__file__).with_name('diagnostics.py'),Path(__file__).with_name('provenance.py')]
     protocol_hash=hashlib.sha256(protocol.read_bytes()).hexdigest()
@@ -160,6 +165,8 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
                 or file_digest(root/'report.json')!=cache_identity['report']
                 or file_digest(root/'corpus.json')!=cache_identity['manifest']):
             raise RuntimeError('training/pricing cache content changed')
+        if initial_state is not None and file_digest(initial_state)!=initial_state_sha256:
+            raise RuntimeError('initial artifact changed during training/pricing')
     if device not in ('cpu','cuda') or not 1<=epochs<=100:raise ValueError('bounded training recipe')
     labels=targets(rows)
     fit=np.array([i for i,r in enumerate(rows) if r['split']=='train'],dtype=np.int64)
@@ -180,12 +187,13 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
     random=torch.Generator().manual_seed(seed)
     if device=='cuda':torch.cuda.reset_peak_memory_stats()
     model=InputReadout(use_final_query=False,contextual=contextual).to(device)
+    initialization=initialize(model,initial_state,initial_state_sha256)
     initial_fingerprint=state_fingerprint(model)
     first_order=fit[torch.randperm(len(fit),generator=random).numpy()]
     initial_batch_ids=[rows[i]['id'] for i in first_order[:64]]
     recipe=dict(seed=seed,epochs=epochs,batch=64,contextual=contextual,device=device,schedule=schedule,
         fit_timeout_seconds=timeout,lr=0.001,weight_decay=0.01,parameters=sum(p.numel() for p in model.parameters()),
-        torch_version=torch.__version__,python_exe_sha256=file_digest(Path(sys.executable)))
+        torch_version=torch.__version__,python_exe_sha256=file_digest(Path(sys.executable)),initialization=initialization)
     pricing_receipt_hash=None
     if pricing_receipt is not None:
         pricing_bytes=_read(pricing_receipt,limit=256*1024);pricing_receipt_hash=hashlib.sha256(pricing_bytes).hexdigest()
@@ -204,6 +212,7 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
             initial_batch_ids=initial_batch_ids,loss=float(loss.detach()),source_sha256=source_hashes,
             cache_sha256=cache['cache_sha256'],seed=seed,parameters=sum(p.numel() for p in model.parameters()),
             cache_identity=cache_identity,recipe=recipe,
+            initialization=initialization,
             elapsed_seconds=time.monotonic()-started,process=process_snapshot(os.getpid()),system=system_snapshot(),
             protocol_sha256=protocol_hash,preflight=preflight)
         if device=='cuda':price['cuda']=dict(peak_allocated_bytes=torch.cuda.max_memory_allocated(),peak_reserved_bytes=torch.cuda.max_memory_reserved())
@@ -215,7 +224,8 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
         recheck_cache();progress(time.monotonic()-started,60,system_snapshot())
         (output/'price.json').write_text(json.dumps(price,indent=2),encoding='utf-8')
         print(json.dumps(price),flush=True);return
-    optimizer=torch.optim.AdamW(model.parameters(),lr=0.001,weight_decay=0.01,foreach=False,fused=False)
+    optimizer=fresh_optimizer(model)
+    optimizer_initial_state_entries=len(optimizer.state)
     completed_steps=0
     for epoch in range(epochs):
         order=first_order if epoch==0 else fit[torch.randperm(len(fit),generator=random).numpy()]
@@ -277,6 +287,8 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
                 initial_state_sha256=initial_fingerprint,initial_batch_ids=initial_batch_ids,
                 optimizer_steps=completed_steps,pricing_reset_verified=pricing_receipt is not None,
                 pricing_receipt_sha256=pricing_receipt_hash,cache_identity=cache_identity,recipe=recipe,
+                initialization=initialization,optimizer_initial_state_entries=optimizer_initial_state_entries,
+                optimizer_state_transferred=False,
                 final_evaluation_mode='eval/frozen/no_grad; 64-row batches',numerical_guards='loss/gradient/parameters/optimizer finite; no clipping')
     if len(rows)==1536 and cache.get('input_manifest_version')==1:
         report['matched_analysis']=matched_analysis(rows,predicted)
@@ -315,9 +327,12 @@ def main(argv=None):
     parser.add_argument('--fit-timeout',type=int)
     parser.add_argument('--price-only',action='store_true')
     parser.add_argument('--pricing-receipt',type=Path)
+    parser.add_argument('--initial-state',type=Path)
+    parser.add_argument('--initial-state-sha256')
     args=parser.parse_args(argv);train(args.dataset,args.sources,args.protocol,args.output,args.cache_protocol,args.contextual,
                                  args.device,args.epochs,args.seed,args.schedule,args.activation_cache,args.fit_timeout,
-                                 price_only=args.price_only,pricing_receipt=args.pricing_receipt)
+                                 price_only=args.price_only,pricing_receipt=args.pricing_receipt,
+                                 initial_state=args.initial_state,initial_state_sha256=args.initial_state_sha256)
 
 
 if __name__=='__main__':main()
