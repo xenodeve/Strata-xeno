@@ -100,3 +100,46 @@ The once-only comment retry after the user's explicit comment-vs-body
 clarification was again rejected before execution by automatic approval review.
 The stated blocker remains the unresolved earlier body-edit form. No remote
 comment, alternative route or further retry followed; the backfill draft is safe.
+
+## Transaction component checkpoint
+
+`Transaction` now trials the candidate window on the actual circuit and a copied
+CPU grammar state, restores its retained base, then replays only the accepted
+input prefix. Its callback receives the clamped count and must commit and fence
+the language verifier. The native burst runs only after that callback succeeds.
+The controller never receives model caches. It stages all machine output until
+Success and keeps an exact token-ID/cursor ledger so subsequent language replay
+does not feed that text through the circuit again. A failed language callback,
+restore, trace or mismatching replay invalidates the session. Lifecycle is serial;
+the stream, executor and immutable artifact outlive it. The pinned input/status
+arrays total 6,144 host bytes. History callers supply bounded chunks and check
+cancellation between calls.
+
+The first genuine RED failed at `transaction_not_implemented`; an earlier test
+build failure was only a mixed-auto declaration in the fixture. Native GREEN
+checks closing-call rows 0 through 4, discarded-shadow S/lag restoration,
+rejected-tail decisions, exact callback/position counts and accepted-prefix
+replay. A second control commits just the accepted newline before a rejected TCC,
+then verifies that only the subsequent accepted TCC takes ownership. An owned
+`17*23` burst returns `391`; replaying its result changes neither S/lag nor the
+circuit Text-evaluation counter. These use a fake language callback, so actual
+verifier, MTP, language-cache freeze and real-model parity remain open.
+
+An allocation negative control reproduced a real defect: the controller rejected
+an Executor/Artifact mismatch after allocating its base image. The corrected
+initialization checks identities and explicit stream first, and runtime limits
+before allocating the base image. Wrong identity, zero chunk limit and default
+stream now fail with equal GPU-free-memory readings while the refused controller
+is still alive. The complete functional test passes after the fix.
+
+The bounded `--short` instrumentation control exercises ordinary Text steps,
+trial/commit, rollback and injected language-commit failure. memcheck, initcheck
+and synccheck report zero errors; racecheck reports zero hazards. This scope
+does not launch the WHILE body or exercise result replay, and does not close the
+P4 WHILE instrumentation gap. The new timeline analyzer fixture first failed
+for missing transaction regions; all 22 timeline tests pass after implementation.
+Host regions include waits and are not reported as invented GPU time.
+
+No production decoder, service protocol, serving configuration or default has
+changed at this checkpoint. HIP/SYCL validation remains unavailable, and the
+whole P5 phase is still in progress.

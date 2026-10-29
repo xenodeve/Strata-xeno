@@ -40,6 +40,18 @@ def test_qwenputer_budget_is_absent_from_an_unmodified_trace(tmp_path):
     assert timeline.qwenputer_report(timeline.load(write(tmp_path, [X(1, "unrelated", 0, 2)]))) == {}
 
 
+def test_qwenputer_transaction_regions_are_measured_without_inventing_gpu_time(tmp_path):
+    events = [X(1, "qwenputer.shadow_trial", 0, 3),
+              X(1, "qwenputer.accepted_replay", 4, 6),
+              X(1, "qwenputer.history", 8, 13)]
+    r = timeline.qwenputer_report(timeline.load(write(tmp_path, events)))
+    assert r["host_ms"]["shadow_trial"] == pytest.approx(3)
+    assert r["host_ms"]["accepted_replay"] == pytest.approx(2)
+    assert r["host_ms"]["history"] == pytest.approx(5)
+    assert r["chunks"] == r["steps"] == 0
+    assert r["gpu_ms"] == 0  # host regions include waits, not a fabricated GPU split
+
+
 def X(tid, name, t0_ms, t1_ms, a=-1, b=-1):
     e = {"ph": "X", "pid": PID, "tid": tid, "ts": t0_ms * 1000.0, "dur": (t1_ms - t0_ms) * 1000.0, "name": name}
     if a != -1 or b != -1:

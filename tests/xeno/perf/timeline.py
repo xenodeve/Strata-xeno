@@ -558,6 +558,10 @@ def qwenputer_report(tl: Timeline) -> dict:
     chunks = tl.find("qwenputer.chunk")
     host = {name: sum(s.dur for s in tl.find("qwenputer." + name))
             for name in ("prepare", "enqueue", "wait", "collect", "cancel")}
+    for name in ("shadow_trial", "accepted_replay", "history"):
+        regions = tl.find("qwenputer." + name)
+        if regions:
+            host[name] = sum(s.dur for s in regions)
     if not chunks and not any(host.values()):
         return {}
     return {"chunks": len(chunks), "steps": sum(max(s.a, 0) for s in chunks),
