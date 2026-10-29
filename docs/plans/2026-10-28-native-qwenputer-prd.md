@@ -1,3 +1,5 @@
+> **R10 priority supersession, 2026-10-29:** [IGC primary PRD](2026-10-29-igc-primary-prd.md) is the current primary contract. The R9 text below is preserved as the compiled-Qwenputer secondary reference. Its compiled-only architecture requirements no longer constrain the primary IGC path; retained safety/exactness/state/measurement gates are enumerated in R10. No historical result is relabeled.
+
 # PRD R9: ให้ Strata คำนวณด้วย Native Qwenputer
 
 ฉบับ R9 สำหรับ PRD issue #276 — 28 ตุลาคม 2026
