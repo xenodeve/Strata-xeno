@@ -38,9 +38,26 @@ class Preanchor(unittest.TestCase):
         self.assertEqual(result['residuals'].shape,(4,4,2560))
         self.assertEqual(result['residuals'][2,0,0],1.25)
 
+    def test_activation_stage_is_explicit_and_cannot_be_cross_loaded(self):
+        self.meta.update(preanchor_embedding_stage='native_embedding_broadcast',preanchor_embedding_rows=4,
+                         preanchor_attention_stage='native_first_attention_output',preanchor_attention_rows=4)
+        (self.root/'mixed.0.meta.json').write_text(json.dumps(self.meta))
+        for stage,magic,suffix in [('embedding',b'IGCEMB01','embedding'),('attention',b'IGCATN01','attention')]:
+            raw=self.raw.copy();raw[:8]=magic
+            path=self.root/f'mixed.0.{suffix}.bin';path.write_bytes(raw)
+            result=load_preanchor(self.root,0,stage=stage)
+            self.assertEqual(result['activation_stage'],stage)
+            self.assertEqual(result['positions'],[19,20,21,22])
+            path.write_bytes(self.raw)
+            with self.assertRaises(ValueError):load_preanchor(self.root,0,stage=stage)
+
     @unittest.skipUnless(os.environ.get('IGC_PREANCHOR_FIXTURE'),'native CPU contract fixture not selected')
     def test_cpp_fixture_equals_independent_wire_fixture(self):
-        self.assertEqual(Path(os.environ['IGC_PREANCHOR_FIXTURE']).read_bytes(),self.raw)
+        fixture=Path(os.environ['IGC_PREANCHOR_FIXTURE'])
+        self.assertEqual(fixture.read_bytes(),self.raw)
+        for suffix,magic in [('embedding',b'IGCEMB01'),('attention',b'IGCATN01')]:
+            expected=self.raw.copy();expected[:8]=magic
+            self.assertEqual(Path(str(fixture)+'.'+suffix).read_bytes(),expected)
 
     def test_invalid_headers_positions_tokens_sources_and_nonfinite_rows_refused(self):
         for offset,fmt,value in [(0,'B',0),(8,'I',2),(12,'I',1),(16,'I',2559),(20,'I',81),(24,'I',81),

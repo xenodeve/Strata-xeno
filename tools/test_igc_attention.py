@@ -1,11 +1,32 @@
 """Learned-input-head mask and gradient checks, not frozen-Gyro gradients."""
 import unittest
+import json
+from pathlib import Path
+import tempfile
+from unittest.mock import patch
+import numpy as np
 import torch
-from tools.igc.attention_readout import InputReadout
+from tools.igc.attention_readout import InputReadout, contexts
 from tools.igc.readout import SIZES
 
 
 class AttentionContract(unittest.TestCase):
+    def test_context_stage_is_bound_to_its_own_record_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            metadata=dict(sha256='embedding-sha',positions=[3],sources=[1],missing=[0,1,2])
+            (root/'records.json').write_text(json.dumps([dict(observation=dict(preanchor_stages=dict(embedding=metadata)))]))
+            observation=dict(preanchor_sha256='embedding-sha',positions=[3],sources=[1],missing_positions=[0,1,2],
+                             anchor=dict(position=4),residuals=np.full((1,4,2560),2.5,dtype=np.float32))
+            with patch('tools.igc.attention_readout.load_preanchor',return_value=observation) as read:
+                values,valid,positions=contexts(root,[{}],stage='embedding')
+                read.assert_called_once_with(root,0,stage='embedding')
+                self.assertEqual(int(valid.sum()),1)
+                self.assertTrue(valid[0,79])
+                self.assertEqual(float(values[0,79,0,0]),2.5)
+                observation['preanchor_sha256']='wrong-stage-sha'
+                with self.assertRaises(ValueError):contexts(root,[{}],stage='embedding')
+
     def inputs(self):
         torch.set_num_threads(1)
         torch.manual_seed(7)

@@ -2022,6 +2022,8 @@ if(STRATA_BUILD_IGC_HEAD_PROBE)
   endif()
   add_executable(igc_head_probe tests/igc/head_probe.cpp tests/igc/head_vjp.cu)
   target_link_libraries(igc_head_probe PRIVATE strata_engine)
+  add_executable(igc_embedding_probe tests/igc/embedding_probe.cpp)
+  target_link_libraries(igc_embedding_probe PRIVATE strata_engine)
 endif()
 
 option(STRATA_BUILD_IGC_EXACT_TESTS "Build isolated typed exact GPU executor tests" OFF)

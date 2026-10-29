@@ -42,18 +42,23 @@ class InputReadout(torch.nn.Module):
         return torch.cat([head(result[:,i]) for i,head in enumerate(self.heads)],dim=1)
 
 
-def contexts(root,rows):
+def contexts(root,rows,stage='final'):
+    if stage not in ('final','embedding','attention'):
+        raise ValueError('unknown input activation stage')
     values=np.zeros((len(rows),80,4,2560),dtype=np.float32)
     valid=np.zeros((len(rows),80),dtype=np.bool_)
     positions=np.broadcast_to(np.arange(80,dtype=np.int64),(len(rows),80)).copy()
     records=json.loads((root/'records.json').read_text(encoding='utf-8'))
     for i in range(len(rows)):
-        observed=load_preanchor(root,i)
+        observed=load_preanchor(root,i,stage=stage)
         meta=records[i]['observation']
-        if (observed['preanchor_sha256']!=meta['preanchor_sha256']
-                or observed['positions']!=meta['preanchor_positions']
-                or observed['sources']!=meta['preanchor_sources']
-                or observed['missing_positions']!=meta['preanchor_missing'] or not observed['positions']):
+        identity=(dict(sha256=meta['preanchor_sha256'],positions=meta['preanchor_positions'],
+                       sources=meta['preanchor_sources'],missing=meta['preanchor_missing'])
+                  if stage=='final' else meta['preanchor_stages'][stage])
+        if (observed['preanchor_sha256']!=identity['sha256']
+                or observed['positions']!=identity['positions']
+                or observed['sources']!=identity['sources']
+                or observed['missing_positions']!=identity['missing'] or not observed['positions']):
             raise ValueError('preanchor collection identity or empty observation')
         anchor=observed['anchor']['position']
         for p,value in zip(observed['positions'],observed['residuals'],strict=True):
@@ -63,13 +68,13 @@ def contexts(root,rows):
     return values,valid,positions
 
 
-def train(root,sources,output,protocol):
+def train(root,sources,output,protocol,stage='final'):
     from safetensors.torch import save_file
     output.mkdir(parents=True,exist_ok=False)
     query,rows,collection=load_dataset(root,sources)
     train_mask=np.array([r['split']=='train' for r in rows])
     normalized,mean,scale=standardize(query,train_mask)
-    values,valid,positions=contexts(root,rows)
+    values,valid,positions=contexts(root,rows,stage=stage)
     labels=targets(rows)
     torch.set_num_threads(4)
     torch.manual_seed(20261029)
@@ -102,6 +107,7 @@ def train(root,sources,output,protocol):
     eligible=(train_report['positive_exact_routed']==train_report['positive_count']
               and diagnostic['positive_exact_routed']>0)
     report=dict(kind='activation-attention-input-readout; no deployed mapping',
+                activation_stage=stage,query_stage='head_mixed_after_final_hc',
                 training_seconds=time.monotonic()-started,epochs=300,seed=20261029,
                 torch_version=torch.__version__,device='cpu',threads=4,
                 parameters=sum(p.numel() for p in model.parameters()),
@@ -124,5 +130,6 @@ if __name__=='__main__':
     parser.add_argument('--sources',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--protocol',type=Path,required=True)
+    parser.add_argument('--activation-stage',choices=('final','embedding','attention'),default='final')
     args=parser.parse_args()
-    train(args.dataset,args.sources,args.output,args.protocol)
+    train(args.dataset,args.sources,args.output,args.protocol,args.activation_stage)

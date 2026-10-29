@@ -13,6 +13,7 @@
 namespace strata::program::igc_observation {
 class Capture {
 public:
+    enum class Stage { FinalHC, Embedding, FirstAttention };
     static constexpr uint32_t max_rows=80, hc=4, embedding=2560, dimensions=hc*embedding;
     bool begin(std::span<const int64_t> prefix,std::string& error) {
         enabled_=false;bad_=false;rows_.clear();tokens_.clear();
@@ -45,12 +46,15 @@ public:
         }
         error.clear();return true;
     }
-    bool write(const std::string& path,std::string& error) {
+    bool write(const std::string& path,std::string& error,Stage stage=Stage::FinalHC) {
         static_assert(std::endian::native==std::endian::little);
         if (!active() || rows_.size()>max_rows) return fail(error,"preanchor_write_state");
+        const char* magic=stage==Stage::FinalHC ? "IGCPREA1" : stage==Stage::Embedding ? "IGCEMB01" :
+                          stage==Stage::FirstAttention ? "IGCATN01" : nullptr;
+        if (!magic) return fail(error,"preanchor_stage");
         std::ofstream file(path,std::ios::binary|std::ios::trunc);
         if (!file) return fail(error,"preanchor_write_open");
-        file.write("IGCPREA1",8);
+        file.write(magic,8);
         auto put=[&]<class T>(const T& value){file.write(reinterpret_cast<const char*>(&value),sizeof(value));};
         const uint32_t version=1,n=static_cast<uint32_t>(rows_.size());
         const uint64_t anchor=static_cast<uint64_t>(anchor_),prompt=anchor+1;

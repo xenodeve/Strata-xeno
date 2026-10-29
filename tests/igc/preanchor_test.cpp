@@ -25,6 +25,8 @@ int main(int argc, char** argv) try {
     require(c.observe(20,3,1,copy,error)&&copied==3,"window selection");
     require(c.observe(19,1,2,copy,error)&&copied==4,"unordered chunk");
     require(c.write(argv[1],error),"write sorted sparse fixture");
+    require(c.write(std::string(argv[1])+".embedding",error,Capture::Stage::Embedding),"embedding stage fixture");
+    require(c.write(std::string(argv[1])+".attention",error,Capture::Stage::FirstAttention),"attention stage fixture");
     require(c.count()==4&&c.first()==19&&c.anchor()==99,"bounded tail geometry");
     require(!c.observe(20,1,1,copy,error),"duplicate position accepted");
     require(!c.write(argv[1],error),"invalidated collector wrote data");

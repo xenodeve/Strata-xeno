@@ -64,18 +64,26 @@ def load_observation(root, index):
             'metadata_sha256':hashlib.sha256(meta_raw).hexdigest()}
 
 
-def load_preanchor(root,index):
+def load_preanchor(root,index,stage='final'):
     """Only observed F32 rows; absence in a valid prefix cache is explicit."""
     anchor=load_observation(root,index)
-    raw=_read(Path(root)/f'mixed.{index}.preanchor.bin',limit=4*1024**2)
+    contracts={'final':(b'IGCPREA1','preanchor','head_mixed_after_final_hc'),
+               'embedding':(b'IGCEMB01','embedding','native_embedding_broadcast'),
+               'attention':(b'IGCATN01','attention','native_first_attention_output')}
+    if stage not in contracts:
+        raise ValueError('unknown activation stage')
+    expected_magic,suffix,stage_name=contracts[stage]
+    raw=_read(Path(root)/f'mixed.{index}.{suffix}.bin',limit=4*1024**2)
     header=struct.Struct('<8sIIIIIQQ')
     if len(raw)<header.size:
         raise ValueError('preanchor header size')
     magic,version,hc,dim,cap,n,position,count=header.unpack_from(raw)
-    if (magic!=b'IGCPREA1' or (version,hc,dim,cap)!=(1,4,2560,80)
+    count_key='preanchor_rows' if stage=='final' else f'preanchor_{suffix}_rows'
+    if (magic!=expected_magic or (version,hc,dim,cap)!=(1,4,2560,80)
             or position!=anchor['position'] or count!=anchor['prompt_tokens']
             or n>min(position,cap) or anchor.get('preanchor_format')!=1
-            or anchor.get('preanchor_rows')!=n or anchor.get('preanchor_capacity')!=cap):
+            or anchor.get(count_key)!=n or anchor.get('preanchor_capacity')!=cap
+            or (stage!='final' and anchor.get(f'preanchor_{suffix}_stage')!=stage_name)):
         raise ValueError('preanchor geometry or boundary')
     row_bytes=16+hc*dim*4
     if len(raw)!=header.size+n*row_bytes:
@@ -92,7 +100,7 @@ def load_preanchor(root,index):
         if not np.isfinite(row).all():
             raise ValueError('preanchor nonfinite')
         positions.append(p);sources.append(source);values.append(row.copy())
-    return dict(anchor=anchor,positions=positions,sources=sources,
+    return dict(anchor=anchor,activation_stage=stage,positions=positions,sources=sources,
                 residuals=np.stack(values) if values else np.empty((0,hc,dim),dtype=np.float32),
                 missing_positions=[p for p in range(first,position) if p not in positions],
                 preanchor_sha256=hashlib.sha256(raw).hexdigest())

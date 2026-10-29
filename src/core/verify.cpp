@@ -593,6 +593,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
         pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
         ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
+        observation_embedding_ = observe_early_ && lb_ == 0 ? b.take<float>(T * HC * N) : nullptr;
+        observation_attention_ = observe_early_ && lb_ == 0 ? b.take<float>(T * HC * N) : nullptr;
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
@@ -872,6 +874,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         embedding_gather_dev(codes, scales, offsets, tok_, T, w->ne0, w->code_bits, w->code_bias, w->group_elems,
                              row_codes, row_groups, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+    }
+
+    if (observation_embedding_ && cudaMemcpyAsync(observation_embedding_, R_,
+            static_cast<size_t>(T * HC * N) * sizeof(float), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+        err = "verify: observation embedding copy failed"; return false;
     }
 
     // per-layer state indices (GDN and QSA layers are numbered separately)
@@ -1624,6 +1631,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
     for (int grp = 0; grp < G; ++grp)
         if (!pre(lb_, grp)) return false;
+    if (observation_attention_ && cudaMemcpyAsync(observation_attention_, R_,
+            static_cast<size_t>(T * HC * N) * sizeof(float), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+        err = "verify: observation first-attention copy failed"; return false;
+    }
     for (int64_t l = lb_; l < le_; ++l)
         for (int grp = 0; grp < G; ++grp) {
             if (!post(l, grp)) return false;
@@ -3031,6 +3042,18 @@ bool Verifier::copy_head_input(int t, float* residual, float* mixed) const {
                                    hc_width * sizeof(float), cudaMemcpyDeviceToHost, cs_) != cudaSuccess) return false;
     if (mixed && cudaMemcpyAsync(mixed, head_mixed_ + static_cast<size_t>(t) * width,
                                 width * sizeof(float), cudaMemcpyDeviceToHost, cs_) != cudaSuccess) return false;
+    return cudaStreamSynchronize(cs_) == cudaSuccess;
+}
+
+bool Verifier::copy_observation_tap(ObservationTap tap, int t, float* host) const {
+    if (!observe_early_ || !host || !g_ || !cs_ || device_ < 0 || lb_ != 0 || t < 0 || t >= last_t_) return false;
+    const float* source = tap == ObservationTap::Embedding ? observation_embedding_ :
+                          tap == ObservationTap::FirstAttention ? observation_attention_ : nullptr;
+    if (!source) return false;
+    const OnDevice on_device(device_);
+    const size_t width = static_cast<size_t>(g_->n_embd) * static_cast<size_t>(g_->hc);
+    if (cudaMemcpyAsync(host, source + static_cast<size_t>(t) * width, width * sizeof(float),
+                        cudaMemcpyDeviceToHost, cs_) != cudaSuccess) return false;
     return cudaStreamSynchronize(cs_) == cudaSuccess;
 }
 

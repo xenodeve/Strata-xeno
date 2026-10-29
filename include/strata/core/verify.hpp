@@ -96,6 +96,17 @@ public:
     /// and/or head input. Host buffers are hc*n_embd and n_embd floats. Call after
     /// run(), before another window; synchronizes this verifier's explicit stream.
     bool copy_head_input(int t, float* residual, float* mixed) const;
+    enum class ObservationTap { Embedding, FirstAttention };
+    // Offline diagnostics only, configured before init. These copy actual native
+    // tensors, preserving fusion: initial HC embedding broadcast and the first
+    // attention output after pre(layer0), before its MoE result is combined.
+    bool enable_early_observation(bool enabled) {
+        if (g_ != nullptr) return false;
+        observe_early_ = enabled; return true;
+    }
+    // Plain run() only; caller fences/consumes before another window. This first
+    // stage owns the buffers; a later stage must not stand in for it.
+    bool copy_observation_tap(ObservationTap tap, int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
@@ -407,6 +418,9 @@ private:
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
+    bool observe_early_ = false;
+    float* observation_embedding_ = nullptr;
+    float* observation_attention_ = nullptr;
     SessionState* ss_ = nullptr;
     VerifyHits hits_;
     const NativeHead* head_ = nullptr;

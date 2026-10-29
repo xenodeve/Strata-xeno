@@ -9121,6 +9121,11 @@ int main(int argc, char** argv) {
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
         ver.set_remote_expert_opt(remote_opt.get());
+        const bool early_observing = !o.dump_mixed.empty() && !pipe && !multi_gpu && !batch_mtp;
+        if (early_observing && !ver.enable_early_observation(true)) {
+            std::fprintf(stderr, "strata serve: early observation must be configured before verifier init\n");
+            return 1;
+        }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -9300,6 +9305,7 @@ int main(int argc, char** argv) {
         };
         std::vector<int64_t> cur;
         strata::program::igc_observation::Capture preanchor_capture;
+        strata::program::igc_observation::Capture embedding_capture, attention_capture;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
         // saved points; every one of them is a prefix of `live` (the loop drops the rest), so they form a chain -
@@ -12153,6 +12159,10 @@ int main(int argc, char** argv) {
                     std::printf("ERR unsupported or malformed pre-anchor diagnostic input: %s\n", observation_error.c_str());
                     std::fflush(stdout);continue;
                 }
+                if (early_observing && (!embedding_capture.begin(cur, observation_error) ||
+                                        !attention_capture.begin(cur, observation_error))) {
+                    std::printf("ERR %s\n", observation_error.c_str());std::fflush(stdout);continue;
+                }
             }
             const Clock::time_point r0 = Clock::now();
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
@@ -12691,6 +12701,14 @@ int main(int argc, char** argv) {
                         if (!preanchor_capture.observe(q, T, 1, [&](int64_t offset, std::span<float> row) {
                                 return ver.copy_head_input((int) offset, row.data(), nullptr);
                             }, e)) return false;
+                        if (early_observing) {
+                            using Tap = strata::core::Verifier::ObservationTap;
+                            if (!embedding_capture.observe(q, T, 1, [&](int64_t offset, std::span<float> row) {
+                                    return ver.copy_observation_tap(Tap::Embedding, (int) offset, row.data());
+                                }, e) || !attention_capture.observe(q, T, 1, [&](int64_t offset, std::span<float> row) {
+                                    return ver.copy_observation_tap(Tap::FirstAttention, (int) offset, row.data());
+                                }, e)) return false;
+                        }
                     }
                     // STRATA_LOGPOS=<path>: the teacher-forced log-probability of every token read here (every
                     // token is committed and nxt[t] is the prompt's own next token), appended to <path>; the last
@@ -13976,6 +13994,13 @@ int main(int argc, char** argv) {
                                     std::printf("ERR %s\n", observation_error.c_str());
                                     return serve_fatal();
                                 }
+                                if (early_observing) {
+                                    using Stage = strata::program::igc_observation::Capture::Stage;
+                                    if (!embedding_capture.write(prefix + ".embedding.bin", observation_error, Stage::Embedding) ||
+                                        !attention_capture.write(prefix + ".attention.bin", observation_error, Stage::FirstAttention)) {
+                                        std::printf("ERR %s\n", observation_error.c_str());return serve_fatal();
+                                    }
+                                }
                             }
                             std::FILE* tokens_file = std::fopen((prefix + ".tokens.bin").c_str(), "wb");
                             bool ok = tokens_file != nullptr;
@@ -13983,15 +14008,21 @@ int main(int argc, char** argv) {
                                 ok = std::fwrite(prompt_ids.data(), sizeof(int32_t), prompt_ids.size(), tokens_file) == prompt_ids.size();
                                 if (std::fclose(tokens_file) != 0) ok = false;
                             }
-                            char meta[512];
+                            char meta[1024];
                             const int count = std::snprintf(meta, sizeof(meta),
                                 "{\"version\":1,\"kind\":\"first_window_observation\","
                                 "\"stage\":\"head_mixed_after_final_hc\",\"row\":0,\"position\":%lld,"
                                 "\"token\":%d,\"prompt_tokens\":%llu,\"n_embd\":%lld,\"hc\":%lld,\"n_vocab\":%lld,"
-                                "\"preanchor_format\":1,\"preanchor_rows\":%llu,\"preanchor_capacity\":80}\n",
+                                "\"preanchor_format\":1,\"preanchor_rows\":%llu,\"preanchor_capacity\":80,"
+                                "\"preanchor_embedding_stage\":\"%s\",\"preanchor_embedding_rows\":%llu,"
+                                "\"preanchor_attention_stage\":\"%s\",\"preanchor_attention_rows\":%llu}\n",
                                 (long long) p, (int) window[0], (unsigned long long) prompt_ids.size(),
                                 (long long) g.n_embd, (long long) g.hc, (long long) ver.vocab(),
-                                (unsigned long long) preanchor_capture.count());
+                                (unsigned long long) preanchor_capture.count(),
+                                early_observing ? "native_embedding_broadcast" : "unsupported_mode",
+                                (unsigned long long) embedding_capture.count(),
+                                early_observing ? "native_first_attention_output" : "unsupported_mode",
+                                (unsigned long long) attention_capture.count());
                             if (count <= 0 || (size_t) count >= sizeof(meta)) ok = false;
                             std::FILE* meta_file = ok ? std::fopen((prefix + ".meta.json").c_str(), "wb") : nullptr;
                             if (!meta_file) ok = false;
