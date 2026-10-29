@@ -99,7 +99,12 @@ endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_BUILD_XENO_TESTS "Build machine-targeted Strata-xeno CPU checks" OFF)
 option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
+option(STRATA_BUILD_QWENPUTER_HOST_TESTS "Build CPU-only Native Qwenputer artifact checks" OFF)
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
+
+if(STRATA_BUILD_QWENPUTER_HOST_TESTS)
+  add_subdirectory(tests/qwenputer/host)
+endif()
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()

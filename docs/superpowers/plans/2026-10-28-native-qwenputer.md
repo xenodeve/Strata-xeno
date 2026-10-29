@@ -18,7 +18,7 @@
 
 **Spec:** [Native Qwenputer PRD](../../plans/2026-10-28-native-qwenputer-prd.md)
 
-**Status:** อนุมัติสถาปัตยกรรมและแผน R2 ให้ทำ P0 แล้ว ส่วน build/probe ของ P0 มีหลักฐานผ่าน; model-dependent runs ใช้ Gyro-M 262K/5 workers ที่ผู้ใช้เลือกแล้ว ยังไม่เริ่ม P1
+**Status:** P0, P1 offline export/oracles and P2 CPU-loader gates passed; P3 deterministic CUDA step is next. Later Native integration/performance gates remain open.
 **Revision:** R2 หลัง parent review: ขัดเกลาภาษา, ยืนยัน D2x compatibility, เพิ่ม policy references, dual-architecture build และ numerical/measurement gates
 **Baseline:** `e5737a27f485773a7ce22784fef6af7b480dcc9a`
 **Upstream pin:** `ca13310e2f9f788d1dd3feeea8213c1b0c23913c`
@@ -148,18 +148,18 @@ flowchart LR
 
 ## P2 — Safe loader และ token-feature decoding
 
-**Files:** สร้าง `include/strata/artifact/qwenputer.hpp`, `src/artifact/qwenputer.cpp`, `tests/qwenputer/artifact_test.cpp` และ `tests/qwenputer/feature_test.cpp`; อัปเดต CMake/format/blueprint
+**Files:** สร้าง `include/strata/core/qwenputer_artifact.hpp`, `src/core/qwenputer_artifact.cpp`, `tests/qwenputer/artifact_test.cpp` และ `tests/qwenputer/feature_test.cpp`; อัปเดต CMake/format/blueprint
 
 **Consumes:** P1 schema/oracle bundle
 **Produces:** `Artifact`, `Binding`, `LoadLimits`, `MemoryPlan`, `load_artifact(...)` และ CPU token-feature expansion สำหรับ tests เท่านั้น
 
-- [ ] สร้าง linked test harness และ minimal unsupported boundary ก่อน red โดย malformed fixture ต้อง fail ด้วยชื่อ field/violation ที่ implementation รายงาน ไม่ใช่ compiler/link/import error
-- [ ] เพิ่ม valid roundtrip และ cases ของ corrupt magic/version/endian/digest, overlapping/out-of-file sections, integer overflow, nonmonotone CSR, invalid columns/heads/output slots, NaN/Inf, excessive shapes/counts และ wrong tokenizer/firmware/ABI bindings
-- [ ] ทำ streaming/bounded CPU validation ก่อน CUDA allocation/upload โดย failure ไม่แก้ Artifact output หรือ active state ทดสอบ allocation spy/byte budget และ malformed fields แบบ mutation/fuzz ที่มี seed
-- [ ] Implement checked memory estimate ให้ครอบคลุม shadow/init/history/FIFO กับ restore transient โดย loader ต้อง recompute resource costs ไม่เชื่อ claims ของ artifact
-- [ ] CPU feature tests ต้องตรงกับ P1 exhaustive vectors สำหรับ tagged Text/Trace, ONE/code/tau/mu, family/payload/byte flags, special/printable mappings และ invalid IDs โดยไม่ยอมรับ source callbacks
-- [ ] Build/run `qwenputer_artifact_test` และ `qwenputer_feature_test` ทุก fixture ต้องผ่านหรือ refuse ตามเหตุผล และ invalid packs ต้องมี allocation spy=0 เพิ่ม negative control ที่ยอมรับ bad index เพื่อพิสูจน์ว่า test จับได้ แล้วคืน implementation
-- [ ] Commit loader/format/blueprint โดยยังไม่แตะ decoder path
+- [x] สร้าง linked test harness และ minimal unsupported boundary ก่อน red โดย malformed fixture ต้อง fail ด้วยชื่อ field/violation ที่ implementation รายงาน ไม่ใช่ compiler/link/import error
+- [x] เพิ่ม valid roundtrip และ cases ของ corrupt magic/version/endian/digest, overlapping/out-of-file sections, integer overflow, nonmonotone CSR, invalid columns/heads/output slots, NaN/Inf, excessive shapes/counts และ wrong tokenizer/firmware/ABI bindings
+- [x] ทำ streaming/bounded CPU validation ก่อน CUDA allocation/upload โดย failure ไม่แก้ Artifact output หรือ active state ทดสอบ allocation spy/byte budget และ malformed fields แบบ mutation/fuzz ที่มี seed
+- [x] Implement checked memory estimate ให้ครอบคลุม shadow/init/history/FIFO กับ restore transient โดย loader ต้อง recompute resource costs ไม่เชื่อ claims ของ artifact
+- [x] CPU feature tests ต้องตรงกับ P1 exhaustive vectors สำหรับ tagged Text/Trace, ONE/code/tau/mu, family/payload/byte flags, special/printable mappings และ invalid IDs โดยไม่ยอมรับ source callbacks
+- [x] Build/run `qwenputer_artifact_test` และ `qwenputer_feature_test` ทุก fixture ต้องผ่านหรือ refuse ตามเหตุผล และ invalid packs ต้องมี allocation spy=0 เพิ่ม negative control ที่ยอมรับ bad index เพื่อพิสูจน์ว่า test จับได้ แล้วคืน implementation
+- [x] Commit loader/format/blueprint โดยยังไม่แตะ decoder path
 
 ## P3 — Deterministic native CUDA circuit step
 

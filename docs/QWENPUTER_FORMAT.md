@@ -102,6 +102,13 @@ stage; it must not be shifted after that stage's outputs have already mutated it
 Initial state, committed state, trial state and lag history have separate ownership.
 Runtime graph handles are never serialized.
 
+The native CPU loader supports this arithmetic ABI explicitly; repeating an
+unknown digest in the caller binding does not enable another numerical ABI.
+Caller-provided file/host/device budgets are checked from actual section geometry,
+never from metadata claims. Its MemoryPlan includes three state/history sets and
+bounded scratch/FIFO; graph driver resources remain unmeasured until runtime
+instantiation. Previously retained artifacts are additional caller-owned memory.
+
 ## Capture, scope and provenance
 
 Outside a live enrolled calc call, long language tokens remain valid. Within the
