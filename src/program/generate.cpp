@@ -17,6 +17,9 @@
 
 #include "strata/platform/memory.hpp"
 #include "strata/program/igc_observation.hpp"
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+#include "strata/program/igc_output_diagnostic.hpp"
+#endif
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
@@ -447,6 +450,9 @@ struct Options {
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
     std::string dump_mixed;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    std::string igc_output_artifact,igc_output_fixture;
+#endif
     /// One residual snapshot per layer per position: `n_layers * hc * n_embd` floats per position, appended in
     /// position order.  This is the C1 BISECTION LADDER - it is what `llama-debug --tensor-filter l_last` prints
     /// for the reference, so the first layer whose `sum` diverges is the layer that holds the bug.  It needs the
@@ -939,6 +945,10 @@ void usage() {
                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
                  "                       which changes every number downstream - pass it for any real run\n"
                  "  --dump-mixed PATH    write the post-attention residual (n_embd, f32)\n"
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                 "  --igc-output-diagnostic-artifact PATH  controlled I3 native mapper (not production)\n"
+                 "  --igc-output-diagnostic-fixture PATH   exact-prefix checked-result fixture\n"
+#endif
                  "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
                  "                       event interval includes host gaps, so run with --gpu-only-full first\n"
                  "  --graph-only         MEASURE: replay the 48 `pre` graphs only.  OMITS the 48 `post` graphs\n"
@@ -2521,6 +2531,10 @@ int main(int argc, char** argv) {
         }
         else if (a == "--dump-residual") o.dump_residual = next("--dump-residual");
         else if (a == "--dump-mixed") o.dump_mixed = next("--dump-mixed");
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+        else if (a == "--igc-output-diagnostic-artifact") o.igc_output_artifact = next("--igc-output-diagnostic-artifact");
+        else if (a == "--igc-output-diagnostic-fixture") o.igc_output_fixture = next("--igc-output-diagnostic-fixture");
+#endif
         else if (a == "--dump-layers") o.dump_layers = next("--dump-layers");
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
@@ -3474,6 +3488,24 @@ int main(int argc, char** argv) {
     }
 
     std::string err;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    std::unique_ptr<strata::program::IgcOutputDiagnostic> igc_output;
+    if(!o.igc_output_artifact.empty() || !o.igc_output_fixture.empty()) {
+        if(o.igc_output_artifact.empty() || o.igc_output_fixture.empty() || !o.serve || o.batch!=0 ||
+                !o.split_device.empty() || o.pipeline_windows>0 || o.native_shards.empty()) {
+            std::fprintf(stderr,"IGC output diagnostic requires both paths, single serve/native model and no layer/pipeline split\n");return 2;
+        }
+        igc_output=std::make_unique<strata::program::IgcOutputDiagnostic>();
+        std::vector<std::filesystem::path> model_paths;
+        for(const auto& path:o.native_shards)model_paths.emplace_back(path);
+        std::fprintf(stderr,"strata IGC diagnostic: validating fixture and content-binding model/tokenizer before allocation\n");
+        if(!igc_output->load_host(o.igc_output_artifact,o.igc_output_fixture,err)
+                || !igc_output->bind(std::filesystem::path(o.pack)/"tokenizer",model_paths,err)) {
+            std::fprintf(stderr,"strata IGC diagnostic: %s\n",err.c_str());return 2;
+        }
+        std::fprintf(stderr,"strata IGC diagnostic: %zu controlled prefixes; oracle inputs, not learned I2\n",igc_output->entries());
+    }
+#endif
     if (!o.native_head_gguf.empty() && !o.stream_token) {
         std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
         return 2;
@@ -9127,6 +9159,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+        if(igc_output && !ver.set_diagnostic_head_transform(igc_output->hook())) {
+            std::fprintf(stderr,"strata IGC diagnostic: hook configuration failed\n");return 2;
+        }
+#endif
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
             (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
@@ -13930,10 +13967,20 @@ int main(int argc, char** argv) {
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                if(first_window && igc_output && !igc_output->stage(ids,err)) {
+                    std::printf("ERR %s\n",err.c_str());return serve_fatal();
+                }
+#endif
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return serve_fatal();
                 }
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                if(igc_output && !igc_output->check(T,err)) {
+                    std::printf("ERR %s\n",err.c_str());return serve_fatal();
+                }
+#endif
                 if (strata::timeline::enabled()) {   // #23: cumulative tier entries after each window
                     const int64_t* te = drive.d.tier_entries;
                     strata::timeline::instant("tiers primary/cpu", te[0], te[3]);

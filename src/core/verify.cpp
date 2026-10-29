@@ -436,6 +436,11 @@ Verifier::~Verifier() {
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    // Graphs and their bound stream are drained above; release referenced
+    // adapter buffers before destroying the stream/context they belong to.
+    if(diagnostic_head_.release)diagnostic_head_.release(diagnostic_head_.user);
+#endif
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
@@ -756,6 +761,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    if(diagnostic_head_.run) {
+        if(g.n_embd!=2560 || g.hc!=4 || !head_ || !head_->loaded() || head_->type()!=8 || next_ || lb_!=0 || le_!=g.n_layers) {
+            err="diagnostic output mapper requires the qualified unsplit Q8 native head";return false;
+        }
+        if(!diagnostic_head_.prepare(diagnostic_head_.user,cs_,err))return false;
+    }
+#endif
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
@@ -1714,6 +1727,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
             }
         }
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+        if(diagnostic_head_.run && !diagnostic_head_.run(diagnostic_head_.user,head_mixed_,T,cs,err))return false;
+#endif
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);

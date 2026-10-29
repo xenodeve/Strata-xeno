@@ -70,6 +70,20 @@ public:
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    struct DiagnosticHeadTransform {
+        void* user=nullptr;
+        bool (*prepare)(void*,void*,std::string&)=nullptr;
+        bool (*run)(void*,float*,int,void*,std::string&)=nullptr;
+        void (*release)(void*)=nullptr;
+    };
+    // Only diagnostic builds expose this seam. Stable addresses and one stream;
+    // configure before init, never mutate graph behavior through host callbacks.
+    bool set_diagnostic_head_transform(DiagnosticHeadTransform hook) {
+        if(g_ || !hook.user || !hook.prepare || !hook.run || !hook.release)return false;
+        diagnostic_head_=hook;return true;
+    }
+#endif
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -505,6 +519,9 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    DiagnosticHeadTransform diagnostic_head_{};
+#endif
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
