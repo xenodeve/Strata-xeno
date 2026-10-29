@@ -577,6 +577,22 @@ def igc_observation_report(tl: Timeline) -> dict:
             'host_ms': {'observe': sum(s.dur for s in rows), 'write': sum(s.dur for s in writes)}}
 
 
+def igc_controller_report(tl: Timeline) -> dict:
+    """Inclusive host attempts, including failures/waits; never GPU runtime.
+
+    These scopes are outside the captured head. They do not count device
+    invocations or split the kernels inside a verifier window. Do not add them
+    to overlapping GPU/parent scopes or interpret an attempt as a successful call.
+    """
+    names = ("load_host", "bind", "prepare", "begin", "stage", "cancel", "audit", "release")
+    regions = {name: tl.find("igc.controller." + name) for name in names}
+    if not any(regions.values()):
+        return {}
+    return {"attempts": {name: len(spans) for name, spans in regions.items()},
+            "host_ms": {name: sum(s.dur for s in spans) for name, spans in regions.items()},
+            "max_host_ms": {name: max((s.dur for s in spans), default=0) for name, spans in regions.items()}}
+
+
 def secondary_memory_report(tl: Timeline) -> list[dict]:
     """Boot resource observations in bytes; missing samples are not free memory."""
     rows = []
@@ -611,6 +627,10 @@ def main(argv: list[str] | None = None) -> int:
     native = qwenputer_report(tl)
     secondary_memory = secondary_memory_report(tl)
     observations = igc_observation_report(tl)
+    controller = igc_controller_report(tl)
+    if controller:
+        print("\n== IGC controller host scopes (attempts/waits, not GPU execution) ==")
+        print(controller)
     if observations['observe_calls']:
         print("\n== IGC observation host scopes (diagnostic copies/waits, not GPU time) ==")
         print(observations)
@@ -635,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dump({"prefill": prefill_report(tl, a.top), "decode": decode_report(tl), "lanes": utilisation(tl),
                        "threads": thread_report(tl), "server": server_report(tl),
                        "qwenputer": native, "secondary_memory": secondary_memory,
-                       "igc_observation": observations},
+                       "igc_observation": observations, "igc_controller": controller},
                       f, indent=1, default=str)
     if a.perfetto:
         export_perfetto(a.trace, a.perfetto)

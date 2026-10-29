@@ -14,7 +14,9 @@ static void require(bool ok,const std::string& why){if(!ok)throw std::runtime_er
 static void check(cudaError_t c){require(c==cudaSuccess,cudaGetErrorString(c));}
 struct Stream{cudaStream_t s=nullptr;Stream(){check(cudaStreamCreateWithFlags(&s,cudaStreamNonBlocking));}~Stream(){if(s){cudaStreamSynchronize(s);cudaStreamDestroy(s);}}};
 struct Buffer{float* p=nullptr;explicit Buffer(size_t count){check(cudaMalloc(&p,count*4));}~Buffer(){if(p)cudaFree(p);}};
+struct TimelineFlush{~TimelineFlush(){strata::timeline::flush();}};
 int main(int argc,char** argv)try{
+    TimelineFlush flush; // First object: flush after stream/controller teardown.
     require(argc==6,"bundle tokenizer model prefix-fixture activation-fixture required");
     constexpr size_t width=4*2560,plane=80*width,record_bytes=16+2*plane*4+80+2560*4;
     std::ifstream pf(argv[4],std::ios::binary);std::array<char,8> magic{};uint32_t count=0;

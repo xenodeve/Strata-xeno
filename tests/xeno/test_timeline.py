@@ -16,6 +16,36 @@ LANES = {1: "main", 2: "gpu0 copy engine (prefill)", 3: "gpu0 compute (prefill)"
          5: "pool worker 0", 6: "pool worker 1", 7: "pool worker 2", 8: "gpu1 4070 experts"}
 
 
+def test_igc_controller_host_attempts_do_not_claim_device_execution(tmp_path):
+    events = [X(1, "igc.controller.bind", 0, 5),
+              X(1, "igc.controller.prepare", 5, 6),
+              X(1, "igc.controller.begin", 6, 6.25),
+              X(1, "igc.controller.stage", 7, 7.5),
+              X(1, "igc.controller.stage", 9, 9.25),
+              X(1, "igc.controller.cancel", 10, 11),
+              X(1, "igc.controller.audit", 12, 12.4),
+              X(1, "igc.controller.release", 13, 13.3),
+              X(3, "unrelated GPU work", 0, 14)]
+    report = timeline.igc_controller_report(timeline.load(write(tmp_path, events)))
+    assert report["attempts"]["stage"] == 2
+    assert report["attempts"]["bind"] == 1
+    assert report["host_ms"] == {"load_host": 0, "bind": 5, "prepare": 1, "begin": .25,
+                                  "stage": .75, "cancel": 1, "audit": pytest.approx(.4),
+                                  "release": pytest.approx(.3)}
+    assert report["max_host_ms"]["stage"] == .5
+    assert "gpu_ms" not in report and "total_ms" not in report
+    assert timeline.igc_controller_report(timeline.Timeline([])) == {}
+
+
+def test_igc_controller_cli_publishes_the_host_budget(tmp_path, capsys):
+    trace = write(tmp_path, [X(1, "igc.controller.bind", 0, 2)])
+    destination = tmp_path / "summary.json"
+    assert timeline.main([trace, "--json", str(destination)]) == 0
+    report = json.loads(destination.read_text(encoding="utf-8"))["igc_controller"]
+    assert report["host_ms"]["bind"] == 2 and report["attempts"]["bind"] == 1
+    assert "IGC controller host scopes" in capsys.readouterr().out
+
+
 def test_igc_observation_accounts_host_scopes_without_calling_them_gpu_time(tmp_path):
     events=[X(1,"igc.preanchor.observe",1,1.2,3,10240),
             X(1,"igc.preanchor.observe",2,2.4,4,10240),

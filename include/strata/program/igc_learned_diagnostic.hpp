@@ -3,6 +3,7 @@
 #include "strata/core/igc_pipeline.hpp"
 #include "strata/core/qwenputer_binding.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/timeline.hpp"
 #include <cuda_runtime.h>
 #include <limits>
 #include <memory>
@@ -22,6 +23,7 @@ class IgcLearnedDiagnostic {
     bool loaded_=false,active_=false,staged_=false;
 
     bool prepare(void* raw,std::string& error) {
+        strata::timeline::Span span("igc.controller.prepare");
         if(!loaded_ || !inputs_.proof() || pipeline_ || !raw){error="igc learned prepare/binding";return false;}
         stream_=static_cast<cudaStream_t>(raw);
         context_=std::make_unique<strata::igc::ContextWindow>();
@@ -35,11 +37,13 @@ public:
     IgcLearnedDiagnostic& operator=(const IgcLearnedDiagnostic&)=delete;
 
     bool load_host(const std::filesystem::path& path,std::string& error) {
+        strata::timeline::Span span("igc.controller.load_host");
         if(loaded_){error="igc learned bundle already loaded";return false;}
         loaded_=strata::igc::load_controller_bundle(path,true,bundle_,error);
         return loaded_;
     }
     bool bind(const std::filesystem::path& tokenizer,const std::vector<std::filesystem::path>& models,std::string& error) {
+        strata::timeline::Span span("igc.controller.bind",static_cast<int64_t>(models.size()));
         if(!loaded_){error="igc learned bind before load";return false;}
         strata::qwenputer::Binding expected;
         expected.digests[4]=bundle_.model;expected.digests[5]=bundle_.tokenizer;
@@ -56,6 +60,7 @@ public:
     // Caller has waited for the previous commit and verified the retained live
     // prefix lineage. Clear the prior answer before ANY prompt head can run.
     bool begin(std::span<const int64_t> prefix,int64_t reused,bool may_reuse,bool eligible,std::string& error) {
+        strata::timeline::Span span("igc.controller.begin",static_cast<int64_t>(prefix.size()),eligible);
         if(!pipeline_ || prefix.empty() || prefix.size()>strata::igc::ContextWindow::max_tokens
                 || invocation_==std::numeric_limits<uint64_t>::max()) {error="igc learned begin arguments";return false;}
         ++invocation_;anchor_=prefix.size()-1;active_=eligible;staged_=false;
@@ -99,6 +104,7 @@ public:
         return !active_ || context_->accept(pos0,accepted,error);
     }
     bool stage(std::string& error) {
+        strata::timeline::Span span("igc.controller.stage",active_,static_cast<int64_t>(anchor_));
         if(!pipeline_ || !invocation_ || staged_){error="igc learned stage lifetime";return false;}
         bool available=false;
         if(active_) {available=context_->gather(static_cast<int64_t>(anchor_),stream_,error);if(!error.empty())return false;}
@@ -108,12 +114,14 @@ public:
         staged_=true;return true;
     }
     bool audit(strata::igc::Invocation& record,uint32_t& status,std::string& error) {
+        strata::timeline::Span span("igc.controller.audit");
         if(!pipeline_){error="igc learned audit before prepare";return false;}
         return pipeline_->audit(record,status,stream_,error);
     }
     // Outside capture after the owner's prior work; clearing context alone
     // cannot revoke the retained device result used by already captured heads.
     bool cancel(std::string& error) {
+        strata::timeline::Span span("igc.controller.cancel");
         if(!pipeline_ || !invocation_){error="igc learned cancel lifetime";return false;}
         context_->invalidate();active_=false;staged_=true;
         return pipeline_->stage_inputs(nullptr,nullptr,nullptr,invocation_,anchor_,false,stream_,true,error);
@@ -122,6 +130,7 @@ public:
         return (context_?context_->device_bytes():0)+(pipeline_?pipeline_->device_bytes():0);
     }
     void release() {
+        strata::timeline::Span span("igc.controller.release");
         if(stream_)cudaStreamSynchronize(stream_);
         pipeline_.reset();context_.reset();stream_=nullptr;active_=false;staged_=true;
     }
