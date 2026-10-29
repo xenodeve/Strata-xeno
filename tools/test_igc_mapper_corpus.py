@@ -1,10 +1,21 @@
 """Frozen splits for the first activation-readout feasibility experiment."""
 import collections
 import unittest
-from tools.igc.mapper_corpus import corpus
+from tools.igc.mapper_corpus import corpus, evaluation_manifest
 
 
 class MapperCorpus(unittest.TestCase):
+    def test_new_evaluation_is_frozen_separate_and_never_marked_training(self):
+        evaluation=evaluation_manifest()
+        self.assertEqual(evaluation,evaluation_manifest())
+        rows=evaluation['rows']
+        self.assertEqual(len(rows),64)
+        self.assertEqual({r['split'] for r in rows},{'evaluation'})
+        self.assertEqual(collections.Counter(r['ready_op'] for r in rows),{op:16 for op in range(4)})
+        self.assertFalse({r['prompt'] for r in rows}&{r['prompt'] for r in corpus()})
+        self.assertFalse({(r['lhs'],r['rhs']) for r in rows}&{(r['lhs'],r['rhs']) for r in corpus()})
+        self.assertEqual(len({r['prompt'] for r in rows}),64)
+
     def test_frozen_split_balance_and_no_prompt_leakage(self):
         rows=corpus()
         self.assertEqual(rows,corpus())
