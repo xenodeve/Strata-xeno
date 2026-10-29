@@ -3,7 +3,9 @@ import argparse
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
+import sys
 import time
 import numpy as np
 import torch
@@ -14,6 +16,14 @@ from tools.igc.diagnostics import analyze
 from tools.igc.observation import _read
 from tools.igc.provenance import verify_sources
 from tools.igc.readout import SIZES,metrics,targets
+
+
+def training_lr(schedule,step,total_steps):
+    if type(step) is not int or type(total_steps) is not int or total_steps<2 or not 0<=step<total_steps:
+        raise ValueError('global training step bounds')
+    if schedule=='constant':return 0.001
+    if schedule!='cosine':raise ValueError('unknown learning-rate schedule')
+    return 0.001*(0.01+0.99*0.5*(1+math.cos(math.pi*step/(total_steps-1))))
 
 
 def batch_inputs(table,indices,valid,selection):
@@ -77,11 +87,13 @@ def load_cache(root,sources,protocol):
     return table,indices,valid,corpus['rows'],report
 
 
-def train(root,sources,protocol,output,cache_protocol=None,contextual=False,device='cpu',epochs=30,seed=20261030):
+def train(root,sources,protocol,output,cache_protocol=None,contextual=False,device='cpu',epochs=30,seed=20261030,schedule='constant'):
     from safetensors.torch import save_file
     from tools.qwenputer.memory import process_snapshot,system_snapshot
     import os
     output.mkdir(parents=True,exist_ok=False)
+    source_paths=[Path(__file__),Path(__file__).with_name('attention_readout.py'),Path(__file__).with_name('balanced_corpus.py')]
+    source_hashes={path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}
     table,indices,valid,rows,cache=load_cache(root,sources,cache_protocol or protocol)
     if device not in ('cpu','cuda') or not 1<=epochs<=100:raise ValueError('bounded training recipe')
     labels=targets(rows)
@@ -103,11 +115,14 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
     model=InputReadout(use_final_query=False,contextual=contextual).to(device)
     optimizer=torch.optim.AdamW(model.parameters(),lr=0.001,weight_decay=0.01,foreach=False,fused=False)
     started=time.monotonic();history=[];resources=[]
+    steps_per_epoch=(len(fit)+63)//64;total_steps=steps_per_epoch*epochs
     for epoch in range(epochs):
         order=fit[torch.randperm(len(fit),generator=random).numpy()]
         total=0.
         for offset in range(0,len(order),64):
             if time.monotonic()-started>600:raise RuntimeError('bounded fit deadline; no completed model')
+            rate=training_lr(schedule,epoch*steps_per_epoch+offset//64,total_steps)
+            for group in optimizer.param_groups:group['lr']=rate
             selection=order[offset:offset+64]
             y=torch.from_numpy(labels[selection]).to(device);positive=y[:,0]>0
             optimizer.zero_grad(set_to_none=True)
@@ -140,6 +155,7 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
                 seed=seed,epochs=epochs,batch=64,threads=4,device=device,torch_version=torch.__version__,
                 parameters=sum(p.numel() for p in model.parameters()),training_seconds=time.monotonic()-started,
                 query_mode='learned_queries_only',activation_stage='native_embedding_broadcast',
+                learning_rate_schedule=schedule,final_learning_rate=rate,global_steps=total_steps,
                 contextual_block=contextual,
                 gradient_scope='input readout only; frozen activation cache, no Gyro or output-mapper backward',
                 initial_epoch_loss=history[0],final_epoch_loss=history[-1],loss_history=history,
@@ -148,6 +164,10 @@ def train(root,sources,protocol,output,cache_protocol=None,contextual=False,devi
                 protocol_sha256=hashlib.sha256(protocol.read_bytes()).hexdigest(),
                 cache_preparation_protocol_sha256=cache['protocol_sha256'],source_manifest_sha256=cache['source_manifest_sha256'],
                 trained_state_sha256=hashlib.sha256((output/'input.safetensors').read_bytes()).hexdigest())
+    if source_hashes!={path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}:
+        raise RuntimeError('training source changed during run')
+    report.update(training_source_sha256=source_hashes,python_version=sys.version,
+                  python_exe_sha256=hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest())
     if device=='cuda':
         report['cuda']=dict(build=torch.version.cuda,device=torch.cuda.get_device_name(0),tf32=False,
                            sdp='math',peak_allocated_bytes=torch.cuda.max_memory_allocated(),
@@ -166,5 +186,6 @@ if __name__=='__main__':
     parser.add_argument('--device',choices=('cpu','cuda'),default='cpu')
     parser.add_argument('--epochs',type=int,default=30)
     parser.add_argument('--seed',type=int,default=20261030)
+    parser.add_argument('--schedule',choices=('constant','cosine'),default='constant')
     args=parser.parse_args();train(args.dataset,args.sources,args.protocol,args.output,args.cache_protocol,args.contextual,
-                                 args.device,args.epochs,args.seed)
+                                 args.device,args.epochs,args.seed,args.schedule)

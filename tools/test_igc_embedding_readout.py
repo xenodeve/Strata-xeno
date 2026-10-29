@@ -2,10 +2,21 @@
 import unittest
 import numpy as np
 import torch
-from tools.igc.embedding_readout import batch_inputs,TensorInputs
+from tools.igc.embedding_readout import batch_inputs,TensorInputs,training_lr
 
 
 class EmbeddingInputs(unittest.TestCase):
+    def test_cosine_decay_is_global_bounded_and_reaches_its_declared_floor(self):
+        self.assertEqual(training_lr('constant',999,11200),0.001)
+        self.assertEqual(training_lr('cosine',0,11200),0.001)
+        self.assertAlmostEqual(training_lr('cosine',11199,11200),0.00001)
+        values=[training_lr('cosine',step,11200) for step in range(11200)]
+        self.assertTrue(all(.00001<=value<=.001 for value in values))
+        self.assertTrue(all(a>=b for a,b in zip(values,values[1:])))
+        self.assertLess(values[160],values[159])
+        for step,total in [(-1,11200),(11200,11200),(0,1)]:
+            with self.assertRaises(ValueError):training_lr('cosine',step,total)
+
     def test_tensor_cache_preserves_the_checked_cpu_batch_contract(self):
         table=np.stack([np.full((4,2560),v,dtype=np.float32) for v in (1.25,2.5)])
         indices=np.tile(np.arange(80,dtype=np.int32)%2,(2,1))

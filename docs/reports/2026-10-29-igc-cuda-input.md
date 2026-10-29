@@ -64,23 +64,54 @@ change. These are head-training observations, not inference speed claims.
 Evidence: `igc-cuda-expanded-fit.log` and
 `igc-cuda-expanded-fit-01/{report,predictions}.json`.
 
-## Debug-mantra reproduction in progress
+## Debug-mantra reproduction and immediate failure mechanism
 
-Root cause is not established. The reproducible target is the exact final-epoch
-loss jump under the frozen seed/data/runtime, not a generic GPU or memory claim.
+The target is the exact final-epoch loss jump under the frozen seed/data/runtime,
+not a generic GPU or memory claim.
 The diagnostic reruns the same recipe, preserves a model/optimizer/RNG checkpoint
 after epoch 69, and records epoch-70 batch losses, gradients and actual updates.
-Loss history and final-state SHA256 will be compared to the failed run. A late
-optimizer instability, numerical fault and data/lifetime issue are hypotheses
-to distinguish, not reasons to apply a guessed fix.
+The investigation compares loss history and final-state SHA256 to the failed
+run, then distinguishes optimizer, numerical and data/lifetime hypotheses.
 
 The first diagnostic wrapper failed before its first optimizer update because
 Torch added an optimizer profiling wrapper around the intercepted method. Its
 assertion/log is preserved; no reproduction was claimed. A bounded caller-frame
-walk fixes only that harness. The second reproducer's first 30 epoch losses match
-the failed run exactly at this checkpoint. Evidence is
+walk fixes only that harness. The second reproducer's complete loss history and
+final-state SHA256 match the failed run exactly. It traced all 160 final-epoch
+batches. Evidence is
 `igc-cuda-instability-debug-02.log` and `igc-cuda-instability-debug-02/`.
 
-Only an independently justified fix and a new frozen validation run can advance
-this gate. The [native-head bridge plan](../plans/2026-10-29-igc-native-head-training-bridge.md)
+The immediate mechanism is a constant-rate Adam update overshooting a fitted
+solution. At epoch 70 batch 155, gradient L2 is 1.0274 and the actual update L2 is
+0.07611. Loss rises from 0.00085203 to 0.36760777 on the same batch; the next
+updates cascade. Replaying the epoch-69 model/optimizer/RNG checkpoint matches
+all 156 pre-failure batch losses bit for bit. CPU loss is 0.0008519723, CUDA loss
+0.0008520325, and all gradients agree under the declared mixed FP32 rule.
+
+The actual direction is initially downhill: gradient dot update = -0.03951294.
+Predetermined fractions of that same update give:
+
+| fraction | same-batch loss |
+|---:|---:|
+| 0 | 0.000852033 |
+| 0.01 | 0.000541836 |
+| 0.1 | 0.000058891 |
+| 0.5 | 0.004338040 |
+| 1 | 0.367607772 |
+
+This falsifies an incorrect local gradient as the explanation and supports
+reducing step size near convergence. Evidence:
+`igc-cuda-instability-debug-02/{summary,falsification}.json`, `epoch70.jsonl` and
+`igc-adam-falsification.log`. It does not establish generalization quality or
+every possible future instability.
+
+The [new frozen validation](../plans/2026-10-29-igc-cosine-input-experiment.md)
+starts fresh with identical data/seed/architecture/70 epochs and changes only
+the global learning-rate schedule to cosine decay from 0.001 to 0.00001.
+There is no conditional bad-batch workaround or earlier-checkpoint selection.
+Twenty input/cache/corpus/diagnostic/readout tests pass, including schedule
+endpoints, monotonic bounds and absence of epoch restarts. The new final-weight
+quality result is pending; stability and input quality remain separate gates.
+
+The [native-head bridge plan](../plans/2026-10-29-igc-native-head-training-bridge.md)
 is independent I3 preparation, not implemented or validated output mapping.
