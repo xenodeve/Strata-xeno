@@ -66,3 +66,43 @@ Next is the predeclared70-epoch native-feature fit, same model/data/seed/cosine
 recipe as its embedding control. Final weights only, no development checkpoint
 selection. Passing collection is separate from I2 generalization, I3 faithful
 result use and actual integrated Hub performance.
+
+## Completed70-epoch fit: I2 remains failed
+
+After the separately documented time-budget correction, `igc-native-context-fit-02`
+finishes DONE0 in1,407.866s, final training loss0.00001152515. Final state SHA256
+`519fbc196993c94676f4031f7bd45ad9abf661f8b7b4fd3b9d6358204b5294e2`.
+All7,680 fit tuples are exact, all10,240 operators/readiness labels match, and
+none of2,560 fit negatives calls the calculator. Fresh acceptance64 is untouched.
+
+| Known development axis | Embedding control exact/96 | Native first-attention exact/96 | Native false calls/32 |
+|---|---:|---:|---:|
+|Seen values / new templates|50|96|30|
+|New values / seen templates|77|50|0|
+|New values / new templates|33|67|32|
+
+These are the same frozen expanded-v2 cases/seed/architecture/optimizer/schedule,
+with only activation features changed. The mixed outcome is not a blanket
+improvement: one new-value axis regresses and unseen negative wording still
+triggers incorrectly. Peak CUDA allocated728,959,488/reserved920,649,728 bytes is
+for this offline readout fit, not the full language model or serving overhead.
+
+All positive operator, sign and length fields match. Nonpadding tens digits also
+match on every axis. New-value failures involve ones/padding-digit predictions:
+41 noncanonical operand predictions on new-values/seen-templates and25 on both-new.
+There are no operand swaps or digit reversals in these cases. Examples:
+
+- `Work out 93 * -3 and give its value.` correctly selects multiply and length1
+  for the right operand, but predicts ones4/tens3. This is an **invalid encoding**,
+  not a valid -34 operand or an executed arithmetic answer.
+- `Treat 0+-84 as a label. Only acknowledge it.` incorrectly selects addition
+  instead of no call; operand extraction does not establish readiness correctness.
+
+Next falsifiable hypotheses: a left-aligned neural digit representation with an
+explicit padding class may match the tokenizer better while preserving the exact
+executor's little-endian ABI; readiness may need a separate learned intent readout
+from the normal full-model anchor state rather than early token features alone.
+Neither is established by this outcome. Preserve this failed run and freeze a
+distinct experiment before testing either; do not repair old predictions after the
+fact or call the old head eligible. Full-sequence output training proceeds as an
+independent necessary component, using oracle/checked-native results initially.

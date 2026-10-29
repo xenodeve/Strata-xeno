@@ -13,6 +13,11 @@ corpus/development and untouched acceptance64. Hold development result values ou
 of fitting as well as operand pairs. This pilot does not establish62-digit range,
 new languages or spontaneous use; it prepares full-sequence output training.
 
+Frozen row SHA256 `913fbdf842ce9cc55862200167147dee26f116f81e99ea5792e49ccb817725e3`.
+Using the verified native wrapper/tokenizer produces421 teacher-forced positions,
+181 numeric-symbol targets and a maximum86-token input prefix. This includes
+the real end-of-turn token. These counts are preparation, not model execution.
+
 `tools/igc/output_corpus.py` produces independent Python oracle labels **only for
 offline training/evaluation**. Before fitting, execute all typed requests through
 the actual I1a CUDA executor and compare its canonical results to the independent

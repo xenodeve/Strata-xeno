@@ -126,6 +126,10 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
     spec=importlib.util.spec_from_file_location('igc_pinned_hub_server',server)
     helper=importlib.util.module_from_spec(spec);sys.modules[spec.name]=helper;spec.loader.exec_module(helper)
     env=helper.child_env(cfg);env.pop('STRATA_TIMELINE',None) # This is a dataset, not a timing run.
+    if cfg.get('cjk_guard') or helper.layer_split_of(cfg) or cfg.get('vision') or cfg.get('replicas'):
+        raise ValueError('output pilot only qualified for the selected non-replica D2x profile')
+    effort=helper.effort_end_args(cfg,str(executable),tokenizer) or []
+    engine_arguments=helper.engine_args(cfg)+effort
     results=checked_results(corpus['rows'],examples,exact_executable,output,env)
     record=[];samples=[];stop=threading.Event();cancel=threading.Event();failure=[];active_request=[None]
     engine=None;root=psutil.Process(os.getpid());original_popen=subprocess.Popen
@@ -153,7 +157,8 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
     subprocess.Popen=headless
     try:
         limits=current_job()
-        engine=helper.StrataEngine(str(executable),helper.engine_args(cfg),cwd=cfg.get('cwd'),log=cfg['log'],env=env)
+        engine=helper.StrataEngine(str(executable),engine_arguments,cwd=cfg.get('cwd'),log=cfg['log'],env=env)
+        engine.silence_s=helper.engine_silence_s(cfg)
         for index,example in enumerate(examples):
             if cancel.is_set() or time.monotonic()-started>900:raise TimeoutError('output collection cancelled/deadline')
             active_request[0]=time.monotonic()
