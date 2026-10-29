@@ -32,7 +32,7 @@ def final_integer(text):
     return int(numbers[0]) if len(numbers)==1 else None
 
 
-def run(profile,server,candidate,baseline,sources,capture,reference,pack,capture_protocol,protocol,artifact,fixture,output,smoke=False):
+def run(profile,server,candidate,baseline,sources,capture,reference,pack,capture_protocol,protocol,artifact,fixture,output,smoke=False,parity_only=False):
     validate_launcher_env(os.environ)
     if any((p.info['name'] or '').lower().startswith('strata') for p in psutil.process_iter(['name'])):
         raise RuntimeError('another Strata process is active; no model launched')
@@ -58,7 +58,7 @@ def run(profile,server,candidate,baseline,sources,capture,reference,pack,capture
     before={str(path):digest(path) for path in source_paths}
     output.mkdir(exist_ok=False)
     (output/'inputs.json').write_text(json.dumps(dict(preflight=preflight,job=current_job(),cases=cases,source_sha256=before,
-        original_collection=data['collection_report_sha256'],smoke=smoke),ensure_ascii=False,indent=2),encoding='utf-8')
+        original_collection=data['collection_report_sha256'],smoke=smoke,parity_only=parity_only),ensure_ascii=False,indent=2),encoding='utf-8')
     sys.path[:0]=[str(server.parent),str(server.parent.parent)]
     spec=importlib.util.spec_from_file_location('igc_output_integration_hub',server)
     helper=importlib.util.module_from_spec(spec);sys.modules[spec.name]=helper;spec.loader.exec_module(helper)
@@ -87,7 +87,10 @@ def run(profile,server,candidate,baseline,sources,capture,reference,pack,capture
     def headless(*args,**kwargs):kwargs['creationflags']=kwargs.get('creationflags',0)|0x08000000;return popen(*args,**kwargs)
     subprocess.Popen=headless;all_records={}
     try:
-        for arm,exe,enabled in [('prehook',baseline,False),('candidate_off',candidate,False),('candidate_on',candidate,True)]:
+        arms=([('prehook',baseline,False),('candidate_off',candidate,False),
+               ('candidate_off_repeat',candidate,False),('prehook_repeat',baseline,False)] if parity_only else
+              [('prehook',baseline,False),('candidate_off',candidate,False),('candidate_on',candidate,True)])
+        for arm,exe,enabled in arms:
             current_arm[0]=arm;folder=output/arm;folder.mkdir()
             local=json.loads(json.dumps(cfg));local['exe']=str(exe);local['log']=str(folder/'engine.log')
             args=list(local['args']);original=Path(args[args.index('--expert-profile')+1]);initial_hash=digest(original)
@@ -131,9 +134,16 @@ def run(profile,server,candidate,baseline,sources,capture,reference,pack,capture
     if before!={str(path):digest(path) for path in source_paths}:raise RuntimeError('controlled source changed during run')
     by_id={arm:{r['id']:r for r in rows} for arm,rows in all_records.items()}
     off_equal=all(by_id['prehook'][c['id']]['tokens']==by_id['candidate_off'][c['id']]['tokens'] for c in cases)
-    unmatched_equal=all(by_id['candidate_off'][c['id']]['tokens']==by_id['candidate_on'][c['id']]['tokens'] for c in cases if not c['matched'])
-    report=dict(success=True,kind='controlled native output generation; no learned I2 or performance claim',
+    unmatched_equal=(all(by_id['candidate_off'][c['id']]['tokens']==by_id['candidate_on'][c['id']]['tokens'] for c in cases if not c['matched']) if not parity_only else None)
+    comparisons={}
+    if parity_only:
+        for name,a,b in [('prehook_self','prehook','prehook_repeat'),('candidate_self','candidate_off','candidate_off_repeat'),
+                         ('cross_first','prehook','candidate_off'),('cross_second','prehook_repeat','candidate_off_repeat')]:
+            comparisons[name]={c['id']:by_id[a][c['id']]['tokens']==by_id[b][c['id']]['tokens'] for c in cases}
+    report=dict(run_completed=True,kind='controlled native output generation; no learned I2 or performance claim',
         smoke=smoke,cases=len(cases),off_raw_token_parity=off_equal,unmatched_raw_token_parity=unmatched_equal,
+        parity_only=parity_only,repeat_comparisons=comparisons,final_answer_rubric='single-integer final format, not mathematical correctness',
+        same_executable_control=before[str(candidate)]==before[str(baseline)],
         arms={arm:{split:dict(n=len(selected),numeric_correct=sum(r['numeric_match'] is True for r in selected),
             limit=sum(r['done'].get('finish')=='length' for r in selected))
             for split in dict.fromkeys(r['split'] for r in rows)
@@ -151,4 +161,5 @@ if __name__=='__main__':
     for name in ('profile','server','candidate','baseline','sources','capture','reference','pack','capture-protocol','protocol','artifact','fixture','output'):
         parser.add_argument('--'+name,type=Path,required=True)
     parser.add_argument('--smoke',action='store_true')
+    parser.add_argument('--parity-only',action='store_true')
     run(**vars(parser.parse_args()))
