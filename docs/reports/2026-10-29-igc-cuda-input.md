@@ -110,8 +110,35 @@ starts fresh with identical data/seed/architecture/70 epochs and changes only
 the global learning-rate schedule to cosine decay from 0.001 to 0.00001.
 There is no conditional bad-batch workaround or earlier-checkpoint selection.
 Twenty input/cache/corpus/diagnostic/readout tests pass, including schedule
-endpoints, monotonic bounds and absence of epoch restarts. The new final-weight
-quality result is pending; stability and input quality remain separate gates.
+endpoints, monotonic bounds and absence of epoch restarts.
+
+## Fresh cosine validation outcome
+
+The fresh run completed in 230.275 seconds. It remained stable to final epoch
+loss 0.000204544, with final learning rate 0.00001. All 10,240 fitting readiness/
+operator classes and 7,680 positive operand tuples match, with no fitting false
+calls. Thus the observed convergence failure is removed in this validation.
+Generalization still fails:
+
+| development axis | exact routed tuples | false calls |
+|---|---:|---:|
+| seen values/new templates | 50/96 | 28/32 |
+| new values/seen templates | 77/96 | 0/32 |
+| new values/new templates | 33/96 | 32/32 |
+
+I2 remains open and fresh64 remains untouched. Stability and input quality are
+separate gates; a perfectly fitted training set is not release readiness.
+Final weights SHA256:
+`ec7273bed946ea3fa03ca375f453a602de82b34a96cdca88da880945505c427a`.
+GPU peak allocated/reserved remains 745,498,112/941,621,248 bytes. The report
+records training-source hashes and verifies that source did not change during
+the run. Evidence: `igc-cuda-cosine-fit.log` and
+`igc-cuda-cosine-fit-01/{report,predictions}.json`.
+
+Next input work must address contextual extraction/false triggers rather than
+repeating overfit checks. Frozen-model contextual features and stronger coverage
+remain research options; none is silently claimed as implemented. No serving
+or default change follows from this result.
 
 The [native-head bridge plan](../plans/2026-10-29-igc-native-head-training-bridge.md)
 is independent I3 preparation, not implemented or validated output mapping.
