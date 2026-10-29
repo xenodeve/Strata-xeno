@@ -68,7 +68,7 @@ def current_job():
     return value
 
 
-def collect(profile,server,executable,exact_executable,pack,reference,sources,protocol,output):
+def collect(profile,server,executable,exact_executable,pack,reference,sources,protocol,output,readiness_anchors=False):
     validate_launcher_env(os.environ)
     started=time.monotonic();resolution=verify_sources(sources)
     pinned={Path(r['path']).resolve() for r in json.loads(_read(sources,limit=256*1024))['files']}
@@ -78,11 +78,17 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
     vision_cfg=({key:(os.path.abspath(os.path.join(cfg.get('cwd') or '.',value))
                        if key in ('exe','mmproj','model') and isinstance(value,str) and not os.path.isabs(value)
                        else value) for key,value in cfg['vision'].items()} if cfg.get('vision') else None)
-    source_paths=[profile,server,executable,exact_executable,protocol]
+    source_paths=[profile,server,executable,exact_executable,protocol,Path(__file__)]
+    if readiness_anchors:
+        from tools.igc import readiness_corpus
+        source_paths.append(Path(readiness_corpus.__file__))
     if vision_cfg:source_paths.extend(Path(vision_cfg[key]) for key in ('exe','model','mmproj'))
     before={str(p):digest(p) for p in source_paths}
     tokenizer=NativeText.from_pack(pack/'tokenizer');prefix,suffix=wrapped_prefix(reference,tokenizer)
-    corpus=dataset();examples=position_examples(corpus['rows'],tokenizer,prefix,suffix)
+    if readiness_anchors:
+        corpus=readiness_corpus.dataset();examples=readiness_corpus.anchor_examples(corpus['rows'],tokenizer,prefix,suffix)
+    else:
+        corpus=dataset();examples=position_examples(corpus['rows'],tokenizer,prefix,suffix)
     system=system_snapshot()
     if (system['physical_available_bytes']<24*1024**3 or system['system_commit_available_bytes']<55_000_000_000+4*1024**3
             or shutil.disk_usage(output.parent).free<4*1024**3):
@@ -112,7 +118,9 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
         raise ValueError('output pilot only qualified for the selected non-replica D2x profile')
     effort=helper.effort_end_args(cfg,str(executable),tokenizer) or []
     engine_arguments=helper.engine_args(cfg)+effort
-    results=checked_results(corpus['rows'],examples,exact_executable,output,env)
+    # No arithmetic executor or answer preparation in the readiness experiment.
+    results=({r['id']:None for r in corpus['rows']} if readiness_anchors else
+             checked_results(corpus['rows'],examples,exact_executable,output,env))
     record=[];samples=[];stop=threading.Event();cancel=threading.Event();failure=[];active_request=[None]
     engine=None;vision=None;vision_log=None;root=psutil.Process(os.getpid());original_popen=subprocess.Popen
     owned_executables={executable.resolve()}
@@ -176,7 +184,9 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
             or digest(learned)!=learned_hash or len(record)!=len(examples)):
         raise RuntimeError('output source/owned completion validation failed')
     verify_sources(sources)
-    report=dict(success=True,kind='native teacher-forced output positions; no trained result-use or speed claim',
+    report=dict(success=True,kind=('native fixed-anchor readiness observations; no trained use or speed claim' if readiness_anchors else
+                                  'native teacher-forced output positions; no trained result-use or speed claim'),
+                readiness_anchors=readiness_anchors,
                 positions=len(record),samples=len(corpus['rows']),rows_sha256=corpus['rows_sha256'],job=limits,
                 records_sha256=digest(output/'records.json'),source_manifest_sha256=digest(sources),
                 source_resolution=resolution,protocol_sha256=before[str(protocol)],source_sha256=before,
@@ -195,4 +205,5 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     for name in ('profile','server','executable','exact-executable','pack','reference','sources','protocol','output'):
         parser.add_argument('--'+name,type=Path,required=True)
+    parser.add_argument('--readiness-anchors',action='store_true')
     args=parser.parse_args();collect(**vars(args))
