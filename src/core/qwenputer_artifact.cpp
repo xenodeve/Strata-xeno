@@ -114,6 +114,21 @@ bool valid_feature(const Feature& f) {
 } // namespace
 
 Digest sha256(std::span<const std::uint8_t> bytes) { Hash hash; hash.update(bytes); return hash.finish(); }
+bool sha256_stream(std::istream& file, std::uint64_t max_bytes, Digest& output,
+                   std::uint64_t& bytes, std::string& error) try {
+    Hash hash;
+    std::vector<std::uint8_t> buffer(1u << 20);
+    std::uint64_t count=0;
+    while (file) {
+        file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        const auto n=static_cast<std::uint64_t>(file.gcount());
+        if (n>max_bytes-count) { error="binding_file_size"; return false; }
+        hash.update(std::span(buffer).first(static_cast<std::size_t>(n))); count+=n;
+    }
+    if (!file.eof()) { error="binding_file"; return false; }
+    output=hash.finish(); bytes=count; error.clear(); return true;
+} catch (const std::bad_alloc&) { error="binding_allocation"; return false; }
+  catch (const std::ios_base::failure&) { error="binding_file"; return false; }
 const Digest& arithmetic_abi() {
     static const Digest value{0x47,0xac,0xf4,0x8b,0x7f,0x07,0x43,0xf9,
         0x5a,0xa2,0x72,0xb4,0xf6,0x5a,0x10,0x27,0x63,0xe3,0x9c,0x25,

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <iterator>
 #include <string_view>
+#include <sstream>
 
 using namespace strata::qwenputer;
 
@@ -47,6 +48,16 @@ int main(int argc, char** argv) {
           "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA256 abc");
     std::vector<std::uint8_t> million(1000000, 'a');
     check(hex(sha256(million)) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0", "SHA256 million a");
+    {
+        Digest result{}; result[0]=77; std::uint64_t bytes=99; std::string reason;
+        std::istringstream input("abc");
+        check(sha256_stream(input,3,result,bytes,reason) && bytes==3
+              && hex(result)=="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "stream SHA256 abc");
+        const auto prior=result;
+        std::istringstream oversized("abc"); bytes=99;
+        check(!sha256_stream(oversized,2,result,bytes,reason) && reason=="binding_file_size"
+              && result==prior && bytes==99,"stream cap preserves outputs");
+    }
     Artifact output;
     output.config[0] = 77;
     MemoryPlan memory;

@@ -135,6 +135,15 @@ instantiation. Previously retained artifacts are additional caller-owned memory.
 
 ## Capture, scope and provenance
 
+`VerifiedInputs` hashes supplied source contents before publishing a model/tokenizer
+proof. A single model source uses its SHA256; multiple sources use the canonical
+ordered `strata-model-files-v1` manifest of byte counts and SHA256 values. Paths
+are not identity. Tokenizer identity includes the four required files and an
+optional chat template. On Windows, retained read handles deny concurrent writes
+and deletion. The caller must enumerate all sources required by its contract;
+this helper does not discover pack banks, MTP inputs, build options or settings.
+Binding the GGUF and tokenizer alone is not a complete training-run identity.
+
 Outside a live enrolled calc call, long language tokens remain valid. Within the
 capture, reject rows wider than 16 bytes, reserved tokens, NUL, invalid UTF-8,
 more than 80 rows, malformed/nested XML or an expression beyond 255 bytes. Total

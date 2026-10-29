@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <iosfwd>
 #include <span>
 #include <string>
 #include <vector>
@@ -85,6 +86,8 @@ struct Artifact {
 };
 
 Digest sha256(std::span<const std::uint8_t> bytes);
+bool sha256_stream(std::istream&, std::uint64_t max_bytes, Digest& output,
+                   std::uint64_t& bytes, std::string& error);
 // This loader implements the arithmetic ABI only; a matching caller binding
 // cannot authorize an otherwise unsupported numerical contract.
 const Digest& arithmetic_abi();
