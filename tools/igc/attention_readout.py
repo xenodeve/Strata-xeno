@@ -12,14 +12,14 @@ from tools.igc.readout import SIZES, load_dataset, metrics, standardize, targets
 
 
 class InputReadout(torch.nn.Module):
-    def __init__(self):
+    def __init__(self,use_final_query=True):
         super().__init__()
         self.norm=torch.nn.LayerNorm(2560)
         self.stream=torch.nn.Linear(2560,16)
         self.position=torch.nn.Embedding(80,64)
         self.key=torch.nn.Linear(64,64)
         self.value=torch.nn.Linear(64,64)
-        self.context=torch.nn.Linear(2560,64)
+        self.context=torch.nn.Linear(2560,64) if use_final_query else None
         self.queries=torch.nn.Parameter(torch.empty(9,64))
         self.heads=torch.nn.ModuleList(torch.nn.Linear(64,size) for size in SIZES)
         torch.nn.init.normal_(self.position.weight,std=0.02)
@@ -35,7 +35,9 @@ class InputReadout(torch.nn.Module):
         # Padding and missing cache rows carry no evidence or gradient.
         safe=states.masked_fill(~valid[:,:,None,None],0)
         tokens=self.stream(self.norm(safe)).flatten(2)+self.position(positions)
-        q=self.queries[None,:,:]+self.context(query)[:,None,:]
+        q=self.queries[None,:,:].expand(len(states),-1,-1)
+        if self.context is not None:
+            q=q+self.context(query)[:,None,:]
         scores=torch.bmm(q,self.key(tokens).transpose(1,2))/8
         weights=torch.softmax(scores.masked_fill(~valid[:,None,:],float('-inf')),dim=-1)
         result=torch.bmm(weights,self.value(tokens))+q
@@ -68,7 +70,7 @@ def contexts(root,rows,stage='final'):
     return values,valid,positions
 
 
-def train(root,sources,output,protocol,stage='final'):
+def train(root,sources,output,protocol,stage='final',query_mode='final'):
     from safetensors.torch import save_file
     output.mkdir(parents=True,exist_ok=False)
     query,rows,collection=load_dataset(root,sources)
@@ -79,7 +81,9 @@ def train(root,sources,output,protocol,stage='final'):
     torch.set_num_threads(4)
     torch.manual_seed(20261029)
     torch.use_deterministic_algorithms(True)
-    model=InputReadout()
+    if query_mode not in ('final','learned'):
+        raise ValueError('unknown query mode')
+    model=InputReadout(use_final_query=query_mode=='final')
     optimizer=torch.optim.AdamW(model.parameters(),lr=0.001,weight_decay=0.01)
     inputs=[torch.from_numpy(x[train_mask]) for x in [values,valid,positions,normalized]]
     y=torch.from_numpy(labels[train_mask])
@@ -107,7 +111,7 @@ def train(root,sources,output,protocol,stage='final'):
     eligible=(train_report['positive_exact_routed']==train_report['positive_count']
               and diagnostic['positive_exact_routed']>0)
     report=dict(kind='activation-attention-input-readout; no deployed mapping',
-                activation_stage=stage,query_stage='head_mixed_after_final_hc',
+                activation_stage=stage,query_stage='head_mixed_after_final_hc' if query_mode=='final' else 'learned_queries_only',
                 training_seconds=time.monotonic()-started,epochs=300,seed=20261029,
                 torch_version=torch.__version__,device='cpu',threads=4,
                 parameters=sum(p.numel() for p in model.parameters()),
@@ -131,5 +135,6 @@ if __name__=='__main__':
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--protocol',type=Path,required=True)
     parser.add_argument('--activation-stage',choices=('final','embedding','attention'),default='final')
+    parser.add_argument('--query-mode',choices=('final','learned'),default='final')
     args=parser.parse_args()
-    train(args.dataset,args.sources,args.output,args.protocol,args.activation_stage)
+    train(args.dataset,args.sources,args.output,args.protocol,args.activation_stage,args.query_mode)

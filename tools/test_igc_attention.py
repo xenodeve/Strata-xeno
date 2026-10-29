@@ -11,6 +11,15 @@ from tools.igc.readout import SIZES
 
 
 class AttentionContract(unittest.TestCase):
+    def test_query_free_variant_cannot_recover_labels_from_final_query(self):
+        states,valid,positions,query=self.inputs()
+        model=InputReadout(use_final_query=False).eval()
+        original=model(states,valid,positions,query)
+        changed=model(states,valid,positions,query+1000)
+        torch.testing.assert_close(original,changed,rtol=0,atol=0)
+        original.square().mean().backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
+
     def test_context_stage_is_bound_to_its_own_record_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
@@ -44,6 +53,18 @@ class AttentionContract(unittest.TestCase):
         b=model(changed,valid,positions,query)
         self.assertEqual(a.shape,(2,sum(SIZES)))
         torch.testing.assert_close(a,b,rtol=0,atol=0)
+
+    def test_order_features_enter_attention_not_only_the_archive(self):
+        states,valid,positions,query=self.inputs()
+        valid=torch.ones_like(valid)
+        model=InputReadout().eval()
+        permutation=torch.tensor([1,0,2,3])
+        original=model(states,valid,positions,query)
+        reversed_states=model(states[:,permutation],valid,positions,query)
+        self.assertGreater(float((original-reversed_states).detach().abs().max()),1e-6)
+        # Reordering complete state/position pairs changes storage order only.
+        same_pairs=model(states[:,permutation],valid,positions[:,permutation],query)
+        torch.testing.assert_close(original,same_pairs,rtol=1e-5,atol=1e-6)
 
     def test_no_states_or_invalid_position_is_refused(self):
         states,valid,positions,query=self.inputs()
