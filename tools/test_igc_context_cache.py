@@ -9,6 +9,26 @@ from tools.igc.context_cache import decode_archive,ContextInputs,NpyRows
 
 
 class ContextCache(unittest.TestCase):
+    def test_file_selection_preserves_distinct_masks_streams_channels_and_duplicate_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'states.npy';writer=NpyRows.create(path,3)
+            base=np.arange(80*4*2560,dtype=np.float32).reshape(80,4,2560)
+            for row in range(3):writer[row]=base+row*1000000
+            writer.flush();writer.close()
+            reader=NpyRows(path)
+            try:
+                mask=np.zeros((3,80),dtype=np.bool_)
+                for row in range(3):mask[row,-row-2:]=True
+                selection=np.array([2,0,2],dtype=np.int64)
+                actual,valid,positions,query=ContextInputs(reader,mask,'cpu').batch(selection)
+                for i,row in enumerate(selection):
+                    np.testing.assert_array_equal(actual[i].numpy(),base+row*1000000)
+                np.testing.assert_array_equal(valid.numpy(),mask[selection])
+                np.testing.assert_array_equal(positions.numpy(),np.tile(np.arange(80),(3,1)))
+                self.assertFalse(torch.equal(valid[0],valid[1]));self.assertTrue(torch.equal(valid[0],valid[2]))
+                self.assertFalse(bool(query.any()))
+            finally:reader.close()
+
     def test_file_rows_use_bounded_io_and_refuse_truncation(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'states.npy'
