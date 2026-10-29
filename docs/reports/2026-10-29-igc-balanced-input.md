@@ -59,16 +59,47 @@ resource observation, not a serving latency or quality-benefit comparison.
 Full evidence: `igc-balanced-input-fit.log` and
 `igc-balanced-input-fit-01/{report,predictions}.json`.
 
-## Next controlled arm
+## Contextual arm outcome
 
 The [contextual protocol](../plans/2026-10-29-igc-contextual-input-experiment.md)
 keeps this exact data/order/seed/30-epoch budget and adds one trained contextual
 block before learned-query pooling. Its common initial weights are tested equal
-to this baseline. Its result is not known at this checkpoint. It is input-head
-development, not an additional layer in Gyro or a production host parser.
+to this baseline. It is input-head development, not an additional layer in Gyro
+or a production host parser.
+
+The 96,964-parameter arm completed in 247.296 seconds. Final epoch loss was
+0.1032965. Training tuples increased from 1,457 to 3,061 of 3,072. Development
+exact routed tuples were 47/96 (seen values/new templates), 60/96 (new values/
+seen templates), and 22/96 (both new). The two template-new axes still had
+16/32 false calls each. It fails the unchanged eligibility gate; the fresh
+evaluation64 is not consumed. This supports better accessibility to this recipe,
+not a guarantee that contextualization alone provides general invocation safety.
+
+Contextual weights SHA256:
+`3d92a397cc3a6cf550152288c9f02d18aa4ac002272cb49f39580c4de34c4f3e`.
+Evidence: `igc-contextual-input-fit.log` and
+`igc-contextual-input-fit-01/{report,predictions}.json`. All training runs and
+their different outcomes remain preserved rather than selecting a successful
+subset after evaluation.
 
 Thirteen current input/cache/corpus/diagnostic tests pass. Native cache indices
 are range-checked before gathering, padding stays masked, and the new block has
 finite gradients and excludes padded values. CUDA engine code is unchanged from
 the earlier build; HIP/SYCL and disabled-token parity remain stated debt.
 No output mapper, committed inference integration, deployment or new default.
+
+## Existing CUDA training runtime discovery
+
+The project's default Python has CPU-only Torch 2.14.0. A separate environment
+already installed on the machine has official PyTorch 2.11.0+cu130, NumPy 2.5.2
+and safetensors 0.8.0. A tiny deterministic F32 CUDA matrix forward/backward
+passed on the primary RTX 5060 Ti, with `sm_120` in its compiled architectures,
+TF32 disabled and 67,111,936 bytes peak allocated (69,206,016 reserved).
+No installation, download, ExLlama import, model load or serving change occurred.
+
+The first probe failed before CUDA because an optional `psutil` metadata import
+was absent. Removing that nonessential import allowed the same bounded probe to
+run. Red/green evidence is `igc-existing-torch-cuda.log` and
+`igc-existing-torch-cuda-green.log`. This establishes a working CUDA backend for
+task-owned neural-head training, not backward through Gyro's quantized engine,
+an output mapper or CPU/GPU numerical equivalence. Those checks remain separate.
