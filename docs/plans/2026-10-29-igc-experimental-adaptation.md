@@ -1,10 +1,10 @@
 # IGC สำหรับ Strata: แผนเส้นทางหลัก
 
 ติดตามร่วมกับ [PRD #276](https://github.com/xenodeve/Strata-xeno/issues/276)
-สถานะ: อ่านงานต้นฉบับและสำรวจ training seam แล้ว ยังไม่มี mapper ที่ฝึกกับ Gyro-M
+สถานะ: มี training-seam และ readout experiment แล้ว แต่ยังไม่มี mapper ที่ผ่าน learned-integration gates
 ผู้ใช้เลือก IGC เป็นทางหลักแล้ว compiled-Qwenputer เป็นทางรองสำหรับเทียบผล
 ผลทดสอบ P0–P8 เดิมยังเป็นประวัติของเส้นทางนั้น ไม่เปลี่ยนชื่อเป็นผลของ IGC
-PRD ปัจจุบันอยู่ที่ [IGC primary PRD R10](2026-10-29-igc-primary-prd.md)
+PRD ปัจจุบันอยู่ที่ [IGC primary PRD R11](2026-10-29-igc-primary-prd.md)
 
 ## สิ่งที่จะนำมาใช้
 
@@ -12,7 +12,15 @@ PRD ปัจจุบันอยู่ที่ [IGC primary PRD R10](2026-10-
 ให้ native executor ใน engine แล้วส่งผลกลับผ่าน activation โดยไม่ต้องสร้างข้อความเรียก tool
 เก็บ compiled-Qwenputer ไว้เป็นอีกเส้นทางสำหรับเทียบความถูกต้อง คุณภาพ และเวลาใช้งานจริง
 
-Research attribution และสถานะ source/license อยู่ใน PRD R10 ใช้แหล่งต้นฉบับและเขียน implementation เอง
+Research attribution และสถานะ source/license อยู่ใน PRD R11 ใช้แหล่งต้นฉบับและเขียน implementation เอง
+
+I0–I5 เป็นฐาน Native arithmetic ไม่ใช่เส้นชัยของโครงการทั้งหมด ติดตาม C1 programmable
+execution, C2 iterative debugging, C3 geometry, C4 model-addressable store และ A1 smaller-MoE /
+Universal ในตารางของ PRD พร้อม dependencies, oracle และสถานะของแต่ละงาน ก่อนวัดประโยชน์
+ต้องตรึง workload, baseline, rubric, uncertainty และ non-regression criteria ไว้ก่อนเห็นผล
+
+Arithmetic ABI แรกไม่รับ arbitrary code/pointers ส่วน C1 อาจเพิ่ม bounded interpreter/DSL/
+bytecode หรือ validated program reference ได้ภายใต้สัญญาของมัน ไม่เปิด unrestricted host execution
 
 ## แยกระดับหลักฐานให้ชัด
 

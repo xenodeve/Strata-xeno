@@ -1,7 +1,7 @@
-# PRD R10: IGC เป็นทางหลักของการคำนวณภายใน Strata
+# PRD R11: IGC เป็นทางหลักของการคำนวณภายใน Strata
 
 Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276)
-สถานะ: R10 หลังผู้ใช้เปลี่ยน priority วันที่ 29 ตุลาคม 2026; I0 feasibility กำลังทำ
+สถานะ: R11 เพิ่มเส้นทางตรวจเป้าหมายครบทุกด้าน; งานฝึก mapper และ integration ยังไม่ผ่าน gates
 
 ## Problem Statement
 
@@ -12,7 +12,7 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276)
 reasoning tokens และ incremental prefill ที่ลดลง, context ที่โตช้าลง, external tools และข้อมูล
 ที่ไม่จำเป็นน้อยลง, งานสำเร็จต่อ token มากขึ้น และเวลาถึงคำตอบที่ถูกลดลง รวมทั้งความสามารถ
 จาก upstream, งาน geometry/3D, model-accessible memory และการ optimize/offload จนใช้จริงได้
-เริ่มจาก Native บน Gyro-M แล้วจึงขยาย Universal รายละเอียด goal ledger ใน repo คือ
+เริ่มจาก Native บน Gyro-M แล้วจึงขยายไปโมเดล MoE ที่เล็กลงและ Universal พร้อม adapter และการตรวจของแต่ละโมเดล รายละเอียด goal ledger ใน repo คือ
 `docs/plans/2026-10-28-qwenputer-capability-roadmap.md` เป้าหมายทั้งหมดข้างต้นมีผลใน PRD นี้
 
 | เป้าหมายที่ต้องรักษา | การตรวจที่ต้องมี |
@@ -27,6 +27,7 @@ reasoning tokens และ incremental prefill ที่ลดลง, context �
 | Upstream capabilities | ทำ ledger ของสิ่งที่มีจริง/standalone/experimental รวม programmable execution และ model-accessible store; snapshots ไม่แทน filesystem |
 | Optimization/residency | แยก immutable weights, active state, scratch, shadow/cache และ cold snapshots; ทดลอง resident/on-demand/tiered support พร้อม cold/warm/tail และ expert hits |
 | Quantization hypothesis | เทียบ Gyro-M เดิมกับ IGC เป็น ablation หลัก; เทียบ higher-precision same-base เมื่อมีอยู่และใช้งานได้จริง โดยไม่ดาวน์โหลดเพิ่มเอง |
+| โมเดล MoE ที่เล็กลง | หลัง Native ให้ทำ adapter และตรวจ input/output fidelity, task quality, resources และ latency แยกตามโมเดล ไม่อนุมานจากผล Gyro-M |
 | Practical rollout | Correctness/quality, ordinary latency, resources, startup, cancellation และ repeated sessions ต้องผ่าน; trade-off เป็น opt-in |
 
 ## Solution
@@ -38,7 +39,7 @@ mapper เพื่อให้โมเดลตอบหรือทดลอ�
 เก็บ compiled-Qwenputer เป็นทางรองสำหรับเทียบ semantics, state, คุณภาพและ latency
 P0–P3 ผ่าน gates เดิม P4 มี autonomous exactness/lifecycle evidence แต่ WHILE instrumentation
 ยังเปิดอยู่ P5 มี state/grammar/transaction components แล้ว ยังไม่ใช่ real-model integration
-checkpoint ล่าสุดขององค์ประกอบที่ตรวจแล้วคือ `8bdad772` ไม่เดินงาน P5–P8 ขนาดใหญ่ก่อน IGC
+checkpoint ของ transaction components ทางรองคือ `8bdad772` ไม่เดินงาน P5–P8 ขนาดใหญ่ก่อน IGC
 
 แผนดำเนินงานใน repo คือ `docs/plans/2026-10-29-igc-experimental-adaptation.md`
 milestone แรกพิสูจน์ input/output training seam กับ Gyro-M ที่ใช้งานจริง โดยเฉพาะ forward fidelity
@@ -83,8 +84,10 @@ milestone แรกพิสูจน์ input/output training seam กับ Gy
 
 ### สัญญาของทางหลัก
 
-- Record มี operation/domain/sign/length/digits หรือ limbs, invocation ID และ logical position
-  ไม่รับ arbitrary pointers/code ผลมี status และ provenance ชัดเจน
+- Arithmetic ABI แรกมี operation/domain/sign/length/digits หรือ limbs, invocation ID และ logical
+  position ไม่รับ arbitrary pointers/code ผลมี status และ provenance ชัดเจน ข้อจำกัดนี้ใช้กับ ABI
+  แรก ไม่ปิดทาง bounded interpreter/DSL/bytecode หรือ validated program reference ใน C1
+  โดยต้องมีขอบเขตและการตรวจของตนเอง ไม่เปิด unrestricted host execution
 - Arithmetic ใช้ checked exact integers/rationals ตาม ABI ไม่ใช้ int64/FP32 แทนขอบเขต 62 digits
   ส่วนที่ยังไม่รองรับต้องแสดงสถานะ ไม่ clamp, wrap หรือเปลี่ยนไปใช้ host calculator
 - Learned mapping กับ arithmetic ตรวจแยกกัน Operand tuples ที่ mapper เลือกต้องมี held-out gate
@@ -100,7 +103,7 @@ milestone แรกพิสูจน์ input/output training seam กับ Gy
 
 ### ลำดับความสำคัญและการแทนข้อกำหนดเดิม
 
-R10 แทนสถาปัตยกรรมและ priority ของ R9/R2 เฉพาะทางหลัก ข้อบังคับว่าต้องคำนวณด้วย compiled
+R11 คงสถาปัตยกรรมและ priority ที่ R10 ใช้แทน R9/R2 เฉพาะทางหลัก ข้อบังคับว่าต้องคำนวณด้วย compiled
 FFN/GDN, ใช้ WHILE trace, ใช้ STQPUT01 และคืนผลด้วย Text replay ใช้กับทางรองเท่านั้น
 ทางหลักใช้ adapter/typed ABI และ latent output mapping ของตนเอง
 
@@ -131,6 +134,12 @@ full latent path, compiled-Qwenputer และ external tools ที่ใช้
 ตรึง corpus/seeds ก่อน held-out tests ตรวจภาษาไทย, distractors, quoted arithmetic,
 unsupported tasks และ final-answer/execution consistency ไม่ยืนยัน learned integration จาก typed tests
 
+ก่อนวัดประโยชน์ของแต่ละ experiment ต้องตรึง workload/splits/seeds, source/model/build/config,
+baseline ที่จะเทียบ, rubric ของคำตอบที่ถูก, การนับ tokens/เวลา และเกณฑ์ uncertainty/non-regression
+ไว้ก่อนเห็นผล Baseline external tools ใช้ cache ที่ถูกต้องตามปกติ แยก gate ว่า execute ถูกต้อง
+ออกจาก gate ว่า task สำเร็จมากขึ้นต่อ token หรือถึงคำตอบที่ถูกเร็วขึ้น ต้องผ่านการตรวจทั้งสองส่วน
+จึงอ้างประโยชน์นั้นได้ ไม่เปลี่ยน workload หรือเกณฑ์หลังวัดเพื่อให้ผลดูดี
+
 ## Phases
 
 I0 training/forward feasibility → I1 checked typed executor → I2 input/readiness mapper →
@@ -148,7 +157,25 @@ independent oracle tests ครบ Unsupported/overflow ต้องชัดเ
 I2 ฝึก input/readiness heads ด้วย cached activations จริงที่ตรึง identity/splits/seeds
 I3 ต้องแสดง output-mapper training และผลกับโมเดลจริง ส่วน I4 เพิ่ม repeated model-selected
 triggers และ accepted-state rollback จากฐาน fixed-anchor ที่ตรวจแล้ว I5 ตรวจคุณภาพและ latency
-ครบ workload ตาม hub รวม sandbox/code/geometry milestones ที่ประกาศเพิ่มภายหลัง
+ครบ workload ของฐาน arithmetic ตาม hub และใช้กรอบวัดเดียวกันตรวจ capability milestones ด้านล่าง
+
+### Capability milestones และความครบของโครงการ
+
+I0–I5 เป็นฐานการเชื่อมโมเดลกับ execution และการตรวจ arithmetic การผ่านฐานนี้ยังไม่ถือว่าปิด
+โครงการทั้งหมด ต้องติดตามแต่ละเป้าหมายกับ milestone และหลักฐานของมันต่อไป
+
+| Milestone | Dependencies และสิ่งที่ส่งมอบ | Oracle/เกณฑ์รับงาน | สถานะ |
+|---|---|---|---|
+| C0: ฐาน Native arithmetic | I0–I5; learned input/output, exact domains, ownership และ Hub evaluation | Tuple/exactness แยกจากผลกับโมเดล; G0–G9 และ matched task success/token/time | ทำอยู่; component arithmetic ผ่าน แต่ learned integration ยังไม่ผ่าน |
+| C1: Bounded programmable execution | I1 numeric contracts, I3/I4; interpreter/DSL/bytecode หรือ validated program reference ที่มี version, memory/step/output/time bounds, reset/rollback และ assertions/state feedback | Independent semantic oracle กับ held-out programs: branches, loops, state transitions, malformed/limit/cancel; oracle ไม่ใช้ compiler/runtime ตัวเดียวกันเป็นคำตอบอ้างอิงเพียงตัวเดียว | ยังไม่ implement |
+| C2: Iterative hypothesis/debug sandbox | C1, I4 และกรอบวัด I5; อ่าน source หรือใช้ canonical cached prefix แล้ววนสร้างสมมุติฐาน รัน ตรวจ และแก้ โดยคืน compact evidence | Held-out bug fixes/tests อิสระ, hypothesis discrimination, final-answer consistency; วัด attempts, calls, reasoning/prefill/context และเวลาถึง fix ที่ตรวจผ่าน เทียบ cached external-tool baseline | ยังไม่ implement |
+| C3: Geometry/3D verification | C1 และ numerical contracts ที่ระบุ; vectors/matrices/world transforms, clearance/overlap และ Three.js scene repair | Independent geometry oracle/tolerances; แยก AABB/OBB broad phase จาก mesh intersection ตรวจ transformed bounds และ moving samples; วัด violations ที่แก้แล้วและ task time | ยังไม่ implement |
+| C4: Model-addressable store | I3/I4 และ session identity; bounded put/append/get/list/delete พร้อม save/load ข้าม session แยกจาก conversation snapshots | Independent state-model oracle, content roundtrip, capacity/name/token boundaries, isolation, mismatch/partial restore; ตรวจ numerical ABI ของ store แยกจาก arithmetic | ยังไม่ implement; upstream ที่เกี่ยวข้องยังเป็น experimental |
+| A1: Smaller MoE / Universal adapters | หลัง C0 Native; model/tokenizer/layer/quantization bindings และ mapper ของโมเดลแต่ละตัว | Native forward fidelity, held-out mapping/result use, hard-off parity และ matched quality/resources/latency ต่อโมเดล เลือกใช้ไฟล์ที่มีหรือขออนุมัติการได้โมเดลใหม่ตามปกติ | ยังไม่เริ่ม |
+
+ทุก milestone ใช้ experiment contract ที่ตรึงก่อนวัด และรายงานทั้ง correct execution กับ task
+success ต่อ token/เวลา ไม่ใช้เพียงตัวอย่างที่ forced call สำเร็จเป็นหลักฐานว่าเป้าหมายทั้งหมดผ่าน
+Optimization/residency/offload และผลที่ไม่ถดถอยต้องตรวจซ้ำเมื่อเพิ่ม capability หรือ adapter
 
 ```mermaid
 flowchart TD
@@ -227,7 +254,8 @@ hypothesis/logic/debug sandbox; verified math/code outcomes; fewer reasoning and
 tokens; slower retained-context growth; fewer external tools and irrelevant feedback; more
 successful tasks per token; and less time to correct results. Upstream capability adaptation,
 geometry/3D, model-accessible memory and practical optimization/offload also remain goals.
-Native Gyro-M comes first, then Universal. Calculator success alone does not complete them.
+Native Gyro-M comes first, then smaller-MoE and Universal adaptation with per-model adapters
+and evaluation. Calculator success alone does not complete them.
 
 ## Solution and Priority
 
@@ -275,8 +303,10 @@ necessary Strata support within scope. Measured wins with costs remain opt-in; d
 requires adequate no-tradeoff coverage and the standing paired-measurement gates.
 
 Typed records carry version, invocation ID, logical position, operation/domain, signs, lengths
-and bounded digits/limbs. They contain no arbitrary pointers/code. Results carry explicit status
-and provenance. Arithmetic uses checked exact integer/rational semantics; int64/FP32 cannot
+and bounded digits/limbs. The initial arithmetic ABI contains no arbitrary pointers/code; this
+is not a permanent ban on a later bounded interpreter/DSL/bytecode or validated program reference
+in C1, with its own validation and bounds. Unrestricted host execution remains excluded. Results
+carry explicit status and provenance. Arithmetic uses checked exact integer/rational semantics; int64/FP32 cannot
 silently replace the 62-digit scope. Unsupported/range errors must not clamp, wrap or invoke a
 host calculator automatically. Mapper tuple selection and arithmetic exactness are separate gates.
 
@@ -295,7 +325,7 @@ adapter, ABI, model/tokenizer and layout. Do not serialize graph handles.
 
 ## Precedence over R9/R2
 
-R10 supersedes primary architecture and priority. Mandatory compiled FFN/GDN arithmetic,
+R11 retains R10's supersession of primary architecture and priority. Mandatory compiled FFN/GDN arithmetic,
 conditional WHILE traces, STQPUT01 and textual result replay now apply only to secondary Qwenputer.
 Primary IGC has its own adapter/typed ABI and latent output mapping. Retain exactness, bounded
 execution, accepted-prefix transactions, identity/isolation, history/session integrity, status,
@@ -325,6 +355,12 @@ full latent mapping, secondary compiled Qwenputer and external tools with normal
 caching. Freeze datasets/seeds before held-out evaluation. Include Thai, distractors, quoted
 arithmetic, unsupported tasks and final-answer/execution consistency. Typed-kernel or token-feature
 tests do not establish learned activation integration.
+
+Before each benefit experiment, freeze workload/splits/seeds, source/model/build/config, the
+baseline arms, correctness rubric, token/time accounting and uncertainty/non-regression criteria.
+Give external-tool baselines their normal valid caching. Correct execution and improved successful
+tasks per token or time to a correct answer are separate gates; both must support the corresponding
+claim. Do not change the workload or acceptance rules after observing results to manufacture a win.
 
 The complete goal ledger additionally requires: hypothesis/logic/debug experiments with compact
 assertions/counterexamples and held-out-test-verified fixes; separate formulation, execution and
@@ -356,8 +392,27 @@ rational, floor/modulo, gcd, powers and decimal contracts. I1 stays open until e
 has independent exact tests and explicit unsupported/overflow behavior. I2 trains input/readiness
 heads from identity-bound real activations with frozen splits/seeds. I3 trains and evaluates the
 output mapper on the real model. I4 extends the validated fixed anchor to repeated model-selected,
-committed triggers and rollback. I5 performs matched practical-use evaluation and the declared
-sandbox/code/geometry milestones. I1/preparatory I2 work cannot be counted as passing I3.
+committed triggers and rollback. I5 performs matched practical-use evaluation of the arithmetic
+foundation; its evaluation framework also applies to the capability milestones below.
+I1/preparatory I2 work cannot be counted as passing I3.
+
+### Capability milestones and project completion
+
+I0–I5 establish the model/execution and arithmetic foundation. Passing that foundation does not
+close the whole project. Track every goal against its own milestone and evidence.
+
+| Milestone | Dependencies and deliverables | Independent oracle / acceptance | Status |
+|---|---|---|---|
+| C0: Native arithmetic foundation | I0–I5; learned input/output, exact domains, ownership and Hub evaluation | Separate tuple/exactness from real-model outcomes; G0–G9 plus matched task success/token/time | In progress; component arithmetic passes, learned integration does not |
+| C1: Bounded programmable execution | I1 numeric contracts, I3/I4; versioned interpreter/DSL/bytecode or validated program reference, memory/step/output/time limits, reset/rollback and assertion/state feedback | Independent semantic oracle and held-out programs: branches, loops, state transitions, malformed/limit/cancel cases; the same compiler/runtime cannot be the sole reference | Not implemented |
+| C2: Iterative hypothesis/debug sandbox | C1, I4 and I5 measurement protocol; read source or reuse a canonical valid prefix, then hypothesize, execute, inspect compact feedback and revise | Independent held-out bug-fix tests, hypothesis discrimination, final-answer consistency; attempts, calls, reasoning/prefill/context and time to a verified fix versus a normally cached external-tool baseline | Not implemented |
+| C3: Geometry/3D verification | C1 and declared numerical contracts; vectors/matrices/world transforms, clearance/overlap and Three.js scene repairs | Independent geometry oracle/tolerances, AABB/OBB broad phase separate from mesh intersection, transformed bounds and moving samples; repaired violations and task time | Not implemented |
+| C4: Model-addressable store | I3/I4 and session identity; bounded put/append/get/list/delete and cross-session save/load, separate from conversation snapshots | Independent state-model oracle, content roundtrip, capacity/name/token boundaries, isolation and mismatch/partial restore; validate its numerical ABI separately from arithmetic | Not implemented; relevant upstream features are experimental |
+| A1: Smaller-MoE / Universal adapters | After C0 Native; per-model tokenizer/layer/quantization bindings and mappers | Native forward fidelity, held-out mapping/result use, hard-off parity and matched quality/resources/latency per model; existing model inputs or normally approved acquisition | Not started |
+
+Every milestone uses the frozen experiment contract and reports both correct execution and
+successful-task token/time outcomes. A successful forced call does not satisfy the whole goal set.
+Recheck optimization/residency/offload and non-regression when adding a capability or adapter.
 
 ## Scope and Current Feasibility
 
