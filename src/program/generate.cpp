@@ -3503,7 +3503,8 @@ int main(int argc, char** argv) {
                 || !igc_output->bind(std::filesystem::path(o.pack)/"tokenizer",model_paths,err)) {
             std::fprintf(stderr,"strata IGC diagnostic: %s\n",err.c_str());return 2;
         }
-        std::fprintf(stderr,"strata IGC diagnostic: %zu controlled prefixes; oracle inputs, not learned I2\n",igc_output->entries());
+        std::fprintf(stderr,"strata IGC diagnostic: %zu controlled prefixes; %s; oracle inputs, not learned I2\n",igc_output->entries(),
+                     igc_output->runtime_requests()?"runtime exact GPU requests":"stored checked results (output-only)");
     }
 #endif
     if (!o.native_head_gguf.empty() && !o.stream_token) {

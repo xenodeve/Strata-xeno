@@ -14,6 +14,7 @@ int main(int argc,char** argv)try{
         std::vector<int64_t> prefix(ids.begin(),ids.end());
         if(!diagnostic.select(prefix,selected,matched,error))throw std::runtime_error(error);
     }
-    std::cout<<"{\"entries\":"<<diagnostic.entries()<<",\"matched\":"<<(matched?"true":"false")<<"}\n";
+    std::cout<<"{\"entries\":"<<diagnostic.entries()<<",\"matched\":"<<(matched?"true":"false")
+             <<",\"runtime_requests\":"<<(diagnostic.runtime_requests()?"true":"false")<<"}\n";
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 2;}

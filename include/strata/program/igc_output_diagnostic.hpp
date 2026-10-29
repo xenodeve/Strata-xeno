@@ -15,17 +15,24 @@ namespace strata::program {
 // Controlled-input I3 experiment only. The host matches a complete prefix hash;
 // it never parses arithmetic or computes a result. No learned I2 claim.
 class IgcOutputDiagnostic {
-    struct Record {strata::igc::adapter::Digest prefix{};strata::igc::ExactResult result{};};
+    struct Record {strata::igc::adapter::Digest prefix{};strata::igc::ExactResult result{};strata::igc::ExactRequest request{};};
     strata::igc::adapter::Artifact artifact_;
     strata::igc::adapter::Binding binding_{};
     strata::qwenputer::VerifiedInputs inputs_;
     std::vector<Record> records_;
     std::unique_ptr<strata::igc::OutputMapper> mapper_;
     strata::igc::ExactResult* results_=nullptr;
+    strata::igc::ExactRequest* request_=nullptr;
     uint64_t *ids_=nullptr,*anchors_=nullptr;
     uint32_t* status_=nullptr;
     cudaStream_t stream_=nullptr;
     bool matched_=false;
+    bool request_mode_=false;
+    static bool canonical(const strata::igc::Integer& v) {
+        if(v.length<1 || v.length>62 || v.negative>1)return false;
+        for(int j=0;j<62;++j)if(v.digits[j]>9 || (j>=v.length && v.digits[j]))return false;
+        return !(v.length>1 && !v.digits[v.length-1]) && !(v.length==1 && !v.digits[0] && v.negative);
+    }
     bool cuda_ok(cudaError_t value,std::string& error) {
         if(value==cudaSuccess)return true;error=cudaGetErrorString(value);return false;
     }
@@ -35,6 +42,7 @@ class IgcOutputDiagnostic {
         mapper_=std::make_unique<strata::igc::OutputMapper>();
         if(!mapper_->load(artifact_,stream,error))return false;
         if(!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&results_),64*sizeof(*results_)),error)
+                || !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&request_),sizeof(*request_)),error)
                 || !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&ids_),64*sizeof(*ids_)),error)
                 || !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&anchors_),64*sizeof(*anchors_)),error)
                 || !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&status_),64*sizeof(*status_)),error))return false;
@@ -48,22 +56,27 @@ public:
     bool load_host(const std::filesystem::path& artifact,const std::filesystem::path& fixture,std::string& error)try{
         if(!records_.empty() || !std::filesystem::is_regular_file(std::filesystem::symlink_status(fixture))){error="igc fixture file";return false;}
         const auto size=std::filesystem::file_size(fixture);
-        if(size<228 || size>108+64*120){error="igc fixture bytes";return false;}
+        if(size<228 || size>108+64*192){error="igc fixture bytes";return false;}
         std::vector<uint8_t> raw(static_cast<std::size_t>(size));std::ifstream file(fixture,std::ios::binary);
         file.read(reinterpret_cast<char*>(raw.data()),static_cast<std::streamsize>(raw.size()));
         uint32_t count=0;std::memcpy(&count,raw.data()+8,4);
-        if(!file || file.peek()!=std::char_traits<char>::eof() || std::memcmp(raw.data(),"IGCOFX01",8)
-                || !count || count>64 || size!=108+uint64_t(count)*120){error="igc fixture header";return false;}
+        request_mode_=std::memcmp(raw.data(),"IGCOFX02",8)==0;
+        const uint32_t stride=request_mode_?192:120;
+        if(!file || file.peek()!=std::char_traits<char>::eof() || (!request_mode_ && std::memcmp(raw.data(),"IGCOFX01",8))
+                || !count || count>64 || size!=108+uint64_t(count)*stride){error="igc fixture header";return false;}
         std::copy_n(raw.data()+12,32,binding_.model.begin());std::copy_n(raw.data()+44,32,binding_.tokenizer.begin());std::copy_n(raw.data()+76,32,binding_.file.begin());
         std::set<strata::igc::adapter::Digest> seen;
         for(uint32_t i=0;i<count;++i){
-            Record record;std::memcpy(record.prefix.data(),raw.data()+108+i*120,32);
-            std::memcpy(&record.result,raw.data()+140+i*120,88);
-            const auto& r=record.result;const auto& v=r.value;
-            bool valid=r.version==1 && r.status==strata::igc::Status::Success && r.invocation && r.position<262144
-                && v.length>=1 && v.length<=62 && v.negative<=1;
-            for(int j=0;j<62;++j)valid=valid && v.digits[j]<=9 && (j<v.length || !v.digits[j]);
-            if(valid)valid=!(v.length>1 && !v.digits[v.length-1]) && !(v.length==1 && !v.digits[0] && v.negative);
+            Record record;std::memcpy(record.prefix.data(),raw.data()+108+i*stride,32);bool valid=false;
+            if(request_mode_){
+                std::memcpy(&record.request,raw.data()+140+i*stride,160);const auto& r=record.request;
+                valid=r.version==1 && r.domain==1 && static_cast<uint32_t>(r.operation)>=1 && static_cast<uint32_t>(r.operation)<=3
+                    && !r.reserved && r.invocation && r.position<262144 && canonical(r.lhs) && canonical(r.rhs);
+                record.result.status=strata::igc::Status::Fault;record.result.invocation=r.invocation;record.result.position=r.position;
+            }else{
+                std::memcpy(&record.result,raw.data()+140+i*stride,88);const auto& r=record.result;
+                valid=r.version==1 && r.status==strata::igc::Status::Success && r.invocation && r.position<262144 && canonical(r.value);
+            }
             if(!valid || !seen.insert(record.prefix).second){error="igc fixture canonical result/duplicate";return false;}
             records_.push_back(record);
         }
@@ -75,6 +88,7 @@ public:
         return inputs_.bind(expected,tokenizer,models,error);
     }
     std::size_t entries()const{return records_.size();}
+    bool runtime_requests()const{return request_mode_;}
     strata::core::Verifier::DiagnosticHeadTransform hook(){
         return {this,
             [](void* self,void* stream,std::string& error){return static_cast<IgcOutputDiagnostic*>(self)->prepare(stream,error);},
@@ -83,7 +97,7 @@ public:
                 return p->mapper_->run(mixed,p->results_,p->ids_,p->anchors_,p->status_,static_cast<uint32_t>(count),stream,true,error);},
             [](void* self){static_cast<IgcOutputDiagnostic*>(self)->release();}};
     }
-    bool select(const std::vector<int64_t>& prefix,strata::igc::ExactResult& chosen,bool& matched,std::string& error)const{
+    bool select(const std::vector<int64_t>& prefix,strata::igc::ExactResult& chosen,bool& matched,std::string& error,strata::igc::ExactRequest* request=nullptr)const{
         chosen={};chosen.status=strata::igc::Status::Fault;chosen.invocation=1;matched=false;
         if(!prefix.empty()){
             if(prefix.size()>262144){error="igc diagnostic prefix bound";return false;}
@@ -92,20 +106,25 @@ public:
             auto hash=strata::qwenputer::sha256({reinterpret_cast<const uint8_t*>(values.data()),values.size()*4});
             for(const auto& record:records_)if(record.prefix==hash){
                 if(record.result.position!=prefix.size()-1){error="igc fixture prefix/anchor mismatch";return false;}
-                chosen=record.result;matched=true;break;
+                chosen=record.result;if(request)*request=record.request;matched=true;break;
             }
         }
         return true;
     }
     bool stage(const std::vector<int64_t>& prefix,std::string& error){
         if(!stream_ || !results_ || !ids_ || !anchors_){error="igc diagnostic not prepared";return false;}
-        strata::igc::ExactResult chosen;
-        if(!select(prefix,chosen,matched_,error))return false;
+        strata::igc::ExactResult chosen;strata::igc::ExactRequest request;
+        if(!select(prefix,chosen,matched_,error,&request))return false;
         std::array<strata::igc::ExactResult,64> results;results.fill(chosen);
         std::array<uint64_t,64> ids,anchors;ids.fill(chosen.invocation);anchors.fill(chosen.position);
         // Diagnostic request-entry copies only, never a per-token answer bridge.
-        return cuda_ok(cudaMemcpyAsync(results_,results.data(),sizeof(results),cudaMemcpyHostToDevice,stream_),error)
-            && cuda_ok(cudaMemcpyAsync(ids_,ids.data(),sizeof(ids),cudaMemcpyHostToDevice,stream_),error)
+        bool result_ready=false;
+        if(request_mode_ && matched_){
+            result_ready=cuda_ok(cudaMemcpyAsync(request_,&request,sizeof(request),cudaMemcpyHostToDevice,stream_),error)
+                && strata::igc::execute_exact(request_,results_,1,stream_,error)
+                && strata::igc::broadcast_exact_result(results_,64,stream_,error);
+        }else result_ready=cuda_ok(cudaMemcpyAsync(results_,results.data(),sizeof(results),cudaMemcpyHostToDevice,stream_),error);
+        return result_ready && cuda_ok(cudaMemcpyAsync(ids_,ids.data(),sizeof(ids),cudaMemcpyHostToDevice,stream_),error)
             && cuda_ok(cudaMemcpyAsync(anchors_,anchors.data(),sizeof(anchors),cudaMemcpyHostToDevice,stream_),error)
             && cuda_ok(cudaStreamSynchronize(stream_),error);
     }
@@ -120,8 +139,8 @@ public:
     void release(){
         if(stream_)cudaStreamSynchronize(stream_);
         mapper_.reset();
-        if(results_)cudaFree(results_);if(ids_)cudaFree(ids_);if(anchors_)cudaFree(anchors_);if(status_)cudaFree(status_);
-        results_=nullptr;ids_=nullptr;anchors_=nullptr;status_=nullptr;stream_=nullptr;
+        if(results_)cudaFree(results_);if(request_)cudaFree(request_);if(ids_)cudaFree(ids_);if(anchors_)cudaFree(anchors_);if(status_)cudaFree(status_);
+        results_=nullptr;request_=nullptr;ids_=nullptr;anchors_=nullptr;status_=nullptr;stream_=nullptr;
     }
 };
 } // namespace strata::program

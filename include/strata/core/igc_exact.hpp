@@ -39,4 +39,7 @@ static_assert(std::is_trivially_copyable_v<ExactRequest> && std::is_trivially_co
 // Each request has a compile-time bounded amount of work, independent of its data.
 bool execute_exact(const ExactRequest* input, ExactResult* output, uint32_t count,
                    void* stream, std::string& error);
+// Copy one already completed result at output[0] to rows1..count-1 on the same
+// explicit stream. Row0 is never written, so there is no read/write alias race.
+bool broadcast_exact_result(ExactResult* output,uint32_t count,void* stream,std::string& error);
 } // namespace strata::igc

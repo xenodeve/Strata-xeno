@@ -32,6 +32,28 @@ def final_integer(text):
     return int(numbers[0]) if len(numbers)==1 else None
 
 
+def interpreted_final(text,expression):
+    """Offline result extraction/consistency checks, never arithmetic evaluation."""
+    result=dict(value=None,equation_consistent=True,contradictory=False)
+    if '</think>' not in text:return result
+    final=text.rsplit('</think>',1)[1].replace('<|im_end|>','').replace('**','').replace('`','').strip()
+    values=[]
+    def normalized(value):return re.sub(r'[\s()]','',value).replace('×','*').replace('−','-')
+    for line in final.splitlines():
+        line=line.strip().replace('−','-')
+        bare=re.fullmatch(r'([-+]?[0-9]+)\s*[.!。]?',line)
+        statement=re.search(r'(?:the\s+)?(?:result|answer)\s*(?:is|equals|[:=])\s*([-+]?[0-9]+)\s*[.!。]?$',line,re.I)
+        thai=re.search(r'(?:ผลลัพธ์|คำตอบ)(?:ที่ได้)?\s*(?:คือ|เป็น|เท่ากับ|[:=])\s*([-+]?[0-9]+)\s*[.!。]?$',line)
+        equation=re.fullmatch(r'([0-9\s()+*×\-]+)=\s*([-+]?[0-9]+)\s*[.!。]?',line)
+        if equation:
+            result['equation_consistent'] &= expression is not None and normalized(equation.group(1))==normalized(expression)
+            values.append(int(equation.group(2)))
+        elif bare or statement or thai:values.append(int((bare or statement or thai).group(1)))
+    unique=set(values);result['contradictory']=len(unique)>1
+    if len(unique)==1:result['value']=values[0]
+    return result
+
+
 def run(profile,server,candidate,baseline,sources,capture,reference,pack,capture_protocol,protocol,artifact,fixture,output,smoke=False,parity_only=False):
     validate_launcher_env(os.environ)
     if any((p.info['name'] or '').lower().startswith('strata') for p in psutil.process_iter(['name'])):
@@ -41,13 +63,13 @@ def run(profile,server,candidate,baseline,sources,capture,reference,pack,capture
         raise RuntimeError('diagnostic system-headroom admission; not a Hub memory cap')
     data=load_dataset(capture,reference,pack,sources,capture_protocol)
     tokenizer=data['tokenizer'];rows={r['id']:r for r in data['rows']}
-    cases=[dict(id=r['sample'],ids=r['ids'],expected=rows[r['sample']]['answer'],split=r['split'],matched=True)
+    cases=[dict(id=r['sample'],ids=r['ids'],expected=rows[r['sample']]['answer'],expression=rows[r['sample']]['expression'],split=r['split'],matched=True)
            for r in data['records'] if r['output_offset']==0]
     if smoke:cases=[r for r in cases if r['id'] in ('output-development-op2-00','output-development-op3-01')]
     prefix,suffix=wrapped_prefix(reference,tokenizer)
     for i,prompt in enumerate(('Reply with only the word READY.','ตอบเพียงคำว่า พร้อม')):
         cases.append(dict(id=f'unmatched-{i}',ids=tokenizer.encode((prefix+prompt.encode('utf-8')+suffix).decode('utf-8')),
-                          expected=None,split='unmatched',matched=False))
+                          expected=None,expression=None,split='unmatched',matched=False))
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
     if cfg.get('replicas') or cfg.get('cjk_guard'):raise ValueError('unsupported diagnostic profile combination')
     vision_cfg=({key:(os.path.abspath(os.path.join(cfg.get('cwd') or '.',value))
@@ -116,9 +138,11 @@ def run(profile,server,candidate,baseline,sources,capture,reference,pack,capture
                     try:generated=[int(t) for t in engine.generate(case['ids'],96,{'temperature':0},cancel) if t is not None]
                     finally:active[0]=None
                     if failure or not engine.alive():raise RuntimeError('controlled engine failed')
-                    text=tokenizer.decode_bytes(generated).decode('utf-8',errors='replace');actual=final_integer(text)
+                    text=tokenizer.decode_bytes(generated).decode('utf-8',errors='replace')
+                    strict=final_integer(text);semantic=interpreted_final(text,case['expression']);actual=semantic['value']
                     records.append(dict(id=case['id'],split=case['split'],matched=case['matched'],expected=case['expected'],
-                        actual=actual,numeric_match=actual==case['expected'] if case['expected'] is not None else None,
+                        actual=actual,final_consistency=semantic,single_integer_format=strict,
+                        numeric_match=(actual==case['expected'] and semantic['equation_consistent'] and not semantic['contradictory']) if case['expected'] is not None else None,
                         tokens=generated,text=text,done=engine.last))
                     (folder/'records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
                     print('I3 generation',arm,case['id'],'expected',case['expected'],'actual',actual,'finish',engine.last.get('finish'),flush=True)
@@ -142,9 +166,12 @@ def run(profile,server,candidate,baseline,sources,capture,reference,pack,capture
             comparisons[name]={c['id']:by_id[a][c['id']]['tokens']==by_id[b][c['id']]['tokens'] for c in cases}
     report=dict(run_completed=True,kind='controlled native output generation; no learned I2 or performance claim',
         smoke=smoke,cases=len(cases),off_raw_token_parity=off_equal,unmatched_raw_token_parity=unmatched_equal,
-        parity_only=parity_only,repeat_comparisons=comparisons,final_answer_rubric='single-integer final format, not mathematical correctness',
+        parity_only=parity_only,repeat_comparisons=comparisons,
+        fixture_version=fixture.read_bytes()[:8].decode('ascii'),
+        final_answer_rubric='explicit result/bare integer; equations match known expression; single-integer format separate; no arithmetic evaluated',
         same_executable_control=before[str(candidate)]==before[str(baseline)],
         arms={arm:{split:dict(n=len(selected),numeric_correct=sum(r['numeric_match'] is True for r in selected),
+            single_integer_format_matches=sum(r['expected'] is not None and r['single_integer_format']==r['expected'] for r in selected),
             limit=sum(r['done'].get('finish')=='length' for r in selected))
             for split in dict.fromkeys(r['split'] for r in rows)
             for selected in [[r for r in rows if r['split']==split]]} for arm,rows in all_records.items()},

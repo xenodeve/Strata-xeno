@@ -93,6 +93,10 @@ __global__ void execute_kernel(const ExactRequest* input, ExactResult* output, u
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) output[i] = calculate(input[i]);
 }
+__global__ void broadcast_kernel(ExactResult* output,uint32_t count) {
+    const uint32_t row=blockIdx.x*blockDim.x+threadIdx.x+1;
+    if(row<count)output[row]=output[0];
+}
 }
 
 bool execute_exact(const ExactRequest* input, ExactResult* output, uint32_t count,
@@ -108,5 +112,15 @@ bool execute_exact(const ExactRequest* input, ExactResult* output, uint32_t coun
     if (status != cudaSuccess) { error = cudaGetErrorString(status); return false; }
     error.clear();
     return true;
+}
+bool broadcast_exact_result(ExactResult* output,uint32_t count,void* stream,std::string& error) {
+    const auto created_stream=static_cast<cudaStream_t>(stream);
+    if(!output || !count || count>kMaxBatch || !created_stream || created_stream==cudaStreamLegacy || created_stream==cudaStreamPerThread) {
+        error="exact_broadcast_arguments";return false;
+    }
+    if(count>1)broadcast_kernel<<<1,64,0,created_stream>>>(output,count);
+    const auto status=cudaPeekAtLastError();
+    if(status!=cudaSuccess){error=cudaGetErrorString(status);return false;}
+    error.clear();return true;
 }
 } // namespace strata::igc

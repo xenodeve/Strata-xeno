@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 import numpy as np
-from tools.igc.output_fixture import pack_fixture
+from tools.igc.output_fixture import pack_fixture,pack_request_fixture
 
 
 @unittest.skipUnless(os.environ.get('IGC_FIXTURE_PROBE'),'native fixture validator not selected')
@@ -36,6 +36,13 @@ class NativeFixture(unittest.TestCase):
             for bad in (raw[:-1],raw+b'x',anchor,malformed,duplicate,wrong_artifact):
                 outcome=run(bad);self.assertEqual(outcome.returncode,2,outcome.stdout.decode());self.assertFalse(outcome.stdout)
             prefix.write_bytes(np.array([1,-1,3],dtype='<i4').tobytes());self.assertEqual(run(raw).returncode,2)
+            prefix.write_bytes(np.array([1,2,3],dtype='<i4').tobytes())
+            requests=pack_request_fixture([{**record,'sample':'a'}],{'a':dict(operation=3,lhs=93,rhs=-3)},
+                bytes.fromhex(os.environ['IGC_MODEL_SHA256']),bytes.fromhex(os.environ['IGC_TOKENIZER_SHA256']),digest)
+            actual=run(requests);self.assertEqual(actual.returncode,0,actual.stderr.decode());self.assertTrue(json.loads(actual.stdout)['runtime_requests'])
+            for offset,fmt,value in [(144,'<I',2),(148,'<I',4),(152,'<I',1),(156,'<Q',0),(164,'<Q',3),(174,'B',10)]:
+                bad=bytearray(requests);struct.pack_into(fmt,bad,offset,value)
+                self.assertEqual(run(bad).returncode,2)
 
 
 if __name__=='__main__':unittest.main()
