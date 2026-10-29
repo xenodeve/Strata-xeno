@@ -71,9 +71,17 @@ struct Artifact {
     std::vector<std::int32_t> keep;
     std::vector<std::array<std::uint8_t, 16>> text_rows;
     std::vector<std::uint32_t> text_lengths;
+    // v1.1 CPU-only lexicon. These arrays are never uploaded by the executor.
+    std::vector<std::uint32_t> text_offsets;
+    std::vector<std::uint8_t> text_bytes;
     std::vector<std::uint8_t> text_types;
     std::vector<std::int32_t> printable;
     std::vector<std::int32_t> printable_index; // derived, never trusted from the file
+    bool has_full_text() const { return text_offsets.size() == text_lengths.size() + 1; }
+    std::span<const std::uint8_t> token_bytes(std::uint32_t id) const {
+        if (!has_full_text() || id >= text_lengths.size()) return {};
+        return std::span(text_bytes).subspan(text_offsets[id], text_lengths[id]);
+    }
 };
 
 Digest sha256(std::span<const std::uint8_t> bytes);

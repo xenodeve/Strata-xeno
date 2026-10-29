@@ -14,7 +14,9 @@ def align64(n):
     return (n + 63) & ~63
 
 
-def encode_sections(sections):
+def encode_sections(sections, minor=0):
+    if type(minor) is not int or minor not in (0, 1):
+        raise NativeInputError('artifact_version')
     if not 1 <= len(sections) <= MAX_SECTIONS:
         raise NativeInputError('section_count')
     header_bytes = align64(HEADER.size + len(sections) * SECTION.size)
@@ -32,7 +34,7 @@ def encode_sections(sections):
         body.extend(data)
         body.extend(bytes(align64(len(data)) - len(data)))
         offset = HEADER.size + len(body)
-    return HEADER.pack(b'STQPUT01', 1, 0, 0x01020304, len(sections), header_bytes,
+    return HEADER.pack(b'STQPUT01', 1, minor, 0x01020304, len(sections), header_bytes,
                        HEADER.size + len(body), hashlib.sha256(body).digest()) + body
 
 
@@ -42,7 +44,7 @@ def decode_sections(blob, max_bytes=256 * 1024 * 1024):
     magic, major, minor, endian, count, hbytes, total, digest = HEADER.unpack_from(blob)
     if magic != b'STQPUT01':
         raise NativeInputError('artifact_magic')
-    if (major, minor) != (1, 0):
+    if major != 1 or minor not in (0, 1):
         raise NativeInputError('artifact_version')
     if endian != 0x01020304:
         raise NativeInputError('artifact_endian')

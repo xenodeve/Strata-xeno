@@ -127,7 +127,8 @@ bool parse_artifact(std::span<const std::uint8_t> bytes, const Binding& binding,
     if constexpr (std::endian::native != std::endian::little) return fail("host_endian");
     if (bytes.size() < 64 || bytes.size() > std::min<std::uint64_t>(limits.file_bytes, 256ull << 20)) return fail("artifact_size");
     if (std::memcmp(bytes.data(), "STQPUT01", 8)) return fail("artifact_magic");
-    if (scalar<std::uint16_t>(bytes, 8) != 1 || scalar<std::uint16_t>(bytes, 10) != 0) return fail("artifact_version");
+    const auto minor = scalar<std::uint16_t>(bytes, 10);
+    if (scalar<std::uint16_t>(bytes, 8) != 1 || minor > 1) return fail("artifact_version");
     if (scalar<std::uint32_t>(bytes, 12) != 0x01020304) return fail("artifact_endian");
     const auto count = scalar<std::uint32_t>(bytes, 16), hbytes = scalar<std::uint32_t>(bytes, 20);
     if (scalar<std::uint64_t>(bytes, 24) != bytes.size() || bytes.size() % 64) return fail("artifact_size");
@@ -167,11 +168,12 @@ bool parse_artifact(std::span<const std::uint8_t> bytes, const Binding& binding,
         previous = name;
     }
     if (end != bytes.size()) return fail("section_bounds");
-    const std::map<std::string, std::uint32_t> schema{
+    std::map<std::string, std::uint32_t> schema{
         {"chans",20},{"config",64},{"dims",8},{"exprs",8},{"features",16},
         {"ffn_terms",12},{"ffns",24},{"head_levels",1},{"heads",88},{"identity",32},
         {"init",520},{"keep",4},{"maps",8},{"meta",1},{"outputs",12},
         {"printable",4},{"terms",8},{"text_lens",4},{"text_rows",16},{"text_types",1}};
+    if (minor == 1) { schema.emplace("text_offsets", 4); schema.emplace("text_bytes", 1); }
     if (sections.size() != schema.size()) return fail("artifact_sections");
     for (const auto& [name, stride] : schema) {
         const auto it = sections.find(name);
@@ -223,6 +225,28 @@ bool parse_artifact(std::span<const std::uint8_t> bytes, const Binding& binding,
     if (a.dims.size() != c[0] || a.heads.size() != c[3] || a.ffns.size() != c[4]
         || a.head_levels.size() != c[3]) return fail("circuit_counts");
     if (a.text_rows.size() != c[2] || a.text_lengths.size() != c[2] || a.text_types.size() != c[2]) return fail("text_geometry");
+    std::uint64_t cpu_lexicon_bytes = 0;
+    if (minor == 1) {
+        const auto& offsets = sections.at("text_offsets");
+        const auto& raw = sections.at("text_bytes");
+        cpu_lexicon_bytes = offsets.data.size() + raw.data.size();
+        if (offsets.data.size() != (static_cast<std::uint64_t>(c[2]) + 1) * 4
+                || cpu_lexicon_bytes > 64ull * 1024 * 1024) return fail("text_lexicon_shape");
+        // Validate in the bounded file view before allocating or exposing spans.
+        if (scalar<std::uint32_t>(offsets.data, 0) != 0
+                || scalar<std::uint32_t>(offsets.data, c[2] * 4ull) != raw.data.size())
+            return fail("text_lexicon_offsets");
+        for (std::size_t q = 0; q < c[2]; ++q) {
+            const auto begin = scalar<std::uint32_t>(offsets.data, q * 4);
+            const auto end_offset = scalar<std::uint32_t>(offsets.data, (q + 1) * 4);
+            if (begin > end_offset || end_offset > raw.data.size() || end_offset - begin != a.text_lengths[q])
+                return fail("text_lexicon_offsets");
+            const auto n = std::min<std::size_t>(16, end_offset - begin);
+            if (std::memcmp(a.text_rows[q].data(), raw.data.data() + begin, n)) return fail("text_lexicon_projection");
+        }
+        a.text_offsets = copy<std::uint32_t>(offsets);
+        a.text_bytes = copy<std::uint8_t>(raw);
+    }
     if (a.dims[0].kind != 0 || a.dims[0].level != 0) return fail("dimension_kind_level");
     for (const auto& d : a.dims) if (d.kind < 0 || d.kind > 3 || d.level < 0 || d.level > 128) return fail("dimension_kind_level");
     std::map<std::int32_t, Feature> features;
@@ -354,7 +378,7 @@ bool parse_artifact(std::span<const std::uint8_t> bytes, const Binding& binding,
     const auto meta = sections.at("meta").data;
     if (meta.empty() || meta.size() > 4 * 1024 * 1024) return fail("metadata_size");
     for (auto byte : meta) if (byte >= 127 || (byte < 32 && byte != 9 && byte != 10 && byte != 13)) return fail("metadata_ascii");
-    plan.weights = payload_bytes + static_cast<std::uint64_t>(c[2]) * 4;
+    plan.weights = payload_bytes - cpu_lexicon_bytes + static_cast<std::uint64_t>(c[2]) * 4;
     plan.state_each = static_cast<std::uint64_t>(c[6]) * 4;
     plan.lag_each = head_sublayers.size() * 3ull * c[0] * 4;
     plan.scratch = static_cast<std::uint64_t>(c[0]) * 8 + a.expressions.size() * 4ull

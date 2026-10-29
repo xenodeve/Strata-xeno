@@ -1,6 +1,6 @@
 # Native Qwenputer P5: ownership and state foundations
 
-Status: partial implementation. Decoder hooks, native-call grammar and real-model
+Status: partial implementation. Decoder hooks and real-model
 ownership/freeze/replay gates are not implemented yet. P4 functional checkpoint
 is `10d848eb`; its WHILE instrumentation coverage remains open.
 
@@ -37,12 +37,28 @@ selected tokenizer has 6,882 tokens longer than 16 bytes; 38 of those contain a
 newline, and token 63434 contains 32 tildes. Inspecting only a projection could
 miscount a fence or miss a line boundary.
 
-The next planned adaptation is a backward-compatible STQPUT01 minor 1 extension
+The implemented adaptation is a backward-compatible STQPUT01 minor 1 extension
 with complete CPU-only token bytes and offsets, derived from the bound tokenizer.
 All numeric circuit sections and the 1.0 runtime remain supported. The additional
-raw data is about 2.84 MB, with no GPU upload. This extension is not implemented yet;
+raw data is 2,839,441 bytes, with no GPU upload. The data-only upgrade retains every
+numeric section byte and records a new digest. Python container/lexicon and C++
+loader/mutant controls pass 13 tests. Both artifact versions have equal derived
+device-buffer budgets; the host estimate increases to include the new tables.
+The first C++ RED attempt had a missing binding fixture and is not a valid RED;
+the corrected fixture then failed at `artifact_version` before implementation.
+The earlier v1 artifact and raw evidence remain unchanged. This extension
 it satisfies the existing non-execution-of-quoted/history-text contract rather
 than changing the approved execution architecture.
+
+The new copyable `CallParser` performs no arithmetic. It restricts capture to
+live enrolled assistant text, distinguishes other tool names, rejects malformed
+calc framing/nesting/width/NUL/count errors, and suppresses entry in history,
+quotes, inline/fenced/indented code, blockquotes and after an authoritative stop
+token. It uses complete bytes, including the actual 32-tilde token. An initial
+fence fixture incorrectly placed a close in the middle of a line; corrected tests
+now check both a proper standalone close and a non-closing mid-line run. Added
+boundary tests exposed indented-code entry and malformed multi-newline framing;
+the same tests pass after their fixes. Decoder integration remains unimplemented.
 
 ## Tracker publication blocker
 
@@ -53,3 +69,34 @@ because the earlier mandatory form was unresolved and this connector was treated
 as a reroute. No alternate write or retry followed. The MCP Apps side panel exposed
 no form; no approval ID or form URL is available. The user was asked to resolve or
 cancel the stale form while implementation continues. No remote update is claimed.
+
+## Final component verification for the lexicon checkpoint
+
+The selected Python discovery run completed 99 tests: 95 passed and 4 skipped
+in 30.879 seconds. The skips are the two unselected P0 probe tests and the
+previously documented symbolic-link/junction environment controls. The native
+CPU grammar test also passes using the actual bound tokenizer artifact, including
+its complete 32-tilde token. CUDA rebuilt successfully; HIP/SYCL were not built
+on this executor and remain explicit backend validation debt.
+
+A prefix-only native CUDA smoke with artifact 1.1 computes `17*23` as `391`,
+Success with 1,543 evaluations. It uses 31,804,988 owned device-buffer bytes,
+equal to the previous standalone buffer count. Its artifact SHA256 is
+`bc0db822ca05ee50a92b72adaeaf4a8c61d4a44b78846a091a2045c2b7b75152`;
+the retained CLI SHA256 is
+`d2503ac28469d1b97c82675fd01907b173216950b29d5a59f70cb777e46064c7`.
+This is autonomous standalone circuit evidence, not model integration, an ABBA
+measurement or proof of practical performance. The new CPU lexicon artifact and
+CLI have separate identities from the frozen P4 held-out evidence.
+
+Manual diff/boundary review checked loader offset overflow/ranges, versioned
+section presence, unchanged numeric arrays and GPU uploads, bounded parser state,
+copy isolation, role/stop gates and failure classification. The unavailable exact
+review/security/simplify leaf skills were not claimed as run. No independent
+whole-branch review or production decoder parity is claimed at this component
+checkpoint. The standing final-branch review remains due after implementation.
+
+The once-only comment retry after the user's explicit comment-vs-body
+clarification was again rejected before execution by automatic approval review.
+The stated blocker remains the unresolved earlier body-edit form. No remote
+comment, alternative route or further retry followed; the backfill draft is safe.

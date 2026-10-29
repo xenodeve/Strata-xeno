@@ -1,4 +1,4 @@
-# Native Qwenputer artifact format 1.0
+# Native Qwenputer artifact format 1.0 / 1.1
 
 This is the data-only ABI for the opt-in Native Flash-Next experiment tracked in
 [#276](https://github.com/xenodeve/Strata-xeno/issues/276). It contains a compiled
@@ -13,7 +13,7 @@ must validate the entire container, binding and sparse indices on CPU before any
 GPU allocation or mutation of a live session. The hard file limit is 256 MiB and
 the section limit is 32. Empty typed sections are allowed.
 
-The 64-byte header is `<8sHHIIIQ32s>`: magic `STQPUT01`, major 1, minor 0,
+The 64-byte header is `<8sHHIIIQ32s>`: magic `STQPUT01`, major 1, minor 0 or 1,
 endian marker `0x01020304`, section count, aligned header bytes, exact file bytes,
 and SHA256 of all bytes after the header. Each 80-byte section entry is
 `<16sQQII32s8s>`: NUL-padded ASCII name, offset, byte size, record stride, flags
@@ -48,6 +48,30 @@ are accepted. SHA256 checks integrity; they are not a publisher signature.
 | `text_types` | uint8 | original Strata token type for every ID |
 | `printable` | int32 | 256 exact byte IDs followed by tool-response open/close and think open/close |
 | `meta` | ASCII JSON bytes | human-readable provenance, names, ABI policy and limits; never executable |
+
+### Minor 1: complete CPU token bytes
+
+Version 1.0 has exactly the 20 sections above. Version 1.1 requires two additional
+sections: `text_offsets` (uint32, text vocabulary size + 1 entries) and `text_bytes`
+(byte blob). The first offset is zero, the last is the exact blob size, and each
+nondecreasing adjacent pair spans exactly the corresponding `text_lens` value.
+Every span's first 16 bytes must match its padded `text_rows` projection. Combined
+offset/blob storage is bounded to 64 MiB, also subject to file and host budgets.
+Unknown minor versions or missing/extra version-specific sections are refused.
+
+These two tables stay on CPU for the trusted quote/fence/role parser. They do not
+change circuit embeddings, numeric ABI, firmware or GPU uploads. The loader's
+host estimate includes them; its GPU buffer estimate excludes them. The selected
+tokenizer adds 2,839,441 data bytes, including offsets. Version 1.0 remains valid
+for standalone circuit execution; enrolling the P5 parser requires 1.1, since a
+16-byte projection cannot establish complete code-fence lengths or newlines.
+
+`python -m tools.qwenputer.lexicon --artifact <v1-file> --tokenizer-dir <bound-pack>
+--output <new-directory>` is a data-only migration. It verifies the tokenizer
+binding and every old length/projection, preserves all numeric section bytes,
+records the old/new artifact digests and retains the distribution hold. It does
+not execute a compiler or firmware, overwrite the input or change the default P1
+export. New artifact digests are distinct session/state-image identities.
 
 Every index/count/range must be revalidated by the native loader, including empty
 maps. Every head has 128 × 128 FP32 state cells. Key/query maps and initial row

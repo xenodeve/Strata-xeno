@@ -68,6 +68,19 @@ int main(int argc, char** argv) {
             check(memory.state_each == 12845056, "derived state memory");
             check(memory.device_total >= 3 * memory.state_each, "all state copies budgeted");
             check(!memory.graph_measured && memory.graph_bytes == 0, "driver graph resources not invented");
+            const bool full = bytes.size() >= 12 && bytes[10] == 1;
+            check(output.has_full_text() == full, "version-specific CPU lexicon presence");
+            check(output.token_bytes(output.config[2]).empty(), "out-of-range token bytes refused");
+            if (full) {
+                std::size_t long_tokens = 0;
+                for (std::uint32_t q = 0; q < output.config[2]; ++q) {
+                    const auto raw = output.token_bytes(q);
+                    check(raw.size() == output.text_lengths[q], "full token byte count");
+                    if (raw.size() > 16) ++long_tokens;
+                }
+                check(long_tokens == 6882, "all actual long Gyro tokens retained");
+                check(output.token_bytes(63434).size() == 32, "32-byte tilde fence token retained");
+            }
             const auto valid_memory = memory;
             const auto valid_digest = output.digest;
             auto bad = binding;

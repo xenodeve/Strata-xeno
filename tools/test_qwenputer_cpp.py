@@ -2,6 +2,7 @@
 import json
 import hashlib
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -107,6 +108,39 @@ class CppArtifactTests(unittest.TestCase):
         binding = self.root / 'unknown-abi.bin'
         binding.write_bytes(data)
         self.run_bad(sections, 'numeric_abi', 'unknown_abi', binding)
+
+    @unittest.skipUnless(os.environ.get('QWENPUTER_LEXICON_FILE'), 'full token lexicon not selected')
+    def test_full_cpu_lexicon_preserves_gpu_budget_and_rejects_resigned_mutants(self):
+        upgraded = Path(os.environ['QWENPUTER_LEXICON_FILE'])
+        original_sections = decode_sections(upgraded.read_bytes())
+        values = []
+        for file in (self.artifact, upgraded):
+            result = subprocess.run([self.binary, str(file), str(self.identity)], capture_output=True,
+                                    text=True, timeout=60, creationflags=0x08000000)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            values.append(dict((key, int(n)) for key, n in re.findall(r'(\w+)=(\d+)', result.stdout)))
+        for key in ('weights', 'state_each', 'lag_each', 'scratch', 'fifo', 'device_buffers'):
+            self.assertEqual(values[0][key], values[1][key], key)
+        self.assertGreater(values[1]['host_peak_estimate'], values[0]['host_peak_estimate'])
+        for name, offset, value, expected in (
+                ('first', 0, 1, 'text_lexicon_offsets'),
+                ('end', len(original_sections['text_offsets'][1]) - 4, 0, 'text_lexicon_offsets'),
+                ('descending', 4, 0xffffffff, 'text_lexicon_offsets'),
+                ('length', 4, 0, 'text_lexicon_offsets')):
+            with self.subTest(name=name):
+                sections = dict(original_sections)
+                stride, data = sections['text_offsets']; data = bytearray(data)
+                struct.pack_into('<I', data, offset, value)
+                sections['text_offsets'] = stride, bytes(data)
+                self.run_bad_bytes(encode_sections(sections, minor=1), expected, 'lexicon-' + name)
+        sections = dict(original_sections)
+        stride, data = sections['text_bytes']
+        sections['text_bytes'] = stride, bytes([data[0] ^ 1]) + data[1:]
+        self.run_bad_bytes(encode_sections(sections, minor=1), 'text_lexicon_projection', 'lexicon-projection')
+        sections = dict(original_sections)
+        del sections['text_offsets']
+        self.run_bad_bytes(encode_sections(sections, minor=1), 'artifact_sections', 'lexicon-missing')
+        self.run_bad_bytes(encode_sections(original_sections), 'artifact_sections', 'lexicon-old-version')
 
 
 if __name__ == '__main__':
