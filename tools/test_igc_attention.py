@@ -11,6 +11,15 @@ from tools.igc.readout import SIZES
 
 
 class AttentionContract(unittest.TestCase):
+    def test_key_bias_has_zero_gradient_for_softmax_translation(self):
+        states,valid,positions,query=self.inputs()
+        model=InputReadout(use_final_query=False,contextual=True)
+        original=model(states,valid,positions,query)
+        original.square().mean().backward()
+        self.assertLess(float(model.key.bias.grad.abs().max()),1e-7)
+        with torch.no_grad():model.key.bias.add_(1)
+        torch.testing.assert_close(original,model(states,valid,positions,query),rtol=1e-5,atol=1e-6)
+
     def test_context_block_preserves_common_initialization_and_masks_padding(self):
         torch.manual_seed(20261030)
         baseline=InputReadout(use_final_query=False)

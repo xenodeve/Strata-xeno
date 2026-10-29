@@ -2,10 +2,19 @@
 import unittest
 import numpy as np
 import torch
-from tools.igc.embedding_readout import batch_inputs
+from tools.igc.embedding_readout import batch_inputs,TensorInputs
 
 
 class EmbeddingInputs(unittest.TestCase):
+    def test_tensor_cache_preserves_the_checked_cpu_batch_contract(self):
+        table=np.stack([np.full((4,2560),v,dtype=np.float32) for v in (1.25,2.5)])
+        indices=np.tile(np.arange(80,dtype=np.int32)%2,(2,1))
+        valid=np.ones((2,80),dtype=np.bool_);valid[:,0]=False
+        selection=np.array([1,0])
+        expected=batch_inputs(table,indices,valid,selection)
+        actual=TensorInputs(table,indices,valid,'cpu').batch(selection)
+        for lhs,rhs in zip(expected,actual,strict=True):torch.testing.assert_close(lhs,rhs,rtol=0,atol=0)
+
     def test_cache_row_numbering_is_not_a_network_feature(self):
         table=np.stack([np.full((4,2560),v,dtype=np.float32) for v in (1.25,2.5)])
         indices=np.tile(np.arange(80,dtype=np.int32)%2,(2,1))
