@@ -48,6 +48,7 @@ static void executed_trials(LatentPipeline& pipeline,const ControllerBundle& bun
         else require(reference.evaluations==0 && reference.result.status!=Status::Success && reference.result.value.length==0,"failure_is_valueless");
         stage(id,true);Invocation before;uint32_t before_status=0;read(before,before_status);
         require(before.armed==1 && before.attempts==0,"base_is_pending");
+        require(before_status!=0,"new_stage_must_clear_previous_head_success");
         require(pipeline.begin_trial(stream,true,error),error);
         require(!pipeline.begin_trial(stream,true,error),"nested_trial_refused");
         require(!pipeline.finish_trial(false,foreign.s,true,error),"foreign_finish_cannot_discard_trial");

@@ -111,13 +111,19 @@ public:
         if(!pipeline_){error="igc learned audit before prepare";return false;}
         return pipeline_->audit(record,status,stream_,error);
     }
-    void invalidate(){if(context_)context_->invalidate();active_=false;}
+    // Outside capture after the owner's prior work; clearing context alone
+    // cannot revoke the retained device result used by already captured heads.
+    bool cancel(std::string& error) {
+        if(!pipeline_ || !invocation_){error="igc learned cancel lifetime";return false;}
+        context_->invalidate();active_=false;staged_=true;
+        return pipeline_->stage_inputs(nullptr,nullptr,nullptr,invocation_,anchor_,false,stream_,true,error);
+    }
     std::size_t device_bytes()const {
         return (context_?context_->device_bytes():0)+(pipeline_?pipeline_->device_bytes():0);
     }
     void release() {
         if(stream_)cudaStreamSynchronize(stream_);
-        pipeline_.reset();context_.reset();stream_=nullptr;active_=false;staged_=false;
+        pipeline_.reset();context_.reset();stream_=nullptr;active_=false;staged_=true;
     }
 };
 }

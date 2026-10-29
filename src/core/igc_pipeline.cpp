@@ -70,6 +70,7 @@ bool LatentPipeline::stage_inputs(const float* embedding,const float* attention,
             || !checked(cudaMemcpyAsync(&d->arm_anchor,&m.arm_anchor,8,cudaMemcpyHostToDevice,m.stream),error)
             || !checked(cudaMemsetAsync(&d->embedding_status,0xff,4,m.stream),error)
             || !checked(cudaMemsetAsync(&d->attention_status,0xff,4,m.stream),error)
+            || !checked(cudaMemsetAsync(d->head_status,0xff,sizeof(d->head_status),m.stream),error)
             || !arm_invocations(&d->invocation,&d->arm_id,&d->arm_anchor,1,raw,true,error))return false;
     if(available && (!m.primary.run(embedding,mask,d->embedding,&d->embedding_status,1,raw,true,error)
                     || !m.secondary.run(attention,mask,d->attention,&d->attention_status,1,raw,true,error)))return false;
