@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.24)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  project(igc_rational_exact LANGUAGES CXX CUDA)
+endif()
+find_package(CUDAToolkit 13.3 REQUIRED)
+get_filename_component(IGC_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+add_library(igc_rational_exact STATIC "${IGC_ROOT}/src/kernels/igc_rational_exact.cu")
+target_include_directories(igc_rational_exact PUBLIC "${IGC_ROOT}/include")
+target_compile_features(igc_rational_exact PUBLIC cxx_std_20)
+target_link_libraries(igc_rational_exact PUBLIC CUDA::cudart)
+set_target_properties(igc_rational_exact PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED YES)
+add_executable(igc_rational_exact_test "${IGC_ROOT}/tests/igc/rational_exact_test.cpp")
+target_link_libraries(igc_rational_exact_test PRIVATE igc_rational_exact)
+# Separate test executable: older kernels never become dependencies of the new
+# executor library. Unique target names also work with both older test trees ON.
+add_library(igc_rational_compatibility STATIC
+  "${IGC_ROOT}/src/kernels/igc_exact.cu" "${IGC_ROOT}/src/kernels/igc_integer_extended.cu")
+target_include_directories(igc_rational_compatibility PUBLIC "${IGC_ROOT}/include")
+target_link_libraries(igc_rational_compatibility PUBLIC CUDA::cudart)
+set_target_properties(igc_rational_compatibility PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED YES)
+add_executable(igc_rational_compatibility_test "${IGC_ROOT}/tests/igc/rational_compatibility_test.cpp")
+target_link_libraries(igc_rational_compatibility_test PRIVATE igc_rational_exact igc_rational_compatibility)
