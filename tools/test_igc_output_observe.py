@@ -1,5 +1,5 @@
 import unittest
-from tools.igc.output_observe import position_examples
+from tools.igc.output_observe import position_examples,validate_launcher_env
 
 
 class Tokenizer:
@@ -8,6 +8,12 @@ class Tokenizer:
 
 
 class PositionExamples(unittest.TestCase):
+    def test_launcher_gpu_mapping_is_required_before_model_start(self):
+        validate_launcher_env({'CUDA_VISIBLE_DEVICES':'1,0'})
+        validate_launcher_env({'CUDA_VISIBLE_DEVICES':'1,0','CUDA_DEVICE_ORDER':''})
+        for env in ({},{'CUDA_VISIBLE_DEVICES':'0,1'},
+                    {'CUDA_VISIBLE_DEVICES':'1,0','CUDA_DEVICE_ORDER':'PCI_BUS_ID'}):
+            with self.assertRaises(ValueError):validate_launcher_env(env)
     def test_future_targets_never_enter_the_captured_input(self):
         rows=[dict(id='a',prompt='Q',completion='12E',split='train',answer=12)]
         result=position_examples(rows,Tokenizer(),b'S',b'A')

@@ -15,6 +15,7 @@ import time
 import numpy as np
 import psutil
 from tools.igc.output_corpus import dataset
+from tools.igc.output_examples import position_examples,wrapped_prefix
 from tools.igc.observation import load_observation,_read
 from tools.igc.provenance import verify_sources
 from tools.qwenputer.memory import system_snapshot,process_snapshot,ExtendedLimit,job_fields
@@ -25,38 +26,11 @@ def digest(path):
     with Path(path).open('rb') as source:return hashlib.file_digest(source,'sha256').hexdigest()
 
 
-def position_examples(rows,tokenizer,prefix,suffix):
-    examples=[];seen=set()
-    for invocation,row in enumerate(rows,1):
-        if row['id'] in seen:raise ValueError('duplicate output sample')
-        seen.add(row['id'])
-        base=tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8'))
-        completion=tokenizer.encode(row['completion'])
-        if not 1<=len(completion)<=64 or not 2<=len(base)<=256:raise ValueError('output sequence bounds')
-        anchor=len(base)-1
-        for j,target in enumerate(completion):
-            tokens=base+completion[:j]
-            if len(tokens)>256 or len(examples)>=1024:raise ValueError('output observation bound')
-            piece=tokenizer.decode_bytes([target])
-            numeric=bool(piece) and all(c in b'-0123456789' for c in piece)
-            examples.append(dict(sample=row['id'],split=row['split'],invocation=invocation,
-                                 invocation_position=anchor,position=len(tokens)-1,output_offset=j,
-                                 target=target,numeric_target=numeric,ids=tokens))
-    return examples
-
-
-def wrapped_prefix(reference,tokenizer):
-    original=json.loads(_read(reference/'corpus.json',limit=1024**2))['rows']
-    prefix=suffix=None
-    for i,row in enumerate(original):
-        observed=load_observation(reference,i);tokens=observed['prefix_tokens'].tolist()
-        raw=tokenizer.decode_bytes(tokens);prompt=row['prompt'].encode('utf-8')
-        if raw.count(prompt)!=1:raise ValueError('output wrapper occurrence')
-        at=raw.index(prompt)
-        if prefix is None:prefix,suffix=raw[:at],raw[at+len(prompt):]
-        if raw!=prefix+prompt+suffix or tokenizer.encode(raw.decode('utf-8'))!=tokens:
-            raise ValueError('output native wrapper fidelity')
-    return prefix,suffix
+def validate_launcher_env(env):
+    # Actual selected launcher, strata-hub.bat:131-132. Profile JSON alone does
+    # not carry these settings; refusing here avoids allocating on the wrong GPU.
+    if env.get('CUDA_VISIBLE_DEVICES')!='1,0' or env.get('CUDA_DEVICE_ORDER','')!='':
+        raise ValueError('output collector requires selected Hub launcher CUDA_VISIBLE_DEVICES=1,0 and default CUDA_DEVICE_ORDER')
 
 
 def operand(value):
@@ -95,11 +69,18 @@ def current_job():
 
 
 def collect(profile,server,executable,exact_executable,pack,reference,sources,protocol,output):
+    validate_launcher_env(os.environ)
     started=time.monotonic();resolution=verify_sources(sources)
     pinned={Path(r['path']).resolve() for r in json.loads(_read(sources,limit=256*1024))['files']}
     if any(path.resolve() not in pinned for path in (profile,server,executable,pack/'index.txt')):
         raise ValueError('output collector source not bound to verified identity')
-    before={str(p):digest(p) for p in (profile,server,executable,exact_executable,protocol)}
+    cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
+    vision_cfg=({key:(os.path.abspath(os.path.join(cfg.get('cwd') or '.',value))
+                       if key in ('exe','mmproj','model') and isinstance(value,str) and not os.path.isabs(value)
+                       else value) for key,value in cfg['vision'].items()} if cfg.get('vision') else None)
+    source_paths=[profile,server,executable,exact_executable,protocol]
+    if vision_cfg:source_paths.extend(Path(vision_cfg[key]) for key in ('exe','model','mmproj'))
+    before={str(p):digest(p) for p in source_paths}
     tokenizer=NativeText.from_pack(pack/'tokenizer');prefix,suffix=wrapped_prefix(reference,tokenizer)
     corpus=dataset();examples=position_examples(corpus['rows'],tokenizer,prefix,suffix)
     system=system_snapshot()
@@ -112,7 +93,7 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
     output.mkdir(exist_ok=False)
     (output/'corpus.json').write_text(json.dumps(corpus,ensure_ascii=False,indent=2),encoding='utf-8')
     (output/'planned-positions.json').write_text(json.dumps(examples,indent=2),encoding='utf-8')
-    cfg=json.loads(profile.read_text(encoding='utf-8-sig'));cfg['exe']=str(executable)
+    cfg['exe']=str(executable)
     args=list(cfg['args']);learned=Path(args[args.index('--expert-profile')+1])
     learned_hash=digest(learned);shutil.copyfile(learned,output/'initial-expert-profile.bin')
     args[args.index('--expert-profile')+1]=str(output/'initial-expert-profile.bin')
@@ -126,13 +107,16 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
     spec=importlib.util.spec_from_file_location('igc_pinned_hub_server',server)
     helper=importlib.util.module_from_spec(spec);sys.modules[spec.name]=helper;spec.loader.exec_module(helper)
     env=helper.child_env(cfg);env.pop('STRATA_TIMELINE',None) # This is a dataset, not a timing run.
-    if cfg.get('cjk_guard') or helper.layer_split_of(cfg) or cfg.get('vision') or cfg.get('replicas'):
+    validate_launcher_env(env)
+    if cfg.get('cjk_guard') or helper.layer_split_of(cfg) or cfg.get('replicas'):
         raise ValueError('output pilot only qualified for the selected non-replica D2x profile')
     effort=helper.effort_end_args(cfg,str(executable),tokenizer) or []
     engine_arguments=helper.engine_args(cfg)+effort
     results=checked_results(corpus['rows'],examples,exact_executable,output,env)
     record=[];samples=[];stop=threading.Event();cancel=threading.Event();failure=[];active_request=[None]
-    engine=None;root=psutil.Process(os.getpid());original_popen=subprocess.Popen
+    engine=None;vision=None;vision_log=None;root=psutil.Process(os.getpid());original_popen=subprocess.Popen
+    owned_executables={executable.resolve()}
+    if vision_cfg:owned_executables.add(Path(vision_cfg['exe']).resolve())
     def headless(*args,**kwargs):
         kwargs['creationflags']=kwargs.get('creationflags',0)|0x08000000
         return original_popen(*args,**kwargs)
@@ -141,22 +125,28 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
             system=system_snapshot();owned=[]
             for child in root.children(recursive=True):
                 try:
-                    if Path(child.exe()).resolve()==executable.resolve():owned.append(process_snapshot(child.pid))
+                    if Path(child.exe()).resolve() in owned_executables:owned.append(process_snapshot(child.pid))
                 except (psutil.Error,OSError):pass
             samples.append(dict(seconds=time.monotonic()-started,system=system,processes=owned))
             if (time.monotonic()-started>900 or (active_request[0] is not None and time.monotonic()-active_request[0]>30)
                     or system['system_commit_available_bytes']<2*1024**3
                     or system['physical_available_bytes']<1024**3):
-                failure.append('owned collection deadline/system emergency floor');cancel.set()
+                failure.append(dict(reason=('total900s' if time.monotonic()-started>900 else
+                    'request30s' if active_request[0] is not None and time.monotonic()-active_request[0]>30 else
+                    'commit2GiB' if system['system_commit_available_bytes']<2*1024**3 else 'physical1GiB'),
+                    seconds=time.monotonic()-started,system=system));cancel.set()
                 for child in root.children(recursive=True):
                     try:
-                        if Path(child.exe()).resolve()==executable.resolve():child.terminate()
+                        if Path(child.exe()).resolve() in owned_executables:child.terminate()
                     except (psutil.Error,OSError):pass
                 return
     thread=threading.Thread(target=monitor,daemon=True);thread.start()
     subprocess.Popen=headless
     try:
         limits=current_job()
+        if vision_cfg:
+            vision_log=(output/'vision.log').open('w',encoding='utf-8')
+            vision=helper.Vision(vision_cfg,log=vision_log,env=helper.vision_env(cfg,env),lazy=False)
         engine=helper.StrataEngine(str(executable),engine_arguments,cwd=cfg.get('cwd'),log=cfg['log'],env=env)
         engine.silence_s=helper.engine_silence_s(cfg)
         for index,example in enumerate(examples):
@@ -174,11 +164,15 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
             (output/'records.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
             if (index+1)%16==0:print('output positions',index+1,'/',len(examples),'seconds',round(time.monotonic()-started,2),flush=True)
     finally:
-        if engine is not None:engine.close()
-        stop.set();thread.join(timeout=2);subprocess.Popen=original_popen
-        (output/'memory.json').write_text(json.dumps(samples,indent=2),encoding='utf-8')
-        (output/'incomplete.json').write_text(json.dumps(dict(completed=len(record),planned=len(examples),failure=failure),indent=2),encoding='utf-8')
-    if (failure or before!={str(p):digest(p) for p in (profile,server,executable,exact_executable,protocol)}
+        try:
+            if engine is not None:engine.close()
+        finally:
+            if vision is not None:vision.close()
+            if vision_log is not None:vision_log.close()
+            stop.set();thread.join(timeout=2);subprocess.Popen=original_popen
+            (output/'memory.json').write_text(json.dumps(samples,indent=2),encoding='utf-8')
+            (output/'incomplete.json').write_text(json.dumps(dict(completed=len(record),planned=len(examples),failure=failure),indent=2),encoding='utf-8')
+    if (failure or before!={str(p):digest(p) for p in source_paths}
             or digest(learned)!=learned_hash or len(record)!=len(examples)):
         raise RuntimeError('output source/owned completion validation failed')
     verify_sources(sources)
@@ -188,6 +182,8 @@ def collect(profile,server,executable,exact_executable,pack,reference,sources,pr
                 source_resolution=resolution,protocol_sha256=before[str(protocol)],source_sha256=before,
                 tokenizer_binding_sha256=tokenizer.binding_sha256,seconds=time.monotonic()-started,
                 original_learned_sha256=learned_hash,hard_private_commit_cap=None,
+                actual_hub_vision_initialized=vision_cfg is not None,
+                launcher_gpu_environment={key:env.get(key,'') for key in ('CUDA_VISIBLE_DEVICES','CUDA_DEVICE_ORDER')},
                 differences=['direct canonical token requests/teacher forcing, not HTTP latency',
                              'isolated main-based candidate, task-owned logs/expert-profile output',
                              'opt-in first-window mixed/logit capture','bounded headless owned tree/emergency cleanup'])

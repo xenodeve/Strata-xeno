@@ -40,6 +40,22 @@ prefixes plus a teacher-forced assistant continuation; they are data collection,
 not an HTTP/Hub latency measurement. The source wrapper must reproduce all64
 existing full native prefixes before use.
 
+The selected profile also enables its Vision encoder. Start it with the same
+actual `Vision` and `vision_env` helpers/order before the language engine, retaining
+its GPU setting and source-pin its executable/mmproj/model files. A first collector
+attempt refused this profile before model startup because its conservative guard
+excluded Vision; do not bypass that by disabling the user's subsystem. Monitor
+and close only the owned encoder/engine. No image encoding is requested by the
+text-only corpus.
+
+Preserve the launcher environment as well as JSON: selected `strata-hub.bat`
+lines131-132 sets `CUDA_VISIBLE_DEVICES=1,0` and clears `CUDA_DEVICE_ORDER`.
+The JSON has no GPU-list/environment override. A second diagnostic attempt
+omitted those inherited settings and the engine correctly refused the D2x
+secondary arena before capture. Both owned processes drained. Require the exact
+resolved launcher mapping before any model allocation, with a negative test;
+do not reinterpret that harness failure as a model/branch compatibility defect.
+
 The actual engine consumes each prefix and completes its owned one-token request.
 Capture its mixed activation/logits and verify exact token-prefix/position metadata
 before associating a label. Prefix cache reuse remains the engine's normal valid
