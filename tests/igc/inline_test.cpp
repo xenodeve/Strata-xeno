@@ -4,7 +4,8 @@
 #include <vector>
 using namespace strata::igc;
 static void require(bool v, const char* e) { if (!v) throw std::runtime_error(e); }
-static int number(const Integer& v) {
+static int number(const InlineNumber& value) {
+    const Integer& v = value.coefficient;
     int n = 0;
     for (int i = v.length - 1; i >= 0; --i) n = n * 10 + v.digits[i];
     return n;
@@ -12,9 +13,9 @@ static int number(const Integer& v) {
 int main() try {
     // '12*34=' and '12 × 34 = ' as the pack tokenizes them
     auto a = parse_inline(std::vector<int32_t>{16, 17, 9, 18, 19, 28});
-    require(a && a->operations == std::vector<Operation>{Operation::Multiply} && number(a->numbers[0]) == 12 && number(a->numbers[1]) == 34 && !a->spaced, "tight");
+    require(a && a->operations == std::vector<InlineOperation>{InlineOperation::Multiply} && number(a->numbers[0]) == 12 && number(a->numbers[1]) == 34 && !a->spaced, "tight");
     auto b = parse_inline(std::vector<int32_t>{16, 17, 23985, 220, 18, 19, 283});
-    require(b && b->operations[0] == Operation::Multiply && b->spaced, "spaced");
+    require(b && b->operations[0] == InlineOperation::Multiply && b->spaced, "spaced");
     auto c = parse_inline(std::vector<int32_t>{17, 11, 22, 20, 17, 478, 220, 18, 11, 16, 15, 15, 283});
     require(c && number(c->numbers[0]) == 2752 && number(c->numbers[1]) == 3100, "commas");
     // '16-3-4=' runs left to right; '2+3*4=' keeps the model's precedence
@@ -22,7 +23,19 @@ int main() try {
     require(chain && chain->numbers.size() == 3 && number(chain->numbers[0]) == 16 && chain->operations.size() == 2, "chain");
     require(!parse_inline(std::vector<int32_t>{17, 10, 18, 9, 19, 28}), "mixed precedence");
     require(!parse_inline(std::vector<int32_t>{7, 16, 10, 17, 8, 9, 18, 28}), "parenthesis");
-    require(!parse_inline(std::vector<int32_t>{16, 13, 20, 10, 17, 28}), "decimal");
+    // '1.5+2=' and '12/3=' and '12 ÷ 3 = '
+    auto decimal = parse_inline(std::vector<int32_t>{16, 13, 20, 10, 17, 28});
+    require(decimal && number(decimal->numbers[0]) == 15 && decimal->numbers[0].scale == 1 && !decimal->exact_integers(), "decimal");
+    require(parse_inline(std::vector<int32_t>{16, 17, 14, 18, 28}) && !parse_inline(std::vector<int32_t>{16, 17, 14, 18, 28})->exact_integers(), "division");
+    auto divided = parse_inline(std::vector<int32_t>{16, 17, 1624, 115, 220, 18, 283});
+    require(divided && divided->operations[0] == InlineOperation::Divide, "spaced division sign");
+    require(!parse_inline(std::vector<int32_t>{13, 20, 10, 17, 28}), "bare point");
+    rational_exact::Rational half{};
+    half.numerator.length = 1; half.numerator.digits[0] = 7;
+    half.denominator.length = 1; half.denominator.digits[0] = 2;
+    require(rational_tokens(half, false) == std::vector<int32_t>{18, 13, 20}, "terminating decimal");
+    half.denominator.digits[0] = 3;
+    require(!rational_tokens(half, false), "repeating decimal stays the model's");
     require(!parse_inline(std::vector<int32_t>{16, 17, 18}), "no equals");
     require(!parse_inline(std::vector<int32_t>{9, 18, 28}), "no left operand");
     std::vector<int32_t> tooLong(32, 16);
