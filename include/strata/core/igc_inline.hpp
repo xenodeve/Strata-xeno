@@ -11,8 +11,8 @@
 
 namespace strata::igc {
 struct InlineCall {
-    Operation operation = Operation::Add;
-    Integer lhs{}, rhs{};
+    std::vector<Integer> numbers;      // left to right; one step per operation
+    std::vector<Operation> operations;
     bool spaced = false;  // ` =` keeps a space before the value
 };
 
@@ -55,19 +55,26 @@ inline std::optional<InlineCall> parse_inline(std::span<const int32_t> tokens) {
     InlineCall call;
     call.spaced = tokens.back() == kSpacedEquals;
     std::ptrdiff_t at = (std::ptrdiff_t) tokens.size() - 2;
-    if (!read_number(tokens, at, call.rhs)) return std::nullopt;
-    while (at >= 0 && tokens[(size_t) at] == kSpace) --at;
-    if (at < 0) return std::nullopt;
-    const auto op = operation(tokens[(size_t) at]);
-    if (!op) return std::nullopt;
-    call.operation = *op;
-    --at;
-    if (!read_number(tokens, at, call.lhs)) return std::nullopt;
-    while (at >= 0 && tokens[(size_t) at] == kSpace) --at;
-    // Precedence and signs stay the model's: chains, parentheses and decimals are not calls.
+    for (;;) {
+        Integer number;
+        if (!read_number(tokens, at, number)) return std::nullopt;
+        call.numbers.insert(call.numbers.begin(), number);
+        while (at >= 0 && tokens[(size_t) at] == kSpace) --at;
+        const auto op = at >= 0 ? operation(tokens[(size_t) at]) : std::nullopt;
+        if (!op) break;
+        if (call.operations.size() == 15) return std::nullopt;
+        call.operations.insert(call.operations.begin(), *op);
+        --at;
+    }
+    if (call.operations.empty()) return std::nullopt;
+    // Precedence and signs stay the model's: multiplication mixed with addition,
+    // parentheses, decimals and a leading sign are not calls.
+    const bool multiply = call.operations[0] == Operation::Multiply;
+    for (const Operation op : call.operations)
+        if ((op == Operation::Multiply) != multiply) return std::nullopt;
     if (at >= 0) {
         const int32_t before = tokens[(size_t) at];
-        if (operation(before) || before == kDot || before == kOpen || before == kClose || before == kSlash) return std::nullopt;
+        if (before == kDot || before == kOpen || before == kClose || before == kSlash) return std::nullopt;
     }
     return call;
 }

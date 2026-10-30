@@ -35,6 +35,7 @@ struct LatentPipeline::Impl {
     uint64_t arm_id=0,arm_anchor=0;
     Invocation delivered{};uint32_t delivered_status=0;bool output_ended=false;
     Status bypass=Status::Malformed;
+    bool output_bypass=false;
     ~Impl(){if(stream)cudaStreamSynchronize(stream);if(checkpoint)cudaFree(checkpoint);if(data)cudaFree(data);}
 };
 LatentPipeline::~LatentPipeline(){delete impl_;}
@@ -88,9 +89,10 @@ bool LatentPipeline::head(float* mixed,uint32_t rows,void* raw,bool enabled,std:
         && assemble_selective_exact(inputs,&d->request,&d->selection,1,raw,true,error)
         && execute_invocations(&d->invocation,&d->request,&d->selection,1,raw,true,error)
         && broadcast_invocation(&d->invocation,d->results,rows,raw,true,error)
-        && m.output.run(mixed,d->results,d->ids,d->anchors,d->head_status,rows,raw,true,error);
+        && (m.output_bypass || m.output.run(mixed,d->results,d->ids,d->anchors,d->head_status,rows,raw,true,error));
 }
 bool LatentPipeline::output_ended()const{return impl_ && impl_->output_ended;}
+void LatentPipeline::set_output_bypass(bool on){if(impl_)impl_->output_bypass=on;}
 bool LatentPipeline::end_output(void* raw,std::string& error){
     if(!impl_ || impl_->failed || raw!=impl_->stream){error="pipeline_end_output_arguments";return false;}
     auto& m=*impl_;

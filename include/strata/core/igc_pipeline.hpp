@@ -23,6 +23,8 @@ public:
     // unchanged, captured graphs included. Audit keeps reporting the invocation.
     bool end_output(void* stream,std::string&);
     bool output_ended()const;
+    // Before any graph capture: the head selects and executes but leaves the activations alone.
+    void set_output_bypass(bool on);
     // Optional module-only trial, outside capture on the owning stream. Lazy
     // bounded checkpoint storage is retained for reuse; never touches LM state.
     // Caller discards rejected output rows and fences borrowed inputs. Partial

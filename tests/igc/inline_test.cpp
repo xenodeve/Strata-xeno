@@ -12,12 +12,15 @@ static int number(const Integer& v) {
 int main() try {
     // '12*34=' and '12 × 34 = ' as the pack tokenizes them
     auto a = parse_inline(std::vector<int32_t>{16, 17, 9, 18, 19, 28});
-    require(a && a->operation == Operation::Multiply && number(a->lhs) == 12 && number(a->rhs) == 34 && !a->spaced, "tight");
+    require(a && a->operations == std::vector<Operation>{Operation::Multiply} && number(a->numbers[0]) == 12 && number(a->numbers[1]) == 34 && !a->spaced, "tight");
     auto b = parse_inline(std::vector<int32_t>{16, 17, 23985, 220, 18, 19, 283});
-    require(b && b->operation == Operation::Multiply && b->spaced, "spaced");
+    require(b && b->operations[0] == Operation::Multiply && b->spaced, "spaced");
     auto c = parse_inline(std::vector<int32_t>{17, 11, 22, 20, 17, 478, 220, 18, 11, 16, 15, 15, 283});
-    require(c && number(c->lhs) == 2752 && number(c->rhs) == 3100, "commas");
-    require(!parse_inline(std::vector<int32_t>{16, 22, 12, 18, 12, 19, 28}), "chain is the model's");
+    require(c && number(c->numbers[0]) == 2752 && number(c->numbers[1]) == 3100, "commas");
+    // '16-3-4=' runs left to right; '2+3*4=' keeps the model's precedence
+    auto chain = parse_inline(std::vector<int32_t>{16, 21, 12, 18, 12, 19, 28});
+    require(chain && chain->numbers.size() == 3 && number(chain->numbers[0]) == 16 && chain->operations.size() == 2, "chain");
+    require(!parse_inline(std::vector<int32_t>{17, 10, 18, 9, 19, 28}), "mixed precedence");
     require(!parse_inline(std::vector<int32_t>{7, 16, 10, 17, 8, 9, 18, 28}), "parenthesis");
     require(!parse_inline(std::vector<int32_t>{16, 13, 20, 10, 17, 28}), "decimal");
     require(!parse_inline(std::vector<int32_t>{16, 17, 18}), "no equals");

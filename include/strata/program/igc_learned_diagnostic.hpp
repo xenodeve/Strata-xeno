@@ -34,7 +34,7 @@ class IgcLearnedDiagnostic {
     bool loaded_=false,active_=false,staged_=false,invocation_known_=false,invoked_=false,bridge_=false;
     std::vector<int32_t> bridge_tokens_;std::size_t bridge_at_=0;
     std::vector<int32_t> generated_;
-    std::vector<std::array<int64_t,3>> inline_seen_;
+    std::vector<int64_t> inline_seen_;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
     strata::igc::ExactRequest* inline_request_=nullptr;strata::igc::ExactResult* inline_result_=nullptr;
@@ -59,7 +59,9 @@ class IgcLearnedDiagnostic {
             return true;
         }
         pipeline_=std::make_unique<strata::igc::LatentPipeline>();
-        return context_->allocate(raw,error) && pipeline_->initialize(bundle_,raw,error);
+        if(!context_->allocate(raw,error) || !pipeline_->initialize(bundle_,raw,error))return false;
+        pipeline_->set_output_bypass(bridge_);
+        return true;
     }
 public:
     IgcLearnedDiagnostic()=default;
@@ -288,21 +290,26 @@ public:
         if(!call)return true;
         if(!inline_request_ && (cudaMalloc(&inline_request_,sizeof(*inline_request_))!=cudaSuccess
                 || cudaMalloc(&inline_result_,sizeof(*inline_result_))!=cudaSuccess)){error="igc inline device buffers";return false;}
-        strata::igc::ExactRequest request;request.operation=call->operation;request.invocation=1;request.lhs=call->lhs;request.rhs=call->rhs;
-        strata::igc::ExactResult result;
-        if(cudaMemcpyAsync(inline_request_,&request,sizeof(request),cudaMemcpyHostToDevice,stream_)!=cudaSuccess
-                || !strata::igc::execute_exact(inline_request_,inline_result_,1,stream_,error)
-                || cudaMemcpyAsync(&result,inline_result_,sizeof(result),cudaMemcpyDeviceToHost,stream_)!=cudaSuccess
-                || cudaStreamSynchronize(stream_)!=cudaSuccess){if(error.empty())error="igc inline execution";return false;}
-        if(result.status!=strata::igc::Status::Success)return true;
+        strata::igc::ExactResult result;result.status=strata::igc::Status::Success;result.value=call->numbers[0];
+        for(std::size_t step=0;step<call->operations.size();++step) {
+            strata::igc::ExactRequest request;request.operation=call->operations[step];request.invocation=1;
+            request.lhs=result.value;request.rhs=call->numbers[step+1];
+            if(cudaMemcpyAsync(inline_request_,&request,sizeof(request),cudaMemcpyHostToDevice,stream_)!=cudaSuccess
+                    || !strata::igc::execute_exact(inline_request_,inline_result_,1,stream_,error)
+                    || cudaMemcpyAsync(&result,inline_result_,sizeof(result),cudaMemcpyDeviceToHost,stream_)!=cudaSuccess
+                    || cudaStreamSynchronize(stream_)!=cudaSuccess){if(error.empty())error="igc inline execution";return false;}
+            if(result.status!=strata::igc::Status::Success)return true;
+        }
         bridge_tokens_=strata::igc::value_tokens(result.value,call->spaced);bridge_at_=0;
         // Inside reasoning the value says where it came from; unmarked, the model re-derives it.
         if(std::find(generated_.begin(),generated_.end(),kThinkClose)==generated_.end()) {
             // A repeat means the model is re-checking: say so once, then close the thinking.
-            const std::array<int64_t,3> key{static_cast<int64_t>(call->operation),number_key(call->lhs),number_key(call->rhs)};
+            int64_t key=0;
+            for(const auto op:call->operations)key=key*7+static_cast<int64_t>(op);
+            for(const auto& number:call->numbers)key=key*1000003+number_key(number);
             const auto seen=std::count(inline_seen_.begin(),inline_seen_.end(),key);
             inline_seen_.push_back(key);
-            if(!seen)bridge_tokens_.insert(bridge_tokens_.end(),{318,44839,11,494,279,28974,11,874,1144,310,1716,553}); // ` (exact, from the calculator, no need to check).`
+            if(!seen)bridge_tokens_.insert(bridge_tokens_.end(),{318,44839,553}); // ` (exact).`
             else if(seen==1)bridge_tokens_.insert(bridge_tokens_.end(),{318,43967,10457,11,2842,12910,553}); // ` (already confirmed, stop checking).`
             else bridge_tokens_.insert(bridge_tokens_.end(),{13,198,kThinkClose,271});
         }
