@@ -14,7 +14,7 @@ def fixture(root):
     records = [dict(role='anchor', base=i, step=0, tokens=[1, 2, 3+i]) for i in range(4)]
     records.append(dict(role='output', base=0, step=1, tokens=[1, 2, 3, 7]))
     plan = encode_plan(dict(model='11'*32, tokenizer='22'*32, records=records))
-    writer = CompactArchive(root, plan, dict(engine='33'*32, profile='44'*32))
+    writer = CompactArchive(root, plan, dict(engine='33'*32, profile='44'*32,bundle='55'*32))
     states = np.zeros((80,4,2560),dtype='<f4')
     states[-2] = 2; states[-1] = 4
     for i, record in enumerate(records):
