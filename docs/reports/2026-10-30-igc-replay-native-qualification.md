@@ -60,8 +60,11 @@ Reuse the same immutable 64-prompt coherent capture, with genuine embedding,
 first-attention and final mixed states. Its historical labels are 48 TRAIN and
 16 HELDOUT; it has been inspected repeatedly and is **not** sealed acceptance64.
 There are 48 compute prompts and 16 no-call prompts. The larger matched/legacy
-sets above have only the required attention cache, so their raw head scores must
-not be relabeled as measured controller call rates.
+sets lack paired final-anchor/output data, so raw head scores must not be relabeled
+as measured controller call rates. A subsequent
+[index audit](2026-10-30-igc-controller-gating-diagnosis.md) confirms existing
+embedding lookups for all 343 legacy and 384/768 matched-development rows; the
+other 384 need eleven additional embedding token rows.
 
 | Same coherent 64 prompts | Original retained | Replay candidate | Warm fit counterfactual |
 | --- | ---: | ---: | ---: |
@@ -202,7 +205,9 @@ Next, after separate review and fresh resource admission, use the existing
 bounded live diagnostic harness on the unchanged Gyro-M262K/five-worker Hub
 profile with only task-owned executable/log/profile-save paths and this separate
 diagnostic bundle. Preserve model/quantization, RoPE, workers, expert tiers, MTP
-suffix, cache and normal serving priority. No private-commit cap. The existing
+suffix, cache and the actual profile's serving priorities. The subsequent config
+audit confirms pool/process priorities 2/2; the earlier "normal priority" proposal
+was incorrect. No profile was changed. No private-commit cap. The existing
 six requests are three known compute prompts (`31*-24`, `20--15`, `-28+-49`),
 two quoted/no-compute prompts and a repeat of the first prompt. Check each
 actual staged feature/anchor, native audit, exact result, output use and cleanup.
