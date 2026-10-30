@@ -16,13 +16,17 @@ struct InlineNumber {
     Integer coefficient{};
     uint32_t scale = 0;  // value = coefficient * 10^-scale
 };
+struct InlineStep {
+    bool number = false;
+    InlineOperation operation = InlineOperation::Add;
+    InlineNumber value{};
+};
 struct InlineCall {
-    std::vector<InlineNumber> numbers;  // left to right; one step per operation
-    std::vector<InlineOperation> operations;
-    bool spaced = false;                // ` =` keeps a space before the value
+    std::vector<InlineStep> program;  // postfix, in the expression's own precedence
+    bool spaced = false;              // ` =` keeps a space before the value
     bool exact_integers() const {
-        for (const auto op : operations) if (op == InlineOperation::Divide) return false;
-        for (const auto& n : numbers) if (n.scale) return false;
+        for (const auto& step : program)
+            if (step.number ? step.value.scale != 0 : step.operation == InlineOperation::Divide) return false;
         return true;
     }
 };
@@ -30,12 +34,13 @@ struct InlineCall {
 namespace inline_tokens {
 inline constexpr int32_t kZero = 15, kNine = 24, kSpace = 220, kComma = 11, kDot = 13, kMinus = 12, kSpacedMinus = 471;
 inline constexpr int32_t kEquals = 28, kSpacedEquals = 283, kOpen = 7, kClose = 8;
+inline constexpr int32_t kPercent = 4, kOf = 314, kDollar = 3, kSpacedDollar = 393, kTimesDollar = 37726;
 inline bool digit(int32_t t) { return t >= kZero && t <= kNine; }
 inline std::optional<InlineOperation> operation(int32_t t) {
     switch (t) {
         case 10: case 478: return InlineOperation::Add;
         case kMinus: case kSpacedMinus: return InlineOperation::Subtract;
-        case 9: case 348: case 17044: case 23985: return InlineOperation::Multiply;
+        case 9: case 348: case 17044: case 23985: case kTimesDollar: return InlineOperation::Multiply;
         case 14: case 593: case 169814: return InlineOperation::Divide;
         default: return std::nullopt;
     }
@@ -69,40 +74,112 @@ inline bool read_number(std::span<const int32_t> tokens, std::ptrdiff_t& at, Inl
     return true;
 }
 
+// One step of the postfix program: a number, or an operation on the two values below it.
+inline bool numeric_token(int32_t t) {
+    using namespace inline_tokens;
+    return digit(t) || t == kComma || t == kDot;
+}
+
+// Precedence climbing over the tokens of one expression, left to right.
+struct InlineParser {
+    std::span<const int32_t> tokens;
+    size_t at = 0;
+    InlineCall& call;
+    void skip() { while (at < tokens.size() && tokens[at] == inline_tokens::kSpace) ++at; }
+    std::optional<InlineOperation> peek(size_t& width) {
+        skip();
+        width = 1;
+        if (at >= tokens.size()) return std::nullopt;
+        if (tokens[at] == inline_tokens::kOf && at > 0 && tokens[at - 1] == inline_tokens::kPercent)
+            return InlineOperation::Multiply;  // `30% of 180`
+        if (at + 1 < tokens.size() && tokens[at] == 1624 && tokens[at + 1] == 115) {  // ` ÷`
+            width = 2;
+            return InlineOperation::Divide;
+        }
+        return inline_tokens::operation(tokens[at]);
+    }
+    bool primary() {
+        using namespace inline_tokens;
+        skip();
+        if (at >= tokens.size()) return false;
+        if (tokens[at] == kOpen) {
+            ++at;
+            if (!sum()) return false;
+            skip();
+            if (at >= tokens.size() || tokens[at] != kClose) return false;
+            ++at;
+            return true;
+        }
+        if (tokens[at] == kDollar || tokens[at] == kSpacedDollar) ++at;
+        size_t last = at;
+        while (last < tokens.size() && numeric_token(tokens[last])) ++last;
+        if (last == at) return false;
+        std::ptrdiff_t back = (std::ptrdiff_t) last - 1;
+        InlineNumber number;
+        const auto run = tokens.subspan(at, last - at);
+        back = (std::ptrdiff_t) run.size() - 1;
+        if (!read_number(run, back, number) || back != -1) return false;
+        if (last < tokens.size() && tokens[last] == kPercent) {
+            number.scale += 2;
+            ++last;
+        }
+        call.program.push_back(InlineStep{true, InlineOperation::Add, number});
+        at = last;
+        return true;
+    }
+    bool product() {
+        if (!primary()) return false;
+        for (size_t width = 1;;) {
+            const auto op = peek(width);
+            if (!op || (*op != InlineOperation::Multiply && *op != InlineOperation::Divide)) return true;
+            at += width;
+            if (!primary()) return false;
+            call.program.push_back(InlineStep{false, *op, {}});
+        }
+    }
+    bool sum() {
+        if (!product()) return false;
+        for (size_t width = 1;;) {
+            const auto op = peek(width);
+            if (!op || (*op != InlineOperation::Add && *op != InlineOperation::Subtract)) return true;
+            at += width;
+            if (!product()) return false;
+            call.program.push_back(InlineStep{false, *op, {}});
+        }
+    }
+};
+
 inline std::optional<InlineCall> parse_inline(std::span<const int32_t> tokens) {
     using namespace inline_tokens;
     if (tokens.empty() || (tokens.back() != kEquals && tokens.back() != kSpacedEquals)) return std::nullopt;
     InlineCall call;
     call.spaced = tokens.back() == kSpacedEquals;
-    std::ptrdiff_t at = (std::ptrdiff_t) tokens.size() - 2;
-    for (;;) {
-        InlineNumber number;
-        if (!read_number(tokens, at, number)) return std::nullopt;
-        call.numbers.insert(call.numbers.begin(), number);
-        const std::ptrdiff_t end = at;
-        while (at >= 0 && tokens[(size_t) at] == kSpace) --at;
-        auto op = at >= 0 ? operation(tokens[(size_t) at]) : std::nullopt;
-        if (!op && at > 0 && tokens[(size_t) at] == 115 && tokens[(size_t) at - 1] == 1624) {  // ` ÷`
-            op = InlineOperation::Divide;
-            --at;
-        }
-        if (!op) {
-            at = end;
-            break;
-        }
-        if (call.operations.size() == 15) return std::nullopt;
-        call.operations.insert(call.operations.begin(), *op);
-        --at;
+    // Walk back over the expression; an unmatched `(` belongs to the prose around it.
+    std::ptrdiff_t first = (std::ptrdiff_t) tokens.size() - 1;
+    int depth = 0;
+    while (first > 0) {
+        const int32_t t = tokens[(size_t) first - 1];
+        if (t == kClose) ++depth;
+        else if (t == kOpen) {
+            if (!depth) break;
+            --depth;
+        } else if (t == kOf ? !(first >= 2 && tokens[(size_t) first - 2] == kPercent)
+                            : !(numeric_token(t) || t == kSpace || operation(t) || t == 115 || t == 1624
+                                || t == kPercent || t == kDollar || t == kSpacedDollar)) break;
+        --first;
     }
-    if (call.operations.empty()) return std::nullopt;
-    // Precedence and signs stay the model's: mixed precedence, parentheses and a leading sign are not calls.
-    const auto multiplicative = [](InlineOperation op) { return op == InlineOperation::Multiply || op == InlineOperation::Divide; };
-    for (const InlineOperation op : call.operations)
-        if (multiplicative(op) != multiplicative(call.operations[0])) return std::nullopt;
-    if (at >= 0) {
-        const int32_t before = tokens[(size_t) at];
-        if (before == kDot || before == kOpen || before == kClose) return std::nullopt;
-    }
+    while (first + 1 < (std::ptrdiff_t) tokens.size() && tokens[(size_t) first] == kSpace) ++first;
+    const auto body = tokens.subspan((size_t) first, tokens.size() - 1 - (size_t) first);
+    if (body.empty() || body.size() > 96) return std::nullopt;
+    // A sign before the first number belongs to words we cannot see.
+    if (first > 0 && tokens[(size_t) first - 1] == kDot) return std::nullopt;
+    InlineParser parser{body, 0, call};
+    if (!parser.sum()) return std::nullopt;
+    parser.skip();
+    if (parser.at != body.size()) return std::nullopt;
+    size_t steps = 0;
+    for (const auto& step : call.program) steps += !step.number;
+    if (!steps || steps > 15) return std::nullopt;
     return call;
 }
 

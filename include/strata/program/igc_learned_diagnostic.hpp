@@ -293,38 +293,48 @@ public:
                 || cudaMalloc(&inline_result_,sizeof(*inline_result_))!=cudaSuccess)){error="igc inline device buffers";return false;}
         std::vector<int32_t> value;
         if(call->exact_integers()) {
-            strata::igc::ExactResult result;result.status=strata::igc::Status::Success;result.value=call->numbers[0].coefficient;
-            for(std::size_t step=0;step<call->operations.size();++step) {
-                strata::igc::ExactRequest request;request.operation=static_cast<strata::igc::Operation>(call->operations[step]);request.invocation=1;
-                request.lhs=result.value;request.rhs=call->numbers[step+1].coefficient;
+            std::vector<strata::igc::Integer> stack;
+            for(const auto& step:call->program) {
+                if(step.number){stack.push_back(step.value.coefficient);continue;}
+                if(stack.size()<2){error="igc inline program";return false;}
+                strata::igc::ExactRequest request;request.operation=static_cast<strata::igc::Operation>(step.operation);request.invocation=1;
+                request.rhs=stack.back();stack.pop_back();request.lhs=stack.back();stack.pop_back();
+                strata::igc::ExactResult result;
                 if(cudaMemcpyAsync(inline_request_,&request,sizeof(request),cudaMemcpyHostToDevice,stream_)!=cudaSuccess
                         || !strata::igc::execute_exact(inline_request_,inline_result_,1,stream_,error)
                         || cudaMemcpyAsync(&result,inline_result_,sizeof(result),cudaMemcpyDeviceToHost,stream_)!=cudaSuccess
                         || cudaStreamSynchronize(stream_)!=cudaSuccess){if(error.empty())error="igc inline execution";return false;}
                 if(result.status!=strata::igc::Status::Success)return true;
+                stack.push_back(result.value);
             }
-            value=strata::igc::value_tokens(result.value,call->spaced);
+            if(stack.size()!=1){error="igc inline program";return false;}
+            value=strata::igc::value_tokens(stack.back(),call->spaced);
         } else {
             namespace rational=strata::igc::rational_exact;
-            auto operand=[](const strata::igc::InlineNumber& number) {
-                rational::Operand out;out.numerator=number.coefficient;
-                out.denominator.length=static_cast<uint8_t>(number.scale+1);out.denominator.digits[number.scale]=1;
-                return out;
-            };
             if(!inline_rational_request_ && (cudaMalloc(&inline_rational_request_,sizeof(*inline_rational_request_))!=cudaSuccess
                     || cudaMalloc(&inline_rational_result_,sizeof(*inline_rational_result_))!=cudaSuccess)){error="igc inline device buffers";return false;}
-            rational::Operand left=operand(call->numbers[0]);rational::Result result;
-            for(std::size_t step=0;step<call->operations.size();++step) {
-                rational::Request request;request.operation=static_cast<rational::Operation>(call->operations[step]);request.invocation=1;
-                request.lhs=left;request.rhs=operand(call->numbers[step+1]);
+            std::vector<rational::Operand> stack;
+            for(const auto& step:call->program) {
+                if(step.number) {
+                    rational::Operand operand;operand.numerator=step.value.coefficient;
+                    operand.denominator.length=static_cast<uint8_t>(step.value.scale+1);operand.denominator.digits[step.value.scale]=1;
+                    stack.push_back(operand);continue;
+                }
+                if(stack.size()<2){error="igc inline program";return false;}
+                rational::Request request;request.operation=static_cast<rational::Operation>(step.operation);request.invocation=1;
+                request.rhs=stack.back();stack.pop_back();request.lhs=stack.back();stack.pop_back();
+                rational::Result result;
                 if(cudaMemcpyAsync(inline_rational_request_,&request,sizeof(request),cudaMemcpyHostToDevice,stream_)!=cudaSuccess
                         || !rational::execute(inline_rational_request_,inline_rational_result_,1,stream_,error)
                         || cudaMemcpyAsync(&result,inline_rational_result_,sizeof(result),cudaMemcpyDeviceToHost,stream_)!=cudaSuccess
                         || cudaStreamSynchronize(stream_)!=cudaSuccess){if(error.empty())error="igc inline execution";return false;}
                 if(result.status!=rational::Status::Success)return true;
-                left.numerator=result.value.numerator;left.denominator=result.value.denominator;
+                rational::Operand next;next.numerator=result.value.numerator;next.denominator=result.value.denominator;
+                stack.push_back(next);
             }
-            const auto tokens=strata::igc::rational_tokens(result.value,call->spaced);
+            if(stack.size()!=1){error="igc inline program";return false;}
+            rational::Rational final_value;final_value.numerator=stack.back().numerator;final_value.denominator=stack.back().denominator;
+            const auto tokens=strata::igc::rational_tokens(final_value,call->spaced);
             if(!tokens)return true;
             value=*tokens;
         }
@@ -333,8 +343,8 @@ public:
         if(std::find(generated_.begin(),generated_.end(),kThinkClose)==generated_.end()) {
             // A repeat means the model is re-checking: say so once, then close the thinking.
             int64_t key=0;
-            for(const auto op:call->operations)key=key*7+static_cast<int64_t>(op);
-            for(const auto& number:call->numbers)key=key*1000003+number_key(number.coefficient)+number.scale;
+            for(const auto& step:call->program)
+                key=key*1000003+(step.number?number_key(step.value.coefficient)+step.value.scale:static_cast<int64_t>(step.operation));
             const auto seen=std::count(inline_seen_.begin(),inline_seen_.end(),key);
             inline_seen_.push_back(key);
             if(!seen)bridge_tokens_.insert(bridge_tokens_.end(),{318,44839,553}); // ` (exact).`
