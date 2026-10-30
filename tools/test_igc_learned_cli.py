@@ -26,6 +26,12 @@ class LearnedAdmission(unittest.TestCase):
             "--igc-learned-diagnostic-bundle", "missing-controller.bin",
             "--igc-output-diagnostic-artifact", "missing-output.bin"))
 
+    def test_coherent_observation_requires_both_paths_and_bound_controller(self):
+        for args in [("--igc-observation-plan","plan.bin"),
+                     ("--igc-observation-root","out"),
+                     ("--igc-observation-plan","plan.bin","--igc-observation-root","out")]:
+            self.assertIn("IGC observation requires plan, fresh root and bound learned bundle",self.invoke(*args))
+
     @unittest.skipUnless(os.environ.get("STRATA_IGC_MODEL_INPUT"), "select an existing model for metadata-only admission")
     def test_valid_native_route_reaches_bundle_validation(self):
         model = os.environ["STRATA_IGC_MODEL_INPUT"]

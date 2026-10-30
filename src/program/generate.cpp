@@ -453,6 +453,7 @@ struct Options {
     std::string dump_mixed;
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
     std::string igc_output_artifact,igc_output_fixture,igc_learned_bundle;
+    std::string igc_observation_plan,igc_observation_root;
 #endif
     /// One residual snapshot per layer per position: `n_layers * hc * n_embd` floats per position, appended in
     /// position order.  This is the C1 BISECTION LADDER - it is what `llama-debug --tensor-filter l_last` prints
@@ -2537,6 +2538,8 @@ int main(int argc, char** argv) {
         else if (a == "--igc-output-diagnostic-artifact") o.igc_output_artifact = next("--igc-output-diagnostic-artifact");
         else if (a == "--igc-output-diagnostic-fixture") o.igc_output_fixture = next("--igc-output-diagnostic-fixture");
         else if (a == "--igc-learned-diagnostic-bundle") o.igc_learned_bundle = next("--igc-learned-diagnostic-bundle");
+        else if (a == "--igc-observation-plan") o.igc_observation_plan = next("--igc-observation-plan");
+        else if (a == "--igc-observation-root") o.igc_observation_root = next("--igc-observation-root");
 #endif
         else if (a == "--dump-layers") o.dump_layers = next("--dump-layers");
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
@@ -2912,6 +2915,10 @@ int main(int argc, char** argv) {
         }   // if (!parsed)
     }
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+    if((!o.igc_observation_plan.empty() || !o.igc_observation_root.empty())
+            && (o.igc_observation_plan.empty() || o.igc_observation_root.empty() || o.igc_learned_bundle.empty())) {
+        std::fprintf(stderr,"IGC observation requires plan, fresh root and bound learned bundle\n");return 2;
+    }
     if(!o.igc_learned_bundle.empty()) {
         if(!o.igc_output_artifact.empty() || !o.igc_output_fixture.empty()) {
             std::fprintf(stderr,"IGC learned diagnostic cannot combine with controlled output fixtures\n");return 2;
@@ -3531,7 +3538,12 @@ int main(int argc, char** argv) {
                 || !igc_learned->bind(std::filesystem::path(o.pack)/"tokenizer",model_paths,err)) {
             std::fprintf(stderr,"strata IGC learned: %s\n",err.c_str());return 2;
         }
-        std::fprintf(stderr,"strata IGC learned: first-anchor diagnostic; batched-missing features bypass, no oracle operands\n");
+        if(!o.igc_observation_plan.empty() && !igc_learned->observe_only(o.igc_observation_plan,o.igc_observation_root,err)) {
+            std::fprintf(stderr,"strata IGC observation: %s\n",err.c_str());return 2;
+        }
+        std::fprintf(stderr,"strata IGC learned: %s\n",igc_learned->observing()
+            ?"coherent observation only; no result injection; missing features fail capture"
+            :"first-anchor diagnostic; batched-missing features bypass, no oracle operands");
     }
     std::unique_ptr<strata::program::IgcOutputDiagnostic> igc_output;
     if(!o.igc_output_artifact.empty() || !o.igc_output_fixture.empty()) {
@@ -12615,6 +12627,9 @@ int main(int argc, char** argv) {
             if (use_mtp) mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+            if(igc_learned && igc_learned->observing() && max_new!=1) {
+                std::printf("ERR coherent observation requires exactly one generated token per owned request\n");return serve_fatal();
+            }
             if(igc_learned && !igc_learned->begin(cur,read_from,igc_same_live && from_live && reread_to<=0,
                     req_imgs.empty(),err)) {
                 std::printf("ERR %s\n",err.c_str());return serve_fatal();
@@ -14296,6 +14311,11 @@ int main(int argc, char** argv) {
             }
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
             if(igc_learned) {
+                if(igc_learned->observing()) {
+                    if(!igc_learned->finish_observation(ver,native_head,!cancelled && finish!="cancel" && produced_n==1,err)) {
+                        std::printf("ERR %s\n",err.c_str());return serve_fatal();
+                    }
+                } else {
                 strata::igc::Invocation record;uint32_t status=0;
                 if(!igc_learned->audit(record,status,err)) {
                     std::printf("ERR %s\n",err.c_str());return serve_fatal();
@@ -14306,6 +14326,7 @@ int main(int argc, char** argv) {
                 const auto* bytes=reinterpret_cast<const unsigned char*>(&record);
                 for(std::size_t j=0;j<sizeof(record);++j)std::fprintf(stderr,"%02x",bytes[j]);
                 std::fputc('\n',stderr);
+                }
             }
 #endif
             if (dec_timing && dec_windows > 0) {

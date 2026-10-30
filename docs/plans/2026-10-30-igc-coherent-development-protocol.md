@@ -221,3 +221,14 @@ language/frame/width/sign cells and cluster-level uncertainty. Any failure is
 evidence for a separately designed training/data change, not permission to tune
 thresholds, fit this evaluation set, promote an artifact or close I2/I3. This
 protocol is the next measured gate investigation, not another executor benchmark.
+
+## Implementation checkpoint
+
+The [joint observation infrastructure report](../reports/2026-10-30-igc-coherent-observation.md)
+records the default-off producer, v2 input-only plan, bounded v3 staging/compact
+archive, manifest-only preparation and component tests. The actual tokenizer
+fixes 400 anchors plus 570 extra output positions, 970 requests total. The 1488 upper
+bound and existing resource reserves are not reduced. Native/compact v3 refuses
+existing or partial directories; cross-process resume is deliberately unsupported.
+Full-model Verifier readback, live cache lineage, disabled parity and resource
+fit remain unverified until a separately admitted bounded collection runs.
