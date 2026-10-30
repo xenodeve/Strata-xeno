@@ -38,6 +38,8 @@ int main() try {
     auto divided = parse_inline(std::vector<int32_t>{16, 17, 1624, 115, 220, 18, 283});  // 12 ÷ 3 =
     require(divided && program(divided) == std::vector<int>{12, 3, -4} && !divided->exact_integers(), "division");
     require(!parse_inline(std::vector<int32_t>{13, 20, 10, 17, 28}), "bare point");
+    auto squares = parse_inline(std::vector<int32_t>{18, 61, 17, 478, 220, 19, 61, 17, 283});  // 3^2 + 4^2 =
+    require(squares && program(squares) == std::vector<int>{3, 2, -5, 4, 2, -5, -1}, "powers");
     auto percent = parse_inline(std::vector<int32_t>{18, 15, 4, 314, 220, 16, 23, 15, 283});  // 30% of 180 =
     require(percent && program(percent) == std::vector<int>{30, 180, -3} && percent->program[0].value.scale == 2 && !percent->exact_integers(), "percent of");
     auto dollars = parse_inline(std::vector<int32_t>{3, 20, 348, 220, 18, 283});  // $5 * 3 =

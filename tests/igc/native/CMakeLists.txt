@@ -47,7 +47,7 @@ target_compile_options(igc_readiness PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--ftz=fa
 add_executable(igc_readiness_probe "${IGC_ROOT}/tests/igc/readiness_probe.cpp")
 target_compile_features(igc_readiness_probe PRIVATE cxx_std_20)
 target_link_libraries(igc_readiness_probe PRIVATE igc_readiness)
-add_library(igc_inline_rational STATIC "${IGC_ROOT}/src/kernels/igc_rational_exact.cu")
+add_library(igc_inline_rational STATIC "${IGC_ROOT}/src/kernels/igc_rational_exact.cu" "${IGC_ROOT}/src/kernels/igc_integer_extended.cu")
 target_include_directories(igc_inline_rational PUBLIC "${IGC_ROOT}/include")
 target_link_libraries(igc_inline_rational PUBLIC CUDA::cudart)
 set_target_properties(igc_inline_rational PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED YES)

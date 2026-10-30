@@ -8,10 +8,11 @@
 #include <span>
 #include <vector>
 #include "strata/core/igc_exact.hpp"
+#include "strata/core/igc_integer_extended.hpp"
 #include "strata/core/igc_rational_exact.hpp"
 
 namespace strata::igc {
-enum class InlineOperation : uint32_t { Add = 1, Subtract = 2, Multiply = 3, Divide = 4 };
+enum class InlineOperation : uint32_t { Add = 1, Subtract = 2, Multiply = 3, Divide = 4, Power = 5 };
 struct InlineNumber {
     Integer coefficient{};
     uint32_t scale = 0;  // value = coefficient * 10^-scale
@@ -42,6 +43,7 @@ inline std::optional<InlineOperation> operation(int32_t t) {
         case kMinus: case kSpacedMinus: return InlineOperation::Subtract;
         case 9: case 348: case 17044: case 23985: case kTimesDollar: return InlineOperation::Multiply;
         case 14: case 593: case 169814: return InlineOperation::Divide;
+        case 61: case 6108: return InlineOperation::Power;
         default: return std::nullopt;
     }
 }
@@ -127,13 +129,22 @@ struct InlineParser {
         at = last;
         return true;
     }
-    bool product() {
+    bool power() {
         if (!primary()) return false;
+        size_t width = 1;
+        if (peek(width) != InlineOperation::Power) return true;
+        at += width;
+        if (!power()) return false;  // right to left
+        call.program.push_back(InlineStep{false, InlineOperation::Power, {}});
+        return true;
+    }
+    bool product() {
+        if (!power()) return false;
         for (size_t width = 1;;) {
             const auto op = peek(width);
             if (!op || (*op != InlineOperation::Multiply && *op != InlineOperation::Divide)) return true;
             at += width;
-            if (!primary()) return false;
+            if (!power()) return false;
             call.program.push_back(InlineStep{false, *op, {}});
         }
     }

@@ -300,6 +300,21 @@ public:
                 strata::igc::ExactRequest request;request.operation=static_cast<strata::igc::Operation>(step.operation);request.invocation=1;
                 request.rhs=stack.back();stack.pop_back();request.lhs=stack.back();stack.pop_back();
                 strata::igc::ExactResult result;
+                if(step.operation==strata::igc::InlineOperation::Power) {
+                    namespace extended=strata::igc::integer_extended;
+                    extended::Request power;power.operation=extended::Operation::Power;power.invocation=1;
+                    power.lhs=request.lhs;power.rhs=request.rhs;
+                    extended::Result raised;
+                    // ABI2 records have ABI1's size, so the same device buffers carry them.
+                    auto* device_request=reinterpret_cast<extended::Request*>(inline_request_);
+                    auto* device_result=reinterpret_cast<extended::Result*>(inline_result_);
+                    if(cudaMemcpyAsync(device_request,&power,sizeof(power),cudaMemcpyHostToDevice,stream_)!=cudaSuccess
+                            || !extended::execute(device_request,device_result,1,stream_,error)
+                            || cudaMemcpyAsync(&raised,device_result,sizeof(raised),cudaMemcpyDeviceToHost,stream_)!=cudaSuccess
+                            || cudaStreamSynchronize(stream_)!=cudaSuccess){if(error.empty())error="igc inline execution";return false;}
+                    if(raised.status!=extended::Status::Success)return true;
+                    stack.push_back(raised.value);continue;
+                }
                 if(cudaMemcpyAsync(inline_request_,&request,sizeof(request),cudaMemcpyHostToDevice,stream_)!=cudaSuccess
                         || !strata::igc::execute_exact(inline_request_,inline_result_,1,stream_,error)
                         || cudaMemcpyAsync(&result,inline_result_,sizeof(result),cudaMemcpyDeviceToHost,stream_)!=cudaSuccess
@@ -321,6 +336,7 @@ public:
                     stack.push_back(operand);continue;
                 }
                 if(stack.size()<2){error="igc inline program";return false;}
+                if(step.operation==strata::igc::InlineOperation::Power)return true; // fractional powers stay the model's
                 rational::Request request;request.operation=static_cast<rational::Operation>(step.operation);request.invocation=1;
                 request.rhs=stack.back();stack.pop_back();request.lhs=stack.back();stack.pop_back();
                 rational::Result result;

@@ -21,8 +21,13 @@ ARITHMETIC=('two_digit_addition','two_digit_subtraction','two_digit_multiplicati
 BIGBENCH=('3d_addition','3d_subtraction','3d_multiplication','5d_addition','5d_subtraction','5d_multiplication')
 
 
-def cases(data,arithmetic,gsm,bigbench=0):
+def cases(data,arithmetic,gsm,bigbench=0,math=0):
     rows=[]
+    if math:
+        problems=[json.loads(line) for line in (data/'math500.jsonl').read_text(encoding='utf-8').splitlines()]
+        problems=[row for row in problems if re.fullmatch(r'-?\d+',str(row['answer']))]
+        for i,row in enumerate(problems[:math]):
+            rows.append(dict(id=f'math-{i}',suite='math500',prompt=row['problem'],answer=int(row['answer']),limit=8192))
     for name in BIGBENCH if bigbench else ():
         for i,row in enumerate(json.loads((data/'bigbench'/f'{name}.json').read_text(encoding='utf-8'))['examples'][:bigbench]):
             rows.append(dict(id=f'{name}-{i}',suite=name,prompt=row['input'],answer=int(row['target']),limit=2048))
@@ -56,12 +61,12 @@ def score(records):
     return suites
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
     tokenizer=NativeText.from_pack(pack/'tokenizer');prefix,suffix=wrapped_prefix(reference,tokenizer)
-    rows=cases(data,arithmetic,gsm,bigbench)
+    rows=cases(data,arithmetic,gsm,bigbench,math)
     (output/'cases.json').write_text(json.dumps(rows,ensure_ascii=False),encoding='utf-8')
     sys.path[:0]=[str(server.parent),str(server.parent.parent)]
     spec=importlib.util.spec_from_file_location('igc_bench_hub',server)
@@ -70,6 +75,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     args[args.index('--expert-profile')+1]=str(output/'initial-profile.bin')
     args[args.index('--expert-profile-save')+1]=str(output/'learned-profile.bin')
     if bundle:args+=['--igc-learned-diagnostic-bundle',str(bundle)]+(['--igc-inline-exec'] if inline else ['--igc-result-bridge'] if bridge else [])
+    if no_adapt:args[args.index('--adapt-swaps')+1]='0';args[args.index('--adapt-secondary')+1]='0'
     cfg.update(exe=str(executable),args=args,log=str(output/'engine.log'))
     env=helper.child_env(cfg);env.pop('STRATA_TIMELINE',None);validate_launcher_env(env)
     original=subprocess.Popen
@@ -115,5 +121,5 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     for key in ('profile','server','executable','data','reference','pack','output'):parser.add_argument('--'+key,type=Path,required=True)
-    parser.add_argument('--bundle',type=Path);parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40);parser.add_argument('--bigbench',type=int,default=0);parser.add_argument('--bridge',action='store_true');parser.add_argument('--inline',action='store_true')
+    parser.add_argument('--bundle',type=Path);parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40);parser.add_argument('--bigbench',type=int,default=0);parser.add_argument('--bridge',action='store_true');parser.add_argument('--inline',action='store_true');parser.add_argument('--math',type=int,default=0);parser.add_argument('--no-adapt',action='store_true')
     run(**vars(parser.parse_args()))
