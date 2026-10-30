@@ -60,11 +60,21 @@ class NpyRows:
             output.truncate(output.tell()+count*80*4*2560*4)
         return cls(path,True)
     def __len__(self):return self.shape[0]
-    def __getitem__(self,selection):
+    def _selection(self,selection):
         if (not isinstance(selection,np.ndarray) or selection.ndim!=1 or not 1<=len(selection)<=64
                 or selection.dtype not in (np.int32,np.int64) or np.any(selection<0) or np.any(selection>=len(self))):
             raise ValueError('bounded file-row selection')
+
+    def __getitem__(self,selection):
+        self._selection(selection)
         result=np.empty((len(selection),80,4,2560),dtype=np.float32)
+        return self.read_into(selection,result)
+
+    def read_into(self,selection,result):
+        self._selection(selection)
+        if (not isinstance(result,np.ndarray) or result.shape!=(len(selection),80,4,2560)
+                or result.dtype!=np.float32 or not result.flags.c_contiguous or not result.flags.writeable):
+            raise ValueError('bounded writable F32 row destination')
         for i,row in enumerate(selection):
             self.file.seek(self.offset+int(row)*self.row_bytes)
             view=memoryview(result[i]).cast('B');done=0
