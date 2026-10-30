@@ -453,6 +453,7 @@ struct Options {
     std::string dump_mixed;
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
     std::string igc_output_artifact,igc_output_fixture,igc_learned_bundle;
+    bool igc_result_bridge=false;
     std::string igc_observation_plan,igc_observation_root;
 #endif
     /// One residual snapshot per layer per position: `n_layers * hc * n_embd` floats per position, appended in
@@ -951,6 +952,7 @@ void usage() {
                  "  --igc-output-diagnostic-artifact PATH  controlled I3 native mapper (not production)\n"
                  "  --igc-output-diagnostic-fixture PATH   exact-prefix checked-result fixture\n"
                  "  --igc-learned-diagnostic-bundle PATH  learned first-anchor controller (not production)\n"
+                 "  --igc-result-bridge  emit the executed result as tokens instead of the output mapper\n"
 #endif
                  "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
                  "                       event interval includes host gaps, so run with --gpu-only-full first\n"
@@ -2547,6 +2549,7 @@ int main(int argc, char** argv) {
         else if (a == "--igc-output-diagnostic-artifact") o.igc_output_artifact = next("--igc-output-diagnostic-artifact");
         else if (a == "--igc-output-diagnostic-fixture") o.igc_output_fixture = next("--igc-output-diagnostic-fixture");
         else if (a == "--igc-learned-diagnostic-bundle") o.igc_learned_bundle = next("--igc-learned-diagnostic-bundle");
+        else if (a == "--igc-result-bridge") o.igc_result_bridge = true;
         else if (a == "--igc-observation-plan") o.igc_observation_plan = next("--igc-observation-plan");
         else if (a == "--igc-observation-root") o.igc_observation_root = next("--igc-observation-root");
 #endif
@@ -3540,6 +3543,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<strata::program::IgcLearnedDiagnostic> igc_learned;
     if(!o.igc_learned_bundle.empty()) {
         igc_learned=std::make_unique<strata::program::IgcLearnedDiagnostic>();
+        igc_learned->set_bridge(o.igc_result_bridge);
         std::vector<std::filesystem::path> model_paths;
         for(const auto& path:o.native_shards)model_paths.emplace_back(path);
         std::fprintf(stderr,"strata IGC learned: validating bundle and content-binding model/tokenizer before allocation\n");
@@ -14004,11 +14008,19 @@ int main(int argc, char** argv) {
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
+                bool igc_delivering = false;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                if (igc_learned && !first_window) {
+                    igc_delivering = igc_learned->delivering(err);
+                    if (!err.empty()) { std::printf("ERR %s\n", err.c_str()); return serve_fatal(); }
+                    if (igc_delivering) T = 1;
+                }
+#endif
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window) {
+                if (o.suffix_draft > 0 && !first_window && !igc_delivering) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
@@ -14018,7 +14030,7 @@ int main(int argc, char** argv) {
                 }
                 // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
                 int chain_n = 0, cm = 0;
-                if (o.lookup_chain > 0 && !first_window && !from_sfx && T < S) {
+                if (o.lookup_chain > 0 && !first_window && !from_sfx && !igc_delivering && T < S) {
                     int csrc = -1;
                     const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
                     chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
@@ -14197,6 +14209,13 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                if (igc_learned && o.igc_result_bridge && T == 1) {
+                    const bool bridged = igc_learned->delivering(err);
+                    if (!err.empty()) { std::printf("ERR %s\n", err.c_str()); return serve_fatal(); }
+                    if (bridged) igc_learned->bridge_sample(outv[0]);
+                }
+#endif
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 trace_commit(drive, T, a, strata::core::routing_trace::kPhaseDecode);   // #85

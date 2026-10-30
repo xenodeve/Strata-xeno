@@ -30,7 +30,8 @@ class IgcLearnedDiagnostic {
     void* observation_q8_=nullptr;
     cudaStream_t stream_=nullptr;
     uint64_t invocation_=0,anchor_=0;
-    bool loaded_=false,active_=false,staged_=false,invocation_known_=false,invoked_=false;
+    bool loaded_=false,active_=false,staged_=false,invocation_known_=false,invoked_=false,bridge_=false;
+    std::vector<int32_t> bridge_tokens_;std::size_t bridge_at_=0;
     bool note_stream(void* stream,std::string& error) {
         if(!observation_ || stream==stream_)return true;
         for(size_t i=0;i<producer_streams_.size();++i)if(producer_streams_[i]==stream || !producer_streams_[i]) {
@@ -237,9 +238,29 @@ public:
         if(!invocation_known_) {
             strata::igc::Invocation record;uint32_t status=0;
             if(!pipeline_->audit(record,status,stream_,error))return false;
-            invoked_=record.evaluations>0;invocation_known_=true;
+            invoked_=record.evaluations>0 && record.result.status==strata::igc::Status::Success;invocation_known_=true;
+            bridge_tokens_.clear();bridge_at_=0;
+            if(bridge_ && invoked_)bridge_tokens_=result_tokens(record.result.value);
         }
+        if(bridge_)return bridge_at_<bridge_tokens_.size();
         return invoked_ && !pipeline_->output_ended();
+    }
+    // Token-result bridge: the executed value, as the answer's own tokens (packs/gyro-m).
+    static std::vector<int32_t> result_tokens(const strata::igc::Integer& v) {
+        std::vector<int32_t> digits;
+        for(int i=v.length-1;i>=0;--i)digits.push_back(15+v.digits[i]);
+        std::vector<int32_t> out{760,1067,369,v.negative?471:220};
+        out.insert(out.end(),digits.begin(),digits.end());
+        out.insert(out.end(),{13,198,248069,271});
+        if(v.negative)out.push_back(12);
+        out.insert(out.end(),digits.begin(),digits.end());
+        out.push_back(248046);
+        return out;
+    }
+    void set_bridge(bool on){bridge_=on;}
+    // One-token rounds only: replaces the sampled token while a bridged result is delivered.
+    void bridge_sample(int32_t& token) {
+        if(bridge_ && bridge_at_<bridge_tokens_.size())token=bridge_tokens_[bridge_at_++];
     }
     bool end_output_after(std::span<const int64_t> accepted,std::string& error) {
         if(!pipeline_ || observation_ || std::find(accepted.begin(),accepted.end(),kThinkClose)==accepted.end())return true;

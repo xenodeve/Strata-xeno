@@ -18,10 +18,14 @@ from tools.qwenputer.memory import system_snapshot
 from tools.qwenputer.tokenizer import NativeText
 
 ARITHMETIC=('two_digit_addition','two_digit_subtraction','two_digit_multiplication')
+BIGBENCH=('3d_addition','3d_subtraction','3d_multiplication','5d_addition','5d_subtraction','5d_multiplication')
 
 
-def cases(data,arithmetic,gsm):
+def cases(data,arithmetic,gsm,bigbench=0):
     rows=[]
+    for name in BIGBENCH if bigbench else ():
+        for i,row in enumerate(json.loads((data/'bigbench'/f'{name}.json').read_text(encoding='utf-8'))['examples'][:bigbench]):
+            rows.append(dict(id=f'{name}-{i}',suite=name,prompt=row['input'],answer=int(row['target']),limit=2048))
     for name in ARITHMETIC:
         lines=(data/f'{name}.jsonl').read_text(encoding='utf-8').splitlines()[:arithmetic]
         for i,line in enumerate(lines):
@@ -52,12 +56,12 @@ def score(records):
     return suites
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
     tokenizer=NativeText.from_pack(pack/'tokenizer');prefix,suffix=wrapped_prefix(reference,tokenizer)
-    rows=cases(data,arithmetic,gsm)
+    rows=cases(data,arithmetic,gsm,bigbench)
     (output/'cases.json').write_text(json.dumps(rows,ensure_ascii=False),encoding='utf-8')
     sys.path[:0]=[str(server.parent),str(server.parent.parent)]
     spec=importlib.util.spec_from_file_location('igc_bench_hub',server)
@@ -65,7 +69,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     args=list(cfg['args']);shutil.copyfile(args[args.index('--expert-profile')+1],output/'initial-profile.bin')
     args[args.index('--expert-profile')+1]=str(output/'initial-profile.bin')
     args[args.index('--expert-profile-save')+1]=str(output/'learned-profile.bin')
-    if bundle:args+=['--igc-learned-diagnostic-bundle',str(bundle)]
+    if bundle:args+=['--igc-learned-diagnostic-bundle',str(bundle)]+(['--igc-result-bridge'] if bridge else [])
     cfg.update(exe=str(executable),args=args,log=str(output/'engine.log'))
     env=helper.child_env(cfg);env.pop('STRATA_TIMELINE',None);validate_launcher_env(env)
     original=subprocess.Popen
@@ -111,5 +115,5 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     for key in ('profile','server','executable','data','reference','pack','output'):parser.add_argument('--'+key,type=Path,required=True)
-    parser.add_argument('--bundle',type=Path);parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40)
+    parser.add_argument('--bundle',type=Path);parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40);parser.add_argument('--bigbench',type=int,default=0);parser.add_argument('--bridge',action='store_true')
     run(**vars(parser.parse_args()))
