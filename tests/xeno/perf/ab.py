@@ -68,6 +68,73 @@ def memory_peak_line(peak, samples, errors):
     return (f"memory peak              system in use {peak[0]:.2f} GiB  committed {peak[1]:.2f} GiB  "
             f"process private {peak[2]:.2f} GiB  working set {peak[3]:.2f} GiB\n")
 
+
+def _session(value):
+    if (not isinstance(value, dict) or type(value.get('version')) is not int or value['version'] != 1
+            or not isinstance(value.get('arms'), dict) or not 1 <= len(value['arms']) <= 16
+            or any(not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', k) or not isinstance(v, str)
+                   or not re.fullmatch(r'[0-9a-f]{64}', v) for k, v in value['arms'].items())
+            or not isinstance(value.get('order'), list) or not 1 <= len(value['order']) <= 1024
+            or any(not isinstance(k, str) or k not in value['arms'] for k in value['order'])
+            or set(value['order']) != set(value['arms'])
+            or not isinstance(value.get('prompts'), list) or not 1 <= len(value['prompts']) <= 64
+            or any(not isinstance(p, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', p) for p in value['prompts'])
+            or len(set(value['prompts'])) != len(value['prompts'])):
+        raise ValueError('invalid measurement session manifest')
+    return value
+
+
+def _prompt_evidence(root, session, prompt):
+    failures=[]; outputs=[]; memory=[]
+    expected={f'{prompt}-{i}-{arm}' for i,arm in enumerate(session['order'],1)}
+    for suffix in ('.stdout','.stderr','.run.json'):
+        actual={p.name[:-len(suffix)] for p in root.glob('*'+suffix)
+                if re.fullmatch(re.escape(prompt)+r'-[1-9][0-9]*-.+'+re.escape(suffix),p.name)}
+        if actual != expected: failures.append('missing or extra scheduled '+suffix)
+    for i,arm in enumerate(session['order'],1):
+        tag=f'{prompt}-{i}-{arm}'; meta=root/(tag+'.run.json')
+        if meta.stat().st_size>4096: raise ValueError('run receipt size')
+        record=json.loads(meta.read_text(encoding='utf-8'))
+        if (type(record.get('version')) is not int or record['version']!=1 or record.get('prompt')!=prompt
+                or type(record.get('ordinal')) is not int or record['ordinal']!=i or record.get('arm')!=arm
+                or record.get('exe_sha256')!=session['arms'][arm]
+                or type(record.get('returncode')) is not int or record['returncode']!=0):
+            failures.append('failed or mismatched run receipt')
+        for suffix in ('stdout','stderr'):
+            with (root/(tag+'.'+suffix)).open('rb') as stream:
+                if hashlib.file_digest(stream,'sha256').hexdigest()!=record.get(suffix+'_sha256'):
+                    failures.append('raw log identity mismatch')
+        output,_=parse_run((root/(tag+'.stdout')).read_text(encoding='utf-8'))
+        if output is None or not output.split() or any(not t.isdigit() for t in output.split()):
+            failures.append('missing or invalid greedy token output')
+        outputs.append(output); memory.append(record.get('memory_complete') is True)
+    return failures, outputs, memory
+
+
+def session_evidence(out, prompt):
+    root = Path(out); manifest = root / 'session.json'
+    if not manifest.is_file():
+        return dict(complete=False, parity_qualified=False, memory_complete=False,
+                    reason='unverified legacy completeness: no session manifest')
+    failures=[]; memory=[]; outputs=[]
+    try:
+        if manifest.stat().st_size > 1024*1024: raise ValueError('manifest size')
+        session = _session(json.loads(manifest.read_text(encoding='utf-8')))
+        if prompt not in session['prompts']: raise ValueError('prompt not in session')
+        for arm, digest in session['arms'].items():
+            with (root/(arm+'.exe')).open('rb') as stream:
+                if hashlib.file_digest(stream,'sha256').hexdigest()!=digest: failures.append('snapshot identity mismatch')
+        for scheduled_prompt in session['prompts']:
+            errors, raw, observed_memory = _prompt_evidence(root, session, scheduled_prompt)
+            failures.extend(errors); memory.extend(observed_memory)
+            if scheduled_prompt == prompt: outputs = raw
+        complete=not failures
+        return dict(complete=complete,parity_qualified=complete and len(session['arms'])>=2 and len(set(outputs))==1,
+                    memory_complete=complete and all(memory),reason='; '.join(sorted(set(failures))) or 'complete session')
+    except (OSError,ValueError,TypeError,AttributeError) as error:
+        return dict(complete=False,parity_qualified=False,memory_complete=False,
+                    reason='unverified session: '+str(error))
+
 T = os.environ.get("TEMP", os.environ.get("TMP", "."))
 REF = {"code": "strata-codex-dispatch-detail-code256", "thai": "strata-codex-dispatch-detail-thai256",
        "sky": "strata-codex-compact-parity-sky256", "long": "strata-codex-compact-parity-long256",
@@ -91,13 +158,20 @@ def main(argv):
         if a == "--order": order = argv[i + 1].split(","); i += 2; continue
         if a == "--extra": extra = argv[i + 1].split(); i += 2; continue
         k, v = a.split("=", 1); arms[k] = v; i += 1   # NAME=exe or NAME=exe|extra args for this arm
-    out = os.path.join(T, out_name); os.makedirs(out, exist_ok=True)
-    exe, sha, arm_args = {}, {}, {}
+    _session(dict(version=1, arms={k:'0'*64 for k in arms}, prompts=prompts, order=order))
+    out = os.path.join(T, out_name)
+    if os.path.isdir(out) and os.listdir(out): raise ValueError('measurement requires a fresh output directory; old evidence is preserved')
+    os.makedirs(out, exist_ok=True)
+    exe, sha, sha_full, arm_args = {}, {}, {}, {}
     for k, v in arms.items():
         path, _, args = v.partition("|")
         arm_args[k] = args.split()
         exe[k] = os.path.join(out, f"{k}.exe"); shutil.copy2(path, exe[k])
-        sha[k] = hashlib.sha256(open(exe[k], "rb").read()).hexdigest()[:12]
+        with open(exe[k], "rb") as stream: sha_full[k] = hashlib.file_digest(stream, 'sha256').hexdigest()
+        sha[k] = sha_full[k][:12]
+    session = _session(dict(version=1, arms=sha_full, prompts=prompts, order=order))
+    with open(os.path.join(out, 'session.json'), 'x', encoding='utf-8') as manifest:
+        json.dump(session, manifest, indent=2)
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="1,0")
     cuda = os.path.join("C:" + os.sep, "Program Files", "NVIDIA GPU Computing Toolkit", "CUDA", "v13.3", "bin")
     env["PATH"] = os.pathsep.join([cuda, os.path.join(cuda, "x64"), env["PATH"]])
@@ -121,8 +195,14 @@ def main(argv):
             stdout, stderr = pr.communicate(); th.join()
             stdout += memory_peak_line(peak, sample_count[0], sample_errors)
             p = subprocess.CompletedProcess(pr.args, pr.returncode, stdout, stderr)
-            open(os.path.join(out, tag + ".stdout"), "w", encoding="utf-8").write(p.stdout)
-            open(os.path.join(out, tag + ".stderr"), "w", encoding="utf-8").write(p.stderr)
+            log_hashes={}
+            for suffix, text in (('stdout',p.stdout),('stderr',p.stderr)):
+                path=os.path.join(out,tag+'.'+suffix)
+                with open(path,'w',encoding='utf-8') as stream: stream.write(text)
+                with open(path,'rb') as stream: log_hashes[suffix+'_sha256']=hashlib.file_digest(stream,'sha256').hexdigest()
+            with open(os.path.join(out, tag + '.run.json'), 'x', encoding='utf-8') as receipt:
+                json.dump(dict(version=1,prompt=prompt,ordinal=n,arm=arm,exe_sha256=sha_full[arm],
+                               returncode=p.returncode,memory_complete=not sample_errors and bool(sample_count[0]),**log_hashes),receipt)
             tps = re.search(STAGES["tok/s"], p.stdout)
             line = f"{tag} rc={p.returncode} sha={sha[arm]} tok/s {tps.group(1) if tps else 'NA'} wall {time.time()-t0:.0f}s memory={'unavailable' if sample_errors or not sample_count[0] else 'complete'}"
             print(line, flush=True); log.write(line + "\n"); log.flush()
@@ -146,9 +226,13 @@ def summarize(out, prompts):
             if not (f.startswith(prompt + "-") and f.endswith(".stdout")): continue
             output, vals = parse_run(open(os.path.join(out, f), encoding="utf-8").read())
             if output is None: continue
-            runs.setdefault(f[:-7].split("-")[-1], []).append((output, vals))
+            match=re.fullmatch(re.escape(prompt)+r'-[1-9][0-9]*-(.+)\.stdout',f)
+            if match: runs.setdefault(match.group(1), []).append((output, vals))
         outputs = {o for v in runs.values() for o, _ in v}
-        lines.append(f"{prompt}: {sum(len(v) for v in runs.values())} runs, outputs identical across arms: {len(outputs) == 1}")
+        evidence=session_evidence(out,prompt)
+        lines.append(f"{prompt}: {sum(len(v) for v in runs.values())} runs, outputs identical across arms: {evidence['parity_qualified']}; "
+                     f"session complete: {evidence['complete']}; memory complete: {evidence['memory_complete']}; {evidence['reason']}")
+        lines.append(f"  recorded outputs identical: {bool(outputs) and len(outputs)==1} (does not establish completeness)")
         for arm in sorted(runs):
             vals = [v for _, v in runs[arm]]
             keys = [k for k in STAGES if all(k in v for v in vals)]

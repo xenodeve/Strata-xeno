@@ -36,6 +36,20 @@ failing when its memory telemetry is incomplete. Successful-run peak text and TS
 columns are unchanged. Fake-API/launcher tests are in `tools/test_perf_memory.py`;
 they run without a model, GPU or live system-memory polling.
 
+New measurements require a fresh output directory. `session.json` freezes full
+executable hashes, prompts and arm order before launch; each `*.run.json` records
+the run identity, exit status, raw stdout/stderr hashes and memory completeness.
+Summary qualification requires every scheduled prompt/run to be present and
+successful, unchanged snapshots/logs and matching greedy outputs across at least
+two arms. Recorded token agreement, session completeness and memory completeness
+are separate facts. Old directories without this manifest remain readable with
+completeness explicitly unverified; old evidence is never overwritten or upgraded
+to a qualified session. `tools/test_perf_session.py` tests these gates with small
+files. This is an evidence gate, not automatic quality or performance approval.
+Log/snapshot verification adds diagnostic file I/O after the engine runs; the
+script's `wall` field includes postprocessing. Use paired engine stage counters
+for engine latency and separately measure actual Hub request latency.
+
 Measurement rules from AGENTS.md:
 
 - **Priority.** Every arm runs at `--pool-priority 2` and in the HIGH process priority class. `@normal` in an arm's args opts that arm out.

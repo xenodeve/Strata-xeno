@@ -80,3 +80,74 @@ Evidence basenames: `igc-perf-memory-red01.log`,
 `igc-perf-memory-red03.log`, `igc-perf-memory-integration05.log`,
 `igc-perf-memory-final08.log` and `igc-perf-memory-final08.json`.
 All engine/backend code is unchanged; no CUDA/HIP/SYCL build is required.
+
+## Session completeness and parity evidence
+
+A second small fixture reproduces a false reporting gate: the old summary says
+`outputs identical across arms: True` when only one recorded arm exists. It
+compares the set of available token strings without knowing which runs were
+scheduled or whether they exited successfully. This is not an inference bug, but
+cannot serve as the same-session cross-arm correctness gate required by AGENTS.
+
+The existing runner now validates arm/prompt names and schedule before filesystem
+side effects, requires a fresh output directory and freezes full executable
+hashes, prompts and order in `session.json`. Per-run receipts bind prompt, ordinal,
+arm, executable, exit status, stdout/stderr hashes and memory completeness. The
+summary checks the entire multi-prompt schedule, not just one prompt in isolation,
+and verifies snapshots and raw-log identity. Missing/extra/failed/mismatched runs,
+replaced logs, empty token output and unsupported receipts cannot qualify parity.
+At least two planned arms and identical raw token output are required. A valid
+single-arm measurement may be complete but cannot qualify cross-arm parity.
+
+Recorded output agreement, whole-session completeness and memory completeness
+are separate. Memory may be unavailable while token parity is established; that
+does not satisfy the resource gates. Divergent successful runs remain complete
+but fail parity. Legacy directories without session receipts remain readable as
+unverified completeness; their raw counters and outputs are preserved. Fresh
+measurement mode refuses nonempty directories instead of mixing or overwriting
+old evidence. A summary is not a substitute for independent task quality, an
+appropriate baseline, complete profiler-off ABBA counters or actual Hub traffic.
+
+Independent review reproduced three additional gaps before commit: arm-name
+validation after copying could escape the output directory; run status did not
+bind log content; and checking one prompt could qualify while another scheduled
+prompt was missing/failed. New red fixtures reproduce all three; the final fixes
+validate before copies, bind both logs and require whole-schedule completeness.
+Reviews have no remaining material findings. The executable snapshot/run receipt
+is evidence from this trusted local harness, not cryptographic proof against a
+party able to rewrite all local evidence and manifests.
+
+The final CPU suite passes **17 tests and 10 subcases**: eight session tests,
+seven memory tests and two existing stage-parser fixtures. One process takes
+1.047 seconds including pytest initialization, with lifetime peaks of
+**32,362,496 bytes private commitment / 41,353,216 bytes working set**. Fake APIs,
+fake launchers and small files are used; no model, GPU, training, admission check
+or actual benchmark runs. Evidence: `igc-perf-session-red01.log`,
+`igc-perf-session-red02.log`, `igc-perf-session-review-red04.log`,
+`igc-perf-session-review-green04.log`, `igc-perf-session-final05.log`/`.json`.
+
+Engine commands/priorities, sampling interval, CUDA placement and default arm
+order remain unchanged. Snapshot/log verification adds diagnostic file I/O after
+the engine finishes. The legacy script's `wall` field includes postprocessing;
+do not compare that field to historical wall values as a claim about engine
+latency. Engine stage counters remain the paired source for those claims; Hub
+end-to-end latency needs its own request measurements. No speedup is claimed.
+
+## Critical-path backlog after these corrections
+
+The inspected CPU-only measurement gaps are now addressed. The repo already has
+ABBA orchestration, per-stage parsing and the pipeline timeline, so a second
+generic benchmark runner would duplicate them. I5 still needs validated I3/I4
+arms, a frozen supported workload/rubric and actual Hub sessions. Preparing a
+benchmark invocation around the current unqualified learned route would not
+establish usability or meet the user's requested sequence.
+
+The next decisive I2/I3 checks need coherent observations from the real Verifier
+and native head/cache behavior, then actual native readout/controller and output
+control replay. I4 needs accepted-prefix/MTP/repeated-trigger behavior on the real
+decoder. Existing host metadata and cancellation/trial interfaces are present;
+their unresolved claims concern those GPU/model states, which new CPU fake
+callbacks cannot validate. Further optimization needs the timeline and actual
+quality/per-stage evidence. The remaining capability milestones depend on that
+foundation, so this work does not invent another interpreter, change the frozen
+corpora or claim PRD completion while live execution is unavailable.
