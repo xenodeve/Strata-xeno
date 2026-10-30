@@ -2012,7 +2012,16 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const stra
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
 bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     std::string error;
-    if (strata::core::conversation_checkpoint_save(c, ss, g, error)) return true;
+    // A system-managed page file grows on demand, a moment after the failed commit asks for it (#276).
+    for (int attempt = 0;; ++attempt) {
+        try {
+            if (strata::core::conversation_checkpoint_save(c, ss, g, error)) return true;
+            break;
+        } catch (const std::bad_alloc&) {
+            if (attempt == 100) throw;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
     std::fprintf(stderr, "strata serve: checkpoint save: %s\n", error.c_str());   // the caller's ERR has no reason
     return false;
 }
@@ -14224,7 +14233,8 @@ int main(int argc, char** argv) {
                 if(igc_learned) {
                     std::array<int64_t,64> accepted;
                     std::copy_n(window.begin(),a+1,accepted.begin());
-                    if(!igc_learned->capture(ver,p,std::span<const int64_t>(accepted.data(),a+1),err)) {
+                    if(!igc_learned->capture(ver,p,std::span<const int64_t>(accepted.data(),a+1),err)
+                            || !igc_learned->end_output_after(std::span<const int64_t>(accepted.data(),a+1),err)) {
                         if(adapt_thr.joinable())adapt_thr.join();
                         std::printf("ERR %s\n",err.c_str());return serve_fatal();
                     }

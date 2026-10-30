@@ -9,6 +9,8 @@ namespace strata::igc {
 struct ControllerBundle {
     adapter::Digest model{},tokenizer{},manifest{};
     std::array<adapter::Artifact,4> networks;
+    // Manifest version 2: the attention readout alone selects; embedding is not run.
+    bool single_readout=false;
 };
 // Fixed204-byte manifest and fixed sibling filenames; validate every network
 // before publishing anything to `out`. Refuses production before file access.

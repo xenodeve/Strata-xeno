@@ -62,6 +62,14 @@ static void replay(strata::igc::LatentPipeline& pipeline,const strata::igc::Cont
             check(cudaGraphExecDestroy(many_exec));check(cudaGraphDestroy(many));broadcast_checked=true;
         }
         selected+=first.evaluations;
+        // After end_output the head stays unchanged, the audit keeps the answer and nothing executes again.
+        if(first.result.status==strata::igc::Status::Success){
+            require(pipeline.end_output(stream,error),error);
+            check(cudaMemcpyAsync(device_mixed.p,mixed.data(),mixed.size()*4,cudaMemcpyHostToDevice,stream));check(cudaGraphLaunch(instance,stream));
+            strata::igc::Invocation ended;uint32_t ended_status=0;require(pipeline.audit(ended,ended_status,stream,error),error);
+            check(cudaMemcpyAsync(after.data(),device_mixed.p,2560*4,cudaMemcpyDeviceToHost,stream));check(cudaStreamSynchronize(stream));
+            require(!std::memcmp(&ended,&first,sizeof(first)) && ended_status==first_status && !std::memcmp(after.data(),mixed.data(),2560*4),"pipeline_end_output");
+        }
         saved.write(reinterpret_cast<const char*>(&first),sizeof(first));saved.write(reinterpret_cast<const char*>(&first_status),4);saved.write(reinterpret_cast<const char*>(first_output.data()),2560*4);
     }
     require(file.peek()==std::char_traits<char>::eof() && saved.good(),"pipeline_record_completion");

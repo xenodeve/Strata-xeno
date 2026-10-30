@@ -19,6 +19,9 @@ public:
     // Graph-capturable. Reads actual final-HC mixed row0 for readiness, selects
     // typed fields, executes once, retains result, maps it into all mixed rows.
     bool head(float* mixed,uint32_t rows,void* stream,bool enabled,std::string&);
+    // Outside capture, once the result has been delivered: later heads pass through
+    // unchanged, captured graphs included. Audit keeps reporting the invocation.
+    bool end_output(void* stream,std::string&);
     // Optional module-only trial, outside capture on the owning stream. Lazy
     // bounded checkpoint storage is retained for reuse; never touches LM state.
     // Caller discards rejected output rows and fences borrowed inputs. Partial

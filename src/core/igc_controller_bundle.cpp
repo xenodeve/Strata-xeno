@@ -26,7 +26,7 @@ bool load_controller_bundle(const std::filesystem::path& path,bool diagnostic,Co
 #endif
     std::array<uint8_t,204> raw{};std::ifstream file(path,std::ios::binary);
     file.read(reinterpret_cast<char*>(raw.data()),raw.size());uint32_t version=0;std::memcpy(&version,raw.data()+8,4);
-    if(!file || file.peek()!=std::char_traits<char>::eof() || std::memcmp(raw.data(),"IGCLAT01",8) || version!=1){
+    if(!file || file.peek()!=std::char_traits<char>::eof() || std::memcmp(raw.data(),"IGCLAT01",8) || (version!=1 && version!=2)){
         error="controller_bundle_manifest_header";return false;
     }
     for(std::size_t start=12;start<raw.size();start+=32)
@@ -34,7 +34,7 @@ bool load_controller_bundle(const std::filesystem::path& path,bool diagnostic,Co
             error="controller_bundle_manifest_zero_digest";return false;
         }
     ControllerBundle candidate;std::copy_n(raw.data()+12,32,candidate.model.begin());std::copy_n(raw.data()+44,32,candidate.tokenizer.begin());
-    candidate.manifest=strata::qwenputer::sha256(raw);
+    candidate.manifest=strata::qwenputer::sha256(raw);candidate.single_readout=version==2;
     for(std::size_t i=0;i<names.size();++i){
         adapter::Binding binding;binding.model=candidate.model;binding.tokenizer=candidate.tokenizer;
         std::copy_n(raw.data()+76+i*32,32,binding.file.begin());

@@ -17,6 +17,7 @@ namespace strata::program {
 // First-anchor learned diagnostic, distinct from the oracle-input comparator.
 // Runtime receipts bind the actual loaded model/tokenizer before allocation.
 class IgcLearnedDiagnostic {
+    static constexpr int64_t kThinkClose=248069; // packs/gyro-m/tokenizer/vocab.json `</think>`
     strata::igc::ControllerBundle bundle_;
     strata::qwenputer::VerifiedInputs inputs_;
     std::unique_ptr<strata::igc::ContextWindow> context_;
@@ -227,6 +228,11 @@ public:
         return export_observation(committed,[&](std::span<float> mixed,std::span<float> logits) {
             return verifier.copy_head_input(0,nullptr,mixed.data()) && verifier.copy_logits(0,logits.data());
         },error,&head);
+    }
+    // The model copies its own text after the thinking closes, so injection stops there.
+    bool end_output_after(std::span<const int64_t> accepted,std::string& error) {
+        if(!pipeline_ || observation_ || std::find(accepted.begin(),accepted.end(),kThinkClose)==accepted.end())return true;
+        return pipeline_->end_output(stream_,error);
     }
     bool audit(strata::igc::Invocation& record,uint32_t& status,std::string& error) {
         strata::timeline::Span span("igc.controller.audit");

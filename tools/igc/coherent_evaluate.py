@@ -74,7 +74,7 @@ def _bootstrap(groups,clusters):
         scope='structural-cluster development bootstrap; shared values can still correlate errors')
 
 
-def evaluate(manifest,audit,binding,records):
+def evaluate(manifest,audit,binding,records,expected_controller=None):
     """Consume original-anchor replay rows exactly once; labels stay offline."""
     if (not isinstance(manifest,dict) or manifest.get('version')!=2
             or manifest.get('kind')!='coherent-development-manifest' or manifest.get('acceptance64_access') is not False
@@ -90,7 +90,7 @@ def evaluate(manifest,audit,binding,records):
         if k=='manifest_sha256':
             if binding[k]!=hashlib.sha256(_json_bytes(manifest)).hexdigest():raise ValueError('scorecard frozen manifest identity')
         elif k!='controller_sha256' and binding[k]!=audit[k]:raise ValueError('scorecard replay identity')
-    if binding['controller_sha256']!=audit.get('sources',{}).get('bundle'):
+    if binding['controller_sha256']!=(expected_controller or audit.get('sources',{}).get('bundle')):
         raise ValueError('scorecard frozen controller identity')
     rows=manifest.get('rows');requests=manifest.get('requests');clusters=manifest.get('clusters')
     if (not isinstance(rows,list) or not 1<=len(rows)<=2048 or manifest.get('anchors')!=len(rows)
@@ -228,7 +228,7 @@ def ledger_rows(path):
         raise ValueError('scorecard ledger count bound')
 
 
-def evaluate_files(archive,manifest_path,replay,output,allow_synthetic=False):
+def evaluate_files(archive,manifest_path,replay,output,allow_synthetic=False,expected_controller=None):
     if output.exists():raise FileExistsError('scorecard output already exists')
     if output.resolve().is_relative_to(archive.resolve()):raise ValueError('scorecard output must be outside the input archive')
     audit=audit_archive(archive,require_native=not allow_synthetic)
@@ -238,7 +238,7 @@ def evaluate_files(archive,manifest_path,replay,output,allow_synthetic=False):
     records=ledger_rows(replay)
     try:binding=next(records)
     except StopIteration as error:raise ValueError('scorecard missing ledger header') from error
-    report=evaluate(manifest,audit,binding,records)
+    report=evaluate(manifest,audit,binding,records,expected_controller)
     after=_ledger_info(replay)
     with replay.open('rb') as stream:final_sha=hashlib.file_digest(stream,'sha256').hexdigest()
     if ((before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns) or final_sha!=replay_sha
@@ -253,8 +253,9 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     for key in ('archive','manifest','replay','output'):parser.add_argument('--'+key,type=Path,required=True)
     parser.add_argument('--allow-synthetic',action='store_true')
+    parser.add_argument('--expected-controller',help='score a later controller on an archive collected under another bundle')
     args=parser.parse_args()
-    report=evaluate_files(args.archive,args.manifest,args.replay,args.output,args.allow_synthetic)
+    report=evaluate_files(args.archive,args.manifest,args.replay,args.output,args.allow_synthetic,args.expected_controller)
     print(json.dumps(report['counts']))
 
 

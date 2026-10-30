@@ -1,5 +1,6 @@
 """Versioned observation seams, synthetic states only; no corpus builders."""
 import unittest
+import json
 import hashlib
 import copy
 import struct
@@ -9,7 +10,7 @@ import threading
 import numpy as np
 from tools.igc.coherent_observation import encode_plan,decode_plan,decode_capture,CompactArchive,load_compact,load_input_observation,first_four_fidelity
 from tools.igc.coherent_prepare import compile_plan,inspected_keys
-from tools.igc.coherent_collect import admission,guarded_monitor
+from tools.igc.coherent_collect import admission,guarded_monitor,require_clean_finish
 
 
 class CoherentObservation(unittest.TestCase):
@@ -68,6 +69,15 @@ class CoherentObservation(unittest.TestCase):
         self.assertTrue(cancelled.is_set());self.assertEqual(failures[0]['reason'],'telemetry monitor stopped unexpectedly')
         cancelled.clear();failures.clear();stop.set();guarded_monitor(lambda:None,cancelled,failures,stop)
         self.assertFalse(cancelled.is_set());self.assertEqual(failures,[])
+
+    def test_failed_finish_records_its_reason(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);require_clean_finish(root,[],[],[{}],{})
+            self.assertFalse((root/'FAILURE.json').exists())
+            with self.assertRaisesRegex(RuntimeError,'no successful run report'):
+                require_clean_finish(root,[dict(pid=7,name='conhost.exe')],[dict(reason='late')],[],None)
+            self.assertEqual(json.loads((root/'FAILURE.json').read_text()),
+                dict(failure=[dict(reason='late')],remaining=[dict(pid=7,name='conhost.exe')],samples=0,summary=False))
 
     def capture(self):
         p=self.plan();plan=encode_plan(p);tokens=p['records'][1]['tokens']

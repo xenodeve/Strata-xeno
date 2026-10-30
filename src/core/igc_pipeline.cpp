@@ -30,15 +30,17 @@ bool outside_capture(cudaStream_t stream,std::string& error){
 struct LatentPipeline::Impl {
     InputMapper primary,secondary;ReadinessMapper readiness;OutputMapper output;
     cudaStream_t stream=nullptr;Buffers* data=nullptr;Buffers* checkpoint=nullptr;
-    bool trial=false,failed=false;
+    bool trial=false,failed=false,single_readout=false;
     std::array<uint64_t,64> ids{},anchors{};
     uint64_t arm_id=0,arm_anchor=0;
+    Invocation delivered{};uint32_t delivered_status=0;bool output_ended=false;
+    Status bypass=Status::Malformed;
     ~Impl(){if(stream)cudaStreamSynchronize(stream);if(checkpoint)cudaFree(checkpoint);if(data)cudaFree(data);}
 };
 LatentPipeline::~LatentPipeline(){delete impl_;}
 bool LatentPipeline::initialize(const ControllerBundle& bundle,void* raw,std::string& error)try{
     if(impl_ || !created(raw)){error="pipeline_initialize_arguments";return false;}
-    auto next=std::make_unique<Impl>();next->stream=static_cast<cudaStream_t>(raw);
+    auto next=std::make_unique<Impl>();next->stream=static_cast<cudaStream_t>(raw);next->single_readout=bundle.single_readout;
     if(!outside_capture(next->stream,error))return false;
     constexpr std::array<uint32_t,4> kinds={1,1,3,2};
     for(std::size_t i=0;i<kinds.size();++i)if(bundle.networks[i].kind!=kinds[i] || !bundle.networks[i].diagnostic_only){error="pipeline_network_roles";return false;}
@@ -61,7 +63,7 @@ bool LatentPipeline::stage_inputs(const float* embedding,const float* attention,
     auto& m=*impl_;auto* d=m.data;
     if(m.trial){error="pipeline_stage_during_trial";return false;}
     if(!outside_capture(m.stream,error))return false;
-    m.ids.fill(id);m.anchors.fill(anchor);m.arm_id=available?id:0;m.arm_anchor=anchor;
+    m.output_ended=false;m.ids.fill(id);m.anchors.fill(anchor);m.arm_id=available?id:0;m.arm_anchor=anchor;
     // These host buffers belong to Impl, remaining alive through graph execution.
     // Caller fences its prior request before staging the next one.
     if(!checked(cudaMemcpyAsync(d->ids,m.ids.data(),sizeof(d->ids),cudaMemcpyHostToDevice,m.stream),error)
@@ -72,7 +74,7 @@ bool LatentPipeline::stage_inputs(const float* embedding,const float* attention,
             || !checked(cudaMemsetAsync(&d->attention_status,0xff,4,m.stream),error)
             || !checked(cudaMemsetAsync(d->head_status,0xff,sizeof(d->head_status),m.stream),error)
             || !arm_invocations(&d->invocation,&d->arm_id,&d->arm_anchor,1,raw,true,error))return false;
-    if(available && (!m.primary.run(embedding,mask,d->embedding,&d->embedding_status,1,raw,true,error)
+    if(available && ((!m.single_readout && !m.primary.run(embedding,mask,d->embedding,&d->embedding_status,1,raw,true,error))
                     || !m.secondary.run(attention,mask,d->attention,&d->attention_status,1,raw,true,error)))return false;
     error.clear();return true;
 }
@@ -80,16 +82,27 @@ bool LatentPipeline::head(float* mixed,uint32_t rows,void* raw,bool enabled,std:
     if(!enabled){error.clear();return true;}
     if(!impl_ || impl_->failed || raw!=impl_->stream || !mixed || !rows || rows>64){error="pipeline_head_arguments";return false;}
     auto& m=*impl_;auto* d=m.data;
-    const SelectionInputs inputs{d->embedding,d->attention,d->ready,&d->embedding_status,&d->attention_status,&d->ready_status,d->ids,d->anchors};
+    const SelectionInputs inputs{m.single_readout?d->attention:d->embedding,d->attention,d->ready,
+        m.single_readout?&d->attention_status:&d->embedding_status,&d->attention_status,&d->ready_status,d->ids,d->anchors};
     return m.readiness.run(mixed,d->ready,&d->ready_status,1,raw,true,error)
         && assemble_selective_exact(inputs,&d->request,&d->selection,1,raw,true,error)
         && execute_invocations(&d->invocation,&d->request,&d->selection,1,raw,true,error)
         && broadcast_invocation(&d->invocation,d->results,rows,raw,true,error)
         && m.output.run(mixed,d->results,d->ids,d->anchors,d->head_status,rows,raw,true,error);
 }
+bool LatentPipeline::end_output(void* raw,std::string& error){
+    if(!impl_ || impl_->failed || raw!=impl_->stream){error="pipeline_end_output_arguments";return false;}
+    auto& m=*impl_;
+    if(m.output_ended){error.clear();return true;}
+    if(!audit(m.delivered,m.delivered_status,raw,error))return false;
+    m.output_ended=true;
+    // Selection and evaluation are disarmed already; only the broadcast result stops.
+    return checked(cudaMemcpyAsync(&m.data->invocation.result.status,&m.bypass,sizeof(m.bypass),cudaMemcpyHostToDevice,m.stream),error);
+}
 bool LatentPipeline::audit(Invocation& out,uint32_t& status,void* raw,std::string& error){
     if(!impl_ || impl_->failed || raw!=impl_->stream){error="pipeline_audit_arguments";return false;}
     if(!outside_capture(impl_->stream,error))return false;
+    if(impl_->output_ended){out=impl_->delivered;status=impl_->delivered_status;error.clear();return true;}
     return checked(cudaMemcpyAsync(&out,&impl_->data->invocation,sizeof(out),cudaMemcpyDeviceToHost,impl_->stream),error)
         && checked(cudaMemcpyAsync(&status,impl_->data->head_status,4,cudaMemcpyDeviceToHost,impl_->stream),error)
         && checked(cudaStreamSynchronize(impl_->stream),error);

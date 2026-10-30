@@ -40,6 +40,12 @@ def guarded_monitor(operation,cancel,failure,stop=None):
         cancel.set()
 
 
+def require_clean_finish(output,remaining,failure,samples,summary):
+    if remaining or failure or not samples or summary is None:
+        _exclusive(output/'FAILURE.json',_json_bytes(dict(remaining=remaining,failure=failure,samples=len(samples),summary=summary is not None)))
+        raise RuntimeError('coherent cleanup/telemetry incomplete; no successful run report')
+
+
 def collect(prepared,profile,server,executable,bundle,pack,sources,protocol,output):
     # Account predictable compaction-runtime commitment before admission rather
     # than cold-importing it after the model fills most system commitment.
@@ -191,7 +197,7 @@ def collect(prepared,profile,server,executable,bundle,pack,sources,protocol,outp
         try:remaining.append(dict(pid=child.pid,name=child.name()))
         except psutil.Error:pass
     final_job=current_job();_exclusive(output/'job-final.json',_json_bytes(final_job))
-    if remaining or failure or not samples or summary is None:raise RuntimeError('coherent cleanup/telemetry incomplete; no successful run report')
+    require_clean_finish(output,remaining,failure,samples,summary)
     summary.update(job_final=final_job,owned_children_remaining=remaining)
     _exclusive(output/'report.json',_json_bytes(summary))
 
