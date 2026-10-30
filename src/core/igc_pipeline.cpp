@@ -90,6 +90,7 @@ bool LatentPipeline::head(float* mixed,uint32_t rows,void* raw,bool enabled,std:
         && broadcast_invocation(&d->invocation,d->results,rows,raw,true,error)
         && m.output.run(mixed,d->results,d->ids,d->anchors,d->head_status,rows,raw,true,error);
 }
+bool LatentPipeline::output_ended()const{return impl_ && impl_->output_ended;}
 bool LatentPipeline::end_output(void* raw,std::string& error){
     if(!impl_ || impl_->failed || raw!=impl_->stream){error="pipeline_end_output_arguments";return false;}
     auto& m=*impl_;

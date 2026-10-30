@@ -30,7 +30,7 @@ class IgcLearnedDiagnostic {
     void* observation_q8_=nullptr;
     cudaStream_t stream_=nullptr;
     uint64_t invocation_=0,anchor_=0;
-    bool loaded_=false,active_=false,staged_=false;
+    bool loaded_=false,active_=false,staged_=false,invocation_known_=false,invoked_=false;
     bool note_stream(void* stream,std::string& error) {
         if(!observation_ || stream==stream_)return true;
         for(size_t i=0;i<producer_streams_.size();++i)if(producer_streams_[i]==stream || !producer_streams_[i]) {
@@ -172,7 +172,7 @@ public:
         if(!pipeline_->stage_inputs(context_->states(strata::igc::ContextTap::Embedding),
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
-        staged_=true;return true;
+        staged_=true;invocation_known_=false;return true;
     }
     // Only after wait_commit, before another run. The diagnostic head above is
     // hard no-op, so copy_head_input is the genuine pre-injection mixed row.
@@ -230,6 +230,17 @@ public:
         },error,&head);
     }
     // The model copies its own text after the thinking closes, so injection stops there.
+    // One token a round while a result is delivered: a longer window would run the
+    // heads past `</think>` before the host can end injection. Reads back once a request.
+    bool delivering(std::string& error) {
+        if(!pipeline_ || observation_ || !staged_)return false;
+        if(!invocation_known_) {
+            strata::igc::Invocation record;uint32_t status=0;
+            if(!pipeline_->audit(record,status,stream_,error))return false;
+            invoked_=record.evaluations>0;invocation_known_=true;
+        }
+        return invoked_ && !pipeline_->output_ended();
+    }
     bool end_output_after(std::span<const int64_t> accepted,std::string& error) {
         if(!pipeline_ || observation_ || std::find(accepted.begin(),accepted.end(),kThinkClose)==accepted.end())return true;
         return pipeline_->end_output(stream_,error);
