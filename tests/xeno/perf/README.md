@@ -25,6 +25,17 @@ These are the scripts behind the 2026-09-28/29 reports in `docs/reports/`. They 
 
 The summary then states whether the outputs were identical across arms.
 
+Memory samples use `GetPerformanceInfo` for system physical usage and commitment,
+and `GetProcessMemoryInfo` for process private bytes/working set. The process-limited
+`GlobalMemoryStatusEx` page-file allowance is not a system-commit counter. Older
+logs retain their original values; their `committed` label alone does not establish
+system-wide commitment. See the [diagnostic correction](../../../docs/reports/2026-10-30-igc-benchmark-readiness.md).
+Sampling errors or zero samples print `memory unavailable` instead of a valid zero
+peak. `mem_trace.py` preserves raw logs and writes `memory-errors.json` before
+failing when its memory telemetry is incomplete. Successful-run peak text and TSV
+columns are unchanged. Fake-API/launcher tests are in `tools/test_perf_memory.py`;
+they run without a model, GPU or live system-memory polling.
+
 Measurement rules from AGENTS.md:
 
 - **Priority.** Every arm runs at `--pool-priority 2` and in the HIGH process priority class. `@normal` in an arm's args opts that arm out.

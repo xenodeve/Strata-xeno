@@ -9,14 +9,10 @@ commands are %TEMP%/<REF dir>/on.command.json (see README.md).
 """
 import ctypes, hashlib, json, os, re, shutil, statistics as st, subprocess, sys, threading, time
 from ctypes import wintypes
+from pathlib import Path
 
-
-class _MemStatus(ctypes.Structure):
-    _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
-                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from tools.qwenputer.memory import system_snapshot
 
 
 class _ProcMem(ctypes.Structure):
@@ -29,11 +25,11 @@ class _ProcMem(ctypes.Structure):
 
 
 def system_memory():
-    """(in-use GiB, available GiB, committed GiB) of the whole machine - what Task Manager shows."""
-    m = _MemStatus(); m.dwLength = ctypes.sizeof(m)
-    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    """System physical in-use/available and commitment in GiB, from GetPerformanceInfo."""
+    m = system_snapshot()
     g = 2 ** 30
-    return (m.ullTotalPhys - m.ullAvailPhys) / g, m.ullAvailPhys / g, (m.ullTotalPageFile - m.ullAvailPageFile) / g
+    return ((m['physical_total_bytes'] - m['physical_available_bytes']) / g,
+            m['physical_available_bytes'] / g, m['system_commit_bytes'] / g)
 
 
 def process_memory(pid):
@@ -48,6 +44,29 @@ def process_memory(pid):
         return c.PrivateUsage / 2 ** 30, c.WorkingSetSize / 2 ** 30
     finally:
         ctypes.windll.kernel32.CloseHandle(h)
+
+
+def collect_memory(process, receive, errors, interval=0.5):
+    """Shared observer; failures remain explicit and never become zero samples."""
+    try:
+        while process.poll() is None:
+            used, available, committed = system_memory()
+            private = process_memory(process.pid)
+            if private is None:
+                if process.poll() is not None:
+                    return
+                raise OSError("running process memory is unavailable")
+            receive((used, available, committed, private[0], private[1]))
+            time.sleep(interval)
+    except Exception as error:
+        errors.append(f"{type(error).__name__}: {error}")
+
+
+def memory_peak_line(peak, samples, errors):
+    if errors or not samples:
+        return f"memory unavailable       samples={samples} errors={json.dumps(errors)}\n"
+    return (f"memory peak              system in use {peak[0]:.2f} GiB  committed {peak[1]:.2f} GiB  "
+            f"process private {peak[2]:.2f} GiB  working set {peak[3]:.2f} GiB\n")
 
 T = os.environ.get("TEMP", os.environ.get("TMP", "."))
 REF = {"code": "strata-codex-dispatch-detail-code256", "thai": "strata-codex-dispatch-detail-thai256",
@@ -94,23 +113,20 @@ def main(argv):
             flags = (0 if "@normal" in arm_args[arm] else 0x80) | 0x08000000   # + CREATE_NO_WINDOW: no console pops up on the display
             pr = subprocess.Popen([exe[arm]] + [c for c in cmd if '~' + c not in arm_args[arm]] + [x for x in arm_args[arm] if not x.startswith(('~', '@'))], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", creationflags=flags)
             peak = [0.0, 0.0, 0.0, 0.0]   # system in use, system committed, process private, process working set
-            def sample():
-                while pr.poll() is None:
-                    u, _, c = system_memory()
-                    pm = process_memory(pr.pid) or (0.0, 0.0)
-                    for i, v in enumerate((u, c, pm[0], pm[1])): peak[i] = max(peak[i], v)
-                    time.sleep(0.5)
-            th = threading.Thread(target=sample, daemon=True); th.start()
+            sample_count = [0]; sample_errors = []
+            def receive_memory(row):
+                sample_count[0] += 1
+                for i, v in enumerate((row[0], row[2], row[3], row[4])): peak[i] = max(peak[i], v)
+            th = threading.Thread(target=collect_memory, args=(pr, receive_memory, sample_errors), daemon=True); th.start()
             stdout, stderr = pr.communicate(); th.join()
-            stdout += (f"memory peak              system in use {peak[0]:.2f} GiB  committed {peak[1]:.2f} GiB  "
-                       f"process private {peak[2]:.2f} GiB  working set {peak[3]:.2f} GiB\n")
+            stdout += memory_peak_line(peak, sample_count[0], sample_errors)
             p = subprocess.CompletedProcess(pr.args, pr.returncode, stdout, stderr)
             open(os.path.join(out, tag + ".stdout"), "w", encoding="utf-8").write(p.stdout)
             open(os.path.join(out, tag + ".stderr"), "w", encoding="utf-8").write(p.stderr)
             tps = re.search(STAGES["tok/s"], p.stdout)
-            line = f"{tag} rc={p.returncode} sha={sha[arm]} tok/s {tps.group(1) if tps else 'NA'} wall {time.time()-t0:.0f}s"
+            line = f"{tag} rc={p.returncode} sha={sha[arm]} tok/s {tps.group(1) if tps else 'NA'} wall {time.time()-t0:.0f}s memory={'unavailable' if sample_errors or not sample_count[0] else 'complete'}"
             print(line, flush=True); log.write(line + "\n"); log.flush()
-    log.write(summarize(out, prompts) + "\nDONE\n"); log.flush()
+    log.write(summarize(out, prompts) + "\nDONE\n"); log.flush(); log.close()
     print("DONE", flush=True)
 
 
