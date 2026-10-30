@@ -1,4 +1,5 @@
 #pragma once
+#include "strata/core/igc_inline.hpp"
 #include "strata/core/igc_context.hpp"
 #include "strata/core/igc_pipeline.hpp"
 #include "strata/core/qwenputer_binding.hpp"
@@ -32,6 +33,11 @@ class IgcLearnedDiagnostic {
     uint64_t invocation_=0,anchor_=0;
     bool loaded_=false,active_=false,staged_=false,invocation_known_=false,invoked_=false,bridge_=false;
     std::vector<int32_t> bridge_tokens_;std::size_t bridge_at_=0;
+    std::vector<int32_t> generated_;
+    std::vector<std::array<int64_t,3>> inline_seen_;
+    std::vector<int64_t> prefix_;
+    bool inline_exec_=false;int64_t inline_calls_=0;
+    strata::igc::ExactRequest* inline_request_=nullptr;strata::igc::ExactResult* inline_result_=nullptr;
     bool note_stream(void* stream,std::string& error) {
         if(!observation_ || stream==stream_)return true;
         for(size_t i=0;i<producer_streams_.size();++i)if(producer_streams_[i]==stream || !producer_streams_[i]) {
@@ -105,6 +111,7 @@ public:
         if(observation_ && !eligible){observation_->cancel();error="coherent_ineligible_request";return false;}
         if(observation_ && !observation_->begin(prefix,error))return false;
         ++invocation_;anchor_=prefix.size()-1;active_=eligible;staged_=false;
+        prefix_.assign(prefix.begin(),prefix.end());
         if(observation_) {
             observed_prefix_.assign(prefix.begin(),prefix.end());producer_streams_.fill(nullptr);
             provenance_={};provenance_.reused=static_cast<uint64_t>(reused);provenance_.accepted=provenance_.reused;
@@ -173,7 +180,7 @@ public:
         if(!pipeline_->stage_inputs(context_->states(strata::igc::ContextTap::Embedding),
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
-        staged_=true;invocation_known_=false;return true;
+        staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();return true;
     }
     // Only after wait_commit, before another run. The diagnostic head above is
     // hard no-op, so copy_head_input is the genuine pre-injection mixed row.
@@ -240,7 +247,11 @@ public:
             if(!pipeline_->audit(record,status,stream_,error))return false;
             invoked_=record.evaluations>0 && record.result.status==strata::igc::Status::Success;invocation_known_=true;
             bridge_tokens_.clear();bridge_at_=0;
-            if(bridge_ && invoked_)bridge_tokens_=result_tokens(record.result.value);
+            if(bridge_ && invoked_) {
+                if(strata::igc::written_in(prefix_,record.request.lhs) && strata::igc::written_in(prefix_,record.request.rhs))
+                    bridge_tokens_=result_tokens(record.result.value);
+                else if(!pipeline_->end_output(stream_,error))return false;
+            }
         }
         if(bridge_)return bridge_at_<bridge_tokens_.size();
         return invoked_ && !pipeline_->output_ended();
@@ -257,7 +268,46 @@ public:
         out.push_back(248046);
         return out;
     }
+    static int64_t number_key(const strata::igc::Integer& v) {
+        int64_t key=v.length;
+        for(int i=0;i<v.length;++i)key=key*1000003+v.digits[i];
+        return key;
+    }
     void set_bridge(bool on){bridge_=on;}
+    void set_inline_exec(bool on){inline_exec_=on;}
+    int64_t inline_calls()const{return inline_calls_;}
+    // After one accepted token: an expression that just closed runs on the device and its
+    // value is delivered next. The device buffers live as long as the process.
+    bool inline_token(int32_t token,bool& called,std::string& error) {
+        called=false;
+        if(!inline_exec_ || !pipeline_ || observation_ || !staged_)return true;
+        generated_.push_back(token);
+        if(generated_.size()>256)generated_.erase(generated_.begin(),generated_.begin()+128);
+        if(bridge_at_<bridge_tokens_.size())return true;
+        const auto call=strata::igc::parse_inline(generated_);
+        if(!call)return true;
+        if(!inline_request_ && (cudaMalloc(&inline_request_,sizeof(*inline_request_))!=cudaSuccess
+                || cudaMalloc(&inline_result_,sizeof(*inline_result_))!=cudaSuccess)){error="igc inline device buffers";return false;}
+        strata::igc::ExactRequest request;request.operation=call->operation;request.invocation=1;request.lhs=call->lhs;request.rhs=call->rhs;
+        strata::igc::ExactResult result;
+        if(cudaMemcpyAsync(inline_request_,&request,sizeof(request),cudaMemcpyHostToDevice,stream_)!=cudaSuccess
+                || !strata::igc::execute_exact(inline_request_,inline_result_,1,stream_,error)
+                || cudaMemcpyAsync(&result,inline_result_,sizeof(result),cudaMemcpyDeviceToHost,stream_)!=cudaSuccess
+                || cudaStreamSynchronize(stream_)!=cudaSuccess){if(error.empty())error="igc inline execution";return false;}
+        if(result.status!=strata::igc::Status::Success)return true;
+        bridge_tokens_=strata::igc::value_tokens(result.value,call->spaced);bridge_at_=0;
+        // Inside reasoning the value says where it came from; unmarked, the model re-derives it.
+        if(std::find(generated_.begin(),generated_.end(),kThinkClose)==generated_.end()) {
+            // A repeat means the model is re-checking: say so once, then close the thinking.
+            const std::array<int64_t,3> key{static_cast<int64_t>(call->operation),number_key(call->lhs),number_key(call->rhs)};
+            const auto seen=std::count(inline_seen_.begin(),inline_seen_.end(),key);
+            inline_seen_.push_back(key);
+            if(!seen)bridge_tokens_.insert(bridge_tokens_.end(),{318,44839,11,494,279,28974,11,874,1144,310,1716,553}); // ` (exact, from the calculator, no need to check).`
+            else if(seen==1)bridge_tokens_.insert(bridge_tokens_.end(),{318,43967,10457,11,2842,12910,553}); // ` (already confirmed, stop checking).`
+            else bridge_tokens_.insert(bridge_tokens_.end(),{13,198,kThinkClose,271});
+        }
+        ++inline_calls_;called=true;return true;
+    }
     // One-token rounds only: replaces the sampled token while a bridged result is delivered.
     void bridge_sample(int32_t& token) {
         if(bridge_ && bridge_at_<bridge_tokens_.size())token=bridge_tokens_[bridge_at_++];

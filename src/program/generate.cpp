@@ -453,7 +453,7 @@ struct Options {
     std::string dump_mixed;
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
     std::string igc_output_artifact,igc_output_fixture,igc_learned_bundle;
-    bool igc_result_bridge=false;
+    bool igc_result_bridge=false,igc_inline_exec=false;
     std::string igc_observation_plan,igc_observation_root;
 #endif
     /// One residual snapshot per layer per position: `n_layers * hc * n_embd` floats per position, appended in
@@ -953,6 +953,7 @@ void usage() {
                  "  --igc-output-diagnostic-fixture PATH   exact-prefix checked-result fixture\n"
                  "  --igc-learned-diagnostic-bundle PATH  learned first-anchor controller (not production)\n"
                  "  --igc-result-bridge  emit the executed result as tokens instead of the output mapper\n"
+                 "  --igc-inline-exec    execute `A op B =` inside reasoning on the device, with the bridge\n"
 #endif
                  "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
                  "                       event interval includes host gaps, so run with --gpu-only-full first\n"
@@ -2550,6 +2551,7 @@ int main(int argc, char** argv) {
         else if (a == "--igc-output-diagnostic-fixture") o.igc_output_fixture = next("--igc-output-diagnostic-fixture");
         else if (a == "--igc-learned-diagnostic-bundle") o.igc_learned_bundle = next("--igc-learned-diagnostic-bundle");
         else if (a == "--igc-result-bridge") o.igc_result_bridge = true;
+        else if (a == "--igc-inline-exec") o.igc_result_bridge = o.igc_inline_exec = true;
         else if (a == "--igc-observation-plan") o.igc_observation_plan = next("--igc-observation-plan");
         else if (a == "--igc-observation-root") o.igc_observation_root = next("--igc-observation-root");
 #endif
@@ -3544,6 +3546,7 @@ int main(int argc, char** argv) {
     if(!o.igc_learned_bundle.empty()) {
         igc_learned=std::make_unique<strata::program::IgcLearnedDiagnostic>();
         igc_learned->set_bridge(o.igc_result_bridge);
+        igc_learned->set_inline_exec(o.igc_inline_exec);
         std::vector<std::filesystem::path> model_paths;
         for(const auto& path:o.native_shards)model_paths.emplace_back(path);
         std::fprintf(stderr,"strata IGC learned: validating bundle and content-binding model/tokenizer before allocation\n");
@@ -14218,6 +14221,17 @@ int main(int argc, char** argv) {
 #endif
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                if (igc_learned && o.igc_inline_exec)
+                    for (int i = 0; i <= a; ++i) {
+                        bool called = false;
+                        if (!igc_learned->inline_token(outv[(size_t) i], called, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return serve_fatal();
+                        }
+                        if (called) { a = i; break; }   // the rest of the window follows a value it never saw
+                    }
+#endif
                 trace_commit(drive, T, a, strata::core::routing_trace::kPhaseDecode);   // #85
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
