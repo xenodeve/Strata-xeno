@@ -42,6 +42,7 @@ int main() try {
     require(squares && program(squares) == std::vector<int>{3, 2, -5, 4, 2, -5, -1}, "powers");
     auto percent = parse_inline(std::vector<int32_t>{18, 15, 4, 314, 220, 16, 23, 15, 283});  // 30% of 180 =
     require(percent && program(percent) == std::vector<int>{30, 180, -3} && percent->program[0].value.scale == 2 && !percent->exact_integers(), "percent of");
+    require(!parse_inline(std::vector<int32_t>{16, 15, 15, 471, 220, 18, 15, 4, 283}), "percent as a discount");  // 100 - 30% =
     auto dollars = parse_inline(std::vector<int32_t>{3, 20, 348, 220, 18, 283});  // $5 * 3 =
     require(dollars && program(dollars) == std::vector<int>{5, 3, -3}, "dollars");
     auto joined = parse_inline(std::vector<int32_t>{16, 13, 20, 37726, 17, 15, 28});  // 1.5*$20=

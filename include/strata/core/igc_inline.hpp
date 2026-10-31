@@ -16,6 +16,7 @@ enum class InlineOperation : uint32_t { Add = 1, Subtract = 2, Multiply = 3, Div
 struct InlineNumber {
     Integer coefficient{};
     uint32_t scale = 0;  // value = coefficient * 10^-scale
+    bool percent = false;
 };
 struct InlineStep {
     bool number = false;
@@ -123,6 +124,7 @@ struct InlineParser {
         if (!read_number(run, back, number) || back != -1) return false;
         if (last < tokens.size() && tokens[last] == kPercent) {
             number.scale += 2;
+            number.percent = true;
             ++last;
         }
         call.program.push_back(InlineStep{true, InlineOperation::Add, number});
@@ -191,6 +193,21 @@ inline std::optional<InlineCall> parse_inline(std::span<const int32_t> tokens) {
     size_t steps = 0;
     for (const auto& step : call.program) steps += !step.number;
     if (!steps || steps > 15) return std::nullopt;
+    // `100 - 30%` means 70 to a reader and 99.7 to arithmetic: percent is only taken as a factor.
+    std::vector<bool> percent;
+    for (const auto& step : call.program) {
+        if (step.number) {
+            percent.push_back(step.value.percent);
+            continue;
+        }
+        const bool rhs = percent.back();
+        percent.pop_back();
+        const bool lhs = percent.back();
+        percent.pop_back();
+        const bool factor = step.operation == InlineOperation::Multiply || step.operation == InlineOperation::Divide;
+        if (!factor && (lhs || rhs)) return std::nullopt;
+        percent.push_back(false);
+    }
     return call;
 }
 

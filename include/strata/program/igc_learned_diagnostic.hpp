@@ -18,6 +18,7 @@ namespace strata::program {
 // First-anchor learned diagnostic, distinct from the oracle-input comparator.
 // Runtime receipts bind the actual loaded model/tokenizer before allocation.
 class IgcLearnedDiagnostic {
+    static constexpr int32_t kEndOfTurn=248046;
     static constexpr int64_t kThinkClose=248069; // packs/gyro-m/tokenizer/vocab.json `</think>`
     strata::igc::ControllerBundle bundle_;
     strata::qwenputer::VerifiedInputs inputs_;
@@ -281,9 +282,14 @@ public:
     int64_t inline_calls()const{return inline_calls_;}
     // After one accepted token: an expression that just closed runs on the device and its
     // value is delivered next. The device buffers live as long as the process.
-    bool inline_token(int32_t token,bool& called,std::string& error) {
+    bool inline_token(int32_t& token,bool& called,std::string& error) {
         called=false;
         if(!inline_exec_ || !pipeline_ || observation_ || !staged_)return true;
+        // An end of turn inside thinking would leave the reader no answer after a call.
+        if(token==kEndOfTurn && !inline_seen_.empty()
+                && std::find(generated_.begin(),generated_.end(),kThinkClose)==generated_.end()) {
+            token=198;bridge_tokens_={kThinkClose,271};bridge_at_=0;
+        }
         generated_.push_back(token);
         if(generated_.size()>256)generated_.erase(generated_.begin(),generated_.begin()+128);
         if(bridge_at_<bridge_tokens_.size())return true;
