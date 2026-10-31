@@ -7,6 +7,7 @@ import argparse
 from fractions import Fraction
 import json
 from pathlib import Path
+import re
 import torch
 from tools.igc.auto_label import OPERATIONS, after_expression, label_text
 from tools.igc.rule_pointer import interval
@@ -40,6 +41,16 @@ def leading_digit(value):
     return text.lstrip('0.')[:1]
 
 
+def digits(value):
+    text = str(abs(value.numerator)) if value.denominator == 1 else f'{float(abs(value)):.6f}'
+    return text.replace('.', '').lstrip('0')
+
+
+def draft_agrees(value, written, after):
+    """What the drafter shows past the slot: two digits of the number, and no operator after it. Simulated from the text."""
+    return digits(value)[:2] == digits(written)[:2] and not re.match(r'\s*[-+*/×÷^]', after)
+
+
 def score(model, ids, ends, device):
     tokens = torch.tensor([ids], device=device)
     with torch.no_grad():
@@ -65,7 +76,11 @@ def main():
     model.load_state_dict(torch.load(args.weights, map_location=device), strict=False)
     tokenizer = Tokenizer.from_file(str(args.tokenizer))
     points = {}
+    seen = set()
     for trace in json.loads(args.traces.read_text(encoding='utf-8')):
+        if trace['prompt'] in seen:     # both off arms answer the same questions; one question is one sample
+            continue
+        seen.add(trace['prompt'])
         for row in label_text(trace['prompt'], trace['thinking']):
             if row['label'] == 'ambiguous' or after_expression(trace['thinking'][:row['start']]):
                 continue
@@ -77,11 +92,12 @@ def main():
             written = Fraction(row['value'].replace(',', ''))
             good = value == written
             agrees = value is not None and leading_digit(value) == leading_digit(written)
-            points.setdefault(trace['suite'], []).append((confidence, good, row['label'] == 'computed', row['label'] == 'computed' and row['level'] > 0, agrees))
+            drafted = value is not None and draft_agrees(value, written, trace['thinking'][row['end']:row['end'] + 4])
+            points.setdefault(trace['suite'], []).append((confidence, good, row['label'] == 'computed', row['label'] == 'computed' and row['level'] > 0, agrees, drafted))
     for suite in sorted(points):
-        for gate, name in ((False, 'alone'), (True, 'first digit agrees')):
+        for gate, name in ((None, 'alone'), (4, 'first digit agrees'), (5, 'draft agrees')):
             for threshold in THRESHOLDS:
-                fired = [r for r in points[suite] if r[0] >= threshold and (r[4] or not gate)]
+                fired = [r for r in points[suite] if r[0] >= threshold and (gate is None or r[gate])]
                 right = sum(r[1] for r in fired)
                 caught = sum(r[1] and r[3] for r in fired)
                 low, high = interval(right, len(fired)) if fired else (0., 1.)
