@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import re
 from fractions import Fraction
-from tools.igc.auto_label import label_text, numbers, OPERATIONS
+from tools.igc.auto_label import after_expression, label_text, numbers, OPERATIONS
 
 CUES = (
     (r'\b(total|altogether|combined|in all|sum|together|plus)\b', 'add'),
@@ -38,7 +38,7 @@ def evaluate(records, prompts):
     for record in records:
         thinking = record['text'].split('</think>')[0]
         for row in label_text(prompts[record['id']], thinking):
-            if row['label'] == 'computed' and row['level'] == 0:
+            if row['label'] == 'ambiguous' or after_expression(thinking[:row['start']]):
                 continue
             if row['label'] == 'computed':
                 slots += 1

@@ -8,7 +8,7 @@ from fractions import Fraction
 import json
 from pathlib import Path
 import torch
-from tools.igc.auto_label import OPERATIONS, label_text
+from tools.igc.auto_label import OPERATIONS, after_expression, label_text
 from tools.igc.rule_pointer import interval
 from tools.igc.sidecar_data import table
 from tools.igc.sidecar_fit import MAX_ENTRIES, MAX_TOKENS, NONE, OPERATIONS as NAMES, Sidecar, ZERO_FROM, shape_for
@@ -67,7 +67,7 @@ def main():
     points = {}
     for trace in json.loads(args.traces.read_text(encoding='utf-8')):
         for row in label_text(trace['prompt'], trace['thinking']):
-            if row['label'] == 'computed' and row['level'] == 0:
+            if row['label'] == 'ambiguous' or after_expression(trace['thinking'][:row['start']]):
                 continue
             ids, ends, values = slot(trace['prompt'], trace['thinking'], row, tokenizer)
             if not ends:

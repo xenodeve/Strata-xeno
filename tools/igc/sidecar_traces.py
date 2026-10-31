@@ -7,7 +7,7 @@ import argparse
 from fractions import Fraction
 import json
 from pathlib import Path
-from tools.igc.auto_label import label_text
+from tools.igc.auto_label import after_expression, label_text
 from tools.igc.sidecar_data import pointer, table
 
 
@@ -15,7 +15,7 @@ def rows_of(prompt, thinking):
     context = prompt.strip() + '\n'
     text = context + thinking
     for row in label_text(context.strip(), thinking):
-        if row['label'] == 'ambiguous':
+        if row['label'] == 'ambiguous' or after_expression(thinking[:row['start']]):
             continue
         slot = len(context) + row['start']
         entries = table(text, slot)

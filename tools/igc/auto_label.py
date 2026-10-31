@@ -44,6 +44,11 @@ def level_of(thinking, start, operand_positions):
     return 1 if all(p >= sentence for p in operand_positions) else 2
 
 
+def after_expression(prefix):
+    """The number here closes a written expression, which the parser reads; the sidecar has no part in it."""
+    return re.search(r'[-+*×/÷^]\s*\$?\(?\d[\d.,]*%?\)?\s*=\s*\$?$', prefix) is not None
+
+
 def label_text(prompt, thinking):
     seen = {}       # value -> last position, negative inside the prompt
     for _, end, _, value in numbers(prompt):
@@ -57,10 +62,10 @@ def label_text(prompt, thinking):
             row['label'] = 'not_computed'
         else:
             recent = sorted(seen, key=seen.get)[-RECENT:]
-            found = [] if value.denominator == 1 and value <= SMALL else programs(value, recent)
+            found = programs(value, recent)
             if not found:
                 row['label'] = 'not_computed'
-            elif len(found) > 1:
+            elif len(found) > 1 or (value.denominator == 1 and value <= SMALL):
                 row['label'] = 'ambiguous'
             else:
                 name, a, b = found[0]
