@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <vector>
+#include "strata/core/igc_binding_tokens.hpp"
 #include "strata/core/igc_exact.hpp"
 #include "strata/core/igc_integer_extended.hpp"
 #include "strata/core/igc_rational_exact.hpp"
@@ -41,12 +42,24 @@ inline bool digit(int32_t t) { return t >= kZero && t <= kNine; }
 inline std::optional<InlineOperation> operation(int32_t t) {
     switch (t) {
         case 10: case 478: return InlineOperation::Add;
-        case kMinus: case kSpacedMinus: return InlineOperation::Subtract;
-        case 9: case 348: case 17044: case 23985: case kTimesDollar: return InlineOperation::Multiply;
+        case kMinus: case kSpacedMinus: case 32160: case 23437: return InlineOperation::Subtract;
+        case 9: case 348: case 17044: case 23985: case kTimesDollar: case 13535: case 9306: return InlineOperation::Multiply;
         case 14: case 593: case 169814: return InlineOperation::Divide;
         case 61: case 6108: return InlineOperation::Power;
         default: return std::nullopt;
     }
+}
+// `\times`, `\cdot`, `\div` are two tokens: the backslash, then the name.
+inline std::optional<InlineOperation> latex_operation(int32_t slash, int32_t name) {
+    if (slash == 4795) return name == 1672 ? std::optional(InlineOperation::Multiply) : std::nullopt;
+    if (slash != 1088 && slash != 59) return std::nullopt;
+    if (name == 14695 || name == 49142) return InlineOperation::Multiply;
+    if (name == 596) return InlineOperation::Divide;
+    return std::nullopt;
+}
+// `(` written against a word is a function call or a product we cannot read.
+inline bool opens_cleanly(int32_t before) {
+    return before == kEquals || before == kSpacedEquals || before == 198 || before == 271 || before == 25;
 }
 }
 
@@ -99,6 +112,11 @@ struct InlineParser {
             width = 2;
             return InlineOperation::Divide;
         }
+        if (at + 1 < tokens.size())
+            if (const auto latex = inline_tokens::latex_operation(tokens[at], tokens[at + 1])) {
+                width = 2;
+                return latex;
+            }
         return inline_tokens::operation(tokens[at]);
     }
     bool primary() {
@@ -173,6 +191,10 @@ inline std::optional<InlineCall> parse_inline(std::span<const int32_t> tokens) {
     while (first > 0) {
         const int32_t t = tokens[(size_t) first - 1];
         if (t == kDot && tokens[(size_t) first] == kSpace) break;   // a sentence ended here, not a decimal
+        if (first >= 2 && latex_operation(tokens[(size_t) first - 2], t)) {
+            first -= 2;
+            continue;
+        }
         if (t == kClose) ++depth;
         else if (t == kOpen) {
             if (!depth) break;
@@ -187,6 +209,17 @@ inline std::optional<InlineCall> parse_inline(std::span<const int32_t> tokens) {
     if (body.empty() || body.size() > 96) return std::nullopt;
     // A sign before the first number belongs to words we cannot see.
     if (first > 0 && tokens[(size_t) first - 1] == kDot) return std::nullopt;
+    // The tokenizer glues signs to what comes before: `=-1+5=` and `)*4+1=` would read as whole expressions.
+    std::ptrdiff_t before = first - 1;
+    while (before >= 0 && tokens[(size_t) before] == kSpace) --before;
+    if (before >= 0) {
+        const int32_t t = tokens[(size_t) before];
+        if (binds_next(t) || (tokens[(size_t) first] == kOpen && !opens_cleanly(t))) return std::nullopt;
+        if (t == 332 && before > 0) {   // `**` is bold at the start of a line, a power after a value
+            const int32_t left = tokens[(size_t) before - 1];
+            if (digit(left) || left == kClose || left == 87) return std::nullopt;
+        }
+    }
     InlineParser parser{body, 0, call};
     if (!parser.sum()) return std::nullopt;
     parser.skip();

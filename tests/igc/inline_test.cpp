@@ -28,6 +28,30 @@ int main() try {
     require(sentence && program(sentence) == std::vector<int>{12, 34, -3}, "sentence end");
     auto point = parse_inline(std::vector<int32_t>{16, 13, 20, 9, 17, 28});  // 1.5*2=
     require(point.has_value(), "decimal stays a number");
+    auto refused = [](std::vector<int32_t> tokens) { return !parse_inline(tokens).has_value(); };
+    require(refused({64, 10512, 16, 10, 20, 28}), "=-1+5= keeps its sign or stays out");
+    require(refused({4653, 19, 10, 16, 10, 17, 28}), ")*4+1+2=");
+    require(refused({87, 332, 17, 10, 16, 28}), "x**2+1=");
+    require(refused({18, 2942, 220, 19, 478, 220, 16, 283}), "3 times 4 + 1 =");
+    require(refused({830, 220, 19, 478, 220, 16, 283}), "3 x 4 + 1 =");
+    require(refused({1088, 14695, 220, 16, 12, 17, 283}), "a bare \\times has no left side");
+    require(refused({13791, 7, 16, 23, 15, 12, 19, 21, 8, 283}), " tan(180-46) =");
+    auto bold = parse_inline(std::vector<int32_t>{271, 332, 17, 478, 220, 16, 283});  // \n\n**2 + 1 =
+    require(bold && program(bold) == std::vector<int>{2, 1, -1}, "bold opens a line");
+    auto glued = parse_inline(std::vector<int32_t>{271, 7, 18, 10, 19, 8, 9, 17, 28});  // \n\n(3+4)*2=
+    require(glued && program(glued) == std::vector<int>{3, 4, -1, 2, -3}, "a bracket opening a line");
+    auto latex = parse_inline(std::vector<int32_t>{17237, 19, 1088, 14695, 220, 16, 17, 20, 471, 220, 17, 283});  // \(4 \times 125 - 2 =
+    require(latex && program(latex) == std::vector<int>{4, 125, -3, 2, -2}, "\\times");
+    auto tight = parse_inline(std::vector<int32_t>{19, 4795, 1672, 220, 20, 28});  // 4\times 5=
+    require(tight && program(tight) == std::vector<int>{4, 5, -3}, "tight \\times");
+    auto cdot = parse_inline(std::vector<int32_t>{19, 59, 49142, 20, 28});  // 4\cdot5=
+    require(cdot && program(cdot) == std::vector<int>{4, 5, -3}, "\\cdot");
+    auto over = parse_inline(std::vector<int32_t>{19, 1088, 596, 220, 20, 283});  // 4 \div 5 =
+    require(over && program(over) == std::vector<int>{4, 5, -4}, "\\div");
+    auto dots = parse_inline(std::vector<int32_t>{17, 13535, 18, 9306, 220, 19, 28});  // 2·3 · 4=
+    require(dots && program(dots) == std::vector<int>{2, 3, -3, 4, -3}, "middle dot");
+    auto minus = parse_inline(std::vector<int32_t>{20, 32160, 17, 23437, 220, 16, 28});  // 5−2 − 1=
+    require(minus && program(minus) == std::vector<int>{5, 2, -2, 1, -2}, "unicode minus");
     auto chain = parse_inline(std::vector<int32_t>{16, 21, 12, 18, 12, 19, 28});  // 16-3-4=
     require(chain && program(chain) == std::vector<int>{16, 3, -2, 4, -2}, "chain");
     auto mixed = parse_inline(std::vector<int32_t>{17, 10, 18, 9, 19, 28});  // 2+3*4=
