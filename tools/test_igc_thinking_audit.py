@@ -25,7 +25,14 @@ class Audit(unittest.TestCase):
         self.assertEqual(row['moves']['recheck'], 1)
 
     def test_answer_as_part_of_a_number_does_not_count(self):
-        self.assertIsNone(audit('Then 120 and 312.</think>x', 12)['first_sentence'])
+        self.assertIsNone(audit('Then x = 120 and y = 312.</think>x', 12)['first_sentence'])
+
+    def test_a_number_of_the_question_is_not_the_answer(self):
+        row = audit('She has 12 pens and 12 cards. Add them. So 12 + 12 = 24.</think>x', 12)
+        self.assertIsNone(row['first_sentence'])
+
+    def test_an_outcome_word_counts(self):
+        self.assertEqual(audit('Add them. Total is $24.</think>x', 24)['first_sentence'], 1)
 
     def test_repeat_share(self):
         row = audit('Could be 5. Could be 5. Could be 5. Done now.</think>x', 5)

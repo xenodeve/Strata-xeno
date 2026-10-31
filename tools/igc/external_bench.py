@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from tools.igc.external_score import repeating
+from tools.igc.external_score import final_number, repeating
 from tools.igc.hub_contract import validate_launcher_env
 from tools.igc.learned_integration import parse_audit
 from tools.igc.output_examples import wrapped_prefix
@@ -43,14 +43,6 @@ def cases(data,arithmetic,gsm,bigbench=0,math=0,gsm_file='gsm8k-test.jsonl',math
         rows.append(dict(id=f'gsm8k-{i}',suite='gsm8k',prompt=row['question'],
                          answer=int(row['answer'].split('####')[1].strip().replace(',','')),limit=1536))
     return rows
-
-
-def final_number(text):
-    """Last integer in the answer after the thinking block; None when the answer never started."""
-    tail=text.rsplit('</think>',1)
-    if len(tail)<2:return None
-    numbers=re.findall(r'-?\d+(?:\.\d+)?',tail[1].replace(',',''))
-    return float(numbers[-1]) if numbers else None
 
 
 def score(records):

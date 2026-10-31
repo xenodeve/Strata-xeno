@@ -21,7 +21,8 @@ def audit(text, answer):
     thinking = text.split('</think>')[0]
     rows = sentences(thinking)
     plain = str(int(answer)) if float(answer) == int(answer) else str(answer)
-    pattern = re.compile(rf'(?<![\d.,]){re.escape(plain)}(?![\d]|[.,]\d)')
+    # As a result, not as a number the question gave: after `=`, or after a word that states an outcome.
+    pattern = re.compile(rf'(?:=|(?:is|are|answer|total|gives?|get|so|thus):?)\s*\$?\s*{re.escape(plain)}(?![\d]|[.,]\d)', re.I)
     first = next((i for i, s in enumerate(rows) if pattern.search(s.replace(',', ''))), None)
     seen, repeated, moves = set(), 0, Counter()
     for s in rows[(first or 0):]:
