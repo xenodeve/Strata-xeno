@@ -2,7 +2,7 @@
 import unittest
 from tools.igc.sidecar_data import clean, examples
 from tools.igc.auto_label import after_expression
-from tools.igc.sidecar_traces import rows_of
+from tools.igc.sidecar_traces import rows_of, without_expressions
 
 
 class SidecarData(unittest.TestCase):
@@ -40,6 +40,11 @@ class SidecarData(unittest.TestCase):
         self.assertFalse(after_expression('half of 180 is '))
         rows = list(rows_of('Tom has 37 pens and 41 bags.', 'So 37+41=78 items.'))
         self.assertEqual([r['text'][r['slot']:r['slot'] + 2] for r in rows], ['37', '41'])
+
+    def test_expressions_leave_plain_words(self):
+        self.assertEqual(without_expressions('So 37+41=78 items, then 3 * $4 = $12 left.'), 'So 78 items, then 12 left.')
+        self.assertEqual(without_expressions('Total 20+80+160=260.'), 'Total 260.')
+        self.assertEqual(without_expressions('x = 5 and 12 items.'), 'x = 5 and 12 items.')
 
     def test_two_operations_are_dropped(self):
         row = dict(question='Tom has 5 pens and 2 bags.', answer='So <<5*2+1=11>>11.\n#### 11')

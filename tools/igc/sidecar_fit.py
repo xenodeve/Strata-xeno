@@ -4,6 +4,7 @@ Input is `sidecar_data.py` output plus a frozen embedding table (`embed_table.py
 question, so a problem never sits on both sides. Reported: exact structure rate on held questions.
 """
 import argparse
+from collections import Counter
 import json
 from pathlib import Path
 import random
@@ -17,6 +18,7 @@ ZERO_FROM = 248070   # audio tokens of the larger family members have no row in 
 MAX_TOKENS = 512
 MAX_ENTRIES = 64
 COMMUTATIVE = ('add', 'mul')
+COMMON = 4096       # PCA leaves operators and digits at cosine 0.86-0.96; these tokens also get a trained vector
 
 
 class Sidecar(nn.Module):
@@ -25,7 +27,9 @@ class Sidecar(nn.Module):
     def __init__(self, table, width, layers, heads):
         super().__init__()
         self.embedding = nn.Embedding.from_pretrained(table, freeze=True)
-        self.project = nn.Linear(table.shape[1], width)
+        self.project = nn.Sequential(nn.Linear(table.shape[1], width), nn.LayerNorm(width))
+        self.learned = nn.Embedding(COMMON + 1, width)
+        self.register_buffer('index', torch.zeros(table.shape[0], dtype=torch.long))
         self.position = nn.Embedding(MAX_TOKENS, width)
         layer = nn.TransformerEncoderLayer(width, heads, width * 4, dropout=.1, activation='gelu', batch_first=True, norm_first=True)
         self.encoder = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
@@ -39,7 +43,7 @@ class Sidecar(nn.Module):
 
     def forward(self, tokens, lengths, entry_ends):
         steps = tokens.shape[1]
-        x = self.project(self.embedding(tokens)) + self.position(torch.arange(steps, device=tokens.device))
+        x = self.project(self.embedding(tokens)) + self.learned(self.index[tokens]) + self.position(torch.arange(steps, device=tokens.device))
         padding = torch.arange(steps, device=tokens.device)[None] >= lengths[:, None]
         causal = nn.Transformer.generate_square_subsequent_mask(steps, device=tokens.device, dtype=torch.bool)
         h = self.norm(self.encoder(x, mask=causal, src_key_padding_mask=padding))
@@ -51,13 +55,18 @@ class Sidecar(nn.Module):
         return self.operation(query), score(self.left), score(self.right)
 
 
+def common_tokens(rows):
+    counts = Counter(i for row in rows for i in row['ids'])
+    return torch.tensor([i for i, _ in counts.most_common(COMMON)])
+
+
 def trainable(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def shape_for(target):
     """Width and depth near a non-embedding parameter target."""
-    return {5: (256, 6, 4), 30: (544, 8, 8), 100: (896, 10, 8)}[target]
+    return {5: (224, 6, 4), 30: (544, 8, 8), 100: (896, 10, 8)}[target]
 
 
 def encode(rows, tokenizer):
@@ -85,7 +94,7 @@ def encode(rows, tokenizer):
             continue
         elif row['op'] in COMMUTATIVE:
             left, right = min(left, right), max(left, right)
-        out.append(dict(ids=ids, ends=ends, op=OPERATIONS.index(row['op']), left=left, right=right, key=row['group']))
+        out.append(dict(ids=ids, ends=ends, op=OPERATIONS.index(row['op']), left=left, right=right, key=row['group'], source=row.get('source')))
     return out
 
 
@@ -110,6 +119,29 @@ def buckets(rows, size):
     return parts
 
 
+def sources(model, rows, device):
+    """Per source: positives right whole, positives told to fire, and negatives told to fire."""
+    tally = Counter()
+    model.eval()
+    with torch.no_grad():
+        for s in range(0, len(rows), 64):
+            part = rows[s:s + 64]
+            tokens, lengths, ends, labels = batch(part, device)
+            operations, lefts, rights = model(tokens, lengths, ends)
+            guess, a, b = operations.argmax(-1), lefts.argmax(-1), rights.argmax(-1)
+            for i, row in enumerate(part):
+                source = row['source']
+                if row['op'] == NONE:
+                    tally[source, 'neg'] += 1
+                    tally[source, 'neg fired'] += int(guess[i] != NONE)
+                else:
+                    tally[source, 'pos'] += 1
+                    tally[source, 'pos fired'] += int(guess[i] != NONE)
+                    tally[source, 'pos right'] += int(guess[i] == row['op'] and a[i] == row['left'] and b[i] == row['right'])
+    names = sorted({k[0] for k in tally}, key=str)
+    return ' | '.join(f"{n}: right {tally[n, 'pos right']}/{tally[n, 'pos']} fired {tally[n, 'pos fired']} neg fired {tally[n, 'neg fired']}/{tally[n, 'neg']}" for n in names)
+
+
 def evaluate(model, rows, device):
     model.eval()
     right = 0
@@ -124,7 +156,7 @@ def evaluate(model, rows, device):
     return right, len(rows), heads
 
 
-def fit(data, table_path, tokenizer_path, output, target, epochs, seed, size=32):
+def fit(data, table_path, tokenizer_path, output, target, epochs, seed, size=32, none_weight=.25):
     from tokenizers import Tokenizer
     random.seed(seed); torch.manual_seed(seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -137,12 +169,15 @@ def fit(data, table_path, tokenizer_path, output, target, epochs, seed, size=32)
     table = torch.from_numpy(np.load(table_path)).float()
     width, layers, heads = shape_for(target)
     model = Sidecar(table, width, layers, heads).to(device)
+    common = common_tokens(train)
+    model.index[common.to(device)] = torch.arange(1, len(common) + 1, device=device)
     print('non-embedding parameters', trainable(model), 'train', len(train), 'held', len(test), flush=True)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-4, weight_decay=.01)
     steps = max(1, epochs * (len(train) + size - 1) // size)
     scaler = torch.amp.GradScaler(device, enabled=device == 'cuda')
     schedule = torch.optim.lr_scheduler.OneCycleLR(optimizer, 3e-4, total_steps=steps + 1, pct_start=.05)
     loss_of = nn.CrossEntropyLoss(ignore_index=-100)
+    operation_loss = nn.CrossEntropyLoss(weight=torch.tensor([1., 1., 1., 1., none_weight], device=device))
     for epoch in range(epochs):
         model.train()
         for s, part in enumerate(buckets(train, size)):
@@ -150,7 +185,7 @@ def fit(data, table_path, tokenizer_path, output, target, epochs, seed, size=32)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device, enabled=device == 'cuda'):
                 outputs = model(tokens, lengths, ends)
-                loss = sum(loss_of(o, l) for o, l in zip(outputs, labels) if (l != -100).any())
+                loss = operation_loss(outputs[0], labels[0]) + sum(loss_of(o, l) for o, l in zip(outputs[1:], labels[1:]) if (l != -100).any())
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.)
@@ -158,6 +193,7 @@ def fit(data, table_path, tokenizer_path, output, target, epochs, seed, size=32)
             scaler.update()
             schedule.step()
         print('epoch', epoch, round(float(loss.detach()), 4), 'held exact', evaluate(model, test, device), flush=True)
+        print(sources(model, test, device), flush=True)
     output.mkdir(parents=True, exist_ok=True)
     state = {k: v for k, v in model.state_dict().items() if not k.startswith('embedding.')}
     torch.save(state, output / f'sidecar-{target}m.pt')
@@ -171,6 +207,7 @@ if __name__ == '__main__':
     parser.add_argument('--target', type=int, choices=(5, 30, 100), required=True)
     parser.add_argument('--epochs', type=int, default=16)
     parser.add_argument('--batch', type=int, default=32)
+    parser.add_argument('--none-weight', type=float, default=.25)
     parser.add_argument('--seed', type=int, default=20261031)
     args = parser.parse_args()
-    fit(args.data, args.table, args.tokenizer, args.output, args.target, args.epochs, args.seed, args.batch)
+    fit(args.data, args.table, args.tokenizer, args.output, args.target, args.epochs, args.seed, args.batch, args.none_weight)
