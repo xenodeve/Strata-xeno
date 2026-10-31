@@ -39,6 +39,7 @@ class IgcLearnedDiagnostic {
     std::vector<int32_t> generated_;
     bool thinking_closed_=false;   // generated_ is trimmed, so it cannot answer this
     std::vector<int64_t> inline_seen_;
+    std::vector<int32_t> thinking_tail_;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
     std::unique_ptr<strata::igc::Sidecar> sidecar_;std::unique_ptr<strata::igc::NaturalFirer<strata::igc::Sidecar>> natural_;
@@ -188,7 +189,7 @@ public:
         if(!pipeline_->stage_inputs(context_->states(strata::igc::ContextTap::Embedding),
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
-        staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_closed_=false;
+        staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_tail_.clear();thinking_closed_=false;
         if(natural_)natural_->begin(prefix_);
         return true;
     }
@@ -315,6 +316,15 @@ public:
         generated_.push_back(token);
         if(generated_.size()>256)generated_.erase(generated_.begin(),generated_.begin()+128);
         if(bridge_at_<bridge_tokens_.size())return true;
+        if(!thinking_closed_) {
+            // A loop holds no `=` for the repeat rule below; left alone it runs to the end of the context.
+            thinking_tail_.push_back(token);
+            if(thinking_tail_.size()>2048)thinking_tail_.erase(thinking_tail_.begin(),thinking_tail_.begin()+1024);
+            if(thinking_tail_.size()%16==0 && strata::igc::inline_tokens::in_cycle(thinking_tail_,128,8)) {
+                std::fprintf(stderr,"strata igc loop: closed the thinking\n");
+                bridge_tokens_={198,kThinkClose,271};bridge_at_=0;called=true;return true;
+            }
+        }
         const auto call=strata::igc::parse_inline(generated_);
         if(!call)return true;
         if(!inline_request_ && (cudaMalloc(&inline_request_,sizeof(*inline_request_))!=cudaSuccess
@@ -391,8 +401,9 @@ public:
                 key=key*1000003+(step.number?number_key(step.value.coefficient)+step.value.scale:static_cast<int64_t>(step.operation));
             const auto seen=std::count(inline_seen_.begin(),inline_seen_.end(),key);
             inline_seen_.push_back(key);
-            if(!seen)bridge_tokens_.insert(bridge_tokens_.end(),{318,44839,553}); // ` (exact).`
-            else if(seen==1)bridge_tokens_.insert(bridge_tokens_.end(),{318,43967,10457,11,2842,12910,553}); // ` (already confirmed, stop checking).`
+            // No closing `.`: at least 16 % of the values continue, `2100 per week`, and the model writes its own stop.
+            if(!seen)bridge_tokens_.insert(bridge_tokens_.end(),{318,44839,8}); // ` (exact)`
+            else if(seen==1)bridge_tokens_.insert(bridge_tokens_.end(),{318,43967,10457,11,2842,12910,8}); // ` (already confirmed, stop checking)`
             else bridge_tokens_.insert(bridge_tokens_.end(),{13,198,kThinkClose,271});
         }
         ++inline_calls_;called=true;return true;

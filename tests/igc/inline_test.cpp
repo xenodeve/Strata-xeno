@@ -12,6 +12,20 @@ static int number(const InlineNumber& value) {
     return n;
 }
 int main() try {
+    {
+        std::vector<int32_t> cycle;
+        for (int i = 0; i < 100; ++i) cycle.push_back(i * i % 97);
+        for (int round = 0; round < 8; ++round) cycle.insert(cycle.end(), {7, 8, 9});
+        require(inline_tokens::in_cycle(cycle, 128, 8), "eight rounds are a cycle");
+        cycle.resize(cycle.size() - 3);
+        require(!inline_tokens::in_cycle(cycle, 128, 8), "seven rounds can still leave");
+        std::vector<int32_t> plain;
+        for (int i = 0; i < 2000; ++i) plain.push_back(i * i % 9973);
+        require(!inline_tokens::in_cycle(plain, 128, 8), "varied text is no cycle");
+        std::vector<int32_t> run(1024, 5);
+        require(inline_tokens::in_cycle(run, 128, 8), "one token repeated");
+        require(!inline_tokens::in_cycle(std::vector<int32_t>{}, 128, 8), "nothing written");
+    }
     // The program as text: digits, then the operation letters.
     auto program = [](const std::optional<InlineCall>& call) {
         std::vector<int> out;
