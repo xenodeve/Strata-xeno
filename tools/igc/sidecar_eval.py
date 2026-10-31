@@ -11,7 +11,7 @@ import torch
 from tools.igc.auto_label import OPERATIONS, label_text
 from tools.igc.rule_pointer import interval
 from tools.igc.sidecar_data import table
-from tools.igc.sidecar_fit import MAX_ENTRIES, MAX_TOKENS, OPERATIONS as NAMES, Sidecar, ZERO_FROM, shape_for
+from tools.igc.sidecar_fit import MAX_ENTRIES, MAX_TOKENS, NONE, OPERATIONS as NAMES, Sidecar, ZERO_FROM, shape_for
 
 THRESHOLDS = (.5, .8, .9, .95, .98, .99, .995)
 
@@ -32,6 +32,12 @@ def slot(prompt, thinking, row, tokenizer):
             kept.append(entry['value'])
             ends.append(position)
     return ids, ends[-MAX_ENTRIES:], kept[-MAX_ENTRIES:]
+
+
+def leading_digit(value):
+    """The first digit written, which the sampled token at a slot shows before anything is fired."""
+    text = str(abs(value.numerator)) if value.denominator == 1 else f'{float(abs(value)):.6f}'
+    return text.lstrip('0.')[:1]
 
 
 def score(model, ids, ends, device):
@@ -64,17 +70,21 @@ def main():
             if not ends:
                 continue
             (op, left, right), confidence = score(model, ids, ends, device)
+            if op == NONE:
+                continue
             value = OPERATIONS[NAMES[op]](values[left], values[right])
-            good = value == Fraction(row['value'].replace(',', ''))
-            points.setdefault(trace['suite'], []).append((confidence, good, row['label'] == 'computed', row['label'] == 'computed' and row['level'] > 0))
-    for suite, rows in sorted(points.items()):
-        slots = sum(r[3] for r in rows)
-        for threshold in THRESHOLDS:
-            fired = [r for r in rows if r[0] >= threshold]
-            right = sum(r[1] for r in fired)
-            caught = sum(r[1] and r[3] for r in fired)
-            low, high = interval(right, len(fired)) if fired else (0., 1.)
-            print(f'{suite} {args.target}M >= {threshold}: fired {len(fired)} right {right} precision 95% [{low:.3f}, {high:.3f}] recall {caught}/{slots}')
+            written = Fraction(row['value'].replace(',', ''))
+            good = value == written
+            agrees = value is not None and leading_digit(value) == leading_digit(written)
+            points.setdefault(trace['suite'], []).append((confidence, good, row['label'] == 'computed', row['label'] == 'computed' and row['level'] > 0, agrees))
+    for suite in sorted(points):
+        for gate, name in ((False, 'alone'), (True, 'first digit agrees')):
+            for threshold in THRESHOLDS:
+                fired = [r for r in points[suite] if r[0] >= threshold and (r[4] or not gate)]
+                right = sum(r[1] for r in fired)
+                caught = sum(r[1] and r[3] for r in fired)
+                low, high = interval(right, len(fired)) if fired else (0., 1.)
+                print(f'{suite} {args.target}M {name} >= {threshold}: fired {len(fired)} right {right} precision 95% [{low:.3f}, {high:.3f}] caught {caught}')
 
 
 if __name__ == '__main__':

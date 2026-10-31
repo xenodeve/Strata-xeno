@@ -58,10 +58,13 @@ def evaluate(records, prompts):
 
 def interval(hits, n, z=0.05):
     """Clopper-Pearson by bisection on the binomial tail, using only the standard library."""
-    from math import comb
+    from math import exp, lgamma, log
+
+    def term(p, k):
+        return exp(lgamma(n + 1) - lgamma(k + 1) - lgamma(n - k + 1) + k * log(p) + (n - k) * log(1 - p))
 
     def tail(p, low):
-        return sum(comb(n, k) * p ** k * (1 - p) ** (n - k) for k in (range(hits, n + 1) if low else range(0, hits + 1)))
+        return sum(term(p, k) for k in (range(hits, n + 1) if low else range(0, hits + 1)))
 
     def solve(target, low):
         a, b = 0.0, 1.0

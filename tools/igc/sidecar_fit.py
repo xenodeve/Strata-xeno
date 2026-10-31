@@ -11,7 +11,8 @@ import numpy as np
 import torch
 from torch import nn
 
-OPERATIONS = ('add', 'sub', 'mul', 'div')
+OPERATIONS = ('add', 'sub', 'mul', 'div', 'none')
+NONE = OPERATIONS.index('none')
 ZERO_FROM = 248070   # audio tokens of the larger family members have no row in the frozen table
 MAX_TOKENS = 512
 MAX_ENTRIES = 64
@@ -64,16 +65,25 @@ def encode(rows, tokenizer):
     out = []
     for row in rows:
         encoded = tokenizer.encode(row['text'][:row['slot']], add_special_tokens=False)
-        ids = [i if i < ZERO_FROM else 0 for i in encoded.ids]
-        offsets = encoded.offsets
+        start = max(0, len(encoded.ids) - MAX_TOKENS)
+        ids = [i if i < ZERO_FROM else 0 for i in encoded.ids[start:]]
+        offsets = encoded.offsets[start:]
+        if not ids:
+            continue
         ends = []
         for _, end in row['table']:
             position = next((i for i, (_, stop) in enumerate(offsets) if stop >= end), None)
-            ends.append(position if position is not None else -1)
-        if not ids or len(ids) > MAX_TOKENS or len(ends) > MAX_ENTRIES or -1 in (ends[row['left']], ends[row['right']]):
+            ends.append(position if position is not None and offsets[0][0] < end else -1)
+        drop = max(0, len(ends) - MAX_ENTRIES)
+        ends = ends[drop:]
+        left, right = row['left'] - drop, row['right'] - drop
+        if row['op'] == 'none':
+            left = right = -100
+            if max(ends, default=-1) < 0:
+                continue
+        elif min(left, right) < 0 or -1 in (ends[left], ends[right]):
             continue
-        left, right = row['left'], row['right']
-        if row['op'] in COMMUTATIVE:
+        elif row['op'] in COMMUTATIVE:
             left, right = min(left, right), max(left, right)
         out.append(dict(ids=ids, ends=ends, op=OPERATIONS.index(row['op']), left=left, right=right, key=row['group']))
     return out
@@ -100,7 +110,8 @@ def evaluate(model, rows, device):
             tokens, lengths, ends, labels = batch(rows[s:s + 64], device)
             guesses = [o.argmax(-1) for o in model(tokens, lengths, ends)]
             heads = [h + int((g == l).sum()) for h, g, l in zip(heads, guesses, labels)]
-            right += int(((guesses[0] == labels[0]) & (guesses[1] == labels[1]) & (guesses[2] == labels[2])).sum())
+            pointers = ((guesses[1] == labels[1]) & (guesses[2] == labels[2])) | (labels[0] == NONE)
+            right += int(((guesses[0] == labels[0]) & pointers).sum())
     return right, len(rows), heads
 
 
@@ -121,14 +132,15 @@ def fit(data, table_path, tokenizer_path, output, target, epochs, seed):
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-4, weight_decay=.01)
     steps = max(1, epochs * (len(train) + 31) // 32)
     schedule = torch.optim.lr_scheduler.OneCycleLR(optimizer, 3e-4, total_steps=steps + 1, pct_start=.05)
-    loss_of = nn.CrossEntropyLoss()
+    loss_of = nn.CrossEntropyLoss(ignore_index=-100)
     for epoch in range(epochs):
         model.train()
         random.shuffle(train)
         for s in range(0, len(train), 32):
             tokens, lengths, ends, labels = batch(train[s:s + 32], device)
             optimizer.zero_grad(set_to_none=True)
-            loss = sum(loss_of(o, l) for o, l in zip(model(tokens, lengths, ends), labels))
+            outputs = model(tokens, lengths, ends)
+            loss = sum(loss_of(o, l) for o, l in zip(outputs, labels) if (l != -100).any())
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.)
             optimizer.step()
