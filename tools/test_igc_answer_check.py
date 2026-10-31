@@ -49,6 +49,7 @@ class Reader(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                assert 'urllib' not in self.headers['User-Agent'].lower()
                 seen.append((self.path, self.headers['Authorization'], body))
                 status, content = replies.pop(0) if replies else (200, '{"verdict": "same"}')
                 data = json.dumps(dict(choices=[dict(message=dict(content=content))])).encode()

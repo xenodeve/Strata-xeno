@@ -69,7 +69,8 @@ def ask(env, text):
     body = dict(model=env['ANSWER_CHECK_MODEL'], temperature=0, messages=[dict(role='user', content=text)])
     request = urllib.request.Request(env['ANSWER_CHECK_BASE_URL'].rstrip('/') + '/chat/completions',
                                      json.dumps(body).encode('utf-8'),
-                                     {'Authorization': 'Bearer ' + env['ANSWER_CHECK_API_KEY'], 'Content-Type': 'application/json'})
+                                     {'Authorization': 'Bearer ' + env['ANSWER_CHECK_API_KEY'], 'Content-Type': 'application/json',
+                                      'User-Agent': 'strata-answer-check/1.0'})   # Cloudflare refuses urllib's own (1010)
     with urllib.request.urlopen(request, timeout=180) as reply:
         return json.load(reply)['choices'][0]['message']['content']
 
