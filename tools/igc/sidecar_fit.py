@@ -15,6 +15,7 @@ OPERATIONS = ('add', 'sub', 'mul', 'div')
 ZERO_FROM = 248070   # audio tokens of the larger family members have no row in the frozen table
 MAX_TOKENS = 512
 MAX_ENTRIES = 64
+COMMUTATIVE = ('add', 'mul')
 
 
 class Sidecar(nn.Module):
@@ -31,17 +32,21 @@ class Sidecar(nn.Module):
         self.left = nn.Linear(width, width)
         self.right = nn.Linear(width, width)
         self.entry = nn.Linear(width, width)
+        self.recency = nn.Embedding(MAX_ENTRIES, width)
+        self.norm = nn.LayerNorm(width)
+        self.scale = nn.Parameter(torch.tensor(10.))
 
     def forward(self, tokens, lengths, entry_ends):
         steps = tokens.shape[1]
         x = self.project(self.embedding(tokens)) + self.position(torch.arange(steps, device=tokens.device))
         padding = torch.arange(steps, device=tokens.device)[None] >= lengths[:, None]
         causal = nn.Transformer.generate_square_subsequent_mask(steps, device=tokens.device, dtype=torch.bool)
-        h = self.encoder(x, mask=causal, src_key_padding_mask=padding)
+        h = self.norm(self.encoder(x, mask=causal, src_key_padding_mask=padding))
         query = h[torch.arange(len(h)), lengths - 1]
         valid = entry_ends >= 0
-        entries = self.entry(h[torch.arange(len(h))[:, None], entry_ends.clamp(min=0)])
-        score = lambda head: (entries @ head(query)[:, :, None]).squeeze(-1).masked_fill(~valid, -1e9)
+        rank = (valid.sum(1, keepdim=True) - 1 - torch.arange(valid.shape[1], device=tokens.device)[None]).clamp(min=0, max=MAX_ENTRIES - 1)
+        entries = nn.functional.normalize(self.entry(h[torch.arange(len(h))[:, None], entry_ends.clamp(min=0)]) + self.recency(rank), dim=-1)
+        score = lambda head: self.scale * (entries @ nn.functional.normalize(head(query), dim=-1)[:, :, None]).squeeze(-1).masked_fill(~valid, -1e9)
         return self.operation(query), score(self.left), score(self.right)
 
 
@@ -67,7 +72,10 @@ def encode(rows, tokenizer):
             ends.append(position if position is not None else -1)
         if not ids or len(ids) > MAX_TOKENS or len(ends) > MAX_ENTRIES or -1 in (ends[row['left']], ends[row['right']]):
             continue
-        out.append(dict(ids=ids, ends=ends, op=OPERATIONS.index(row['op']), left=row['left'], right=row['right'], key=row['text']))
+        left, right = row['left'], row['right']
+        if row['op'] in COMMUTATIVE:
+            left, right = min(left, right), max(left, right)
+        out.append(dict(ids=ids, ends=ends, op=OPERATIONS.index(row['op']), left=left, right=right, key=row['group']))
     return out
 
 
@@ -86,12 +94,14 @@ def batch(rows, device):
 def evaluate(model, rows, device):
     model.eval()
     right = 0
+    heads = [0, 0, 0]
     with torch.no_grad():
         for s in range(0, len(rows), 64):
             tokens, lengths, ends, labels = batch(rows[s:s + 64], device)
             guesses = [o.argmax(-1) for o in model(tokens, lengths, ends)]
+            heads = [h + int((g == l).sum()) for h, g, l in zip(heads, guesses, labels)]
             right += int(((guesses[0] == labels[0]) & (guesses[1] == labels[1]) & (guesses[2] == labels[2])).sum())
-    return right, len(rows)
+    return right, len(rows), heads
 
 
 def fit(data, table_path, tokenizer_path, output, target, epochs, seed):
@@ -109,6 +119,8 @@ def fit(data, table_path, tokenizer_path, output, target, epochs, seed):
     model = Sidecar(table, width, layers, heads).to(device)
     print('non-embedding parameters', trainable(model), 'train', len(train), 'held', len(test), flush=True)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-4, weight_decay=.01)
+    steps = max(1, epochs * (len(train) + 31) // 32)
+    schedule = torch.optim.lr_scheduler.OneCycleLR(optimizer, 3e-4, total_steps=steps + 1, pct_start=.05)
     loss_of = nn.CrossEntropyLoss()
     for epoch in range(epochs):
         model.train()
@@ -118,7 +130,9 @@ def fit(data, table_path, tokenizer_path, output, target, epochs, seed):
             optimizer.zero_grad(set_to_none=True)
             loss = sum(loss_of(o, l) for o, l in zip(model(tokens, lengths, ends), labels))
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.)
             optimizer.step()
+            schedule.step()
         print('epoch', epoch, round(float(loss.detach()), 4), 'held exact', evaluate(model, test, device), flush=True)
     output.mkdir(parents=True, exist_ok=True)
     state = {k: v for k, v in model.state_dict().items() if not k.startswith('embedding.')}
@@ -131,7 +145,7 @@ if __name__ == '__main__':
     for key in ('data', 'table', 'tokenizer', 'output'):
         parser.add_argument('--' + key, type=Path, required=True)
     parser.add_argument('--target', type=int, choices=(5, 30, 100), required=True)
-    parser.add_argument('--epochs', type=int, default=8)
+    parser.add_argument('--epochs', type=int, default=16)
     parser.add_argument('--seed', type=int, default=20261031)
     args = parser.parse_args()
     fit(args.data, args.table, args.tokenizer, args.output, args.target, args.epochs, args.seed)

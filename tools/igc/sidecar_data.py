@@ -13,6 +13,7 @@ from tools.igc.auto_label import NUMBER
 
 CALL = re.compile(r'<<([^<>=]+)=([^<>]+)>>')
 SIMPLE = re.compile(r'^\s*(-?[\d.,]+%?)\s*([-+*/])\s*(-?[\d.,]+%?)\s*$')
+WRITTEN = re.compile(r'[-\d.,%$\s]*\$?-?[\d.,]+%?\s*[-+*/]\s*\$?-?[\d.,]+%?\s*=\s*\$?$')
 NAMES = {'+': 'add', '-': 'sub', '*': 'mul', '/': 'div'}
 
 
@@ -70,7 +71,17 @@ def examples(row):
             yield dict(kept=False, reason='operand not written')
             continue
         yield dict(kept=True, text=text, slot=slot, op=NAMES[m[2]], left=left, right=right, entries=len(entries), result=result,
-                   table=[[e['start'], e['end']] for e in entries])
+                   table=[[e['start'], e['end']] for e in entries], group=row['question'], written=True)
+        before = WRITTEN.search(text[:slot])
+        if before is None:
+            continue
+        kept_text = text[:before.start()].rstrip() + ' '
+        text_without = kept_text + text[slot:]
+        entries = table(text_without, len(kept_text))
+        left, right = pointer(entries, a), pointer(entries, b)
+        if left is not None and right is not None:
+            yield dict(kept=True, text=text_without, slot=len(kept_text), op=NAMES[m[2]], left=left, right=right, entries=len(entries),
+                       result=result, table=[[e['start'], e['end']] for e in entries], group=row['question'], written=False)
 
 
 def main():
