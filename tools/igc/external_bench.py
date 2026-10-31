@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from tools.igc.external_score import repeating
 from tools.igc.hub_contract import validate_launcher_env
 from tools.igc.learned_integration import parse_audit
 from tools.igc.output_examples import wrapped_prefix
@@ -61,7 +62,7 @@ def score(records):
     return suites
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -86,7 +87,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     def monitor():
         while not stop.wait(1):
             state=system_snapshot()
-            if state['physical_available_bytes']<1024**3 or (active[0] and time.monotonic()-active[0]>600):
+            if state['physical_available_bytes']<1024**3 or (active[0] and time.monotonic()-active[0]>(7200 if whole_context else 600)):
                 failure.append(dict(reason='time or physical bound',system=state));cancel.set();return
     thread=threading.Thread(target=monitor,daemon=True);thread.start()
     engine=None;records=[]
@@ -98,11 +99,15 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             if cancel.is_set():raise RuntimeError('bench stopped before request')
             ids=tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8'))
             active[0]=start=time.monotonic()
-            tokens=[int(t) for t in engine.generate(ids,row['limit'],{'temperature':0},cancel) if t is not None]
+            limit=262144-len(ids)-64 if whole_context else row['limit'];tokens=[];stuck=False
+            for t in engine.generate(ids,limit,{'temperature':0},cancel):
+                if t is None:continue
+                tokens.append(int(t))
+                if len(tokens)%64==0 and repeating(tokens):stuck=True;break
             seconds=time.monotonic()-start;active[0]=None
             text=tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace');final=final_number(text)
             records.append(dict(id=row['id'],suite=row['suite'],answer=row['answer'],final=final,correct=final==row['answer'],
-                                tokens=len(tokens),seconds=seconds,finish=engine.last.get('finish'),prompt_tokens=len(ids),text=text))
+                                tokens=len(tokens),seconds=seconds,finish='stuck' if stuck else engine.last.get('finish'),prompt_tokens=len(ids),text=text))
             (output/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
             print(row['id'],row['answer'],final,len(tokens),round(seconds,1),flush=True)
     finally:
@@ -123,5 +128,5 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     for key in ('profile','server','executable','data','reference','pack','output'):parser.add_argument('--'+key,type=Path,required=True)
-    parser.add_argument('--bundle',type=Path);parser.add_argument('--timeline',type=Path);parser.add_argument('--sidecar',type=Path);parser.add_argument('--gsm-file',default='gsm8k-test.jsonl');parser.add_argument('--math-file',default='math500.jsonl');parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40);parser.add_argument('--bigbench',type=int,default=0);parser.add_argument('--bridge',action='store_true');parser.add_argument('--inline',action='store_true');parser.add_argument('--math',type=int,default=0);parser.add_argument('--no-adapt',action='store_true')
+    parser.add_argument('--whole-context',action='store_true');parser.add_argument('--bundle',type=Path);parser.add_argument('--timeline',type=Path);parser.add_argument('--sidecar',type=Path);parser.add_argument('--gsm-file',default='gsm8k-test.jsonl');parser.add_argument('--math-file',default='math500.jsonl');parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40);parser.add_argument('--bigbench',type=int,default=0);parser.add_argument('--bridge',action='store_true');parser.add_argument('--inline',action='store_true');parser.add_argument('--math',type=int,default=0);parser.add_argument('--no-adapt',action='store_true')
     run(**vars(parser.parse_args()))
