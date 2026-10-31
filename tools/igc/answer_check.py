@@ -100,19 +100,47 @@ def read_all(env, records, questions, path):
     return verdicts
 
 
+def read_records(arm):
+    """The bench rewrites this file after each case, so a read can meet it half written."""
+    try:
+        return json.loads((arm / 'records.json').read_text(encoding='utf-8'))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def read_questions(arm):
+    return {c['id']: c['prompt'] for c in json.loads((arm / 'cases.json').read_text(encoding='utf-8'))}
+
+
+def follow(env, arm, path, every=15.):
+    """Reads a running arm beside it: the bench never waits for a verdict. Ends when the arm's report is written."""
+    verdicts = {}
+    while True:
+        finished = (arm / 'report.json').exists()
+        records = read_records(arm)
+        if records:
+            verdicts = read_all(env, records, read_questions(arm), path)
+        if finished and records is not None:
+            return verdicts
+        time.sleep(every)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--follow', action='store_true', help='read a running arm as its answers arrive')
     parser.add_argument('arm', type=Path)
     parser.add_argument('--verdicts', type=Path, help='JSON of id -> verdict; default verdicts.json in the arm')
     parser.add_argument('--env', type=Path, default=Path('.env'))
     args = parser.parse_args()
-    records = json.loads((args.arm / 'records.json').read_text(encoding='utf-8'))
-    questions = {c['id']: c['prompt'] for c in json.loads((args.arm / 'cases.json').read_text(encoding='utf-8'))}
     env = load_env(args.env)
     missing = [k for k in ('ANSWER_CHECK_BASE_URL', 'ANSWER_CHECK_API_KEY', 'ANSWER_CHECK_MODEL') if not env.get(k)]
     if missing:
         raise SystemExit(f'{args.env} has no value for {", ".join(missing)}')
-    verdicts = read_all(env, records, questions, args.verdicts or args.arm / 'verdicts.json')
+    records = [] if args.follow else read_records(args.arm)
+    questions = None if args.follow else read_questions(args.arm)
+    path = args.verdicts or args.arm / 'verdicts.json'
+    verdicts = follow(env, args.arm, path) if args.follow else read_all(env, records, questions, path)
+    records = read_records(args.arm)
     rows = triage(records, verdicts)
     (args.arm / 'triage.json').write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding='utf-8')
     print(args.arm.name, dict(Counter(r['route'] for r in rows)))

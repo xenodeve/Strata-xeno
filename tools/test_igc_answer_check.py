@@ -3,8 +3,9 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
-from tools.igc.answer_check import load_env, prompt, read_all, read_one, triage
+from tools.igc.answer_check import follow, load_env, prompt, read_all, read_one, triage
 
 
 def record(id, answer, text):
@@ -93,6 +94,27 @@ class Reader(unittest.TestCase):
             self.assertEqual(sorted(verdicts), ['a', 'b'])
             self.assertEqual(sorted(json.loads(path.read_text(encoding='utf-8'))), ['a', 'b'])
         self.assertEqual(len(seen), 1)
+
+    def test_follows_a_running_arm_to_its_report(self):
+        env, seen = self.serve([])
+        with tempfile.TemporaryDirectory() as folder:
+            arm = Path(folder)
+            (arm / 'cases.json').write_text(json.dumps([dict(id='a', prompt='q'), dict(id='b', prompt='q')]), encoding='utf-8')
+
+            def bench():
+                (arm / 'records.json').write_text('[{"id"', encoding='utf-8')    # caught half written
+                time.sleep(.05)
+                (arm / 'records.json').write_text(json.dumps([record('a', 5, 'x</think>5')]), encoding='utf-8')
+                time.sleep(.05)
+                (arm / 'records.json').write_text(json.dumps([record('a', 5, 'x</think>5'), record('b', 5, 'x</think>5')]), encoding='utf-8')
+                (arm / 'report.json').write_text('{}', encoding='utf-8')
+
+            thread = threading.Thread(target=bench)
+            thread.start()
+            verdicts = follow(env, arm, arm / 'verdicts.json', every=.01)
+            thread.join()
+        self.assertEqual(sorted(verdicts), ['a', 'b'])
+        self.assertEqual(len(seen), 2)
 
     def test_the_env_file(self):
         with tempfile.TemporaryDirectory() as folder:
