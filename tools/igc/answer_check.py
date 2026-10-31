@@ -2,8 +2,13 @@
 who erred and why. They agree that it is wrong: read the case and say what went wrong."""
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import sys
+import time
+import urllib.error
+import urllib.request
 from tools.igc.external_score import final_number
 
 RULES = """You compare a reply with the reference answer of a question. Do not solve the question.
@@ -43,13 +48,72 @@ def triage(records, verdicts):
     return rows
 
 
+def load_env(path):
+    rows = (line.split('=', 1) for line in path.read_text(encoding='utf-8').splitlines()
+            if '=' in line and not line.lstrip().startswith('#'))
+    return {key.strip(): value.strip() for key, value in rows}
+
+
+def parse_verdict(text):
+    start, end = text.find('{'), text.rfind('}')
+    if start < 0 or end < start:
+        return None
+    try:
+        verdict = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return verdict if isinstance(verdict, dict) and 'verdict' in verdict else None
+
+
+def ask(env, text):
+    body = dict(model=env['ANSWER_CHECK_MODEL'], temperature=0, messages=[dict(role='user', content=text)])
+    request = urllib.request.Request(env['ANSWER_CHECK_BASE_URL'].rstrip('/') + '/chat/completions',
+                                     json.dumps(body).encode('utf-8'),
+                                     {'Authorization': 'Bearer ' + env['ANSWER_CHECK_API_KEY'], 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(request, timeout=180) as reply:
+        return json.load(reply)['choices'][0]['message']['content']
+
+
+def read_one(env, case, tries=4, wait=2.):
+    for attempt in range(tries):
+        try:
+            verdict = parse_verdict(ask(env, prompt(case)))
+            if verdict:
+                return verdict
+        except (urllib.error.URLError, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+            # The reason only: an error's text can carry the request.
+            print('reader', case['id'], type(error).__name__, getattr(error, 'code', ''), file=sys.stderr)
+        time.sleep(wait * 2 ** attempt)
+    return None
+
+
+def read_all(env, records, questions, path):
+    """Asks for what `path` does not hold yet and saves as it goes, so a stopped run goes on where it was."""
+    verdicts = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+    cases = [dict(id=r['id'], question=questions[r['id']], gold=r['answer'], reply=r['text']) for r in records
+             if r['id'] not in verdicts and reply_of(r['text']) is not None]
+    with ThreadPoolExecutor(int(env.get('ANSWER_CHECK_WORKERS') or 4)) as pool:
+        for case, verdict in zip(cases, pool.map(lambda c: read_one(env, c), cases)):
+            if verdict:
+                verdicts[case['id']] = verdict
+                path.write_text(json.dumps(verdicts, ensure_ascii=False, indent=1), encoding='utf-8')
+    return verdicts
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('arm', type=Path)
-    parser.add_argument('--verdicts', type=Path, required=True, help='JSON of id -> verdict, from the reader')
+    parser.add_argument('--verdicts', type=Path, help='JSON of id -> verdict; default verdicts.json in the arm')
+    parser.add_argument('--env', type=Path, default=Path('.env'))
     args = parser.parse_args()
     records = json.loads((args.arm / 'records.json').read_text(encoding='utf-8'))
-    rows = triage(records, json.loads(args.verdicts.read_text(encoding='utf-8')))
+    questions = {c['id']: c['prompt'] for c in json.loads((args.arm / 'cases.json').read_text(encoding='utf-8'))}
+    env = load_env(args.env)
+    missing = [k for k in ('ANSWER_CHECK_BASE_URL', 'ANSWER_CHECK_API_KEY', 'ANSWER_CHECK_MODEL') if not env.get(k)]
+    if missing:
+        raise SystemExit(f'{args.env} has no value for {", ".join(missing)}')
+    verdicts = read_all(env, records, questions, args.verdicts or args.arm / 'verdicts.json')
+    rows = triage(records, verdicts)
     (args.arm / 'triage.json').write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding='utf-8')
     print(args.arm.name, dict(Counter(r['route'] for r in rows)))
     for r in rows:
