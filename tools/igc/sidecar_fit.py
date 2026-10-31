@@ -47,7 +47,7 @@ class Sidecar(nn.Module):
         valid = entry_ends >= 0
         rank = (valid.sum(1, keepdim=True) - 1 - torch.arange(valid.shape[1], device=tokens.device)[None]).clamp(min=0, max=MAX_ENTRIES - 1)
         entries = nn.functional.normalize(self.entry(h[torch.arange(len(h))[:, None], entry_ends.clamp(min=0)]) + self.recency(rank), dim=-1)
-        score = lambda head: self.scale * (entries @ nn.functional.normalize(head(query), dim=-1)[:, :, None]).squeeze(-1).masked_fill(~valid, -1e9)
+        score = lambda head: self.scale * (entries @ nn.functional.normalize(head(query), dim=-1)[:, :, None]).squeeze(-1).masked_fill(~valid, -1e4)
         return self.operation(query), score(self.left), score(self.right)
 
 

@@ -16,8 +16,8 @@ class SidecarFit(unittest.TestCase):
         model = Sidecar(torch.zeros(100, 16), 32, 1, 2).eval()
         _, left, right = model(torch.randint(0, 99, (2, 9)), torch.tensor([9, 5]), torch.tensor([[1, 4, 8], [2, 4, -1]]))
         self.assertEqual(left.shape, (2, 3))
-        self.assertLess(left[1, 2], -1e8)
-        self.assertLess(right[1, 2], -1e8)
+        self.assertLess(left[1, 2], -1e3)
+        self.assertLess(right[1, 2], -1e3)
 
     def test_a_later_token_cannot_change_a_slot(self):
         torch.manual_seed(1)
