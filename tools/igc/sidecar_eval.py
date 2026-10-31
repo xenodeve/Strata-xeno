@@ -13,7 +13,7 @@ from tools.igc.rule_pointer import interval
 from tools.igc.sidecar_data import table
 from tools.igc.sidecar_fit import MAX_ENTRIES, MAX_TOKENS, NONE, OPERATIONS as NAMES, Sidecar, ZERO_FROM, shape_for
 
-THRESHOLDS = (.5, .8, .9, .95, .98, .99, .995)
+THRESHOLDS = (.05, .1, .2, .3, .4, .5, .6, .7, .8, .9, .95)
 
 
 def slot(prompt, thinking, row, tokenizer):
@@ -45,8 +45,11 @@ def score(model, ids, ends, device):
     with torch.no_grad():
         outputs = model(tokens, torch.tensor([len(ids)], device=device), torch.tensor([ends], device=device))
     probabilities = [o.softmax(-1)[0] for o in outputs]
+    fire = 1 - float(probabilities[0][NONE])
+    probabilities[0] = probabilities[0].clone()
+    probabilities[0][NONE] = 0
     best = [int(p.argmax()) for p in probabilities]
-    return best, float(probabilities[0][best[0]] * probabilities[1][best[1]] * probabilities[2][best[2]])
+    return best, fire * float(probabilities[1][best[1]] * probabilities[2][best[2]])
 
 
 def main():
@@ -70,8 +73,6 @@ def main():
             if not ends:
                 continue
             (op, left, right), confidence = score(model, ids, ends, device)
-            if op == NONE:
-                continue
             value = OPERATIONS[NAMES[op]](values[left], values[right])
             written = Fraction(row['value'].replace(',', ''))
             good = value == written
