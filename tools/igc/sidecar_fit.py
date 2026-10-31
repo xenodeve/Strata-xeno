@@ -156,7 +156,7 @@ def evaluate(model, rows, device):
     return right, len(rows), heads
 
 
-def fit(data, table_path, tokenizer_path, output, target, epochs, seed, size=32, none_weight=.25):
+def fit(data, table_path, tokenizer_path, output, target, epochs, seed, size=32, none_weight=.25, rate=3e-4):
     from tokenizers import Tokenizer
     random.seed(seed); torch.manual_seed(seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -172,10 +172,10 @@ def fit(data, table_path, tokenizer_path, output, target, epochs, seed, size=32,
     common = common_tokens(train)
     model.index[common.to(device)] = torch.arange(1, len(common) + 1, device=device)
     print('non-embedding parameters', trainable(model), 'train', len(train), 'held', len(test), flush=True)
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-4, weight_decay=.01)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=rate, weight_decay=.01)
     steps = max(1, epochs * (len(train) + size - 1) // size)
     scaler = torch.amp.GradScaler(device, enabled=device == 'cuda')
-    schedule = torch.optim.lr_scheduler.OneCycleLR(optimizer, 3e-4, total_steps=steps + 1, pct_start=.05)
+    schedule = torch.optim.lr_scheduler.OneCycleLR(optimizer, rate, total_steps=steps + 1, pct_start=.05)
     loss_of = nn.CrossEntropyLoss(ignore_index=-100)
     operation_loss = nn.CrossEntropyLoss(weight=torch.tensor([1., 1., 1., 1., none_weight], device=device))
     for epoch in range(epochs):
@@ -208,6 +208,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=16)
     parser.add_argument('--batch', type=int, default=32)
     parser.add_argument('--none-weight', type=float, default=.25)
+    parser.add_argument('--rate', type=float, default=3e-4)
     parser.add_argument('--seed', type=int, default=20261031)
     args = parser.parse_args()
-    fit(args.data, args.table, args.tokenizer, args.output, args.target, args.epochs, args.seed, args.batch, args.none_weight)
+    fit(args.data, args.table, args.tokenizer, args.output, args.target, args.epochs, args.seed, args.batch, args.none_weight, args.rate)
