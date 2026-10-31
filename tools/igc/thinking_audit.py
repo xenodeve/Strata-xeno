@@ -22,7 +22,7 @@ def audit(text, answer):
     rows = sentences(thinking)
     plain = str(int(answer)) if float(answer) == int(answer) else str(answer)
     # As a result, not as a number the question gave: after `=`, or after a word that states an outcome.
-    pattern = re.compile(rf'(?:=|(?:is|are|answer|total|gives?|get|so|thus):?)\s*\$?\s*{re.escape(plain)}(?![\d]|[.,]\d)', re.I)
+    pattern = re.compile(rf'(?:=|\b(?:is|are|answer|total|gives?|get|so|thus)\b:?)\s*\$?\s*{re.escape(plain)}(?![\d]|[.,]\d|\s*[-+*/×])', re.I)
     first = next((i for i, s in enumerate(rows) if pattern.search(s.replace(',', ''))), None)
     seen, repeated, moves = set(), 0, Counter()
     for s in rows[(first or 0):]:
