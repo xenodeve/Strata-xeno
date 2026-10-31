@@ -1,5 +1,7 @@
 #pragma once
 #include "strata/core/igc_inline.hpp"
+#include "strata/core/igc_natural.hpp"
+#include "strata/core/igc_sidecar.hpp"
 #include "strata/core/igc_context.hpp"
 #include "strata/core/igc_pipeline.hpp"
 #include "strata/core/qwenputer_binding.hpp"
@@ -38,6 +40,7 @@ class IgcLearnedDiagnostic {
     std::vector<int64_t> inline_seen_;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
+    std::unique_ptr<strata::igc::Sidecar> sidecar_;std::unique_ptr<strata::igc::NaturalFirer<strata::igc::Sidecar>> natural_;
     strata::igc::ExactRequest* inline_request_=nullptr;strata::igc::ExactResult* inline_result_=nullptr;
     strata::igc::rational_exact::Request* inline_rational_request_=nullptr;strata::igc::rational_exact::Result* inline_rational_result_=nullptr;
     bool note_stream(void* stream,std::string& error) {
@@ -184,7 +187,9 @@ public:
         if(!pipeline_->stage_inputs(context_->states(strata::igc::ContextTap::Embedding),
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
-        staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();return true;
+        staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();
+        if(natural_)natural_->begin(prefix_);
+        return true;
     }
     // Only after wait_commit, before another run. The diagnostic head above is
     // hard no-op, so copy_head_input is the genuine pre-injection mixed row.
@@ -279,6 +284,12 @@ public:
     }
     void set_bridge(bool on){bridge_=on;}
     void set_inline_exec(bool on){inline_exec_=on;}
+    bool set_sidecar(const std::string& path,std::string& error) {
+        sidecar_=std::make_unique<strata::igc::Sidecar>();
+        if(!sidecar_->load(path,error))return false;
+        natural_=std::make_unique<strata::igc::NaturalFirer<strata::igc::Sidecar>>(*sidecar_);
+        return true;
+    }
     int64_t inline_calls()const{return inline_calls_;}
     // After one accepted token: an expression that just closed runs on the device and its
     // value is delivered next. The device buffers live as long as the process.
@@ -289,6 +300,15 @@ public:
         if(token==kEndOfTurn && !inline_seen_.empty()
                 && std::find(generated_.begin(),generated_.end(),kThinkClose)==generated_.end()) {
             token=198;bridge_tokens_={kThinkClose,271};bridge_at_=0;
+        }
+        if(natural_) {
+            strata::timeline::Span span("igc.sidecar");
+            const int32_t sampled=token;
+            auto rest=natural_->step(token);
+            if(token!=sampled && bridge_at_>=bridge_tokens_.size()) {
+                std::fprintf(stderr,"strata igc sidecar: fired, %d became %d, %d digits follow, confidence %.3f\n",sampled,token,static_cast<int>(rest.size()),natural_->last_confidence());
+                bridge_tokens_=std::move(rest);bridge_at_=0;called=true;
+            }
         }
         generated_.push_back(token);
         if(generated_.size()>256)generated_.erase(generated_.begin(),generated_.begin()+128);

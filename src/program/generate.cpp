@@ -454,6 +454,7 @@ struct Options {
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
     std::string igc_output_artifact,igc_output_fixture,igc_learned_bundle;
     bool igc_result_bridge=false,igc_inline_exec=false;
+    std::string igc_sidecar;
     std::string igc_observation_plan,igc_observation_root;
 #endif
     /// One residual snapshot per layer per position: `n_layers * hc * n_embd` floats per position, appended in
@@ -954,6 +955,7 @@ void usage() {
                  "  --igc-learned-diagnostic-bundle PATH  learned first-anchor controller (not production)\n"
                  "  --igc-result-bridge  emit the executed result as tokens instead of the output mapper\n"
                  "  --igc-inline-exec    execute `A op B =` inside reasoning on the device, with the bridge\n"
+                 "  --igc-sidecar <file> also check numbers written in plain words against this sidecar (with --igc-inline-exec)\n"
 #endif
                  "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
                  "                       event interval includes host gaps, so run with --gpu-only-full first\n"
@@ -2552,6 +2554,7 @@ int main(int argc, char** argv) {
         else if (a == "--igc-learned-diagnostic-bundle") o.igc_learned_bundle = next("--igc-learned-diagnostic-bundle");
         else if (a == "--igc-result-bridge") o.igc_result_bridge = true;
         else if (a == "--igc-inline-exec") o.igc_result_bridge = o.igc_inline_exec = true;
+        else if (a == "--igc-sidecar") o.igc_sidecar = next("--igc-sidecar");
         else if (a == "--igc-observation-plan") o.igc_observation_plan = next("--igc-observation-plan");
         else if (a == "--igc-observation-root") o.igc_observation_root = next("--igc-observation-root");
 #endif
@@ -3547,6 +3550,13 @@ int main(int argc, char** argv) {
         igc_learned=std::make_unique<strata::program::IgcLearnedDiagnostic>();
         igc_learned->set_bridge(o.igc_result_bridge);
         igc_learned->set_inline_exec(o.igc_inline_exec);
+        if (!o.igc_sidecar.empty()) {
+            std::string sidecar_error;
+            if (!o.igc_inline_exec || !igc_learned->set_sidecar(o.igc_sidecar, sidecar_error)) {
+                std::fprintf(stderr, "strata generate: --igc-sidecar: %s\n", sidecar_error.empty() ? "needs --igc-inline-exec" : sidecar_error.c_str());
+                return 1;
+            }
+        }
         std::vector<std::filesystem::path> model_paths;
         for(const auto& path:o.native_shards)model_paths.emplace_back(path);
         std::fprintf(stderr,"strata IGC learned: validating bundle and content-binding model/tokenizer before allocation\n");
