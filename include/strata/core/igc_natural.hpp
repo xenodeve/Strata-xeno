@@ -83,7 +83,7 @@ private:
     bool parser_owns() const {
         size_t i = tokens_.size();
         while (i > 0 && (tokens_[i - 1] == 220 || tokens_[i - 1] == 3 || tokens_[i - 1] == 393)) --i;
-        if (i == 0 || (tokens_[i - 1] != 28 && tokens_[i - 1] != 283)) return false;
+        if (i == 0 || !inline_tokens::closes_expression(tokens_[i - 1])) return false;
         return parse_inline(std::span<const int32_t>(tokens_).first(i)).has_value();
     }
 

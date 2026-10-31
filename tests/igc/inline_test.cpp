@@ -52,6 +52,17 @@ int main() try {
     require(refused({17237, 17, 1088, 14695, 220, 21, 478, 220, 19, 1088, 14695, 220, 16, 283}), "shown working stays the model's");
     auto plain = parse_inline(std::vector<int32_t>{17, 9, 21, 10, 19, 9, 16, 28});  // 2*6+4*1=
     require(plain.has_value(), "the same sum in plain text is read");
+    auto closes = parse_inline(std::vector<int32_t>{19, 6391, 20, 10, 16, 11393});  // 4*(5+1)=
+    require(closes && program(closes) == std::vector<int>{4, 5, 1, -1, -3} && !closes->spaced, "a bracket glued to =");
+    auto after = parse_inline(std::vector<int32_t>{7, 17, 10, 18, 4653, 19, 28});  // (2+3)*4=
+    require(after && program(after) == std::vector<int>{2, 3, -1, 4, -3}, "a bracket glued to its operation");
+    auto squared = parse_inline(std::vector<int32_t>{7, 16, 15, 15, 12, 16, 28803, 17, 10, 24, 24, 283});  // (100-1)^2+99 =
+    require(squared && program(squared) == std::vector<int>{100, 1, -2, 2, -5, 99, -1}, "a bracket glued to its power");
+    auto opened = parse_inline(std::vector<int32_t>{64, 318, 18, 10, 19, 8, 9, 17, 28});  // a (3+4)*2=
+    require(opened && program(opened) == std::vector<int>{3, 4, -1, 2, -3}, "a spaced bracket");
+    require(refused({87, 7, 16, 8, 7030, 17, 9, 18, 28}), "x(1)+2*3=");
+    require(refused({87, 8, 7030, 17, 9, 18, 28}), "x)+2*3=");
+    require(refused({17, 7030, 18, 28}), "2)+3=");
     auto dots = parse_inline(std::vector<int32_t>{17, 13535, 18, 9306, 220, 19, 28});  // 2·3 · 4=
     require(dots && program(dots) == std::vector<int>{2, 3, -3, 4, -3}, "middle dot");
     auto minus = parse_inline(std::vector<int32_t>{20, 32160, 17, 23437, 220, 16, 28});  // 5−2 − 1=

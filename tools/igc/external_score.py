@@ -13,12 +13,16 @@ FORMS = dict(
 
 
 def final_number(text):
-    """The bold number if the answer has one, else the last number; None when thinking never closed."""
+    """The last boxed number, else a bold number on the closing line, else the last number; None when thinking never closed."""
     parts = text.rsplit('</think>', 1)
     if len(parts) < 2:
         return None
-    answer = parts[1].replace(',', '').replace(MINUS, '-')
-    bold = [b for b in re.findall(r'\*\*([^*]*)\*\*', answer) if re.search(r'\d', b)]
+    answer = parts[1].replace('<|im_end|>', '').replace(',', '').replace(MINUS, '-').strip()
+    boxed = re.findall(r'\boxed\{\s*(-?\d+(?:\.\d+)?)\s*\}', answer)
+    if boxed:
+        return float(boxed[-1])
+    closing = answer.splitlines()[-1] if answer else ''
+    bold = [b for b in re.findall(r'\*\*([^*]*)\*\*', closing) if re.search(r'\d', b)]
     numbers = re.findall(r'-?\d+(?:\.\d+)?', bold[-1] if bold else answer)
     if not numbers:
         return None

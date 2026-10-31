@@ -37,6 +37,7 @@ class IgcLearnedDiagnostic {
     bool loaded_=false,active_=false,staged_=false,invocation_known_=false,invoked_=false,bridge_=false;
     std::vector<int32_t> bridge_tokens_;std::size_t bridge_at_=0;
     std::vector<int32_t> generated_;
+    bool thinking_closed_=false;   // generated_ is trimmed, so it cannot answer this
     std::vector<int64_t> inline_seen_;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
@@ -187,7 +188,7 @@ public:
         if(!pipeline_->stage_inputs(context_->states(strata::igc::ContextTap::Embedding),
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
-        staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();
+        staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_closed_=false;
         if(natural_)natural_->begin(prefix_);
         return true;
     }
@@ -298,7 +299,7 @@ public:
         if(!inline_exec_ || !pipeline_ || observation_ || !staged_)return true;
         // An end of turn inside thinking would leave the reader no answer after a call.
         if(token==kEndOfTurn && !inline_seen_.empty()
-                && std::find(generated_.begin(),generated_.end(),kThinkClose)==generated_.end()) {
+                && !thinking_closed_) {
             token=198;bridge_tokens_={kThinkClose,271};bridge_at_=0;
         }
         if(natural_) {
@@ -310,6 +311,7 @@ public:
                 bridge_tokens_=std::move(rest);bridge_at_=0;called=true;
             }
         }
+        thinking_closed_=thinking_closed_||token==kThinkClose;
         generated_.push_back(token);
         if(generated_.size()>256)generated_.erase(generated_.begin(),generated_.begin()+128);
         if(bridge_at_<bridge_tokens_.size())return true;
@@ -382,7 +384,7 @@ public:
         }
         bridge_tokens_=std::move(value);bridge_at_=0;
         // Inside reasoning the value says where it came from; unmarked, the model re-derives it.
-        if(std::find(generated_.begin(),generated_.end(),kThinkClose)==generated_.end()) {
+        if(!thinking_closed_) {
             // A repeat means the model is re-checking: say so once, then close the thinking.
             int64_t key=0;
             for(const auto& step:call->program)

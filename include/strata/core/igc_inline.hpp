@@ -2,8 +2,10 @@
 // Finds `A op B =` at the end of generated tokens, for exact execution inside reasoning.
 // Token ids are the Gyro-M pack's; each decimal digit is one token. Host parsing only:
 // values always come from the device executors.
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <span>
 #include <vector>
@@ -57,6 +59,44 @@ inline std::optional<InlineOperation> latex_operation(int32_t slash, int32_t nam
     if (name == 596) return InlineOperation::Divide;
     return std::nullopt;
 }
+// The tokenizer's one-token brackets, as the tokens the walk and the parser read.
+inline std::vector<int32_t> split_brackets(std::span<const int32_t> tokens) {
+    std::vector<int32_t> out;
+    out.reserve(tokens.size() + 8);
+    auto put = [&](std::initializer_list<int32_t> parts) { out.insert(out.end(), parts); };
+    for (const int32_t t : tokens) switch (t) {
+        case 4653: put({kClose, 9}); break;                  // )*
+        case 7030: put({kClose, 10}); break;                 // )+
+        case 7060: put({kClose, kMinus}); break;             // )-
+        case 5443: put({kClose, 14}); break;                 // )/
+        case 28803: put({kClose, 61}); break;                // )^
+        case 11393: put({kClose, kEquals}); break;           // )=
+        case 6391: put({9, kOpen}); break;                   // *(
+        case 12975: put({10, kOpen}); break;                 // +(
+        case 7762: put({kMinus, kOpen}); break;              // -(
+        case 11545: put({14, kOpen}); break;                 // /(
+        case 12883: put({61, kOpen}); break;                 // ^(
+        case 1148: put({kOpen, kOpen}); break;               // ((
+        case 578: put({kClose, kClose}); break;              // ))
+        case 7461: put({kClose, kClose, kClose}); break;     // )))
+        case 30824: put({kClose, kClose, 9}); break;         // ))*
+        case 17201: put({kClose, 9, kOpen}); break;          // )*(
+        case 40415: put({kClose, 10, kOpen}); break;         // )+(
+        case 49629: put({kClose, kMinus, kOpen}); break;     // )-(
+        case 23493: put({kClose, 14, kOpen}); break;         // )/(
+        case 80851: put({kClose, kClose, 9, kOpen}); break;  // ))*(
+        case 4391: put({kEquals, kOpen}); break;             // =(
+        case 42163: put({kSpacedEquals, kOpen}); break;      // ` =(`
+        case 318: put({kSpace, kOpen}); break;               // ` (`
+        case 12492: put({348, kOpen}); break;                // ` *(`
+        case 59025: put({478, kOpen}); break;                // ` +(`
+        case 27478: put({kSpacedMinus, kOpen}); break;       // ` -(`
+        case 68477: put({593, kOpen}); break;                // ` /(`
+        default: out.push_back(t);
+    }
+    return out;
+}
+inline bool closes_expression(int32_t t) { return t == kEquals || t == kSpacedEquals || t == 11393; }
 // `(` written against a word is a function call or a product we cannot read.
 inline bool opens_cleanly(int32_t before) {
     return before == kEquals || before == kSpacedEquals || before == 198 || before == 271 || before == 25;
@@ -101,7 +141,7 @@ struct InlineParser {
     std::span<const int32_t> tokens;
     size_t at = 0;
     InlineCall& call;
-    bool latex = false;       // written as `\\times`: shown working
+    bool latex = false;       // written as `\times`: shown working
     int product_terms = 0;    // terms of the outer sums that multiply or divide
     void skip() { while (at < tokens.size() && tokens[at] == inline_tokens::kSpace) ++at; }
     std::optional<InlineOperation> peek(size_t& width) {
@@ -191,9 +231,11 @@ struct InlineParser {
     }
 };
 
-inline std::optional<InlineCall> parse_inline(std::span<const int32_t> tokens) {
+inline std::optional<InlineCall> parse_inline(std::span<const int32_t> written) {
     using namespace inline_tokens;
-    if (tokens.empty() || (tokens.back() != kEquals && tokens.back() != kSpacedEquals)) return std::nullopt;
+    if (written.empty() || !closes_expression(written.back())) return std::nullopt;
+    const auto split = split_brackets(written.last(std::min<size_t>(written.size(), 128)));
+    const std::span<const int32_t> tokens = split;
     InlineCall call;
     call.spaced = tokens.back() == kSpacedEquals;
     // Walk back over the expression; an unmatched `(` belongs to the prose around it.
@@ -225,7 +267,8 @@ inline std::optional<InlineCall> parse_inline(std::span<const int32_t> tokens) {
     while (before >= 0 && tokens[(size_t) before] == kSpace) --before;
     if (before >= 0) {
         const int32_t t = tokens[(size_t) before];
-        if (binds_next(t) || (tokens[(size_t) first] == kOpen && !opens_cleanly(t))) return std::nullopt;
+        const bool glued = tokens[(size_t) first - 1] != kSpace;
+        if (binds_next(t) || (tokens[(size_t) first] == kOpen && glued && !opens_cleanly(t))) return std::nullopt;
         if (t == 332 && before > 0) {   // `**` is bold at the start of a line, a power after a value
             const int32_t left = tokens[(size_t) before - 1];
             if (digit(left) || left == kClose || left == 87) return std::nullopt;
@@ -235,7 +278,7 @@ inline std::optional<InlineCall> parse_inline(std::span<const int32_t> tokens) {
     if (!parser.sum()) return std::nullopt;
     parser.skip();
     if (parser.at != body.size()) return std::nullopt;
-    // `2 \\times 6 + 4 \\times 1.5 = 12 + 6` shows its steps: the full value there reads as a term and gets added to again.
+    // `2 \times 6 + 4 \times 1.5 = 12 + 6` shows its steps: the full value there reads as a term and gets added to again.
     if (parser.latex && parser.product_terms > 1) return std::nullopt;
     size_t steps = 0;
     for (const auto& step : call.program) steps += !step.number;
