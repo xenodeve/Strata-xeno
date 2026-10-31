@@ -17,11 +17,13 @@ def final_number(text):
     parts = text.rsplit('</think>', 1)
     if len(parts) < 2:
         return None
-    answer = parts[1].replace('<|im_end|>', '').replace(',', '').replace(MINUS, '-').strip()
-    boxed = re.findall(r'\boxed\{\s*(-?\d+(?:\.\d+)?)\s*\}', answer)
+    answer = parts[1].replace('<|im_end|>', '').replace('{,}', '').replace(',', '').replace(MINUS, '-').strip()
+    boxed = re.findall(r'\\boxed\{\s*(-?\d+(?:\.\d+)?)\s*\}', answer)
     if boxed:
         return float(boxed[-1])
     closing = answer.splitlines()[-1] if answer else ''
+    # `**160 minutes**, or **2 hours 40 minutes**`: what follows `or` is the same answer in another form.
+    closing = re.sub(r'\s+or\s+\*\*.*', '', closing)
     bold = [b for b in re.findall(r'\*\*([^*]*)\*\*', closing) if re.search(r'\d', b)]
     numbers = re.findall(r'-?\d+(?:\.\d+)?', bold[-1] if bold else answer)
     if not numbers:

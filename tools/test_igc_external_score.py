@@ -14,6 +14,10 @@ class FinalNumber(unittest.TestCase):
         self.assertEqual(final_number('x</think>Claire eats **7 dozen eggs** in 4 weeks.<|im_end|>'), 7)
         self.assertEqual(final_number('x</think>**12 + 11 = 23**'), 23)
 
+    def test_another_form_of_the_answer(self):
+        self.assertEqual(final_number('x</think>Total: **40 + 20 + 100 = 160 minutes**, or **2 hours 40 minutes**.'), 160)
+        self.assertEqual(final_number('x</think>So she spent **70 minutes**, or **1 hour and 10 minutes**.'), 70)
+
     def test_unfinished(self):
         self.assertIsNone(final_number('never closed'))
 
