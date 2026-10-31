@@ -1,7 +1,58 @@
-# PRD R11: IGC เป็นทางหลักของการคำนวณภายใน Strata
+# PRD R12: IGC เป็นทางหลักของการคำนวณภายใน Strata
 
 Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276)
-สถานะ: R11 เพิ่มเส้นทางตรวจเป้าหมายครบทุกด้าน; งานฝึก mapper และ integration ยังไม่ผ่าน gates
+สถานะ: R12 กำหนดเกณฑ์ตัดสินตามขนาดโมเดล และลำดับงานลด token กับการตรวจสมมุติฐาน; R11 ด้านล่างยังมีผลในส่วนที่ R12 ไม่ได้แก้
+
+## R12 (2026-11-01)
+
+### เกณฑ์ตัดสิน
+
+- บนโมเดลใหญ่อย่าง Gyro-M เป้าหลักคือลด token และเวลาตอบ ความแม่นเป็นผลพลอยได้ที่ต้องไม่แย่ลง
+- ข้อที่ผิดเพราะโมเดลตีความโจทย์ไม่นับเป็นผลเสียของ MIP แต่ MIP รับผิดชอบความเสียหายที่ตัวเองก่อ เช่น ข้อความที่แทรกแล้วเปลี่ยนสิ่งที่โมเดลเขียน
+- ผู้พัฒนาคาดว่าโมเดลขนาดกลางและเล็กจะได้ผลด้านความแม่นมากกว่า ข้อนี้ยังไม่ได้วัด ห้ามอ้างจนกว่าจะมีตัวเลข
+- การแก้แต่ละครั้งทดสอบเฉพาะข้อที่การแก้นั้นมีผล คัดจากผลที่มีอยู่ด้วยกฎที่ระบุก่อนรัน และรันแขนเทียบใหม่บนข้อชุดเดียวกัน ชุดเต็มเก็บไว้รอบสุดท้าย
+
+### หลักฐาน (รายละเอียดใน #276)
+
+- GSM-Hard 200 ข้อ: เปิด MIP 177, ปิด MIP 178 หลังอ่านข้อที่เห็นแย้ง token น้อยลง 22 % เวลา decode น้อยลง 18 % จากการรันแขนละรอบ ยังไม่ใช่ ABBA เฉลยของชุดนี้ผิดบางส่วน
+- ผลคูณ 180 จุดในการคิดของแขนปิดไม่พบข้อผิดจริง จากการตรวจด้วย pattern ที่เห็นเฉพาะ `a*b = c`
+- 30 ข้อเพดานรันจนสุด context: แขนปิดจบเองครบ การคิด 71 % (เปิด) และ 83 % (ปิด) อยู่หลังเจอคำตอบครั้งแรก
+- จุดปิดท้ายโน้ตตัดประโยคและทำให้ gsm8k-201 วน 3 จาก 3 รอบ เอาออกแล้วจบเอง 3 จาก 3 รอบ โน้ตจึงไม่ปิดด้วย `.` อีกต่อไป และ engine ปิดการคิดเมื่อเจอวงซ้ำเป๊ะ 8 รอบ (ตัวกันวนยังไม่เคยทำงานจริงนอก unit test)
+- สัญญาณจากตัวเลขอย่างเดียวจับข้อผิดได้น้อย: ค่าที่ไม่เป็นจำนวนเต็มเกิดในข้อถูก 23 ข้อ ข้อผิด 9 ข้อ และ MIP ตรวจได้ว่าคำนวณถูก แต่ตรวจไม่ได้ว่าโจทย์ตั้งถูก การแทนคำตอบกลับลงสมการเดิมจึงผ่านเสมอ
+
+### ลำดับงาน
+
+1. **ความมั่นใจในค่าที่ส่งให้:** เพิ่มประโยคใน system ว่าค่าที่มีโน้ตมาจากเครื่องคำนวณและให้ตรวจเฉพาะการตั้งโจทย์ วัดบน 60 ข้อที่คัด เทียบแขนไม่มี hint ถ้าใช้จริงต้องดูผลต่อ prefix ของงาน serve
+2. **ระงับการทบทวนหลังยืนยันค่า:** แนวทาง CGRS ใน engine วัด token และเวลาบนข้อที่คัดก่อน ไม่เพิ่ม dependency และแยกการตรวจสมมุติฐานออกจากการตรวจเลข
+3. **ตรวจสมมุติฐานด้วยเกณฑ์ภายนอก:** ทดลองตรวจย้อนกลับแบบ FOBAR หรือ Key Condition Verification โดยซ่อนเลขในโจทย์แล้วให้ MIP คำนวณ เทียบกับเลขจริง เริ่มจากข้อผิด 20 ข้อและข้อถูก 20 ข้อ วัดอัตราจับข้อผิดและการเตือนผิด ถ้าไม่คุ้มไม่สร้าง ถ้าคุ้มให้ทำงานเฉพาะเมื่อมีสัญญาณ
+4. **แปลงเป็นเงื่อนไขให้ solver (SatLM):** ทางเลือกระยะยาว ใช้เมื่อข้อ 3 พิสูจน์แล้วว่าการตรวจภายนอกคุ้มค่า เป็น dependency ใหม่ ต้องคุยกับผู้พัฒนาก่อน
+5. **วัดเวลาจริง:** ABBA ที่ priority สูงตามกฎ repo และแยกต้นทุนด้วย timeline ก่อนอ้างตัวเลขเวลา
+
+ถ้อยคำกำกวมที่ไม่มีเงื่อนไขให้ตรวจอยู่นอกขอบเขต เป็นเรื่องการตัดสินของโมเดล
+
+### R12 in English
+
+**Decision criteria.** On a large model such as Gyro-M the main goal is fewer tokens and less response time; accuracy is a by-product that must not fall. A wrong answer from the model misreading a question does not count against MIP, but MIP owns harm it causes itself, such as inserted text that changes what the model writes. The developer expects medium and small models to gain more accuracy; that is unmeasured and must not be claimed until it has numbers. Each change is tested on the cases it reaches, picked from existing runs by a rule stated before the run, with a fresh comparison arm on the same cases. Full suites wait for the final round.
+
+**Evidence, details in #276.** GSM-Hard 200: on 177, off 178 after reading disagreements, 22 % fewer tokens and 18 % less decode time from one run per arm, not ABBA; part of that suite's gold is wrong. 180 products in off's thinking held no real error, by a pattern that sees only `a*b = c`. The 30 limit cases ran to the end: off finished all of them, and 71 % (on) and 83 % (off) of the thinking came after the answer first appeared. The note's closing stop cut sentences and made gsm8k-201 cycle in 3 of 3 runs; without it the case finished in 3 of 3, so the note no longer ends in `.`, and the engine closes thinking on an exact cycle of 8 rounds (the guard has not fired outside its unit test). Numeric signals alone catch little: a non-integer value appears in 23 right cases and 9 wrong ones. MIP checks that a calculation is right, not that the setup is right, so substituting an answer back into the same equations always passes.
+
+**Order of work.**
+
+1. Confidence in delivered values: a system line saying marked values come from a calculator and only the setup needs checking, measured on the 60 selected cases against an arm without it. Real use must check the effect on serve's prefix.
+2. Suppress reflection after a value is confirmed: the CGRS approach in the engine, token and time measured on selected cases first, no new dependency, keeping the check of assumptions apart from the check of numbers.
+3. Check assumptions by an outside criterion: a trial of backward verification in the style of FOBAR or Key Condition Verification, masking a number in the question and having MIP compute it against the known value. Start from 20 wrong and 20 right cases and measure catches and false alarms. Do not build it if it does not pay; if it does, it runs only on a signal.
+4. Declarative constraints for a solver (SatLM): a longer-term option once step 3 shows outside checks pay. A new dependency, to be discussed with the developer first.
+5. Measure time properly: ABBA at high priority under the repository's rules, with cost split by the timeline, before any time figure is claimed.
+
+Ambiguous wording with no condition to check is out of scope; it is the model's judgement.
+
+Research read at abstract and summary level only, numbers to be checked against the papers before reuse: [RCoT](https://arxiv.org/pdf/2305.11499), [FOBAR](https://arxiv.org/pdf/2308.07758), [SatLM](https://arxiv.org/pdf/2305.09656), [First Try Matters](https://papers.cool/arxiv/2510.08308), [CGRS](https://papers.cool/arxiv/2508.05337).
+
+---
+
+R11 เดิมอยู่ด้านล่าง
+
+สถานะ R11: เพิ่มเส้นทางตรวจเป้าหมายครบทุกด้าน; งานฝึก mapper และ integration ยังไม่ผ่าน gates
 
 ## Problem Statement
 
