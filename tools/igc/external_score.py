@@ -21,13 +21,20 @@ def final_number(text):
     boxed = re.findall(r'\\boxed\{\s*(-?\d+(?:\.\d+)?)\s*\}', answer)
     if boxed:
         return float(boxed[-1])
-    closing = answer.splitlines()[-1] if answer else ''
+    # A closing `If both boxes must be nonempty...` or `since 2^6 = 64` comes after the answer.
+    lines = [line for line in answer.splitlines() if line.strip()]
+    while len(lines) > 1 and (lines[-1].startswith('since') or (lines[-1].startswith('If ') and re.search(r'\*\*[^*]*\d', lines[-2]))):
+        lines.pop()
+    closing = re.sub(r'\s+since\b.*', '', lines[-1]) if lines else ''
+    answer = '\n'.join(lines[:-1] + [closing])
     # `**160 minutes**, or **2 hours 40 minutes**`: what follows `or` is the same answer in another form.
     closing = re.sub(r'\s+or\s+\*\*.*', '', closing)
     bold = [b for b in re.findall(r'\*\*([^*]*)\*\*', closing) if re.search(r'\d', b)]
     numbers = re.findall(r'-?\d+(?:\.\d+)?', bold[-1] if bold else answer)
     if not numbers:
         return None
+    if not bold and '=' not in closing and re.match(r'\d', closing):    # `5 cars drove through in the first 15 minutes.`
+        return float(re.findall(r'-?\d+(?:\.\d+)?', closing)[0])
     # `**7 minutes**` keeps its first number, `**12 + 11 = 23**` its result.
     equation = bold and '=' in bold[-1]
     return float(numbers[-1] if equation or not bold else numbers[0])
