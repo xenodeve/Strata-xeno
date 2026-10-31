@@ -101,6 +101,8 @@ struct InlineParser {
     std::span<const int32_t> tokens;
     size_t at = 0;
     InlineCall& call;
+    bool latex = false;       // written as `\\times`: shown working
+    int product_terms = 0;    // terms of the outer sums that multiply or divide
     void skip() { while (at < tokens.size() && tokens[at] == inline_tokens::kSpace) ++at; }
     std::optional<InlineOperation> peek(size_t& width) {
         skip();
@@ -113,11 +115,15 @@ struct InlineParser {
             return InlineOperation::Divide;
         }
         if (at + 1 < tokens.size())
-            if (const auto latex = inline_tokens::latex_operation(tokens[at], tokens[at + 1])) {
+            if (const auto latex_op = inline_tokens::latex_operation(tokens[at], tokens[at + 1])) {
                 width = 2;
-                return latex;
+                return latex_step(*latex_op);
             }
         return inline_tokens::operation(tokens[at]);
+    }
+    InlineOperation latex_step(InlineOperation op) {
+        latex = true;
+        return op;
     }
     bool primary() {
         using namespace inline_tokens;
@@ -160,9 +166,14 @@ struct InlineParser {
     }
     bool product() {
         if (!power()) return false;
+        int multiplied = 0;
         for (size_t width = 1;;) {
             const auto op = peek(width);
-            if (!op || (*op != InlineOperation::Multiply && *op != InlineOperation::Divide)) return true;
+            if (!op || (*op != InlineOperation::Multiply && *op != InlineOperation::Divide)) {
+                product_terms += multiplied;
+                return true;
+            }
+            multiplied = 1;
             at += width;
             if (!power()) return false;
             call.program.push_back(InlineStep{false, *op, {}});
@@ -224,6 +235,8 @@ inline std::optional<InlineCall> parse_inline(std::span<const int32_t> tokens) {
     if (!parser.sum()) return std::nullopt;
     parser.skip();
     if (parser.at != body.size()) return std::nullopt;
+    // `2 \\times 6 + 4 \\times 1.5 = 12 + 6` shows its steps: the full value there reads as a term and gets added to again.
+    if (parser.latex && parser.product_terms > 1) return std::nullopt;
     size_t steps = 0;
     for (const auto& step : call.program) steps += !step.number;
     if (!steps || steps > 15) return std::nullopt;

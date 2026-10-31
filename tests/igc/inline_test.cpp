@@ -48,6 +48,10 @@ int main() try {
     require(cdot && program(cdot) == std::vector<int>{4, 5, -3}, "\\cdot");
     auto over = parse_inline(std::vector<int32_t>{19, 1088, 596, 220, 20, 283});  // 4 \div 5 =
     require(over && program(over) == std::vector<int>{4, 5, -4}, "\\div");
+    // \\(2 \\times 6 + 4 \\times 1 =
+    require(refused({17237, 17, 1088, 14695, 220, 21, 478, 220, 19, 1088, 14695, 220, 16, 283}), "shown working stays the model's");
+    auto plain = parse_inline(std::vector<int32_t>{17, 9, 21, 10, 19, 9, 16, 28});  // 2*6+4*1=
+    require(plain.has_value(), "the same sum in plain text is read");
     auto dots = parse_inline(std::vector<int32_t>{17, 13535, 18, 9306, 220, 19, 28});  // 2·3 · 4=
     require(dots && program(dots) == std::vector<int>{2, 3, -3, 4, -3}, "middle dot");
     auto minus = parse_inline(std::vector<int32_t>{20, 32160, 17, 23437, 220, 16, 28});  // 5−2 − 1=
