@@ -113,8 +113,9 @@ inline bool read_number(std::span<const int32_t> tokens, std::ptrdiff_t& at, Inl
     while (at >= 0) {
         const int32_t t = tokens[(size_t) at];
         if (digit(t)) digits.push_back((uint8_t) (t - kZero));
-        else if (t == kComma && !digits.empty() && !point) { /* thousands */ }
-        else if (t == kDot && !digits.empty() && !point && at > 0 && digit(tokens[(size_t) at - 1])) {
+        else if (t == kComma && !digits.empty() && !point) {
+            if (digits.size() % 3 != 0) return false;   // `[6,9+4=` is a list, not 69
+        } else if (t == kDot && !digits.empty() && !point && at > 0 && digit(tokens[(size_t) at - 1])) {
             point = true;
             scale = (uint32_t) digits.size();
         } else break;
@@ -269,6 +270,7 @@ inline std::optional<InlineCall> parse_inline(std::span<const int32_t> written) 
         const int32_t t = tokens[(size_t) before];
         const bool glued = tokens[(size_t) first - 1] != kSpace;
         if (binds_next(t) || (tokens[(size_t) first] == kOpen && glued && !opens_cleanly(t))) return std::nullopt;
+        if (glued && tokens[(size_t) first] != kOpen && !number_may_follow(t)) return std::nullopt;   // `d12^2=`, `sin60^3=`, `a1 +1 =`
         if (t == 332 && before > 0) {   // `**` is bold at the start of a line, a power after a value
             const int32_t left = tokens[(size_t) before - 1];
             if (digit(left) || left == kClose || left == 87) return std::nullopt;

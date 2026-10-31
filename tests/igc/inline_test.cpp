@@ -32,6 +32,18 @@ int main() try {
     require(refused({64, 10512, 16, 10, 20, 28}), "=-1+5= keeps its sign or stays out");
     require(refused({4653, 19, 10, 16, 10, 17, 28}), ")*4+1+2=");
     require(refused({87, 332, 17, 10, 16, 28}), "x**2+1=");
+    require(refused({58, 21, 11, 24, 10, 19, 28}), "[6,9+4= is a list");
+    require(parse_inline(std::vector<int32_t>{16, 11, 15, 15, 15, 10, 20, 28}).has_value(), "1,000+5=");
+    require(refused({67, 16, 17, 61, 17, 28}), "d12^2= is a name");
+    require(refused({64, 16, 478, 16, 283}), "a1 +1 =");
+    require(refused({15470, 21, 15, 61, 18, 28}), "sin60^3=");
+    require(refused({26026, 19, 16, 471, 16, 24, 283}), "sqrt41 -19 =");
+    require(refused({87, 62, 16, 10, 17, 28}), "x_1+2=");
+    require(refused({26026, 18, 14, 18, 283}), "sqrt3/3 =");
+    require(refused({169614, 17, 10, 16, 28}), "a root sign binds");
+    require(parse_inline(std::vector<int32_t>{7354, 220, 17, 10, 17, 28}).has_value(), "a word and a space");
+    require(parse_inline(std::vector<int32_t>{3, 17, 10, 17, 28}).has_value(), "$2+2=");
+    require(parse_inline(std::vector<int32_t>{332, 17, 10, 17, 28}).has_value(), "**2+2=");
     require(refused({18, 2942, 220, 19, 478, 220, 16, 283}), "3 times 4 + 1 =");
     require(refused({830, 220, 19, 478, 220, 16, 283}), "3 x 4 + 1 =");
     require(refused({1088, 14695, 220, 16, 12, 17, 283}), "a bare \\times has no left side");
