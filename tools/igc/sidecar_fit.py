@@ -101,6 +101,15 @@ def batch(rows, device):
     return tokens.to(device), torch.tensor([len(r['ids']) for r in rows]).to(device), ends.to(device), labels
 
 
+def buckets(rows, size):
+    """Batches of near-equal length in random order, so padding does not cost a long row's time for every short one."""
+    rows = random.sample(rows, len(rows))
+    chunks = [sorted(rows[s:s + size * 50], key=lambda r: len(r['ids'])) for s in range(0, len(rows), size * 50)]
+    parts = [chunk[s:s + size] for chunk in chunks for s in range(0, len(chunk), size)]
+    random.shuffle(parts)
+    return parts
+
+
 def evaluate(model, rows, device):
     model.eval()
     right = 0
@@ -115,7 +124,7 @@ def evaluate(model, rows, device):
     return right, len(rows), heads
 
 
-def fit(data, table_path, tokenizer_path, output, target, epochs, seed):
+def fit(data, table_path, tokenizer_path, output, target, epochs, seed, size=32):
     from tokenizers import Tokenizer
     random.seed(seed); torch.manual_seed(seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -130,20 +139,23 @@ def fit(data, table_path, tokenizer_path, output, target, epochs, seed):
     model = Sidecar(table, width, layers, heads).to(device)
     print('non-embedding parameters', trainable(model), 'train', len(train), 'held', len(test), flush=True)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-4, weight_decay=.01)
-    steps = max(1, epochs * (len(train) + 31) // 32)
+    steps = max(1, epochs * (len(train) + size - 1) // size)
+    scaler = torch.amp.GradScaler(device, enabled=device == 'cuda')
     schedule = torch.optim.lr_scheduler.OneCycleLR(optimizer, 3e-4, total_steps=steps + 1, pct_start=.05)
     loss_of = nn.CrossEntropyLoss(ignore_index=-100)
     for epoch in range(epochs):
         model.train()
-        random.shuffle(train)
-        for s in range(0, len(train), 32):
-            tokens, lengths, ends, labels = batch(train[s:s + 32], device)
+        for s, part in enumerate(buckets(train, size)):
+            tokens, lengths, ends, labels = batch(part, device)
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(tokens, lengths, ends)
-            loss = sum(loss_of(o, l) for o, l in zip(outputs, labels) if (l != -100).any())
-            loss.backward()
+            with torch.amp.autocast(device, enabled=device == 'cuda'):
+                outputs = model(tokens, lengths, ends)
+                loss = sum(loss_of(o, l) for o, l in zip(outputs, labels) if (l != -100).any())
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             schedule.step()
         print('epoch', epoch, round(float(loss.detach()), 4), 'held exact', evaluate(model, test, device), flush=True)
     output.mkdir(parents=True, exist_ok=True)
@@ -158,6 +170,7 @@ if __name__ == '__main__':
         parser.add_argument('--' + key, type=Path, required=True)
     parser.add_argument('--target', type=int, choices=(5, 30, 100), required=True)
     parser.add_argument('--epochs', type=int, default=16)
+    parser.add_argument('--batch', type=int, default=32)
     parser.add_argument('--seed', type=int, default=20261031)
     args = parser.parse_args()
-    fit(args.data, args.table, args.tokenizer, args.output, args.target, args.epochs, args.seed)
+    fit(args.data, args.table, args.tokenizer, args.output, args.target, args.epochs, args.seed, args.batch)

@@ -14016,7 +14016,8 @@ int main(int argc, char** argv) {
                 if (igc_learned && !first_window) {
                     igc_delivering = igc_learned->delivering(err);
                     if (!err.empty()) { std::printf("ERR %s\n", err.c_str()); return serve_fatal(); }
-                    if (igc_delivering) T = 1;
+                    // an inline value is known ahead: it goes in as one window, not one round per token
+                    if (igc_delivering) T = o.igc_inline_exec ? std::min(igc_learned->bridge_left(), S_mtp) : 1;
                 }
 #endif
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -14055,6 +14056,9 @@ int main(int argc, char** argv) {
                 window[0] = x;
                 for (int i = 1; i < T_mtp; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                if (igc_delivering) for (int i = 1; i < T; ++i) window[(size_t) i] = igc_learned->bridge_ahead(i - 1);
+#endif
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -14091,7 +14095,7 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw0 = Clock::now();
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
-                if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                if (use_mtp && mtp.prob() && !from_sfx && !igc_delivering && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
                 if(first_window && igc_output && !igc_output->stage(ids,err)) {
                     std::printf("ERR %s\n",err.c_str());return serve_fatal();
@@ -14213,10 +14217,10 @@ int main(int argc, char** argv) {
                     }
                 }
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
-                if (igc_learned && o.igc_result_bridge && T == 1) {
+                if (igc_learned && o.igc_result_bridge && (T == 1 || igc_delivering)) {
                     const bool bridged = igc_learned->delivering(err);
                     if (!err.empty()) { std::printf("ERR %s\n", err.c_str()); return serve_fatal(); }
-                    if (bridged) igc_learned->bridge_sample(outv[0]);
+                    if (bridged) for (int i = 0; i < T; ++i) igc_learned->bridge_sample(outv[(size_t) i]);
                 }
 #endif
                 int a = 0;
@@ -14235,7 +14239,7 @@ int main(int argc, char** argv) {
                 trace_commit(drive, T, a, strata::core::routing_trace::kPhaseDecode);   // #85
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
-                if (!from_sfx && !first_window)
+                if (!from_sfx && !first_window && !igc_delivering)
                     for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
                 if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
                     ++t2_rej[a];

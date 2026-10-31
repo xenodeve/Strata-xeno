@@ -21,10 +21,10 @@ ARITHMETIC=('two_digit_addition','two_digit_subtraction','two_digit_multiplicati
 BIGBENCH=('3d_addition','3d_subtraction','3d_multiplication','5d_addition','5d_subtraction','5d_multiplication')
 
 
-def cases(data,arithmetic,gsm,bigbench=0,math=0,gsm_file='gsm8k-test.jsonl'):
+def cases(data,arithmetic,gsm,bigbench=0,math=0,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl'):
     rows=[]
     if math:
-        problems=[json.loads(line) for line in (data/'math500.jsonl').read_text(encoding='utf-8').splitlines()]
+        problems=[json.loads(line) for line in (data/math_file).read_text(encoding='utf-8').splitlines()]
         problems=[row for row in problems if re.fullmatch(r'-?\d+',str(row['answer']))]
         for i,row in enumerate(problems[:math]):
             rows.append(dict(id=f'math-{i}',suite='math500',prompt=row['problem'],answer=int(row['answer']),limit=8192))
@@ -61,12 +61,12 @@ def score(records):
     return suites
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl'):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl'):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
     tokenizer=NativeText.from_pack(pack/'tokenizer');prefix,suffix=wrapped_prefix(reference,tokenizer)
-    rows=cases(data,arithmetic,gsm,bigbench,math,gsm_file)
+    rows=cases(data,arithmetic,gsm,bigbench,math,gsm_file,math_file)
     (output/'cases.json').write_text(json.dumps(rows,ensure_ascii=False),encoding='utf-8')
     sys.path[:0]=[str(server.parent),str(server.parent.parent)]
     spec=importlib.util.spec_from_file_location('igc_bench_hub',server)
@@ -122,5 +122,5 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     for key in ('profile','server','executable','data','reference','pack','output'):parser.add_argument('--'+key,type=Path,required=True)
-    parser.add_argument('--bundle',type=Path);parser.add_argument('--timeline',type=Path);parser.add_argument('--gsm-file',default='gsm8k-test.jsonl');parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40);parser.add_argument('--bigbench',type=int,default=0);parser.add_argument('--bridge',action='store_true');parser.add_argument('--inline',action='store_true');parser.add_argument('--math',type=int,default=0);parser.add_argument('--no-adapt',action='store_true')
+    parser.add_argument('--bundle',type=Path);parser.add_argument('--timeline',type=Path);parser.add_argument('--gsm-file',default='gsm8k-test.jsonl');parser.add_argument('--math-file',default='math500.jsonl');parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40);parser.add_argument('--bigbench',type=int,default=0);parser.add_argument('--bridge',action='store_true');parser.add_argument('--inline',action='store_true');parser.add_argument('--math',type=int,default=0);parser.add_argument('--no-adapt',action='store_true')
     run(**vars(parser.parse_args()))

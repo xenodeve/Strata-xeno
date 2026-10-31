@@ -376,6 +376,8 @@ public:
         ++inline_calls_;called=true;return true;
     }
     // One-token rounds only: replaces the sampled token while a bridged result is delivered.
+    int bridge_left()const{return static_cast<int>(bridge_tokens_.size()-bridge_at_);}
+    int32_t bridge_ahead(int i)const{return bridge_tokens_[bridge_at_+static_cast<size_t>(i)];}
     void bridge_sample(int32_t& token) {
         if(bridge_ && bridge_at_<bridge_tokens_.size())token=bridge_tokens_[bridge_at_++];
     }
