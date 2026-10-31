@@ -1,8 +1,10 @@
 #pragma once
 // Firing on natural language: a number the model starts in plain words is checked against the sidecar's proposal.
 // The two leading digits stay the model's and must agree, which is the gate measured on reasoning traces (#276). A
-// later digit that differs is replaced with the computed value. Numbers closing a written expression are the parser's.
+// later digit that differs is replaced with the computed value. A number closing an expression the parser reads is the
+// parser's; one it could not read, like `*13,000 =`, is checked here.
 
+#include "strata/core/igc_inline.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <optional>
@@ -76,29 +78,18 @@ private:
     static constexpr int kMaxEntries = 64;
 
     static bool digit(int32_t token) { return token >= 15 && token <= 24; }
-    static bool op(int32_t token) {
-        return token == 10 || token == 12 || token == 9 || token == 14 || token == 169814 || token == 17044 || token == 61
-            || token == 478 || token == 471 || token == 348 || token == 593 || token == 23985 || token == 6108;
-    }
 
-    // After `a op b =` the parser has the number. Walks back over the expression's own tokens.
-    bool closes_expression() const {
+    // After `a op b =` the parser has the number, when it can read the expression.
+    bool parser_owns() const {
         size_t i = tokens_.size();
         while (i > 0 && (tokens_[i - 1] == 220 || tokens_[i - 1] == 3 || tokens_[i - 1] == 393)) --i;
         if (i == 0 || (tokens_[i - 1] != 28 && tokens_[i - 1] != 283)) return false;
-        --i;
-        while (i > 0) {
-            const int32_t t = tokens_[i - 1];
-            if (op(t)) return true;
-            if (!(digit(t) || t == 220 || t == 3 || t == 393 || t == 11 || t == 13 || t == 4 || t == 7 || t == 8)) return false;
-            --i;
-        }
-        return false;
+        return parse_inline(std::span<const int32_t>(tokens_).first(i)).has_value();
     }
 
     void propose() {
         expected_.clear();
-        if (table_.size() < 1 || closes_expression()) return;
+        if (table_.size() < 1 || parser_owns()) return;
         std::vector<int> ends;
         const size_t first = table_.size() > kMaxEntries ? table_.size() - kMaxEntries : 0;
         for (size_t i = first; i < table_.size(); ++i) ends.push_back(table_[i].end);

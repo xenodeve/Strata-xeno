@@ -90,6 +90,15 @@ int main() {
         assert(firer.fires() == 0);
         assert(stub.calls == before + 2);   // proposed for the operands, not the result
     }
+    {   // an expression the parser cannot read is checked here: `*34 =`
+        NaturalFirer<Stub> firer(stub);
+        firer.begin(prompt({d(1), d(2), 1000, d(3), d(4), 1000}));
+        stub.next.left = 0; stub.next.right = 1;
+        const int before = stub.calls;
+        run(firer, {9, d(3), d(4), 28, d(4), d(0), d(9)});
+        assert(stub.calls == before + 2);
+        assert(firer.fires() == 1);
+    }
     {   // a comma continues the number, so 1,200 is one entry
         NaturalFirer<Stub> firer(stub);
         firer.begin(prompt({d(1), 11, d(2), d(0), d(0), 1000, d(3), 1000}));

@@ -172,6 +172,7 @@ inline std::optional<InlineCall> parse_inline(std::span<const int32_t> tokens) {
     int depth = 0;
     while (first > 0) {
         const int32_t t = tokens[(size_t) first - 1];
+        if (t == kDot && tokens[(size_t) first] == kSpace) break;   // a sentence ended here, not a decimal
         if (t == kClose) ++depth;
         else if (t == kOpen) {
             if (!depth) break;

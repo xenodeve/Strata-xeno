@@ -24,6 +24,10 @@ int main() try {
     require(b && program(b) == std::vector<int>{12, 34, -3} && b->spaced, "spaced");
     auto c = parse_inline(std::vector<int32_t>{17, 11, 22, 20, 17, 478, 220, 18, 11, 16, 15, 15, 283});
     require(c && program(c) == std::vector<int>{2752, 3100, -1}, "commas");
+    auto sentence = parse_inline(std::vector<int32_t>{24, 15, 24, 13, 220, 16, 17, 9, 18, 19, 283});  // 909. 12*34 =
+    require(sentence && program(sentence) == std::vector<int>{12, 34, -3}, "sentence end");
+    auto point = parse_inline(std::vector<int32_t>{16, 13, 20, 9, 17, 28});  // 1.5*2=
+    require(point.has_value(), "decimal stays a number");
     auto chain = parse_inline(std::vector<int32_t>{16, 21, 12, 18, 12, 19, 28});  // 16-3-4=
     require(chain && program(chain) == std::vector<int>{16, 3, -2, 4, -2}, "chain");
     auto mixed = parse_inline(std::vector<int32_t>{17, 10, 18, 9, 19, 28});  // 2+3*4=
