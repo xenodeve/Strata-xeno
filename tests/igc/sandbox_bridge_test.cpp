@@ -73,6 +73,10 @@ int main(int argc, char** argv) {
         auto p = feed(f, {"f", "(", "5", "))", "\n", "```"});
         require(p && *p == "\nprint(f(5))\n", "a forced call keeps its head");
         require(binds_a_name("def f(n):\n    return n\n") && binds_a_name("x = 2\n"), "a block with names");
+        require(last_def("\ndef a(x):\n    def inner():\n        pass\n    return 1\n\ndef main(n: int) -> int:\n    return a(n)\n") == "main", "the last top-level def");
+        require(call_head("def f(n):\n    return n\n") == "print(f(", "the call names it");
+        require(call_head("x = 2\n") == "print(", "no function, a bare print");
+        require(call_head("class A:\n    def m(self):\n        pass\n") == "print(", "a method is not called this way");
         require(!binds_a_name("\n") && !binds_a_name("import math\n"), "a block with none has nothing to call");
     }
     {
@@ -147,7 +151,7 @@ int main(int argc, char** argv) {
         const auto block = vocab.encode(output_block("12.0"));
         require(std::find(block.begin(), block.end(), 71093) != block.end(), "a fence is one token");
         require(std::find(block.begin(), block.end(), 63) == block.end(), "and no single backticks");
-        const auto call = vocab.encode(kCallBlock);
+        const auto call = vocab.encode(std::string(kBlockOpen) + call_head("def f(n):\n    return n\n"));
         require(call.size() >= 4 && call[0] == 71093 && call[1] == 12305 && call[2] == 198, "the forced call opens as the forced block does");
         std::string back;
         for (const int32_t t : vocab.encode("สวัสดี 12")) back += vocab.text(t);

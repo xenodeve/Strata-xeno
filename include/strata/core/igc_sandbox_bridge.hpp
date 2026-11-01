@@ -28,9 +28,10 @@ inline constexpr std::string_view kNothingPrinted = "[it ran and printed nothing
 // The model's own words before it answers: 4 of 66 replies after a close were the program again, with no sentence (#279).
 inline constexpr std::string_view kCloseLine = "Need final with enough detail.\n";
 inline constexpr std::string_view kOnlyModules = "[only math, fractions, itertools, functools and collections are here: rewrite with those]";
-// Told to call its function, the model did not in 36 of 36 blocks, with a whole draft in 17 of 19 scored (#279). So the call is opened for it.
+// Told to call its function, the model did not in 36 of 36 blocks, with a whole draft in 17 of 19 scored (#279). So the call is opened
+// for it, with the name: given a bare `print(`, 12 of 22 runs wrote `print(1)`, and the thinking closed on that.
 inline constexpr std::string_view kCallHead = "print(";
-inline constexpr std::string_view kCallBlock = "```python\nprint(";
+inline constexpr std::string_view kBlockOpen = "```python\n";
 
 // The GPT-2 byte table: printable bytes stand for themselves, the others sit from code point 256 up, in order.
 inline bool byte_is_itself(uint32_t b) { return (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255); }
@@ -207,6 +208,27 @@ private:
     std::string text_;
     bool inside_ = false;
 };
+
+// The function to call: the last one the block defined at its top level. Helpers come first, so this is the one the block is for.
+inline std::string last_def(std::string_view program) {
+    std::string name;
+    for (std::size_t at = 0; at < program.size();) {
+        std::size_t end = program.find('\n', at);
+        if (end == std::string_view::npos) end = program.size();
+        const std::string_view line = program.substr(at, end - at);
+        const std::size_t paren = line.find('(');
+        if (line.starts_with("def ") && paren != std::string_view::npos) name = std::string(line.substr(4, paren - 4));
+        at = end + 1;
+    }
+    return name;
+}
+// What the forced block opens with, after its fence.
+inline std::string call_head(std::string_view program) {
+    std::string head(kCallHead);
+    const std::string name = last_def(program);
+    if (!name.empty()) head += name + "(";
+    return head;
+}
 
 // A block that bound nothing leaves nothing to call.
 inline bool binds_a_name(std::string_view program) {

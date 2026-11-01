@@ -395,8 +395,9 @@ public:
                 bridge_tokens_=sandbox_text_->encode(text);bridge_at_=0;called=true;
                 if(sandbox_call_ && !sandbox_called_ && sandbox_session_.quiet() && strata::igc::sandbox::binds_a_name(*program)) {
                     std::fprintf(stderr,"strata igc sandbox: opened a call\n");
-                    sandbox_called_=true;sandbox_block_=0;sandbox_fence_.enter(strata::igc::sandbox::kCallHead);
-                    const auto open=sandbox_text_->encode(strata::igc::sandbox::kCallBlock);
+                    const std::string head=strata::igc::sandbox::call_head(*program);
+                    sandbox_called_=true;sandbox_block_=0;sandbox_fence_.enter(head);
+                    const auto open=sandbox_text_->encode(std::string(strata::igc::sandbox::kBlockOpen)+head);
                     bridge_tokens_.insert(bridge_tokens_.end(),open.begin(),open.end());
                 }
                 // Given the answer the model still went on for thousands of tokens to prove it.
