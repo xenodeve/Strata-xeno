@@ -15,6 +15,7 @@ from tools.igc.external_score import final_number, question_id, repeating
 from tools.igc.hub_contract import validate_launcher_env
 from tools.igc.learned_integration import parse_audit
 from tools.igc.output_examples import wrapped_prefix
+from tools.igc.few_shot import few_shot
 from tools.qwenputer.memory import system_snapshot
 from tools.qwenputer.tokenizer import NativeText
 
@@ -54,15 +55,17 @@ def score(records):
     return suites
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None,no_think=False,shots=0):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
     tokenizer=NativeText.from_pack(pack/'tokenizer');prefix,suffix=wrapped_prefix(reference,tokenizer)
     if think_hint:suffix+=think_hint.encode('utf-8')
+    if no_think:suffix+=b'\n</think>\n\n'
     if effort_medium:prefix=prefix[prefix.index(b'<|im_start|>user'):]   # the template writes no system turn at medium
     if hint:prefix=prefix.replace(b'<|im_end|>',b' '+hint.encode('utf-8')+b'<|im_end|>',1)
     rows=cases(data,arithmetic,gsm,bigbench,math,gsm_file,math_file)
+    if shots:rows=[{**row,'prompt':few_shot(row['prompt'],shots)} if row['suite']=='gsm8k' else row for row in rows]
     (output/'cases.json').write_text(json.dumps(rows,ensure_ascii=False),encoding='utf-8')
     sys.path[:0]=[str(server.parent),str(server.parent.parent)]
     spec=importlib.util.spec_from_file_location('igc_bench_hub',server)
@@ -112,7 +115,9 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                 tokens.append(int(t))
                 if len(tokens)%64==0 and repeating(tokens):stuck=True;break
             seconds=time.monotonic()-start;active[0]=None
-            text=tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace');final=final_number(text)
+            text=tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace')
+            if no_think:text='</think>\n\n'+text   # the close is in the prompt; the readers look for it here
+            final=final_number(text)
             records.append(dict(id=row['id'],suite=row['suite'],answer=row['answer'],final=final,correct=final==row['answer'],
                                 tokens=len(tokens),seconds=seconds,finish='stuck' if stuck else engine.last.get('finish'),prompt_tokens=len(ids),text=text))
             (output/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
@@ -146,4 +151,6 @@ if __name__=='__main__':
     parser.add_argument('--sandbox-after',type=int,help='open a block after this many tokens of reasoning')
     parser.add_argument('--sandbox-close',action='store_true',help='close the thinking once a program has printed')
     parser.add_argument('--sandbox-close-line',action='store_true',help='the model\'s own line before the close')
+    parser.add_argument('--no-think',action='store_true',help='close the thinking in the prompt')
+    parser.add_argument('--shots',type=int,default=0,help='few-shot exemplars before each GSM8K question')
     run(**vars(parser.parse_args()))

@@ -97,6 +97,10 @@ inline std::vector<int32_t> split_brackets(std::span<const int32_t> tokens) {
     return out;
 }
 inline bool closes_expression(int32_t t) { return t == kEquals || t == kSpacedEquals || t == 11393; }
+// `<think>\n\n</think>\n\n` ends a request with the thinking off: what follows is the reply from its first token.
+inline bool thinking_off(std::span<const int64_t> prompt, int64_t think_close) {
+    return prompt.size() >= 2 && prompt[prompt.size() - 2] == think_close && prompt.back() == 271;
+}
 // The tail is one exact cycle. In 1410 measured runs no text that repeated six times ever left, 2263 rounds at most.
 // At least 64 tokens: digits are one token each, so `2102500000000` and `0.33333333` are eight rounds of one token.
 // At most 1024 tokens or three rounds: of 7073 runs none left a block of 300 characters after three rounds.

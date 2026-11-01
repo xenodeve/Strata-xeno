@@ -57,6 +57,11 @@ int main() try {
         require(inline_tokens::after_value(0, true, 3, 77, SumNote::None).empty(), "a sum alone");
         require(inline_tokens::after_value(1, true, 3, 77, SumNote::None).empty(), "a repeated sum alone");
         require(inline_tokens::after_value(2, true, 3, 77, SumNote::None) == closing, "the third still closes without a note");
+        const std::vector<int64_t> off{5, 248068, 271, 248069, 271}, on{5, 248068, 198}, history{248069, 271, 5, 248068, 198}, one{271};
+        require(inline_tokens::thinking_off(off, 248069), "a closed thinking ends the prompt");
+        require(!inline_tokens::thinking_off(on, 248069), "an open one does not");
+        require(!inline_tokens::thinking_off(history, 248069), "nor an earlier turn's close");
+        require(!inline_tokens::thinking_off(one, 248069), "a short prompt");
         using inline_tokens::RepeatNote;
         const std::vector<int32_t> bare{318, 43967, 10457, 8}, bare_stop{318, 43967, 10457, 553}, next{318, 43967, 10457, 11, 1727, 2923, 8};
         require(inline_tokens::after_value(1, true, 3, 77, SumNote::Open, RepeatNote::Stop) == confirmed, "stop checking stays the default");
