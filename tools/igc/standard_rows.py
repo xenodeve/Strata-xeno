@@ -31,6 +31,19 @@ def bbh_rows(data):
 
 
 LETTERS = 'ABCDEFGHIJKLMNOP'
+LETTER_TAIL = '\n\nFinish your answer with "the answer is (X)" where X is the correct letter.'
+
+
+def plain_prompt(row):
+    """The question alone, with no exemplars, for the arms with the thinking on."""
+    text = row['prompt']
+    if row['suite'] == 'stdmath':
+        return text.rsplit('Problem:\n', 1)[1].rsplit('\n\nSolution:', 1)[0]
+    if row['suite'] == 'mmlupro':
+        return text.rsplit('Question:\n', 1)[1].rsplit("Answer: Let's think", 1)[0].strip() + LETTER_TAIL
+    if row['suite'] == 'supergpqa':
+        return text.rsplit('Question: \n', 1)[1].rsplit("Answer: Let's think", 1)[0].strip() + LETTER_TAIL
+    return text
 
 
 def mmlu_pro_rows(data):

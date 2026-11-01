@@ -17,6 +17,7 @@ from tools.igc.hub_contract import validate_launcher_env
 from tools.igc.learned_integration import parse_audit
 from tools.igc.output_examples import wrapped_prefix
 from tools.igc.few_shot import few_shot
+from tools.igc.standard_rows import plain_prompt
 from tools.qwenputer.memory import system_snapshot
 from tools.qwenputer.tokenizer import NativeText
 
@@ -108,7 +109,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -119,6 +120,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     if hint:prefix=prefix.replace(b'<|im_end|>',b' '+hint.encode('utf-8')+b'<|im_end|>',1)
     rows=cases(data,arithmetic,gsm,bigbench,math,gsm_file,math_file,rows_file)
     if shots:rows=[{**row,'prompt':few_shot(row['prompt'],shots)} if row['suite']=='gsm8k' else row for row in rows]
+    if plain:rows=[{**row,'prompt':plain_prompt(row)} for row in rows]
     (output/'cases.json').write_text(json.dumps(rows,ensure_ascii=False),encoding='utf-8')
     sys.path[:0]=[str(server.parent),str(server.parent.parent)]
     spec=importlib.util.spec_from_file_location('igc_bench_hub',server)
@@ -212,6 +214,7 @@ if __name__=='__main__':
     parser.add_argument('--sandbox-close',action='store_true',help='close the thinking once a program has printed')
     parser.add_argument('--sandbox-close-line',action='store_true',help='the model\'s own line before the close')
     parser.add_argument('--sandbox-call',action='store_true',help='open a print( after a block that printed nothing')
+    parser.add_argument('--plain',action='store_true',help='with --rows-file: the question alone, no exemplars')
     parser.add_argument('--rows-file',help='file of whole prompts in the data dir, optionally name:first-last')
     parser.add_argument('--keep-prefix',action='store_true',help='read the prompt part every question shares once')
     parser.add_argument('--slots',type=int,default=0,help='decode in this many batch slots, questions at once')

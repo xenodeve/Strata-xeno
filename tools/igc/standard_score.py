@@ -63,7 +63,9 @@ def reply(text):
 
 def math_answer(text):
     found = re.search(r'Final Answer: The final answer is(.*?)\. I hope it is correct\.', reply(text) + 'I hope it is correct.', re.S)
-    return found.group(1).strip() if found else None
+    if found:
+        return found.group(1).strip()
+    return last_boxed(reply(text))   # a reply with the thinking on ends in a box, not in the exemplars' sentence
 
 
 def math_right(text, gold):
