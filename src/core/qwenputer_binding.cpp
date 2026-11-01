@@ -4,7 +4,11 @@
 #include <string_view>
 #include <limits>
 #include <map>
+#include <cstdlib>
 #include <exception>
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -22,6 +26,26 @@ std::string hex(const Digest& value) {
     for(auto b:value){text+=digits[b>>4];text+=digits[b&15];}
     return text;
 }
+#if !defined(_WIN32)
+// A cloud CPU with no SHA instructions hashes 92 GB in about 10 minutes (0.2 GiB/s, the file reads at 3.9), at every boot,
+// and the rest of the boot takes under a minute. With STRATA_IGC_BINDING_CACHE=<file> a model file with the same path, size
+// and write time keeps its hash. A file rewritten with its old time would pass, so this is for a test machine, not a server.
+std::string file_key(const std::filesystem::path& path) {
+    struct stat info{};
+    if(stat(path.c_str(),&info)!=0)return {};
+    return path.string()+"\t"+std::to_string(info.st_size)+"\t"+std::to_string(info.st_mtim.tv_sec)+"."+std::to_string(info.st_mtim.tv_nsec);
+}
+bool known_hash(const char* cache,const std::string& key,Digest& digest,std::uint64_t& bytes) {
+    std::ifstream file(cache);
+    for(std::string line;std::getline(file,line);) {
+        if(key.empty() || line.size()!=key.size()+1+digest.size()*2 || line.compare(0,key.size(),key)!=0 || line[key.size()]!='\t')continue;
+        for(std::size_t i=0;i<digest.size();++i)digest[i]=static_cast<std::uint8_t>(std::stoi(line.substr(key.size()+1+i*2,2),nullptr,16));
+        bytes=std::filesystem::file_size(line.substr(0,line.find('\t')));
+        return true;
+    }
+    return false;
+}
+#endif
 struct ReadInput {
     Digest digest{};
     std::uint64_t bytes=0;
@@ -65,7 +89,11 @@ struct ReadInput {
         if(!std::filesystem::is_regular_file(path,ec)){error="binding_file";return false;}
         file.open(path,std::ios::binary);
         if(!file){error="binding_file";return false;}
+        const char* cache=limit==std::numeric_limits<std::uint64_t>::max()?std::getenv("STRATA_IGC_BINDING_CACHE"):nullptr;
+        const std::string key=cache?file_key(path):std::string();
+        if(cache && known_hash(cache,key,digest,bytes))return true;
         if(!sha256_stream(file,limit,digest,bytes,error))return false;
+        if(cache && !key.empty())std::ofstream(cache,std::ios::app)<<key<<'\t'<<hex(digest)<<'\n';
 #endif
         return true;
     }
