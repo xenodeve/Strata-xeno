@@ -16387,6 +16387,14 @@ int main(int argc, char** argv) {
     // (traced: all four return, the first join never does); STRATA_EXP_QUICK_EXIT=1 ends the process here, after
     // every result is printed and flushed.  A bypass for measuring, not a fix.
     // TerminateProcess skips atexit: the timeline is written here or never
-    if (std::getenv("STRATA_EXP_QUICK_EXIT")) { strata::timeline::flush(); std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 0); }
+    if (std::getenv("STRATA_EXP_QUICK_EXIT")) {
+        strata::timeline::flush();
+        std::fflush(nullptr);
+#ifdef _WIN32
+        TerminateProcess(GetCurrentProcess(), 0);
+#else
+        _exit(0);
+#endif
+    }
     return 0;
 }
