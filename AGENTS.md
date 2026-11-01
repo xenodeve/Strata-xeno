@@ -171,6 +171,20 @@ as soon as that question has an answer.
   one round is enough and a difference belongs to the rule. This PC gives 1 of 49: paths part before the rule. Seconds are not compared
   across machines, and time claims stay on this PC.
 
+## Time spent is the cost (developer, 2026-11-02)
+
+"The time we lose at each point is a cost we really pay." Each of these cost hours or credits once, so each is now a rule:
+
+- **No machine sits idle unnoticed.** One queue with one worker on a remote machine, never scripts chained to wait on each other (one waited
+  on itself for 10 minutes). The watcher reports the moment the queue runs dry, and both machines always have the next job.
+- **Check a job started,** a minute after starting it, not when its result is due.
+- **Gate a scorer on real replies first.** After the first rows of a pass, read how many replies gave no answer and what the misses look
+  like. A score far from any published figure is an alarm, not a result.
+- **Stop a run the moment its question has an answer,** and stop a running arm whose result no longer matters. Keep what it wrote.
+- **Measure a machine's speed on one question before giving it a queue.** Two sessions once ran an hour for numbers nothing used.
+- **Script what repeats:** retries, uploads, scoring, setup. Hand-typed steps fail differently each time.
+- **Write code with backslashes through the file tool,** not a shell heredoc: three commits broke on lost escapes.
+
 ## Run every speed measurement at high CPU priority
 
 Other programs on this machine (browser, Discord, Wallpaper Engine, Defender scans) take CPU time from the pool's
