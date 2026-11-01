@@ -8,6 +8,7 @@
 #include <initializer_list>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 #include "strata/core/igc_binding_tokens.hpp"
 #include "strata/core/igc_exact.hpp"
@@ -115,6 +116,29 @@ inline bool in_cycle(std::span<const int32_t> tokens, int longest, int rounds) {
     }
     return false;
 }
+// A loop past in_cycle's reach still says the same lines: one of about 1,000 lines ran to the end of the context, 261,496 tokens,
+// with a line back 37 times. Of 7,437 stored runs, a line of 12 tokens came back 16 times in 3 that ended by themselves, one of them
+// right and 2,535 tokens from its end, and in all 4 that ran to the end of the context, at 11,202 to 128,741 tokens.
+inline constexpr int kLineTokens = 12, kLineRounds = 16;
+class LineRepeat {
+public:
+    bool step(int32_t token) {
+        if (token != 198 && token != 271) {
+            hash_ = (hash_ ^ static_cast<uint32_t>(token)) * 0x100000001B3ull;
+            ++length_;
+            return false;
+        }
+        const bool counts = length_ >= kLineTokens;
+        const uint64_t line = hash_;
+        hash_ = 0xCBF29CE484222325ull;
+        length_ = 0;
+        return counts && ++seen_[line] >= kLineRounds;
+    }
+private:
+    uint64_t hash_ = 0xCBF29CE484222325ull;
+    int length_ = 0;
+    std::unordered_map<uint64_t, int> seen_;
+};
 // The note on a value whose expression is a sum at its top level. Left open, the model takes the value for the
 // first term and writes the last one again, `a + b = V (exact) + b`: 28 times in 297 runs, none in 1290 runs with a `.`.
 enum class SumNote : int { Open = 0, Stop = 1, None = 2 };

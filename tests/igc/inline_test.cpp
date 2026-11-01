@@ -21,6 +21,29 @@ int main() try {
         };
         const std::vector<int32_t> phrase{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
         require(inline_tokens::in_cycle(tail(phrase, 8), 128, 8), "eight rounds of a phrase are a cycle");
+        {
+            const auto rounds = [](int length, int tokens_between) {
+                inline_tokens::LineRepeat lines;
+                int fired = 0;
+                for (int round = 1; round <= 40 && !fired; ++round) {
+                    for (int i = 0; i < length; ++i) lines.step(1000 + i);
+                    if (lines.step(198)) fired = round;
+                    for (int i = 0; i < tokens_between; ++i) lines.step(5000 + round * 20 + i);
+                    lines.step(271);
+                }
+                return fired;
+            };
+            require(rounds(12, 0) == inline_tokens::kLineRounds, "a long line back sixteen times is a loop");
+            require(rounds(12, 15) == inline_tokens::kLineRounds, "other lines between its rounds change nothing");
+            require(rounds(11, 0) == 0, "a short line can recur for ever");
+            inline_tokens::LineRepeat lines;
+            bool fired = false;
+            for (int round = 0; round < 40; ++round) {
+                for (int i = 0; i < 12; ++i) lines.step(round * 100 + i);
+                fired = lines.step(198) || fired;
+            }
+            require(!fired, "different lines are not a loop");
+        }
         require(!inline_tokens::in_cycle(tail(phrase, 7), 128, 8), "seven rounds can still leave");
         require(inline_tokens::in_cycle(tail({7, 8}, 32), 128, 8), "a short loop, 64 tokens");
         require(!inline_tokens::in_cycle(tail({7, 8}, 31), 128, 8), "a short run is not yet one");
