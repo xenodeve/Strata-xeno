@@ -85,6 +85,7 @@ int main(int argc, char** argv) {
         require(s.run("def f(n):\n    return n + 1\n") == output_block(kNothingPrinted) && s.quiet(), "a draft is quiet");
         require(s.run("print(f(1))\n") == "\n```output\n2\n```\n\n" && s.printed() && !s.quiet(), "its call prints");
         require(s.run("print()\n") == output_block(kNothingPrinted) && !s.printed() && s.quiet(), "an empty line says nothing");
+        require(s.run("print(None)\n") == "\n```output\nNone\n```\n\n" && !s.printed() && !s.quiet(), "None is shown, but it is no result");
         require(s.run("print(g(1))\n").find("NameError") != std::string::npos && !s.quiet() && !s.printed(), "an error is neither");
     }
     {

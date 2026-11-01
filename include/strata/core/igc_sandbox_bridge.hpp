@@ -305,7 +305,8 @@ public:
             cut = true;
         }
         if (cut) body += "\n[output cut]";
-        printed_last_ = result.status == Status::Ok && !body.empty();
+        // `None` is an unfinished draft called anyway, not a result: the close took 2 of the 4 rows it lost on one (#279).
+        printed_last_ = result.status == Status::Ok && !body.empty() && body != "None\n";
         quiet_last_ = result.status == Status::Ok && body.empty();
         if (result.status == Status::Ok) {
             done_ = std::move(source);

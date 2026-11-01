@@ -110,7 +110,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -140,6 +140,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     if sandbox_after is not None:args+=['--igc-sandbox-after',str(sandbox_after)]
     if sandbox_close:args.append('--igc-sandbox-close')
     if sandbox_close_line:args.append('--igc-sandbox-close-line')
+    if sandbox_read:args+=['--igc-sandbox-read',str(sandbox_read)]
     if sandbox_call:args.append('--igc-sandbox-call')
     if slots:args+=['--batch',str(slots)]
     if no_adapt:args[args.index('--adapt-swaps')+1]='0';args[args.index('--adapt-secondary')+1]='0'
@@ -214,6 +215,7 @@ if __name__=='__main__':
     parser.add_argument('--sandbox-after',type=int,help='open a block after this many tokens of reasoning')
     parser.add_argument('--sandbox-close',action='store_true',help='close the thinking once a program has printed')
     parser.add_argument('--sandbox-close-line',action='store_true',help='the model\'s own line before the close')
+    parser.add_argument('--sandbox-read',type=int,default=0,help='tokens the model reads a printed result for before the close')
     parser.add_argument('--sandbox-call',action='store_true',help='open a print( after a block that printed nothing')
     parser.add_argument('--plain',action='store_true',help='with --rows-file: the question alone, no exemplars')
     parser.add_argument('--rows-file',help='file of whole prompts in the data dir, optionally name:first-last')

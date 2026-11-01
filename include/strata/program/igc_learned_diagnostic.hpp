@@ -29,6 +29,7 @@ struct InlineTurn {
     strata::igc::sandbox::Session sandbox_session_;
     int sandbox_thought_=0,sandbox_block_=0,bridged_unread_=0;
     bool sandbox_opened_=false,sandbox_called_=false;
+    int sandbox_reading_=-1;   // tokens left to read a result in before the close, -1 when none is due
     bool request_on_=true;   // GEN key igc=0: this request runs with no MIP
 };
 // First-anchor learned diagnostic, distinct from the oracle-input comparator.
@@ -52,7 +53,7 @@ class IgcLearnedDiagnostic : InlineTurn {
     std::vector<InlineTurn> slots_;
     bool in_slot_=false;
     std::unique_ptr<strata::igc::sandbox::TokenText> sandbox_text_;
-    int sandbox_after_=0;
+    int sandbox_after_=0,sandbox_read_=0;
     bool sandbox_close_=false,sandbox_close_line_=false,sandbox_call_=false;
     bool inline_notes_=true,inline_reply_=true;int close_repeat_=3;strata::igc::inline_tokens::SumNote sum_note_=strata::igc::inline_tokens::SumNote::Stop;strata::igc::inline_tokens::RepeatNote repeat_note_=strata::igc::inline_tokens::RepeatNote::Stop;
     std::vector<int64_t> prefix_;
@@ -205,7 +206,7 @@ public:
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
         staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_tail_.clear();thinking_closed_=strata::igc::inline_tokens::thinking_off(prefix_,kThinkClose);
-        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;bridged_unread_=0;
+        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;sandbox_reading_=-1;bridged_unread_=0;
         bridge_tokens_.clear();bridge_at_=0;   // an admission never reaches delivering(), and a stopped request can leave a delivery half done
         if(natural_)natural_->begin(prefix_);
         return true;
@@ -306,6 +307,7 @@ public:
     void set_inline_notes(bool on){inline_notes_=on;}
     void set_inline_reply(bool on){inline_reply_=on;}
     void set_sandbox_after(int tokens){sandbox_after_=tokens;}
+    void set_sandbox_read(int tokens){sandbox_read_=tokens;}
     void set_sandbox_close(bool on){sandbox_close_=on;}
     void set_sandbox_close_line(bool on){sandbox_close_line_=on;}
     void set_sandbox_call(bool on){sandbox_call_=on;}
@@ -401,8 +403,12 @@ public:
                     const auto open=sandbox_text_->encode(std::string(strata::igc::sandbox::kBlockOpen)+head);
                     bridge_tokens_.insert(bridge_tokens_.end(),open.begin(),open.end());
                 }
-                // Given the answer the model still went on for thousands of tokens to prove it.
-                if(sandbox_close_ && sandbox_session_.printed()) {
+                // Given the answer the model still went on for thousands of tokens to prove it. But a close in this delivery
+                // comes before the model reads the result: a sample that printed 1 for an expected 3 went out as the answer (#279).
+                sandbox_reading_=-1;
+                if(sandbox_close_ && sandbox_session_.printed() && sandbox_read_>0) {
+                    sandbox_reading_=sandbox_read_;
+                } else if(sandbox_close_ && sandbox_session_.printed()) {
                     if(sandbox_close_line_) {
                         const auto line=sandbox_text_->encode(strata::igc::sandbox::kCloseLine);
                         bridge_tokens_.insert(bridge_tokens_.end(),line.begin(),line.end());
@@ -418,6 +424,12 @@ public:
                 bridge_tokens_=sandbox_text_->encode("```"+strata::igc::sandbox::output_block("[too long, not run]"));bridge_at_=0;called=true;return true;
             }
             sandbox_block_=0;
+            if(sandbox_reading_>0)--sandbox_reading_;
+            if(sandbox_reading_==0 && (token==198 || token==271)) {
+                std::fprintf(stderr,"strata igc sandbox: closed the thinking after reading the result\n");
+                sandbox_reading_=-1;
+                bridge_tokens_={kThinkClose,271};bridge_at_=0;called=true;return true;
+            }
             // Long reasoning is where a program pays: open a block at the next line end, once. Opening one every N tokens
             // cut off a derivation that was going well, and made an exact loop.
             if(sandbox_after_>0 && !sandbox_opened_ && ++sandbox_thought_>=sandbox_after_ && (token==198 || token==271)) {
