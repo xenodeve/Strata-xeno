@@ -2961,9 +2961,9 @@ int main(int argc, char** argv) {
         if(!o.igc_output_artifact.empty() || !o.igc_output_fixture.empty()) {
             std::fprintf(stderr,"IGC learned diagnostic cannot combine with controlled output fixtures\n");return 2;
         }
-        if(!o.serve || o.batch!=0 || !o.layer_split.empty() || !o.split_device.empty()
+        if(!o.serve || !o.layer_split.empty() || !o.split_device.empty()
                 || o.pipeline_windows>0 || o.native_preset.empty() || !o.cvec_files.empty()) {
-            std::fprintf(stderr,"IGC learned diagnostic requires native serve, one session, no layer/pipeline split or control vectors\n");return 2;
+            std::fprintf(stderr,"IGC learned diagnostic requires native serve, no layer/pipeline split or control vectors\n");return 2;
         }
     }
 #endif
