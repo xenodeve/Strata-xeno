@@ -62,7 +62,8 @@ def reply(text):
 
 
 def math_answer(text):
-    found = re.search(r'Final Answer: The final answer is(.*?)\. I hope it is correct\.', reply(text) + 'I hope it is correct.', re.S)
+    # The base model copies the exemplars' `I hope it is correct.`; a post-trained model stops at the answer.
+    found = re.search(r'[Tt]he final answer is(.*?)(?:\.\s*I hope it is correct|\.?\s*(?:\n|$))', reply(text), re.S)
     if found:
         return found.group(1).strip()
     return last_boxed(reply(text))   # a reply with the thinking on ends in a box, not in the exemplars' sentence
