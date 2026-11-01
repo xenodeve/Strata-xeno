@@ -13,6 +13,11 @@ REMOVED = ['square', 'ways', 'integers', 'dollars', 'mph', 'inches', 'ft', 'hour
 
 def normalize_math(answer):
     answer = answer.split('=')[-1]
+    # Same value, other spelling: the harness leaves these to sympy, which is not used here.
+    for spelling in ('tfrac', 'dfrac', 'cfrac'):
+        answer = answer.replace(spelling, 'frac')
+    answer = answer.replace('\\left', '').replace('\\right', '').replace('\\!', '').replace('\\%', '').replace('%', '')
+    answer = re.sub(r'(frac\{[^{}]*\})([^{\s])', r'\1{\2}', answer)
     for word in REMOVED:
         if word.isalpha():
             answer = re.sub(rf'(?<!\\)\b{word}\b', '', answer)
