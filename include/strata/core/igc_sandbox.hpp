@@ -9949,6 +9949,127 @@ inline Value f_lru_cache(Call& c) {
 inline Value f_cache(Call& c) { return cached_of(c.a[0], -1); }
 inline Value t_cast(Call& c) { return c.a[1]; }
 
+// The sifts of CPython's heapq.py, so ties land where they land there.
+inline Vals& heap_arg(const Value& v) {
+    if (v.tag != Tag::List) raise(T_TypeError, "heap argument must be a list");
+    return v.as<ListObj>()->v;
+}
+inline void heap_down(Vals& h, std::size_t start, std::size_t pos) {
+    Value item = std::move(h[pos]);
+    while (pos > start) {
+        const std::size_t up = (pos - 1) >> 1;
+        rt->tick();
+        if (!order(Cmp::Lt, item, h[up])) break;
+        h[pos] = h[up];
+        pos = up;
+    }
+    h[pos] = std::move(item);
+}
+inline void heap_up(Vals& h, std::size_t pos) {
+    const std::size_t end = h.size(), start = pos;
+    Value item = std::move(h[pos]);
+    for (std::size_t child = 2 * pos + 1; child < end; child = 2 * pos + 1) {
+        rt->tick();
+        if (child + 1 < end && !order(Cmp::Lt, h[child], h[child + 1])) ++child;
+        h[pos] = h[child];
+        pos = child;
+    }
+    h[pos] = std::move(item);
+    heap_down(h, start, pos);
+}
+inline Value hq_push(Call& c) {
+    Vals& h = heap_arg(c.a[0]);
+    h.push_back(c.a[1]);
+    heap_down(h, 0, h.size() - 1);
+    return Value::none();
+}
+inline Value hq_pop(Call& c) {
+    Vals& h = heap_arg(c.a[0]);
+    if (h.empty()) raise(T_IndexError, "index out of range");
+    Value last = std::move(h.back());
+    h.pop_back();
+    if (h.empty()) return last;
+    Value top = std::move(h[0]);
+    h[0] = std::move(last);
+    heap_up(h, 0);
+    return top;
+}
+inline Value hq_heapify(Call& c) {
+    Vals& h = heap_arg(c.a[0]);
+    for (std::size_t i = h.size() / 2; i-- > 0;) heap_up(h, i);
+    return Value::none();
+}
+inline Value hq_replace(Call& c) {
+    Vals& h = heap_arg(c.a[0]);
+    if (h.empty()) raise(T_IndexError, "index out of range");
+    Value top = std::move(h[0]);
+    h[0] = c.a[1];
+    heap_up(h, 0);
+    return top;
+}
+inline Value hq_pushpop(Call& c) {
+    Vals& h = heap_arg(c.a[0]);
+    if (h.empty() || !order(Cmp::Lt, h[0], c.a[1])) return c.a[1];
+    Value top = std::move(h[0]);
+    h[0] = c.a[1];
+    heap_up(h, 0);
+    return top;
+}
+inline Value heap_first(Call& c, const char* name, bool reverse) {
+    only_keywords(c, {"key"}, name);
+    Vals items = to_vals(c.a[1]);
+    Value* key = c.keyword("key");
+    sort_values(items, key ? *key : Value::none(), reverse);
+    const int64_t n = std::max<int64_t>(int_arg(c.a[0]), 0);
+    if ((int64_t) items.size() > n) items.resize((std::size_t) n);
+    return make_list(std::move(items));
+}
+inline Value hq_nlargest(Call& c) { return heap_first(c, "nlargest", true); }
+inline Value hq_nsmallest(Call& c) { return heap_first(c, "nsmallest", false); }
+
+inline int64_t bisect_at(Call& c, const char* name, bool right) {
+    only_keywords(c, {"lo", "hi", "key"}, name);
+    if (c.a[0].tag != Tag::List && c.a[0].tag != Tag::Tuple) refuse(std::string(name) + " on this sequence");
+    const Vals& a = seq_of(c.a[0]);
+    Value* lo_kw = c.keyword("lo");
+    Value* hi_kw = c.keyword("hi");
+    Value* key_kw = c.keyword("key");
+    const Value* lo_v = c.n > 2 ? &c.a[2] : lo_kw;
+    const Value* hi_v = c.n > 3 ? &c.a[3] : hi_kw;
+    int64_t lo = lo_v ? int_arg(*lo_v) : 0;
+    if (lo < 0) raise(T_ValueError, "lo must be non-negative");
+    int64_t hi = hi_v && !hi_v->is_none() ? int_arg(*hi_v) : (int64_t) a.size();
+    const Value key = key_kw ? *key_kw : Value::none();
+    const bool insort = std::string_view(name).starts_with("insort");
+    Value x = c.a[1];
+    if (insort && !key.is_none()) {
+        Value arg = x;
+        x = call_value(key, &arg, 1);
+    }
+    while (lo < hi) {
+        const int64_t mid = (lo + hi) / 2;
+        rt->tick();
+        if (mid >= (int64_t) a.size()) raise(T_IndexError, "list index out of range");
+        Value at = a[(std::size_t) mid];
+        if (!key.is_none()) at = call_value(key, &at, 1);
+        if (right ? order(Cmp::Lt, x, at) : !order(Cmp::Lt, at, x)) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+inline Value s_left(Call& c) { return Value::integer(bisect_at(c, "bisect_left", false)); }
+inline Value s_right(Call& c) { return Value::integer(bisect_at(c, "bisect_right", true)); }
+inline Value insort_at(Call& c, const char* name, bool right) {
+    if (c.a[0].tag != Tag::List) raise(T_AttributeError, "object has no attribute 'insert'");
+    const int64_t at = bisect_at(c, name, right);
+    Vals& a = c.a[0].as<ListObj>()->v;
+    rt->tick((uint64_t) ((int64_t) a.size() - at) >> 4);
+    a.insert(a.begin() + at, c.a[1]);
+    return Value::none();
+}
+inline Value s_insort_left(Call& c) { return insort_at(c, "insort_left", false); }
+inline Value s_insort_right(Call& c) { return insort_at(c, "insort_right", true); }
+
 inline const NativeDef kBuiltins[] = {
     {"print", b_print, 0, -1, true}, {"len", b_len, 1, 1}, {"abs", b_abs, 1, 1}, {"sum", b_sum, 1, 2, true}, {"min", b_min, 1, -1, true},
     {"max", b_max, 1, -1, true}, {"sorted", b_sorted, 1, 1, true}, {"any", b_any, 1, 1}, {"all", b_all, 1, 1}, {"repr", b_repr, 1, 1},
@@ -9971,14 +10092,18 @@ inline const NativeDef kMath[] = {
 inline const NativeDef kChainFromIterable = {"from_iterable", chain_from_iterable, 1, 1, false, true};
 inline const NativeDef* chain_from_iterable_def() { return &kChainFromIterable; }
 inline const NativeDef kFunctools[] = {{"reduce", f_reduce, 2, 3}, {"lru_cache", f_lru_cache, 0, 2, true}, {"cache", f_cache, 1, 1}};
+inline const NativeDef kHeapq[] = {{"heappush", hq_push, 2, 2}, {"heappop", hq_pop, 1, 1}, {"heapify", hq_heapify, 1, 1}, {"heapreplace", hq_replace, 2, 2},
+    {"heappushpop", hq_pushpop, 2, 2}, {"nlargest", hq_nlargest, 2, 2, true}, {"nsmallest", hq_nsmallest, 2, 2, true}};
+inline const NativeDef kBisect[] = {{"bisect_left", s_left, 2, 4, true}, {"bisect_right", s_right, 2, 4, true}, {"bisect", s_right, 2, 4, true},
+    {"insort_left", s_insort_left, 2, 4, true}, {"insort_right", s_insort_right, 2, 4, true}, {"insort", s_insort_right, 2, 4, true}};
 inline const NativeDef kCast = {"cast", t_cast, 2, 2};
 inline constexpr std::string_view kTypingNames =
     " List Dict Tuple Set FrozenSet Optional Union Any Callable Iterable Iterator Sequence Mapping MutableMapping MutableSequence "
     "Generator Type TypeVar Generic NoReturn Final Literal DefaultDict Deque Counter Collection Hashable Sized ";
-enum ModuleId : int { kModuleMath, kModuleItertools, kModuleFunctools, kModuleCollections, kModuleFractions, kModuleTyping };
-inline constexpr const char* kModuleNames[] = {"math", "itertools", "functools", "collections", "fractions", "typing"};
+enum ModuleId : int { kModuleMath, kModuleItertools, kModuleFunctools, kModuleCollections, kModuleFractions, kModuleTyping, kModuleHeapq, kModuleBisect };
+inline constexpr const char* kModuleNames[] = {"math", "itertools", "functools", "collections", "fractions", "typing", "heapq", "bisect"};
 inline Value import_module(std::string_view name) {
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < (int) std::size(kModuleNames); ++i)
         if (name == kModuleNames[i]) return Value::module(i);
     const std::string_view top = name.substr(0, name.find('.'));
     for (const char* known : kModuleNames)
@@ -10015,6 +10140,12 @@ inline Value module_attr(int module, std::string_view name) {
             break;
         case kModuleFunctools:
             if (const NativeDef* d = find_native(kFunctools, name)) return Value::from(d);
+            break;
+        case kModuleHeapq:
+            if (const NativeDef* d = find_native(kHeapq, name)) return Value::from(d);
+            break;
+        case kModuleBisect:
+            if (const NativeDef* d = find_native(kBisect, name)) return Value::from(d);
             break;
         case kModuleCollections:
             if (name == "Counter") return Value::type(T_Counter);

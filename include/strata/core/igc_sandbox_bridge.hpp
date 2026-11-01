@@ -27,7 +27,7 @@ inline constexpr std::string_view kNothingPrinted = "[it ran and printed nothing
 // 8 of 32 imports were sympy: told only that it is missing, the model went on by hand for 1820 to 9189 tokens (#279).
 // The model's own words before it answers: 4 of 66 replies after a close were the program again, with no sentence (#279).
 inline constexpr std::string_view kCloseLine = "Need final with enough detail.\n";
-inline constexpr std::string_view kOnlyModules = "[only math, fractions, itertools, functools and collections are here: rewrite with those]";
+inline constexpr std::string_view kOnlyModules = "[only math, fractions, itertools, functools, collections, heapq and bisect are here: rewrite with those]";
 // Told to call its function, the model did not in 36 of 36 blocks, with a whole draft in 17 of 19 scored (#279). So the call is opened
 // for it, with the name: given a bare `print(`, 12 of 22 runs wrote `print(1)`, and the thinking closed on that.
 inline constexpr std::string_view kCallHead = "print(";
