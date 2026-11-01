@@ -160,6 +160,8 @@ as soon as that question has an answer.
   only what it missed, with `tools/igc/select_rows.py`.
 - **When the result on the misses satisfies, check the trade-off** on questions that were right, by a sample. If there is one, fix it and
   go round the same loop. A gain on misses alone is not a claim: failures can only go up.
+- **Drop misses the feature cannot reach.** A low score does not make every miss useful: a wrong fact or a misread question has nothing for
+  MIP to compute. Test only what the feature under work can change, and say how many were left out and by what rule.
 - **A whole suite runs only when a whole-suite number is the thing asked for.**
 - **Run tracks in parallel and never stop to wait for one.** While one track runs, advance the other: prepare the next queue, write the
   reader, read partial results, fix what they show. An idle machine is lost time.
