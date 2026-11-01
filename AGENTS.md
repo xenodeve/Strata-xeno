@@ -149,6 +149,10 @@ measure the exact mechanism the fix would change, from the run itself. Then desi
 
   Two of them led to proposed work, the prefetch plan and D0, that the next measurement cancelled.
 
+## CLAUDE.md and AGENTS.md mirror each other (developer, 2026-11-02)
+
+A rule added to one goes into the other in the same commit, word for word, so no agent reads less than another.
+
 ## Test with the smallest run that answers the question (developer, 2026-11-02)
 
 "Testing must be as efficient and as short as it can be; a whole suite is not needed." A test exists to answer one question, so it stops
