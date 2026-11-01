@@ -87,6 +87,18 @@ int main() try {
     require(refused({87, 62, 16, 10, 17, 28}), "x_1+2=");
     require(refused({26026, 18, 14, 18, 283}), "sqrt3/3 =");
     require(refused({169614, 17, 10, 16, 28}), "a root sign binds");
+    require(refused({4139, 314, 220, 21, 23, 478, 220, 16, 15, 283}), "half of 68 + 10 =");
+    require(refused({41212, 314, 220, 21, 23, 478, 220, 16, 15, 283}), "Half of 68 + 10 =");
+    require(refused({4139, 279, 220, 21, 23, 478, 220, 16, 15, 283}), "half the 68 + 10 =");
+    require(refused({4139, 314, 279, 220, 21, 23, 478, 220, 16, 15, 283}), "half of the 68 + 10 =");
+    require(refused({4139, 314, 318, 21, 23, 478, 220, 16, 15, 8, 283}), "half of (68 + 10) =");
+    require(refused({4139, 314, 220, 21, 23, 9, 18, 283}), "half of 68*3 =");
+    require(refused({10598, 220, 20, 478, 220, 18, 283}), "twice 5 + 3 =");
+    require(refused({16, 14, 19, 314, 220, 17, 15, 478, 220, 20, 283}), "1/4 of 20 + 5 =");
+    require(refused({15, 13, 20, 314, 220, 21, 23, 478, 220, 16, 15, 283}), "0.5 of 68 + 10 =");
+    require(parse_inline(std::vector<int32_t>{2542, 314, 220, 21, 23, 478, 220, 16, 15, 283}).has_value(), "sum of 68 + 10 =");
+    require(parse_inline(std::vector<int32_t>{2702, 220, 21, 23, 478, 220, 16, 15, 283}).has_value(), "total 68 + 10 =");
+    require(parse_inline(std::vector<int32_t>{17, 20, 4, 314, 220, 19, 15, 478, 220, 18, 283}).has_value(), "25% of 40 + 3 =");
     require(parse_inline(std::vector<int32_t>{7354, 220, 17, 10, 17, 28}).has_value(), "a word and a space");
     require(parse_inline(std::vector<int32_t>{3, 17, 10, 17, 28}).has_value(), "$2+2=");
     require(parse_inline(std::vector<int32_t>{332, 17, 10, 17, 28}).has_value(), "**2+2=");

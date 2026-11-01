@@ -128,6 +128,23 @@ inline bool opens_cleanly(int32_t before) {
 }
 }
 
+// A word that scales the number after it: `half of 68 + 10` is 44 to a reader and 78 as a sum.
+inline bool scales_next(std::span<const int32_t> tokens, std::ptrdiff_t at) {
+    using namespace inline_tokens;
+    static constexpr int32_t kThe = 279;
+    static constexpr int32_t kWords[] = {4139, 35778, 25015, 41212, 4688, 30686, 20226, 35750, 89931,   // half, third, thirds
+                                         8079, 30961, 33252, 83618, 30439, 19069, 17175, 22132,         // quarter, quarters, fifth
+                                         24238, 64714, 29398, 72086, 35174, 93154, 41127, 82798, 53797, // sixth to tenth
+                                         10598, 90345, 1923, 4190, 6872, 7144, 22983, 35436, 79968};    // twice, double, triple
+    bool of = false;
+    while (at > 0 && (tokens[(size_t) at] == kOf || tokens[(size_t) at] == kThe)) {
+        of = of || tokens[(size_t) at] == kOf;
+        --at;
+    }
+    const int32_t t = tokens[(size_t) at];
+    return (of && digit(t)) || std::find(std::begin(kWords), std::end(kWords), t) != std::end(kWords);   // `1/4 of 20 + 5`
+}
+
 // Digits are read right to left; the executor's limit decides the operand bound.
 inline bool read_number(std::span<const int32_t> tokens, std::ptrdiff_t& at, InlineNumber& value) {
     using namespace inline_tokens;
@@ -293,6 +310,7 @@ inline std::optional<InlineCall> parse_inline(std::span<const int32_t> written) 
     while (before >= 0 && tokens[(size_t) before] == kSpace) --before;
     if (before >= 0) {
         const int32_t t = tokens[(size_t) before];
+        if (scales_next(tokens, before)) return std::nullopt;
         const bool glued = tokens[(size_t) first - 1] != kSpace;
         if (binds_next(t) || (tokens[(size_t) first] == kOpen && glued && !opens_cleanly(t))) return std::nullopt;
         if (glued && tokens[(size_t) first] != kOpen && !number_may_follow(t)) return std::nullopt;   // `d12^2=`, `sin60^3=`, `a1 +1 =`
