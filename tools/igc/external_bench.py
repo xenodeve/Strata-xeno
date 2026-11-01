@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from tools.igc.external_score import final_number, repeating
+from tools.igc.external_score import final_number, question_id, repeating
 from tools.igc.hub_contract import validate_launcher_env
 from tools.igc.learned_integration import parse_audit
 from tools.igc.output_examples import wrapped_prefix
@@ -28,7 +28,7 @@ def cases(data,arithmetic,gsm,bigbench=0,math=0,gsm_file='gsm8k-test.jsonl',math
         problems=[json.loads(line) for line in (data/math_file).read_text(encoding='utf-8').splitlines()]
         problems=[row for row in problems if re.fullmatch(r'-?\d+',str(row['answer']))]
         for i,row in enumerate(problems[:math]):
-            rows.append(dict(id=f'math-{i}',suite='math500',prompt=row['problem'],answer=int(row['answer']),limit=8192))
+            rows.append(dict(id=question_id('math',row['problem']),suite='math500',prompt=row['problem'],answer=int(row['answer']),limit=8192))
     for name in BIGBENCH if bigbench else ():
         for i,row in enumerate(json.loads((data/'bigbench'/f'{name}.json').read_text(encoding='utf-8'))['examples'][:bigbench]):
             rows.append(dict(id=f'{name}-{i}',suite=name,prompt=row['input'],answer=int(row['target']),limit=2048))
@@ -40,7 +40,7 @@ def cases(data,arithmetic,gsm,bigbench=0,math=0,gsm_file='gsm8k-test.jsonl',math
                              answer=int(row['completion'].strip()),limit=512))
     for i,line in enumerate((data/gsm_file).read_text(encoding='utf-8').splitlines()[:gsm]):
         row=json.loads(line)
-        rows.append(dict(id=f'gsm8k-{i}',suite='gsm8k',prompt=row['question'],
+        rows.append(dict(id=question_id('gsm8k',row['question']),suite='gsm8k',prompt=row['question'],
                          answer=int(row['answer'].split('####')[1].strip().replace(',','')),limit=1536))
     return rows
 
@@ -54,11 +54,12 @@ def score(records):
     return suites
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
     tokenizer=NativeText.from_pack(pack/'tokenizer');prefix,suffix=wrapped_prefix(reference,tokenizer)
+    if effort_medium:prefix=prefix[prefix.index(b'<|im_start|>user'):]   # the template writes no system turn at medium
     if hint:prefix=prefix.replace(b'<|im_end|>',b' '+hint.encode('utf-8')+b'<|im_end|>',1)
     rows=cases(data,arithmetic,gsm,bigbench,math,gsm_file,math_file)
     (output/'cases.json').write_text(json.dumps(rows,ensure_ascii=False),encoding='utf-8')
@@ -70,6 +71,9 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     args[args.index('--expert-profile-save')+1]=str(output/'learned-profile.bin')
     if bundle:args+=['--igc-learned-diagnostic-bundle',str(bundle)]+(['--igc-inline-exec'] if inline else ['--igc-result-bridge'] if bridge else [])
     if sidecar:args+=['--igc-sidecar',str(sidecar)]
+    if no_note:args+=['--igc-no-note']
+    if close_repeat is not None:args+=['--igc-close-repeat',str(close_repeat)]
+    if sum_note is not None:args+=['--igc-sum-note',str(sum_note)]
     if no_adapt:args[args.index('--adapt-swaps')+1]='0';args[args.index('--adapt-secondary')+1]='0'
     cfg.update(exe=str(executable),args=args,log=str(output/'engine.log'))
     env=helper.child_env(cfg);env.pop('STRATA_TIMELINE',None);validate_launcher_env(env)
@@ -121,5 +125,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     for key in ('profile','server','executable','data','reference','pack','output'):parser.add_argument('--'+key,type=Path,required=True)
-    parser.add_argument('--whole-context',action='store_true');parser.add_argument('--hint',help='added to the system message');parser.add_argument('--bundle',type=Path);parser.add_argument('--timeline',type=Path);parser.add_argument('--sidecar',type=Path);parser.add_argument('--gsm-file',default='gsm8k-test.jsonl');parser.add_argument('--math-file',default='math500.jsonl');parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40);parser.add_argument('--bigbench',type=int,default=0);parser.add_argument('--bridge',action='store_true');parser.add_argument('--inline',action='store_true');parser.add_argument('--math',type=int,default=0);parser.add_argument('--no-adapt',action='store_true')
+    parser.add_argument('--whole-context',action='store_true');parser.add_argument('--hint',help='added to the system message');parser.add_argument('--no-note',action='store_true');parser.add_argument('--effort-medium',action='store_true');parser.add_argument('--bundle',type=Path);parser.add_argument('--timeline',type=Path);parser.add_argument('--sidecar',type=Path);parser.add_argument('--gsm-file',default='gsm8k-test.jsonl');parser.add_argument('--math-file',default='math500.jsonl');parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40);parser.add_argument('--bigbench',type=int,default=0);parser.add_argument('--bridge',action='store_true');parser.add_argument('--inline',action='store_true');parser.add_argument('--math',type=int,default=0);parser.add_argument('--no-adapt',action='store_true')
+    parser.add_argument('--close-repeat',type=int,help='close thinking at this repeat, 0 never')
+    parser.add_argument('--sum-note',type=int,help='note on a top-level sum: 0 open, 1 stop, 2 none')
     run(**vars(parser.parse_args()))

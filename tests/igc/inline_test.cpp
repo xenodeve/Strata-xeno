@@ -13,18 +13,50 @@ static int number(const InlineNumber& value) {
 }
 int main() try {
     {
-        std::vector<int32_t> cycle;
-        for (int i = 0; i < 100; ++i) cycle.push_back(i * i % 97);
-        for (int round = 0; round < 8; ++round) cycle.insert(cycle.end(), {7, 8, 9});
-        require(inline_tokens::in_cycle(cycle, 128, 8), "eight rounds are a cycle");
-        cycle.resize(cycle.size() - 3);
-        require(!inline_tokens::in_cycle(cycle, 128, 8), "seven rounds can still leave");
+        auto tail = [](std::vector<int32_t> round, int rounds) {
+            std::vector<int32_t> out;
+            for (int i = 0; i < 100; ++i) out.push_back(i * i % 97);
+            for (int i = 0; i < rounds; ++i) out.insert(out.end(), round.begin(), round.end());
+            return out;
+        };
+        const std::vector<int32_t> phrase{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+        require(inline_tokens::in_cycle(tail(phrase, 8), 128, 8), "eight rounds of a phrase are a cycle");
+        require(!inline_tokens::in_cycle(tail(phrase, 7), 128, 8), "seven rounds can still leave");
+        require(inline_tokens::in_cycle(tail({7, 8}, 32), 128, 8), "a short loop, 64 tokens");
+        require(!inline_tokens::in_cycle(tail({7, 8}, 31), 128, 8), "a short run is not yet one");
+        require(!inline_tokens::in_cycle(tail({15}, 13), 128, 8), "the zeros of 2102500000000");
+        require(!inline_tokens::in_cycle(tail({18}, 40), 128, 8), "a repeating decimal");
         std::vector<int32_t> plain;
         for (int i = 0; i < 2000; ++i) plain.push_back(i * i % 9973);
         require(!inline_tokens::in_cycle(plain, 128, 8), "varied text is no cycle");
         std::vector<int32_t> run(1024, 5);
         require(inline_tokens::in_cycle(run, 128, 8), "one token repeated");
         require(!inline_tokens::in_cycle(std::vector<int32_t>{}, 128, 8), "nothing written");
+        std::vector<int32_t> block;
+        for (int i = 0; i < 350; ++i) block.push_back(1000 + i);
+        require(inline_tokens::in_cycle(tail(block, 3), 512, 8), "a long block needs three rounds");
+        require(!inline_tokens::in_cycle(tail(block, 2), 512, 8), "two rounds of a block can still leave");
+        std::vector<int32_t> mid(block.begin(), block.begin() + 128);
+        require(inline_tokens::in_cycle(tail(mid, 8), 512, 8), "128 tokens, eight rounds");
+        require(!inline_tokens::in_cycle(tail(mid, 7), 512, 8), "128 tokens, seven rounds");
+        const std::vector<int32_t> exact{318, 44839, 8}, confirmed{318, 43967, 10457, 11, 2842, 12910, 8}, closing{13, 198, 77, 271};
+        require(inline_tokens::after_value(0, true, 3, 77) == exact, "the first value is marked");
+        require(inline_tokens::after_value(1, true, 3, 77) == confirmed, "the first repeat is confirmed");
+        require(inline_tokens::after_value(2, true, 3, 77) == closing, "the third closes");
+        require(inline_tokens::after_value(9, true, 3, 77) == closing, "any later one closes");
+        require(inline_tokens::after_value(9, true, 0, 77) == confirmed, "0 never closes");
+        require(inline_tokens::after_value(1, false, 3, 77).empty(), "no note, no close yet");
+        require(inline_tokens::after_value(2, false, 3, 77) == closing, "the close does not depend on notes");
+        require(inline_tokens::after_value(0, false, 0, 77).empty(), "the value alone");
+        using inline_tokens::SumNote;
+        const std::vector<int32_t> exact_stop{318, 44839, 553}, confirmed_stop{318, 43967, 10457, 11, 2842, 12910, 553};
+        require(inline_tokens::after_value(0, true, 3, 77, SumNote::Stop) == exact_stop, "a sum closes its note");
+        require(inline_tokens::after_value(1, true, 3, 77, SumNote::Stop) == confirmed_stop, "a repeated sum closes its note");
+        require(inline_tokens::after_value(2, true, 3, 77, SumNote::Stop) == closing, "the third still closes a sum");
+        require(inline_tokens::after_value(0, false, 3, 77, SumNote::Stop).empty(), "no notes, nothing to close");
+        require(inline_tokens::after_value(0, true, 3, 77, SumNote::None).empty(), "a sum alone");
+        require(inline_tokens::after_value(1, true, 3, 77, SumNote::None).empty(), "a repeated sum alone");
+        require(inline_tokens::after_value(2, true, 3, 77, SumNote::None) == closing, "the third still closes without a note");
     }
     // The program as text: digits, then the operation letters.
     auto program = [](const std::optional<InlineCall>& call) {

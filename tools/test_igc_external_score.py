@@ -1,10 +1,13 @@
 import unittest
-from tools.igc.external_score import final_number
+from tools.igc.external_score import final_number, question_id
 
 
 class FinalNumber(unittest.TestCase):
     def test_boxed_wins(self):
         self.assertEqual(final_number('x</think>**10** ways\n\[\n5 \times 45 = 225\n\]\n\[\n\boxed{225}\n\]<|im_end|>'), 225)
+
+    def test_boxed_with_a_dollar(self):
+        self.assertEqual(final_number('x</think>\\[\n\\boxed{\\$165{,}762{,}163}\n\\]\n\nNote: 6139339 is not divisible by 4.<|im_end|>'), 165762163)
 
     def test_bold_in_the_working_is_not_the_answer(self):
         self.assertEqual(final_number('x</think>- **2** hide: 17 − 2 = 15<|im_end|>\n'), 2)
@@ -33,6 +36,13 @@ class FinalNumber(unittest.TestCase):
 
     def test_unfinished(self):
         self.assertIsNone(final_number('never closed'))
+
+
+class QuestionId(unittest.TestCase):
+    def test_follows_the_question(self):
+        self.assertEqual(question_id('math', 'What is 2+2?'), question_id('math', 'What is 2+2?'))
+        self.assertNotEqual(question_id('math', 'What is 2+2?'), question_id('math', 'What is 2+3?'))
+        self.assertTrue(question_id('gsm8k', 'q').startswith('gsm8k-'))
 
 
 if __name__ == '__main__':

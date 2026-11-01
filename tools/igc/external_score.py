@@ -1,6 +1,7 @@
 """One scorer for every external arm, and the census of what the model computes in its thinking."""
 import argparse
 from collections import Counter
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -12,13 +13,18 @@ FORMS = dict(
     equation=r'[a-z]\s*=\s*-?\d', variable_term=r'\d[a-z]\b')
 
 
+def question_id(prefix, prompt):
+    """From the question, not its place in a case file: `math-3` was a different question in four selected sets."""
+    return f"{prefix}-{hashlib.sha256(prompt.encode('utf-8')).hexdigest()[:8]}"
+
+
 def final_number(text):
     """The last boxed number, else a bold number on the closing line, else the last number; None when thinking never closed."""
     parts = text.rsplit('</think>', 1)
     if len(parts) < 2:
         return None
     answer = parts[1].replace('<|im_end|>', '').replace('{,}', '').replace(',', '').replace(MINUS, '-').strip()
-    boxed = re.findall(r'\\boxed\{\s*(-?\d+(?:\.\d+)?)\s*\}', answer)
+    boxed = re.findall(r'\\boxed\{\s*(?:\\\$)?\s*(-?\d+(?:\.\d+)?)\s*\}', answer)
     if boxed:
         return float(boxed[-1])
     # A closing `If both boxes must be nonempty...` or `since 2^6 = 64` comes after the answer.

@@ -98,14 +98,29 @@ inline std::vector<int32_t> split_brackets(std::span<const int32_t> tokens) {
 }
 inline bool closes_expression(int32_t t) { return t == kEquals || t == kSpacedEquals || t == 11393; }
 // The tail is one exact cycle. In 1410 measured runs no text that repeated six times ever left, 2263 rounds at most.
+// At least 64 tokens: digits are one token each, so `2102500000000` and `0.33333333` are eight rounds of one token.
+// At most 1024 tokens or three rounds: of 7073 runs none left a block of 300 characters after three rounds.
 inline bool in_cycle(std::span<const int32_t> tokens, int longest, int rounds) {
     for (int period = 1; period <= longest; ++period) {
-        const std::size_t span = static_cast<std::size_t>(period) * rounds;
+        const std::size_t whole = static_cast<std::size_t>(period);
+        const std::size_t span = std::max(std::clamp<std::size_t>(whole * rounds, 64, 1024), whole * 3);
         if (tokens.size() < span) return false;
         const auto tail = tokens.last(span);
         if (std::equal(tail.begin() + period, tail.end(), tail.begin())) return true;
     }
     return false;
+}
+// The note on a value whose expression is a sum at its top level. Left open, the model takes the value for the
+// first term and writes the last one again, `a + b = V (exact) + b`: 28 times in 297 runs, none in 1290 runs with a `.`.
+enum class SumNote : int { Open = 0, Stop = 1, None = 2 };
+// What follows a value delivered inside reasoning, when this expression was written `seen` times before.
+// The `close_at`th time closes the thinking, 0 never. The close carries its own `.`, `notes` only the two marks.
+inline std::vector<int32_t> after_value(int seen, bool notes, int close_at, int32_t think_close, SumNote sum = SumNote::Open) {
+    if (close_at > 0 && seen + 1 >= close_at) return {13, 198, think_close, 271};
+    if (!notes || sum == SumNote::None) return {};
+    const int32_t end = sum == SumNote::Stop ? 553 : 8;   // `).` or `)`
+    if (!seen) return {318, 44839, end};                  // ` (exact)`
+    return {318, 43967, 10457, 11, 2842, 12910, end};     // ` (already confirmed, stop checking)`
 }
 // `(` written against a word is a function call or a product we cannot read.
 inline bool opens_cleanly(int32_t before) {

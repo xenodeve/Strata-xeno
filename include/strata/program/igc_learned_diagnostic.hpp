@@ -40,6 +40,7 @@ class IgcLearnedDiagnostic {
     bool thinking_closed_=false;   // generated_ is trimmed, so it cannot answer this
     std::vector<int64_t> inline_seen_;
     std::vector<int32_t> thinking_tail_;
+    bool inline_notes_=true;int close_repeat_=3;strata::igc::inline_tokens::SumNote sum_note_=strata::igc::inline_tokens::SumNote::Open;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
     std::unique_ptr<strata::igc::Sidecar> sidecar_;std::unique_ptr<strata::igc::NaturalFirer<strata::igc::Sidecar>> natural_;
@@ -286,6 +287,9 @@ public:
     }
     void set_bridge(bool on){bridge_=on;}
     void set_inline_exec(bool on){inline_exec_=on;}
+    void set_inline_notes(bool on){inline_notes_=on;}
+    void set_close_repeat(int n){close_repeat_=n;}
+    void set_sum_note(int mode){sum_note_=static_cast<strata::igc::inline_tokens::SumNote>(mode);}
     bool set_sidecar(const std::string& path,std::string& error) {
         sidecar_=std::make_unique<strata::igc::Sidecar>();
         if(!sidecar_->load(path,error))return false;
@@ -320,7 +324,7 @@ public:
             // A loop holds no `=` for the repeat rule below; left alone it runs to the end of the context.
             thinking_tail_.push_back(token);
             if(thinking_tail_.size()>2048)thinking_tail_.erase(thinking_tail_.begin(),thinking_tail_.begin()+1024);
-            if(thinking_tail_.size()%16==0 && strata::igc::inline_tokens::in_cycle(thinking_tail_,128,8)) {
+            if(thinking_tail_.size()%16==0 && strata::igc::inline_tokens::in_cycle(thinking_tail_,512,8)) {
                 std::fprintf(stderr,"strata igc loop: closed the thinking\n");
                 bridge_tokens_={198,kThinkClose,271};bridge_at_=0;called=true;return true;
             }
@@ -398,13 +402,14 @@ public:
             // A repeat means the model is re-checking: say so once, then close the thinking.
             int64_t key=0;
             for(const auto& step:call->program)
-                key=key*1000003+(step.number?number_key(step.value.coefficient)+step.value.scale:static_cast<int64_t>(step.operation));
+                key=key*1000003+(step.number?number_key(step.value.coefficient)*16+step.value.scale:static_cast<int64_t>(step.operation));
             const auto seen=std::count(inline_seen_.begin(),inline_seen_.end(),key);
             inline_seen_.push_back(key);
-            // No closing `.`: at least 16 % of the values continue, `2100 per week`, and the model writes its own stop.
-            if(!seen)bridge_tokens_.insert(bridge_tokens_.end(),{318,44839,8}); // ` (exact)`
-            else if(seen==1)bridge_tokens_.insert(bridge_tokens_.end(),{318,43967,10457,11,2842,12910,8}); // ` (already confirmed, stop checking)`
-            else bridge_tokens_.insert(bridge_tokens_.end(),{13,198,kThinkClose,271});
+            // No closing `.` by default: at least 16 % of the values continue, `2100 per week`, and the model writes its own stop.
+            const auto& top=call->program.back();
+            const bool sum=!top.number && (top.operation==strata::igc::InlineOperation::Add || top.operation==strata::igc::InlineOperation::Subtract);
+            const auto after=strata::igc::inline_tokens::after_value(static_cast<int>(seen),inline_notes_,close_repeat_,static_cast<int32_t>(kThinkClose),sum?sum_note_:strata::igc::inline_tokens::SumNote::Open);
+            bridge_tokens_.insert(bridge_tokens_.end(),after.begin(),after.end());
         }
         ++inline_calls_;called=true;return true;
     }

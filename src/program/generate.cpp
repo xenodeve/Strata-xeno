@@ -453,7 +453,8 @@ struct Options {
     std::string dump_mixed;
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
     std::string igc_output_artifact,igc_output_fixture,igc_learned_bundle;
-    bool igc_result_bridge=false,igc_inline_exec=false;
+    bool igc_result_bridge=false,igc_inline_exec=false,igc_no_note=false;
+    int igc_close_repeat=3,igc_sum_note=0;
     std::string igc_sidecar;
     std::string igc_observation_plan,igc_observation_root;
 #endif
@@ -955,6 +956,9 @@ void usage() {
                  "  --igc-learned-diagnostic-bundle PATH  learned first-anchor controller (not production)\n"
                  "  --igc-result-bridge  emit the executed result as tokens instead of the output mapper\n"
                  "  --igc-inline-exec    execute `A op B =` inside reasoning on the device, with the bridge\n"
+                 "  --igc-no-note        deliver an inline value with no source note (with --igc-inline-exec)\n"
+                 "  --igc-close-repeat N close the thinking when one expression is written N times, 0 never (default 3, with --igc-inline-exec)\n"
+                 "  --igc-sum-note N     the note on a value of a top-level sum: 0 open, 1 closed with a stop, 2 none (default 0, with --igc-inline-exec)\n"
                  "  --igc-sidecar <file> also check numbers written in plain words against this sidecar (with --igc-inline-exec)\n"
 #endif
                  "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
@@ -2554,6 +2558,9 @@ int main(int argc, char** argv) {
         else if (a == "--igc-learned-diagnostic-bundle") o.igc_learned_bundle = next("--igc-learned-diagnostic-bundle");
         else if (a == "--igc-result-bridge") o.igc_result_bridge = true;
         else if (a == "--igc-inline-exec") o.igc_result_bridge = o.igc_inline_exec = true;
+        else if (a == "--igc-no-note") o.igc_no_note = true;
+        else if (a == "--igc-close-repeat") o.igc_close_repeat = std::atoi(next("--igc-close-repeat"));
+        else if (a == "--igc-sum-note") o.igc_sum_note = std::atoi(next("--igc-sum-note"));
         else if (a == "--igc-sidecar") o.igc_sidecar = next("--igc-sidecar");
         else if (a == "--igc-observation-plan") o.igc_observation_plan = next("--igc-observation-plan");
         else if (a == "--igc-observation-root") o.igc_observation_root = next("--igc-observation-root");
@@ -3550,6 +3557,9 @@ int main(int argc, char** argv) {
         igc_learned=std::make_unique<strata::program::IgcLearnedDiagnostic>();
         igc_learned->set_bridge(o.igc_result_bridge);
         igc_learned->set_inline_exec(o.igc_inline_exec);
+        igc_learned->set_inline_notes(!o.igc_no_note);
+        igc_learned->set_close_repeat(o.igc_close_repeat);
+        igc_learned->set_sum_note(o.igc_sum_note);
         if (!o.igc_sidecar.empty()) {
             std::string sidecar_error;
             if (!o.igc_inline_exec || !igc_learned->set_sidecar(o.igc_sidecar, sidecar_error)) {
