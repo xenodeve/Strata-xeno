@@ -22,7 +22,7 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276)
 
 ### ลำดับงาน
 
-1. **ความมั่นใจในค่าที่ส่งให้:** เพิ่มประโยคใน system ว่าค่าที่มีโน้ตมาจากเครื่องคำนวณและให้ตรวจเฉพาะการตั้งโจทย์ วัดบน 60 ข้อที่คัด เทียบแขนไม่มี hint ถ้าใช้จริงต้องดูผลต่อ prefix ของงาน serve
+1. **ความมั่นใจในค่าที่ส่งให้:** ไม่ใช้ ประโยคใน system บน 60 ข้อที่คัด token ไม่ลด เวลาเพิ่ม 4 % ประโยคตรวจซ้ำเพิ่ม 15 % และโมเดลลอกโน้ตจนเกิดวงใหม่ 1 ข้อ ขั้นถัดไปคือวัดแขนส่งค่าไม่มีโน้ต และแขน effort medium บน 49 ข้อ
 2. **ยกเลิกการปิดการคิดจากการซ้ำ:** การซ้ำครั้งที่ 3 ของนิพจน์ตัดกลางงานจริง (math-3 ที่ `[2,3]: 3*4=12.`) จึงเหลือแค่โน้ต วัดบน 49 ข้อที่เคยถูกปิดแบบนี้ ส่วนการปิดเมื่อเจอคำทบทวนแบบ CGRS ถูกยกเลิก เพราะลดได้ 3–10 % และปิดกลางงานราว 8 % คำในการคิดบอกไม่ได้ว่าคิดเสร็จแล้ว
 3. **ตรวจสมมุติฐานด้วยเกณฑ์ภายนอก:** ทดลองตรวจย้อนกลับแบบ FOBAR หรือ Key Condition Verification โดยซ่อนเลขในโจทย์แล้วให้ MIP คำนวณ เทียบกับเลขจริง เริ่มจากข้อผิด 20 ข้อและข้อถูก 20 ข้อ วัดอัตราจับข้อผิดและการเตือนผิด ถ้าไม่คุ้มไม่สร้าง ถ้าคุ้มให้ทำงานเฉพาะเมื่อมีสัญญาณ
 4. **แปลงเป็นเงื่อนไขให้ solver (SatLM):** ทางเลือกระยะยาว ใช้เมื่อข้อ 3 พิสูจน์แล้วว่าการตรวจภายนอกคุ้มค่า เป็น dependency ใหม่ ต้องคุยกับผู้พัฒนาก่อน
@@ -38,7 +38,7 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276)
 
 **Order of work.**
 
-1. Confidence in delivered values: a system line saying marked values come from a calculator and only the setup needs checking, measured on the 60 selected cases against an arm without it. Real use must check the effect on serve's prefix.
+1. Confidence in delivered values: rejected. A system line on the 60 selected cases gave no token gain, 4 % more time, 15 % more recheck sentences, and one new loop where the model copied the note. Next, an arm with no note and an arm at medium effort on 49 cases.
 2. Stop closing thinking on repeats: the third repeat of an expression cut real work (math-3 at `[2,3]: 3*4=12.`), so a repeat is only marked, measured on the 49 cases closed that way. A close at a reflection opener in the CGRS style was dropped: it saved 3 to 10 % with about 8 % of closes mid-work, and words in the thinking do not show that the work is done.
 3. Check assumptions by an outside criterion: a trial of backward verification in the style of FOBAR or Key Condition Verification, masking a number in the question and having MIP compute it against the known value. Start from 20 wrong and 20 right cases and measure catches and false alarms. Do not build it if it does not pay; if it does, it runs only on a signal.
 4. Declarative constraints for a solver (SatLM): a longer-term option once step 3 shows outside checks pay. A new dependency, to be discussed with the developer first.
