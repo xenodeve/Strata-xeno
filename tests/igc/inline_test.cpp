@@ -57,6 +57,15 @@ int main() try {
         require(inline_tokens::after_value(0, true, 3, 77, SumNote::None).empty(), "a sum alone");
         require(inline_tokens::after_value(1, true, 3, 77, SumNote::None).empty(), "a repeated sum alone");
         require(inline_tokens::after_value(2, true, 3, 77, SumNote::None) == closing, "the third still closes without a note");
+        using inline_tokens::RepeatNote;
+        const std::vector<int32_t> bare{318, 43967, 10457, 8}, bare_stop{318, 43967, 10457, 553}, next{318, 43967, 10457, 11, 1727, 2923, 8};
+        require(inline_tokens::after_value(1, true, 3, 77, SumNote::Open, RepeatNote::Stop) == confirmed, "stop checking stays the default");
+        require(inline_tokens::after_value(1, true, 3, 77, SumNote::Open, RepeatNote::Bare) == bare, "a bare repeat note");
+        require(inline_tokens::after_value(1, true, 3, 77, SumNote::Stop, RepeatNote::Bare) == bare_stop, "closed on a sum");
+        require(inline_tokens::after_value(1, true, 3, 77, SumNote::Open, RepeatNote::Next) == next, "next step");
+        require(inline_tokens::after_value(0, true, 3, 77, SumNote::Open, RepeatNote::Bare) == exact, "the first note does not change");
+        require(inline_tokens::after_value(2, true, 3, 77, SumNote::Open, RepeatNote::Next) == closing, "nor does the close");
+        require(inline_tokens::after_value(1, true, 3, 77, SumNote::None, RepeatNote::Next).empty(), "no note on the sum, none on its repeat");
     }
     // The program as text: digits, then the operation letters.
     auto program = [](const std::optional<InlineCall>& call) {

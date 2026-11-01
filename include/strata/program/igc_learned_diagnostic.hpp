@@ -45,8 +45,8 @@ class IgcLearnedDiagnostic {
     strata::igc::sandbox::Fence sandbox_fence_;
     strata::igc::sandbox::Session sandbox_session_;
     int sandbox_after_=0,sandbox_thought_=0,sandbox_block_=0,bridged_unread_=0;
-    bool sandbox_opened_=false,sandbox_close_=false;
-    bool inline_notes_=true,inline_reply_=true;int close_repeat_=3;strata::igc::inline_tokens::SumNote sum_note_=strata::igc::inline_tokens::SumNote::Open;
+    bool sandbox_opened_=false,sandbox_close_=false,sandbox_close_line_=false;
+    bool inline_notes_=true,inline_reply_=true;int close_repeat_=3;strata::igc::inline_tokens::SumNote sum_note_=strata::igc::inline_tokens::SumNote::Stop;strata::igc::inline_tokens::RepeatNote repeat_note_=strata::igc::inline_tokens::RepeatNote::Stop;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
     std::unique_ptr<strata::igc::Sidecar> sidecar_;std::unique_ptr<strata::igc::NaturalFirer<strata::igc::Sidecar>> natural_;
@@ -298,12 +298,14 @@ public:
     void set_inline_reply(bool on){inline_reply_=on;}
     void set_sandbox_after(int tokens){sandbox_after_=tokens;}
     void set_sandbox_close(bool on){sandbox_close_=on;}
+    void set_sandbox_close_line(bool on){sandbox_close_line_=on;}
     bool set_sandbox(const std::filesystem::path& vocab,std::string& error) {
         sandbox_text_=std::make_unique<strata::igc::sandbox::TokenText>();
         return sandbox_text_->load(vocab,error);
     }
     void set_close_repeat(int n){close_repeat_=n;}
     void set_sum_note(int mode){sum_note_=static_cast<strata::igc::inline_tokens::SumNote>(mode);}
+    void set_repeat_note(int mode){repeat_note_=static_cast<strata::igc::inline_tokens::RepeatNote>(mode);}
     bool set_sidecar(const std::string& path,std::string& error) {
         sidecar_=std::make_unique<strata::igc::Sidecar>();
         if(!sidecar_->load(path,error))return false;
@@ -362,7 +364,13 @@ public:
                 std::fprintf(stderr,"strata igc sandbox: run %d of %d bytes, %d bytes back, %llu steps so far\n",sandbox_session_.runs(),static_cast<int>(program->size()),static_cast<int>(text.size()),static_cast<unsigned long long>(sandbox_session_.steps()));
                 bridge_tokens_=sandbox_text_->encode(text);bridge_at_=0;called=true;
                 // Given the answer the model still went on for thousands of tokens to prove it.
-                if(sandbox_close_ && sandbox_session_.printed())bridge_tokens_.insert(bridge_tokens_.end(),{kThinkClose,271});
+                if(sandbox_close_ && sandbox_session_.printed()) {
+                    if(sandbox_close_line_) {
+                        const auto line=sandbox_text_->encode(strata::igc::sandbox::kCloseLine);
+                        bridge_tokens_.insert(bridge_tokens_.end(),line.begin(),line.end());
+                    }
+                    bridge_tokens_.insert(bridge_tokens_.end(),{kThinkClose,271});
+                }
                 return true;
             }
             if(sandbox_fence_.inside()) {   // code, not arithmetic
@@ -456,10 +464,10 @@ public:
                 key=key*1000003+(step.number?number_key(step.value.coefficient)*16+step.value.scale:static_cast<int64_t>(step.operation));
             const auto seen=std::count(inline_seen_.begin(),inline_seen_.end(),key);
             inline_seen_.push_back(key);
-            // No closing `.` by default: at least 16 % of the values continue, `2100 per week`, and the model writes its own stop.
+            // No closing `.` outside a sum: at least 16 % of the values continue, `2100 per week`, and the model writes its own stop.
             const auto& top=call->program.back();
             const bool sum=!top.number && (top.operation==strata::igc::InlineOperation::Add || top.operation==strata::igc::InlineOperation::Subtract);
-            const auto after=strata::igc::inline_tokens::after_value(static_cast<int>(seen),inline_notes_,close_repeat_,static_cast<int32_t>(kThinkClose),sum?sum_note_:strata::igc::inline_tokens::SumNote::Open);
+            const auto after=strata::igc::inline_tokens::after_value(static_cast<int>(seen),inline_notes_,close_repeat_,static_cast<int32_t>(kThinkClose),sum?sum_note_:strata::igc::inline_tokens::SumNote::Open,repeat_note_);
             bridge_tokens_.insert(bridge_tokens_.end(),after.begin(),after.end());
         }
         ++inline_calls_;called=true;return true;

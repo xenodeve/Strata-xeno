@@ -54,7 +54,7 @@ def score(records):
     return suites
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -75,10 +75,12 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     if no_note:args+=['--igc-no-note']
     if close_repeat is not None:args+=['--igc-close-repeat',str(close_repeat)]
     if sum_note is not None:args+=['--igc-sum-note',str(sum_note)]
+    if repeat_note is not None:args+=['--igc-repeat-note',str(repeat_note)]
     if no_reply:args.append('--igc-no-reply')
     if sandbox:args.append('--igc-sandbox')
     if sandbox_after is not None:args+=['--igc-sandbox-after',str(sandbox_after)]
     if sandbox_close:args.append('--igc-sandbox-close')
+    if sandbox_close_line:args.append('--igc-sandbox-close-line')
     if no_adapt:args[args.index('--adapt-swaps')+1]='0';args[args.index('--adapt-secondary')+1]='0'
     if no_spec:
         args[args.index('--spec')+1]='2'
@@ -136,10 +138,12 @@ if __name__=='__main__':
     parser.add_argument('--whole-context',action='store_true');parser.add_argument('--hint',help='added to the system message');parser.add_argument('--no-note',action='store_true');parser.add_argument('--effort-medium',action='store_true');parser.add_argument('--bundle',type=Path);parser.add_argument('--timeline',type=Path);parser.add_argument('--sidecar',type=Path);parser.add_argument('--gsm-file',default='gsm8k-test.jsonl');parser.add_argument('--math-file',default='math500.jsonl');parser.add_argument('--arithmetic',type=int,default=40);parser.add_argument('--gsm',type=int,default=40);parser.add_argument('--bigbench',type=int,default=0);parser.add_argument('--bridge',action='store_true');parser.add_argument('--inline',action='store_true');parser.add_argument('--math',type=int,default=0);parser.add_argument('--no-adapt',action='store_true')
     parser.add_argument('--close-repeat',type=int,help='close thinking at this repeat, 0 never')
     parser.add_argument('--sum-note',type=int,help='note on a top-level sum: 0 open, 1 stop, 2 none')
+    parser.add_argument('--repeat-note',type=int,help='note on a repeat: 0 stop checking, 1 no instruction, 2 next step')
     parser.add_argument('--no-spec',action='store_true',help='spec 2 and no MTP drafts, for a repeatable run')
     parser.add_argument('--no-reply',action='store_true',help='no inline value after the thinking closes')
     parser.add_argument('--sandbox',action='store_true',help='run a python block in the reasoning')
     parser.add_argument('--think-hint',help='written after the opening of the thinking')
     parser.add_argument('--sandbox-after',type=int,help='open a block after this many tokens of reasoning')
     parser.add_argument('--sandbox-close',action='store_true',help='close the thinking once a program has printed')
+    parser.add_argument('--sandbox-close-line',action='store_true',help='the model\'s own line before the close')
     run(**vars(parser.parse_args()))

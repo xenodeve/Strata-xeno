@@ -113,13 +113,18 @@ inline bool in_cycle(std::span<const int32_t> tokens, int longest, int rounds) {
 // The note on a value whose expression is a sum at its top level. Left open, the model takes the value for the
 // first term and writes the last one again, `a + b = V (exact) + b`: 28 times in 297 runs, none in 1290 runs with a `.`.
 enum class SumNote : int { Open = 0, Stop = 1, None = 2 };
+// The note on a repeat. `stop checking` can end the thinking with work left: 2 of 6 runs of one sum stopped after its
+// first term and answered -95 for 5, and 5 of the 10 runs in 294 that ended on the note had a step to go (#281).
+enum class RepeatNote : int { Stop = 0, Bare = 1, Next = 2 };
 // What follows a value delivered inside reasoning, when this expression was written `seen` times before.
 // The `close_at`th time closes the thinking, 0 never. The close carries its own `.`, `notes` only the two marks.
-inline std::vector<int32_t> after_value(int seen, bool notes, int close_at, int32_t think_close, SumNote sum = SumNote::Open) {
+inline std::vector<int32_t> after_value(int seen, bool notes, int close_at, int32_t think_close, SumNote sum = SumNote::Open, RepeatNote repeat = RepeatNote::Stop) {
     if (close_at > 0 && seen + 1 >= close_at) return {13, 198, think_close, 271};
     if (!notes || sum == SumNote::None) return {};
     const int32_t end = sum == SumNote::Stop ? 553 : 8;   // `).` or `)`
     if (!seen) return {318, 44839, end};                  // ` (exact)`
+    if (repeat == RepeatNote::Bare) return {318, 43967, 10457, end};            // ` (already confirmed)`
+    if (repeat == RepeatNote::Next) return {318, 43967, 10457, 11, 1727, 2923, end};   // ` (already confirmed, next step)`
     return {318, 43967, 10457, 11, 2842, 12910, end};     // ` (already confirmed, stop checking)`
 }
 // `(` written against a word is a function call or a product we cannot read.

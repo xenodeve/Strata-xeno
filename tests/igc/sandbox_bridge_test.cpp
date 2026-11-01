@@ -95,6 +95,9 @@ int main(int argc, char** argv) {
         require(s.run("print('สวัสดี')\n") == "\n```output\nสวัสดี\n```\n\n", "text outside ASCII");
         const auto refused = s.run("import os\n");
         require(refused.find("os") != std::string::npos && refused.find("```output\n") == 1, "an unsupported import reports");
+        require(refused.find(kOnlyModules) != std::string::npos, "and says what is here");
+        require(!s.printed(), "a refused import does not count as a result");
+        require(s.run("x = 1 / 0\n").find(kOnlyModules) == std::string::npos, "other errors stay as they are");
         require(s.run("print(1)\n") == "\n```output\n1\n```\n\n", "and the session goes on");
     }
     TokenText small;

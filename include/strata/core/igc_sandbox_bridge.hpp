@@ -24,6 +24,10 @@ inline constexpr int kMaxRuns = 32;
 inline constexpr int kMaxBlockTokens = 1024;   // the model can drop its program and reason on inside the open block: one ran to 36607 characters
 // Told plainly: on a bare `[nothing printed]` the model decided it cannot execute anything, and looped on that.
 inline constexpr std::string_view kNothingPrinted = "[it ran and printed nothing: call your function and print the result]";
+// 8 of 32 imports were sympy: told only that it is missing, the model went on by hand for 1820 to 9189 tokens (#279).
+// The model's own words before it answers: 4 of 66 replies after a close were the program again, with no sentence (#279).
+inline constexpr std::string_view kCloseLine = "Need final with enough detail.\n";
+inline constexpr std::string_view kOnlyModules = "[only math, fractions, itertools, functools and collections are here: rewrite with those]";
 
 // The GPT-2 byte table: printable bytes stand for themselves, the others sit from code point 256 up, in order.
 inline bool byte_is_itself(uint32_t b) { return (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255); }
@@ -240,6 +244,10 @@ public:
         } else {
             if (!body.empty()) body += '\n';
             body += result.error;
+            if (result.error.starts_with("ModuleNotFoundError")) {
+                body += '\n';
+                body += kOnlyModules;
+            }
         }
         while (!body.empty() && body.back() == '\n') body.pop_back();
         return output_block(body);
