@@ -86,6 +86,8 @@ int main(int argc, char** argv) {
         require(s.run("print(f(1))\n") == "\n```output\n2\n```\n\n" && s.printed() && !s.quiet(), "its call prints");
         require(s.run("print()\n") == output_block(kNothingPrinted) && !s.printed() && s.quiet(), "an empty line says nothing");
         require(s.run("print(None)\n") == "\n```output\nNone\n```\n\n" && !s.printed() && !s.quiet(), "None is shown, but it is no result");
+        require(s.run("print(None)\nprint(None)\n").find("None") != std::string::npos && !s.printed(), "nor are two of them");
+        require(s.run("print(None)\nprint(1)\n").find("1") != std::string::npos && s.printed(), "a value after one is");
         require(s.run("print(g(1))\n").find("NameError") != std::string::npos && !s.quiet() && !s.printed(), "an error is neither");
     }
     {

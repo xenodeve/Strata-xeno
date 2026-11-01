@@ -63,7 +63,9 @@ def last_boxed(solution):
 
 
 def reply(text):
-    return text.rsplit('</think>', 1)[-1].replace('<|im_end|>', '')
+    """Nothing when the thinking never closed: a guess in a cut-off reasoning is not an answer, as in final_number."""
+    parts = text.rsplit('</think>', 1)
+    return parts[1].replace('<|im_end|>', '') if len(parts) == 2 else ''
 
 
 def math_answer(text):

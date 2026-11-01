@@ -35,6 +35,8 @@ FENCE = chr(96) * 3
 
 
 def code_of(text):
+    if '</think>' not in text:
+        return None
     reply = text.rsplit('</think>', 1)[-1]
     found = re.findall(FENCE + r'(?:python|py)?\n(.*?)' + FENCE, reply, re.S)
     return found[-1] if found else None

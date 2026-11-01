@@ -244,6 +244,12 @@ inline bool binds_a_name(std::string_view program) {
     return program.find("def ") != std::string_view::npos || program.find('=') != std::string_view::npos;
 }
 
+// `None` is an unfinished draft called anyway, not a result: the close took 2 of the 4 rows it lost on one (#279).
+inline bool says_something(std::string_view body) {
+    while (body.starts_with("None\n")) body.remove_prefix(5);
+    return !body.empty();
+}
+
 // A run replays the blocks before it, so the interpreter counts from the first of them, and a 2-line block reported
 // `SyntaxError (line 23)` (#279). The model sees one block: the number is rebased, and the line itself says what failed.
 inline std::string name_the_line(std::string_view error, std::string_view source, int replayed) {
@@ -305,8 +311,7 @@ public:
             cut = true;
         }
         if (cut) body += "\n[output cut]";
-        // `None` is an unfinished draft called anyway, not a result: the close took 2 of the 4 rows it lost on one (#279).
-        printed_last_ = result.status == Status::Ok && !body.empty() && body != "None\n";
+        printed_last_ = result.status == Status::Ok && says_something(body);
         quiet_last_ = result.status == Status::Ok && body.empty();
         if (result.status == Status::Ok) {
             done_ = std::move(source);

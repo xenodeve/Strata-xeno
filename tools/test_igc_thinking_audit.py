@@ -13,6 +13,11 @@ class Repeating(unittest.TestCase):
     def test_a_few_rounds_can_still_leave(self):
         self.assertFalse(repeating(list(range(100)) + [7, 8, 9] * 10))
 
+    def test_a_cycle_past_512_tokens_takes_eight_rounds(self):
+        cycle = [i * i % 9973 for i in range(517)]
+        self.assertTrue(repeating(list(range(100)) + cycle * 8))
+        self.assertFalse(repeating(list(range(100)) + cycle * 7))
+
     def test_varied_text_runs_on(self):
         self.assertFalse(repeating([i * i % 9973 for i in range(5000)]))
 

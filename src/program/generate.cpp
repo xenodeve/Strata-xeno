@@ -962,7 +962,7 @@ void usage() {
                  "  --igc-sandbox-after N  open a ```python block after N tokens of reasoning, 0 never (default 0, with --igc-sandbox)\n"
                  "  --igc-sandbox-close  close the thinking once a program has printed (with --igc-sandbox)\n"
                  "  --igc-sandbox-close-line  write the model's own line before that close (with --igc-sandbox-close)\n"
-                 "  --igc-sandbox-read N  let the model read a printed result for N tokens before that close, 0 close at once (default 0)\n"
+                 "  --igc-sandbox-read N  let the model read a printed result for N tokens before that close, 0 close at once (default 0, with --igc-sandbox-close; replaces its line)\n"
                  "  --igc-sandbox-call  after a block that printed nothing, open a print( for the model, once a reasoning (with --igc-sandbox)\n"
                  "  --igc-close-repeat N close the thinking when one expression is written N times, 0 never (default 3, with --igc-inline-exec)\n"
                  "  --igc-sum-note N     the note on a value of a top-level sum: 0 open, 1 closed with a stop, 2 none (default 1, with --igc-inline-exec)\n"

@@ -367,8 +367,8 @@ struct BoundObj : Obj {
     BoundObj(Value s, const NativeDef* m) : Obj(Tag::Bound), self(std::move(s)), method(m) {}
     void clear() override { self.reset(); }
 };
-// A class holds methods and nothing else: `class X:` with `def`s, all the model was seen to write (29 of 241 blocks, every one
-// `class Solution`, no bases, no dunders but none at all). The parser refuses the rest, so no protocol method is ever silently ignored.
+// A class holds methods and nothing else: `class X:` with `def`s and `__init__`, which covers what the model was seen to write (29 of
+// 241 blocks had a class, each a `class Solution` of plain methods). The parser refuses the rest, so no protocol method is ever silently ignored.
 using Attrs = std::vector<std::pair<std::string_view, Value>, Alloc<std::pair<std::string_view, Value>>>;
 inline const Value* find_attr(const Attrs& attrs, std::string_view name) {
     for (std::size_t i = attrs.size(); i-- > 0;)
@@ -8969,10 +8969,12 @@ inline bool is_instance(const Value& v, const Value& t) {
 }
 inline Value b_isinstance(Call& c) { return Value::boolean(is_instance(c.a[0], c.a[1])); }
 inline Value b_issubclass(Call& c) {
-    if (c.a[0].tag != Tag::Type) raise(T_TypeError, "issubclass() arg 1 must be a class");
+    const bool own = c.a[0].tag == Tag::Class;
+    if (c.a[0].tag != Tag::Type && !own) raise(T_TypeError, "issubclass() arg 1 must be a class");
     const auto test = [&](const Value& t) {
+        if (t.tag == Tag::Class) return own && t.o == c.a[0].o;
         if (t.tag != Tag::Type) raise(T_TypeError, "issubclass() arg 2 must be a class, a tuple of classes, or a union");
-        return subtype((int) c.a[0].i, (int) t.i);
+        return own ? t.i == T_object : subtype((int) c.a[0].i, (int) t.i);
     };
     if (c.a[1].tag == Tag::Tuple) {
         for (const auto& item : seq_of(c.a[1]))
@@ -10145,7 +10147,7 @@ inline Value f_lru_cache(Call& c) {
     Value* size = c.keyword("maxsize");
     const Value first = size ? *size : c.n ? c.a[0] : Value::integer(128);
     if (!first.is_none() && !is_int(first)) {
-        if (first.tag == Tag::Function || first.tag == Tag::Native || first.tag == Tag::Type || first.tag == Tag::Bound) return cached_of(first, 128);
+        if (first.tag == Tag::Function || first.tag == Tag::Native || first.tag == Tag::Type || first.tag == Tag::Bound || first.tag == Tag::Method || first.tag == Tag::Class) return cached_of(first, 128);
         raise(T_TypeError, "Expected first argument to be an integer, a callable, or None");
     }
     return Value(new BoundObj(first, &kWrapWith));
