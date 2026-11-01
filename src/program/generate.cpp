@@ -453,7 +453,7 @@ struct Options {
     std::string dump_mixed;
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
     std::string igc_output_artifact,igc_output_fixture,igc_learned_bundle;
-    bool igc_result_bridge=false,igc_inline_exec=false,igc_no_note=false,igc_no_reply=false,igc_sandbox=false;
+    bool igc_result_bridge=false,igc_inline_exec=false,igc_no_note=false,igc_no_reply=false,igc_sandbox=false,igc_sandbox_close=false;
     int igc_close_repeat=3,igc_sum_note=0,igc_sandbox_after=0;
     std::string igc_sidecar;
     std::string igc_observation_plan,igc_observation_root;
@@ -960,6 +960,7 @@ void usage() {
                  "  --igc-no-reply       deliver no inline value after the thinking closes (with --igc-inline-exec)\n"
                  "  --igc-sandbox        run a ```python block in the reasoning and deliver its output (with --igc-inline-exec)\n"
                  "  --igc-sandbox-after N  open a ```python block after N tokens of reasoning, 0 never (default 0, with --igc-sandbox)\n"
+                 "  --igc-sandbox-close  close the thinking once a program has printed (with --igc-sandbox)\n"
                  "  --igc-close-repeat N close the thinking when one expression is written N times, 0 never (default 3, with --igc-inline-exec)\n"
                  "  --igc-sum-note N     the note on a value of a top-level sum: 0 open, 1 closed with a stop, 2 none (default 0, with --igc-inline-exec)\n"
                  "  --igc-sidecar <file> also check numbers written in plain words against this sidecar (with --igc-inline-exec)\n"
@@ -2564,6 +2565,7 @@ int main(int argc, char** argv) {
         else if (a == "--igc-no-note") o.igc_no_note = true;
         else if (a == "--igc-no-reply") o.igc_no_reply = true;
         else if (a == "--igc-sandbox") o.igc_sandbox = true;
+        else if (a == "--igc-sandbox-close") o.igc_sandbox_close = true;
         else if (a == "--igc-sandbox-after") o.igc_sandbox_after = std::atoi(next("--igc-sandbox-after"));
         else if (a == "--igc-close-repeat") o.igc_close_repeat = std::atoi(next("--igc-close-repeat"));
         else if (a == "--igc-sum-note") o.igc_sum_note = std::atoi(next("--igc-sum-note"));
@@ -3568,6 +3570,7 @@ int main(int argc, char** argv) {
         if (o.igc_sandbox) {
             std::string sandbox_error;
             igc_learned->set_sandbox_after(o.igc_sandbox_after);
+            igc_learned->set_sandbox_close(o.igc_sandbox_close);
             if (!o.igc_inline_exec || !o.igc_result_bridge || !igc_learned->set_sandbox(std::filesystem::path(o.pack)/"tokenizer"/"vocab.json", sandbox_error)) {
                 std::fprintf(stderr, "strata generate: --igc-sandbox: %s\n", sandbox_error.empty() ? "needs --igc-inline-exec and --igc-result-bridge" : sandbox_error.c_str());
                 return 1;

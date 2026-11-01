@@ -56,6 +56,13 @@ int main(int argc, char** argv) {
     {
         Fence f;
         f.enter();
+        f.leave();
+        require(!f.inside(), "a stopped block is left behind");
+        require(!feed(f, {"\n", "```", "\n"}), "and its fence is not read as a close");
+    }
+    {
+        Fence f;
+        f.enter();
         require(f.inside(), "a forced fence counts as read");
         auto p = feed(f, {"print", "(", "3", ")", "\n", "```"});
         require(p && *p == "\nprint(3)\n", "and the block closes as any other");
@@ -64,7 +71,9 @@ int main(int argc, char** argv) {
         Session s;
         require(s.run("x = 2\nprint(x)\n") == "\n```output\n2\n```\n\n", "first block");
         require(s.run("print(x + 1)\n") == "\n```output\n3\n```\n\n", "names carry over and old prints go");
+        require(s.printed(), "it printed");
         require(s.run("y = 5\n") == output_block(kNothingPrinted), "nothing printed");
+        require(!s.printed(), "and says so");
         const auto failed = s.run("print(7)\nprint(z)\n");
         require(failed.find("7\n") != std::string::npos && failed.find("NameError") != std::string::npos, "a print, then the error");
         require(s.run("print(y)\n") == "\n```output\n5\n```\n\n", "a failed block leaves no trace");

@@ -44,8 +44,8 @@ class IgcLearnedDiagnostic {
     std::unique_ptr<strata::igc::sandbox::TokenText> sandbox_text_;
     strata::igc::sandbox::Fence sandbox_fence_;
     strata::igc::sandbox::Session sandbox_session_;
-    int sandbox_after_=0,sandbox_thought_=0,bridged_unread_=0;
-    bool sandbox_opened_=false;
+    int sandbox_after_=0,sandbox_thought_=0,sandbox_block_=0,bridged_unread_=0;
+    bool sandbox_opened_=false,sandbox_close_=false;
     bool inline_notes_=true,inline_reply_=true;int close_repeat_=3;strata::igc::inline_tokens::SumNote sum_note_=strata::igc::inline_tokens::SumNote::Open;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
@@ -197,7 +197,7 @@ public:
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
         staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_tail_.clear();thinking_closed_=false;
-        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_opened_=false;bridged_unread_=0;
+        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;bridged_unread_=0;
         if(natural_)natural_->begin(prefix_);
         return true;
     }
@@ -297,6 +297,7 @@ public:
     void set_inline_notes(bool on){inline_notes_=on;}
     void set_inline_reply(bool on){inline_reply_=on;}
     void set_sandbox_after(int tokens){sandbox_after_=tokens;}
+    void set_sandbox_close(bool on){sandbox_close_=on;}
     bool set_sandbox(const std::filesystem::path& vocab,std::string& error) {
         sandbox_text_=std::make_unique<strata::igc::sandbox::TokenText>();
         return sandbox_text_->load(vocab,error);
@@ -359,9 +360,18 @@ public:
                 strata::timeline::Span span("igc.sandbox");
                 const auto text=sandbox_session_.spent()?strata::igc::sandbox::output_block("[no more runs]"):sandbox_session_.run(*program);
                 std::fprintf(stderr,"strata igc sandbox: run %d of %d bytes, %d bytes back, %llu steps so far\n",sandbox_session_.runs(),static_cast<int>(program->size()),static_cast<int>(text.size()),static_cast<unsigned long long>(sandbox_session_.steps()));
-                bridge_tokens_=sandbox_text_->encode(text);bridge_at_=0;called=true;return true;
+                bridge_tokens_=sandbox_text_->encode(text);bridge_at_=0;called=true;
+                // Given the answer the model still went on for thousands of tokens to prove it.
+                if(sandbox_close_ && sandbox_session_.printed())bridge_tokens_.insert(bridge_tokens_.end(),{kThinkClose,271});
+                return true;
             }
-            if(sandbox_fence_.inside())return true;   // code, not arithmetic
+            if(sandbox_fence_.inside()) {   // code, not arithmetic
+                if(++sandbox_block_<strata::igc::sandbox::kMaxBlockTokens || (token!=198 && token!=271))return true;
+                std::fprintf(stderr,"strata igc sandbox: stopped a block at %d tokens\n",sandbox_block_);
+                sandbox_fence_.leave();sandbox_block_=0;
+                bridge_tokens_=sandbox_text_->encode("```"+strata::igc::sandbox::output_block("[too long, not run]"));bridge_at_=0;called=true;return true;
+            }
+            sandbox_block_=0;
             // Long reasoning is where a program pays: open a block at the next line end, once. Opening one every N tokens
             // cut off a derivation that was going well, and made an exact loop.
             if(sandbox_after_>0 && !sandbox_opened_ && ++sandbox_thought_>=sandbox_after_ && (token==198 || token==271)) {

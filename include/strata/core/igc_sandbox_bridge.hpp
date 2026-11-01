@@ -21,6 +21,7 @@ namespace strata::igc::sandbox {
 
 inline constexpr std::size_t kShownOutput = 1024;   // one forced token per byte: a long output costs seconds of decode
 inline constexpr int kMaxRuns = 32;
+inline constexpr int kMaxBlockTokens = 1024;   // the model can drop its program and reason on inside the open block: one ran to 36607 characters
 // Told plainly: on a bare `[nothing printed]` the model decided it cannot execute anything, and looped on that.
 inline constexpr std::string_view kNothingPrinted = "[it ran and printed nothing: call your function and print the result]";
 
@@ -184,6 +185,10 @@ public:
         return program;
     }
     bool inside() const { return inside_; }
+    void leave() {
+        text_.clear();
+        inside_ = false;
+    }
     // The opening fence was forced, so this class never read it.
     void enter() {
         text_ = "\n";
@@ -208,6 +213,7 @@ public:
     // How many times this program was run before, counted so a repeat can end the thinking.
     int seen(std::string_view program) const { return (int) std::count(programs_.begin(), programs_.end(), program); }
     int runs() const { return runs_; }
+    bool printed() const { return printed_last_; }   // the last run finished and said something
     uint64_t steps() const { return steps_; }
     // What the reasoning reads next, right after the closing fence.
     std::string run(std::string_view program, const std::atomic<bool>* cancel = nullptr) {
@@ -226,6 +232,7 @@ public:
             cut = true;
         }
         if (cut) body += "\n[output cut]";
+        printed_last_ = result.status == Status::Ok && !body.empty();
         if (result.status == Status::Ok) {
             done_ = std::move(source);
             printed_ = result.output.size();
@@ -243,6 +250,7 @@ private:
     std::string done_;
     std::vector<std::string> programs_;
     std::size_t printed_ = 0;
+    bool printed_last_ = false;
     int runs_ = 0;
     uint64_t steps_ = 0;
 };
