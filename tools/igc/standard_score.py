@@ -81,3 +81,9 @@ def bbh_answer(text):
 def bbh_right(text, gold):
     answer = bbh_answer(text)
     return answer is not None and answer.lower().rstrip('.') == gold.strip().lower().rstrip('.')
+
+
+def letter_answer(text):
+    """MMLU-Pro: `the answer is (X)`, then `Answer: X`. SuperGPQA ends in `Answer: X.`; the last such line counts, as both evaluators read it."""
+    found = re.findall(r'answer is \(?\$?([A-P])\b', reply(text)) or re.findall(r'[Aa]nswer:\s*\(?\$?([A-P])\b', reply(text))
+    return found[-1] if found else None
