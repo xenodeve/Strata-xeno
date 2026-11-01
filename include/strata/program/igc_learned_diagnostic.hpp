@@ -206,6 +206,7 @@ public:
                 invocation_,anchor_,available,stream_,true,error))return false;
         staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_tail_.clear();thinking_closed_=strata::igc::inline_tokens::thinking_off(prefix_,kThinkClose);
         sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;bridged_unread_=0;
+        bridge_tokens_.clear();bridge_at_=0;   // an admission never reaches delivering(), and a stopped request can leave a delivery half done
         if(natural_)natural_->begin(prefix_);
         return true;
     }
@@ -268,7 +269,7 @@ public:
     // One token a round while a result is delivered: a longer window would run the
     // heads past `</think>` before the host can end injection. Reads back once a request.
     bool delivering(std::string& error) {
-        if(!pipeline_ || observation_ || !staged_)return false;
+        if(!pipeline_ || observation_ || !staged_ || !request_on_)return false;
         if(!invocation_known_) {
             strata::igc::Invocation record;uint32_t status=0;
             if(!pipeline_->audit(record,status,stream_,error))return false;
