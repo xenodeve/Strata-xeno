@@ -3570,6 +3570,10 @@ int main(int argc, char** argv) {
     if(!o.igc_learned_bundle.empty()) {
         igc_learned=std::make_unique<strata::program::IgcLearnedDiagnostic>();
         igc_learned->set_bridge(o.igc_result_bridge);
+        if(o.batch>0) {
+            if(!o.igc_sidecar.empty()){std::fprintf(stderr,"--igc-sidecar is not for --batch slots\n");return 2;}
+            igc_learned->set_slots(o.batch);
+        }
         igc_learned->set_inline_exec(o.igc_inline_exec);
         igc_learned->set_inline_notes(!o.igc_no_note);
         igc_learned->set_inline_reply(!o.igc_no_reply);
@@ -11561,6 +11565,15 @@ int main(int argc, char** argv) {
             for (int a = 0; a < A; ++a) {
                 const int b = active[a], i = first[a];
                 const BSlot& sl = bs[(size_t) b];
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                // A delivery replaces what the window sampled; a proposal after it, or after the token that starts it, goes.
+                bool igc_forced = false;
+                if (igc_learned && o.igc_inline_exec && !igc_learned->slot_token(b, outb[i], igc_forced, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return false;
+                }
+                if (igc_forced && batch_mtp) tok[i + 1] = -1;
+#endif
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
                 keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
@@ -11582,7 +11595,14 @@ int main(int argc, char** argv) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
                 for (int j = 0; j < keep[b]; ++j) {
-                    const int32_t y = outb[first[t] + j];
+                    int32_t y = outb[first[t] + j];
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                    bool igc_forced = false;   // the first token went through it above
+                    if (j > 0 && igc_learned && o.igc_inline_exec && !igc_learned->slot_token(b, y, igc_forced, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return false;
+                    }
+#endif
                     sl.ids.push_back(tok[first[t] + j]);
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
@@ -11682,6 +11702,12 @@ int main(int argc, char** argv) {
         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
         const int n_pipe = (int) stages.size() + 1;
         const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+        if (piped && igc_learned && o.igc_inline_exec) {   // the pipelined path never reaches batch_step
+            std::fprintf(stderr, "--igc-inline-exec needs --batch-groups 1\n");
+            return 2;
+        }
+#endif
         if (piped && batch_mtp)   // #1413: said, not silent
             std::fprintf(stderr,
                          "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
@@ -12134,6 +12160,7 @@ int main(int argc, char** argv) {
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
+            bool req_igc = true;   // igc=0: this request runs with no MIP
             // pin=N: the first N prompt tokens are a shared read-only prefix (a long document that many short queries
             // follow).  The prompt is read in two parts at N, the checkpoint there is PINNED (retention never evicts it,
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
@@ -12166,6 +12193,9 @@ int main(int argc, char** argv) {
                     else if (key == "ckpt_at") req_ckpt_at = std::atoll(tok.c_str() + eq + 1);
                     else if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                    else if (key == "igc") req_igc = std::atoi(tok.c_str() + eq + 1) != 0;
+#endif
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -12693,6 +12723,7 @@ int main(int argc, char** argv) {
             if(igc_learned && igc_learned->observing() && max_new!=1) {
                 std::printf("ERR coherent observation requires exactly one generated token per owned request\n");return serve_fatal();
             }
+            if(igc_learned)igc_learned->set_request(req_igc);
             if(igc_learned && !igc_learned->begin(cur,read_from,igc_same_live && from_live && reread_to<=0,
                     req_imgs.empty(),err)) {
                 std::printf("ERR %s\n",err.c_str());return serve_fatal();
@@ -14632,6 +14663,9 @@ int main(int argc, char** argv) {
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                    if (igc_learned) igc_learned->slot_adopt(admit_slot);
+#endif
                     if (batch_mtp) {
                         if (!slot_mtp[(size_t) admit_slot]->draft_first(1, ver.final_R_all(), sl.x,
                                                                         sl.p - 1, sl.draft.data(), err)) {

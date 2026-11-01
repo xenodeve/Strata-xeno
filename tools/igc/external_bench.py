@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import subprocess
@@ -55,7 +56,53 @@ def score(records):
     return suites
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20):
+def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_context,stuck_rounds,output,cancel):
+    """The questions through batch slots, each as `BGEN`; with `pair` each also runs with `igc=0`, written to records-off.json."""
+    jobs=[(row,True) for row in rows]+[(row,False) for row in rows if pair]
+    if pair:jobs=[job for two in zip(jobs[:len(rows)],jobs[len(rows):]) for job in two]
+    jobs.reverse();free=list(range(slots));live={};admitting=None;done=[]
+    def finish(b,why):
+        state=live.pop(b);free.append(b)
+        text=tokenizer.decode_bytes(state['tokens']).decode('utf-8',errors='replace')
+        if no_think:text='</think>\n\n'+text
+        final=final_number(text);row=state['row']
+        done.append(dict(id=row['id'],suite=row['suite'],answer=row['answer'],final=final,correct=final==row['answer'],tokens=len(state['tokens']),
+                         seconds=time.monotonic()-state['start'],finish=why,prompt_tokens=state['ids'],text=text,mip=state['on']))
+        (output/'records.json').write_text(json.dumps([r for r in done if r['mip']],ensure_ascii=False),encoding='utf-8')
+        if pair:(output/'records-off.json').write_text(json.dumps([r for r in done if not r['mip']],ensure_ascii=False),encoding='utf-8')
+        print(row['id'],row['answer'],final,len(state['tokens']),'mip' if state['on'] else 'off',round(done[-1]['seconds'],1),flush=True)
+    def take(state,token):
+        state['tokens'].append(token)
+        if len(state['tokens'])%64==0 and repeating(state['tokens'],rounds=stuck_rounds) and not state['stuck']:
+            state['stuck']=True;engine.proc.stdin.write(f"BSTOP {state['slot']}\n");engine.proc.stdin.flush()
+    while jobs or live:
+        if cancel.is_set():raise RuntimeError('bench stopped')
+        if jobs and free and admitting is None:
+            row,on=jobs.pop();b=free.pop()
+            ids=tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8'))
+            limit=262144-len(ids)-64 if whole_context else row['limit']
+            head=f"BGEN {b} {limit}{engine.sampling_keys({'temperature':0})}"+('' if on else ' igc=0')
+            live[b]=dict(row=row,on=on,slot=b,tokens=[],stuck=False,start=time.monotonic(),ids=len(ids));admitting=b
+            engine.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n");engine.proc.stdin.flush()
+        try:line=engine.lines.get(timeout=1)
+        except queue.Empty:continue
+        if line is None:raise RuntimeError('the engine ended')
+        if line.startswith('T ') and admitting is not None:take(live[admitting],int(line.split()[1]))
+        elif line.startswith('BT '):
+            _,b,t=line.split()
+            if int(b) in live:take(live[int(b)],int(t))
+        elif line.startswith('BDONE '):
+            part=line.split();b=int(part[1])
+            finish(b,'stuck' if live[b]['stuck'] else part[3])
+        elif line.startswith('BADM '):
+            part=line.split()
+            if part[2]=='0':finish(admitting,'stop')
+            admitting=None
+        elif line.startswith('ERR'):raise RuntimeError(line)
+    return [r for r in done if r['mip']]
+
+
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -85,6 +132,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     if sandbox_close:args.append('--igc-sandbox-close')
     if sandbox_close_line:args.append('--igc-sandbox-close-line')
     if sandbox_call:args.append('--igc-sandbox-call')
+    if slots:args+=['--batch',str(slots)]
     if no_adapt:args[args.index('--adapt-swaps')+1]='0';args[args.index('--adapt-secondary')+1]='0'
     if no_spec:
         args[args.index('--spec')+1]='2'
@@ -106,7 +154,8 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
         engine=helper.StrataEngine(str(executable),helper.engine_args(cfg)+(helper.effort_end_args(cfg,str(executable),tokenizer) or []),
                                    cwd=cfg.get('cwd'),log=cfg['log'],env=env)
         engine.silence_s=helper.engine_silence_s(cfg)
-        for row in rows:
+        if slots:records=run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_context,stuck_rounds,output,cancel)
+        for row in rows if not slots else ():
             if cancel.is_set():raise RuntimeError('bench stopped before request')
             ids=tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8'))
             active[0]=start=time.monotonic()
@@ -126,7 +175,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     finally:
         if engine is not None:engine.close()
         stop.set();thread.join(timeout=3);subprocess.Popen=original
-    if bundle:
+    if bundle and not slots:
         lines=(output/'engine.log').read_text(encoding='utf-8',errors='replace')
         audits=[parse_audit(bytes.fromhex(h)) for h in re.findall(r'strata IGC learned audit: head_status=\d+ record=([0-9a-f]{576})',lines)]
         if len(audits)!=len(records):raise ValueError('incomplete audit pairing')
@@ -153,6 +202,8 @@ if __name__=='__main__':
     parser.add_argument('--sandbox-close',action='store_true',help='close the thinking once a program has printed')
     parser.add_argument('--sandbox-close-line',action='store_true',help='the model\'s own line before the close')
     parser.add_argument('--sandbox-call',action='store_true',help='open a print( after a block that printed nothing')
+    parser.add_argument('--slots',type=int,default=0,help='decode in this many batch slots, questions at once')
+    parser.add_argument('--pair',action='store_true',help='with --slots: run each question with MIP and with igc=0, in one engine')
     parser.add_argument('--stuck-rounds',type=int,default=20,help='rounds of a cycle before the bench gives up; 40 leaves a loop of up to 3 tokens to the engine, which closes at 64')
     parser.add_argument('--no-think',action='store_true',help='close the thinking in the prompt')
     parser.add_argument('--shots',type=int,default=0,help='few-shot exemplars before each GSM8K question')

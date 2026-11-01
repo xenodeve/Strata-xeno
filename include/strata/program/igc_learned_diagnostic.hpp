@@ -18,9 +18,22 @@
 #include <vector>
 
 namespace strata::program {
+// What one request's reasoning has reached. A solo request uses the diagnostic's own copy, a batch slot keeps one (#284).
+struct InlineTurn {
+    std::vector<int32_t> bridge_tokens_;std::size_t bridge_at_=0;
+    std::vector<int32_t> generated_;
+    bool thinking_closed_=false;   // generated_ is trimmed, so it cannot answer this
+    std::vector<int64_t> inline_seen_;
+    std::vector<int32_t> thinking_tail_;
+    strata::igc::sandbox::Fence sandbox_fence_;
+    strata::igc::sandbox::Session sandbox_session_;
+    int sandbox_thought_=0,sandbox_block_=0,bridged_unread_=0;
+    bool sandbox_opened_=false,sandbox_called_=false;
+    bool request_on_=true;   // GEN key igc=0: this request runs with no MIP
+};
 // First-anchor learned diagnostic, distinct from the oracle-input comparator.
 // Runtime receipts bind the actual loaded model/tokenizer before allocation.
-class IgcLearnedDiagnostic {
+class IgcLearnedDiagnostic : InlineTurn {
     static constexpr int32_t kEndOfTurn=248046;
     static constexpr int64_t kThinkClose=248069; // packs/gyro-m/tokenizer/vocab.json `</think>`
     strata::igc::ControllerBundle bundle_;
@@ -36,16 +49,11 @@ class IgcLearnedDiagnostic {
     cudaStream_t stream_=nullptr;
     uint64_t invocation_=0,anchor_=0;
     bool loaded_=false,active_=false,staged_=false,invocation_known_=false,invoked_=false,bridge_=false;
-    std::vector<int32_t> bridge_tokens_;std::size_t bridge_at_=0;
-    std::vector<int32_t> generated_;
-    bool thinking_closed_=false;   // generated_ is trimmed, so it cannot answer this
-    std::vector<int64_t> inline_seen_;
-    std::vector<int32_t> thinking_tail_;
+    std::vector<InlineTurn> slots_;
+    bool in_slot_=false;
     std::unique_ptr<strata::igc::sandbox::TokenText> sandbox_text_;
-    strata::igc::sandbox::Fence sandbox_fence_;
-    strata::igc::sandbox::Session sandbox_session_;
-    int sandbox_after_=0,sandbox_thought_=0,sandbox_block_=0,bridged_unread_=0;
-    bool sandbox_opened_=false,sandbox_close_=false,sandbox_close_line_=false,sandbox_call_=false,sandbox_called_=false;
+    int sandbox_after_=0;
+    bool sandbox_close_=false,sandbox_close_line_=false,sandbox_call_=false;
     bool inline_notes_=true,inline_reply_=true;int close_repeat_=3;strata::igc::inline_tokens::SumNote sum_note_=strata::igc::inline_tokens::SumNote::Stop;strata::igc::inline_tokens::RepeatNote repeat_note_=strata::igc::inline_tokens::RepeatNote::Stop;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
@@ -300,6 +308,26 @@ public:
     void set_sandbox_close(bool on){sandbox_close_=on;}
     void set_sandbox_close_line(bool on){sandbox_close_line_=on;}
     void set_sandbox_call(bool on){sandbox_call_=on;}
+    void set_slots(int count){slots_.resize(static_cast<std::size_t>(count));}
+    void set_request(bool on){request_on_=on;}
+    // --batch: a request reads its prompt and first token on the solo path, then goes on in slot b with what it has reached.
+    void slot_adopt(int b){std::swap(static_cast<InlineTurn&>(*this),slots_[static_cast<std::size_t>(b)]);}
+    // One row a window, so a delivery goes one token a window. `token` becomes what the slot feeds next; `forced` says a
+    // delivery is running, and any proposal for the next token follows a value the model never saw.
+    bool slot_token(int b,int32_t& token,bool& forced,std::string& error) {
+        forced=false;
+        InlineTurn& turn=slots_[static_cast<std::size_t>(b)];
+        if(!turn.request_on_)return true;
+        std::swap(static_cast<InlineTurn&>(*this),turn);
+        in_slot_=true;
+        bridge_sample(token);
+        bool called=false;
+        const bool ok=inline_token(token,called,error);
+        forced=bridge_at_<bridge_tokens_.size();
+        in_slot_=false;
+        std::swap(static_cast<InlineTurn&>(*this),turn);
+        return ok;
+    }
     bool set_sandbox(const std::filesystem::path& vocab,std::string& error) {
         sandbox_text_=std::make_unique<strata::igc::sandbox::TokenText>();
         return sandbox_text_->load(vocab,error);
@@ -318,7 +346,8 @@ public:
     // value is delivered next. The device buffers live as long as the process.
     bool inline_token(int32_t& token,bool& called,std::string& error) {
         called=false;
-        if(!inline_exec_ || !pipeline_ || observation_ || !staged_)return true;
+        // A prompt read clears staged_ while the slots go on decoding between its chunks.
+        if(!inline_exec_ || !pipeline_ || observation_ || (!staged_ && !in_slot_) || !request_on_)return true;
         // An end of turn inside thinking would leave the reader no answer after a call.
         if(token==kEndOfTurn && (!inline_seen_.empty() || sandbox_session_.runs()>0)
                 && !thinking_closed_) {
