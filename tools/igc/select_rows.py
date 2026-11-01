@@ -13,7 +13,7 @@ def right(row, text):
     return letter_answer(text) == row['answer']
 
 
-CALCULATION = re.compile(r'\d\s*(?:[-+*/^=<>×÷]|\times|\frac|\cdot)\s*[\d(\]')
+CALCULATION = re.compile(r'\d\s*(?:[-+*/^=<>×÷]|\\times|\\frac|\\cdot)\s*[\d(\\]')
 
 
 def reachable(row, text):
