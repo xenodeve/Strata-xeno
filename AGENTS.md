@@ -149,6 +149,24 @@ measure the exact mechanism the fix would change, from the run itself. Then desi
 
   Two of them led to proposed work, the prefetch plan and D0, that the next measurement cancelled.
 
+## Test with the smallest run that answers the question (developer, 2026-11-02)
+
+"Testing must be as efficient and as short as it can be; a whole suite is not needed." A test exists to answer one question, so it stops
+as soon as that question has an answer.
+
+- **Do not pick a suite the model nearly aces.** Read its published score first. A high score means easy questions the model already gets,
+  and they cost the same and show nothing.
+- **First pass, then only the misses.** Run the smallest first pass that shows a result, aimed at what the change can reach. Then repeat
+  only what it missed, with `tools/igc/select_rows.py`.
+- **When the result on the misses satisfies, check the trade-off** on questions that were right, by a sample. If there is one, fix it and
+  go round the same loop. A gain on misses alone is not a claim: failures can only go up.
+- **A whole suite runs only when a whole-suite number is the thing asked for.**
+- **Run tracks in parallel and never stop to wait for one.** While one track runs, advance the other: prepare the next queue, write the
+  reader, read partial results, fix what they show. An idle machine is lost time.
+- **Rule A/Bs run on a machine that repeats itself.** A Colab A100 with every expert in VRAM gave identical text on 49 of 49 questions, so
+  one round is enough and a difference belongs to the rule. This PC gives 1 of 49: paths part before the rule. Seconds are not compared
+  across machines, and time claims stay on this PC.
+
 ## Run every speed measurement at high CPU priority
 
 Other programs on this machine (browser, Discord, Wallpaper Engine, Defender scans) take CPU time from the pool's

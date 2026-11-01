@@ -6,7 +6,7 @@ The rules for every coding agent on this repository live in `AGENTS.md`, so Clau
 real Claude Code turn on the served D2x profile, fix root causes rather than work around them, and name the issue that removes any
 latency a change adds. In full: `AGENTS.md` → "The goal".
 
-The six rules agents miss most, all in full in `AGENTS.md`:
+The seven rules agents miss most, all in full in `AGENTS.md`:
 
 1. **Run everything in the background,** with no window on the developer's display.
 2. **Update the issue as soon as a piece of work is done,** and open a new issue the moment a problem (perf, bug,
@@ -26,5 +26,8 @@ The six rules agents miss most, all in full in `AGENTS.md`:
    `docs/reports/<date>-merge-upstream-<version>.md` as its blueprint and checkpoint: what moved, each conflict and
    the side kept, the hazards checked, the bugs the merge introduced, the verification with numbers, and what is left.
    Link it from the tracking issue and the blueprint's revision log. A merge without it is not finished.
+7. **Test with the smallest run that answers the question.** Skip suites the model nearly aces. Run a small first pass, then repeat only
+   the misses; when that satisfies, check the trade-off on a sample of right answers, fix, and go round again. No whole suites unless a
+   whole-suite number is what is asked for. Run tracks in parallel and never stop to wait for one.
 
 @AGENTS.md
