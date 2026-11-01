@@ -1,0 +1,7 @@
+print(1, 2, 3, sep='-', end='!\n')
+print('a', 'b', sep='')
+print()
+print('x', end='')
+print('y', end=None)
+print(1, 2, sep=None)
+print(None, True, 1.5, 'str', [1, 'a', None], (1,), {'k': [1]}, sep=' | ')

@@ -1,0 +1,10 @@
+from collections import Counter
+c = Counter('hello')
+print(c, c['l'], c['z'], len(c), 'l' in c, 'z' in c, sorted(c), c.most_common(), c.most_common(1), c.most_common(0), sum(c.values()), c.total(), list(c.elements()), dict(c))
+print(Counter(), Counter([1, 1, 2]), Counter({'a': 2}), Counter(a=2, b=1), Counter('aab') == Counter('aba'), Counter('a') == {'a': 1}, Counter(a=0) == Counter(), Counter('abc') + Counter('ab'), Counter('aab') - Counter('a'), Counter('ab') | Counter('bb'), Counter('aab') & Counter('ab'), Counter('ab') - Counter('abc'), +Counter(a=1, b=-1), -Counter(a=1, b=-1))
+d = Counter('ab'); d.update('aa'); d.update({'b': 2}); d.update(c=5); print(d); d.subtract('a'); d.subtract({'b': 5}); print(d); d['q'] += 1; print(d); del d['q']; print(d)
+e = Counter(a=1); f = e; e += Counter(a=1, b=1); print(f, e is f); e -= Counter(a=5); print(f)
+print(isinstance(c, dict), isinstance(c, Counter), type(c).__name__, type(c.copy()).__name__, c.copy() == c, c.get('z'), c.get('l'), list(c.items())[:2], list(c.keys()), Counter('aab') <= Counter('aabb'), Counter('aab') < Counter('aab'), Counter('b') >= Counter())
+g = Counter(['x', 'y', 'x']); g['z'] = 0; print(g, sorted(g.elements()), g.most_common())
+h = Counter(a=-1, b=3); print(h, list(h.elements()))
+print(Counter(a=2.5), Counter({'a': 1.5}) + Counter({'a': 1}), max(Counter('aab'), key=Counter('aab').get))

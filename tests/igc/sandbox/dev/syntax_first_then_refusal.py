@@ -1,0 +1,3 @@
+x = (
+class A:
+    pass

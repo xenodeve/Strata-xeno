@@ -1,0 +1,1 @@
+print(str(), str(1), str(1.5), str(True), str(None), str([1, 'a']), str((1,)), str({'a': 1}), str('x'), str(range(2)), str(int), str(ValueError), str(1e100), str(-0.0), str(10 ** 20), str(float('inf')))

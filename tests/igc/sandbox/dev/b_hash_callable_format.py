@@ -1,0 +1,2 @@
+print(hash(1) == hash(1.0), hash(0) == hash(False), hash(-1), hash(-2), hash(2 ** 61 - 1), hash(2 ** 61), hash(-2 ** 61), hash(0.5), hash(1.5), hash(-1.5), hash(1e300), hash(float('inf')), hash(-float('inf')), hash(10 ** 30), hash(None) == hash(None), hash(()) == hash(()), hash((1, 2)) == hash((1, 2)), hash('a') == hash('a'))
+print(callable(len), callable(1), callable(int), callable(lambda: 0), callable(print), callable('a'.upper), format(1.5, '.2f'), format(5, '03d'), format('a', '>3'), format(1), format('x'), format(True), format(None), format([1]))

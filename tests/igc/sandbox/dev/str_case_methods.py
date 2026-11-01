@@ -1,0 +1,2 @@
+print('hello WORLD'.upper(), 'hello WORLD'.lower(), 'hello WORLD'.swapcase(), 'hello WORLD'.title(), 'hello WORLD'.capitalize(), 'HELLO'.casefold(), "they're bill's".title(), 'a1b2'.title(), '1a'.capitalize(), ''.upper(), ''.title(), 'aB'.capitalize())
+print('Abc'.istitle(), 'ABC'.isupper(), 'abc'.islower(), 'Abc'.isupper(), 'a1'.islower(), '1'.islower(), ''.islower(), 'A B'.istitle(), 'A b'.istitle(), ''.istitle(), '1'.isupper(), 'A1'.isupper())

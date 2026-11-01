@@ -1,0 +1,1 @@
+print(bool(), bool(0), bool(1), bool(-1), bool(0.0), bool(0.1), bool(''), bool(' '), bool([]), bool([0]), bool(()), bool({}), bool(set()), bool(None), bool(range(0)), bool(range(1)), bool(float('nan')), bool(10 ** 30))

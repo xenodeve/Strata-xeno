@@ -1,0 +1,2 @@
+print(sum([1, 2, 3]), sum([0.1] * 3), sum([[1], [2]], []), min(3, 1, 2), max([1, 5, 2]), min('abc'), max([1, 2], key=lambda x: -x), max([], default=7), abs(-3), abs(-2.5), pow(2, 10), pow(2, 10, 1000), divmod(7, 2), ord('a'), chr(97), hex(255), bin(5), oct(8))
+print(int('42'), int('ff', 16), int(' 7 '), int(3.9), float('1.5'), str(1), bool(0), bool('a'), bool([]), list('ab'), tuple([1]), dict(a=1), set([1, 1]), repr('x'), repr(1.0))

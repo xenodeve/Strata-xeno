@@ -1,0 +1,2 @@
+# These programs test exact bytes: CRLF, bare CR, NUL, tabs, invalid UTF-8.
+* -text

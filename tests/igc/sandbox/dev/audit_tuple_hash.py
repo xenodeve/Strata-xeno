@@ -1,0 +1,1 @@
+print(hash(()), hash((1,)), hash((1, 2)), hash((1, 2, 3)), hash((-1,)), hash((0, 0)), hash(((1, 2), 3)), hash((1.5, 2)), hash((True, False)), hash((2 ** 70, -1)), hash((None,)) == hash((None,)), {(1, 2): 'k'}[(1.0, 2.0)], hash((1, 2)) == hash((1.0, 2.0)))

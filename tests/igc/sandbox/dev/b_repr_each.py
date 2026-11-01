@@ -1,0 +1,1 @@
+print(repr(1), repr(1.0), repr('a'), repr("it's"), repr('say "hi"'), repr('both \' and "'), repr('a\nb\tc\\d'), repr(None), repr(True), repr([]), repr(()), repr((1,)), repr((1, 2)), repr({}), repr({1: 'a'}), repr(set()), repr({1}), repr(range(1)), repr('\x00\x7f\x1b'), repr('ñé'), repr('ไทย'), repr(frozenset()), repr(frozenset({1})))

@@ -1,0 +1,42 @@
+def f():
+ def f():
+  def f():
+   def f():
+    def f():
+     def f():
+      def f():
+       def f():
+        def f():
+         def f():
+          def f():
+           def f():
+            def f():
+             def f():
+              def f():
+               def f():
+                def f():
+                 def f():
+                  def f():
+                   def f():
+                    def f():
+                     def f():
+                      def f():
+                       def f():
+                        def f():
+                         def f():
+                          def f():
+                           def f():
+                            def f():
+                             def f():
+                              def f():
+                               def f():
+                                def f():
+                                 def f():
+                                  def f():
+                                   def f():
+                                    def f():
+                                     def f():
+                                      def f():
+                                       def f():
+                                        pass
+print("defs")

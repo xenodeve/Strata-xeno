@@ -1,0 +1,2 @@
+print(sorted([3, 1, 2], reverse=True), list(reversed([1, 2])), list(enumerate('ab', 1)), list(zip([1, 2], 'ab', [True, False])), list(map(str, [1, 2])), list(filter(None, [0, 1, 2])), list(filter(lambda x: x > 1, [1, 2])), list(map(lambda a, b: a + b, [1, 2], [3, 4])))
+print(isinstance(1, int), isinstance(True, int), isinstance(1.0, (int, float)), isinstance('a', str), isinstance([], list), isinstance(None, int))

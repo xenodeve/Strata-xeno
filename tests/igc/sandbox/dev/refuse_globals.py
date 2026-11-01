@@ -1,0 +1,2 @@
+# expect: Unsupported
+print(globals())

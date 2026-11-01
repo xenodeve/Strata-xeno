@@ -1,0 +1,2 @@
+print(divmod(7, 2), divmod(-7, 2), divmod(7, -2), divmod(-7, -2), divmod(7.5, 2), divmod(-7.5, 2), divmod(7, 2.5), divmod(0, 5), divmod(True, 1), divmod(10 ** 20, 7), divmod(-10 ** 20, 7), divmod(1e300, 1e-300) == divmod(1e300, 1e-300))
+print(divmod(5.0, float('inf')), divmod(-5.0, float('inf')), 5.0 % float('inf'), -5.0 % float('inf'), 5.0 // float('inf'), -5.0 // float('inf'), 0.0 % 5, -0.0 % 5, 0.0 // 5, -0.0 // 5)

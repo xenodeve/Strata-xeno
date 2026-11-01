@@ -1,0 +1,2 @@
+# expect: Unsupported
+print((-8) ** (1 / 3))
