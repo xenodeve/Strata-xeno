@@ -6,7 +6,7 @@ The rules for every coding agent on this repository live in `AGENTS.md`, so Clau
 real Claude Code turn on the served D2x profile, fix root causes rather than work around them, and name the issue that removes any
 latency a change adds. In full: `AGENTS.md` → "The goal".
 
-The eight rules agents miss most, all in full in `AGENTS.md`:
+The nine rules agents miss most, all in full in `AGENTS.md`:
 
 1. **Run everything in the background,** with no window on the developer's display.
 2. **Update the issue as soon as a piece of work is done,** and open a new issue the moment a problem (perf, bug,
@@ -32,6 +32,8 @@ The eight rules agents miss most, all in full in `AGENTS.md`:
    score the stored replies again before running anything twice.
 8. **Time spent is the cost.** No machine sits idle unnoticed, a job is checked a minute after it starts, a scorer is gated on real
    replies, a run stops the moment its question has an answer, and what repeats is scripted.
+9. **Idle means scrutinize the tests and the mechanism.** When both tracks wait on a run, run `/scrutinize` on the test procedure and the
+   mechanism under work. Most results of 2026-11-02 came from bugs in the system, so a number is not evidence until its code has been read.
 
 ## CLAUDE.md and AGENTS.md mirror each other (developer, 2026-11-02)
 
@@ -72,5 +74,22 @@ as soon as that question has an answer.
 - **Measure a machine's speed on one question before giving it a queue.** Two sessions once ran an hour for numbers nothing used.
 - **Script what repeats:** retries, uploads, scoring, setup. Hand-typed steps fail differently each time.
 - **Write code with backslashes through the file tool,** not a shell heredoc: three commits broke on lost escapes.
+
+## Idle means scrutinize the tests and the mechanism (developer, 2026-11-02)
+
+"Through this whole session most results came from bugs in the system, not from a test or a score we could use." A number is not evidence
+until the code that produced it has been read, so time spent waiting goes here first.
+
+- **When both tracks wait on a run, run `/scrutinize`,** on the test procedure and on the mechanism under work: row builders, selection, reply
+  caps, scorers, readers, runners, queues, and the feature's own path. Fix the bug, and improve the procedure that let it through.
+- **Ask what else could have produced a number** before reading it as a result. Read one cut reply, one refusal and one miss first.
+- **Prove the path ran.** Work is not done until a run's log or output shows it firing. A test that stops at a refusal has tested nothing.
+- **Try to break it.** Run adversarial inputs against a reference, and compare against a control that needs none of the feature.
+- **A fix lands with the check that would have caught it,** and stored replies are scored again where they can answer.
+
+Each of these looked like a result on 2026-11-02: a reply cap turned 93.3 % into 63.3 % and 68.3 % into 23.3 %; a reader that needed one phrase
+reported 45 %; a bench check missed a cycle by 5 tokens and ran 31 minutes to the end of the context; MIP in slots was reported done while a
+boot refusal kept it from running, and then the bench did not read the slots' lines; the sandbox refused every `class Solution`; the close
+came in the same delivery as the output, so the model never read it.
 
 @AGENTS.md

@@ -189,6 +189,23 @@ as soon as that question has an answer.
 - **Script what repeats:** retries, uploads, scoring, setup. Hand-typed steps fail differently each time.
 - **Write code with backslashes through the file tool,** not a shell heredoc: three commits broke on lost escapes.
 
+## Idle means scrutinize the tests and the mechanism (developer, 2026-11-02)
+
+"Through this whole session most results came from bugs in the system, not from a test or a score we could use." A number is not evidence
+until the code that produced it has been read, so time spent waiting goes here first.
+
+- **When both tracks wait on a run, run `/scrutinize`,** on the test procedure and on the mechanism under work: row builders, selection, reply
+  caps, scorers, readers, runners, queues, and the feature's own path. Fix the bug, and improve the procedure that let it through.
+- **Ask what else could have produced a number** before reading it as a result. Read one cut reply, one refusal and one miss first.
+- **Prove the path ran.** Work is not done until a run's log or output shows it firing. A test that stops at a refusal has tested nothing.
+- **Try to break it.** Run adversarial inputs against a reference, and compare against a control that needs none of the feature.
+- **A fix lands with the check that would have caught it,** and stored replies are scored again where they can answer.
+
+Each of these looked like a result on 2026-11-02: a reply cap turned 93.3 % into 63.3 % and 68.3 % into 23.3 %; a reader that needed one phrase
+reported 45 %; a bench check missed a cycle by 5 tokens and ran 31 minutes to the end of the context; MIP in slots was reported done while a
+boot refusal kept it from running, and then the bench did not read the slots' lines; the sandbox refused every `class Solution`; the close
+came in the same delivery as the output, so the model never read it.
+
 ## Run every speed measurement at high CPU priority
 
 Other programs on this machine (browser, Discord, Wallpaper Engine, Defender scans) take CPU time from the pool's
