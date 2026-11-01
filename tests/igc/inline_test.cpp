@@ -36,6 +36,11 @@ int main() try {
         for (int i = 0; i < 350; ++i) block.push_back(1000 + i);
         require(inline_tokens::in_cycle(tail(block, 3), 512, 8), "a long block needs three rounds");
         require(!inline_tokens::in_cycle(tail(block, 2), 512, 8), "two rounds of a block can still leave");
+        std::vector<int32_t> whole_list;
+        for (int i = 0; i < 3630; ++i) whole_list.push_back(2000 + i);
+        require(inline_tokens::in_cycle(tail(whole_list, 3), 4096, 8), "a list of 3630 tokens, three rounds");
+        require(!inline_tokens::in_cycle(tail(whole_list, 2), 4096, 8), "two rounds of it can still leave");
+        require(!inline_tokens::in_cycle(tail(whole_list, 3), 512, 8), "and a short reach does not see it");
         std::vector<int32_t> mid(block.begin(), block.begin() + 128);
         require(inline_tokens::in_cycle(tail(mid, 8), 512, 8), "128 tokens, eight rounds");
         require(!inline_tokens::in_cycle(tail(mid, 7), 512, 8), "128 tokens, seven rounds");

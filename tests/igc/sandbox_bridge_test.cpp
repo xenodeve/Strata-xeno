@@ -68,6 +68,21 @@ int main(int argc, char** argv) {
         require(p && *p == "\nprint(3)\n", "and the block closes as any other");
     }
     {
+        Fence f;
+        f.enter(kCallHead);
+        auto p = feed(f, {"f", "(", "5", "))", "\n", "```"});
+        require(p && *p == "\nprint(f(5))\n", "a forced call keeps its head");
+        require(binds_a_name("def f(n):\n    return n\n") && binds_a_name("x = 2\n"), "a block with names");
+        require(!binds_a_name("\n") && !binds_a_name("import math\n"), "a block with none has nothing to call");
+    }
+    {
+        Session s;
+        require(s.run("def f(n):\n    return n + 1\n") == output_block(kNothingPrinted) && s.quiet(), "a draft is quiet");
+        require(s.run("print(f(1))\n") == "\n```output\n2\n```\n\n" && s.printed() && !s.quiet(), "its call prints");
+        require(s.run("print()\n") == output_block(kNothingPrinted) && !s.printed() && s.quiet(), "an empty line says nothing");
+        require(s.run("print(g(1))\n").find("NameError") != std::string::npos && !s.quiet() && !s.printed(), "an error is neither");
+    }
+    {
         Session s;
         require(s.run("x = 2\nprint(x)\n") == "\n```output\n2\n```\n\n", "first block");
         require(s.run("print(x + 1)\n") == "\n```output\n3\n```\n\n", "names carry over and old prints go");
@@ -119,6 +134,8 @@ int main(int argc, char** argv) {
         const auto block = vocab.encode(output_block("12.0"));
         require(std::find(block.begin(), block.end(), 71093) != block.end(), "a fence is one token");
         require(std::find(block.begin(), block.end(), 63) == block.end(), "and no single backticks");
+        const auto call = vocab.encode(kCallBlock);
+        require(call.size() >= 4 && call[0] == 71093 && call[1] == 12305 && call[2] == 198, "the forced call opens as the forced block does");
         std::string back;
         for (const int32_t t : vocab.encode("สวัสดี 12")) back += vocab.text(t);
         require(back == "สวัสดี 12", "bytes come back");

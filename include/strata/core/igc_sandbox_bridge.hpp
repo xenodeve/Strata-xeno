@@ -28,6 +28,9 @@ inline constexpr std::string_view kNothingPrinted = "[it ran and printed nothing
 // The model's own words before it answers: 4 of 66 replies after a close were the program again, with no sentence (#279).
 inline constexpr std::string_view kCloseLine = "Need final with enough detail.\n";
 inline constexpr std::string_view kOnlyModules = "[only math, fractions, itertools, functools and collections are here: rewrite with those]";
+// Told to call its function, the model did not in 36 of 36 blocks, with a whole draft in 17 of 19 scored (#279). So the call is opened for it.
+inline constexpr std::string_view kCallHead = "print(";
+inline constexpr std::string_view kCallBlock = "```python\nprint(";
 
 // The GPT-2 byte table: printable bytes stand for themselves, the others sit from code point 256 up, in order.
 inline bool byte_is_itself(uint32_t b) { return (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255); }
@@ -193,9 +196,10 @@ public:
         text_.clear();
         inside_ = false;
     }
-    // The opening fence was forced, so this class never read it.
-    void enter() {
+    // The opening fence was forced, so this class never read it, nor `head` after it.
+    void enter(std::string_view head = {}) {
         text_ = "\n";
+        text_ += head;
         inside_ = true;
     }
 
@@ -203,6 +207,11 @@ private:
     std::string text_;
     bool inside_ = false;
 };
+
+// A block that bound nothing leaves nothing to call.
+inline bool binds_a_name(std::string_view program) {
+    return program.find("def ") != std::string_view::npos || program.find('=') != std::string_view::npos;
+}
 
 // Blocks of one reasoning share their names, as notebook cells do: each run replays the blocks that finished and drops
 // what they printed. The language has no clock or randomness, so a replay gives the same state.
@@ -218,6 +227,7 @@ public:
     int seen(std::string_view program) const { return (int) std::count(programs_.begin(), programs_.end(), program); }
     int runs() const { return runs_; }
     bool printed() const { return printed_last_; }   // the last run finished and said something
+    bool quiet() const { return quiet_last_; }       // the last run finished and said nothing
     uint64_t steps() const { return steps_; }
     // What the reasoning reads next, right after the closing fence.
     std::string run(std::string_view program, const std::atomic<bool>* cancel = nullptr) {
@@ -231,12 +241,14 @@ public:
         steps_ += result.steps;
         std::string body = result.output.size() > printed_ ? result.output.substr(printed_) : std::string();
         bool cut = result.truncated;
+        if (body.find_first_not_of(" \t\r\n") == std::string::npos) body.clear();   // `print()` says nothing
         if (body.size() > kShownOutput) {
             body.resize(kShownOutput);
             cut = true;
         }
         if (cut) body += "\n[output cut]";
         printed_last_ = result.status == Status::Ok && !body.empty();
+        quiet_last_ = result.status == Status::Ok && body.empty();
         if (result.status == Status::Ok) {
             done_ = std::move(source);
             printed_ = result.output.size();
@@ -259,6 +271,7 @@ private:
     std::vector<std::string> programs_;
     std::size_t printed_ = 0;
     bool printed_last_ = false;
+    bool quiet_last_ = false;
     int runs_ = 0;
     uint64_t steps_ = 0;
 };

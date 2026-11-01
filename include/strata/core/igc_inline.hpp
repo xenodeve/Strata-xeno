@@ -103,7 +103,8 @@ inline bool thinking_off(std::span<const int64_t> prompt, int64_t think_close) {
 }
 // The tail is one exact cycle. In 1410 measured runs no text that repeated six times ever left, 2263 rounds at most.
 // At least 64 tokens: digits are one token each, so `2102500000000` and `0.33333333` are eight rounds of one token.
-// At most 1024 tokens or three rounds: of 7073 runs none left a block of 300 characters after three rounds.
+// At most 1024 tokens or three rounds: of 7073 runs none left a block of 300 characters after three rounds, and of
+// 1472 runs long enough the model left no block of 1000 characters after three rounds by itself (#282).
 inline bool in_cycle(std::span<const int32_t> tokens, int longest, int rounds) {
     for (int period = 1; period <= longest; ++period) {
         const std::size_t whole = static_cast<std::size_t>(period);

@@ -45,7 +45,7 @@ class IgcLearnedDiagnostic {
     strata::igc::sandbox::Fence sandbox_fence_;
     strata::igc::sandbox::Session sandbox_session_;
     int sandbox_after_=0,sandbox_thought_=0,sandbox_block_=0,bridged_unread_=0;
-    bool sandbox_opened_=false,sandbox_close_=false,sandbox_close_line_=false;
+    bool sandbox_opened_=false,sandbox_close_=false,sandbox_close_line_=false,sandbox_call_=false,sandbox_called_=false;
     bool inline_notes_=true,inline_reply_=true;int close_repeat_=3;strata::igc::inline_tokens::SumNote sum_note_=strata::igc::inline_tokens::SumNote::Stop;strata::igc::inline_tokens::RepeatNote repeat_note_=strata::igc::inline_tokens::RepeatNote::Stop;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
@@ -197,7 +197,7 @@ public:
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
         staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_tail_.clear();thinking_closed_=strata::igc::inline_tokens::thinking_off(prefix_,kThinkClose);
-        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;bridged_unread_=0;
+        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;bridged_unread_=0;
         if(natural_)natural_->begin(prefix_);
         return true;
     }
@@ -299,6 +299,7 @@ public:
     void set_sandbox_after(int tokens){sandbox_after_=tokens;}
     void set_sandbox_close(bool on){sandbox_close_=on;}
     void set_sandbox_close_line(bool on){sandbox_close_line_=on;}
+    void set_sandbox_call(bool on){sandbox_call_=on;}
     bool set_sandbox(const std::filesystem::path& vocab,std::string& error) {
         sandbox_text_=std::make_unique<strata::igc::sandbox::TokenText>();
         return sandbox_text_->load(vocab,error);
@@ -344,8 +345,8 @@ public:
         if(!thinking_closed_) {
             // A loop holds no `=` for the repeat rule below; left alone it runs to the end of the context.
             thinking_tail_.push_back(token);
-            if(thinking_tail_.size()>2048)thinking_tail_.erase(thinking_tail_.begin(),thinking_tail_.begin()+1024);
-            if(thinking_tail_.size()%16==0 && strata::igc::inline_tokens::in_cycle(thinking_tail_,512,8)) {
+            if(thinking_tail_.size()>16384)thinking_tail_.erase(thinking_tail_.begin(),thinking_tail_.begin()+4096);
+            if(thinking_tail_.size()%16==0 && strata::igc::inline_tokens::in_cycle(thinking_tail_,4096,8)) {
                 std::fprintf(stderr,"strata igc loop: closed the thinking\n");
                 bridge_tokens_={198,kThinkClose,271};bridge_at_=0;called=true;return true;
             }
@@ -363,6 +364,12 @@ public:
                 const auto text=sandbox_session_.spent()?strata::igc::sandbox::output_block("[no more runs]"):sandbox_session_.run(*program);
                 std::fprintf(stderr,"strata igc sandbox: run %d of %d bytes, %d bytes back, %llu steps so far\n",sandbox_session_.runs(),static_cast<int>(program->size()),static_cast<int>(text.size()),static_cast<unsigned long long>(sandbox_session_.steps()));
                 bridge_tokens_=sandbox_text_->encode(text);bridge_at_=0;called=true;
+                if(sandbox_call_ && !sandbox_called_ && sandbox_session_.quiet() && strata::igc::sandbox::binds_a_name(*program)) {
+                    std::fprintf(stderr,"strata igc sandbox: opened a call\n");
+                    sandbox_called_=true;sandbox_block_=0;sandbox_fence_.enter(strata::igc::sandbox::kCallHead);
+                    const auto open=sandbox_text_->encode(strata::igc::sandbox::kCallBlock);
+                    bridge_tokens_.insert(bridge_tokens_.end(),open.begin(),open.end());
+                }
                 // Given the answer the model still went on for thousands of tokens to prove it.
                 if(sandbox_close_ && sandbox_session_.printed()) {
                     if(sandbox_close_line_) {
