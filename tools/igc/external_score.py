@@ -46,13 +46,15 @@ def final_number(text):
     return float(numbers[-1] if equation or not bold else numbers[0])
 
 
-def repeating(tokens, longest=512, rounds=20):
-    """Greedy text whose tail is one exact cycle, many rounds long, cannot leave it."""
+def repeating(tokens, longest=4096, rounds=20):
+    """Greedy text whose tail is one exact cycle, many rounds long, cannot leave it. Past 512 tokens eight rounds are enough, as in the
+    engine: a cycle of about 517 tokens once ran to the end of the context, 31 minutes, because this stopped looking at 512."""
     for period in range(1, longest + 1):
-        if len(tokens) < period * rounds:
-            return False
-        tail = tokens[-period * rounds:]
-        if tail == tail[:period] * rounds:
+        count = rounds if period <= 512 else 8
+        if len(tokens) < period * count or tokens[-1] != tokens[-1 - period]:
+            continue
+        tail = tokens[-period * count:]
+        if tail == tail[:period] * count:
             return True
     return False
 
