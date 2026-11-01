@@ -55,7 +55,7 @@ def score(records):
     return suites
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -114,7 +114,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             for t in engine.generate(ids,limit,{'temperature':0},cancel):
                 if t is None:continue
                 tokens.append(int(t))
-                if len(tokens)%64==0 and repeating(tokens):stuck=True;break
+                if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
             seconds=time.monotonic()-start;active[0]=None
             text=tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace')
             if no_think:text='</think>\n\n'+text   # the close is in the prompt; the readers look for it here
@@ -153,6 +153,7 @@ if __name__=='__main__':
     parser.add_argument('--sandbox-close',action='store_true',help='close the thinking once a program has printed')
     parser.add_argument('--sandbox-close-line',action='store_true',help='the model\'s own line before the close')
     parser.add_argument('--sandbox-call',action='store_true',help='open a print( after a block that printed nothing')
+    parser.add_argument('--stuck-rounds',type=int,default=20,help='rounds of a cycle before the bench gives up; 40 leaves a loop of up to 3 tokens to the engine, which closes at 64')
     parser.add_argument('--no-think',action='store_true',help='close the thinking in the prompt')
     parser.add_argument('--shots',type=int,default=0,help='few-shot exemplars before each GSM8K question')
     run(**vars(parser.parse_args()))
