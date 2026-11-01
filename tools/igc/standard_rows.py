@@ -34,20 +34,12 @@ LETTERS = 'ABCDEFGHIJKLMNOP'
 
 
 def mmlu_pro_rows(data):
-    head = (data / 'mp-init.txt').read_text(encoding='utf-8').strip() + '
-
-'
+    head = (data / 'mp-init.txt').read_text(encoding='utf-8').strip() + '\n\n'
     def body(row):
-        return 'Question:
-' + row['question'] + '
-Options:
-' + ''.join(f'{LETTERS[i]}. {o}
-' for i, o in enumerate(row['options']))
+        return 'Question:\n' + row['question'] + '\nOptions:\n' + ''.join(f'{LETTERS[i]}. {o}\n' for i, o in enumerate(row['options']))
     shots = {}
     for row in json.loads((data / 'mp-val.json').read_text(encoding='utf-8')):
-        text = body(row) + row['cot_content'].replace("A: Let's think step by step.", "Answer: Let's think step by step.") + '
-
-'
+        text = body(row) + row['cot_content'].replace("A: Let's think step by step.", "Answer: Let's think step by step.") + '\n\n'
         shots.setdefault(row['category'], []).append(text)
     for row in json.loads((data / 'mp-test.json').read_text(encoding='utf-8')):
         cat = row['category']
@@ -58,8 +50,7 @@ Options:
 def super_gpqa_rows(data, sample=2000):
     """A seeded sample by discipline: the whole suite is 26,529 questions, and the sample shows the trend before it is run."""
     text = (data / 'sg-five.yaml').read_text(encoding='utf-8')
-    prompt = textwrap.dedent(text[text.index('- |') + 3:].split('
-', 1)[1]).strip()
+    prompt = textwrap.dedent(text[text.index('- |') + 3:].split('\n', 1)[1]).strip()
     rows = json.loads((data / 'sg.json').read_text(encoding='utf-8'))
     random.Random(1).shuffle(rows)
     per = {}
@@ -68,9 +59,7 @@ def super_gpqa_rows(data, sample=2000):
     keep = [r for group in per.values() for r in group[:round(sample * len(group) / len(rows))]]
     random.Random(2).shuffle(keep)
     for row in keep:
-        question = row['question'] + '
-' + ''.join(f'{LETTERS[i]}) {o}
-' for i, o in enumerate(row['options']))
+        question = row['question'] + '\n' + ''.join(f'{LETTERS[i]}) {o}\n' for i, o in enumerate(row['options']))
         yield dict(id=question_id('supergpqa', row['uuid']), suite='supergpqa', prompt=prompt.replace('{{', '{').replace('}}', '}').replace('{}', question.strip()),
                    answer=row['answer_letter'], limit=1024, group=row['discipline'], calculation=str(row['is_calculation']) == 'True', difficulty=row['difficulty'])
 
