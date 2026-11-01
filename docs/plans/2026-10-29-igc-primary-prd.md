@@ -27,6 +27,7 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276)
 3. **ตรวจสมมุติฐานด้วยเกณฑ์ภายนอก:** ทดลองตรวจย้อนกลับแบบ FOBAR หรือ Key Condition Verification โดยซ่อนเลขในโจทย์แล้วให้ MIP คำนวณ เทียบกับเลขจริง เริ่มจากข้อผิด 20 ข้อและข้อถูก 20 ข้อ วัดอัตราจับข้อผิดและการเตือนผิด ถ้าไม่คุ้มไม่สร้าง ถ้าคุ้มให้ทำงานเฉพาะเมื่อมีสัญญาณ
 4. **แปลงเป็นเงื่อนไขให้ solver (SatLM):** ทางเลือกระยะยาว ใช้เมื่อข้อ 3 พิสูจน์แล้วว่าการตรวจภายนอกคุ้มค่า เป็น dependency ใหม่ ต้องคุยกับผู้พัฒนาก่อน
 5. **วัดเวลาจริง:** ABBA ที่ priority สูงตามกฎ repo และแยกต้นทุนด้วย timeline ก่อนอ้างตัวเลขเวลา
+6. **เทียบกับผลที่เผยแพร่ด้วยโปรโตคอลเดียวกัน:** Table 11 ของ arXiv 2608.30320 ให้ `Qwen3.8-Flash-Next-Base` GSM8K 93.29, MATH 72.78 (4-shot, CoT), BBH 90.87 (3-shot, CoT) เป็นผลของ base weights เท่านั้น ไม่มีผลของโมเดล instruct หรือแบบเปิด reasoning ไม่บอก split จำนวนข้อ หรือวิธีดึงคำตอบ ตัวเลข Gyro-M ที่เปิดการคิดบน prompt เปล่าจึงเทียบตรงไม่ได้ ก่อนไต่ชุดเต็มต้องมีแขน few-shot CoT ไม่เปิดการคิด บน GSM8K test เต็ม เปิดและปิด MIP และรายงานคู่กับแขนแบบใช้งานจริง โดยบอกทุกครั้งว่าเป็นคนละโมเดล และ MATH-500 เฉพาะคำตอบจำนวนเต็มไม่ใช่ MATH ของ paper
 
 ถ้อยคำกำกวมที่ไม่มีเงื่อนไขให้ตรวจอยู่นอกขอบเขต เป็นเรื่องการตัดสินของโมเดล
 
@@ -43,6 +44,7 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276)
 3. Check assumptions by an outside criterion: a trial of backward verification in the style of FOBAR or Key Condition Verification, masking a number in the question and having MIP compute it against the known value. Start from 20 wrong and 20 right cases and measure catches and false alarms. Do not build it if it does not pay; if it does, it runs only on a signal.
 4. Declarative constraints for a solver (SatLM): a longer-term option once step 3 shows outside checks pay. A new dependency, to be discussed with the developer first.
 5. Measure time properly: ABBA at high priority under the repository's rules, with cost split by the timeline, before any time figure is claimed.
+6. Compare with published results under the same protocol. Table 11 of arXiv 2608.30320 gives `Qwen3.8-Flash-Next-Base` GSM8K 93.29, MATH 72.78 (4-shot, CoT) and BBH 90.87 (3-shot, CoT). These are base weights only, with no instruct or reasoning result, and no split, problem count or answer extraction stated. Gyro-M numbers with thinking on plain prompts cannot be set against them. Before the full-suite climb there must be a few-shot CoT arm with thinking off on the whole GSM8K test, MIP on and off, reported beside the arm as used in practice. Each report must say it is a different model, and that integer-answer MATH-500 is not the paper's MATH.
 
 Ambiguous wording with no condition to check is out of scope; it is the model's judgement.
 
