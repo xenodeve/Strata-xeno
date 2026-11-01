@@ -56,7 +56,7 @@ def score(records):
     return suites
 
 
-def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_context,stuck_rounds,output,cancel):
+def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_context,stuck_rounds,output,cancel,sampling):
     """The questions through batch slots, each as `BGEN`; with `pair` each also runs with `igc=0`, written to records-off.json."""
     jobs=[(row,True) for row in rows]+[(row,False) for row in rows if pair]
     if pair:jobs=[job for two in zip(jobs[:len(rows)],jobs[len(rows):]) for job in two]
@@ -81,7 +81,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
             row,on=jobs.pop();b=free.pop()
             ids=tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8'))
             limit=262144-len(ids)-64 if whole_context else row['limit']
-            head=f"BGEN {b} {limit}{engine.sampling_keys({'temperature':0})}"+('' if on else ' igc=0')
+            head=f"BGEN {b} {limit}{engine.sampling_keys(sampling)}"+('' if on else ' igc=0')
             live[b]=dict(row=row,on=on,slot=b,tokens=[],stuck=False,start=time.monotonic(),ids=len(ids));admitting=b
             engine.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n");engine.proc.stdin.flush()
         try:line=engine.lines.get(timeout=1)
@@ -102,7 +102,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -154,13 +154,17 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
         engine=helper.StrataEngine(str(executable),helper.engine_args(cfg)+(helper.effort_end_args(cfg,str(executable),tokenizer) or []),
                                    cwd=cfg.get('cwd'),log=cfg['log'],env=env)
         engine.silence_s=helper.engine_silence_s(cfg)
-        if slots:records=run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_context,stuck_rounds,output,cancel)
+        sampling={'temperature':0}
+        if keep_prefix:   # the turn every question shares is read once: the engine keeps a checkpoint at its end
+            all_ids=[tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8')) for row in rows]
+            sampling['_ckpt_at']=len(os.path.commonprefix(all_ids))
+        if slots:records=run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_context,stuck_rounds,output,cancel,sampling)
         for row in rows if not slots else ():
             if cancel.is_set():raise RuntimeError('bench stopped before request')
             ids=tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8'))
             active[0]=start=time.monotonic()
             limit=262144-len(ids)-64 if whole_context else row['limit'];tokens=[];stuck=False
-            for t in engine.generate(ids,limit,{'temperature':0},cancel):
+            for t in engine.generate(ids,limit,sampling,cancel):
                 if t is None:continue
                 tokens.append(int(t))
                 if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
@@ -202,6 +206,7 @@ if __name__=='__main__':
     parser.add_argument('--sandbox-close',action='store_true',help='close the thinking once a program has printed')
     parser.add_argument('--sandbox-close-line',action='store_true',help='the model\'s own line before the close')
     parser.add_argument('--sandbox-call',action='store_true',help='open a print( after a block that printed nothing')
+    parser.add_argument('--keep-prefix',action='store_true',help='read the prompt part every question shares once')
     parser.add_argument('--slots',type=int,default=0,help='decode in this many batch slots, questions at once')
     parser.add_argument('--pair',action='store_true',help='with --slots: run each question with MIP and with igc=0, in one engine')
     parser.add_argument('--stuck-rounds',type=int,default=20,help='rounds of a cycle before the bench gives up; 40 leaves a loop of up to 3 tokens to the engine, which closes at 64')
