@@ -97,6 +97,19 @@ int main(int argc, char** argv) {
     }
     {
         Session s;
+        s.run("a = 1\nb = 2\nc = 3\n");
+        const auto failed = s.run("\nx = 1\nassert x == 2\n");
+        require(failed.find("AssertionError (line 2)\n    assert x == 2\n") != std::string::npos, "the line in this block, and its text");
+        s.run("def f(n):\n    return n[0]\n");
+        const auto deeper = s.run("f([])\n");
+        require(deeper.find("(in an earlier block)\n    return n[0]") != std::string::npos, "a failure inside an earlier block says so");
+        const auto syntax = s.run("x = = 1\n");
+        require(syntax.find("(line 1)\n    x = = 1") != std::string::npos, "a syntax error too");
+        require(name_the_line("TypeError", "x\n", 0) == "TypeError", "no line, nothing to name");
+        require(name_the_line("ValueError (line 9)", "x\n", 0) == "ValueError (line 9)", "a line past the source");
+    }
+    {
+        Session s;
         const auto long_output = s.run("for i in range(2000):\n    print(i)\n");
         require(long_output.find("[output cut]") != std::string::npos, "a long output is cut");
         require(long_output.size() < kShownOutput + 64, "to the shown size");

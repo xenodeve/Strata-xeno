@@ -213,6 +213,32 @@ inline bool binds_a_name(std::string_view program) {
     return program.find("def ") != std::string_view::npos || program.find('=') != std::string_view::npos;
 }
 
+// A run replays the blocks before it, so the interpreter counts from the first of them, and a 2-line block reported
+// `SyntaxError (line 23)` (#279). The model sees one block: the number is rebased, and the line itself says what failed.
+inline std::string name_the_line(std::string_view error, std::string_view source, int replayed) {
+    const std::size_t at = error.rfind(" (line ");
+    if (at == std::string_view::npos || error.back() != ')') return std::string(error);
+    int line = 0;
+    for (const char c : error.substr(at + 7, error.size() - at - 8)) {
+        if (c < '0' || c > '9') return std::string(error);
+        line = line * 10 + (c - '0');
+    }
+    std::size_t from = 0;
+    for (int i = 1; i < line && from != std::string_view::npos; ++i) {
+        from = source.find('\n', from);
+        if (from != std::string_view::npos) ++from;
+    }
+    std::string_view text = from == std::string_view::npos ? std::string_view() : source.substr(from, source.find('\n', from) - from);
+    text.remove_prefix(std::min(text.find_first_not_of(" \t"), text.size()));
+    std::string named(error.substr(0, at));
+    named += line > replayed ? " (line " + std::to_string(line - replayed) + ")" : std::string(" (in an earlier block)");
+    if (!text.empty()) {
+        named += "\n    ";
+        named += text;
+    }
+    return named;
+}
+
 // Blocks of one reasoning share their names, as notebook cells do: each run replays the blocks that finished and drops
 // what they printed. The language has no clock or randomness, so a replay gives the same state.
 class Session {
@@ -233,6 +259,7 @@ public:
     std::string run(std::string_view program, const std::atomic<bool>* cancel = nullptr) {
         ++runs_;
         programs_.emplace_back(program);
+        const int replayed = (int) std::count(done_.begin(), done_.end(), '\n') + (program.starts_with('\n') ? 1 : 0);
         std::string source = done_;
         source += program;
         // A fresh stack: the interpreter's budget of 640 KiB counts from run(), and the decode loop already sits deep in its own.
@@ -255,7 +282,7 @@ public:
             if (body.empty()) body = kNothingPrinted;
         } else {
             if (!body.empty()) body += '\n';
-            body += result.error;
+            body += name_the_line(result.error, source, replayed);
             if (result.error.starts_with("ModuleNotFoundError")) {
                 body += '\n';
                 body += kOnlyModules;
