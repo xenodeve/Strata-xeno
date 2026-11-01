@@ -76,7 +76,8 @@ int main(int argc, char** argv) {
         require(last_def("\ndef a(x):\n    def inner():\n        pass\n    return 1\n\ndef main(n: int) -> int:\n    return a(n)\n") == "main", "the last top-level def");
         require(call_head("def f(n):\n    return n\n") == "print(f(", "the call names it");
         require(call_head("x = 2\n") == "print(", "no function, a bare print");
-        require(call_head("class A:\n    def m(self):\n        pass\n") == "print(", "a method is not called this way");
+        require(call_head("class Solution:\n    def __init__(self):\n        pass\n    def helper(self, a):\n        return a\n    def solve(self, a: int) -> int:\n        return a\n") == "print(Solution().solve(", "a class's last method");
+        require(call_head("class A:\n    def __init__(self):\n        pass\n") == "print(", "a class with no method to call");
         require(!binds_a_name("\n") && !binds_a_name("import math\n"), "a block with none has nothing to call");
     }
     {

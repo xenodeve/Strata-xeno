@@ -209,15 +209,24 @@ private:
     bool inside_ = false;
 };
 
-// The function to call: the last one the block defined at its top level. Helpers come first, so this is the one the block is for.
+// The function to call: the last one the block defined at its top level, or a class's last method when the block is a
+// `class Solution`. Helpers come first, so this is the one the block is for.
 inline std::string last_def(std::string_view program) {
-    std::string name;
+    std::string name, in_class;
     for (std::size_t at = 0; at < program.size();) {
         std::size_t end = program.find('\n', at);
         if (end == std::string_view::npos) end = program.size();
         const std::string_view line = program.substr(at, end - at);
         const std::size_t paren = line.find('(');
-        if (line.starts_with("def ") && paren != std::string_view::npos) name = std::string(line.substr(4, paren - 4));
+        if (line.starts_with("def ") && paren != std::string_view::npos) {
+            name = std::string(line.substr(4, paren - 4));
+            in_class.clear();
+        } else if (line.starts_with("class ")) {
+            in_class = std::string(line.substr(6, line.find_first_of("(:") - 6));
+            name.clear();
+        } else if (!in_class.empty() && line.starts_with("    def ") && paren != std::string_view::npos && !line.starts_with("    def __")) {
+            name = in_class + "()." + std::string(line.substr(8, paren - 8));
+        }
         at = end + 1;
     }
     return name;
