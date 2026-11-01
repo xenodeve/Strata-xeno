@@ -88,7 +88,7 @@ until the code that produced it has been read, so time spent waiting goes here f
 - **A fix lands with the check that would have caught it,** and stored replies are scored again where they can answer.
 
 Each of these looked like a result on 2026-11-02: a reply cap turned 93.3 % into 63.3 % and 68.3 % into 23.3 %; a reader that needed one phrase
-reported 45 %; a bench check missed a cycle by 5 tokens and ran 31 minutes to the end of the context; MIP in slots was reported done while a
+reported 45 %; a bench check stopped at 512 tokens, missed a longer cycle and ran 31 minutes to the end of the context; MIP in slots was reported done while a
 boot refusal kept it from running, and then the bench did not read the slots' lines; the sandbox refused every `class Solution`; the close
 came in the same delivery as the output, so the model never read it.
 

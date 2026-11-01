@@ -48,7 +48,7 @@ def final_number(text):
 
 def repeating(tokens, longest=4096, rounds=20):
     """Greedy text whose tail is one exact cycle, many rounds long, cannot leave it. Past 512 tokens eight rounds are enough, as in the
-    engine: a cycle of about 517 tokens once ran to the end of the context, 31 minutes, because this stopped looking at 512."""
+    engine: a longer cycle once ran to the end of the context, 31 minutes, because this stopped looking at 512."""
     for period in range(1, longest + 1):
         count = rounds if period <= 512 else 8
         if len(tokens) < period * count or tokens[-1] != tokens[-1 - period]:
