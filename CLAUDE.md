@@ -28,6 +28,7 @@ The seven rules agents miss most, all in full in `AGENTS.md`:
    Link it from the tracking issue and the blueprint's revision log. A merge without it is not finished.
 7. **Test with the smallest run that answers the question.** Skip suites the model nearly aces. Run a small first pass, then repeat only
    the misses the feature can reach; when that satisfies, check the trade-off on a sample of right answers, fix, and go round again. No whole suites unless a
-   whole-suite number is what is asked for. Run tracks in parallel and never stop to wait for one.
+   whole-suite number is what is asked for. Run tracks in parallel and never stop to wait for one. When a scorer was wrong, fix it and
+   score the stored replies again before running anything twice.
 
 @AGENTS.md

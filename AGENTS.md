@@ -162,6 +162,8 @@ as soon as that question has an answer.
   go round the same loop. A gain on misses alone is not a claim: failures can only go up.
 - **Drop misses the feature cannot reach.** A low score does not make every miss useful: a wrong fact or a misread question has nothing for
   MIP to compute. Test only what the feature under work can change, and say how many were left out and by what rule.
+- **A wrong scorer does not cost the run.** Bench records keep the raw reply, so fix the scorer, then score the same records again, by the
+  new scorer or by hand, and use them. Run again only when the text itself cannot answer. Say which numbers changed.
 - **A whole suite runs only when a whole-suite number is the thing asked for.**
 - **Run tracks in parallel and never stop to wait for one.** While one track runs, advance the other: prepare the next queue, write the
   reader, read partial results, fix what they show. An idle machine is lost time.
