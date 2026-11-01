@@ -91,21 +91,22 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
             head=f"BGEN {b} {limit}{engine.sampling_keys(sampling)}"+('' if on else ' igc=0')
             live[b]=dict(row=row,on=on,slot=b,tokens=[],stuck=False,start=time.monotonic(),ids=len(ids));admitting=b
             engine.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n");engine.proc.stdin.flush()
-        try:line=engine.lines.get(timeout=1)
-        except queue.Empty:continue
+        try:line=engine.lines.get(timeout=0.02)
+        except queue.Empty:line=''
         if line is None:raise RuntimeError('the engine ended')
         if line.startswith('T ') and admitting is not None:take(live[admitting],int(line.split()[1]))
-        elif line.startswith('BT '):
-            _,b,t=line.split()
-            if int(b) in live:take(live[int(b)],int(t))
-        elif line.startswith('BDONE '):
-            part=line.split();b=int(part[1])
-            finish(b,'stuck' if live[b]['stuck'] else part[3])
         elif line.startswith('BADM '):
             part=line.split()
             if part[2]=='0':finish(admitting,'stop')
             admitting=None
         elif line.startswith('ERR'):raise RuntimeError(line)
+        for b in list(live):   # the server's pump routes a slot's own lines to its queue; a slot still admitting has its T lines first
+            while b!=admitting and b in live and not engine.slot_q[b].empty():
+                line=engine.slot_q[b].get_nowait()
+                if line is None:raise RuntimeError('the engine ended')
+                part=line.split()
+                if line.startswith('BT '):take(live[b],int(part[2]))
+                else:finish(b,'stuck' if live[b]['stuck'] else part[3])
     return [r for r in done if r['mip']]
 
 
