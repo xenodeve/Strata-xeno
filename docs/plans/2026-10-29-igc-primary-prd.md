@@ -17,13 +17,13 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276)
 - GSM-Hard 200 ข้อ: เปิด MIP 177, ปิด MIP 178 หลังอ่านข้อที่เห็นแย้ง token น้อยลง 22 % เวลา decode น้อยลง 18 % จากการรันแขนละรอบ ยังไม่ใช่ ABBA เฉลยของชุดนี้ผิดบางส่วน
 - ผลคูณ 180 จุดในการคิดของแขนปิดไม่พบข้อผิดจริง จากการตรวจด้วย pattern ที่เห็นเฉพาะ `a*b = c`
 - 30 ข้อเพดานรันจนสุด context: แขนปิดจบเองครบ การคิด 71 % (เปิด) และ 83 % (ปิด) อยู่หลังเจอคำตอบครั้งแรก
-- จุดปิดท้ายโน้ตตัดประโยคและทำให้ gsm8k-201 วน 3 จาก 3 รอบ เอาออกแล้วจบเอง 3 จาก 3 รอบ โน้ตจึงไม่ปิดด้วย `.` อีกต่อไป และ engine ปิดการคิดเมื่อเจอวงซ้ำเป๊ะ 8 รอบ (ตัวกันวนยังไม่เคยทำงานจริงนอก unit test)
+- จุดปิดท้ายโน้ตตัดประโยคและทำให้ gsm8k-201 วน 3 จาก 3 รอบ เอาออกแล้วจบเอง 3 จาก 3 รอบ โน้ตจึงไม่ปิดด้วย `.` อีกต่อไป และ engine ปิดการคิดเมื่อเจอวงซ้ำเป๊ะ (ตัวกันวนทำงานจริงแล้วในงานวัด และวงยาว 350 token ของ math-6 ทำให้ต้องขยายระยะที่มองเห็น)
 - สัญญาณจากตัวเลขอย่างเดียวจับข้อผิดได้น้อย: ค่าที่ไม่เป็นจำนวนเต็มเกิดในข้อถูก 23 ข้อ ข้อผิด 9 ข้อ และ MIP ตรวจได้ว่าคำนวณถูก แต่ตรวจไม่ได้ว่าโจทย์ตั้งถูก การแทนคำตอบกลับลงสมการเดิมจึงผ่านเสมอ
 
 ### ลำดับงาน
 
 1. **ความมั่นใจในค่าที่ส่งให้:** ไม่ใช้ ประโยคใน system บน 60 ข้อที่คัด token ไม่ลด เวลาเพิ่ม 4 % ประโยคตรวจซ้ำเพิ่ม 15 % และโมเดลลอกโน้ตจนเกิดวงใหม่ 1 ข้อ ขั้นถัดไปคือวัดแขนส่งค่าไม่มีโน้ต และแขน effort medium บน 49 ข้อ
-2. **ยกเลิกการปิดการคิดจากการซ้ำ:** การซ้ำครั้งที่ 3 ของนิพจน์ตัดกลางงานจริง (math-3 ที่ `[2,3]: 3*4=12.`) จึงเหลือแค่โน้ต วัดบน 49 ข้อที่เคยถูกปิดแบบนี้ ส่วนการปิดเมื่อเจอคำทบทวนแบบ CGRS ถูกยกเลิก เพราะลดได้ 3–10 % และปิดกลางงานราว 8 % คำในการคิดบอกไม่ได้ว่าคิดเสร็จแล้ว
+2. **คงการปิดการคิดเมื่อนิพจน์ซ้ำครั้งที่ 3:** ที่เคยตัดสินใจเลิกปิดนั้นผิด วัดบน 49 ข้อ การถอดออกเพิ่ม token 43.7 % (เพิ่ม 36 ลด 13 ข้อ, sign-flip p 0.0012) ถูกหลังอ่าน 37 เทียบ 40 ไม่มีข้อไหนเปลี่ยนจากผิดเป็นถูก และเกิดวงยาวจริง 1 ข้อ ที่ปิดแล้วเสียหายจริงมีโจทย์วงเล็บ (ปิดแล้วถูก 2 จาก 4 รอบ) และ reply ที่ขัดกันเอง 1 ข้อ ขั้นถัดไปคือยืนยันด้วย exe เดียวแบบ `--no-adapt` ผ่าน `--igc-close-repeat 3` กับ `0` เพราะ 48 จาก 49 คู่แยกกันก่อนถึงจุดปิด ส่วนการปิดเมื่อเจอคำทบทวนแบบ CGRS ยังคงยกเลิก เพราะลดได้ 3–10 % และปิดกลางงานราว 8 % คำในการคิดบอกไม่ได้ว่าคิดเสร็จแล้ว
 3. **ตรวจสมมุติฐานด้วยเกณฑ์ภายนอก:** ทดลองตรวจย้อนกลับแบบ FOBAR หรือ Key Condition Verification โดยซ่อนเลขในโจทย์แล้วให้ MIP คำนวณ เทียบกับเลขจริง เริ่มจากข้อผิด 20 ข้อและข้อถูก 20 ข้อ วัดอัตราจับข้อผิดและการเตือนผิด ถ้าไม่คุ้มไม่สร้าง ถ้าคุ้มให้ทำงานเฉพาะเมื่อมีสัญญาณ
 4. **แปลงเป็นเงื่อนไขให้ solver (SatLM):** ทางเลือกระยะยาว ใช้เมื่อข้อ 3 พิสูจน์แล้วว่าการตรวจภายนอกคุ้มค่า เป็น dependency ใหม่ ต้องคุยกับผู้พัฒนาก่อน
 5. **วัดเวลาจริง:** ABBA ที่ priority สูงตามกฎ repo และแยกต้นทุนด้วย timeline ก่อนอ้างตัวเลขเวลา
@@ -39,7 +39,7 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276)
 **Order of work.**
 
 1. Confidence in delivered values: rejected. A system line on the 60 selected cases gave no token gain, 4 % more time, 15 % more recheck sentences, and one new loop where the model copied the note. Next, an arm with no note and an arm at medium effort on 49 cases.
-2. Stop closing thinking on repeats: the third repeat of an expression cut real work (math-3 at `[2,3]: 3*4=12.`), so a repeat is only marked, measured on the 49 cases closed that way. A close at a reflection opener in the CGRS style was dropped: it saved 3 to 10 % with about 8 % of closes mid-work, and words in the thinking do not show that the work is done.
+2. Keep closing thinking on the third repeat of an expression. The decision to stop was wrong. On 49 cases, removing it added 43.7 % tokens (36 more, 13 fewer, sign-flip p 0.0012), 37 right after reading against 40, no case went from wrong to right, and one real long loop appeared. The close does real harm on the parenthesis question (2 right of 4 closed runs) and one reply contradicting itself. Next, confirm on one exe with `--no-adapt` through `--igc-close-repeat 3` and `0`, because 48 of the 49 pairs diverge before the close. A close at a reflection opener in the CGRS style stays dropped: it saved 3 to 10 % with about 8 % of closes mid-work, and words in the thinking do not show that the work is done.
 3. Check assumptions by an outside criterion: a trial of backward verification in the style of FOBAR or Key Condition Verification, masking a number in the question and having MIP compute it against the known value. Start from 20 wrong and 20 right cases and measure catches and false alarms. Do not build it if it does not pay; if it does, it runs only on a signal.
 4. Declarative constraints for a solver (SatLM): a longer-term option once step 3 shows outside checks pay. A new dependency, to be discussed with the developer first.
 5. Measure time properly: ABBA at high priority under the repository's rules, with cost split by the timeline, before any time figure is claimed.
