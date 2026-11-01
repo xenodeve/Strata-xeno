@@ -1,4 +1,4 @@
 # expect: Unsupported
-class A:
+class A(int):
     pass
 x = (

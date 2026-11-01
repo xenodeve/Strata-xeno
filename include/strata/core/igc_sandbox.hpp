@@ -133,7 +133,7 @@ struct Alloc {
 
 enum class Tag : uint8_t {
     Empty, None, Bool, Int, Float, Type, Native, Module, Stub, Ellipsis, Block,
-    Big, Str, List, Tuple, Dict, Set, Range, Slice, Function, Bound, Iter, Exc, Cell, Cached, Fraction, Deque, View
+    Big, Str, List, Tuple, Dict, Set, Range, Slice, Function, Bound, Iter, Exc, Cell, Cached, Fraction, Deque, View, Class, Instance, Method
 };
 
 // clang-format off
@@ -367,6 +367,31 @@ struct BoundObj : Obj {
     BoundObj(Value s, const NativeDef* m) : Obj(Tag::Bound), self(std::move(s)), method(m) {}
     void clear() override { self.reset(); }
 };
+// A class holds methods and nothing else: `class X:` with `def`s, all the model was seen to write (29 of 241 blocks, every one
+// `class Solution`, no bases, no dunders but none at all). The parser refuses the rest, so no protocol method is ever silently ignored.
+using Attrs = std::vector<std::pair<std::string_view, Value>, Alloc<std::pair<std::string_view, Value>>>;
+inline const Value* find_attr(const Attrs& attrs, std::string_view name) {
+    for (std::size_t i = attrs.size(); i-- > 0;)
+        if (attrs[i].first == name) return &attrs[i].second;
+    return nullptr;
+}
+struct ClassObj : Obj {
+    std::string_view name;
+    Attrs methods;
+    explicit ClassObj(std::string_view n) : Obj(Tag::Class), name(n) {}
+    void clear() override { methods.clear(); }
+};
+struct InstanceObj : Obj {
+    Value cls;
+    Attrs attrs;
+    explicit InstanceObj(Value c) : Obj(Tag::Instance), cls(std::move(c)) {}
+    void clear() override { cls.reset(); attrs.clear(); }
+};
+struct MethodObj : Obj {
+    Value self, fn;
+    MethodObj(Value s, Value f) : Obj(Tag::Method), self(std::move(s)), fn(std::move(f)) {}
+    void clear() override { self.reset(); fn.reset(); }
+};
 struct ExcObj : Obj {
     int type;
     Vals args;
@@ -537,7 +562,9 @@ inline bool iter_next(const Value& iter, Value& out);
 inline Value call_value(const Value& f, Value* args, int n, const TupleObj* kw_names = nullptr);
 inline const char* tp_name(int type) { return type == T_deque ? "collections.deque" : type == T_defaultdict ? "collections.defaultdict" : kTypes[type].name; }
 inline const char* type_name(const Value& v) { return tp_name(type_of(v)); }
-inline std::string quoted(const Value& v) { return "'" + std::string(type_name(v)) + "'"; }
+inline std::string quoted(const Value& v) {
+    return "'" + (v.tag == Tag::Instance ? std::string(v.as<InstanceObj>()->cls.as<ClassObj>()->name) : std::string(type_name(v))) + "'";
+}
 
 inline Value make_list(Vals&& v = {}) {
     auto* o = new ListObj;
@@ -1566,7 +1593,8 @@ inline int type_of(const Value& v) {
         case Tag::Range: return T_range;
         case Tag::Slice: return T_slice;
         case Tag::Function: return T_function;
-        case Tag::Bound: return T_method;
+        case Tag::Bound: case Tag::Method: return T_method;
+        case Tag::Class: return T_type;
         case Tag::Iter: return v.as<IterObj>()->type;
         case Tag::Exc: return v.as<ExcObj>()->type;
         case Tag::Cached: return T__lru_cache_wrapper;
@@ -1716,6 +1744,11 @@ inline bool eq(const Value& a, const Value& b) {
             auto* x = a.as<SliceObj>();
             auto* y = b.as<SliceObj>();
             return eq(x->start, y->start) && eq(x->stop, y->stop) && eq(x->step, y->step);
+        }
+        case Tag::Method: {
+            auto* x = a.as<MethodObj>();
+            auto* y = b.as<MethodObj>();
+            return x->self.o == y->self.o && x->fn.o == y->fn.o;
         }
         default: return a.o == b.o;
     }
@@ -1874,7 +1907,9 @@ inline uint64_t hash_of(const Value& v) {
         }
         case Tag::Fraction: return hash_frac(v.as<FractionObj>());
         case Tag::Type: case Tag::Module: return mix64(77, (uint64_t) v.i);
-        case Tag::Native: case Tag::Function: case Tag::Bound: case Tag::Iter: case Tag::Exc: case Tag::Cached: return mix64(78, (uint64_t) v.i);
+        case Tag::Native: case Tag::Function: case Tag::Bound: case Tag::Iter: case Tag::Exc: case Tag::Cached: case Tag::Class: case Tag::Instance:
+            return mix64(78, (uint64_t) v.i);
+        case Tag::Method: return mix64(79, (uint64_t) v.as<MethodObj>()->self.i ^ (uint64_t) v.as<MethodObj>()->fn.i);
         case Tag::Ellipsis: return 0x5D5B;
         default: break;
     }
@@ -4598,6 +4633,20 @@ inline const NativeDef* chain_from_iterable_def();
 inline Value get_attr(const Value& obj, std::string_view name) {
     switch (obj.tag) {
         case Tag::Module: return module_attr((int) obj.i, name);
+        case Tag::Class: {
+            auto* c = obj.as<ClassObj>();
+            if (name == "__name__") return text(c->name);
+            if (const Value* m = find_attr(c->methods, name)) return *m;
+            if (name.starts_with("__")) refuse(std::string(name) + " of a class");
+            raise(T_AttributeError, "type object '" + std::string(c->name) + "' has no attribute '" + std::string(name) + "'");
+        }
+        case Tag::Instance: {
+            auto* self = obj.as<InstanceObj>();
+            if (const Value* a = find_attr(self->attrs, name)) return *a;
+            if (const Value* m = find_attr(self->cls.as<ClassObj>()->methods, name)) return Value(new MethodObj(obj, *m));
+            if (name.starts_with("__")) refuse(std::string(name) + " of an instance");
+            raise(T_AttributeError, quoted(obj) + " object has no attribute '" + std::string(name) + "'");
+        }
         case Tag::Type: {
             if (name == "__name__") {
                 if (obj.i == T_iterator || obj.i == T_method) refuse("the type of a C-level iterator or method");
@@ -4656,6 +4705,29 @@ inline Value get_attr(const Value& obj, std::string_view name) {
         if (t == T_object) break;
     }
     if (name == "__name__" && (obj.tag == Tag::Native || obj.tag == Tag::Function || obj.tag == Tag::Cached)) refuse("__name__ of a function");
+    raise(T_AttributeError, quoted(obj) + " object has no attribute '" + std::string(name) + "'");
+}
+
+inline void set_attr(const Value& obj, std::string_view name, Value v) {
+    if (obj.tag != Tag::Instance) refuse(std::string("setting an attribute of a ") + type_name(obj));
+    Attrs& attrs = obj.as<InstanceObj>()->attrs;
+    for (auto& a : attrs) {
+        if (a.first == name) {
+            a.second = std::move(v);
+            return;
+        }
+    }
+    attrs.emplace_back(name, std::move(v));
+}
+inline void delete_attr(const Value& obj, std::string_view name) {
+    if (obj.tag != Tag::Instance) refuse(std::string("deleting an attribute of a ") + type_name(obj));
+    Attrs& attrs = obj.as<InstanceObj>()->attrs;
+    for (std::size_t i = 0; i < attrs.size(); ++i) {
+        if (attrs[i].first == name) {
+            attrs.erase(attrs.begin() + (std::ptrdiff_t) i);
+            return;
+        }
+    }
     raise(T_AttributeError, quoted(obj) + " object has no attribute '" + std::string(name) + "'");
 }
 
@@ -5018,7 +5090,7 @@ struct Lexer {
 enum class K : uint8_t {
     Constant, Name, Binary, Unary, Not, BoolOp, Compare, IfExp, Lambda, Call, Attribute, Subscript, Slice, List, Tuple, Set, Dict, ListComp,
     SetComp, GenExp, DictComp, CompFor, Starred, Walrus, FString, Formatted, Keyword, Param,
-    Block, ExprStmt, Assign, AugAssign, AnnAssign, If, While, For, Break, Continue, Pass, Def, Return, Raise, Global, Nonlocal, Assert, Del,
+    Block, ExprStmt, Assign, AugAssign, AnnAssign, If, While, For, Break, Continue, Pass, Def, Class, Return, Raise, Global, Nonlocal, Assert, Del,
     Import, ImportFrom, Alias, Try, Handler
 };
 struct Scope;
@@ -5148,7 +5220,10 @@ struct Parser {
                 case Kw::Try: into.push_back(parse_try()); return;
                 case Kw::Def: into.push_back(parse_def(nullptr)); return;
                 case Kw::Class:
-                    if (peek().kind == Tok::Name) parse_refuse(line(), "class");
+                    if (peek().kind == Tok::Name) {
+                        into.push_back(parse_class());
+                        return;
+                    }
                     invalid();
                 case Kw::With:
                     if (peek().kind != Tok::Op || peek().id != (uint8_t) P::Assign) parse_refuse(line(), "with");
@@ -5294,10 +5369,31 @@ struct Parser {
         const std::string_view name = head->kind == K::Name || head->kind == K::Attribute ? head->name : std::string_view{};
         if (name != "lru_cache" && name != "cache") parse_refuse(at, "decorator");
         if (is_op(P::At)) parse_refuse(line(), "stacked decorators");
-        if (is_kw(Kw::Class)) parse_refuse(line(), "class");
+        if (is_kw(Kw::Class)) parse_refuse(line(), "a decorated class");
         if (is_kw(Kw::Async)) parse_refuse(line(), "async");
         if (!is_kw(Kw::Def)) invalid();
         return parse_def(decorator);
+    }
+    // Methods only. A base, a class attribute or a protocol method is refused here, never run with the wrong meaning.
+    Node* parse_class() {
+        Node* node = make(K::Class, line());
+        advance();
+        node->name = name_token();
+        if (accept(P::LParen)) {
+            if (!is_op(P::RParen)) {
+                const Node* base = parse_named();
+                if (base->kind != K::Name || base->name != "object" || !is_op(P::RParen)) parse_refuse(node->line, "a base class");
+            }
+            expect(P::RParen);
+        }
+        node->a = parse_block("class definition");
+        for (const Node* item : node->a->items) {
+            if (item->kind == K::Pass) continue;
+            if (item->kind == K::ExprStmt && item->a->kind == K::Constant) continue;
+            if (item->kind != K::Def) parse_refuse(item->line, "a class body with more than methods");
+            if (item->name.starts_with("__") && item->name != "__init__") parse_refuse(item->line, std::string(item->name) + " in a class");
+        }
+        return node;
     }
     void parse_params(Node* owner, bool annotations, P closer) {
         bool seen_star = false, seen_double = false, seen_default = false;
@@ -5423,14 +5519,12 @@ struct Parser {
             Node* node = make(K::AnnAssign, at);
             parse_expr();
             node->a = first;
-            if (first->kind == K::Attribute) parse_refuse(at, "attribute assignment");
             if (accept(P::Assign)) node->b = parse_star_list();
             else if (first->kind != K::Name) parse_refuse(at, "an annotation with no value on a subscript");
             return node;
         }
         if (cur().kind == Tok::Op && cur().id >= (uint8_t) P::PlusEq) {
-            if (first->kind == K::Attribute) parse_refuse(at, "attribute assignment");
-            if (first->kind != K::Name && first->kind != K::Subscript) syntax_error(at, "illegal expression for augmented assignment");
+            if (first->kind != K::Name && first->kind != K::Subscript && first->kind != K::Attribute) syntax_error(at, "illegal expression for augmented assignment");
             Node* node = make(K::AugAssign, at);
             node->op = augmented_op((P) cur().id);
             advance();
@@ -5461,8 +5555,7 @@ struct Parser {
     }
     void check_target(Node* n) {
         switch (n->kind) {
-            case K::Name: case K::Subscript: return;
-            case K::Attribute: parse_refuse(n->line, "attribute assignment");
+            case K::Name: case K::Subscript: case K::Attribute: return;
             case K::Tuple: case K::List: {
                 bool starred = false;
                 for (Node* item : n->items) {
@@ -5482,8 +5575,7 @@ struct Parser {
     }
     void check_delete_target(Node* n) {
         switch (n->kind) {
-            case K::Name: case K::Subscript: return;
-            case K::Attribute: parse_refuse(n->line, "attribute deletion");
+            case K::Name: case K::Subscript: case K::Attribute: return;
             case K::Tuple: case K::List:
                 for (Node* item : n->items) check_delete_target(item);
                 return;
@@ -6287,7 +6379,7 @@ enum class Op : uint16_t {
     JumpIfFalseOrPop, JumpIfTrueOrPop, GetIter, ForIter, BuildList, BuildTuple, BuildSet, BuildDict, BuildSlice, BuildString, FormatValue,
     ListAppend, SetAdd, MapAdd, ListExtend, SetUpdate, DictUpdate, DictMerge, ListToTuple, Subscr, StoreSubscr, DeleteSubscr, LoadAttr, KwNames,
     Call, CallMethod, CallEx, MakeFunction, Return, Yield, Unpack, UnpackEx, Raise, Reraise, SetupTry, PopBlock, PopExcept, PushHandled,
-    ExcMatch, Import, ImportFrom
+    ExcMatch, Import, ImportFrom, BuildClass, AddMethod, StoreAttr, DeleteAttr
 };
 struct Instr {
     Op op;
@@ -6410,6 +6502,14 @@ struct ScopeBuilder {
                 bind(s, n->name);
                 function(s, n);
                 return;
+            case K::Class:   // no scope of its own: a method sees what surrounds the class, and its name binds nowhere
+                bind(s, n->name);
+                for (Node* item : n->a->items) {
+                    if (item->kind != K::Def) continue;
+                    if (item->c) walk(s, item->c);
+                    function(s, item);
+                }
+                return;
             case K::Assign:
                 walk(s, n->a);
                 for (Node* t : n->items) bind_target(s, t);
@@ -6525,7 +6625,9 @@ struct Compiler {
             case Op::StoreFast: case Op::StoreDeref: case Op::StoreGlobal: case Op::Pop: case Op::Add: case Op::Sub: case Op::Mul: case Op::Binary: case Op::Compare:
             case Op::JumpIfFalse: case Op::JumpIfTrue: case Op::JumpIfFalseOrPop: case Op::JumpIfTrueOrPop: case Op::ListAppend: case Op::SetAdd: case Op::ListExtend:
             case Op::SetUpdate: case Op::DictUpdate: case Op::DictMerge: case Op::Subscr: case Op::Return: case Op::Yield: case Op::Reraise: case Op::PopBlock: case Op::ExcMatch: return -1;
-            case Op::MapAdd: case Op::DeleteSubscr: case Op::BuildSlice: return -2;
+            case Op::BuildClass: return 1;
+            case Op::AddMethod: case Op::DeleteAttr: return -1;
+            case Op::MapAdd: case Op::DeleteSubscr: case Op::BuildSlice: case Op::StoreAttr: return -2;
             case Op::StoreSubscr: return -3;
             case Op::ForIter: case Op::SetupTry: return 1;
             case Op::BuildList: case Op::BuildTuple: case Op::BuildSet: case Op::BuildString: return 1 - a;
@@ -7051,6 +7153,10 @@ struct Compiler {
                 expr(t->b);
                 emit(Op::StoreSubscr);
                 return;
+            case K::Attribute:
+                expr(t->a);
+                emit(Op::StoreAttr, attr_index(t->name));
+                return;
             case K::Tuple: case K::List: {
                 int star = -1;
                 for (std::size_t i = 0; i < t->items.size(); ++i)
@@ -7070,6 +7176,9 @@ struct Compiler {
             expr(t->a);
             expr(t->b);
             emit(Op::DeleteSubscr);
+        } else if (t->kind == K::Attribute) {
+            expr(t->a);
+            emit(Op::DeleteAttr, attr_index(t->name));
         } else {
             for (Node* item : t->items) delete_target(item);
         }
@@ -7129,6 +7238,14 @@ struct Compiler {
                     expr(n->b);
                     emit_binary((Bin) n->op, true);
                     store_name(n->a->name);
+                } else if (n->a->kind == K::Attribute) {
+                    expr(n->a->a);
+                    emit(Op::Dup);
+                    emit(Op::LoadAttr, attr_index(n->a->name));
+                    expr(n->b);
+                    emit_binary((Bin) n->op, true);
+                    emit(Op::Rot2);
+                    emit(Op::StoreAttr, attr_index(n->a->name));
                 } else {
                     expr(n->a->a);
                     expr(n->a->b);
@@ -7224,6 +7341,18 @@ struct Compiler {
                 if (n->c) expr(n->c);
                 compile_function_object(n, n->name);
                 if (n->c) emit(Op::Call, 1);
+                store_name(n->name);
+                return;
+            }
+            case K::Class: {
+                emit(Op::BuildClass, attr_index(n->name));
+                for (Node* item : n->a->items) {
+                    if (item->kind != K::Def) continue;
+                    if (item->c) expr(item->c);
+                    compile_function_object(item, std::string(n->name) + "." + std::string(item->name));
+                    if (item->c) emit(Op::Call, 1);
+                    emit(Op::AddMethod, attr_index(item->name));
+                }
                 store_name(n->name);
                 return;
             }
@@ -7645,6 +7774,27 @@ struct VM {
             throw PyError{std::move(passing)};
         }
     }
+    static Vals with_self(const Value& self, Value* args, int n, const TupleObj* kw) {
+        const int nkw = kw ? (int) kw->v.size() : 0;
+        Vals full((std::size_t) (n + nkw + 1));
+        full[0] = self;
+        for (int i = 0; i < n + nkw; ++i) full[(std::size_t) i + 1] = std::move(args[i]);
+        return full;
+    }
+    Value instantiate(const Value& cls, Value* args, int n, const TupleObj* kw) {
+        auto* c = cls.as<ClassObj>();
+        Value self(new InstanceObj(cls));
+        const Value* init = find_attr(c->methods, "__init__");
+        if (!init) {
+            if (n || kw) raise(T_TypeError, std::string(c->name) + "() takes no arguments");
+            return self;
+        }
+        const Value fn = *init;
+        Vals full = with_self(self, args, n, kw);
+        const Value out = call(fn, full.data(), n + 1, kw);
+        if (!out.is_none()) raise(T_TypeError, "__init__() should return None, not " + quoted(out));
+        return self;
+    }
     Value call(const Value& f, Value* args, int n, const TupleObj* kw) {
         switch (f.tag) {
             case Tag::Function: {
@@ -7656,6 +7806,13 @@ struct VM {
             }
             case Tag::Native: return call_native(f.native, args, n, kw);
             case Tag::Type: return construct((int) f.i, args, n, kw);
+            case Tag::Class: return instantiate(f, args, n, kw);
+            case Tag::Method: {
+                auto* m = f.as<MethodObj>();
+                const Value fn = m->fn;
+                Vals full = with_self(m->self, args, n, kw);
+                return call(fn, full.data(), n + 1, kw);
+            }
             case Tag::Bound: {
                 auto* b = f.as<BoundObj>();
                 const int nkw = kw ? (int) kw->v.size() : 0;
@@ -7838,14 +7995,33 @@ struct VM {
         args[-1] = std::move(out);
         f->sp = args;
     }
-    void call_method(Frame* f, const Code* code, int name_index, int total, const TupleObj* kw) {
+    // True when a frame was pushed: `self.dfs(i + 1)` stays on heap frames like any other Python call.
+    bool call_method(Frame* f, const Code* code, int name_index, int total, const TupleObj* kw) {
         const std::string_view name = code->names[(std::size_t) name_index];
         Value* recv = f->sp - total - 1;
         const int npos = total - (kw ? (int) kw->v.size() : 0);
         Value out;
         const NativeDef* method = nullptr;
-        if (recv->tag != Tag::Module && recv->tag != Tag::Type && recv->tag != Tag::Stub) method = method_for(type_of(*recv), name);
-        if (method) {
+        const Value* in_class = nullptr;
+        if (recv->tag == Tag::Instance) {
+            auto* self = recv->as<InstanceObj>();
+            if (!find_attr(self->attrs, name)) in_class = find_attr(self->cls.as<ClassObj>()->methods, name);
+        } else if (recv->tag != Tag::Module && recv->tag != Tag::Type && recv->tag != Tag::Stub && recv->tag != Tag::Class) {
+            method = method_for(type_of(*recv), name);
+        }
+        if (in_class && in_class->tag == Tag::Function) {
+            const Value fn = *in_class;
+            Value gen = enter(fn, recv, npos + 1, kw);
+            clear_range(recv, f->sp);
+            f->sp = recv;
+            if (gen.empty()) return true;
+            *f->sp++ = std::move(gen);
+            return false;
+        }
+        if (in_class) {
+            const Value fn = *in_class;
+            out = call(fn, recv, npos + 1, kw);
+        } else if (method) {
             if (method->is_static) out = call_native(method, recv + 1, npos, kw);
             else out = call_native(method, recv, npos + 1, kw, 1);
         } else {
@@ -7855,6 +8031,7 @@ struct VM {
         clear_range(recv, f->sp);
         *recv = std::move(out);
         f->sp = recv + 1;
+        return false;
     }
     // True when a frame was pushed.
     bool call_ex(Frame* f, bool has_dict) {
@@ -8317,10 +8494,35 @@ inline Value VM::execute(std::size_t stop) {
                 const TupleObj* kw = pending_kw;
                 pending_kw = nullptr;
                 SYNC();
-                call_method(f, f->code, in.a, in.b, kw);
-                sp = f->sp;
+                if (call_method(f, f->code, in.a, in.b, kw)) {
+                    RELOAD();
+                } else {
+                    sp = f->sp;
+                }
                 break;
             }
+            case Op::BuildClass:
+                SYNC();
+                *sp = Value(new ClassObj(f->code->names[(std::size_t) in.a]));
+                ++sp;
+                break;
+            case Op::AddMethod:
+                SYNC();
+                sp[-2].as<ClassObj>()->methods.emplace_back(f->code->names[(std::size_t) in.a], std::move(sp[-1]));
+                --sp;
+                break;
+            case Op::StoreAttr:
+                SYNC();
+                set_attr(sp[-1], f->code->names[(std::size_t) in.a], std::move(sp[-2]));
+                clear_range(sp - 2, sp);
+                sp -= 2;
+                break;
+            case Op::DeleteAttr:
+                SYNC();
+                delete_attr(sp[-1], f->code->names[(std::size_t) in.a]);
+                sp[-1].reset();
+                --sp;
+                break;
             case Op::CallEx:
                 SYNC();
                 if (call_ex(f, in.b != 0)) {
@@ -8761,6 +8963,7 @@ inline bool is_instance(const Value& v, const Value& t) {
         return false;
     }
     if (t.tag == Tag::Stub) refuse("isinstance with a typing object");
+    if (t.tag == Tag::Class) return v.tag == Tag::Instance && v.as<InstanceObj>()->cls.o == t.o;
     if (t.tag != Tag::Type) raise(T_TypeError, "isinstance() arg 2 must be a type, a tuple of types, or a union");
     return subtype(type_of(v), (int) t.i);
 }
@@ -8780,7 +8983,7 @@ inline Value b_issubclass(Call& c) {
 }
 inline Value b_callable(Call& c) {
     const Tag t = c.a[0].tag;
-    return Value::boolean(t == Tag::Function || t == Tag::Native || t == Tag::Type || t == Tag::Bound || t == Tag::Cached);
+    return Value::boolean(t == Tag::Function || t == Tag::Native || t == Tag::Type || t == Tag::Bound || t == Tag::Cached || t == Tag::Class || t == Tag::Method);
 }
 // These hash here, but not to CPython's number. A str has no fixed number there, so any value is true of it.
 inline void require_cpython_hash(const Value& v) {
@@ -9262,7 +9465,7 @@ inline Value make_range(Value* a, int n) {
 }
 inline void require_callable_or_none(const Value& v) {
     const Tag t = v.tag;
-    if (t != Tag::None && t != Tag::Function && t != Tag::Native && t != Tag::Type && t != Tag::Bound && t != Tag::Cached) raise(T_TypeError, "first argument must be callable or None");
+    if (t != Tag::None && t != Tag::Function && t != Tag::Native && t != Tag::Type && t != Tag::Bound && t != Tag::Cached && t != Tag::Class && t != Tag::Method) raise(T_TypeError, "first argument must be callable or None");
 }
 inline Value make_fraction(Value* a, int n, const TupleObj* kw) {
     Value* den_kw = nullptr;
@@ -9420,6 +9623,7 @@ inline Value construct(int type, Value* a, int n, const TupleObj* kw) {
         }
         case T_type: {
             if (n != 1) refuse("type() with three arguments");
+            if (a[0].tag == Tag::Instance) return a[0].as<InstanceObj>()->cls;
             return Value::type(type_of(a[0]));
         }
         case T_deque: {
@@ -9929,7 +10133,7 @@ inline Value f_reduce(Call& c) {
 inline Value f_wrap(Call& c);
 inline const NativeDef kWrapWith = {"lru_cache", f_wrap, 2, 2};
 inline Value cached_of(const Value& fn, int64_t maxsize) {
-    if (fn.tag != Tag::Function && fn.tag != Tag::Native && fn.tag != Tag::Type && fn.tag != Tag::Bound && fn.tag != Tag::Cached) raise(T_TypeError, "the first argument must be callable");
+    if (fn.tag != Tag::Function && fn.tag != Tag::Native && fn.tag != Tag::Type && fn.tag != Tag::Bound && fn.tag != Tag::Cached && fn.tag != Tag::Class && fn.tag != Tag::Method) raise(T_TypeError, "the first argument must be callable");
     return Value(new CachedObj(fn, maxsize));
 }
 inline Value f_wrap(Call& c) { return cached_of(c.a[1], c.a[0].is_none() ? -1 : std::max<int64_t>(int_arg(c.a[0]), 0)); }
