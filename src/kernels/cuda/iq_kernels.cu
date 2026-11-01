@@ -3166,6 +3166,9 @@ void hadamard_bad_block(const char* what, int block, int64_t width) {
                          "(hadamard.txt's block and the expert widths disagree)\n", what, block, (long long) width);
     std::exit(1);
 }
+// A grid dimension stops at 65535. A layer's rows are the prompt chunk times the experts a token routes to, so 8192 tokens
+// with every expert on one card pass it, and the launch fails with `invalid argument` (#285).
+constexpr int64_t kMaxGridRows = 65535;
 bool hadamard_block_ok(int block, int64_t width) {
     return block >= 2 && block <= 1024 && (block & (block - 1)) == 0 && width % block == 0;
 }
@@ -3174,18 +3177,22 @@ bool hadamard_block_ok(int block, int64_t width) {
 void hadamard_rows(const float* x, float* y, int64_t rows, int64_t width, int block, const float* signs, void* stream) {
     if (rows <= 0) return;
     if (!hadamard_block_ok(block, width)) hadamard_bad_block("hadamard_rows", block, width);
-    hadamard_rows_kernel<float><<<dim3((unsigned) (width / block), (unsigned) rows), block, block * sizeof(float),
-                                  (cudaStream_t) stream>>>(x, y, width, signs, 1.0f / std::sqrt((float) block));
-    check("hadamard_rows");
+    for (int64_t at = 0; at < rows; at += kMaxGridRows) {
+        hadamard_rows_kernel<float><<<dim3((unsigned) (width / block), (unsigned) std::min(rows - at, kMaxGridRows)), block, block * sizeof(float),
+                                      (cudaStream_t) stream>>>(x + at * width, y + at * width, width, signs, 1.0f / std::sqrt((float) block));
+        check("hadamard_rows");
+    }
 }
 
 void hadamard_rows_f16(uint16_t* x, int64_t rows, int64_t width, int block, const float* signs, void* stream) {
     if (rows <= 0) return;
     if (!hadamard_block_ok(block, width)) hadamard_bad_block("hadamard_rows_f16", block, width);
-    hadamard_rows_kernel<__half><<<dim3((unsigned) (width / block), (unsigned) rows), block, block * sizeof(float),
-                                   (cudaStream_t) stream>>>((const __half*) x, (__half*) x, width, signs,
-                                                            1.0f / std::sqrt((float) block));
-    check("hadamard_rows_f16");
+    for (int64_t at = 0; at < rows; at += kMaxGridRows) {
+        hadamard_rows_kernel<__half><<<dim3((unsigned) (width / block), (unsigned) std::min(rows - at, kMaxGridRows)), block, block * sizeof(float),
+                                       (cudaStream_t) stream>>>((const __half*) x + at * width, (__half*) x + at * width, width, signs,
+                                                                1.0f / std::sqrt((float) block));
+        check("hadamard_rows_f16");
+    }
 }
 
 const float* hadamard_device_signs(const float* host, int width) {
