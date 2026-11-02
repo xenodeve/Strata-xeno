@@ -44,6 +44,18 @@ int main() try {
             }
             require(!fired, "different lines are not a loop");
         }
+        {
+            const auto said = [](int rounds) {   // `n? phrase? n+1? ...` with the count in digit tokens
+                std::vector<int32_t> masked;
+                for (int n = 1000; n < 1000 + rounds; ++n) {
+                    for (int at = 1000; at > 0; at /= 10) masked.push_back(inline_tokens::masked_digit(15 + n / at % 10));
+                    for (int32_t word : {1701, 1702, 1703, 1704}) masked.push_back(word);
+                }
+                return inline_tokens::counting(masked);
+            };
+            require(said(inline_tokens::kCountRounds), "counting is a cycle once its digits are masked");
+            require(!said(inline_tokens::kCountRounds - 1), "and not before enough rounds");
+        }
         require(!inline_tokens::in_cycle(tail(phrase, 7), 128, 8), "seven rounds can still leave");
         require(inline_tokens::in_cycle(tail({7, 8}, 32), 128, 8), "a short loop, 64 tokens");
         require(!inline_tokens::in_cycle(tail({7, 8}, 31), 128, 8), "a short run is not yet one");

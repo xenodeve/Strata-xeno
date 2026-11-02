@@ -13,6 +13,25 @@ class Repeating(unittest.TestCase):
     def test_a_few_rounds_can_still_leave(self):
         self.assertFalse(repeating(list(range(100)) + [7, 8, 9] * 10))
 
+    def test_counting_by_hand_is_a_cycle_once_masked(self):
+        def said(rounds):
+            out = []
+            for n in range(1000, 1000 + rounds):
+                out += [15 + int(d) for d in str(n)] + [1701, 1702, 1703, 1704]
+            return out
+        self.assertTrue(repeating(said(64)))
+        self.assertFalse(repeating(said(63)))
+
+    def test_a_long_line_back_sixteen_times_is_a_loop(self):
+        line = [1000 + i for i in range(12)] + [198]
+        other = [[2000 + r * 20 + i for i in range(80)] + [198] for r in range(16)]
+        tokens = [t for r in range(16) for t in line + other[r]]
+        tokens += [3000 + i % 7000 for i in range(4096 - len(tokens) % 4096)]
+        self.assertTrue(repeating(tokens))
+        short = [t for r in range(16) for t in line[:11] + [198] + other[r]]
+        short += [3000 + i % 7000 for i in range(4096 - len(short) % 4096)]
+        self.assertFalse(repeating(short))
+
     def test_a_cycle_past_512_tokens_takes_eight_rounds(self):
         cycle = [i * i % 9973 for i in range(517)]
         self.assertTrue(repeating(list(range(100)) + cycle * 8))

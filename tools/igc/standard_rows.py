@@ -34,6 +34,21 @@ LETTERS = 'ABCDEFGHIJKLMNOP'
 LETTER_TAIL = '\n\nFinish your answer with "the answer is (X)" where X is the correct letter.'
 
 
+HLE_TAIL = ('\n\nYour response should be in the following format:\nExplanation: {your explanation for your final answer}\n'
+            'Exact Answer: {your succinct, final answer}\nConfidence: {your confidence score between 0% and 100% for your answer}')
+
+
+def hle_rows(path, categories=('Math', 'Physics', 'Computer Science/AI'), sample=30, seed=1):
+    """Humanity's Last Exam, read from a local parquet that stays on the test machine: its authors ask that the questions are not shared.
+    Text only, numeric gold only: those are the rows a program can reach and a rule can score with no judge."""
+    import pyarrow.parquet as pq
+    table = pq.read_table(path, columns=['id', 'question', 'image', 'answer', 'answer_type', 'category']).to_pylist()
+    keep = [r for r in table if not r['image'] and r['answer_type'] == 'exactMatch' and r['category'] in categories
+            and re.fullmatch(r'-?\d+(?:\.\d+)?(?:/\d+)?', r['answer'].replace(',', '').strip())]
+    random.Random(seed).shuffle(keep)
+    return [dict(id='hle-' + r['id'][:12], suite='hle', prompt=r['question'] + HLE_TAIL, answer=r['answer'].strip(), limit=8192, group=r['category']) for r in keep[:sample]], len(keep)
+
+
 def plain_prompt(row):
     """The question alone, with no exemplars, for the arms with the thinking on."""
     text = row['prompt']

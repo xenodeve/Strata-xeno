@@ -56,6 +56,35 @@ def repeating(tokens, longest=4096, rounds=20):
         tail = tokens[-period * count:]
         if tail == tail[:period] * count:
             return True
+    return counting(tokens) or (len(tokens) % 4096 == 0 and line_back(tokens))
+
+
+def counting(tokens, longest=128, rounds=64):
+    """The engine's check, for arms with no MIP: with digit tokens masked, counting by hand is one cycle."""
+    masked = [15 if 15 <= t <= 24 else t for t in tokens[-longest * rounds:]]
+    for period in range(1, longest + 1):
+        if len(masked) < period * rounds:
+            return False
+        tail = masked[-period * rounds:]
+        if tail[period:] == tail[:-period]:
+            return True
+    return False
+
+
+def line_back(tokens, shortest=12, rounds=16):
+    """The engine's check, for arms with no MIP: a long line that keeps coming back is a loop past any cycle check."""
+    seen = {}
+    line = []
+    for token in tokens:
+        if token not in (198, 271):
+            line.append(token)
+            continue
+        if len(line) >= shortest:
+            key = tuple(line)
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] >= rounds:
+                return True
+        line = []
     return False
 
 

@@ -2,7 +2,7 @@
 Easy questions show nothing, and neither do misses with nothing to compute: a wrong fact or a misread question is out of reach.
 select_rows.py records.json rows.jsonl output.jsonl [share of right]"""
 import json, random, re, sys
-from tools.igc.standard_score import bbh_right, letter_answer, math_right
+from tools.igc.standard_score import bbh_right, hle_right, letter_answer, math_right
 
 
 def right(row, text):
@@ -10,6 +10,8 @@ def right(row, text):
         return math_right(text, row['answer'])
     if row['suite'] == 'bbh':
         return bbh_right(text, row['answer'])
+    if row['suite'] == 'hle':
+        return hle_right(text, row['answer'])
     return letter_answer(text) == row['answer']
 
 

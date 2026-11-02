@@ -123,6 +123,20 @@ inline constexpr int kLineTokens = 12, kLineRounds = 16;
 // A run that counts by hand changes its numbers, so neither check sees it, and it feeds on these values: 8,104 of them in 261,266
 // tokens. Of 2,471 stored runs that took a value and ended by themselves, one took more than 256, and it was wrong; a right one took 78.
 inline constexpr int kMaxValues = 256;
+// Counting with no value and no line end, `3984? "..."? 3985? ...`, ran 915,200 characters on one line to the end of the context, in a
+// row the model answers wrong anyway. With digit tokens masked it is one exact cycle. Over 7,444 stored runs, 64 rounds fired on 5 that
+// ended by themselves, all wrong, and on none that was right.
+inline constexpr int kCountPeriod = 128, kCountRounds = 64;
+inline int32_t masked_digit(int32_t token) { return token >= 15 && token <= 24 ? 15 : token; }
+inline bool counting(std::span<const int32_t> masked) {
+    for (int period = 1; period <= kCountPeriod; ++period) {
+        const std::size_t span = static_cast<std::size_t>(period) * kCountRounds;
+        if (masked.size() < span) return false;
+        const auto tail = masked.last(span);
+        if (std::equal(tail.begin() + period, tail.end(), tail.begin())) return true;
+    }
+    return false;
+}
 class LineRepeat {
 public:
     bool step(int32_t token) {

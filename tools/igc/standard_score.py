@@ -2,6 +2,7 @@
 BBH: the text after `the answer is`, as the CoT exemplars end. Strings are compared after normalizing: the harness's sympy fallback is not
 used, so a right answer in another form counts wrong here and MATH is a lower bound."""
 import re
+from fractions import Fraction
 
 SUBSTITUTIONS = [('an ', ''), ('a ', ''), ('.$', '$'), ('\\$', ''), (r'\ ', ''), (' ', ''), ('mbox', 'text'), (',\\text{and}', ','),
                  ('\\text{and}', ','), ('\\text{m}', '\\text{}')]
@@ -91,6 +92,34 @@ def bbh_answer(text):
 def bbh_right(text, gold):
     answer = bbh_answer(text)
     return answer is not None and answer.lower().rstrip('.') == gold.strip().lower().rstrip('.')
+
+
+def hle_answer(text):
+    """The line the benchmark's prompt asks for, last one wins."""
+    found = re.findall(r'Exact Answer:\s*(.+)', reply(text))
+    return found[-1].strip() if found else None
+
+
+def hle_number(text):
+    """The number a short answer states, as an exact fraction: after its last `=`, the first one. None when it holds none."""
+    text = re.sub(r'\\d?frac\{(\d+)\}\{(\d+)\}', r'\1/\2', str(text)).replace(',', '').rsplit('=', 1)[-1]
+    found = re.search(r'-?\d+(?:\.\d+)?(?:/\d+)?', text)
+    if not found:
+        return None
+    try:
+        return Fraction(found.group())
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def hle_right(text, gold):
+    """Exact, except that a gold with decimals allows one unit in its last place. Only numeric golds are scored here, which needs no judge."""
+    got, want = hle_answer(text), hle_number(gold)
+    value = None if got is None else hle_number(got)
+    if value is None or want is None:
+        return False
+    places = len(str(gold).split('.')[1]) if '.' in str(gold) else None
+    return value == want if places is None else abs(value - want) <= Fraction(1, 10 ** places)
 
 
 def letter_answer(text):
