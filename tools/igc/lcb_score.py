@@ -5,7 +5,8 @@ import json, multiprocessing, re, sys
 CHECK = r'''
 import ast, json, sys, time, io
 source, case, kind, name = json.load(open(sys.argv[1]))
-header = "from typing import *\nfrom collections import *\nfrom functools import *\nfrom itertools import *\nfrom math import *\nfrom heapq import *\nfrom bisect import *\nimport sys, re, string, random, operator\n"
+# builtins last, as LiveCodeBench's own header has it: `from math import *` put math.pow over pow, and every pow(x, e, MOD) failed
+header = "from typing import *\nfrom collections import *\nfrom functools import *\nfrom itertools import *\nfrom math import *\nfrom heapq import *\nfrom bisect import *\nfrom builtins import *\nimport sys, re, string, random, operator\n"
 got = None
 if kind == 'functional':
     space = {}
@@ -49,7 +50,10 @@ def one(job):
         json.dump([source, case, kind, name], f)
     try:
         r = subprocess.run([sys.executable, '-I', '-B', runner, f.name], capture_output=True, text=True, timeout=6)
-        return r.stdout.strip().split('\n')[-1] if r.stdout.strip() else 'error'
+        if r.stdout.strip():
+            return r.stdout.strip().split('\n')[-1]
+        last = r.stderr.strip().split('\n')[-1] if r.stderr.strip() else ''
+        return ('error: ' + last[:160]) if last else 'error'   # the exception, so a scorer fault shows as one
     except subprocess.TimeoutExpired:
         return 'timeout'
     finally:
