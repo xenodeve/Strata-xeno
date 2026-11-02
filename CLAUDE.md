@@ -74,6 +74,8 @@ as soon as that question has an answer.
 - **Measure a machine's speed on one question before giving it a queue.** Two sessions once ran an hour for numbers nothing used.
 - **Script what repeats:** retries, uploads, scoring, setup. Hand-typed steps fail differently each time.
 - **Write code with backslashes through the file tool,** not a shell heredoc: three commits broke on lost escapes.
+- **Build to the end of the plan alongside the tests.** "We want the highest development speed." Do not wait for a test before starting the next
+  planned piece: every feature has to work in the end. If a result goes wrong, fix it and test it together with what was built next.
 
 ## Idle means scrutinize the tests and the mechanism (developer, 2026-11-02)
 
