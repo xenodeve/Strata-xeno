@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -36,9 +37,16 @@ inline constexpr std::string_view kCallHead = "print(";
 inline constexpr std::string_view kExpectHead = "# result, then the expected output from the question\nexpect(";
 // Said in the model's voice after a mismatch. Self-Debugging: a test result with the model's own explanation did best.
 inline constexpr std::string_view kMismatchLine = "Wait, this does not match, so my approach is wrong somewhere. Why?\n";
-// START's hint, before the thinking ends: the point where the model has a draft and nothing has been cut short.
-inline constexpr std::string_view kGateLine = "Wait, I can use Python to check if my approach is correct and refine it, if necessary.\n\n```python\n";
+// Before the thinking ends, where the model has its answer and nothing has been cut short. START's own words came back as a comment in an
+// empty block, 8 times over, on the question that had 4 drafts written (#288): so the line says what to run, and what the block is for.
+// `Let` and not `Wait`: at this point the first raised a small model's score and the second lowered it (2606.16934).
+inline constexpr std::string_view kGateLine = "Let me run my code on the examples before I answer.\n\n```python\n# the whole program I am about to answer with\n";
+// With a draft already defined the block only calls it.
+inline constexpr std::string_view kGateCallLine = "Let me run my code on the examples before I answer.\n\n```python\n";
+// A match is not proof, and a model tests to confirm: asked to look for what breaks it, it finds more (Failing to Falsify, 2604.02485).
+inline constexpr std::string_view kMatchLine = "The examples match. What input would break this?\n";
 inline constexpr int kMaxGates = 3;
+inline constexpr int kProgramRepeat = 3;   // the same program this many times is a loop of whole blocks, whatever the rule for values says
 // stdin holds only what the program fed itself, so a program that read nothing would look like a program that did nothing.
 inline constexpr std::string_view kNoStdin = "[stdin was empty: put feed(\"...\") before the code, with an example from the question]";
 inline constexpr std::string_view kBlockOpen = "```python\n";
@@ -178,9 +186,15 @@ private:
 // A bare ``` stays out: all 83 fences in 7420 reasonings have no language, and they draft the answer.
 class Fence {
 public:
+    // A bare fence holds the model's own draft: 19 of 20 hard questions wrote one, and 66 % of their tokens came after the first (#288).
+    void read_drafts(bool on) { drafts_ = on; }
     std::optional<std::string> step(std::string_view bytes) {
         std::size_t from = inside_ && text_.size() > 3 ? text_.size() - 3 : 0;
         text_ += bytes;
+        if (!inside_ && drafts_) {
+            if (!open_any()) return std::nullopt;
+            from = 0;
+        }
         if (!inside_) {
             for (const std::string_view open : {"```python\n", "```py\n", "```Python\n"}) {
                 const std::size_t at = text_.find(open);
@@ -212,11 +226,41 @@ public:
         text_ = "\n";
         text_ += head;
         inside_ = true;
+        kind_ = Kind::Code;
     }
+    // Whether what just closed is a program to run. Another language never is, and a bare fence only when it holds a whole draft.
+    bool runs(std::string_view program) const {
+        if (kind_ == Kind::Other) return false;
+        if (kind_ == Kind::Code) return true;
+        return (program.find("\ndef ") != std::string_view::npos || program.find("\nclass ") != std::string_view::npos)
+            && std::count(program.begin(), program.end(), '\n') >= 4;
+    }
+    bool code() const { return kind_ == Kind::Code; }   // the model means to run it, so a block too long to run is told so
 
 private:
+    enum class Kind { Code, Bare, Other };
+    // Pairs every fence, so a closing fence is never read as an opening one. A fence in a sentence, ```python ...```, opens nothing.
+    bool open_any() {
+        for (std::size_t at = text_.find("```"); at != std::string::npos; at = text_.find("```", at + 3)) {
+            std::size_t word = at + 3;
+            while (word < text_.size() && word - at < 19 && (std::isalnum((unsigned char) text_[word]) || text_[word] == '+' || text_[word] == '#' || text_[word] == '-')) ++word;
+            if (word == text_.size()) {   // the line is not finished yet
+                text_.erase(0, at);
+                return false;
+            }
+            if (text_[word] != '\n') continue;
+            const std::string_view language = std::string_view(text_).substr(at + 3, word - at - 3);
+            kind_ = language.empty() ? Kind::Bare : language == "python" || language == "py" || language == "Python" ? Kind::Code : Kind::Other;
+            text_.erase(0, word);   // the block's own newline: an empty block closes on it
+            inside_ = true;
+            return true;
+        }
+        if (text_.size() > 16) text_.erase(0, text_.size() - 16);
+        return false;
+    }
     std::string text_;
-    bool inside_ = false;
+    bool inside_ = false, drafts_ = false;
+    Kind kind_ = Kind::Code;
 };
 
 // The function to call: the last one the block defined at its top level, or a class's last method when the block is a
@@ -302,6 +346,7 @@ public:
     bool printed() const { return printed_last_; }   // the last run finished and said something
     bool quiet() const { return quiet_last_; }       // the last run finished and said nothing
     bool mismatch() const { return mismatch_last_; } // the last run's `expect` found a wrong result
+    bool matched() const { return matched_last_; }   // the last run's every `expect` held
     uint64_t steps() const { return steps_; }
     // Real Python, for what the interpreter refuses: (code, a fresh kernel, body, ok), false when nothing answered. The refusal itself
     // chooses the tier, and a turn that moved stays there, because the kernel holds its names.
@@ -334,6 +379,7 @@ public:
         printed_last_ = result.status == Status::Ok && says_something(body);
         quiet_last_ = result.status == Status::Ok && body.empty() && !result.stdin_short;
         mismatch_last_ = result.status == Status::Ok && body.find("MISMATCH: ") != std::string::npos;
+        matched_last_ = result.status == Status::Ok && !mismatch_last_ && body.starts_with("match: ");
         if (result.status == Status::Ok) {
             done_ = std::move(source);
             printed_ = result.output.size();
@@ -369,6 +415,7 @@ private:
         printed_last_ = ok && says_something(body);
         quiet_last_ = ok && body.empty();
         mismatch_last_ = ok && body.find("MISMATCH: ") != std::string::npos;
+        matched_last_ = ok && !mismatch_last_ && body.starts_with("match: ");
         if (body.size() > kShownOutput) {
             body.resize(kShownOutput);
             body += "\n[output cut]";
@@ -387,6 +434,7 @@ private:
     bool printed_last_ = false;
     bool quiet_last_ = false;
     bool mismatch_last_ = false;
+    bool matched_last_ = false;
     int runs_ = 0;
     uint64_t steps_ = 0;
 };

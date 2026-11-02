@@ -22,7 +22,7 @@ def _approx(got, want):
     return False
 
 
-def expect(got, want):
+def expect(got, want=True):
     """A result set against what the question says it should be."""
     if got == want or _approx(got, want):
         print(f'match: {got!r}')

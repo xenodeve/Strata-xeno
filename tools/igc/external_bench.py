@@ -110,7 +110,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -144,6 +144,9 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     if sandbox_expect:args.append('--igc-sandbox-expect')
     if sandbox_why:args.append('--igc-sandbox-why')
     if sandbox_gate:args.append('--igc-sandbox-gate')
+    if sandbox_draft:args.append('--igc-sandbox-draft')
+    if sandbox_falsify:args.append('--igc-sandbox-falsify')
+    if sandbox_pass_close:args.append('--igc-sandbox-pass-close')
     if sandbox_exec:args.append('--igc-sandbox-exec')
     if sandbox_call:args.append('--igc-sandbox-call')
     if slots:args+=['--batch',str(slots)]
@@ -226,6 +229,9 @@ if __name__=='__main__':
     parser.add_argument('--sandbox-expect',action='store_true',help='open the call as expect(result, expected)')
     parser.add_argument('--sandbox-why',action='store_true',help='the model\'s own line after a mismatch')
     parser.add_argument('--sandbox-gate',action='store_true',help='hold the end of the thinking for a check')
+    parser.add_argument('--sandbox-draft',action='store_true',help='a bare fence holding a whole draft runs too')
+    parser.add_argument('--sandbox-falsify',action='store_true',help='after a passing check, ask what input would break it')
+    parser.add_argument('--sandbox-pass-close',action='store_true',help='end the thinking once every check of a run has passed')
     parser.add_argument('--sandbox-exec',action='store_true',help='what the interpreter refuses runs in real Python: throwaway VM only')
     parser.add_argument('--sandbox-call',action='store_true',help='open a print( after a block that printed nothing')
     parser.add_argument('--plain',action='store_true',help='with --rows-file: the question alone, no exemplars')

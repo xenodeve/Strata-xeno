@@ -55,6 +55,23 @@ int main(int argc, char** argv) {
     }
     {
         Fence f;
+        f.read_drafts(true);
+        auto p = feed(f, {"Now:\n", "```", "\n", "class Solution:\n    def f(self, a):\n        b = a\n        return b\n", "```"});
+        require(p && f.runs(*p), "a bare fence with a whole draft runs");
+        auto q = feed(f, {"\n", "```", "\n", "F=(8/3,2)\n", "```"});
+        require(q && !f.runs(*q), "a bare fence with no draft does not");
+        auto r = feed(f, {"\n", "```cpp\n", "int main() {}\n", "```"});
+        require(r && !f.runs(*r), "nor another language");
+        require(!f.inside(), "and its closing fence opens nothing");
+        require(!feed(f, {"Ensure delimiters: ", "```python ...```", ". Done.\n"}), "a fence in a sentence opens nothing");
+        require(!f.inside(), "and leaves the state alone");
+        auto s = feed(f, {"\n", "```", "python", "\n", "x = 1\n", "```"});
+        require(s && f.runs(*s), "a python block split across tokens still runs");
+        auto t = feed(f, {"\n", "``", "`\n", "def f(a):\n    b = a\n    c = b\n    return c\n", "```"});
+        require(t && f.runs(*t), "a bare fence split across tokens");
+    }
+    {
+        Fence f;
         f.enter();
         f.leave();
         require(!f.inside(), "a stopped block is left behind");
@@ -101,6 +118,10 @@ int main(int argc, char** argv) {
         require(s.run("expect(1, 3)\n") == "\n```output\nMISMATCH: expected 3, got 1\n```\n\n" && s.mismatch(), "a wrong one says what was expected");
         require(s.run("expect(None, [1])\n").find("MISMATCH: expected [1], got None") != std::string::npos && s.mismatch(), "an unfinished draft is a mismatch");
         require(s.run("expect(0.1 + 0.2, 0.3)\n").find("match: ") != std::string::npos && !s.mismatch(), "floats within the benchmark's tolerance match");
+        require(s.run("expect(1 + 1 == 2)\n").find("match: True") != std::string::npos && s.matched(), "one argument is a condition");
+        require(s.run("expect(1 + 1 == 3)\n").find("MISMATCH: expected True, got False") != std::string::npos && s.mismatch() && !s.matched(), "a condition that fails");
+        require(s.run("expect(2, 2)\nexpect(2, 3)\n").find("MISMATCH") != std::string::npos && !s.matched(), "one failure among passes is no pass");
+        require(s.run("print(2)\n") == "\n```output\n2\n```\n\n" && !s.matched(), "a print is no check");
         require(s.run("print(1)\n") == "\n```output\n1\n```\n\n" && !s.mismatch(), "and the next run starts clean");
         require(call_head("def f(a):\n    return a\n", true).ends_with("expect(f("), "the forced call can be a test");
         require(call_head("def f(a):\n    return a\n").starts_with("print(f("), "and stays a print by default");
