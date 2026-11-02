@@ -30,6 +30,14 @@ assert called_in_thinking(HINT + WRITTEN) is None, 'never answered inside the th
 assert tool_call(WRITTEN) is None, 'without the hint the open is missing'
 assert HINT.count('<tool_call>') == 1 and HINT.index('</think>') < HINT.index('<tool_call>') and 'Python here is a good idea' in HINT
 
+# --hint-at wait: only after the model's own Wait / Alternatively opening a sentence, and the hint goes on from its word
+from tools.igc.external_bench import HINT_WAIT, hint_point
+assert hint_point('wait', 'So the area is 1/4.\n\nWait') and hint_point('wait', 'gives 466 m. Alternatively')
+assert not hint_point('wait', 'we wait') and not hint_point('wait', 'Waiting') and not hint_point('wait', 'so Wait')
+assert not hint_point('wait', 'Wait, no.\n'), 'a sentence already past its Wait'
+assert hint_point('line', 'a line\n') and not hint_point('line', 'a line')
+assert tool_call('\n\nWait' + HINT_WAIT + WRITTEN) == 'print(6 * 7)' and HINT_WAIT.startswith(', I can use Python')
+
 # One row's engine lines: m5t's loop rule closed the thinking on 2 rows, and nothing in the records said which (#288)
 import tempfile
 from tools.igc.external_bench import read_events

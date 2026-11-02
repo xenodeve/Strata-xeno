@@ -42,6 +42,18 @@ TOOL_AFTER=4
 # an assistant turn in the model's training), with no answer. As a reply call the response comes as the tool's turn and a new thinking reads it.
 HINT='\n\nWait, maybe using Python here is a good idea.\n</think>\n\n<tool_call>\n<function=run_python>\n<parameter=code>\n'
 HINT_MAX=2
+# --hint-at wait: at a fixed line end the hint cut the weighing of a question's reading on MMLU-Pro (mph2: 11 of 19 against 16, tokens 0.37x,
+# 3 losses committed to a formula or a convention at the call). START puts its hints after the model's own "Wait" / "Alternatively" (2503.04625,
+# Intro and A.4), where it is already reconsidering, and words them as a check of the approach and of the reading. The rest of its first hint follows
+# the model's word, so the sentence stays the model's.
+HINT_WAIT=', I can use Python to check if my approach is correct and refine it, if necessary.\n</think>\n\n<tool_call>\n<function=run_python>\n<parameter=code>\n'
+RECONSIDER=re.compile(r'(?:^|[\n.!?]\s*)(?:Wait|Alternatively)$')
+
+
+def hint_point(mode,tail):
+    """Whether the thinking so far ends where a hint goes in: `line`, any line end; `wait`, the model's own Wait or Alternatively opening a sentence."""
+    if mode=='wait':return bool(RECONSIDER.search(tail))
+    return tail.endswith('\n')
 TOOL_END={248059}   # `</tool_call>` is one token in the Gyro-M pack
 TOOL_OUTPUT=4096
 
@@ -193,7 +205,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_tool=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None,hint_after=0):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_tool=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None,hint_after=0,hint_at='line'):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -305,14 +317,16 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                         thinking=thinking and int(t)!=248069
                         quiet+=thinking
                         if (hint_after and tool_loop and not sandbox_tool and thinking and not lead and quiet>=hint_after and len(hints)<HINT_MAX
-                                and int(t) in (198,271)):hinted=True;break   # a line end, N thinking tokens with no call: the hint goes in
+                                and (int(t) in (198,271) if hint_at=='line' else hint_point(hint_at,tokenizer.decode_bytes(tokens[-16:]).decode('utf-8','replace')))):
+                            hinted=True;break   # N thinking tokens with no call, at a hint point: the hint goes in
                         if tool_loop and not sandbox_tool and thinking and int(t) in TOOL_END:   # the close of a call while thinking: run it before the model writes an answer of its own
                             inner=called_in_thinking(lead+tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                             if inner is not None:break
                         if tool_loop and not thinking and int(t) in TOOL_END:break   # a reply call ends here: ddfff815 wrote a user turn of its own after it
                     said.append(tokens)
                     if hinted:   # the model writes the program on from the hint's open call
-                        hints.append(dict(turn=turn,after=quiet));asked=asked+tokens+tokenizer.encode(HINT);lead=HINT;quiet=0
+                        words=HINT if hint_at=='line' else HINT_WAIT
+                        hints.append(dict(turn=turn,after=quiet,at=hint_at));asked=asked+tokens+tokenizer.encode(words);lead=words;quiet=0
                         continue
                     code=inner if inner is not None else None if stuck or not tool_loop else tool_call(lead+tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                     if code is None:break
@@ -416,7 +430,8 @@ if __name__=='__main__':
     parser.add_argument('--short-first',action='store_true',help='rows in the order of the base arm\'s tokens, fewest first')
     parser.add_argument('--stop-on-loss',type=Path,help='verdicts of the base arm: stop at the first row it got right and this arm did not')
     parser.add_argument('--hint-after',type=int,default=0,help='with --tool-loop and not --sandbox-tool: after N thinking tokens with no call, at a line end, '
-                        'START\'s hint opens a run_python call in the thinking (at most 2 a row; 0 never)')
+                        'START\'s hint closes the thinking and opens a run_python call (at most 2 a row; 0 never)')
+    parser.add_argument('--hint-at',choices=('line','wait'),default='line',help='with --hint-after: at any line end, or after the model\'s own Wait / Alternatively')
     parser.add_argument('--lcb-tests',type=Path,help='LiveCodeBench tests, to score each row as it ends (throwaway VM only)')
     parser.add_argument('--tool-loop',action='store_true',help='declare run_python in the model\'s own tool format and answer its calls: throwaway VM only')
     parser.add_argument('--retries',type=int,default=0,help='sampled runs from the prompt after one that ended with its tests failing')
