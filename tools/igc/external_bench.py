@@ -36,6 +36,10 @@ TOOL_ROUNDS=24
 # an oracle, and ended with no code (#288).
 TOOL_SPENT='[no more runs: finish the thinking and write the answer]'
 TOOL_AFTER=4
+# --hint-after N: every call of 205 in five arms came after the whole thinking, so the program checked an answer already reached by hand. START's
+# Hint-infer (2503.04625) puts its own words in the reasoning and the model goes on into a call; here they open the call in the model's format.
+HINT='\n\nWait, maybe using Python here is a good idea.\n\n<tool_call>\n<function=run_python>\n<parameter=code>\n'
+HINT_MAX=2
 TOOL_END={248059}   # `</tool_call>` is one token in the Gyro-M pack
 TOOL_OUTPUT=4096
 
@@ -187,7 +191,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_tool=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_tool=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None,hint_after=0):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -288,21 +292,28 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             for attempt in range(retries+1):
                 tokens=[];stuck=False
                 keys=sampling if not attempt else {**sampling,'temperature':retry_temperature,'seed':attempt}
-                said=[];kernel=None;asked=list(ids);ran=[]
+                said=[];kernel=None;asked=list(ids);ran=[];hints=[];quiet=0;lead=''
                 for turn in range(TOOL_ROUNDS+TOOL_AFTER if tool_loop else 1):
                     tokens=[]
-                    thinking=True;inner=None
+                    thinking=True;inner=None;hinted=False
                     for t in engine.generate(asked,262144-len(asked)-64 if whole_context else limit-sum(len(s) for s in said),keys,cancel):
                         if t is None:continue
                         tokens.append(int(t))
                         if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
                         thinking=thinking and int(t)!=248069
+                        quiet+=thinking
+                        if (hint_after and tool_loop and not sandbox_tool and thinking and not lead and quiet>=hint_after and len(hints)<HINT_MAX
+                                and int(t) in (198,271)):hinted=True;break   # a line end, N thinking tokens with no call: the hint goes in
                         if tool_loop and not sandbox_tool and thinking and int(t) in TOOL_END:   # the close of a call while thinking: run it before the model writes an answer of its own
-                            inner=called_in_thinking(tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
+                            inner=called_in_thinking(lead+tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                             if inner is not None:break
                     said.append(tokens)
+                    if hinted:   # the model writes the program on from the hint's open call
+                        hints.append(dict(turn=turn,after=quiet));asked=asked+tokens+tokenizer.encode(HINT);lead=HINT;quiet=0
+                        continue
                     code=inner if inner is not None else None if stuck or not tool_loop else tool_call(tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                     if code is None:break
+                    quiet=0;lead=''
                     if turn<TOOL_ROUNDS:
                         from serve.sandbox.exec_bridge import Kernel
                         if kernel and not kernel.alive():kernel.close();kernel=None   # a call that ran past its time took the kernel with it
@@ -323,7 +334,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                 text=tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace')
                 if no_think:text='</think>\n\n'+text   # the close is in the prompt; the readers look for it here
                 attempts.append(dict(tokens=len(tokens),text=text,finish='stuck' if stuck else engine.last.get('finish'),check=last_check(text),turns=len(said),ran=ran,
-                                     turn_tokens=[len(x) for x in said]))
+                                     turn_tokens=[len(x) for x in said],hints=hints))
                 if attempts[-1]['check'] not in ('mismatch','stub'):break
             seconds=time.monotonic()-start;active[0]=None
             # The first whose tests did not fail, else the first: a sampled run has no claim over the greedy one.
@@ -331,7 +342,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             text=kept['text'];final=final_number(text)
             records.append(dict(id=row['id'],suite=row['suite'],answer=row['answer'],final=final,correct=final==row['answer'],
                                 tokens=sum(a['tokens'] for a in attempts),seconds=seconds,finish=kept['finish'],prompt_tokens=len(ids),text=text,
-                                attempts=[dict(tokens=a['tokens'],check=a['check'],turns=a['turns'],turn_tokens=a['turn_tokens'],ran=a['ran']) for a in attempts],
+                                attempts=[dict(tokens=a['tokens'],check=a['check'],turns=a['turns'],turn_tokens=a['turn_tokens'],ran=a['ran'],hints=a['hints']) for a in attempts],
                                 tool_seconds=round(sum(c['seconds'] for a in attempts for c in a['ran']),3),log_from=mark))
             ev=read_events(output/'engine.log',mark)
             if ev is not None:records[-1]['events']={**ev,'injected':injected_text(ev['rules'],tokenizer)}
@@ -401,6 +412,8 @@ if __name__=='__main__':
     parser.add_argument('--reuse-rules',help='comma list of the rules this arm adds: draft, gate, verify, pass-close, falsify, brute, after')
     parser.add_argument('--short-first',action='store_true',help='rows in the order of the base arm\'s tokens, fewest first')
     parser.add_argument('--stop-on-loss',type=Path,help='verdicts of the base arm: stop at the first row it got right and this arm did not')
+    parser.add_argument('--hint-after',type=int,default=0,help='with --tool-loop and not --sandbox-tool: after N thinking tokens with no call, at a line end, '
+                        'START\'s hint opens a run_python call in the thinking (at most 2 a row; 0 never)')
     parser.add_argument('--lcb-tests',type=Path,help='LiveCodeBench tests, to score each row as it ends (throwaway VM only)')
     parser.add_argument('--tool-loop',action='store_true',help='declare run_python in the model\'s own tool format and answer its calls: throwaway VM only')
     parser.add_argument('--retries',type=int,default=0,help='sampled runs from the prompt after one that ended with its tests failing')

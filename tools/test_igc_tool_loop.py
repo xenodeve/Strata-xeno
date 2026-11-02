@@ -22,6 +22,12 @@ assert called_in_thinking("Let's call.\n\n" + JSON) == 'print(3)\nprint(4)'
 assert called_in_thinking('done</think>\n\n' + CALL) is None, 'after the thinking it is a reply'
 assert called_in_thinking('a call ' + CALL + ' and more thinking') is None, 'only one that just closed'
 
+# --hint-after: the hint opens the call, the model writes the program and closes it; the bench reads the two together
+from tools.igc.external_bench import HINT
+assert called_in_thinking(HINT + 'print(6 * 7)\n</parameter>\n</function>\n</tool_call>') == 'print(6 * 7)'
+assert called_in_thinking('print(6 * 7)\n</parameter>\n</function>\n</tool_call>') is None, 'without the hint the open is missing'
+assert HINT.count('<tool_call>') == 1 and 'Python here is a good idea' in HINT
+
 # One row's engine lines: m5t's loop rule closed the thinking on 2 rows, and nothing in the records said which (#288)
 import tempfile
 from tools.igc.external_bench import read_events
