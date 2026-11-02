@@ -30,14 +30,32 @@ TOOL_HINT=('\n\n# Tools\n\nYou have access to the following functions:\n\n<tools
            'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
            '<tool_call>\n<function=run_python>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>')
 TOOL_CALL=re.compile(r'<tool_call>\s*<function=run_python>\s*<parameter=code>\n?(.*?)\n?</parameter>',re.S)
+TOOL_JSON=re.compile(r'<tool_call>\s*(\{.*\})\s*</tool_call>',re.S)
 TOOL_ROUNDS=24
+TOOL_END={248059}   # `</tool_call>` is one token in the Gyro-M pack
 TOOL_OUTPUT=4096
+
+
+def program_of(call):
+    """The code of one call, in the template's form or as JSON: on 3674 the model wrote {"name":"run_python","arguments":{"code":...}}."""
+    found=TOOL_CALL.findall(call)
+    if found:return found[-1]
+    for body in TOOL_JSON.findall(call):
+        try:data=json.loads(body)
+        except ValueError:continue
+        if data.get('name')=='run_python' and isinstance(data.get('arguments'),dict) and isinstance(data['arguments'].get('code'),str):return data['arguments']['code']
+    return None
 
 
 def tool_call(text):
     """The program of a reply that ends in a call, or None for an answer."""
-    found=TOOL_CALL.findall(text.rsplit('</think>',1)[-1])
-    return found[-1] if found else None
+    return program_of(text.rsplit('</think>',1)[-1])
+
+
+def called_in_thinking(text):
+    """A call the model closed while still thinking. It was trained to call there too: on 3478 and 3674 it did, got nothing back, wrote a tool's answer of its own and ended with no code."""
+    if '</think>' in text or not text.rstrip().endswith('</tool_call>'):return None
+    return program_of(text[text.rfind('<tool_call>'):])
 
 
 ARITHMETIC=('two_digit_addition','two_digit_subtraction','two_digit_multiplication')
@@ -229,17 +247,25 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                 said=[];kernel=None;asked=list(ids)
                 for turn in range(TOOL_ROUNDS if tool_loop else 1):
                     tokens=[]
+                    thinking=True;inner=None
                     for t in engine.generate(asked,262144-len(asked)-64 if whole_context else limit-sum(len(s) for s in said),keys,cancel):
                         if t is None:continue
                         tokens.append(int(t))
                         if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
+                        thinking=thinking and int(t)!=248069
+                        if tool_loop and thinking and int(t) in TOOL_END:   # the close of a call while thinking: run it before the model writes an answer of its own
+                            inner=called_in_thinking(tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
+                            if inner is not None:break
                     said.append(tokens)
-                    code=None if stuck or not tool_loop else tool_call(tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
+                    code=inner if inner is not None else None if stuck or not tool_loop else tool_call(tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                     if code is None:break
                     from serve.sandbox.exec_bridge import Kernel
                     kernel=kernel or Kernel()
                     ran,shown=kernel.run(code)
                     shown=(shown or '[it ran and printed nothing]')[:TOOL_OUTPUT]
+                    if inner is not None:   # the answer goes into the thinking, which goes on
+                        asked=asked+tokens+tokenizer.encode('\n<tool_response>\n'+shown+'\n</tool_response>\n')
+                        continue
                     spoken=tokens[:-1] if tokens[-1]==248046 else tokens   # the end of turn goes back in below, with the rest of the template's shape
                     asked=asked+spoken+tokenizer.encode((b'<|im_end|>\n<|im_start|>user\n<tool_response>\n'+shown.encode('utf-8')+b'\n</tool_response>'+suffix).decode('utf-8'))
                 if kernel:kernel.close()
