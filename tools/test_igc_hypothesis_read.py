@@ -2,7 +2,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tools.igc.hypothesis_read import corrected, result_of, row, runs_of
+from tools.igc.hypothesis_read import corrected, last_check, result_of, row, runs_of
 
 F = chr(96) * 3
 
@@ -37,6 +37,10 @@ assert result_of('match: 1\nMISMATCH: expected 2, got None\nMISMATCH: expected 3
 assert runs_of('no blocks at all') == []
 assert runs_of(text(reply=block('print(1)', '1'))) == [], 'a block in the reply was not run'
 
+assert last_check(fixed) == 'match'
+assert last_check(stub) == 'match'
+assert last_check(text(block('expect(f(1), 2)', 'match: 2'), block('expect(f(1), 3)', 'MISMATCH: expected 3, got 2'))) == 'mismatch', 'the last test decides'
+assert last_check(text(block('print(1)', '1'))) is None, 'a print is no test'
 r = row(dict(id='a', tokens=9, text=fixed, finish='stop'), 'ok')
 assert r['ok'] and r['corrected'] and r['tested'] and r['runs'] == 3, r
 assert row(dict(id='a', tokens=9, text=fixed, finish='stop'), None)['ok'] is None

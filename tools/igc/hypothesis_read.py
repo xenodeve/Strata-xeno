@@ -49,6 +49,12 @@ def corrected(runs):
     return False
 
 
+def last_check(text):
+    """How the last test of a reasoning came out, or None when it ran none."""
+    checks = [run['result'] for run in runs_of(text) if run['result'] in ('match', 'mismatch', 'stub')]
+    return checks[-1] if checks else None
+
+
 def row(record, verdict):
     runs = runs_of(record['text'])
     results = Counter(run['result'] for run in runs)

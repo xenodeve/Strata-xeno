@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from tools.igc.external_score import final_number, question_id, repeating
+from tools.igc.hypothesis_read import last_check
 from tools.igc.hub_contract import validate_launcher_env
 from tools.igc.learned_integration import parse_audit
 from tools.igc.output_examples import wrapped_prefix
@@ -110,7 +111,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -183,23 +184,33 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             if cancel.is_set():raise RuntimeError('bench stopped before request')
             ids=tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8'))
             active[0]=start=time.monotonic()
-            limit=262144-len(ids)-64 if whole_context else row['limit'];tokens=[];stuck=False
-            for t in engine.generate(ids,limit,sampling,cancel):
-                if t is None:continue
-                tokens.append(int(t))
-                if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
+            limit=262144-len(ids)-64 if whole_context else row['limit']
+            # Greedy repeats itself, so a retry samples. It starts from the prompt: a wrong draft left in the context costs far more than a blank one (2602.04288).
+            attempts=[]
+            for attempt in range(retries+1):
+                tokens=[];stuck=False
+                keys=sampling if not attempt else {**sampling,'temperature':retry_temperature,'seed':attempt}
+                for t in engine.generate(ids,limit,keys,cancel):
+                    if t is None:continue
+                    tokens.append(int(t))
+                    if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
+                text=tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace')
+                if no_think:text='</think>\n\n'+text   # the close is in the prompt; the readers look for it here
+                attempts.append(dict(tokens=len(tokens),text=text,finish='stuck' if stuck else engine.last.get('finish'),check=last_check(text)))
+                if attempts[-1]['check'] not in ('mismatch','stub'):break
             seconds=time.monotonic()-start;active[0]=None
-            text=tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace')
-            if no_think:text='</think>\n\n'+text   # the close is in the prompt; the readers look for it here
-            final=final_number(text)
+            # The first whose tests did not fail, else the first: a sampled run has no claim over the greedy one.
+            kept=next((a for a in attempts if a['check'] not in ('mismatch','stub')),attempts[0])
+            text=kept['text'];final=final_number(text)
             records.append(dict(id=row['id'],suite=row['suite'],answer=row['answer'],final=final,correct=final==row['answer'],
-                                tokens=len(tokens),seconds=seconds,finish='stuck' if stuck else engine.last.get('finish'),prompt_tokens=len(ids),text=text))
+                                tokens=sum(a['tokens'] for a in attempts),seconds=seconds,finish=kept['finish'],prompt_tokens=len(ids),text=text,
+                                attempts=[dict(tokens=a['tokens'],check=a['check']) for a in attempts]))
             (output/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
-            print(row['id'],row['answer'],final,len(tokens),round(seconds,1),flush=True)
+            print(row['id'],row['answer'],final,records[-1]['tokens'],round(seconds,1),flush=True)
     finally:
         if engine is not None:engine.close()
         stop.set();thread.join(timeout=3);subprocess.Popen=original
-    if bundle and not slots:
+    if bundle and not slots and not retries:   # one audit a request, and a retry is a request
         lines=(output/'engine.log').read_text(encoding='utf-8',errors='replace')
         audits=[parse_audit(bytes.fromhex(h)) for h in re.findall(r'strata IGC learned audit: head_status=\d+ record=([0-9a-f]{576})',lines)]
         if len(audits)!=len(records):raise ValueError('incomplete audit pairing')
@@ -241,5 +252,7 @@ if __name__=='__main__':
     parser.add_argument('--pair',action='store_true',help='with --slots: run each question with MIP and with igc=0, in one engine')
     parser.add_argument('--stuck-rounds',type=int,default=20,help='rounds of a cycle before the bench gives up; 40 leaves a loop of up to 3 tokens to the engine, which closes at 64')
     parser.add_argument('--no-think',action='store_true',help='close the thinking in the prompt')
+    parser.add_argument('--retries',type=int,default=0,help='sampled runs from the prompt after one that ended with its tests failing')
+    parser.add_argument('--retry-temperature',type=float,default=0.6)
     parser.add_argument('--shots',type=int,default=0,help='few-shot exemplars before each GSM8K question')
     run(**vars(parser.parse_args()))
