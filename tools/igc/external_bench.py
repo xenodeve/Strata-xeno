@@ -297,7 +297,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                 said=[];kernel=None;asked=list(ids);ran=[];hints=[];quiet=0;lead=''
                 for turn in range(TOOL_ROUNDS+TOOL_AFTER if tool_loop else 1):
                     tokens=[]
-                    thinking=True;inner=None;hinted=False
+                    thinking='</think>' not in lead;inner=None;hinted=False   # after the hint the model writes a reply call, not thinking
                     for t in engine.generate(asked,262144-len(asked)-64 if whole_context else limit-sum(len(s) for s in said),keys,cancel):
                         if t is None:continue
                         tokens.append(int(t))
@@ -309,6 +309,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                         if tool_loop and not sandbox_tool and thinking and int(t) in TOOL_END:   # the close of a call while thinking: run it before the model writes an answer of its own
                             inner=called_in_thinking(lead+tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                             if inner is not None:break
+                        if tool_loop and not thinking and int(t) in TOOL_END:break   # a reply call ends here: ddfff815 wrote a user turn of its own after it
                     said.append(tokens)
                     if hinted:   # the model writes the program on from the hint's open call
                         hints.append(dict(turn=turn,after=quiet));asked=asked+tokens+tokenizer.encode(HINT);lead=HINT;quiet=0
