@@ -35,6 +35,7 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276), ผลแ�
 **ชั้นที่ 1: ตอน inference ไม่แก้ weight ใช้ได้ทุกโมเดล** อยู่ใน Adapter และ bench ใช้ได้ทั้ง Native และโมเดลที่ serve ผ่าน vLLM
 
 1. **ตำแหน่ง hint** แบบ wait (`mpw` เสร็จแล้ว), stop (`mps` กำลังรัน) และ MATH แบบ wait (`m5w`) เกณฑ์ที่ลงทะเบียนไว้: MMLU long ≥ 15/19 โดยไม่เสียข้อที่ base ถูกเพราะเลือก convention ตามตำรา, MATH long ≥ 21/22 ที่ token ไม่เกิน hint line ถ้าไม่มีแบบไหนผ่าน MMLU ถือว่าตำแหน่ง hint ขึ้นกับชุดข้อสอบ และหยุดปรับต่อ
+   **ผล (2026-11-03, #288):** MMLU line 11, wait 14, stop 15 ข้อ / MATH line 21 (token น้อยสุด), wait 20, stop 21 ไม่มีตำแหน่งไหนชนะทั้งสองชุด จึงหยุดปรับ ค่าตั้งต้นคือ stop เพราะปลอดภัยเรื่องความถูกทั้งสองชุด token ที่ลดได้ (median 0.74–0.81x ของแขนไม่มี tool) มาจากทาง tool ไม่ใช่ hint และไม่มีตำแหน่งไหนเปลี่ยนข้อผิดเป็นถูกบน Flash-Next
 2. **ตัดบริบทและหยุดให้ tool แบบ PruneTIR (2605.09931)** มีสามส่วน
    - ตัด call ที่ error ออกจาก context เมื่อ turn ถัดมาแก้ได้
    - เมื่อ error ติดกัน 3 turn ให้ย้อนบริบทไปก่อน call แรกที่ error แล้ว resample
@@ -80,6 +81,7 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276), ผลแ�
 
 *Layer 1: at inference, no weight change, every model.* It lives in the Adapter and the bench, for Native and for models served through vLLM.
 1. Hint placement: wait (`mpw`, done), stop (`mps`, running) and MATH with wait (`m5w`). Pre-registered criteria: MMLU long at least 15 of 19 with no loss where the base was right by choosing the textbook convention; MATH long at least 21 of 22 at no more tokens than the line hint. If none clears MMLU, hint placement is suite-dependent and tuning stops.
+   **Result (2026-11-03, #288):** MMLU line 11, wait 14, stop 15; MATH line 21 at the fewest tokens, wait 20, stop 21. No placement wins both, so tuning stops. Stop is the default because it is accuracy-safe on both suites. The saving (median 0.74 to 0.81x of no-tool) comes from the tool route, not the hint, and no placement turned a wrong question right on Flash-Next.
 2. Context pruning and tool suspension after PruneTIR (2605.09931), in three parts:
    - Remove an erroneous call from the context once a later turn resolves it.
    - After 3 erroneous turns running, revert the context to before the first of them and resample.
