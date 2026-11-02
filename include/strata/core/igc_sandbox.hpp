@@ -46,6 +46,7 @@ struct Result {
     std::string error;
     uint64_t steps = 0;
     std::size_t peak_bytes = 0;
+    bool stdin_short = false;   // the program read past what it was fed
 };
 inline Result run(std::string_view source, const Limits& limits = {}, const std::atomic<bool>* cancel = nullptr);
 
@@ -72,6 +73,10 @@ struct Runtime {
     int nesting = 0;
     std::string output;
     bool truncated = false;
+    std::string stdin_text;   // only what the program gave `feed`, never the host's
+    std::size_t stdin_at = 0;
+    bool stdin_short = false;
+    int64_t recursion_limit = 1000;   // what the program asked for; the real bound stays in `limits`
 
     void charge(std::size_t n) {
         if (n > limits.heap_bytes - used) throw Stop{Status::MemoryLimit, "MemoryError: heap limit " + std::to_string(limits.heap_bytes) + " bytes"};
@@ -6409,7 +6414,7 @@ struct Scope {
 };
 // Names CPython has and this interpreter must not offer. Refused at compile time unless the program defines the name itself.
 inline constexpr std::string_view kRefusedNames =
-    " eval exec open input __import__ compile globals locals vars dir getattr setattr delattr hasattr id breakpoint help memoryview "
+    " eval exec open __import__ compile globals locals vars dir getattr setattr delattr hasattr id breakpoint help memoryview "
     "exit quit super property staticmethod classmethod bytes bytearray complex __file__ __builtins__ __doc__ __spec__ __loader__ "
     "__package__ __annotations__ __cached__ __debug__ license copyright credits NotImplemented ";
 
@@ -8744,6 +8749,61 @@ inline Value b_print(Call& c) {
     else write_output(U"\n");
     return Value::none();
 }
+// Standard input holds what the program fed itself: a block in stdin form runs here with the question's example.
+inline Value stdin_line() {
+    const std::string_view in = rt->stdin_text;
+    if (rt->stdin_at >= in.size()) {
+        rt->stdin_short = true;
+        return text(std::string_view{});
+    }
+    const std::size_t end = in.find('\n', rt->stdin_at);
+    const std::size_t stop = end == std::string_view::npos ? in.size() : end + 1;
+    Value out = text(in.substr(rt->stdin_at, stop - rt->stdin_at));
+    rt->stdin_at = stop;
+    return out;
+}
+inline Value b_feed(Call& c) {
+    if (c.a[0].tag != Tag::Str) raise(T_TypeError, "feed() takes a str");
+    const std::string more = utf8(str_of(c.a[0]));
+    rt->charge(more.size());
+    rt->stdin_text += more;
+    return Value::none();
+}
+inline Value b_input(Call& c) {
+    if (c.n) write_output(str_of(str_value(c.a[0])));
+    Value line = stdin_line();
+    U32 s = str_of(line);
+    if (s.empty()) raise(T_EOFError, "EOF when reading a line");
+    if (s.back() == U'\n') s.pop_back();
+    return text(std::move(s));
+}
+inline Value si_read(Call&) {
+    const std::string_view in = rt->stdin_text;
+    if (rt->stdin_at >= in.size()) rt->stdin_short = true;
+    Value out = text(rt->stdin_at < in.size() ? in.substr(rt->stdin_at) : std::string_view{});
+    rt->stdin_at = in.size();
+    return out;
+}
+inline Value si_readline(Call&) { return stdin_line(); }
+inline Value si_readlines(Call&) {
+    Vals lines;
+    if (rt->stdin_at >= rt->stdin_text.size()) rt->stdin_short = true;
+    while (rt->stdin_at < rt->stdin_text.size()) lines.push_back(stdin_line());
+    return make_list(std::move(lines));
+}
+inline Value so_write(Call& c) {
+    if (c.a[0].tag != Tag::Str) raise(T_TypeError, "write() argument must be str");
+    write_output(str_of(c.a[0]));
+    return Value::integer((int64_t) str_of(c.a[0]).size());
+}
+inline Value so_flush(Call&) { return Value::none(); }
+inline Value sy_setrecursionlimit(Call& c) {
+    if (c.a[0].tag != Tag::Int) raise(T_TypeError, "an integer is required");
+    rt->recursion_limit = c.a[0].i;
+    return Value::none();
+}
+inline Value sy_getrecursionlimit(Call&) { return Value::integer(rt->recursion_limit); }
+inline Value sy_exit(Call&) { raise(T_SystemExit, ""); }
 inline Value b_len(Call& c) { return Value::integer((int64_t) len_of(c.a[0])); }
 inline Value b_abs(Call& c) {
     const Value& v = c.a[0];
@@ -10280,7 +10340,7 @@ inline const NativeDef kBuiltins[] = {
     {"print", b_print, 0, -1, true}, {"len", b_len, 1, 1}, {"abs", b_abs, 1, 1}, {"sum", b_sum, 1, 2, true}, {"min", b_min, 1, -1, true},
     {"max", b_max, 1, -1, true}, {"sorted", b_sorted, 1, 1, true}, {"any", b_any, 1, 1}, {"all", b_all, 1, 1}, {"repr", b_repr, 1, 1},
     {"ascii", b_ascii, 1, 1}, {"round", b_round, 0, 2, true}, {"pow", b_pow, 0, 3, true}, {"divmod", b_divmod, 2, 2}, {"ord", b_ord, 1, 1},
-    {"chr", b_chr, 1, 1}, {"hex", b_hex, 1, 1}, {"oct", b_oct, 1, 1}, {"bin", b_bin, 1, 1}, {"isinstance", b_isinstance, 2, 2},
+    {"input", b_input, 0, 1}, {"feed", b_feed, 1, 1}, {"chr", b_chr, 1, 1}, {"hex", b_hex, 1, 1}, {"oct", b_oct, 1, 1}, {"bin", b_bin, 1, 1}, {"isinstance", b_isinstance, 2, 2},
     {"issubclass", b_issubclass, 2, 2}, {"callable", b_callable, 1, 1}, {"hash", b_hash, 1, 1}, {"iter", b_iter, 1, 2}, {"next", b_next, 1, 2},
     {"format", b_format, 1, 2},
 };
@@ -10303,13 +10363,16 @@ inline const NativeDef kHeapq[] = {{"heappush", hq_push, 2, 2}, {"heappop", hq_p
 inline const NativeDef kBisect[] = {{"bisect_left", s_left, 2, 4, true}, {"bisect_right", s_right, 2, 4, true}, {"bisect", s_right, 2, 4, true},
     {"insort_left", s_insort_left, 2, 4, true}, {"insort_right", s_insort_right, 2, 4, true}, {"insort", s_insort_right, 2, 4, true}};
 inline const NativeDef kCast = {"cast", t_cast, 2, 2};
+inline const NativeDef kSys[] = {{"setrecursionlimit", sy_setrecursionlimit, 1, 1}, {"getrecursionlimit", sy_getrecursionlimit, 0, 0}, {"exit", sy_exit, 0, 1}};
+inline const NativeDef kStdin[] = {{"read", si_read, 0, 0}, {"readline", si_readline, 0, 0}, {"readlines", si_readlines, 0, 0}};
+inline const NativeDef kStdout[] = {{"write", so_write, 1, 1}, {"flush", so_flush, 0, 0}};
 inline constexpr std::string_view kTypingNames =
     " List Dict Tuple Set FrozenSet Optional Union Any Callable Iterable Iterator Sequence Mapping MutableMapping MutableSequence "
     "Generator Type TypeVar Generic NoReturn Final Literal DefaultDict Deque Counter Collection Hashable Sized ";
-enum ModuleId : int { kModuleMath, kModuleItertools, kModuleFunctools, kModuleCollections, kModuleFractions, kModuleTyping, kModuleHeapq, kModuleBisect };
-inline constexpr const char* kModuleNames[] = {"math", "itertools", "functools", "collections", "fractions", "typing", "heapq", "bisect"};
+enum ModuleId : int { kModuleMath, kModuleItertools, kModuleFunctools, kModuleCollections, kModuleFractions, kModuleTyping, kModuleHeapq, kModuleBisect, kModuleSys, kModuleStdin, kModuleStdout };
+inline constexpr const char* kModuleNames[] = {"math", "itertools", "functools", "collections", "fractions", "typing", "heapq", "bisect", "sys", "sys.stdin", "sys.stdout"};
 inline Value import_module(std::string_view name) {
-    for (int i = 0; i < (int) std::size(kModuleNames); ++i)
+    for (int i = 0; i <= kModuleSys; ++i)
         if (name == kModuleNames[i]) return Value::module(i);
     const std::string_view top = name.substr(0, name.find('.'));
     for (const char* known : kModuleNames)
@@ -10352,6 +10415,18 @@ inline Value module_attr(int module, std::string_view name) {
             break;
         case kModuleBisect:
             if (const NativeDef* d = find_native(kBisect, name)) return Value::from(d);
+            break;
+        case kModuleSys:
+            if (name == "stdin") return Value::module(kModuleStdin);
+            if (name == "stdout") return Value::module(kModuleStdout);
+            if (name == "maxsize") return Value::integer(std::numeric_limits<int64_t>::max());
+            if (const NativeDef* d = find_native(kSys, name)) return Value::from(d);
+            break;
+        case kModuleStdin:
+            if (const NativeDef* d = find_native(kStdin, name)) return Value::from(d);
+            break;
+        case kModuleStdout:
+            if (const NativeDef* d = find_native(kStdout, name)) return Value::from(d);
             break;
         case kModuleCollections:
             if (name == "Counter") return Value::type(T_Counter);
@@ -10489,6 +10564,7 @@ inline Result run(std::string_view source, const Limits& limits, const std::atom
     teardown();
     result.output = std::move(runtime.output);
     result.truncated = runtime.truncated;
+    result.stdin_short = runtime.stdin_short;
     result.steps = runtime.steps;
     result.peak_bytes = runtime.peak;
     rt = outer;

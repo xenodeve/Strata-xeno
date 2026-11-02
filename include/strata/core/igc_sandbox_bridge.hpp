@@ -27,10 +27,12 @@ inline constexpr std::string_view kNothingPrinted = "[it ran and printed nothing
 // 8 of 32 imports were sympy: told only that it is missing, the model went on by hand for 1820 to 9189 tokens (#279).
 // The model's own words before it answers: 4 of 66 replies after a close were the program again, with no sentence (#279).
 inline constexpr std::string_view kCloseLine = "Need final with enough detail.\n";
-inline constexpr std::string_view kOnlyModules = "[only math, fractions, itertools, functools, collections, heapq and bisect are here: rewrite with those]";
+inline constexpr std::string_view kOnlyModules = "[only math, fractions, itertools, functools, collections, heapq, bisect and sys are here: rewrite with those]";
 // Told to call its function, the model did not in 36 of 36 blocks, with a whole draft in 17 of 19 scored (#279). So the call is opened
 // for it, with the name: given a bare `print(`, 12 of 22 runs wrote `print(1)`, and the thinking closed on that.
 inline constexpr std::string_view kCallHead = "print(";
+// stdin holds only what the program fed itself, so a program that read nothing would look like a program that did nothing.
+inline constexpr std::string_view kNoStdin = "[stdin was empty: put feed(\"...\") before the code, with an example from the question]";
 inline constexpr std::string_view kBlockOpen = "```python\n";
 
 // The GPT-2 byte table: printable bytes stand for themselves, the others sit from code point 256 up, in order.
@@ -312,17 +314,22 @@ public:
         }
         if (cut) body += "\n[output cut]";
         printed_last_ = result.status == Status::Ok && says_something(body);
-        quiet_last_ = result.status == Status::Ok && body.empty();
+        quiet_last_ = result.status == Status::Ok && body.empty() && !result.stdin_short;
         if (result.status == Status::Ok) {
             done_ = std::move(source);
             printed_ = result.output.size();
-            if (body.empty()) body = kNothingPrinted;
+            if (body.empty() && result.stdin_short) body = kNoStdin;
+            else if (body.empty()) body = kNothingPrinted;
         } else {
             if (!body.empty()) body += '\n';
             body += name_the_line(result.error, source, replayed);
             if (result.error.starts_with("ModuleNotFoundError")) {
                 body += '\n';
                 body += kOnlyModules;
+            }
+            if (result.stdin_short) {
+                body += '\n';
+                body += kNoStdin;
             }
         }
         while (!body.empty() && body.back() == '\n') body.pop_back();

@@ -88,6 +88,17 @@ int main(int argc, char** argv) {
         require(s.run("print(None)\n") == "\n```output\nNone\n```\n\n" && !s.printed() && !s.quiet(), "None is shown, but it is no result");
         require(s.run("print(None)\nprint(None)\n").find("None") != std::string::npos && !s.printed(), "nor are two of them");
         require(s.run("print(None)\nprint(1)\n").find("1") != std::string::npos && s.printed(), "a value after one is");
+    }
+    {
+        Session s;
+        const auto empty = s.run("import sys\ndef main():\n    d = sys.stdin.read().split()\n    print(sum(map(int, d)) if d else None)\nd = sys.stdin.read()\n");
+        require(empty.find("stdin was empty") != std::string::npos && !s.quiet() && !s.printed(), "a program that read nothing says why, and no call is forced");
+        require(s.run("feed(\"3 4\\n\")\nmain()\n") == "\n```output\n7\n```\n\n" && s.printed(), "fed, the same program runs");
+    }
+    {
+        Session s;
+        require(s.run("x = input()\n").find("stdin was empty") != std::string::npos && !s.printed(), "input() past the end says why");
+        require(s.run("feed('a b\\nc\\n')\nprint(input().split(), input())\n") == "\n```output\n['a', 'b'] c\n```\n\n", "input() reads what was fed");
         require(s.run("print(g(1))\n").find("NameError") != std::string::npos && !s.quiet() && !s.printed(), "an error is neither");
     }
     {

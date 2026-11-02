@@ -1,2 +1,0 @@
-# expect: Unsupported
-x = input()
