@@ -45,6 +45,14 @@ inline constexpr std::string_view kGateLine = "Let me run my code on the example
 inline constexpr std::string_view kGateCallLine = "Let me run my code on the examples before I answer.\n\n```python\n";
 // A match is not proof, and a model tests to confirm: asked to look for what breaks it, it finds more (Failing to Falsify, 2604.02485).
 inline constexpr std::string_view kMatchLine = "The examples match. What input would break this?\n";
+// An oracle written from the statement before any idea of how to solve it. 40 % of the reasoning is work a new small program could settle, and it comes in no
+// word a rule can find: `Wait` stands 0.04 times in 1,000 tokens, and windows with a phrase are no likelier to be that work than windows without (#288). A forced
+// block in the old words held brute force 3 times in 181, because it never asked for it.
+inline constexpr std::string_view kBruteHead = "def brute(";
+inline constexpr std::string_view kBruteLine = "Let me write a brute force straight from the statement and run it on the examples.\n\n```python\ndef brute(";
+// A draft that passes the examples, set against the oracle where the examples stop.
+inline constexpr std::string_view kCompareHead = "import random\n";
+inline constexpr std::string_view kCompareLine = "The examples match. Let me compare it with the brute force on random small inputs.\n\n```python\nimport random\n";
 inline constexpr int kMaxGates = 3;
 // stdin holds only what the program fed itself, so a program that read nothing would look like a program that did nothing.
 inline constexpr std::string_view kNoStdin = "[stdin was empty: put feed(\"...\") before the code, with an example from the question]";
@@ -290,6 +298,11 @@ inline std::string call_head(std::string_view program, bool expect = false) {
     const std::string name = last_def(program);
     if (!name.empty()) head += name + "(";
     return head;
+}
+
+// Whether a program is the oracle or a test of it, so that a pass here says nothing of the model's answer.
+inline bool about_the_oracle(std::string_view program) {
+    return last_def(program) == "brute" || program.find("expect(brute(") != std::string_view::npos;
 }
 
 // A block that bound nothing leaves nothing to call.
