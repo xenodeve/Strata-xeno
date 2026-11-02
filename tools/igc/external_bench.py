@@ -147,7 +147,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_tool=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -190,6 +190,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     if sandbox_pass_close:args.append('--igc-sandbox-pass-close')
     if sandbox_brute:args.append('--igc-sandbox-brute')
     if sandbox_verify:args.append('--igc-sandbox-verify')
+    if sandbox_tool:args.append('--igc-sandbox-tool')
     if sandbox_exec:args.append('--igc-sandbox-exec')
     if sandbox_call:args.append('--igc-sandbox-call')
     if slots:args+=['--batch',str(slots)]
@@ -253,7 +254,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                         tokens.append(int(t))
                         if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
                         thinking=thinking and int(t)!=248069
-                        if tool_loop and thinking and int(t) in TOOL_END:   # the close of a call while thinking: run it before the model writes an answer of its own
+                        if tool_loop and not sandbox_tool and thinking and int(t) in TOOL_END:   # the close of a call while thinking: run it before the model writes an answer of its own
                             inner=called_in_thinking(tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                             if inner is not None:break
                     said.append(tokens)
@@ -324,6 +325,7 @@ if __name__=='__main__':
     parser.add_argument('--sandbox-draft',action='store_true',help='a bare fence holding a whole draft runs too')
     parser.add_argument('--sandbox-falsify',action='store_true',help='after a passing check, ask what input would break it')
     parser.add_argument('--sandbox-pass-close',action='store_true',help='end the thinking once every check of a run has passed')
+    parser.add_argument('--sandbox-tool',action='store_true',help='the engine runs a run_python call made while thinking (with --sandbox; --tool-loop answers calls in the reply)')
     parser.add_argument('--sandbox-verify',action='store_true',help="finish the model's `Let's verify` as a check by program")
     parser.add_argument('--sandbox-brute',action='store_true',help='the block opened by --sandbox-after asks for a brute force from the statement')
     parser.add_argument('--sandbox-exec',action='store_true',help='what the interpreter refuses runs in real Python: throwaway VM only')

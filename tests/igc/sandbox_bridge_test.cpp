@@ -129,6 +129,16 @@ int main(int argc, char** argv) {
         require(s.run("print(2)\n") == "\n```output\n2\n```\n\n" && !s.matched(), "a print is no check");
         require(s.run("print(1)\n") == "\n```output\n1\n```\n\n" && !s.mismatch(), "and the next run starts clean");
         require(call_head("def f(a):\n    return a\n", true).ends_with("expect(f("), "the forced call can be a test");
+        require(tool_code("\n<function=run_python>\n<parameter=code>\nprint(1)\nprint(2)\n</parameter>\n</function>\n") == "print(1)\nprint(2)", "the template's form");
+        require(tool_code("\n{\"name\":\"run_python\",\"arguments\":{\"code\":\"print(\\\"a\\\")\\nx = 1\\u00e9\"}}\n") == "print(\"a\")\nx = 1\xc3\xa9", "the JSON form, with its escapes");
+        require(!tool_code("<function=other>\n<parameter=code>\nx\n</parameter>") && !tool_code("{\"name\":\"other\",\"arguments\":{\"code\":\"x\"}}"), "another tool is not ours");
+        require(!tool_code("<function=run_python>\n<parameter=code>\nunfinished") && !tool_code("{\"name\":\"run_python\",\"arguments\":{\"code\":\"open"), "an unfinished call runs nothing");
+        require(tool_response("4") == "\n<tool_response>\n4\n</tool_response>\n", "the template's shape");
+        {
+            Session t;
+            t.run("print(6 * 7)\n");
+            require(t.last_body() == "42", "the body a tool response carries");
+        }
         require(about_to_check("So x = 3.\n\nLet's verify") && about_to_check("Now let me check") && about_to_check("x = 3. Check:") && about_to_check("\nDouble-check"), "the model about to check");
         require(!about_to_check("we can check") && !about_to_check("to verify") && !about_to_check("a sanity Check:") && !about_to_check("Let's see"), "and not a word in passing");
         require(about_the_oracle("\ndef brute(a):\n    return a\n") && about_the_oracle("\nexpect(brute(1), 2)\n"), "the oracle and its test");

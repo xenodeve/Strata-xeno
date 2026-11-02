@@ -42,6 +42,76 @@ inline constexpr std::string_view kMismatchLine = "Wait, this does not match. Is
 // called the approach wrong, and the model wrote the same unfinished brute force 4 times and lost a row it had right (#288).
 inline constexpr std::string_view kStubNote = "[it returned None: the function is not finished]";
 
+// The model's own call, made while it thinks. It was trained to call there and to read `<tool_response>` back: given run_python in its tool format,
+// it ran its examples, set a brute force against its program on random inputs and timed a large input, unforced. The bench answered only calls
+// in the reply, so on 3478 and 3674 it wrote a tool's answer of its own and ended with no code (#288). Both tags are one token in the Gyro-M pack.
+inline constexpr int32_t kToolOpen = 248058, kToolClose = 248059;
+inline constexpr std::string_view kToolOnlyPython = "[while thinking, a call runs run_python with its code; other tools run after the thinking]";
+
+// A JSON string's text from its opening quote on, with its escapes. `\uXXXX` outside one plane comes out as UTF-8 of that code point alone.
+inline std::optional<std::string> json_string(std::string_view s, std::size_t at) {
+    std::string out;
+    for (++at; at < s.size(); ++at) {
+        const char c = s[at];
+        if (c == '"') return out;
+        if (c != '\\') { out += c; continue; }
+        if (++at >= s.size()) return std::nullopt;
+        switch (s[at]) {
+            case 'n': out += '\n'; break;
+            case 't': out += '\t'; break;
+            case 'r': out += '\r'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
+            case 'u': {
+                if (at + 4 >= s.size()) return std::nullopt;
+                uint32_t p = 0;
+                for (int i = 1; i <= 4; ++i) {
+                    const char h = s[at + i];
+                    p = p * 16 + (h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : 99);
+                    if (p > 0xFFFF) return std::nullopt;
+                }
+                at += 4;
+                if (p < 0x80) out += (char) p;
+                else if (p < 0x800) { out += (char) (0xC0 | p >> 6); out += (char) (0x80 | (p & 63)); }
+                else { out += (char) (0xE0 | p >> 12); out += (char) (0x80 | (p >> 6 & 63)); out += (char) (0x80 | (p & 63)); }
+                break;
+            }
+            default: out += s[at];
+        }
+    }
+    return std::nullopt;
+}
+
+// The code of one call to run_python, between `<tool_call>` and `</tool_call>`: the template's form, or the JSON form the model also writes.
+inline std::optional<std::string> tool_code(std::string_view call) {
+    if (const std::size_t f = call.find("<function="); f != std::string_view::npos) {
+        if (call.substr(f + 10, 11) != "run_python>") return std::nullopt;
+        const std::size_t p = call.find("<parameter=code>", f);
+        if (p == std::string_view::npos) return std::nullopt;
+        std::size_t from = p + 16;
+        if (from < call.size() && call[from] == '\n') ++from;
+        std::size_t to = call.find("</parameter>", from);
+        if (to == std::string_view::npos) return std::nullopt;
+        if (to > from && call[to - 1] == '\n') --to;
+        return std::string(call.substr(from, to - from));
+    }
+    const std::size_t name = call.find("\"name\"");
+    if (name == std::string_view::npos || call.find("\"run_python\"", name) == std::string_view::npos) return std::nullopt;
+    const std::size_t key = call.find("\"code\"");
+    if (key == std::string_view::npos) return std::nullopt;
+    const std::size_t quote = call.find('"', call.find(':', key + 6));
+    if (quote == std::string_view::npos) return std::nullopt;
+    return json_string(call, quote);
+}
+
+// What the model reads back, in its template's own shape, inside its thinking.
+inline std::string tool_response(std::string_view body) {
+    std::string out = "\n<tool_response>\n";
+    out += body;
+    out += "\n</tool_response>\n";
+    return out;
+}
+
 // Whether a run's checks found a wrong value, as against only an unfinished function's None.
 inline bool wrong_value(std::string_view body) {
     for (std::size_t at = body.find("MISMATCH: "); at != std::string_view::npos; at = body.find("MISMATCH: ", at + 1)) {
@@ -404,6 +474,7 @@ public:
     bool quiet() const { return quiet_last_; }       // the last run finished and said nothing
     bool mismatch() const { return mismatch_last_; } // the last run's `expect` found a wrong result
     bool matched() const { return matched_last_; }   // the last run's every `expect` held
+    const std::string& last_body() const { return last_body_; }   // what the last run showed, before its fence
     uint64_t steps() const { return steps_; }
     // Real Python, for what the interpreter refuses: (code, a fresh kernel, body, ok), false when nothing answered. The refusal itself
     // chooses the tier, and a turn that moved stays there, because the kernel holds its names. A program using `mcp.` goes too: the
@@ -465,6 +536,7 @@ public:
             }
         }
         while (!body.empty() && body.back() == '\n') body.pop_back();
+        last_body_ = body;
         return output_block(body);
     }
 
@@ -490,6 +562,7 @@ private:
         }
         if (ok && body.empty()) body = kNothingPrinted;
         while (!body.empty() && body.back() == '\n') body.pop_back();
+        last_body_ = body;
         return output_block(body);
     }
     Exec exec_;
@@ -503,6 +576,7 @@ private:
     bool quiet_last_ = false;
     bool mismatch_last_ = false;
     bool matched_last_ = false;
+    std::string last_body_;
     int runs_ = 0;
     uint64_t steps_ = 0;
 };
