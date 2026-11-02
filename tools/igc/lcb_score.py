@@ -48,7 +48,7 @@ def one(job):
     with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False, encoding='utf-8') as f:
         json.dump([source, case, kind, name], f)
     try:
-        r = subprocess.run([sys.executable, '-I', '-B', runner, f.name], capture_output=True, text=True, timeout=8)
+        r = subprocess.run([sys.executable, '-I', '-B', runner, f.name], capture_output=True, text=True, timeout=6)
         return r.stdout.strip().split('\n')[-1] if r.stdout.strip() else 'error'
     except subprocess.TimeoutExpired:
         return 'timeout'
