@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
         require(s.run("print(1)\n") == "\n```output\n1\n```\n\n" && !s.mismatch(), "and the next run starts clean");
         require(call_head("def f(a):\n    return a\n", true).ends_with("expect(f("), "the forced call can be a test");
         require(about_the_oracle("\ndef brute(a):\n    return a\n") && about_the_oracle("\nexpect(brute(1), 2)\n"), "the oracle and its test");
+        require(about_the_oracle("\ndef brute(a):\n    return a\n\ndef helper():\n    pass\n"), "with a helper after it");
         require(!about_the_oracle("\nclass Solution:\n    def f(self, a):\n        return a\n") && !about_the_oracle("\nexpect(f(1), brute(1))\n"), "not the draft, nor the draft set against it");
         require(call_head("def f(a):\n    return a\n").starts_with("print(f("), "and stays a print by default");
     }

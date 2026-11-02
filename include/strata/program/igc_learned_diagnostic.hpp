@@ -440,8 +440,10 @@ public:
                 const auto text=sandbox_session_.spent()?strata::igc::sandbox::output_block("[no more runs]"):sandbox_session_.run(*program);
                 std::fprintf(stderr,"strata igc sandbox: run %d of %d bytes, %d bytes back, %llu steps so far\n",sandbox_session_.runs(),static_cast<int>(program->size()),static_cast<int>(text.size()),static_cast<unsigned long long>(sandbox_session_.steps()));
                 bridge_tokens_=sandbox_text_->encode(text);bridge_at_=0;called=true;
-                const bool draft=!strata::igc::sandbox::last_def(*program).empty(),oracle=strata::igc::sandbox::about_the_oracle(*program);
-                if(oracle && strata::igc::sandbox::last_def(*program)=="brute" && sandbox_session_.quiet())sandbox_oracle_=true;
+                const bool oracle=strata::igc::sandbox::about_the_oracle(*program);
+                const bool compare=program->starts_with(std::string("\n").append(strata::igc::sandbox::kCompareHead));   // its own `gen()` is no new draft
+                const bool draft=!strata::igc::sandbox::last_def(*program).empty() && !compare;
+                if(program->starts_with(std::string("\n").append(strata::igc::sandbox::kBruteHead)) && sandbox_session_.quiet())sandbox_oracle_=true;
                 if(draft && !oracle && (sandbox_session_.quiet() || sandbox_session_.printed())) {sandbox_draft_=*program;sandbox_compared_=false;}
                 // With drafts read, each new draft is a new hypothesis: test it. Otherwise one call a reasoning.
                 if(sandbox_call_ && (sandbox_drafts_?draft:!sandbox_called_ && strata::igc::sandbox::binds_a_name(*program)) && sandbox_session_.quiet()) {

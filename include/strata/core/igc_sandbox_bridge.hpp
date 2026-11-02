@@ -303,7 +303,7 @@ inline std::string call_head(std::string_view program, bool expect = false) {
 
 // Whether a program is the oracle or a test of it, so that a pass here says nothing of the model's answer.
 inline bool about_the_oracle(std::string_view program) {
-    return last_def(program) == "brute" || program.find("expect(brute(") != std::string_view::npos;
+    return program.starts_with("\ndef brute(") || program.find("expect(brute(") != std::string_view::npos;
 }
 
 // A block that bound nothing leaves nothing to call.
