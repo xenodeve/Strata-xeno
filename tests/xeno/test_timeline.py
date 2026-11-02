@@ -302,6 +302,19 @@ def test_server_file_merges_and_the_request_is_split_from_http_to_first_token(tm
     assert r["pipe_ms"] == pytest.approx(7.0)              # engine request - engine side: pipes and parsing
 
 
+def test_the_tool_calls_of_a_block_are_counted_in_their_request(tmp_path):
+    # serve/mip/mcp_adapter.py: a block's MCP calls run on the thread that answers SBX, not on the request's own
+    engine = write(tmp_path, [X(1, "request", 100, 400, 50, 10)])
+    sv = [{"ph": "M", "pid": 9, "tid": 1, "name": "thread_name", "args": {"name": "server Thread-1"}},
+          {"ph": "M", "pid": 9, "tid": 2, "name": "thread_name", "args": {"name": "server Thread-2"}},
+          {**X(1, "http request", 90, 410), "pid": 9},
+          {**X(2, "mip.call", 150, 170, 1), "pid": 9}, {**X(2, "mip.call", 180, 185, 2), "pid": 9},
+          {**X(2, "mip.call", 500, 520, 1), "pid": 9}]            # another request's
+    (tmp_path / "t.json.server.json").write_text("[\n" + "".join(json.dumps(e) + ",\n" for e in sv), encoding="utf-8")
+    r = timeline.server_report(timeline.load(engine))[0]
+    assert r["mip.call_ms"] == pytest.approx(25.0)
+
+
 def test_a_copy_is_matched_to_the_issue_of_its_own_layer(tmp_path):
     # the per-layer path numbers entries from 0 in every layer: a backlogged engine can start layer 5's entry 3
     # after layer 6's entry 3 was issued; matching on the entry alone took layer 6's issue (code-review of #33)

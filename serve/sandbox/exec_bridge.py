@@ -23,7 +23,8 @@ def throwaway() -> bool:
 
 def kernel_env() -> dict:
     """What Python needs and nothing more: a key can sit in the server's environment, and the kernel runs the model's code."""
-    return {k: os.environ[k] for k in ('PATH', 'HOME', 'LANG', 'SYSTEMROOT', 'TEMP', 'TMP', 'TMPDIR') if k in os.environ}
+    return {k: os.environ[k] for k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LD_LIBRARY_PATH', 'SYSTEMROOT', 'TEMP', 'TMP', 'TMPDIR')
+            if k in os.environ}
 
 
 class Kernel:
