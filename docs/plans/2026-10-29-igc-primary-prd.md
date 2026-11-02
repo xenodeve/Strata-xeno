@@ -1,7 +1,108 @@
-# PRD R12: IGC เป็นทางหลักของการคำนวณภายใน Strata
+# PRD R13: IGC เป็นทางหลักของการคำนวณภายใน Strata
 
-Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276)
-สถานะ: R12 กำหนดเกณฑ์ตัดสินตามขนาดโมเดล และลำดับงานลด token กับการตรวจสมมุติฐาน; R11 ด้านล่างยังมีผลในส่วนที่ R12 ไม่ได้แก้
+Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276), ผลแขนทดสอบ [#288](https://github.com/xenodeve/Strata-xeno/issues/288)
+สถานะ: R13 วางสามชั้นให้โมเดลใช้ MIP + Sandbox ได้เอง (inference, เทรนบนโมเดลเล็ก, เทรนบน Flash-Next) R12 และ R11 ด้านล่างยังมีผลในส่วนที่ R13 ไม่ได้แก้
+
+## R13 (2026-11-03)
+
+### เป้า
+
+ข้อง่ายที่โมเดลทำได้อยู่แล้วต้องใช้ token น้อยลง เพราะ MIP + Sandbox คำนวณแทนให้ ข้อยากที่โมเดลต้นแบบผิดต้องถูกมากขึ้นจากกลไกเดียวกัน
+โมเดลตั้งสมมุติฐาน รัน เห็นผลจริง แล้วแก้ ข้อยากใช้ token มากขึ้นได้ ถ้าได้ทั้งถูกขึ้นและ token ลดคือเป้าสูงสุด
+
+### หลักฐานตั้งแต่ R12 (รายละเอียดใน #288)
+
+แขนทั้งหมดรันบน Colab A100 ที่ให้ข้อความซ้ำเดิม ข้อความของแขน tool กับแขนควบคุมตรงกันจนถึงจุดที่กลไกเริ่มทำงาน (proof 4 ข้อบน build ใหม่ตรงทุกตัวอักษร)
+
+| ชุด | แขน | ถูก | token |
+|---|---|---|---|
+| GSM8K 60 | ไม่มี tool / tool | 60 / 60 | 0.62x รวม, median รายข้อ 0.82x, ไม่มี call เลย |
+| MATH L5 60 | ไม่มี tool / tool | 57 / 59 | 0.79x |
+| MMLU-Pro 53 | ไม่มี tool / tool | 50 / 49 | 1.07x, เสีย 1 ข้อที่กำกวม |
+| HLE 10 | ไม่มี tool / tool | 4 / 5 | 0.78x |
+| MATH long 22 | ไม่มี tool / tool / hint line | 21 / 21 / 21 | 157,235 / 121,483 / 101,864 |
+| MMLU long 19 | ไม่มี tool / hint line / hint wait | 16 / 11 / 14 | 1 / 0.37x / 0.59x (median รายข้อ) |
+
+- **โมเดลเรียก tool หลังคิดจบแล้วเกือบทุกครั้ง** 203 จาก 205 call ใน 5 แขน โปรแกรมจึงตรวจคำตอบที่คิดด้วยมือเสร็จแล้ว ไม่ได้ช่วยคิด
+- **hint แบบ line ช่วย MATH แต่ทำร้าย MMLU** hint ลงเร็ว (ราว token ที่ 600) ตัดการคิดเรื่องตีความโจทย์ทิ้ง hint แบบ wait (หลัง "Wait" ของโมเดลเอง ตาม START) เอาคืนได้ 3 ข้อเพราะลงช้ากว่า
+- **มีข้อที่คำนวณละเอียดแล้วออกห่างจากเฉลย** MMLU 9cf86125 ค่า Colebrook จริงคือ 465.5 m อยู่กึ่งกลางตัวเลือก 460 กับ 470 เฉลยใช้ค่าอ่านจาก Moody chart ข้อแบบนี้ไม่มีการคำนวณใดไปถึง
+- **tool loop วนได้โดยไม่มีอะไรหยุด** MMLU 0fd92db9 ส่งโปรแกรมเดิม 9 ครั้งติดกัน ใช้ 150,229 token เทียบ 45,052 แก้แล้วใน e0fee1cc (โปรแกรมเดิมครั้งที่สามติดกันได้ TOOL_SPENT)
+
+### ทางที่เลือก (ผู้พัฒนา 2026-11-03)
+
+เรียงจากยืดหยุ่นมากไปน้อย ชั้นถัดไปเริ่มเมื่อชั้นก่อนหน้ามีผลวัดแล้ว
+
+**ชั้นที่ 1: ตอน inference ไม่แก้ weight ใช้ได้ทุกโมเดล** อยู่ใน Adapter และ bench ใช้ได้ทั้ง Native และโมเดลที่ serve ผ่าน vLLM
+
+1. **ตำแหน่ง hint** แบบ wait (`mpw` เสร็จแล้ว), stop (`mps` กำลังรัน) และ MATH แบบ wait (`m5w`) เกณฑ์ที่ลงทะเบียนไว้: MMLU long ≥ 15/19 โดยไม่เสียข้อที่ base ถูกเพราะเลือก convention ตามตำรา, MATH long ≥ 21/22 ที่ token ไม่เกิน hint line ถ้าไม่มีแบบไหนผ่าน MMLU ถือว่าตำแหน่ง hint ขึ้นกับชุดข้อสอบ และหยุดปรับต่อ
+2. **ตัดบริบทและหยุดให้ tool แบบ PruneTIR (2605.09931)** มีสามส่วน
+   - ตัด call ที่ error ออกจาก context เมื่อ turn ถัดมาแก้ได้
+   - เมื่อ error ติดกัน 3 turn ให้ย้อนบริบทไปก่อน call แรกที่ error แล้ว resample
+   - resample แล้วติดอีก 2 ครั้งให้หยุดให้ tool แล้วกลับไปคิดเอง
+   ผลที่รายงานบน Qwen3-8B AIME24: ถูก 62.1 → 72.7, call 7.7 → 4.2 ครั้ง, context ที่ใช้งาน 11.5K → 9.5K แต่ token รวมเพิ่มราว 1.38 เท่า ตัวเลขนี้อ่านจากบทสรุป ยังไม่ได้ตรวจกับตาราง ที่นี่ใช้ greedy การ resample ต้องใช้ seed ที่บันทึกไว้ และต้องรายงานแยกจากแขน greedy กฎโปรแกรมซ้ำใน e0fee1cc เป็นส่วนเล็กที่สุดของข้อนี้
+3. **ตัวแยกข้อง่ายกับข้อยากจาก hidden state ก่อนเริ่มคิด** 2604.01202 ใช้ logistic regression บน residual stream ที่ token ก่อนคิด ชั้น 20 ของ Qwen3-4B บอกได้ว่าโมเดลจะเรียก tool หรือไม่ ด้วยความมั่นใจเกิน 90 % ก่อนเขียน token แรก (ค่า AUROC อยู่ในรูปที่อ่านไม่ได้) ที่นี่ต้องการ label อีกแบบ คือ "call ช่วยข้อนี้ไหม" ซึ่งงานนั้นไม่ได้วัด จึงยังเป็นสมมุติฐาน label มาจากแขนคู่ที่มีอยู่ (ไม่มี tool เทียบกับ hint ทีละข้อ) ตัวแยกใช้ตัดสินแค่ว่าจะใส่ hint หรือไม่ ไม่ใช้ steering ดันให้เรียก tool เพราะ 2607.05790 พบว่าการเพิ่มการเรียกแบบนั้นไม่ช่วยความแม่นและมักทำให้แย่ลง ต้องตรวจก่อนว่า engine อ่าน hidden state ชั้นกลางที่ token ก่อนคิดได้ ทางที่มีอยู่ (`visit_early_activations`) อ่านแค่ชั้นต้น
+
+**ชั้นที่ 2: เทรนบน Qwen3.5-4B** ถูกและ serve LoRA ผ่าน vLLM ได้โดยไม่ต้อง merge
+
+1. **RFT (START Hint-RFT, ReTool cold start)** รันชั้นที่ 1 แบบที่ดีที่สุดบน train split เท่านั้น เช่น MATH train ข้อสอบที่ใช้ประเมินห้ามเข้าชุดเทรน ตรวจซ้ำด้วย id และ hash ของ prompt เก็บเส้นทางที่ถูกและสั้นที่สุดของแต่ละข้อ รวมเส้นทางที่ไม่เรียก tool ด้วย โมเดลจะได้เรียนว่าข้อง่ายไม่ต้องเรียก แล้ว QLoRA
+2. **RL แบบให้รางวัลตามความยาก (EAPO 2606.02132)** ทำเมื่อข้อ 1 ได้ผล ใส่เส้นทางที่ไม่ใช้ tool ไว้ในกลุ่ม rollout และหักคะแนนการเรียกเกินจำเป็นเฉพาะข้อง่าย ไม่ใช้การหักเท่ากันทุกข้อแบบ OTC เพราะทำให้โมเดลเลี่ยง tool ในข้อยาก ASPO (2508.19201) ขยับ call แรกจากราว 4,000 มาที่ราว 1,000 token ตรงกับปัญหา 203 จาก 205 ข้างบน
+3. **เกณฑ์:** 4B + RFT ต้องชนะ 4B + ชั้นที่ 1 บนข้อ held-out ทั้งจำนวนข้อถูกและ token รายข้อ
+
+**ชั้นที่ 3: เทรนบน Flash-Next** เริ่มเมื่อชั้นที่ 2 พิสูจน์ผลแล้ว และผู้พัฒนาเป็นผู้ตัดสิน เพราะต้องสร้าง pack ใหม่และใช้ CU มาก engine ไม่มี LoRA มีสองทาง
+- merge adapter เข้า weight ความละเอียดสูงแล้ว quantize ใหม่ ห้าม merge เข้า base ที่ quantize แล้ว
+- ทำ LoRA แบบ runtime ใน engine
+ต้องวัดว่าผลของ adapter รอดการลงเป็น 2-bit และ routing ของ MoE ไม่เปลี่ยน ยังไม่มีงานวิจัยที่วัดกรณีนี้ตรงๆ
+
+### สิ่งที่ R13 เปลี่ยนจากเดิม
+
+- "Out of Scope for the First Milestone" ของ R11 ห้ามเทรน base weights R13 อนุญาตให้เทรน adapter บน 4B ในชั้นที่ 2 ส่วนการเปลี่ยน weight ของ Flash-Next ยังต้องให้ผู้พัฒนาตัดสินก่อน
+- เกณฑ์ตัดสินของ R12 ยังใช้ได้ กฎการทดสอบอยู่ใน `AGENTS.md`: ทดสอบด้วยชุดเล็กที่สุดที่ตอบคำถามได้, ใช้ API reader ทุกชุดที่ตอบเป็นข้อความ, ไม่เทียบผลข้ามเครื่อง Colab
+
+### งานวิจัยและระดับที่อ่าน
+
+- อ่านเนื้อหาหลักจากฉบับ HTML: [PruneTIR 2605.09931](https://arxiv.org/html/2605.09931) (ตาราง 1–6 อ่านตรง, ภาคผนวกท้ายจากบทสรุป), [Therefore I am. I Think 2604.01202](https://arxiv.org/html/2604.01202), [Heading-Specific Activation Steering 2607.05790](https://arxiv.org/html/2607.05790)
+- อ่านแค่ abstract และบทสรุป ต้องตรวจตัวเลขก่อนใช้: [START 2503.04625](https://arxiv.org/abs/2503.04625), [ReTool 2504.11536](https://arxiv.org/pdf/2504.11536), [ToRL 2503.23383](https://arxiv.org/html/2503.23383), [OTC 2504.14870](https://huggingface.co/papers/2504.14870), [EAPO 2606.02132](https://arxiv.org/pdf/2606.02132), [ASPO 2508.19201](https://arxiv.org/pdf/2508.19201)
+
+### R13 in English
+
+**Goal.** Easy questions the model already gets must cost fewer tokens, because MIP + Sandbox compute for it. Hard questions the base model gets wrong must come right more often by the same mechanism: the model sets a hypothesis, runs it, sees the real result and corrects itself. Hard questions may spend more tokens. Doing both at once is the top goal.
+
+**Evidence since R12, details in #288.** Every arm ran on a Colab A100 that repeats itself, so a tool arm's text matches its control until the mechanism acts; a 4-row proof on the new build matched to the character. GSM8K 60: 60 / 60, 0.62x tokens in sum and a per-row median of 0.82x, with no calls at all. MATH L5 60: 57 / 59 at 0.79x. MMLU-Pro 53: 50 / 49 at 1.07x, one loss on an ambiguous row. HLE 10: 4 / 5 at 0.78x. MATH long 22, no tool / tool / line hint: 21 / 21 / 21 at 157,235 / 121,483 / 101,864 tokens. MMLU long 19, no tool / line hint / wait hint: 16 / 11 / 14, per-row median 1 / 0.37x / 0.59x.
+- 203 of 205 calls in five arms came after the whole thinking, so the program checked an answer already reached by hand.
+- The line hint helps MATH and hurts MMLU: it lands early (about token 600) and cuts the deliberation over how to read the question. The wait hint, after the model's own "Wait" as in START, won 3 rows back by landing later.
+- Some rows move away from the key when computed exactly. MMLU 9cf86125: Colebrook gives 465.5 m, halfway between the 460 and 470 options; the key uses a Moody-chart value no computation reaches.
+- The tool loop had nothing to stop a cycle. MMLU 0fd92db9 sent one program 9 times running and spent 150,229 tokens against 45,052. Fixed in e0fee1cc: the same program a third time running gets TOOL_SPENT.
+
+**Chosen route (developer, 2026-11-03).** Three layers, most flexible first. Each starts once the one before has measured results.
+
+*Layer 1: at inference, no weight change, every model.* It lives in the Adapter and the bench, for Native and for models served through vLLM.
+1. Hint placement: wait (`mpw`, done), stop (`mps`, running) and MATH with wait (`m5w`). Pre-registered criteria: MMLU long at least 15 of 19 with no loss where the base was right by choosing the textbook convention; MATH long at least 21 of 22 at no more tokens than the line hint. If none clears MMLU, hint placement is suite-dependent and tuning stops.
+2. Context pruning and tool suspension after PruneTIR (2605.09931), in three parts:
+   - Remove an erroneous call from the context once a later turn resolves it.
+   - After 3 erroneous turns running, revert the context to before the first of them and resample.
+   - After 2 more stuck resamples, suspend the tool and return to reasoning by hand.
+
+   Reported on Qwen3-8B AIME24: 62.1 to 72.7 right, 7.7 to 4.2 calls, working context 11.5K to 9.5K. Total tokens rose about 1.38 times (read from a summary, not yet checked against the table). Decoding here is greedy, so a resample needs a recorded seed and is reported apart from greedy arms. The repeat rule of e0fee1cc is the smallest piece of this.
+3. An easy-or-hard gate from the hidden state before thinking. 2604.01202 fits a logistic regression on the residual stream at the pre-generation token (layer 20 of Qwen3-4B) and reads whether the model will call a tool with over 90 % confidence before the first token (the AUROC values are in a figure that could not be read). The label wanted here is different, whether a call helps this question, which that work did not measure, so it is a hypothesis. Labels come from the paired arms already stored (no tool against hint, row by row). The gate decides only whether the hint goes in. Steering is not used to push calls: 2607.05790 found that raising tool use that way did not improve accuracy and mostly lowered it. First check that the engine can read a middle layer at the pre-generation token; the existing path (`visit_early_activations`) reads early layers only.
+
+*Layer 2: training on Qwen3.5-4B.* It is cheap, and vLLM serves a LoRA without a merge.
+1. RFT, after START's Hint-RFT and ReTool's cold start. Run the best layer-1 setting on train splits only, such as MATH train. No evaluated question enters training; check that by id and prompt hash. Keep the right and shortest trajectory per question, including no-call trajectories, so the model learns that easy questions need no call. Then QLoRA.
+2. RL with a difficulty-aware reward (EAPO 2606.02132), only if step 1 shows a gain. Put tool-free trajectories in each rollout group and penalise redundant calls mainly on easy questions, not with OTC's uniform penalty, which makes the policy avoid tools on hard questions too. ASPO (2508.19201) moved the first call from about 4,000 to about 1,000 tokens, the problem the 203 of 205 above describes.
+3. Criterion: 4B with RFT beats 4B with layer 1 on held-out questions, in right answers and in per-row tokens.
+
+*Layer 3: training on Flash-Next.* Only once layer 2 has shown a gain, and the developer decides: it needs a new pack and much compute. The engine has no LoRA, so there are two ways:
+- Merge the adapter into high-precision weights and quantize again. Never merge into the quantized base.
+- Add runtime LoRA to the engine.
+
+Measure whether the adapter's effect survives 2-bit and whether MoE routing stays put; no published work measures this case directly.
+
+**What R13 changes.** R11's "Out of Scope for the First Milestone" forbids training base weights. R13 allows adapter training on 4B in layer 2. A change to Flash-Next's weights still waits for the developer. R12's decision criteria still hold. The testing rules are in `AGENTS.md`: the smallest run that answers the question, the API reader on every written-answer suite, and no comparison of results across Colab machines.
+
+**Research and how deeply it was read.** Main text read from the HTML versions: PruneTIR 2605.09931 (Tables 1 to 6 verbatim, the tail appendices from a summary), 2604.01202, and 2607.05790. Abstracts and summaries only, numbers to be checked before reuse: START 2503.04625, ReTool 2504.11536, ToRL 2503.23383, OTC 2504.14870, EAPO 2606.02132, and ASPO 2508.19201.
+
+---
+
+R12 เดิมอยู่ด้านล่าง
 
 ## R12 (2026-11-01)
 
