@@ -5,10 +5,17 @@ import json, multiprocessing, re, sys
 CHECK = r'''
 import ast, json, sys, time, io
 source, case, kind, name = json.load(open(sys.argv[1]))
-# builtins last, as LiveCodeBench's own header has it: `from math import *` put math.pow over pow, and every pow(x, e, MOD) failed
-header = "from typing import *\nfrom collections import *\nfrom functools import *\nfrom itertools import *\nfrom math import *\nfrom heapq import *\nfrom bisect import *\nfrom builtins import *\nimport sys, re, string, random, operator\n"
+from decimal import Decimal
+# LiveCodeBench's own import_string (lcb_runner/evaluation/testing_util.py), word for word: builtins after math (pow was math.pow,
+# #294), `import math`, and the recursion limit
+header = "from string import *\nfrom re import *\nfrom datetime import *\nfrom collections import *\nfrom heapq import *\nfrom bisect import *\nfrom copy import *\nfrom math import *\nfrom random import *\nfrom statistics import *\nfrom itertools import *\nfrom functools import *\nfrom operator import *\nfrom io import *\nfrom sys import *\nfrom json import *\nfrom builtins import *\nfrom typing import *\nimport string\nimport re\nimport datetime\nimport collections\nimport heapq\nimport bisect\nimport copy\nimport math\nimport random\nimport statistics\nimport itertools\nimport functools\nimport operator\nimport io\nimport sys\nimport json\nsys.setrecursionlimit(50000)\n"
+def decimals(line):
+    try:
+        return [Decimal(x) for x in line.split()]
+    except Exception:
+        return None
 got = None
-if kind == 'functional':
+if kind == 'functional':   # its grade_call_based: exact, a tuple read as a list
     space = {}
     exec(header + source, space)
     args = [json.loads(line) for line in case['input'].split('\n')]
@@ -17,11 +24,8 @@ if kind == 'functional':
     want = json.loads(case['output'])
     if isinstance(got, tuple):
         got = list(got)
-    if isinstance(want, float) or isinstance(got, float):
-        print('ok' if abs(float(got) - float(want)) < 1e-6 else 'wrong')
-    else:
-        print('ok' if got == want else 'wrong')
-else:
+    print('ok' if got == want else 'wrong')
+else:   # its grade_stdio: stripped lines, the same count, each equal or equal as decimals
     sys.stdin = io.StringIO(case['input'])
     sys.stdout, real = io.StringIO(), sys.stdout
     space = {'__name__': '__main__'}
@@ -30,7 +34,8 @@ else:
     sys.stdout = real
     a = [l.strip() for l in text.strip().split('\n')]
     b = [l.strip() for l in case['output'].strip().split('\n')]
-    print('ok' if a == b else 'wrong')
+    same = len(a) == len(b) and all(x == y or (decimals(x) is not None and decimals(x) == decimals(y)) for x, y in zip(a, b))
+    print('ok' if same else 'wrong')
 '''
 FENCE = chr(96) * 3
 

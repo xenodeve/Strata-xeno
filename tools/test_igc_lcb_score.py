@@ -27,6 +27,16 @@ class Check(unittest.TestCase):
         self.assertEqual(self.one(MODPOW, case, 'functional', 'inv'), 'ok')
         self.assertEqual(self.one(STDIN, dict(input='5\n', output='4\n'), 'stdin'), 'ok')
 
+    def test_the_official_header_names_and_recursion(self):
+        uses_math = 'class Solution:\n    def f(self, a: int) -> int:\n        return math.isqrt(a)\n'
+        self.assertEqual(self.one(uses_math, dict(input='17', output='4'), 'functional', 'f'), 'ok')
+        deep = 'import sys\ndef d(n):\n    return 0 if n == 0 else 1 + d(n - 1)\nprint(d(int(input())))\n'
+        self.assertEqual(self.one(deep, dict(input='5000\n', output='5000\n'), 'stdin'), 'ok')
+
+    def test_stdin_lines_equal_as_decimals(self):
+        self.assertEqual(self.one('print("1.50 2")\n', dict(input='', output='1.5 2.0\n'), 'stdin'), 'ok')
+        self.assertTrue(self.one('print("1.5")\nprint(3)\n', dict(input='', output='1.5\n'), 'stdin').startswith('wrong'))
+
     def test_an_exception_says_which(self):
         verdict = self.one(BROKEN, dict(input='2', output='1'), 'functional', 'inv')
         self.assertTrue(verdict.startswith('error: ZeroDivisionError'), verdict)
