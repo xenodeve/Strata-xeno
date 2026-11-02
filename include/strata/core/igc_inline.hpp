@@ -120,6 +120,9 @@ inline bool in_cycle(std::span<const int32_t> tokens, int longest, int rounds) {
 // with a line back 37 times. Of 7,437 stored runs, a line of 12 tokens came back 16 times in 3 that ended by themselves, one of them
 // right and 2,535 tokens from its end, and in all 4 that ran to the end of the context, at 11,202 to 128,741 tokens.
 inline constexpr int kLineTokens = 12, kLineRounds = 16;
+// A run that counts by hand changes its numbers, so neither check sees it, and it feeds on these values: 8,104 of them in 261,266
+// tokens. Of 2,471 stored runs that took a value and ended by themselves, one took more than 256, and it was wrong; a right one took 78.
+inline constexpr int kMaxValues = 256;
 class LineRepeat {
 public:
     bool step(int32_t token) {

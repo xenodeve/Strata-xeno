@@ -31,6 +31,7 @@ struct InlineTurn {
     bool sandbox_opened_=false,sandbox_called_=false;
     int sandbox_reading_=-1;   // tokens left to read a result in before the close, -1 when none is due
     strata::igc::inline_tokens::LineRepeat thinking_lines_;
+    int inline_values_=0;
     bool request_on_=true;   // GEN key igc=0: this request runs with no MIP
 };
 // First-anchor learned diagnostic, distinct from the oracle-input comparator.
@@ -206,7 +207,7 @@ public:
         if(!pipeline_->stage_inputs(context_->states(strata::igc::ContextTap::Embedding),
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
-        staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_tail_.clear();thinking_lines_={};thinking_closed_=strata::igc::inline_tokens::thinking_off(prefix_,kThinkClose);
+        staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_tail_.clear();thinking_lines_={};inline_values_=0;thinking_closed_=strata::igc::inline_tokens::thinking_off(prefix_,kThinkClose);
         sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;sandbox_reading_=-1;bridged_unread_=0;
         bridge_tokens_.clear();bridge_at_=0;   // an admission never reaches delivering(), and a stopped request can leave a delivery half done
         if(natural_)natural_->begin(prefix_);
@@ -445,6 +446,10 @@ public:
         }
         const auto call=strata::igc::parse_inline(generated_);
         if(!call)return true;
+        if(!thinking_closed_ && ++inline_values_>strata::igc::inline_tokens::kMaxValues) {
+            std::fprintf(stderr,"strata igc loop: too many values, closed the thinking\n");
+            bridge_tokens_={198,kThinkClose,271};bridge_at_=0;called=true;return true;
+        }
         if(!inline_request_ && (cudaMalloc(&inline_request_,sizeof(*inline_request_))!=cudaSuccess
                 || cudaMalloc(&inline_result_,sizeof(*inline_result_))!=cudaSuccess)){error="igc inline device buffers";return false;}
         std::vector<int32_t> value;
