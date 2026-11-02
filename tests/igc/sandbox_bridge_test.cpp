@@ -60,6 +60,8 @@ int main(int argc, char** argv) {
         require(p && f.runs(*p), "a bare fence with a whole draft runs");
         auto q = feed(f, {"\n", "```", "\n", "F=(8/3,2)\n", "```"});
         require(q && !f.runs(*q), "a bare fence with no draft does not");
+        auto sketch = feed(f, {"\n", "```", "\n", "class Solution:\n    def f(...):\n        ...\n    pass\n", "```"});
+        require(sketch && !f.runs(*sketch), "a sketch is no draft");
         auto r = feed(f, {"\n", "```cpp\n", "int main() {}\n", "```"});
         require(r && !f.runs(*r), "nor another language");
         require(!f.inside(), "and its closing fence opens nothing");

@@ -239,8 +239,9 @@ public:
     bool runs(std::string_view program) const {
         if (kind_ == Kind::Other) return false;
         if (kind_ == Kind::Code) return true;
+        // A sketch, `def f(...):`, is no draft: run, it answered a SyntaxError the model had to step around.
         return (program.find("\ndef ") != std::string_view::npos || program.find("\nclass ") != std::string_view::npos)
-            && std::count(program.begin(), program.end(), '\n') >= 4;
+            && std::count(program.begin(), program.end(), '\n') >= 4 && program.find("...") == std::string_view::npos;
     }
     bool code() const { return kind_ == Kind::Code; }   // the model means to run it, so a block too long to run is told so
 
