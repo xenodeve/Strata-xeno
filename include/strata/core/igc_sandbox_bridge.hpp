@@ -310,6 +310,16 @@ inline bool binds_a_name(std::string_view program) {
     return program.find("def ") != std::string_view::npos || program.find('=') != std::string_view::npos;
 }
 
+// The kernel's `mcp` object, used: the name as a whole word before a dot. The bytes, not the syntax, so a comment that says `mcp.tools` counts, and
+// costs a kernel the block did not need.
+inline bool uses_mcp(std::string_view program) {
+    for (std::size_t at = program.find("mcp."); at != std::string_view::npos; at = program.find("mcp.", at + 4)) {
+        const char before = at ? program[at - 1] : ' ';
+        if (!std::isalnum((unsigned char) before) && before != '_' && before != '.') return true;
+    }
+    return false;
+}
+
 // `None` is an unfinished draft called anyway, not a result: the close took 2 of the 4 rows it lost on one (#279).
 inline bool says_something(std::string_view body) {
     while (body.starts_with("None\n")) body.remove_prefix(5);
@@ -361,7 +371,8 @@ public:
     bool matched() const { return matched_last_; }   // the last run's every `expect` held
     uint64_t steps() const { return steps_; }
     // Real Python, for what the interpreter refuses: (code, a fresh kernel, body, ok), false when nothing answered. The refusal itself
-    // chooses the tier, and a turn that moved stays there, because the kernel holds its names.
+    // chooses the tier, and a turn that moved stays there, because the kernel holds its names. A program using `mcp.` goes too: the
+    // kernel is its way to a tool (serve/mip/mcp_adapter.py), and the interpreter would only say NameError.
     using Exec = std::function<bool(std::string_view, bool, std::string&, bool&)>;
     void set_exec(Exec exec) { exec_ = std::move(exec); }
     // What the reasoning reads next, right after the closing fence.
@@ -376,7 +387,7 @@ public:
         Result result;
         std::thread([&] { result = sandbox::run(source, limits_, cancel); }).join();
         steps_ += result.steps;
-        if (exec_ && (result.status == Status::Unsupported || result.error.starts_with("ModuleNotFoundError"))) {
+        if (exec_ && (uses_mcp(program) || result.status == Status::Unsupported || result.error.starts_with("ModuleNotFoundError"))) {
             outside_ = true;
             return run_outside(source);
         }

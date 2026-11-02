@@ -1742,6 +1742,8 @@ class StrataEngine:
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
+        if self.sandbox_exec:                            # what this request's blocks may reach (run_with_mcp): here, where it holds the engine
+            self.sandbox_exec.begin((sampling or {}).get("_mip"))
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self._stats = None          # xeno UI S4: this request's STATS line, once the engine sends it
         self._pp = []               # ... and its PP lines (position, ms): the prefill speed per chunk
@@ -1835,6 +1837,8 @@ class StrataEngine:
                     done = True
                     raise ValueError(line[4:].strip())
         finally:
+            if self.sandbox_exec:                         # from here nothing waits for a block
+                self.sandbox_exec.stop()
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
                     try:
@@ -4850,6 +4854,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     max_rounds = max(int(hub.settings["max_rounds"]), AGENT_ROUNDS) if agent_run is not None else int(hub.settings["max_rounds"])      # coding takes many rounds
     if rounds_limit is not None:                                  # a helper (serve/subagent.py) stops sooner
         max_rounds = rounds_limit
+    if getattr(svc.engine, "sandbox_exec", None):                 # a program in the reasoning reads what this request offered, from the hub as it is now
+        from serve.mip.mcp_adapter import McpAdapter
+        sampling = {**sampling, "_mip": McpAdapter(hub, mcp_names, agent_run.policy if agent_run is not None else None, cancel)}
     total, rounds, done = 0, 0, None
     dec_n, dec_ms = 0, 0.0                                       # the tokens decoded and the time the engine spent decoding them, over every round
     messages = list(messages)
@@ -7349,6 +7356,15 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+def sandbox_bridge(args: list[str], groups):
+    """What answers the SBX lines of an engine started with --igc-sandbox-exec, else None.  One kernel for one request, so not across
+    replicas (the engine refuses --batch itself).  No isolation box yet (#287): a block that gets here is told it cannot run."""
+    if "--igc-sandbox-exec" not in args or groups:
+        return None
+    from serve.sandbox.exec_bridge import ExecBridge
+    return ExecBridge()
+
+
 def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool):
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
     and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
@@ -7580,6 +7596,7 @@ def main() -> int:
             engine = StrataEngine(exe, args + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env,
                                   lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
+        engine.sandbox_exec = sandbox_bridge(args, groups)
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups else None
