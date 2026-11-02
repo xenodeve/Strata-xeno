@@ -118,7 +118,10 @@ int main(int argc, char** argv) {
         Session s;
         require(s.run("expect(1 + 1, 2)\n") == "\n```output\nmatch: 2\n```\n\n" && s.printed() && !s.mismatch(), "a right result says so");
         require(s.run("expect(1, 3)\n") == "\n```output\nMISMATCH: expected 3, got 1\n```\n\n" && s.mismatch(), "a wrong one says what was expected");
-        require(s.run("expect(None, [1])\n").find("MISMATCH: expected [1], got None") != std::string::npos && s.mismatch(), "an unfinished draft is a mismatch");
+        const auto stub = s.run("expect(None, [1])\n");
+        require(stub.find("MISMATCH: expected [1], got None") != std::string::npos && !s.mismatch() && !s.matched(), "an unfinished draft is no wrong value");
+        require(stub.find("[it returned None: the function is not finished]") != std::string::npos, "and it is told so");
+        require(wrong_value("match: 1\nMISMATCH: expected 2, got None\nMISMATCH: expected 3, got 4\n") && !wrong_value("MISMATCH: expected 2, got None\n"), "one real value among stubs");
         require(s.run("expect(0.1 + 0.2, 0.3)\n").find("match: ") != std::string::npos && !s.mismatch(), "floats within the benchmark's tolerance match");
         require(s.run("expect(1 + 1 == 2)\n").find("match: True") != std::string::npos && s.matched(), "one argument is a condition");
         require(s.run("expect(1 + 1 == 3)\n").find("MISMATCH: expected True, got False") != std::string::npos && s.mismatch() && !s.matched(), "a condition that fails");

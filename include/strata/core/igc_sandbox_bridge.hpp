@@ -36,7 +36,21 @@ inline constexpr std::string_view kCallHead = "print(";
 // The call as a test: the comment says where the second argument comes from, because `expect` is in no prompt.
 inline constexpr std::string_view kExpectHead = "# result, then the expected output from the question\nexpect(";
 // Said in the model's voice after a mismatch. Self-Debugging: a test result with the model's own explanation did best.
-inline constexpr std::string_view kMismatchLine = "Wait, this does not match, so my approach is wrong somewhere. Why?\n";
+// It asks which side is wrong: one model wrote an expected value of its own, 1 for 45, and this line called a right program wrong (#288).
+inline constexpr std::string_view kMismatchLine = "Wait, this does not match. Is my approach wrong, or did I expect the wrong value? Why?\n";
+// A function that returned None is not finished, and that is all it says: on 2952 a brute force that ended in a comment got None, the line above
+// called the approach wrong, and the model wrote the same unfinished brute force 4 times and lost a row it had right (#288).
+inline constexpr std::string_view kStubNote = "[it returned None: the function is not finished]";
+
+// Whether a run's checks found a wrong value, as against only an unfinished function's None.
+inline bool wrong_value(std::string_view body) {
+    for (std::size_t at = body.find("MISMATCH: "); at != std::string_view::npos; at = body.find("MISMATCH: ", at + 1)) {
+        std::size_t end = body.find('\n', at);
+        if (end == std::string_view::npos) end = body.size();
+        if (!body.substr(at, end - at).ends_with(", got None")) return true;
+    }
+    return false;
+}
 // Before the thinking ends, where the model has its answer and nothing has been cut short. START's own words came back as a comment in an
 // empty block, 8 times over, on the question that had 4 drafts written (#288): so the line says what to run, and what the block is for.
 // `Let` and not `Wait`: at this point the first raised a small model's score and the second lowered it (2606.16934).
@@ -430,8 +444,9 @@ public:
         if (cut) body += "\n[output cut]";
         printed_last_ = result.status == Status::Ok && says_something(body);
         quiet_last_ = result.status == Status::Ok && body.empty() && !result.stdin_short;
-        mismatch_last_ = result.status == Status::Ok && body.find("MISMATCH: ") != std::string::npos;
-        matched_last_ = result.status == Status::Ok && !mismatch_last_ && body.starts_with("match: ");
+        mismatch_last_ = result.status == Status::Ok && wrong_value(body);
+        matched_last_ = result.status == Status::Ok && body.find("MISMATCH: ") == std::string::npos && body.starts_with("match: ");
+        if (result.status == Status::Ok && !mismatch_last_ && body.find("MISMATCH: ") != std::string::npos) body += "\n" + std::string(kStubNote);
         if (result.status == Status::Ok) {
             done_ = std::move(source);
             printed_ = result.output.size();
@@ -466,8 +481,9 @@ private:
         if (body.find_first_not_of(" \t\r\n") == std::string::npos) body.clear();
         printed_last_ = ok && says_something(body);
         quiet_last_ = ok && body.empty();
-        mismatch_last_ = ok && body.find("MISMATCH: ") != std::string::npos;
-        matched_last_ = ok && !mismatch_last_ && body.starts_with("match: ");
+        mismatch_last_ = ok && wrong_value(body);
+        matched_last_ = ok && body.find("MISMATCH: ") == std::string::npos && body.starts_with("match: ");
+        if (ok && !mismatch_last_ && body.find("MISMATCH: ") != std::string::npos) body += "\n" + std::string(kStubNote);
         if (body.size() > kShownOutput) {
             body.resize(kShownOutput);
             body += "\n[output cut]";
