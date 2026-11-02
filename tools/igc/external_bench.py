@@ -232,6 +232,9 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             from tools.igc import lcb_score
             tests=json.loads(Path(lcb_tests).read_text(encoding='utf-8'));runner=output/'lcb.runner.py';runner.write_text(lcb_score.CHECK,encoding='utf-8')
             pool=multiprocessing.Pool(8);judge=lambda r:lcb_score.judge(r,tests,str(runner),pool)
+        elif stop_on_loss:   # a written answer: the suite's own rule, not the last number in the reply (a letter, an expression)
+            from tools.igc.select_rows import right
+            judge=lambda r:'ok' if right(r,r['text']) else 'wrong'
         if slots:records=run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_context,stuck_rounds,output,cancel,sampling)
         for row in rows if not slots else ():
             if cancel.is_set():raise RuntimeError('bench stopped before request')

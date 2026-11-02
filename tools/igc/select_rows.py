@@ -1,18 +1,25 @@
 """Rows for the next arm: the questions a first pass got wrong and the feature can reach, plus an optional seeded share of the right ones.
 Easy questions show nothing, and neither do misses with nothing to compute: a wrong fact or a misread question is out of reach.
-select_rows.py records.json rows.jsonl output.jsonl [share of right]"""
+select_rows.py records.json rows.jsonl output.jsonl [share of right] | --verdicts records.json verdicts.json (for --stop-on-loss)"""
 import json, random, re, sys
+from tools.igc.external_score import final_number
 from tools.igc.standard_score import bbh_right, hle_right, letter_answer, math_right
+
+LETTER_SUITES = ('mmlupro', 'supergpqa', 'gpqa')
 
 
 def right(row, text):
+    """The one rule each suite is scored by: the bench's early stop, the reader's triage and the row selection all use it."""
     if row['suite'] == 'stdmath':
         return math_right(text, row['answer'])
     if row['suite'] == 'bbh':
         return bbh_right(text, row['answer'])
     if row['suite'] == 'hle':
         return hle_right(text, row['answer'])
-    return letter_answer(text) == row['answer']
+    if row['suite'] in LETTER_SUITES:
+        return letter_answer(text) == row['answer']
+    value = final_number(text)   # GSM8K and the other integer suites
+    return value is not None and abs(value - float(row['answer'])) < 1e-6
 
 
 CALCULATION = re.compile(r'\d\s*(?:[-+*/^=<>×÷]|\\times|\\frac|\\cdot)\s*[\d(\\]')
@@ -40,7 +47,16 @@ def select(records, rows, share=.2, seed=1):
     return wrong, good[:round(len(good) * share)], len(good), len(out_of_reach)
 
 
-if __name__ == '__main__':
+def verdicts(records):
+    """The base arm's verdicts for external_bench --stop-on-loss, by the same rule the bench judges the new arm with."""
+    return {r['id']: 'ok' if right(r, r['text']) else 'wrong' for r in records}
+
+
+if __name__ == '__main__' and sys.argv[1] == '--verdicts':   # --verdicts records.json verdicts.json
+    found = verdicts(json.load(open(sys.argv[2], encoding='utf-8')))
+    open(sys.argv[3], 'w', encoding='utf-8').write(json.dumps(found, indent=1))
+    print(sys.argv[3], sum(v == 'ok' for v in found.values()), 'ok of', len(found))
+elif __name__ == '__main__':
     records = json.load(open(sys.argv[1], encoding='utf-8'))
     rows = [json.loads(line) for line in open(sys.argv[2], encoding='utf-8')]
     wrong, kept, right_total, dropped = select(records, rows, float(sys.argv[4]) if len(sys.argv) > 4 else 0)

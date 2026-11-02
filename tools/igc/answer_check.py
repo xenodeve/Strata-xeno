@@ -28,10 +28,7 @@ def prompt(case):
 
 
 def scored_right(record):
-    if record.get('suite') in ('stdmath', 'bbh', 'mmlupro', 'supergpqa', 'hle'):
-        return right(record, record['text'])
-    value = final_number(record['text'])
-    return value is not None and abs(value - float(record['answer'])) < 1e-6
+    return right(record, record['text'])
 
 
 def triage(records, verdicts):
