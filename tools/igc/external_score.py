@@ -24,7 +24,7 @@ def final_number(text):
     if len(parts) < 2:
         return None
     answer = parts[1].replace('<|im_end|>', '').replace('{,}', '').replace(',', '').replace(MINUS, '-').strip()
-    boxed = re.findall(r'\\boxed\{\s*(?:\\\$)?\s*(-?\d+(?:\.\d+)?)(?:\s|\\[,;!]|\\(?:text|mathrm)\{[^{}]*\})*\}', answer)
+    boxed = re.findall(r'\\boxed\{\s*(?:\\\$)?\s*(-?\d+(?:\.\d+)?)(?:\s|\\(?=\\)|\\[;!]|\\(?:text|mathrm)\{[^{}]*\})*\}', answer)
     if boxed:
         return float(boxed[-1])
     # A closing `If both boxes must be nonempty...` or `since 2^6 = 64` comes after the answer.
