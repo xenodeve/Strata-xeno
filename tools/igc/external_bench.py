@@ -331,7 +331,9 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                     said.append(tokens)
                     if hinted:   # the model writes the program on from the hint's open call
                         words=HINT if hint_at=='line' else HINT_WAIT if hint_at=='wait' else HINT_STOP
-                        hints.append(dict(turn=turn,after=quiet,at=hint_at));asked=asked+tokens+tokenizer.encode(words);lead=words;quiet=0
+                        # the hint is not the model's, so it stays out of the text and its count; where it went in and what it said stay here
+                        hints.append(dict(turn=turn,after=quiet,at=hint_at,token=sum(len(s) for s in said),char=len(tokenizer.decode_bytes([x for s in said for x in s]).decode('utf-8','replace')),words=words))
+                        asked=asked+tokens+tokenizer.encode(words);lead=words;quiet=0
                         continue
                     code=inner if inner is not None else None if stuck or not tool_loop else tool_call(lead+tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                     if code is None:break
