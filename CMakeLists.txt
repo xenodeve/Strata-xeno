@@ -1386,8 +1386,7 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME xeno_direct_file_thread_exit COMMAND xeno_direct_file_thread_exit)   # #185
     add_executable(xeno_end_engine tests/xeno/end_engine.cpp src/core/end_engine.cpp)
     target_include_directories(xeno_end_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME xeno_end_engine COMMAND xeno_end_engine)   # #203
-    set_tests_properties(xeno_end_engine PROPERTIES SKIP_RETURN_CODE 77)   # Windows' hazards only
+    add_test(NAME xeno_end_engine COMMAND xeno_end_engine)   # #203; the return from main on Linux, #292
     add_executable(xeno_pool_spin tests/xeno/pool_spin.cpp)
     target_link_libraries(xeno_pool_spin PRIVATE strata_kernels_cpu)
     add_executable(xeno_pool_rest tests/xeno/pool_rest.cpp)

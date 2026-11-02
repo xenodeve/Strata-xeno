@@ -5,8 +5,11 @@
 //              shows the last one as the cause) and no exit-time handler runs;
 //   lock     - another thread holds the loader lock for good (a thread_local's destructor that joins a thread, #185):
 //              ExitProcess would wait for that lock forever, end_engine must not;
-//   deadline - the release itself never returns: the deadline started at startup ends the process.
-// Windows only (the hazards are Windows'); elsewhere it returns 77, which CTest reports as skipped.
+//   deadline - the release itself never returns: the deadline started at startup ends the process;
+//   return   - main returns with the deadline started and never armed, as a refused boot does: exit-time destruction
+//              must not wait on the deadline thread (glibc's condition_variable destructor waited for its waiter, and a
+//              refused MIP bundle left the engine hung for good on Linux, #292).
+// lock is Windows only (the loader lock is Windows'); the others run everywhere.
 #include "strata/core/end_engine.hpp"
 #include "strata/core/progress.hpp"
 
@@ -17,6 +20,10 @@
 #include <thread>
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -34,6 +41,10 @@ struct LoaderLockHolder {   // #185's shape: run at thread exit, under the loade
 int child(const std::string& mode) {
     std::atexit(at_exit);
     strata::core::start_end_engine_deadline(1500);
+    if (mode == "return") {   // as late as a refused boot returns: the deadline thread is waiting by then
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        return 5;
+    }
     strata::core::release_gpu_fn().store(mode == "deadline" ? released_never : released);
     if (mode == "lock") {
         std::thread([] {
@@ -74,6 +85,39 @@ Run run_child(const char* self, const char* mode) {
     CloseHandle(pi.hThread);
     return r;
 }
+#else
+struct Run { bool ended; int code; std::string out; };
+Run run_child(const char* self, const char* mode) {
+    int fd[2];
+    Run r{false, -1, ""};
+    if (pipe(fd) != 0) return r;
+    const pid_t pid = fork();
+    if (pid == 0) {
+        dup2(fd[1], 1);
+        dup2(fd[1], 2);
+        close(fd[0]);
+        close(fd[1]);
+        execl(self, self, mode, (char*) nullptr);
+        _exit(127);
+    }
+    close(fd[1]);
+    int status = 0;
+    for (int i = 0; i < 80 && !r.ended; ++i) {
+        if (waitpid(pid, &status, WNOHANG) == pid) r.ended = true;
+        else std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!r.ended) {   // hung: end it so the pipe closes
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+    }
+    char buf[256];
+    ssize_t n = 0;
+    while ((n = read(fd[0], buf, sizeof buf)) > 0) r.out.append(buf, (size_t) n);
+    close(fd[0]);
+    if (WIFEXITED(status)) r.code = WEXITSTATUS(status);
+    return r;
+}
+#endif
 std::string last_strata_line(const std::string& out) {
     std::string last;
     size_t pos = 0;
@@ -87,12 +131,10 @@ std::string last_strata_line(const std::string& out) {
     }
     return last;
 }
-#endif
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc > 1) return child(argv[1]);
-#if defined(_WIN32)
     int bad = 0;
     auto check = [&](bool ok, const char* what) { std::printf("%s - %s\n", what, ok ? "PASS" : "FAIL"); bad += !ok; };
     const Run plain = run_child(argv[0], "plain");
@@ -101,12 +143,14 @@ int main(int argc, char** argv) {
     check(last_strata_line(plain.out).find("test end (#203)") != std::string::npos,
           "plain: the reason is the last strata line");
     check(plain.out.find("ATEXIT") == std::string::npos, "plain: no exit-time handler runs");
+#if defined(_WIN32)
     const Run lock = run_child(argv[0], "lock");
     check(lock.ended && lock.code == 7, "lock: ends with the loader lock held by another thread");
+#endif
     const Run dl = run_child(argv[0], "deadline");
     check(dl.ended && dl.code == 7, "deadline: a release that never returns is ended by the deadline");
+    const Run ret = run_child(argv[0], "return");
+    check(ret.ended && ret.code == 5, "return: a refused boot that returns from main ends (#292)");
+    check(ret.out.find("ATEXIT") != std::string::npos, "return: the ordinary exit still runs its handlers");
     return bad == 0 ? 0 : 1;
-#else
-    return 77;
-#endif
 }

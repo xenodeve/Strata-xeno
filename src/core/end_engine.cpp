@@ -18,8 +18,11 @@ namespace strata::core {
 namespace {
 std::atomic<bool> g_started{false}, g_armed{false};
 std::atomic<int> g_code{3};
-std::mutex g_mu;
-std::condition_variable g_cv;
+// Never destroyed: the deadline thread waits on them for the whole run, and an ordinary exit destroys statics while it
+// waits. glibc's condition_variable destructor waits for its waiters to leave, so a boot that returned from main (a
+// refused MIP bundle) hung for good on Linux (#292).
+std::mutex& g_mu = *new std::mutex;
+std::condition_variable& g_cv = *new std::condition_variable;
 
 [[noreturn]] void terminate_now(int code) {
 #if defined(_WIN32)
