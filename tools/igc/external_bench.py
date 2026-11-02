@@ -39,10 +39,11 @@ TOOL_AFTER=4
 
 
 def repeated(ran,code,times=3):
-    """The same program a third time running ends the runs. mpw's 0fd92db9 sent one 4116-token program nine times running, 37k tokens of the
-    row's 150k (#288), and the repeat check reads one turn so it never saw it. Once again is left alone: after the second line hint m5h3 and
-    mph2 wrote the program they had just run, then went on to a new one (de922fcd)."""
-    last=[c['code'] for c in ran if c['ok'] is not None][-(times-1):]
+    """The same program a third time running, in calls the model opened itself, ends the runs. mpw's 0fd92db9 sent one 4116-token program
+    nine times running, 37k tokens of the row's 150k (#288), and the repeat check reads one turn so it never saw it. A call a hint opened does
+    not count: after the second hint the model often writes the program it just ran (5 of 12 in m5w), and counting it ended m5w's 53e605d1
+    with no answer where m5h3 went on to a new program and got it right. The caller passes only calls the model opened."""
+    last=[c['code'] for c in ran if c['ok'] is not None and not c.get('hinted')][-(times-1):]
     return len(last)==times-1 and all(c==code[:20000] for c in last)
 # --hint-after N: every call of 205 in five arms came after the whole thinking, so the program checked an answer already reached by hand. START's
 # Hint-infer (2503.04625) puts its own words in the reasoning and the model goes on into a call; here they open the call in the model's format.
@@ -345,8 +346,8 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                         continue
                     code=inner if inner is not None else None if stuck or not tool_loop else tool_call(lead+tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                     if code is None:break
-                    quiet=0;lead=''
-                    spent=spent or repeated(ran,code)
+                    opened=bool(lead);quiet=0;lead=''   # a hint opened this call
+                    spent=spent or (not opened and repeated(ran,code))
                     if spent and sum(c['ok'] is None for c in ran)>=TOOL_AFTER:break   # as many answered calls as past the 24th runs, no more
                     if turn<TOOL_ROUNDS and not spent:
                         from serve.sandbox.exec_bridge import Kernel
@@ -357,7 +358,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                     else:shown=TOOL_SPENT;ok=None;took=0.;full=0;restarted=False
                     # each call whole enough to audit: what ran, what came back and how much was cut, whether it failed, its seconds
                     ran.append(dict(turn=turn,thinking=inner is not None,code=code[:20000],code_chars=len(code),shown=shown[:20000],shown_chars=full,
-                                    ok=ok,seconds=round(took,3),restarted=restarted))
+                                    ok=ok,seconds=round(took,3),restarted=restarted,hinted=opened))
                     if inner is not None:   # the answer goes into the thinking, which goes on
                         asked=asked+tokens+tokenizer.encode('\n<tool_response>\n'+shown+'\n</tool_response>\n')
                         continue

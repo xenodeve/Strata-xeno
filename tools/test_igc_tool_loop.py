@@ -51,6 +51,9 @@ assert not repeated([A], 'print(1)'), 'once again is left alone: m5h3 de922fcd w
 assert not repeated([A, B, A], 'print(1)'), 'not running'
 assert not repeated([A, A, dict(code='print(1)', ok=None)][2:], 'print(1)') and not repeated([], 'print(1)')
 assert not repeated([A, A], 'print(1) ')
+H = dict(A, hinted=True)
+assert not repeated([A, H], 'print(1)'), "m5w 53e605d1: the second hint's rewrite of the last program is not the model's loop"
+assert repeated([A, H, A], 'print(1)'), 'the model-opened calls around it still count'
 
 # One row's engine lines: m5t's loop rule closed the thinking on 2 rows, and nothing in the records said which (#288)
 import tempfile
