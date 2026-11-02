@@ -86,10 +86,10 @@ class Rule(unittest.TestCase):
         self.assertFalse(right(dict(row, answer='2.5'), 'x</think>\\boxed{\\frac53}'))
         self.assertFalse(right(dict(row, answer='16'), 'thinking never closed **16**'))
 
-    def test_the_plain_math_prompt_asks_for_a_box(self):
+    def test_the_plain_math_prompt_is_the_problem_alone(self):
+        """The prompt m5o/m5t ran with: a tail would part every later arm from them at the first sentence."""
         from tools.igc.standard_rows import plain_prompt
-        text = plain_prompt(dict(suite='stdmath', prompt='Problem:\nWhat is 1+1?\n\nSolution:'))
-        self.assertTrue(text.startswith('What is 1+1?') and text.endswith('\\boxed{}.'))
+        self.assertEqual(plain_prompt(dict(suite='stdmath', prompt='Problem:\nWhat is 1+1?\n\nSolution:')), 'What is 1+1?')
 
     def test_verdicts_for_stop_on_loss(self):
         records = [dict(id='a', suite='gsm8k', answer=3, text='x</think>\\boxed{3}'), dict(id='b', suite='mmlupro', answer='A', text='x</think>the answer is (B)')]

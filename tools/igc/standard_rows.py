@@ -55,8 +55,10 @@ def hle_rows(path, categories=('Math', 'Physics', 'Computer Science/AI'), sample
 def plain_prompt(row):
     """The question alone, with no exemplars, for the arms with the thinking on."""
     text = row['prompt']
-    if row['suite'] == 'stdmath':   # with Qwen's own math instruction: without it the replies ended in bold or a display, not a box
-        return text.rsplit('Problem:\n', 1)[1].rsplit('\n\nSolution:', 1)[0] + MATH_TAIL
+    if row['suite'] == 'stdmath':
+        # No answer instruction: the scorer reads a bold or a displayed answer (8a3f6217). A `\boxed{}` tail changed the paths from the first
+        # sentence, so a hint arm with it could not be set against m5o/m5t, which ran without it.
+        return text.rsplit('Problem:\n', 1)[1].rsplit('\n\nSolution:', 1)[0]
     if row['suite'] == 'mmlupro':
         return text.rsplit('Question:\n', 1)[1].rsplit("Answer: Let's think", 1)[0].strip() + LETTER_TAIL
     if row['suite'] == 'supergpqa':
