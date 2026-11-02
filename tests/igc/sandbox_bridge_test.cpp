@@ -107,6 +107,25 @@ int main(int argc, char** argv) {
     }
     {
         Session s;
+        int calls = 0;
+        std::string sent;
+        bool first = false;
+        s.set_exec([&](std::string_view code, bool fresh, std::string& body, bool& ok) {
+            if (!calls) first = fresh;
+            ++calls;
+            sent = std::string(code);
+            body = "2\n";
+            ok = true;
+            return true;
+        });
+        require(s.run("x = 1\nprint(x)\n") == "\n```output\n1\n```\n\n" && calls == 0, "what the interpreter can do stays there");
+        require(s.run("import sympy\nprint(sympy.Integer(2))\n") == "\n```output\n2\n```\n\n" && calls == 1 && first && s.printed(), "a refusal goes to real Python");
+        require(sent.starts_with("x = 1\n"), "with the blocks before it");
+        s.run("print(x)\n");
+        require(calls == 2 && sent == "print(x)\n", "and the turn stays there");
+    }
+    {
+        Session s;
         require(s.run("x = input()\n").find("stdin was empty") != std::string::npos && !s.printed(), "input() past the end says why");
         require(s.run("feed('a b\\nc\\n')\nprint(input().split(), input())\n") == "\n```output\n['a', 'b'] c\n```\n\n", "input() reads what was fed");
         require(s.run("print(g(1))\n").find("NameError") != std::string::npos && !s.quiet() && !s.printed(), "an error is neither");

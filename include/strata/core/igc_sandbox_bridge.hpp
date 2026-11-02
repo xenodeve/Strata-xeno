@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 // A ```python block in the reasoning runs at its closing fence, and its output follows as forced tokens (#279).
 // The engine has no tokenizer, so the pack's vocab.json is read here, and only when the sandbox is on.
 #include <algorithm>
@@ -302,10 +303,15 @@ public:
     bool quiet() const { return quiet_last_; }       // the last run finished and said nothing
     bool mismatch() const { return mismatch_last_; } // the last run's `expect` found a wrong result
     uint64_t steps() const { return steps_; }
+    // Real Python, for what the interpreter refuses: (code, a fresh kernel, body, ok), false when nothing answered. The refusal itself
+    // chooses the tier, and a turn that moved stays there, because the kernel holds its names.
+    using Exec = std::function<bool(std::string_view, bool, std::string&, bool&)>;
+    void set_exec(Exec exec) { exec_ = std::move(exec); }
     // What the reasoning reads next, right after the closing fence.
     std::string run(std::string_view program, const std::atomic<bool>* cancel = nullptr) {
         ++runs_;
         programs_.emplace_back(program);
+        if (outside_) return run_outside(program);
         const int replayed = (int) std::count(done_.begin(), done_.end(), '\n') + (program.starts_with('\n') ? 1 : 0);
         std::string source = done_;
         source += program;
@@ -313,6 +319,10 @@ public:
         Result result;
         std::thread([&] { result = sandbox::run(source, limits_, cancel); }).join();
         steps_ += result.steps;
+        if (exec_ && (result.status == Status::Unsupported || result.error.starts_with("ModuleNotFoundError"))) {
+            outside_ = true;
+            return run_outside(source);
+        }
         std::string body = result.output.size() > printed_ ? result.output.substr(printed_) : std::string();
         bool cut = result.truncated;
         if (body.find_first_not_of(" \t\r\n") == std::string::npos) body.clear();   // `print()` says nothing
@@ -346,6 +356,30 @@ public:
     }
 
 private:
+    std::string run_outside(std::string_view code) {
+        std::string body;
+        bool ok = false;
+        const bool fresh = !kernel_used_;
+        kernel_used_ = true;
+        if (!exec_(code, fresh, body, ok)) {
+            body = "[the sandbox did not answer]";
+            ok = false;
+        }
+        if (body.find_first_not_of(" \t\r\n") == std::string::npos) body.clear();
+        printed_last_ = ok && says_something(body);
+        quiet_last_ = ok && body.empty();
+        mismatch_last_ = ok && body.find("MISMATCH: ") != std::string::npos;
+        if (body.size() > kShownOutput) {
+            body.resize(kShownOutput);
+            body += "\n[output cut]";
+        }
+        if (ok && body.empty()) body = kNothingPrinted;
+        while (!body.empty() && body.back() == '\n') body.pop_back();
+        return output_block(body);
+    }
+    Exec exec_;
+    bool outside_ = false;
+    bool kernel_used_ = false;
     Limits limits_;
     std::string done_;
     std::vector<std::string> programs_;

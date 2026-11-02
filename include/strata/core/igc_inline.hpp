@@ -8,6 +8,8 @@
 #include <initializer_list>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #include "strata/core/igc_binding_tokens.hpp"
@@ -120,6 +122,38 @@ inline bool in_cycle(std::span<const int32_t> tokens, int longest, int rounds) {
 // with a line back 37 times. Of 7,437 stored runs, a line of 12 tokens came back 16 times in 3 that ended by themselves, one of them
 // right and 2,535 tokens from its end, and in all 4 that ran to the end of the context, at 11,202 to 128,741 tokens.
 inline constexpr int kLineTokens = 12, kLineRounds = 16;
+inline constexpr char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+inline std::string base64_encode(std::string_view in) {
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    for (std::size_t i = 0; i < in.size(); i += 3) {
+        const uint32_t a = static_cast<unsigned char>(in[i]);
+        const uint32_t b = i + 1 < in.size() ? static_cast<unsigned char>(in[i + 1]) : 0;
+        const uint32_t c = i + 2 < in.size() ? static_cast<unsigned char>(in[i + 2]) : 0;
+        const uint32_t v = a << 16 | b << 8 | c;
+        out += kBase64[v >> 18 & 63];
+        out += kBase64[v >> 12 & 63];
+        out += i + 1 < in.size() ? kBase64[v >> 6 & 63] : '=';
+        out += i + 2 < in.size() ? kBase64[v & 63] : '=';
+    }
+    return out;
+}
+inline std::string base64_decode(std::string_view in) {
+    std::string out;
+    uint32_t v = 0;
+    int bits = 0;
+    for (const char c : in) {
+        const char* at = std::find(kBase64, kBase64 + 64, c);
+        if (at == kBase64 + 64) continue;
+        v = v << 6 | static_cast<uint32_t>(at - kBase64);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += static_cast<char>(v >> bits & 255);
+        }
+    }
+    return out;
+}
 // A run that counts by hand changes its numbers, so neither check sees it, and it feeds on these values: 8,104 of them in 261,266
 // tokens. Of 2,471 stored runs that took a value and ended by themselves, one took more than 256, and it was wrong; a right one took 78.
 inline constexpr int kMaxValues = 256;

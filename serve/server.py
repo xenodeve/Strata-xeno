@@ -677,6 +677,7 @@ class StrataEngine:
     """
     QUIET_S = 10          # how long a quiet engine waits for a line before a heartbeat and a liveness check
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
+    sandbox_exec = None                  # serve/sandbox/exec_bridge.py, for --igc-sandbox-exec
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
@@ -878,6 +879,9 @@ class StrataEngine:
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
+            if line.startswith("SBX ") and self.sandbox_exec:  # a block for real Python: decoding waits, so this thread must not
+                threading.Thread(target=self._run_block, args=(proc, line), daemon=True).start()
+                continue
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -893,6 +897,14 @@ class StrataEngine:
         lines.put(None)
         for q in slot_q:
             q.put(None)
+
+    def _run_block(self, proc, line):
+        answer = self.sandbox_exec.handle(line)
+        try:
+            proc.stdin.write(answer)
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            pass
 
     def _log_tail(self) -> str:
         """The last 4 KiB of the engine's log ("" without one)."""

@@ -455,7 +455,7 @@ struct Options {
     std::string igc_output_artifact,igc_output_fixture,igc_learned_bundle;
     bool igc_result_bridge=false,igc_inline_exec=false,igc_no_note=false,igc_no_reply=false,igc_sandbox=false,igc_sandbox_close=false,igc_sandbox_close_line=false,igc_sandbox_call=false;
     int igc_close_repeat=3,igc_sum_note=1,igc_repeat_note=0,igc_sandbox_after=0,igc_sandbox_read=0;
-    bool igc_sandbox_expect=false,igc_sandbox_why=false,igc_sandbox_gate=false;
+    bool igc_sandbox_expect=false,igc_sandbox_why=false,igc_sandbox_gate=false,igc_sandbox_exec=false;
     std::string igc_sidecar;
     std::string igc_observation_plan,igc_observation_root;
 #endif
@@ -963,6 +963,7 @@ void usage() {
                  "  --igc-sandbox-expect  open the call as expect(result, expected), a test against the question (with --igc-sandbox-call)\n"
                  "  --igc-sandbox-why     after a mismatch, write the model's own line that its approach is wrong\n"
                  "  --igc-sandbox-gate    hold the first end of the thinking for a check, and again while the last check failed\n"
+                 "  --igc-sandbox-exec    what the interpreter refuses goes to the server's real Python in its box (SBX, SBXR; not with --batch)\n"
                  "  --igc-sandbox-after N  open a ```python block after N tokens of reasoning, 0 never (default 0, with --igc-sandbox)\n"
                  "  --igc-sandbox-close  close the thinking once a program has printed (with --igc-sandbox)\n"
                  "  --igc-sandbox-close-line  write the model's own line before that close (with --igc-sandbox-close)\n"
@@ -2581,6 +2582,7 @@ int main(int argc, char** argv) {
         else if (a == "--igc-sandbox-expect") o.igc_sandbox_expect = true;
         else if (a == "--igc-sandbox-why") o.igc_sandbox_why = true;
         else if (a == "--igc-sandbox-gate") o.igc_sandbox_gate = true;
+        else if (a == "--igc-sandbox-exec") o.igc_sandbox_exec = true;
         else if (a == "--igc-close-repeat") o.igc_close_repeat = std::atoi(next("--igc-close-repeat"));
         else if (a == "--igc-sum-note") o.igc_sum_note = std::atoi(next("--igc-sum-note"));
         else if (a == "--igc-repeat-note") o.igc_repeat_note = std::atoi(next("--igc-repeat-note"));
@@ -3581,6 +3583,7 @@ int main(int argc, char** argv) {
         igc_learned->set_bridge(o.igc_result_bridge);
         if(o.batch>0) {
             if(!o.igc_sidecar.empty()){std::fprintf(stderr,"--igc-sidecar is not for --batch slots\n");return 2;}
+            if(o.igc_sandbox_exec){std::fprintf(stderr,"--igc-sandbox-exec is not for --batch slots: one kernel, one request\n");return 2;}
             igc_learned->set_slots(o.batch);
         }
         igc_learned->set_inline_exec(o.igc_inline_exec);
@@ -11037,6 +11040,32 @@ int main(int argc, char** argv) {
             in_eof = true;
             in_cv.notify_one();
         }).detach();
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+        // Decoding waits for the block's result. A heartbeat every 10 s: any line tells the server the engine is alive.
+        if (igc_learned && o.igc_sandbox_exec) igc_learned->set_sandbox_exec([&](std::string_view code, bool fresh, std::string& body, bool& ok) {
+            std::printf("SBX %d %s\n", fresh ? 1 : 0, strata::igc::inline_tokens::base64_encode(code).c_str());
+            std::fflush(stdout);
+            const auto start = Clock::now();
+            auto beat = start;
+            std::unique_lock<std::mutex> lk(in_mu);
+            for (;;) {
+                for (auto it = in_lines.begin(); it != in_lines.end(); ++it) {
+                    if (it->rfind("SBXR ", 0) != 0) continue;
+                    ok = it->size() > 5 && (*it)[5] == '1';
+                    body = it->size() > 7 ? strata::igc::inline_tokens::base64_decode(std::string_view(*it).substr(7)) : std::string();
+                    in_lines.erase(it);
+                    return true;
+                }
+                if (stop_req.load() || in_eof || Clock::now() - start > std::chrono::seconds(600)) return false;
+                in_cv.wait_for(lk, std::chrono::seconds(1));
+                if (Clock::now() - beat > std::chrono::seconds(10)) {
+                    beat = Clock::now();
+                    std::printf("SBXW\n");
+                    std::fflush(stdout);
+                }
+            }
+        });
+#endif
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
             in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });

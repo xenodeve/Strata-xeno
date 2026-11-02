@@ -58,6 +58,7 @@ class IgcLearnedDiagnostic : InlineTurn {
     bool in_slot_=false;
     std::unique_ptr<strata::igc::sandbox::TokenText> sandbox_text_;
     int sandbox_after_=0,sandbox_read_=0;
+    strata::igc::sandbox::Session::Exec sandbox_exec_;
     bool sandbox_close_=false,sandbox_close_line_=false,sandbox_call_=false,sandbox_expect_=false,sandbox_why_=false,sandbox_gate_=false;
     bool inline_notes_=true,inline_reply_=true;int close_repeat_=3;strata::igc::inline_tokens::SumNote sum_note_=strata::igc::inline_tokens::SumNote::Stop;strata::igc::inline_tokens::RepeatNote repeat_note_=strata::igc::inline_tokens::RepeatNote::Stop;
     std::vector<int64_t> prefix_;
@@ -210,7 +211,7 @@ public:
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
         staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_tail_.clear();thinking_lines_={};thinking_masked_.clear();inline_values_=0;thinking_closed_=strata::igc::inline_tokens::thinking_off(prefix_,kThinkClose);
-        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;sandbox_reading_=-1;sandbox_gates_=0;bridged_unread_=0;
+        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_session_.set_exec(sandbox_exec_);sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;sandbox_reading_=-1;sandbox_gates_=0;bridged_unread_=0;
         bridge_tokens_.clear();bridge_at_=0;   // an admission never reaches delivering(), and a stopped request can leave a delivery half done
         if(natural_)natural_->begin(prefix_);
         return true;
@@ -313,6 +314,7 @@ public:
     void set_sandbox_after(int tokens){sandbox_after_=tokens;}
     void set_sandbox_read(int tokens){sandbox_read_=tokens;}
     void set_sandbox_expect(bool on){sandbox_expect_=on;}
+    void set_sandbox_exec(strata::igc::sandbox::Session::Exec exec){sandbox_exec_=std::move(exec);}
     void set_sandbox_why(bool on){sandbox_why_=on;}
     void set_sandbox_gate(bool on){sandbox_gate_=on;}
     void set_sandbox_close(bool on){sandbox_close_=on;}
