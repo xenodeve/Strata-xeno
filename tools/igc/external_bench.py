@@ -269,6 +269,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                     if code is None:break
                     if turn<TOOL_ROUNDS:
                         from serve.sandbox.exec_bridge import Kernel
+                        if kernel and not kernel.alive():kernel.close();kernel=None   # a call that ran past its time took the kernel with it
                         kernel=kernel or Kernel()
                         _,shown=kernel.run(code)
                         shown=(shown or '[it ran and printed nothing]')[:TOOL_OUTPUT]

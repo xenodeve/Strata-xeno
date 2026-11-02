@@ -53,6 +53,20 @@ def test_a_block_that_never_ends_is_stopped(bridge, monkeypatch):
     block(bridge, 'x = 1\n', fresh=True)
     ok, text = block(bridge, 'while True:\n    pass\n')
     assert not ok and 'ended the sandbox' in text
+    assert block(bridge, 'print(5)\n') == (True, '5\n'), 'the next block gets a new kernel, not the dead one\'s broken pipe'
+
+
+def test_a_dead_kernel_says_so_and_never_raises(monkeypatch):
+    """The bench's tool loop calls a kernel directly: lm1 and htl died of a BrokenPipeError on the call after a block ran past its time."""
+    monkeypatch.setattr(exec_bridge, 'BLOCK_SECONDS', 3.0)
+    kernel = exec_bridge.Kernel(Isolation.start(POLICY))
+    try:
+        assert not kernel.run('while True:\n    pass\n')[0]
+        assert not kernel.alive()
+        ok, text = kernel.run('print(1)\n')
+        assert not ok and 'ended' in text
+    finally:
+        kernel.close()
 
 
 def test_a_new_turn_gets_a_new_kernel_and_a_new_box(bridge):

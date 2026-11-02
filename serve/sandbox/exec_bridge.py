@@ -55,6 +55,9 @@ class Kernel:
         self.proc.stdin.flush()
 
     def run(self, code: str, tools=None, cancel=None) -> tuple[bool, str]:
+        ended_text = f'[the block ended the sandbox, or ran past {BLOCK_SECONDS:.0f} s]'
+        if not self.alive():   # never a broken pipe to the caller: lm1 and htl died of one on the call after a block ran past its time
+            return False, ended_text + ' [this kernel has ended: start another]'
         timer = threading.Timer(BLOCK_SECONDS, self.proc.kill)   # tool calls count: the decoding waits on all of it
         timer.start()
         ended = threading.Event()
@@ -71,11 +74,14 @@ class Kernel:
                 line = self.proc.stdout.readline()
                 if not line:
                     self.ended = True
-                    return False, f'[the block ended the sandbox, or ran past {BLOCK_SECONDS:.0f} s]'
+                    return False, ended_text
                 reply = json.loads(line)
                 if 'mcp' not in reply:
                     return reply['ok'], reply['output']
                 self.send({'mcp': answer(tools, reply['mcp'])})
+        except OSError:   # the kernel went between the check and the write
+            self.ended = True
+            return False, ended_text
         finally:
             timer.cancel()
             ended.set()
@@ -138,7 +144,7 @@ class ExecBridge:
         parts = line.split()
         fresh, code = parts[1] == '1', base64.b64decode(parts[2]).decode('utf-8', 'replace') if len(parts) > 2 else ''
         with self.lock:
-            if fresh and self.kernel:
+            if self.kernel and (fresh or not self.kernel.alive()):   # a block that ran past its time took the kernel: the next gets another
                 self.kernel.close()
                 self.kernel = None
             try:
