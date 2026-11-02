@@ -427,8 +427,12 @@ def server_report(tl: Timeline) -> list[dict]:
     out = []
     firsts = sorted(s.t0 for s in tl.instants if s.name == "first token")
     engine_reqs = [s for s in tl.find("request")]
+    tool_calls = tl.find("mip.call")                    # a block's MCP calls: on the thread that answers SBX, not the request's
     for h in tl.find("http request"):
         r = {"t0_ms": h.t0, "http_ms": h.dur}
+        inside = [s.dur for s in tool_calls if s.t0 >= h.t0 - EPS and s.t1 <= h.t1 + EPS]
+        if inside:
+            r["mip.call_ms"] = sum(inside)
         for s in tl.inside(h.lane, h.t0, h.t1):
             if s.name in ("template+tokenize", "queue wait", "engine request"):
                 r[s.name + "_ms"] = r.get(s.name + "_ms", 0.0) + s.dur
