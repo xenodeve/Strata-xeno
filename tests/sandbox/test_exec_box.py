@@ -37,6 +37,14 @@ def test_the_libraries_are_there(bridge):
     assert ok and text.strip() == '{2: 3, 3: 2, 5: 1}'
 
 
+def test_a_last_expression_shows_its_value_as_a_notebook_does(bridge):
+    """htl: `59**8, 60**8` came back as "printed nothing", and the model spent a call to print it."""
+    assert block(bridge, 'x = 3\nx * 2, x ** 2\n', fresh=True) == (True, '(6, 9)\n')
+    assert block(bridge, 'print(1)\n') == (True, '1\n'), 'a call that returns None adds nothing'
+    assert block(bridge, 'y = 5\n') == (True, '')
+    assert block(bridge, 'for i in range(2):\n    i\n') == (True, ''), 'only a last top-level expression'
+
+
 def test_an_error_is_the_block_s_result(bridge):
     ok, text = block(bridge, '1 / 0\n', fresh=True)
     assert not ok and 'ZeroDivisionError' in text

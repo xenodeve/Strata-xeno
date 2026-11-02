@@ -8,6 +8,7 @@ This file imports nothing from the repository, so the box needs no access to it 
 up and the answer comes down, {"mcp": ...} too, before the block's final reply. The server holds the connections, the credentials
 and the rules; nothing here is trusted, and a program can write anything down this pipe.
 """
+import ast
 import contextlib
 import io
 import json
@@ -96,6 +97,20 @@ class Mcp:
         return Server(server)
 
 
+def run_block(code, space):
+    """As a notebook cell runs: a last top-level expression shows its value when that is not None. The models write `a, b` at the end
+    and expect to see it; an `exec` printed nothing and the next call was spent printing it (htl, #288)."""
+    tree = ast.parse(code, '<block>')
+    last = tree.body[-1] if tree.body and isinstance(tree.body[-1], ast.Expr) else None
+    if last is not None:
+        tree.body.pop()
+    exec(compile(tree, '<block>', 'exec'), space)
+    if last is not None:
+        value = eval(compile(ast.Expression(last.value), '<block>', 'eval'), space)
+        if value is not None:
+            print(repr(value))
+
+
 def main():
     feed = Feed()
     space = {'__name__': '__main__', 'expect': expect, 'feed': feed.add, 'mcp': Mcp()}
@@ -112,7 +127,7 @@ def main():
         ok = True
         with contextlib.redirect_stdout(out):
             try:
-                exec(compile(code, '<block>', 'exec'), space)
+                run_block(code, space)
             except SystemExit:
                 pass
             except BaseException:
