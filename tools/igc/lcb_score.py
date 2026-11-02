@@ -73,7 +73,10 @@ def judge(record, tests, runner, pool):
     cases = t['public'] + t['private']
     name = t['meta'].get('func_name', '')
     for start in range(0, len(cases), 32):
-        for verdict in pool.map(one, [(source, c, c['testtype'], name, runner) for c in cases[start:start + 32]]):
+        jobs = [(source, c, c['testtype'], name, runner) for c in cases[start:start + 32]]
+        for job, verdict in zip(jobs, pool.map(one, jobs)):
+            if verdict == 'timeout':   # 8 at once on a VM that also runs the engine: a case near 6 s gets one more try, alone
+                verdict = one(job)
             if verdict != 'ok':
                 return verdict
     return 'ok'
