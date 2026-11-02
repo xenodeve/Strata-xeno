@@ -8769,6 +8769,31 @@ inline Value b_feed(Call& c) {
     rt->stdin_text += more;
     return Value::none();
 }
+// A result set against what the question says it should be. A printed number alone is easy to pass over: of 14 samples that
+// came out wrong, 9 still ended in a wrong answer (#288). Not a CPython name; a program's own `expect` comes first.
+inline Value b_expect(Call& c) {
+    const Value& got = c.a[0];
+    const Value& want = c.a[1];
+    const auto numeric = [](const Value& v) { return is_int(v) || v.tag == Tag::Float; };
+    bool match = same(got, want);
+    if (!match && numeric(got) && numeric(want) && (got.tag == Tag::Float || want.tag == Tag::Float)) {
+        const Value gap = binary(Bin::Sub, got, want, false);
+        match = gap.tag == Tag::Float && std::fabs(gap.d) < 1e-6;
+    }
+    U32 line;
+    if (match) {
+        append(line, "match: ");
+        repr_to(line, got);
+    } else {
+        append(line, "MISMATCH: expected ");
+        repr_to(line, want);
+        append(line, ", got ");
+        repr_to(line, got);
+    }
+    line.push_back(U'\n');
+    write_output(line);
+    return Value::none();
+}
 inline Value b_input(Call& c) {
     if (c.n) write_output(str_of(str_value(c.a[0])));
     Value line = stdin_line();
@@ -10340,7 +10365,7 @@ inline const NativeDef kBuiltins[] = {
     {"print", b_print, 0, -1, true}, {"len", b_len, 1, 1}, {"abs", b_abs, 1, 1}, {"sum", b_sum, 1, 2, true}, {"min", b_min, 1, -1, true},
     {"max", b_max, 1, -1, true}, {"sorted", b_sorted, 1, 1, true}, {"any", b_any, 1, 1}, {"all", b_all, 1, 1}, {"repr", b_repr, 1, 1},
     {"ascii", b_ascii, 1, 1}, {"round", b_round, 0, 2, true}, {"pow", b_pow, 0, 3, true}, {"divmod", b_divmod, 2, 2}, {"ord", b_ord, 1, 1},
-    {"input", b_input, 0, 1}, {"feed", b_feed, 1, 1}, {"chr", b_chr, 1, 1}, {"hex", b_hex, 1, 1}, {"oct", b_oct, 1, 1}, {"bin", b_bin, 1, 1}, {"isinstance", b_isinstance, 2, 2},
+    {"input", b_input, 0, 1}, {"feed", b_feed, 1, 1}, {"expect", b_expect, 2, 2}, {"chr", b_chr, 1, 1}, {"hex", b_hex, 1, 1}, {"oct", b_oct, 1, 1}, {"bin", b_bin, 1, 1}, {"isinstance", b_isinstance, 2, 2},
     {"issubclass", b_issubclass, 2, 2}, {"callable", b_callable, 1, 1}, {"hash", b_hash, 1, 1}, {"iter", b_iter, 1, 2}, {"next", b_next, 1, 2},
     {"format", b_format, 1, 2},
 };

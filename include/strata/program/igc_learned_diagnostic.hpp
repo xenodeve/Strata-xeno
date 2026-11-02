@@ -30,6 +30,7 @@ struct InlineTurn {
     int sandbox_thought_=0,sandbox_block_=0,bridged_unread_=0;
     bool sandbox_opened_=false,sandbox_called_=false;
     int sandbox_reading_=-1;   // tokens left to read a result in before the close, -1 when none is due
+    int sandbox_gates_=0;      // times this turn the end of the thinking was held for a check
     strata::igc::inline_tokens::LineRepeat thinking_lines_;
     std::vector<int32_t> thinking_masked_;
     int inline_values_=0;
@@ -57,7 +58,7 @@ class IgcLearnedDiagnostic : InlineTurn {
     bool in_slot_=false;
     std::unique_ptr<strata::igc::sandbox::TokenText> sandbox_text_;
     int sandbox_after_=0,sandbox_read_=0;
-    bool sandbox_close_=false,sandbox_close_line_=false,sandbox_call_=false;
+    bool sandbox_close_=false,sandbox_close_line_=false,sandbox_call_=false,sandbox_expect_=false,sandbox_why_=false,sandbox_gate_=false;
     bool inline_notes_=true,inline_reply_=true;int close_repeat_=3;strata::igc::inline_tokens::SumNote sum_note_=strata::igc::inline_tokens::SumNote::Stop;strata::igc::inline_tokens::RepeatNote repeat_note_=strata::igc::inline_tokens::RepeatNote::Stop;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
@@ -209,7 +210,7 @@ public:
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
         staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_tail_.clear();thinking_lines_={};thinking_masked_.clear();inline_values_=0;thinking_closed_=strata::igc::inline_tokens::thinking_off(prefix_,kThinkClose);
-        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;sandbox_reading_=-1;bridged_unread_=0;
+        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_session_=strata::igc::sandbox::Session{};sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;sandbox_reading_=-1;sandbox_gates_=0;bridged_unread_=0;
         bridge_tokens_.clear();bridge_at_=0;   // an admission never reaches delivering(), and a stopped request can leave a delivery half done
         if(natural_)natural_->begin(prefix_);
         return true;
@@ -311,6 +312,9 @@ public:
     void set_inline_reply(bool on){inline_reply_=on;}
     void set_sandbox_after(int tokens){sandbox_after_=tokens;}
     void set_sandbox_read(int tokens){sandbox_read_=tokens;}
+    void set_sandbox_expect(bool on){sandbox_expect_=on;}
+    void set_sandbox_why(bool on){sandbox_why_=on;}
+    void set_sandbox_gate(bool on){sandbox_gate_=on;}
     void set_sandbox_close(bool on){sandbox_close_=on;}
     void set_sandbox_close_line(bool on){sandbox_close_line_=on;}
     void set_sandbox_call(bool on){sandbox_call_=on;}
@@ -368,6 +372,16 @@ public:
                 bridge_tokens_=std::move(rest);bridge_at_=0;called=true;
             }
         }
+        // Held once, and again while the last check failed: the model checks the draft it is about to answer with.
+        if(sandbox_gate_ && sandbox_text_ && token==kThinkClose && !thinking_closed_ && !sandbox_fence_.inside()
+                && bridge_at_>=bridge_tokens_.size() && bridged_unread_==0
+                && (sandbox_gates_==0 || (sandbox_session_.mismatch() && sandbox_gates_<strata::igc::sandbox::kMaxGates))) {
+            std::fprintf(stderr,"strata igc sandbox: held the end of the thinking for a check\n");
+            ++sandbox_gates_;
+            token=198;
+            sandbox_opened_=true;sandbox_called_=false;sandbox_block_=0;sandbox_fence_.enter();
+            bridge_tokens_=sandbox_text_->encode(strata::igc::sandbox::kGateLine);bridge_at_=0;called=true;return true;
+        }
         thinking_closed_=thinking_closed_||token==kThinkClose;
         generated_.push_back(token);
         if(generated_.size()>256)generated_.erase(generated_.begin(),generated_.begin()+128);
@@ -411,13 +425,17 @@ public:
                 bridge_tokens_=sandbox_text_->encode(text);bridge_at_=0;called=true;
                 if(sandbox_call_ && !sandbox_called_ && sandbox_session_.quiet() && strata::igc::sandbox::binds_a_name(*program)) {
                     std::fprintf(stderr,"strata igc sandbox: opened a call\n");
-                    const std::string head=strata::igc::sandbox::call_head(*program);
+                    const std::string head=strata::igc::sandbox::call_head(*program,sandbox_expect_);
                     sandbox_called_=true;sandbox_block_=0;sandbox_fence_.enter(head);
                     const auto open=sandbox_text_->encode(std::string(strata::igc::sandbox::kBlockOpen)+head);
                     bridge_tokens_.insert(bridge_tokens_.end(),open.begin(),open.end());
                 }
                 // Given the answer the model still went on for thousands of tokens to prove it. But a close in this delivery
                 // comes before the model reads the result: a sample that printed 1 for an expected 3 went out as the answer (#279).
+                if(sandbox_why_ && sandbox_session_.mismatch()) {
+                    const auto line=sandbox_text_->encode(strata::igc::sandbox::kMismatchLine);
+                    bridge_tokens_.insert(bridge_tokens_.end(),line.begin(),line.end());
+                }
                 sandbox_reading_=-1;
                 if(sandbox_close_ && sandbox_session_.printed() && sandbox_read_>0) {
                     sandbox_reading_=sandbox_read_;

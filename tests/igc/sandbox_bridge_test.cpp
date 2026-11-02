@@ -97,6 +97,16 @@ int main(int argc, char** argv) {
     }
     {
         Session s;
+        require(s.run("expect(1 + 1, 2)\n") == "\n```output\nmatch: 2\n```\n\n" && s.printed() && !s.mismatch(), "a right result says so");
+        require(s.run("expect(1, 3)\n") == "\n```output\nMISMATCH: expected 3, got 1\n```\n\n" && s.mismatch(), "a wrong one says what was expected");
+        require(s.run("expect(None, [1])\n").find("MISMATCH: expected [1], got None") != std::string::npos && s.mismatch(), "an unfinished draft is a mismatch");
+        require(s.run("expect(0.1 + 0.2, 0.3)\n").find("match: ") != std::string::npos && !s.mismatch(), "floats within the benchmark's tolerance match");
+        require(s.run("print(1)\n") == "\n```output\n1\n```\n\n" && !s.mismatch(), "and the next run starts clean");
+        require(call_head("def f(a):\n    return a\n", true).ends_with("expect(f("), "the forced call can be a test");
+        require(call_head("def f(a):\n    return a\n").starts_with("print(f("), "and stays a print by default");
+    }
+    {
+        Session s;
         require(s.run("x = input()\n").find("stdin was empty") != std::string::npos && !s.printed(), "input() past the end says why");
         require(s.run("feed('a b\\nc\\n')\nprint(input().split(), input())\n") == "\n```output\n['a', 'b'] c\n```\n\n", "input() reads what was fed");
         require(s.run("print(g(1))\n").find("NameError") != std::string::npos && !s.quiet() && !s.printed(), "an error is neither");

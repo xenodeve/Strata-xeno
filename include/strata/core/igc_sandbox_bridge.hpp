@@ -31,6 +31,13 @@ inline constexpr std::string_view kOnlyModules = "[only math, fractions, itertoo
 // Told to call its function, the model did not in 36 of 36 blocks, with a whole draft in 17 of 19 scored (#279). So the call is opened
 // for it, with the name: given a bare `print(`, 12 of 22 runs wrote `print(1)`, and the thinking closed on that.
 inline constexpr std::string_view kCallHead = "print(";
+// The call as a test: the comment says where the second argument comes from, because `expect` is in no prompt.
+inline constexpr std::string_view kExpectHead = "# result, then the expected output from the question\nexpect(";
+// Said in the model's voice after a mismatch. Self-Debugging: a test result with the model's own explanation did best.
+inline constexpr std::string_view kMismatchLine = "Wait, this does not match, so my approach is wrong somewhere. Why?\n";
+// START's hint, before the thinking ends: the point where the model has a draft and nothing has been cut short.
+inline constexpr std::string_view kGateLine = "Wait, I can use Python to check if my approach is correct and refine it, if necessary.\n\n```python\n";
+inline constexpr int kMaxGates = 3;
 // stdin holds only what the program fed itself, so a program that read nothing would look like a program that did nothing.
 inline constexpr std::string_view kNoStdin = "[stdin was empty: put feed(\"...\") before the code, with an example from the question]";
 inline constexpr std::string_view kBlockOpen = "```python\n";
@@ -234,8 +241,8 @@ inline std::string last_def(std::string_view program) {
     return name;
 }
 // What the forced block opens with, after its fence.
-inline std::string call_head(std::string_view program) {
-    std::string head(kCallHead);
+inline std::string call_head(std::string_view program, bool expect = false) {
+    std::string head(expect ? kExpectHead : kCallHead);
     const std::string name = last_def(program);
     if (!name.empty()) head += name + "(";
     return head;
@@ -293,6 +300,7 @@ public:
     int runs() const { return runs_; }
     bool printed() const { return printed_last_; }   // the last run finished and said something
     bool quiet() const { return quiet_last_; }       // the last run finished and said nothing
+    bool mismatch() const { return mismatch_last_; } // the last run's `expect` found a wrong result
     uint64_t steps() const { return steps_; }
     // What the reasoning reads next, right after the closing fence.
     std::string run(std::string_view program, const std::atomic<bool>* cancel = nullptr) {
@@ -315,6 +323,7 @@ public:
         if (cut) body += "\n[output cut]";
         printed_last_ = result.status == Status::Ok && says_something(body);
         quiet_last_ = result.status == Status::Ok && body.empty() && !result.stdin_short;
+        mismatch_last_ = result.status == Status::Ok && body.find("MISMATCH: ") != std::string::npos;
         if (result.status == Status::Ok) {
             done_ = std::move(source);
             printed_ = result.output.size();
@@ -343,6 +352,7 @@ private:
     std::size_t printed_ = 0;
     bool printed_last_ = false;
     bool quiet_last_ = false;
+    bool mismatch_last_ = false;
     int runs_ = 0;
     uint64_t steps_ = 0;
 };
