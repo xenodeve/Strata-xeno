@@ -130,6 +130,60 @@ class TestWhatABoxCanDo:
         assert (writable / "out.txt").read_text(encoding="utf-8") == "output"
         assert "S-1-15-2-" not in sddl(read_only).replace("S-1-15-2-1)", "")
 
+    def test_a_run_can_start_in_a_folder_the_policy_gave_and_pytest_collects_there(self):
+        parent = isolation.Scratch().make(f"cwd-{uuid.uuid4().hex[:8]}")
+        tree = parent / "copy"
+        (tree / "sub").mkdir(parents=True)
+        (tree / "test_here.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        with Isolation.start(replace(SAFE, readwrite=[tree])) as box:
+            where = box.run(["python", "-c", "import os; print(os.getcwd())"], timeout=20, cwd=tree / "sub")
+            tests = box.run(["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_here.py"], timeout=25, cwd=tree)
+        assert where.stdout.decode().strip() == str(tree / "sub"), text_of(where)
+        assert tests.exit_code == 0 and b"1 passed" in tests.stdout, text_of(tests)
+
+    def test_a_run_cannot_start_in_a_folder_the_policy_did_not_give(self, outside_folder):
+        parent = isolation.Scratch().make(f"cwd-{uuid.uuid4().hex[:8]}")
+        (parent / "copy").mkdir()
+        (parent / "copy-other").mkdir()
+        with Isolation.start(replace(SAFE, readwrite=[parent / "copy"])) as box:
+            for where in (outside_folder, parent, parent / "copy-other"):
+                with pytest.raises(IsolationError, match="not a folder this box was given"):
+                    box.run(["python", "-c", "pass"], timeout=20, cwd=where)
+
+    def test_what_lies_beside_a_given_folder_stays_shut(self):
+        parent = isolation.Scratch().make(f"beside-{uuid.uuid4().hex[:8]}")
+        (parent / "copy").mkdir()
+        (parent / "base.pack").write_bytes(b"what a change is measured against")
+        program = (f"import os\nfrom pathlib import Path\nparent = Path(r'{parent}')\n"
+                   "print(parent.stat().st_size >= 0)\n"
+                   "for action in (lambda: os.listdir(parent), lambda: (parent / 'base.pack').read_bytes(), lambda: (parent / 'new.txt').write_text('x')):\n"
+                   "    try:\n        action()\n        print('open')\n"
+                   "    except PermissionError:\n        print('shut')\n")
+        with Isolation.start(replace(SAFE, readwrite=[parent / "copy"])) as box:
+            result = box.run(["python", "-"], stdin=program, timeout=20, cwd=parent / "copy")
+            during = sddl(parent)
+        assert result.stdout.split() == [b"True", b"shut", b"shut", b"shut"], text_of(result)
+        assert during != sddl(parent), "the grant on the parent goes with the box"
+
+    def test_stop_ends_what_runs_and_the_box_goes_on(self):
+        with Isolation.start(SAFE) as box:
+            threading.Timer(0.5, box.stop).start()
+            stopped = box.run(["python", "-c", "import time; time.sleep(30)"], timeout=20)
+            again = box.run(["python", "-c", "print(5)"], timeout=20)
+        assert stopped.killed == "stop"
+        assert (again.exit_code, again.stdout.strip(), again.killed) == (0, b"5", None), text_of(again)
+
+    def test_stop_ends_what_a_finished_run_left_behind(self):
+        leave = ("import subprocess, sys\n"
+                 "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], creationflags=0x08000000)\n")
+        with Isolation.start(SAFE) as box:
+            assert box.run(["python", "-c", leave], timeout=20).exit_code == 0
+            assert box.usage().processes_active > 0
+            box.stop()
+            assert box.run(["python", "-c", "print(5)"], timeout=20).stdout.strip() == b"5"
+            time.sleep(0.05)
+            assert box.usage().processes_active == 0
+
     def test_a_box_can_run_again_after_a_timeout(self):
         with Isolation.start(SAFE) as box:
             assert box.run(["python", "-c", "import time; time.sleep(30)"], timeout=0.4).killed == "timeout"
