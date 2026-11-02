@@ -213,7 +213,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                 said=[];kernel=None;asked=list(ids)
                 for turn in range(TOOL_ROUNDS if tool_loop else 1):
                     tokens=[]
-                    for t in engine.generate(asked,limit-sum(len(s) for s in said),keys,cancel):
+                    for t in engine.generate(asked,262144-len(asked)-64 if whole_context else limit-sum(len(s) for s in said),keys,cancel):
                         if t is None:continue
                         tokens.append(int(t))
                         if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
