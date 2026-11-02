@@ -15,7 +15,8 @@ BLOCK = re.compile(FENCE + r'python\n(.*?)\n?' + FENCE + r'\s*\n?' + FENCE + r'o
 def result_of(output):
     """What one run told the model."""
     if 'MISMATCH' in output:
-        return 'mismatch'
+        # `got None` is a stub that was called, not a hypothesis that failed
+        return 'mismatch' if re.search(r'MISMATCH: expected .*, got (?!None$)', output, re.M) else 'stub'
     if output.startswith('match:'):
         return 'match'
     if output.startswith('[it ran and printed nothing'):
@@ -32,14 +33,13 @@ def result_of(output):
 
 
 def runs_of(text):
-    """Each run in order, with its offset in tokens, read from the reasoning."""
+    """Each run in order, with its offset in characters, read from the reasoning."""
     head, _, _ = text.partition('</think>')
-    scale = 1 / max(len(text) / max(len(text.split()), 1), 1)
     return [dict(at=match.start(), code=match.group(1), output=match.group(2), result=result_of(match.group(2))) for match in BLOCK.finditer(head)]
 
 
 def corrected(runs):
-    """The loop the plan is after: a run that failed its test, then a different program, then a run that passed."""
+    """The loop the plan is after: a run whose result was wrong, then a run that passed."""
     missed = None
     for run in runs:
         if run['result'] == 'mismatch' and missed is None:

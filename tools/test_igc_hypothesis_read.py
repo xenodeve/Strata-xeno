@@ -30,6 +30,10 @@ assert [r['result'] for r in runs_of(fixed)] == ['mismatch', 'nothing', 'match']
 assert corrected(runs_of(fixed)), 'a mismatch, then a match'
 assert not corrected(runs_of(text(block('expect(f(1), 2)', 'match: 2'), block('expect(f(1), 3)', 'MISMATCH: expected 3, got 2')))), 'a match first is not a correction'
 assert not corrected(runs_of(text(block('expect(f(1), 2)', 'MISMATCH: expected 2, got 1')))), 'a mismatch left alone'
+stub = text(block('expect(f(1), 2)', 'MISMATCH: expected 2, got None'), block('expect(f(1), 2)', 'match: 2'))
+assert [r['result'] for r in runs_of(stub)] == ['stub', 'match']
+assert not corrected(runs_of(stub)), 'a stub filled in is no corrected hypothesis'
+assert result_of('match: 1\nMISMATCH: expected 2, got None\nMISMATCH: expected 3, got 4') == 'mismatch', 'one real result among stubs'
 assert runs_of('no blocks at all') == []
 assert runs_of(text(reply=block('print(1)', '1'))) == [], 'a block in the reply was not run'
 

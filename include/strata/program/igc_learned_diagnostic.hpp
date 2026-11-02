@@ -430,7 +430,7 @@ public:
             if(program) {
                 // The same program again is re-checking, as with a repeated expression: a loop of whole blocks is far longer
                 // than in_cycle reaches, 2567 tokens on one question, and it ran to the end of the context.
-                if(sandbox_session_.seen(*program)+1>=(close_repeat_>0?close_repeat_:strata::igc::sandbox::kProgramRepeat)) {
+                if(close_repeat_>0 && sandbox_session_.seen(*program)+1>=close_repeat_) {
                     std::fprintf(stderr,"strata igc sandbox: closed the thinking on a repeated program\n");
                     bridge_tokens_={198,kThinkClose,271};bridge_at_=0;called=true;return true;
                 }

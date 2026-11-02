@@ -46,7 +46,6 @@ inline constexpr std::string_view kGateCallLine = "Let me run my code on the exa
 // A match is not proof, and a model tests to confirm: asked to look for what breaks it, it finds more (Failing to Falsify, 2604.02485).
 inline constexpr std::string_view kMatchLine = "The examples match. What input would break this?\n";
 inline constexpr int kMaxGates = 3;
-inline constexpr int kProgramRepeat = 3;   // the same program this many times is a loop of whole blocks, whatever the rule for values says
 // stdin holds only what the program fed itself, so a program that read nothing would look like a program that did nothing.
 inline constexpr std::string_view kNoStdin = "[stdin was empty: put feed(\"...\") before the code, with an example from the question]";
 inline constexpr std::string_view kBlockOpen = "```python\n";
