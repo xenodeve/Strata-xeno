@@ -22,6 +22,23 @@ from tools.igc.standard_rows import plain_prompt
 from tools.qwenputer.memory import system_snapshot
 from tools.qwenputer.tokenizer import NativeText
 
+# The model's own tool format, serve/chat_template.jinja: think, call, read the result, think on. It was trained on this loop, and on nothing we force into its reasoning.
+TOOL_HINT=('\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n'
+           '{"type":"function","function":{"name":"run_python","description":"Run Python and read what it prints. Names stay between calls. Test an idea on small cases, compare with a brute force, or run your program on the examples, as often as it helps, before you answer.",'
+           '"parameters":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}}}\n</tools>\n\n'
+           'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
+           '<tool_call>\n<function=run_python>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>')
+TOOL_CALL=re.compile(r'<tool_call>\s*<function=run_python>\s*<parameter=code>\n?(.*?)\n?</parameter>',re.S)
+TOOL_ROUNDS=24
+TOOL_OUTPUT=4096
+
+
+def tool_call(text):
+    """The program of a reply that ends in a call, or None for an answer."""
+    found=TOOL_CALL.findall(text.rsplit('</think>',1)[-1])
+    return found[-1] if found else None
+
+
 ARITHMETIC=('two_digit_addition','two_digit_subtraction','two_digit_multiplication')
 BIGBENCH=('3d_addition','3d_subtraction','3d_multiplication','5d_addition','5d_subtraction','5d_multiplication')
 
@@ -111,7 +128,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -119,6 +136,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     if think_hint:suffix+=think_hint.encode('utf-8')
     if no_think:suffix+=b'\n</think>\n\n'
     if effort_medium:prefix=prefix[prefix.index(b'<|im_start|>user'):]   # the template writes no system turn at medium
+    if tool_loop:hint=(hint or '')+TOOL_HINT
     if hint:prefix=prefix.replace(b'<|im_end|>',b' '+hint.encode('utf-8')+b'<|im_end|>',1)
     rows=cases(data,arithmetic,gsm,bigbench,math,gsm_file,math_file,rows_file)
     if shots:rows=[{**row,'prompt':few_shot(row['prompt'],shots)} if row['suite']=='gsm8k' else row for row in rows]
@@ -192,13 +210,27 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             for attempt in range(retries+1):
                 tokens=[];stuck=False
                 keys=sampling if not attempt else {**sampling,'temperature':retry_temperature,'seed':attempt}
-                for t in engine.generate(ids,limit,keys,cancel):
-                    if t is None:continue
-                    tokens.append(int(t))
-                    if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
+                said=[];kernel=None;asked=list(ids)
+                for turn in range(TOOL_ROUNDS if tool_loop else 1):
+                    tokens=[]
+                    for t in engine.generate(asked,limit-sum(len(s) for s in said),keys,cancel):
+                        if t is None:continue
+                        tokens.append(int(t))
+                        if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
+                    said.append(tokens)
+                    code=None if stuck or not tool_loop else tool_call(tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
+                    if code is None:break
+                    from serve.sandbox.exec_bridge import Kernel
+                    kernel=kernel or Kernel()
+                    ran,shown=kernel.run(code)
+                    shown=(shown or '[it ran and printed nothing]')[:TOOL_OUTPUT]
+                    spoken=tokens[:-1] if tokens[-1]==248046 else tokens   # the end of turn goes back in below, with the rest of the template's shape
+                    asked=asked+spoken+tokenizer.encode((b'<|im_end|>\n<|im_start|>user\n<tool_response>\n'+shown.encode('utf-8')+b'\n</tool_response>'+suffix).decode('utf-8'))
+                if kernel:kernel.close()
+                tokens=[t for s in said for t in s]
                 text=tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace')
                 if no_think:text='</think>\n\n'+text   # the close is in the prompt; the readers look for it here
-                attempts.append(dict(tokens=len(tokens),text=text,finish='stuck' if stuck else engine.last.get('finish'),check=last_check(text)))
+                attempts.append(dict(tokens=len(tokens),text=text,finish='stuck' if stuck else engine.last.get('finish'),check=last_check(text),turns=len(said)))
                 if attempts[-1]['check'] not in ('mismatch','stub'):break
             seconds=time.monotonic()-start;active[0]=None
             # The first whose tests did not fail, else the first: a sampled run has no claim over the greedy one.
@@ -206,13 +238,13 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             text=kept['text'];final=final_number(text)
             records.append(dict(id=row['id'],suite=row['suite'],answer=row['answer'],final=final,correct=final==row['answer'],
                                 tokens=sum(a['tokens'] for a in attempts),seconds=seconds,finish=kept['finish'],prompt_tokens=len(ids),text=text,
-                                attempts=[dict(tokens=a['tokens'],check=a['check']) for a in attempts]))
+                                attempts=[dict(tokens=a['tokens'],check=a['check'],turns=a['turns']) for a in attempts]))
             (output/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
             print(row['id'],row['answer'],final,records[-1]['tokens'],round(seconds,1),flush=True)
     finally:
         if engine is not None:engine.close()
         stop.set();thread.join(timeout=3);subprocess.Popen=original
-    if bundle and not slots and not retries:   # one audit a request, and a retry is a request
+    if bundle and not slots and not retries and not tool_loop:   # one audit a request, and a retry or a tool round is a request
         lines=(output/'engine.log').read_text(encoding='utf-8',errors='replace')
         audits=[parse_audit(bytes.fromhex(h)) for h in re.findall(r'strata IGC learned audit: head_status=\d+ record=([0-9a-f]{576})',lines)]
         if len(audits)!=len(records):raise ValueError('incomplete audit pairing')
@@ -256,6 +288,7 @@ if __name__=='__main__':
     parser.add_argument('--pair',action='store_true',help='with --slots: run each question with MIP and with igc=0, in one engine')
     parser.add_argument('--stuck-rounds',type=int,default=20,help='rounds of a cycle before the bench gives up; 40 leaves a loop of up to 3 tokens to the engine, which closes at 64')
     parser.add_argument('--no-think',action='store_true',help='close the thinking in the prompt')
+    parser.add_argument('--tool-loop',action='store_true',help='declare run_python in the model\'s own tool format and answer its calls: throwaway VM only')
     parser.add_argument('--retries',type=int,default=0,help='sampled runs from the prompt after one that ended with its tests failing')
     parser.add_argument('--retry-temperature',type=float,default=0.6)
     parser.add_argument('--shots',type=int,default=0,help='few-shot exemplars before each GSM8K question')
