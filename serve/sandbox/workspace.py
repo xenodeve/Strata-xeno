@@ -808,8 +808,13 @@ class Workspace:
         real_diff = ""
         if not hidden:
             real_diff = self._diff_bytes(head, rel, kept, data or b"", "D" if data is None else ("A" if base is None else "M"))[0]
-        copy_bytes = b"" if here in (None, "link") else self.read_bytes(rel, self.max_file + 1)
-        copy_diff = "a link in the copy\n" if here == "link" else self._diff_bytes(head, rel, kept, copy_bytes, "D" if here is None else ("A" if base is None else "M"))[0]
+        if here == "link":
+            copy_diff = "a link in the copy\n"
+        elif here is not None and private(rel):
+            copy_diff = "not shown: it looks like a secret\n"
+        else:
+            copy_bytes = b"" if here is None else self.read_bytes(rel, self.max_file + 1)
+            copy_diff = self._diff_bytes(head, rel, kept, copy_bytes, "D" if here is None else ("A" if base is None else "M"))[0]
         return {"path": rel, "seen": self._seen(real, hidden), "real": real_diff, "copy": copy_diff, "hidden": hidden}
 
     def _settle(self, rel: str, data: bytes | None) -> None:

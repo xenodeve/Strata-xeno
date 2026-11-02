@@ -10,12 +10,15 @@ Covered elsewhere: 10-14, 17, 33 (at the next command, not at once), 50, 51, 55,
 Not covered: 1, 2, 5-7, 25, 27-29, 36 (only the sweep), 40, 43, 45, 46, 52, 53, 61: other layers, or not built."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -543,6 +546,15 @@ class Applying(Case):
         self.assertFalse(got["isError"], got)
         self.assertEqual(len(self.asked), 1)
 
+    def test_an_allow_rule_does_not_silence_a_file_the_rules_ask_about(self):
+        self.allow.append("sandbox_apply")
+        ctx = self.context()
+        ctx.policy.protected = [str(self.proj / "config.json")]
+        self.call("sandbox_edit", ctx=ctx, path="config.json", old="", new="{}\n")
+        self.passed()
+        self.result("sandbox_apply", ctx=ctx)
+        self.assertEqual(len(self.asked), 1)
+
     def test_the_servers_own_config_is_never_settled_by_a_judge(self):
         self.mode = "auto"
         ctx = self.context()
@@ -563,14 +575,15 @@ class Applying(Case):
 
     def test_a_way_back_that_cannot_be_kept_stops_it_before_the_first_write(self):
         self.call("sandbox_diff")
-        for i in range(5):
-            self.box(self.session().ws, f"n{i}.txt", b"x\n")
+        for rel in (".gitignore", "a.txt", "src/b.py"):                         # files that exist, so the way back for each is a kept copy of it
+            self.box(self.session().ws, rel, b"changed\n")
         self.passed()
-        with mock.patch.object(checkpoints, "MAX_FILES", 3):
+        with mock.patch.object(checkpoints, "MAX_FILES", 2):
             got = self.call("sandbox_apply")
         self.assertIn("a way back could not be kept", got)
-        self.assertFalse((self.proj / "n0.txt").exists())
+        self.assertEqual(self.real("a.txt"), b"one\ntwo\nthree\n")
         self.assertEqual(self.store.listing("chat1"), [], "and none is left half kept")
+        self.assertEqual([p for p in (self.base / "cp").rglob("*") if p.is_file()], [], "not even its copies of the files")
 
     def test_a_file_that_moves_while_the_question_is_open_stops_it(self):
         self.edited()
@@ -682,6 +695,20 @@ class Applying(Case):
         self.assertEqual(ws.conflicts, set())
         self.assertEqual(self.in_copy(ws, "a.txt"), b"formatted\n", "the copy follows")
 
+    def test_an_edit_that_lands_right_after_the_write_is_followed_and_is_no_conflict(self):
+        self.edited()
+        self.passed()
+        real_write = agent.write_bytes_atomic
+
+        def and_then_the_user(path, data):
+            real_write(path, data)
+            Path(path).write_bytes(b"the user's edit, a moment later\n")       # before the sync that follows the write
+        with mock.patch.object(agent, "write_bytes_atomic", and_then_the_user):
+            self.assertIn("นำขึ้น project จริงแล้ว", self.call("sandbox_apply"))
+        got = self.call("sandbox_diff")
+        self.assertNotIn("เปลี่ยนในของจริงด้วย", got)
+        self.assertEqual(self.in_copy(self.session().ws, "a.txt"), b"the user's edit, a moment later\n")
+
     def test_a_change_to_the_tests_is_on_the_question(self):                  # design case 31
         self.call("sandbox_edit", path="tests/test_x.py", old="", new="def test_x():\n    pass\n")
         self.passed()
@@ -786,10 +813,13 @@ class Conflicts(Case):
         self.assertIn(".strata-sandbox/output/", got)
 
     def test_what_is_in_no_conflict_says_so(self):
-        self.call("sandbox_diff")
+        self.call("sandbox_edit", path="a.txt", old="one", new="uno")
         self.assertIn("in no conflict now", self.call("sandbox_conflict", path="a.txt"))
-        got = self.result("sandbox_resolve", path="a.txt", take="real", seen="none")
+        seen = hashlib.sha256(self.real("a.txt")).hexdigest()[:16]               # the right token: only the conflict itself is missing
+        got = self.result("sandbox_resolve", path="a.txt", take="real", seen=seen)
         self.assertTrue(got["isError"])
+        self.assertIn("in no conflict now", got["content"][0]["text"])
+        self.assertEqual(self.in_copy(self.session().ws, "a.txt"), b"uno\ntwo\nthree\n", "the copy's change stays")
 
     def test_a_secret_stays_out_even_as_a_hash(self):                         # design case 16
         self.call("sandbox_diff")
@@ -798,6 +828,10 @@ class Conflicts(Case):
         got = self.call("sandbox_conflict", path="src/token.key")
         self.assertNotIn("the secret value", got)
         self.assertNotIn("ของจริงเทียบ base:\n", got)
+        self.assertIn("seen: hidden", got, "no hash of it either")
+        self.assertIn("only take=real", self.call("sandbox_resolve", path="src/token.key", take="copy", seen="hidden"), "a file nobody may see cannot be merged onto")
+        self.call("sandbox_resolve", path="src/token.key", take="real", seen="hidden")
+        self.assertIsNone(self.in_copy(self.session().ws, "src/token.key"), "taking it leaves it out of the copy")
 
     def test_a_path_out_of_the_project_is_refused(self):
         self.call("sandbox_diff")
@@ -986,6 +1020,17 @@ class Conflicts(Case):
         self.assertEqual(self.in_copy(ws, "gone.txt"), b"real\n")
         self.assertEqual(everything(self.outside), outside)
 
+    def test_a_link_where_both_sides_made_a_new_file_is_not_kept(self):
+        self.call("sandbox_diff")
+        ws = self.session().ws
+        junction(self.outside, Path(ws.copy) / "new.txt")
+        self.put("new.txt", b"the user's new file\n")
+        seen = self.seen("new.txt")
+        got = self.result("sandbox_resolve", path="new.txt", take="copy", seen=seen)
+        self.assertTrue(got["isError"])
+        self.assertIn("a link", got["content"][0]["text"])
+        self.assertNotIn("new.txt", ws.base, "nothing was settled")
+
     def test_a_folder_on_the_way_that_is_a_link_is_refused(self):
         self.call("sandbox_diff")
         ws = self.session().ws
@@ -993,8 +1038,9 @@ class Conflicts(Case):
         (Path(ws.copy) / "src" / "b.py").unlink()
         os.rmdir(Path(ws.copy) / "src")
         junction(self.outside, Path(ws.copy) / "src")
-        got = self.result("sandbox_resolve", path="src/b.py", take="real", seen=self.seen("src/b.py") if False else "x")
+        got = self.result("sandbox_resolve", path="src/b.py", take="real", seen=self.seen("src/b.py"))
         self.assertTrue(got["isError"])
+        self.assertIn("link", got["content"][0]["text"])
         self.assertEqual(sorted(everything(self.outside)), ["stolen.txt"], "nothing was written through it")
 
 
@@ -1126,7 +1172,7 @@ class InABox(Case):
         self.starts = []
 
         def counted(policy, root=None):
-            self.starts.append(policy.readwrite[0])
+            self.starts.append(list(policy.readwrite))
             return Isolation.start(policy, root=root)
         self.server = SandboxServer(self.conf, None, self.logs, start=counted)
         self.addCleanup(self.server.close)
@@ -1304,10 +1350,11 @@ class InABox(Case):
         self.assertNotIn("comparing", self.steps()[:1])
 
     def test_the_base_runs_where_the_copy_cannot_reach_it(self):
-        self.call("sandbox_edit", path="tests/test_look.py", old="", new="import os\n\ndef test_base_is_shut():\n    assert not os.path.exists(os.path.join(os.path.dirname(os.getcwd()), 'base'))\n")
-        self.assertIn("tests: 3 ผ่าน", self.call("sandbox_test", command="python -m pytest -q"))
-        self.call("sandbox_diff")
-        self.assertFalse(os.path.exists(os.path.join(self.session().ws.root, "base")), "it does not outlast its run")
+        self.call("sandbox_edit", path="calc.py", old="return a + b", new="return b + a")
+        self.assertIn("tests: 2 ผ่าน (ก่อนแก้ 2 ผ่าน)", self.call("sandbox_test", command="python -m pytest -q"))
+        ws = self.session().ws
+        self.assertEqual(self.starts, [[ws.copy], [os.path.join(ws.root, "base")]], "each box is given its own tree and only that")
+        self.assertFalse(os.path.exists(os.path.join(ws.root, "base")), "the base tree does not outlast its run")
 
     def test_nothing_changed_means_no_second_run(self):
         self.assertIn("tests: 2 ผ่าน (ก่อนแก้ 2 ผ่าน)", self.call("sandbox_test", command="python -m pytest -q"))
@@ -1414,6 +1461,77 @@ class InABox(Case):
         self.assertIn("tests: 2 ผ่าน", self.call("sandbox_test"))
         self.assertFalse(self.result("sandbox_apply")["isError"])
         self.assertEqual(self.real("calc.py"), b"# the user's line\ndef add(a, b):\n    return b + a\n")
+
+
+class ThroughTheServer(unittest.TestCase):
+    """The route as a chat of the web app takes it: the server offers the tools, runs them in its tool loop, and sends the steps to the page."""
+
+    def setUp(self):
+        from serve.test_agent_chat import Fixture
+        self.fixture = Fixture("run")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        proj = self.fixture.proj
+        for args in (("init", "-q"), ("add", "-A"), ("-c", "user.email=t@example.invalid", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-qm", "x")):
+            subprocess.run(["git", *args], cwd=proj, capture_output=True, check=True, creationflags=0x08000000 if WINDOWS else 0)
+        self.rounds: list[int] = []
+
+    def start(self, *scripts):
+        from serve import agent as agent_mod
+        from serve.frontend import ChatTemplate
+        from serve.mcp import hub_from_config
+        from serve.server import ByteTokenizer, Service, serve
+        from serve.test_mcp import ScriptedEngine
+        f = self.fixture
+        f.agent = agent_mod.AgentServer()
+        sandbox = SandboxServer(OFF, f.base / "sandbox-root", start=no_box)
+        seen = sandbox.call
+
+        def call(tool, arguments, timeout=0, cancel=None, ctx=None):
+            self.rounds.append(ctx.round)
+            return seen(tool, arguments, timeout, cancel, ctx)
+        sandbox.call = call
+        self.sandbox = sandbox
+        f.hub = hub_from_config({}, None, builtins={"agent": f.agent, "sandbox": sandbox})
+        f.hub.start(wait=True)
+        tok = ByteTokenizer()
+        f.engine = ScriptedEngine(tok, list(scripts), max_context=200_000)
+        f.svc = Service(f.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        f.svc.mcp = f.hub
+        f.svc.agent = f.agent
+        f.httpd = serve(f.svc, port=0)
+        f.base_url = f"http://127.0.0.1:{f.httpd.server_address[1]}"
+
+    def test_a_chat_with_the_coding_tools_is_offered_them_and_the_steps_reach_the_page(self):
+        from serve.test_harness import tool_call
+        self.start(tool_call("sandbox_read", path="a.txt"), tool_call("sandbox_diff"), "</think>\n\nDone.")
+        status, said, events = self.fixture.chat()
+        self.assertEqual(status, 200, said)
+        self.assertIn("sandbox_read", self.fixture.engine.prompt_text(0), "offered without the MCP switch")
+        results = [e for e in events if e["event"] == "result"]
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["text"].startswith(HEADER) for r in results), results)
+        self.assertIn("hello", results[0]["text"])
+        copying = [e for e in events if e["event"] == "sandbox"]
+        self.assertEqual([e["step"] for e in copying], ["copying"])
+        self.assertEqual(copying[0]["call_id"], results[0]["id"], "on the call it belongs to")
+        self.assertEqual(self.rounds, [1, 2], "each round of tool calls is a new turn for the budget")
+
+    def test_a_request_with_no_coding_tools_is_not_offered_them(self):
+        self.start("</think>\n\nHi.")
+        status, _, _ = self.fixture.chat({"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True, "strata_mcp": True})
+        self.assertEqual(status, 200)
+        self.assertNotIn("sandbox_read", self.fixture.engine.prompt_text(0))
+
+    def test_deleting_the_chat_removes_its_copy(self):
+        from serve.test_harness import tool_call
+        self.start(tool_call("sandbox_diff"), "</think>\n\nDone.")
+        self.fixture.chat()
+        root = next(iter(self.sandbox._sessions.values())).ws.root
+        with urllib.request.urlopen(self.fixture.post("/agent/checkpoints/forget", {"session": "chat-1"}), timeout=10) as r:
+            self.assertEqual(r.status, 200)
+        self.assertFalse(os.path.exists(root))
+        self.assertEqual(len(self.sandbox._sessions), 0)
 
 
 if __name__ == "__main__":
