@@ -51,8 +51,42 @@
 - **ข้อที่ผิด อ่านทีละข้อ** แล้วแยกสาเหตุเป็น: ความรู้, เข้าใจโจทย์ผิด, คำนวณ, ทดลองแล้วไม่เชื่อผล, ถูกตัด, ตัวตรวจผิด ใช้ผลนี้กำหนดรอบแก้ถัดไป
 - **คำถามของ HLE และ GPQA ห้ามขึ้น repo, issue หรือ artifact** ให้อยู่บน VM และ scratch เท่านั้น
 
-## สิ่งที่ต้องเตรียม
+## ชุดข้อ (พร้อมแล้ว, eb104a9e)
 
-- Row builder ของ GPQA Diamond ยังไม่มี และ dataset ต้องขอสิทธิ์ใน Hugging Face ก่อน
-- MATH ระดับ 5, MMLU-Pro และ SuperGPQA แยกหมวด ใช้ `tools/igc/standard_rows.py` ที่มีอยู่ เพิ่มแค่ตัวกรอง
-- LiveCodeBench v6 ทุกระดับ ใช้ `std-lcb.jsonl` บน VM แล้วสุ่มด้วย seed คงที่
+`python -m tools.igc.standard_rows plan <data dir> <output dir>` สร้างชุดข้อของทุกขั้นที่หาไฟล์ต้นทางเจอใน data dir สุ่มด้วย seed 1 จึงได้ข้อเดียวกันทุกเครื่อง
+
+| ขั้น | ไฟล์ | กฎคัดข้อ | ต้นทางอยู่ที่ |
+|---|---|---|---|
+| 1 | `std-gsm60.jsonl` | สุ่ม 60 จาก test 1,319 ข้อ | PC (`gsm8k-test.jsonl`) |
+| 2 | `std-math5.jsonl` | ระดับ 5 (1,324 ข้อ) | PC (`math.json`) |
+| 3 | `std-mmlupro-calc.jsonl` | หมวด math, physics, engineering | PC (`mp-test.json`) |
+| 4 | `std-supergpqa-calc.jsonl` | `is_calculation` และ field คณิตหรือฟิสิกส์ หรือ discipline วิศวะ | `a1` (`/content/hd/sg.json`) |
+| 5 | `std-gpqa60.jsonl` | ฟิสิกส์กับเคมี 179 ข้อ ตัดชีววิทยา 19 ข้อเพราะไม่มีอะไรให้คำนวณ ตัวเลือกสลับตาม Record ID | scratch บน PC เท่านั้น ห้ามขึ้น repo |
+| 7 | `std-lcb60.jsonl` | สุ่ม 60 จากทุกระดับ บางข้ออาจซ้ำกับ 50 ข้อ hard ที่รันไปแล้ว | `a1` (`/content/cx/std-lcb.jsonl`) |
+
+- สิทธิ์ GPQA ได้แล้ว: `HF_TOKEN` ใน `.env` อ่านไฟล์ได้ (dataset ตั้งเป็น `gated = auto`)
+- `--stop-on-loss` ของชุดที่ตอบเป็นข้อความต้องใช้ verdicts ของแขนไม่มี MIP: `python -m tools.igc.select_rows --verdicts records.json verdicts.json` ตัดสินด้วย `select_rows.right` ตัวเดียวกับ bench และ reader
+- `b1` ไม่มี `/content/lcb-tests.json` ดังนั้นขั้น 7 ต้องรันบน `a1` หรือคัดลอกไฟล์ไปก่อน
+
+## ขั้นหลัง: Qwen3.5-4B (เริ่มหลังระบบบน Flash-Next เสถียรแล้ว)
+
+ผู้พัฒนาสั่งเพิ่ม (2026-11-02) โดยให้เริ่ม**หลังจาก**ระบบบน Qwen3.8 Flash-Next เสถียรแล้ว ตามบันทึกเรื่องขนาดโมเดล โมเดลใหญ่คาดว่าได้ประโยชน์ที่ token และเวลา ส่วนโมเดลเล็กคาดว่าความถูกต้องจะเพิ่มขึ้น แต่ยังไม่เคยวัด 4B จึงเป็นตัวที่ตอบคำถามข้อนี้ได้ตรงที่สุด
+
+คะแนนที่เผยแพร่ (model card `Qwen/Qwen3.5-4B`, โหมด thinking):
+
+| ชุด | Qwen3.5-4B |
+|---|---:|
+| MMLU-Pro | 79.1 |
+| SuperGPQA | 52.9 |
+| GPQA Diamond | 76.2 |
+| LiveCodeBench v6 | 55.8 |
+| HMMT Feb 25 | 74.0 |
+
+model card ไม่มีคะแนน HLE, GSM8K และ MATH มีคนนอกรายงานผลแบบมี Python tool ไว้ (`kth8/Qwen3.5-4B-*-benchmark`) ได้ MMLU-Pro 75.5, SuperGPQA 46.0 และ GPQA Diamond 69.2 ซึ่งต่ำกว่าคะแนนของ model card ทั้งสามชุด ตัวเลขนี้ยังไม่ได้ตรวจ แต่เป็นสัญญาณให้ระวังว่าการเพิ่ม tool อาจทำให้โมเดลเล็กคะแนนลด
+
+**ข้อจำกัด:** engine ของ Strata รันได้แค่ตระกูล Flash-Next แบบ MoE จึงแยกเป็นสองทาง
+
+- **Adapter + Sandbox ทาง tool:** ทำได้ทันที โดยรัน 4B บน vLLM (`--reasoning-parser qwen3 --tool-call-parser qwen3_coder`) แล้วให้ bench ตอบ `run_python` ด้วย Kernel ใน box เดียวกับที่ใช้อยู่ ส่วน MCP ใช้ `mcp.<server>.<tool>()` ต้องเพิ่มตัวส่ง request ของ bench ไปยัง server ภายนอก
+- **MIP Native:** ต้อง port engine ให้รองรับโมเดล dense ของตระกูล `qwen3_5` ก่อน งานนี้ใหญ่ จึงเป็นเรื่องที่ผู้พัฒนาต้องตัดสินใจเมื่อถึงขั้นนี้
+
+แขนเหมือนของ Flash-Next คือ 4B ไม่มี tool เทียบกับ 4B ทาง tool บนเครื่องเดียวกัน ใช้ชุดข้อเดียวกัน (ขั้น 2–7) และกฎระหว่างรันชุดเดียวกัน 4B เล็กพอจะรันบน L4 ได้ แต่ต้องวัดก่อนว่าบน L4 ได้ข้อความซ้ำเดิมทุกครั้งไหม ถ้าไม่ซ้ำ ให้กลับไปใช้ A100
