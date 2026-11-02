@@ -84,6 +84,27 @@ describe("the status of an answer being written", () => {
     for (const i of run) expect(agentStatus(i)).not.toBeNull()
   })
 
+  test("each step of the sandbox has its own words from when it begins, and its question says what is approved", () => {
+    const step = (sandboxStep: string) => label({ tools: [tool("sandbox_test", "running", { sandboxStep })] })
+    expect(step("copying")).toBe("Making a copy of the project…")
+    expect(step("trying")).toBe("Trying it in the copy…")
+    expect(step("testing")).toBe("Running the tests in the copy…")
+    expect(step("comparing")).toBe("Comparing with before the change…")
+    expect(step("retrying")).toBe("Running the failed tests once more…")
+    expect(step("applying")).toBe("Putting the change into the real project…")
+    expect(step("a step this page does not know")).toBe("Running sandbox_test…")
+    expect(label({ tools: [tool("sandbox_run", "running", { sandboxStep: null })] })).toBe("Running sandbox_run…")
+    expect(label({ tools: [tool("sandbox_apply", "asking")] })).toBe("Waiting for your approval to put the change into the project…")
+    expect(kind({ tools: [tool("sandbox_apply", "asking")] })).toBe("asking")
+    expect(label({ tools: [tool("sandbox_apply", "running", { sandboxStep: "applying", judging: true })] })).toBe("Auto mode is checking the call…")      // the judge comes first, as for any call
+  })
+
+  test("a test run in the sandbox never goes quiet: copy, test, compare, run again, the result read", () => {
+    const run = ["copying", "testing", "comparing", "retrying"].map((sandboxStep) => ({ ...base, tools: [tool("sandbox_test", "running", { sandboxStep })] }))
+    const after = { ...base, tools: [tool("sandbox_test", "done")], serverState: "reading" }
+    expect([...run, after].map((i) => agentStatus(i)?.label)).toEqual(["Making a copy of the project…", "Running the tests in the copy…", "Comparing with before the change…", "Running the failed tests once more…", "Reading the tool's result…"])
+  })
+
   test("each status has an orb form and words", () => {
     for (const i of [{ tools: [tool("Bash", "running")] }, { tools: [tool("Bash", "asking")] }, { tools: [tool("Read", "done")], serverState: "reading" }, { text: "x" }]) {
       const s = agentStatus({ ...base, ...i })!

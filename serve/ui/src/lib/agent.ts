@@ -82,6 +82,12 @@ export function toolSummary(tool: string, args: unknown): string {
     case "WebSearch": return cut(str(a.query))
     case "BashOutput": return str(a.bash_id)
     case "KillShell": return str(a.shell_id)
+    case "sandbox_run": return cut(str(a.command) || str(a.code).split("\n")[0])
+    case "sandbox_read": case "sandbox_edit": case "sandbox_conflict": case "sandbox_resolve": case "outline": return cut(str(a.path))
+    case "sandbox_grep": case "search": return cut(str(a.pattern))
+    case "sandbox_test": return cut(str(a.command))
+    case "find_symbol": return cut(str(a.name))
+    case "replace_body": case "insert_before": case "insert_after": return cut(str(a.symbol))
     default: return ""
   }
 }
