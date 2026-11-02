@@ -43,6 +43,15 @@ from tools.igc.external_bench import HINT_STOP
 assert HINT_STOP.count('</think>') == 1 and HINT_STOP.index('Python to check if my approach') < HINT_STOP.index('</think>') < HINT_STOP.index('<tool_call>')
 assert tool_call('the whole reasoning' + HINT_STOP + WRITTEN) == 'print(6 * 7)'
 
+# The same program a third time running ends the runs: mpw's 0fd92db9 sent one program nine times running (#288)
+from tools.igc.external_bench import repeated
+A, B = dict(code='print(1)', ok=True), dict(code='print(2)', ok=False)
+assert repeated([A, A], 'print(1)') and repeated([B, A, A], 'print(1)') and repeated([dict(B), B], 'print(2)'), 'failed or not'
+assert not repeated([A], 'print(1)'), 'once again is left alone: m5h3 de922fcd went on to a new program after it'
+assert not repeated([A, B, A], 'print(1)'), 'not running'
+assert not repeated([A, A, dict(code='print(1)', ok=None)][2:], 'print(1)') and not repeated([], 'print(1)')
+assert not repeated([A, A], 'print(1) ')
+
 # One row's engine lines: m5t's loop rule closed the thinking on 2 rows, and nothing in the records said which (#288)
 import tempfile
 from tools.igc.external_bench import read_events

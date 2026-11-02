@@ -36,6 +36,14 @@ TOOL_ROUNDS=24
 # an oracle, and ended with no code (#288).
 TOOL_SPENT='[no more runs: finish the thinking and write the answer]'
 TOOL_AFTER=4
+
+
+def repeated(ran,code,times=3):
+    """The same program a third time running ends the runs. mpw's 0fd92db9 sent one 4116-token program nine times running, 37k tokens of the
+    row's 150k (#288), and the repeat check reads one turn so it never saw it. Once again is left alone: after the second line hint m5h3 and
+    mph2 wrote the program they had just run, then went on to a new one (de922fcd)."""
+    last=[c['code'] for c in ran if c['ok'] is not None][-(times-1):]
+    return len(last)==times-1 and all(c==code[:20000] for c in last)
 # --hint-after N: every call of 205 in five arms came after the whole thinking, so the program checked an answer already reached by hand. START's
 # Hint-infer (2503.04625) puts its own words in the reasoning and the model goes on into a call; here they open the call in the model's format.
 # The hint closes the thinking first: with the response inside the thinking, 4 of 22 rows of m5h2 ended the turn at once (`</tool_call>` ends
@@ -308,7 +316,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             for attempt in range(retries+1):
                 tokens=[];stuck=False
                 keys=sampling if not attempt else {**sampling,'temperature':retry_temperature,'seed':attempt}
-                said=[];kernel=None;asked=list(ids);ran=[];hints=[];quiet=0;lead=''
+                said=[];kernel=None;asked=list(ids);ran=[];hints=[];quiet=0;lead='';spent=False
                 for turn in range(TOOL_ROUNDS+TOOL_AFTER if tool_loop else 1):
                     tokens=[]
                     thinking='</think>' not in lead;inner=None;hinted=False   # after the hint the model writes a reply call, not thinking
@@ -338,7 +346,9 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                     code=inner if inner is not None else None if stuck or not tool_loop else tool_call(lead+tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                     if code is None:break
                     quiet=0;lead=''
-                    if turn<TOOL_ROUNDS:
+                    spent=spent or repeated(ran,code)
+                    if spent and sum(c['ok'] is None for c in ran)>=TOOL_AFTER:break   # as many answered calls as past the 24th runs, no more
+                    if turn<TOOL_ROUNDS and not spent:
                         from serve.sandbox.exec_bridge import Kernel
                         if kernel and not kernel.alive():kernel.close();kernel=None   # a call that ran past its time took the kernel with it
                         restarted=kernel is None and bool(ran);kernel=kernel or Kernel()
