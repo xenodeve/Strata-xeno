@@ -476,6 +476,28 @@ describe("the coding tools in the chat", () => {
     expect(c.messages[1].tools![0].sandboxStep).toBeNull()
   })
 
+  test("a program run while thinking is on the answer from its start, and gone when its result is in or the answer ends", async () => {
+    keep()
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const bytes = (text: string) => new TextEncoder().encode(text)
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(new ReadableStream({
+      async start(out) {
+        out.enqueue(bytes(sse({ choices: [{ delta: { reasoning_content: "Let me check." } }] }, { strata_mcp: { event: "reasoning_tool", phase: "thinking", state: "running" } })))
+        await gate
+        out.enqueue(bytes(sse({ strata_mcp: { event: "reasoning_tool", phase: "thinking", state: "done" } }, { strata_mcp: { event: "reasoning_tool", phase: "thinking", state: "running" } }, ...finish)))
+        out.close()
+      },
+    }), { status: 200 })
+    const c = new ChatController()
+    const sent = c.send("go", [], { ...ctx, agent: ON })
+    for (let i = 0; i < 400 && !c.messages[1]?.thinkingTool; i++) await new Promise((r) => setTimeout(r, 5))
+    expect(c.messages[1].thinkingTool).toBe(true)
+    release()
+    await sent
+    expect(c.messages[1].thinkingTool).toBe(false)                                     // a last "running" the answer's end cut off does not stay
+  })
+
   test("a todo list from the stream is the answer's list, and a later one replaces it", async () => {
     keep()
     const t1 = [{ content: "a", status: "in_progress", activeForm: "Doing a" }]

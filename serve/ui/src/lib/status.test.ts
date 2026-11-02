@@ -105,6 +105,30 @@ describe("the status of an answer being written", () => {
     expect([...run, after].map((i) => agentStatus(i)?.label)).toEqual(["Making a copy of the project…", "Running the tests in the copy…", "Comparing with before the change…", "Running the failed tests once more…", "Reading the tool's result…"])
   })
 
+  test("the reasoning tool: a program run while thinking and one run in the reply each say which, from when they begin", () => {
+    expect(label({ reasoning: "Let me check.\n<tool_call>", thinkingTool: true })).toBe("Running the model's program while thinking…")
+    expect(kind({ reasoning: "Let me check.", thinkingTool: true })).toBe("running")
+    expect(label({ reasoning: "So it is 42.", thinkingTool: false })).toBe("Thinking…")                              // its result is in the thinking: the model reads on
+    expect(label({ tools: [tool("run_python", "writing")] })).toBe("Writing the call to run_python…")
+    expect(label({ tools: [tool("run_python", "running")] })).toBe("Running the model's program in the reply…")
+    expect(label({ tools: [tool("run_python", "done")], serverState: "reading" })).toBe("Reading the tool's result…")
+    expect(label({ tools: [tool("Bash", "asking")], thinkingTool: true })).toBe("Waiting for you…")                // a question for the user still comes first
+  })
+
+  test("a reply with the reasoning tool never goes quiet: think, run while thinking, think on, call in the reply, run it, read it, answer", () => {
+    const run: StatusInput[] = [
+      { ...base, reasoning: "Let me check." },
+      { ...base, reasoning: "Let me check.\n", thinkingTool: true },
+      { ...base, reasoning: "Let me check.\n<tool_call>…</tool_response>\nSo it is 42." },
+      { ...base, reasoning: "So it is 42.", tools: [tool("run_python", "writing", { rat: 12 })] },
+      { ...base, reasoning: "So it is 42.", tools: [tool("run_python", "running", { rat: 12 })] },
+      { ...base, reasoning: "So it is 42.", tools: [tool("run_python", "done", { rat: 12 })], serverState: "reading" },
+      { ...base, reasoning: "So it is 42.", text: "It is 42.", tools: [tool("run_python", "done", { rat: 12 })] },
+    ]
+    expect(run.map((i) => agentStatus(i)?.label)).toEqual(["Thinking…", "Running the model's program while thinking…", "Thinking…", "Writing the call to run_python…",
+      "Running the model's program in the reply…", "Reading the tool's result…", "Answering…"])
+  })
+
   test("each status has an orb form and words", () => {
     for (const i of [{ tools: [tool("Bash", "running")] }, { tools: [tool("Bash", "asking")] }, { tools: [tool("Read", "done")], serverState: "reading" }, { text: "x" }]) {
       const s = agentStatus({ ...base, ...i })!

@@ -70,8 +70,9 @@ from serve import harness, mcp_admin  # noqa: E402
 from serve import skills as skills_mod  # noqa: E402
 from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, runs as runs_mod, shell as shell_mod, subagent as subagent_mod, web as web_mod  # noqa: E402
 from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
-from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve.mcp import DEFAULTS as MCP_DEFAULTS, McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import reasoning_tool as RT  # noqa: E402  (#288: run_python, opt-in "reasoning_tool")
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -678,6 +679,7 @@ class StrataEngine:
     QUIET_S = 10          # how long a quiet engine waits for a line before a heartbeat and a liveness check
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     sandbox_exec = None                  # serve/sandbox/exec_bridge.py, for --igc-sandbox-exec
+    reasoning_tool = False               # serve/reasoning_tool.py: main() sets it with the run config's key; a request off the route then runs with igc=0
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
@@ -1113,6 +1115,12 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def igc_key(self, sampling) -> str:
+        """" igc=0" for a request off the reasoning tool's route on an engine started for it (serve/reasoning_tool.py): the MIP route runs
+        whole for a request that has the declaration and the handler of its calls, or not at all.  Empty otherwise, so with the run config's
+        key off the GEN line is as it was."""
+        return " igc=0" if self.reasoning_tool and not (sampling or {}).get("_rtool") else ""
+
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = f" cache_slot={cache_slot(sampling)}"
@@ -1422,7 +1430,7 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
-        keys = self.sampling_keys(sampling or {})
+        keys = self.sampling_keys(sampling or {}) + self.igc_key(sampling)
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1743,15 +1751,15 @@ class StrataEngine:
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
         if self.sandbox_exec:                            # what this request's blocks may reach (run_with_mcp): here, where it holds the engine
-            self.sandbox_exec.begin((sampling or {}).get("_mip"))
+            self.sandbox_exec.begin((sampling or {}).get("_mip"), (sampling or {}).get("_rtool"))
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self._stats = None          # xeno UI S4: this request's STATS line, once the engine sends it
         self._pp = []               # ... and its PP lines (position, ms): the prefill speed per chunk
         self.drained = []           # xeno #49 review: tokens the engine committed after an early stop (read in the drain)
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        keys = self.sampling_keys(sampling or {}) + self.igc_key(sampling)
+        head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
@@ -3099,6 +3107,7 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
+        self.reasoning_tool = False                       # opt-in: the run config's "reasoning_tool" (serve/reasoning_tool.py, reasoning_route)
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
         self.replays = collections.OrderedDict()        # xeno: replay_key -> the last greedy non-stream answer
@@ -4342,6 +4351,10 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        # The reasoning tool (serve/reasoning_tool.py): the engine runs a `run_python` call made while thinking at its closing tag, and the
+        # parser holds that call until what follows it decides it (#804): from then until its <tool_response> arrives, the call is running.
+        # Said as it begins and as it ends, as ("mcp", {...}) for run_with_mcp, the only consumer of a request on the route.
+        think_tool = False if (sampling or {}).get("_rtool") is not None else None
         guard = LoopGuard()
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         carry = (sampling or {}).get("_carry")         # #200: this request settles its conversation
@@ -4540,6 +4553,10 @@ class Service:
                                     print(f"[strata] loop guard stopped generation: {guard.reason}", flush=True)
                                     break
                                 yield "event", ev
+                            if think_tool is not None and think_tool != (running := any(
+                                    c is not None and c.name == RT.NAME for _, c in parser.pending)):
+                                think_tool = running
+                                yield "mcp", {"event": "reasoning_tool", "phase": "thinking", "state": "running" if running else "done"}
                             if guard.reason:
                                 break
                             if evs:
@@ -4757,6 +4774,8 @@ class Service:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
             yield "event", ev
+        if think_tool:                                  # the reply ended while a call made in the thinking ran (a stop, the end of the output)
+            yield "mcp", {"event": "reasoning_tool", "phase": "thinking", "state": "done"}
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
@@ -4841,8 +4860,24 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
 AGENT_ROUNDS = 100      # tool rounds in one answer when the chat has the coding tools
+
+
+def reasoning_route(svc: Service, req: dict, tools, force=None, validator=None):
+    """The reasoning tool's Turn for this request (serve/reasoning_tool.py), or None: the run config's key is off, or the request
+    is one the route does not fit - a forced call, tool_choice none, a structured answer, a reply whose opening the server writes
+    (forced_opening), or a client that brings its own run_python (its call goes to it).  A request with None runs with igc=0 on an
+    engine started for the route (StrataEngine.igc_key)."""
+    if not svc.reasoning_tool or force is not None or validator is not None or req.get("_opening"):
+        return None
+    if tool_choice_of(req.get("tool_choice"))[0] == "none":
+        return None
+    if any(isinstance(t, dict) and t.get("name") == RT.NAME for t in tools or []):
+        return None
+    return RT.Turn(getattr(svc.engine, "sandbox_exec", None))
+
+
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names, agent_run=None, rounds_limit=None):
+                 mcp_names, agent_run=None, rounds_limit=None, rtool=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -4850,14 +4885,37 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
-    could not reach the model before the client's)."""
-    max_rounds = max(int(hub.settings["max_rounds"]), AGENT_ROUNDS) if agent_run is not None else int(hub.settings["max_rounds"])      # coding takes many rounds
+    could not reach the model before the client's).
+
+    `rtool`: the reasoning tool's Turn for a request on its route (serve/reasoning_tool.py, reasoning_route), else None.
+    `run_python` is then the server's too: a call in the reply is answered here like an MCP tool's and never reaches the
+    client, and `hub` may be None (a request with no MCP tools)."""
+    if rtool is None:
+        yield from _run_with_mcp(svc, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
+                                 mcp_names, agent_run, rounds_limit, None)
+        return
+    try:
+        yield from _run_with_mcp(svc, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
+                                 mcp_names, agent_run, rounds_limit, rtool)
+    finally:
+        rtool.close()                                             # its kernels end with the request
+
+
+def _run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
+                  mcp_names, agent_run, rounds_limit, rtool):
+    settings = hub.settings if hub is not None else MCP_DEFAULTS
+    max_rounds = max(int(settings["max_rounds"]), AGENT_ROUNDS) if agent_run is not None else int(settings["max_rounds"])      # coding takes many rounds
     if rounds_limit is not None:                                  # a helper (serve/subagent.py) stops sooner
         max_rounds = rounds_limit
-    if getattr(svc.engine, "sandbox_exec", None):                 # a program in the reasoning reads what this request offered, from the hub as it is now
+    if getattr(svc.engine, "sandbox_exec", None) and hub is not None:    # a program in the reasoning reads what this request offered, from the hub as it is now
         from serve.mip.mcp_adapter import McpAdapter
         sampling = {**sampling, "_mip": McpAdapter(hub, mcp_names, agent_run.policy if agent_run is not None else None, cancel)}
-    total, rounds, done = 0, 0, None
+    served = set(mcp_names)                                      # the calls this loop answers
+    if rtool is not None:                                        # the request is on the reasoning tool's route: its run_python is the server's,
+        rtool.mcp = sampling.get("_mip")                         # in the reply as in the thinking, with the same reach
+        sampling = {**sampling, "_rtool": rtool}
+        served.add(RT.NAME)
+    total, rounds, mcp_rounds, done = 0, 0, 0, None
     dec_n, dec_ms = 0, 0.0                                       # the tokens decoded and the time the engine spent decoding them, over every round
     messages = list(messages)
     if agent_run is not None:
@@ -4871,7 +4929,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                 continue
             if kind == "event":
                 ev: Event = x
-                if ev.call is not None and ev.call.name in mcp_names:
+                if ev.call is not None and ev.call.name in served:
                     if ev.kind == "tool_start":          # the model has started writing a call: say so at once
                         yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
                     elif ev.kind == "tool_call":
@@ -4890,8 +4948,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             dec_n += round(tm["predicted_per_second"] * tm["predicted_ms"] / 1000)
             dec_ms += tm["predicted_ms"]
         run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
-        if run_them and rounds >= max_rounds:
-            yield "mcp", {"event": "limit", "max_rounds": max_rounds}
+        tool_only = rtool is not None and all(c.name == RT.NAME for c in calls)     # run_python counts its own calls, not MCP rounds
+        if run_them and (rtool.over() if tool_only else mcp_rounds >= max_rounds):
+            yield "mcp", {"event": "limit", "max_rounds": RT.RUNS + RT.AFTER if tool_only else max_rounds}
             if agent_run is not None:
                 agent_run.limit_hit = True
             run_them = False
@@ -4910,11 +4969,13 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                               "chars": 0, "truncated": False, "ms": 0}
             break
         rounds += 1
+        mcp_rounds += not tool_only
         results = []
         if agent_run is not None:
             agent_run.ctx.round = rounds
         for c in calls:
-            s, tool = hub.routes().get(c.name, (None, c.name))
+            mine = rtool is not None and c.name == RT.NAME            # the reasoning tool's run_python: this server's, not a hub's
+            s, tool = (None, c.name) if mine else hub.routes().get(c.name, (None, c.name))
             yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
                           "tool": tool, "arguments": c.arguments, "round": rounds}
             # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
@@ -4923,9 +4984,10 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             if agent_run is not None:
                 agent_run.current = c.id
 
-            def work(c=c, box=box):
+            def work(c=c, box=box, mine=mine):
                 try:
-                    box["r"] = hub.call(c.name, c.arguments, cancel, agent_run.ctx if agent_run is not None else None)
+                    box["r"] = rtool.run(c.arguments, cancel) if mine else \
+                        hub.call(c.name, c.arguments, cancel, agent_run.ctx if agent_run is not None else None)
                 except McpCancelled:
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
@@ -5150,7 +5212,9 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, run=None):
+    """`run`: the events to send instead of Service.run's (run_with_mcp, for a request on the reasoning tool's route): its
+    ("mcp", {...}) items are the server's own tool activity, which the Messages API has no place for."""
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
@@ -5166,9 +5230,11 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
     choice = req.get("tool_choice") if isinstance(req.get("tool_choice"), dict) else {}
     one_call, first_done = bool(choice.get("disable_parallel_tool_use")), False   # xeno #49 S2
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
         if kind == "ping":
             yield None
+            continue
+        if kind == "mcp":
             continue
         if kind == "event":
             ev: Event = x
@@ -5224,10 +5290,11 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             # which is cache_read_input_tokens (message_start could only say the whole prompt).  At least the last
             # prompt token is always read, and Claude Code takes an input_tokens of 0 as "not given" and keeps
             # message_start's whole prompt beside cache_read_input_tokens: the prompt counted twice (#1013)
-            reused = max(0, min(x.get("reused") or 0, len(ids) - 1))
+            pt = x.get("prompt_tokens", len(ids))  # after the reasoning tool's rounds (run_with_mcp): the last round's prompt
+            reused = max(0, min(x.get("reused") or 0, pt - 1))
             yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
                                                                        "stop_sequence": x.get("stop_sequence")},
-                                    "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
+                                    "usage": {"input_tokens": pt - reused, "cache_read_input_tokens": reused,
                                               "output_tokens": x["completion_tokens"]}}
             yield "message_stop", {"type": "message_stop"}
 
@@ -6548,7 +6615,8 @@ def make_handler(svc: Service):
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = (req.get("strata_mcp") is True or arun is not None) and svc.mcp is not None      # the web app's opt-in (serve/mcp.py), or the coding tools
-            own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
+            rtool = reasoning_route(svc, req, tools, force, validator)      # #288: run_python, the server's own tool (opt-in "reasoning_tool")
+            own = {t.get("name") for t in tools or [] if isinstance(t, dict)} | ({RT.NAME} if rtool is not None else set())   # #592: a second line of defence
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
@@ -6564,6 +6632,8 @@ def make_handler(svc: Service):
                 tools = (tools or []) + extra or None
             if force and use_mcp:
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
+            if rtool is not None:
+                tools = RT.declared(tools)                    # after the client's tools and the MCP ones
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
@@ -6580,7 +6650,9 @@ def make_handler(svc: Service):
             if not detached:
                 self._watch_client(cancel)                   # #430 #431 (a run that goes on when the page goes away is not cancelled by it: serve/runs.py)
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}, arun) if use_mcp else None
+                               {t["name"] for t in extra}, arun, rtool=rtool) if use_mcp else \
+                run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel, set(),
+                             rtool=rtool) if rtool is not None else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
@@ -6811,7 +6883,11 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            # #288: run_python, the server's own tool (opt-in "reasoning_tool"); not for a classifier's turn whose opening is written for it
+            rtool = None if forced_opening.required(messages, False) else reasoning_route(svc, req, tools, force)
+            if rtool is not None:
+                tools = RT.declared(tools)                             # after Claude Code's own tools
+            max_req = max_new = int(req.get("max_tokens") or 0)        # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             think_budget.side_effort(req, kw)                         # xeno #49 S3: before the template renders
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
@@ -6831,17 +6907,19 @@ def make_handler(svc: Service):
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
+            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel, set(),
+                               rtool=rtool) if rtool is not None else None      # a run_python call in the reply is answered here
             if not req.get("stream"):
                 key = svc.replay_key(req, ids, max_new)
                 if key is not None and key in svc.replays:
                     print("[strata] the same greedy request again: its last answer, not generated again", flush=True)
                     return self._json(200, {**svc.replays[key], "id": f"msg_{uuid.uuid4().hex[:24]}"})
-                events = self._capture(anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force), "anthropic")
+                events = self._capture(anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force, run=run), "anthropic")
                 body = anthropic_collect(events)
                 if key is not None and not getattr(cancel, "client_gone", False):   # never one a hang-up cut short
                     svc.remember_reply(key, body)
                 return self._json(200, body)
-            events = self._capture(anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force), "anthropic")
+            events = self._capture(anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force, run=run), "anthropic")
             self._sse()
             trace = sse_tracer()                             # xeno #49 S5: STRATA_TRACE_SSE=<file>
             try:
@@ -7361,13 +7439,15 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
-def sandbox_bridge(args: list[str], groups):
+def sandbox_bridge(args: list[str], groups, box_factory=None):
     """What answers the SBX lines of an engine started with --igc-sandbox-exec, else None.  One kernel for one request, so not across
-    replicas (the engine refuses --batch itself).  No isolation box yet (#287): a block that gets here is told it cannot run."""
+    replicas (the engine refuses --batch itself).  `box_factory` starts the kernel's isolation box: the reasoning tool's, where the
+    developer approved real Python (serve/reasoning_tool.py).  Without one, a block that gets here is told it cannot run, unless the
+    server is on a throwaway VM."""
     if "--igc-sandbox-exec" not in args or groups:
         return None
     from serve.sandbox.exec_bridge import ExecBridge
-    return ExecBridge()
+    return ExecBridge(box_factory)
 
 
 def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool):
@@ -7600,20 +7680,31 @@ def main() -> int:
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
             raise SystemExit(f"[strata] config {e}")
+        rtool_box = False
+        try:                                            # #288 (opt-in): run_python while thinking and in the reply, or a refusal now
+            rtool_on = RT.on(cfg)
+            if rtool_on:
+                extra, rtool_box, why = RT.startup(cfg, args, engine_binary(exe, cfg), groups)
+                args += extra
+                print(f"[strata] reasoning tool on: run_python is declared to each request on its route"
+                      f"{' (engine flags added: ' + ' '.join(extra) + ')' if extra else ''}; {why}", flush=True)
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
         else:                                           # args: engine_args(cfg) and the fork's --ban-ids (#49 S4)
             engine = StrataEngine(exe, args + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env,
                                   lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
-        engine.sandbox_exec = sandbox_bridge(args, groups)
+        engine.sandbox_exec = sandbox_bridge(args, groups, RT.box_factory() if rtool_box else None)
+        engine.reasoning_tool = rtool_on                # a request off the route then runs with igc=0
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups else None
         if note:                                        # #560 #516: before --open starts a browser on that card
             print(note, flush=True)
     else:
-        effort_end = None
+        effort_end, rtool_on = None, False
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
@@ -7623,6 +7714,7 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    svc.reasoning_tool = rtool_on                       # #288: opt-in, off by default (reasoning_route)
     if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
     from serve.keepawake import KeepAwake
