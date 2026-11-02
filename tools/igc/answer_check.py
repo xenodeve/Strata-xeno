@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from tools.igc.external_score import final_number
+from tools.igc.select_rows import right
 
 RULES = """You compare a reply with the reference answer of a question. Do not solve the question.
 same: the value the reply settles on as its answer equals the reference, in any wording or unit form.
@@ -27,6 +28,8 @@ def prompt(case):
 
 
 def scored_right(record):
+    if record.get('suite') in ('stdmath', 'bbh', 'mmlupro', 'supergpqa', 'hle'):
+        return right(record, record['text'])
     value = final_number(record['text'])
     return value is not None and abs(value - float(record['answer'])) < 1e-6
 
