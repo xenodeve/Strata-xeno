@@ -67,6 +67,14 @@
 | ความต้องการใน 339 block ที่เก็บไว้ | sympy 21, sys 4, random 4, numpy 2 |
 | Windows | 10.0.26300.9711 ผ่านเกณฑ์ MXC ที่ระบุ 26300.9550 สำหรับ 26H2 |
 | พื้นที่ว่าง | C: 41 GiB, D: 5.8 GiB |
+| อ่านไฟล์ติดตามทั้งหมดเข้าหน่วยความจำ | 535 ms, 53 MB |
+| ค้นคำตรงตัวในหน่วยความจำ (Python) | 24 ms ทั้ง repo |
+| Parse ไฟล์ Python 1,053 ไฟล์ ได้ 7,842 symbol (`ast`) | 2.4 วินาที |
+| อ่าน `serve/agent.py` ทั้งไฟล์ เทียบ outline บวกหนึ่งฟังก์ชัน | 11,325 เทียบ 1,021 token |
+| อ่าน `serve/permissions.py` เทียบแบบเดียวกัน | 7,071 เทียบ 853 token |
+| อ่าน `tools/igc/external_bench.py` เทียบแบบเดียวกัน | 4,571 เทียบ 555 token |
+| `igc_sandbox.hpp` ทั้งไฟล์ | 135,477 token |
+| เครื่องมือในเครื่อง | serena, uvx, `tree_sitter` ของ Python มี ส่วน rg, ctags, clangd, pyright ไม่มี |
 
 ## 4. โครงสร้าง
 
@@ -212,6 +220,45 @@ Gate จะเตือนเพิ่มเมื่อ diff แก้ไฟล
 
 เพิ่มคำใน `agentStatus` ตามหลักของเว็บ เช่น *กำลังลองในสำเนา*, *กำลังรัน test ในสำเนา*, *กำลังเทียบกับก่อนแก้*, *รออนุมัติการนำขึ้นของจริง* และเก็บบันทึกทุกคำสั่งกับ diff ต่อแชตให้ผู้ใช้ตรวจย้อนหลังได้
 
+### 4.9 การค้นและดูโครงสร้างแบบ native
+
+แนวทางของ Serena คือให้โมเดลอ่านเป็น symbol ไม่ใช่เป็นไฟล์ แนวนี้เหมาะกับ sandbox มาก เพราะทุกไบต์ที่พิมพ์เป็น forced token ใน 3 ไฟล์ที่วัด outline บวกหนึ่งฟังก์ชันใช้ token เหลือ 9-12 % ของการอ่านทั้งไฟล์ ซึ่งเป็นตัวอย่างเล็กที่เลือกฟังก์ชันไว้เองไม่ใช่งานจริง ไฟล์ขนาด `igc_sandbox.hpp` อ่านทั้งไฟล์ไม่ได้อยู่แล้ว
+
+Serena ใช้ language server ผ่าน LSP และทำงานเป็น MCP แยก process ตัว LSP ให้ความแม่นด้านอ้างอิงข้ามไฟล์ แต่เริ่มช้าและกินหน่วยความจำ จึงเสนอ 3 ชั้น เริ่มจากถูกไปแพง และใช้ชื่อคำสั่งตาม Serena เพื่อให้ความรู้ที่โมเดลมีอยู่ใช้ต่อได้
+
+| ชั้น | เครื่องมือ | ตอบอะไร | ราคา | จำกัด |
+|---|---|---|---|---|
+| L1 ข้อความ | ตัวค้นของเราบนไฟล์ในหน่วยความจำ เคารพ `.gitignore` | ชื่อไฟล์, โครงโฟลเดอร์, คำ, regex | 24 ms บน repo นี้ | ไม่รู้โครงสร้างภาษา |
+| L2 โครงสร้าง | tree-sitter ฝังเป็น library ภาษา C | outline, ตำแหน่ง symbol, เนื้อฟังก์ชัน, แก้ทั้งฟังก์ชัน | ต้องวัด ตัวเทียบคือ `ast` 2.4 วินาทีทั้ง repo | รู้แค่ syntax อ้างอิงข้ามไฟล์เป็นการเดาจากชื่อ |
+| L3 ความหมาย | language server ใน box เช่น clangd, pyright | references, definition, rename, diagnostics | เริ่มช้า ต้องวัดต่อภาษา | ต้องติดตั้งต่อภาษา และ project ต้องตั้งค่าได้ |
+
+**คำสั่งในสำเนา**
+
+| คำสั่ง | ชั้น | เทียบกับ Serena |
+|---|---|---|
+| `tree(path, depth)`, `find_file(glob)` | L1 | `list_dir`, `find_file` |
+| `search(pattern, glob)` | L1 | `search_for_pattern` |
+| `outline(path)` | L2 | `get_symbols_overview` |
+| `find_symbol(name, body=False)` | L2 | `find_symbol` |
+| `references(symbol)` | L3 แล้วตกมา L1 พร้อมบอกว่าเป็นการเดา | `find_referencing_symbols` |
+| `replace_body(symbol, text)` | L2 | `replace_symbol_body` |
+| `insert_after(symbol, text)`, `insert_before(symbol, text)` | L2 | `insert_after_symbol`, `insert_before_symbol` |
+| `rename(symbol, new)` | L3 เท่านั้น | `rename_symbol` |
+| `diagnostics(path)` | L3 แล้วตกไปใช้ compiler หรือ linter | ไม่มีโดยตรง |
+
+**ความหมายของ native ในงานนี้**
+
+- **ไม่ผ่าน MCP และไม่จบ turn:** ระหว่างคิดเรียกได้ในรูป block และ server ตอบผ่าน `SBX`
+- **ไม่แยกตัวไปดูของจริง:** ทุกชั้นอ่านสำเนา จึงเห็นสิ่งที่โมเดลเพิ่งแก้ทันที ซึ่งเป็นเรื่องที่ Cursor ทำ shadow workspace ขึ้นมาเพื่อแก้
+- **ทนโค้ดครึ่งทาง:** tree-sitter parse ไฟล์ที่ยังผิด syntax ได้ และ parse ซ้ำเฉพาะส่วนที่เปลี่ยน
+- **ตัว index อยู่ใน box:** parser อ่านไฟล์ที่ไม่น่าไว้ใจ จึงไม่รันใน server ซึ่งมีสิทธิ์เต็ม
+
+**ไม่ได้เอา Serena ทั้งตัวเข้า box ในรุ่นแรก** เพราะมันเพิ่ม Python กับ language server หนึ่งชุดต่อ session ส่วนความสามารถหลักของ L1 และ L2 ทำได้โดยไม่ต้องมี process เพิ่ม ถ้า L3 คุ้ม ค่อยพิจารณาใช้ Solid-LSP ของ Serena เป็นตัวคุย language server ใน box
+
+**Repo map:** [Aider](https://aider.chat/docs/repomap.html) จัดอันดับ symbol ด้วย graph แล้วส่งแผนที่ย่อราว 1,000 token ให้โมเดลตั้งแต่ต้น แนวนี้ใช้กับ `outline(".")` ได้ แต่แผนที่ที่ส่งทุก turn เป็นค่าใช้จ่ายประจำ จึงให้เรียกเมื่อต้องใช้ก่อน
+
+**การค้นเชิงความหมาย (embedding):** เป็นทางเลือกภายหลัง [งานศึกษาบน SWE-QA](https://arxiv.org/abs/2608.01507) รายงานว่า vector search ถูก 65.2 % เทียบกับ subagent ที่ใช้ grep 46.2 % ส่วนตัวเลขลด token 94-98 % ที่เห็นทั่วไปเป็นของผู้ขาย ยังไม่มีการยืนยันอิสระ ชั้นนี้ต้องมี embedding model และ index จึงรอจนเห็นว่า L1-L3 ตอบไม่พอ
+
 ## 5. กรณีที่ต้องรองรับ
 
 ### งานที่ไม่แตะ project
@@ -299,6 +346,18 @@ Gate จะเตือนเพิ่มเมื่อ diff แก้ไฟล
 | 54 | Project อยู่บน network drive หรือ WSL | ปฏิเสธในรุ่นแรก |
 | 55 | รันด้วยสิทธิ์ admin | ลดสิทธิ์ก่อนเข้า box |
 
+### การค้นและโครงสร้าง
+
+| # | กรณี | การจัดการ |
+|---|---|---|
+| 56 | ภาษาที่ไม่มี grammar | ตกไป L1 และบอกว่าไม่มี outline |
+| 57 | Macro หนักแบบ C++ | tree-sitter อาจอ่านผิด ตรวจกับข้อความจริงก่อนแก้ และตกไป L1 |
+| 58 | ชื่อ symbol ซ้ำ | ตอบทุกตัวพร้อมไฟล์และบรรทัด ให้เลือก ไม่แก้แบบเดา |
+| 59 | References จากการเดาชื่อ | ติดป้ายว่าไม่ยืนยัน ไม่ใช้ทำ rename |
+| 60 | ไฟล์ขนาดใหญ่มาก | Index แบบแบ่งส่วน และส่ง outline ทีละระดับ |
+| 61 | Language server ไม่พร้อม | เรียกคำสั่ง L3 แล้วตกลงชั้นล่างพร้อมบอก |
+| 62 | ไฟล์ที่สร้างอัตโนมัติ | ตัดออกจาก index ตาม `.gitignore` และรูปแบบที่รู้จัก |
+
 ## 6. ภัยคุกคามและการทดสอบ
 
 ชุด escape test ต้องผ่าน 100 % ก่อนเปิดทุกขั้น และรันทุกครั้งที่เริ่ม server แบบย่อ
@@ -317,6 +376,7 @@ Gate จะเตือนเพิ่มเมื่อ diff แก้ไฟล
 | GPU | ไม่ให้ | เรียก CUDA และ DirectX |
 | หนีจาก interpreter | กั้นนอก Python | โค้ด introspection ทำอะไรไม่ได้นอกเหนือ policy |
 | ตัว apply ถูกหลอก | ตรวจ path จริงและ base hash | Diff ที่ชี้ออกนอก project หรือผ่าน symlink |
+| Parser ถูกโจมตีด้วยไฟล์ | Index ทำงานใน box | ไฟล์ซ้อนลึก ไฟล์ขนาดมหาศาล ไฟล์ encoding พัง |
 
 ## 7. ทางที่ไม่เลือก
 
@@ -341,6 +401,8 @@ Gate จะเตือนเพิ่มเมื่อ diff แก้ไฟล
 | S2 | ทดลอง MXC และ AppContainer บนเครื่องนี้ด้วยโปรแกรมของเราเอง ไม่ใช่โค้ดโมเดล | Escape test 100 %, เริ่ม box ไม่เกิน 100 ms เมื่ออุ่นไว้ |
 | S3 | T1 บน Windows พร้อม kernel ค้าง | ความเร็ว block ที่อุ่นแล้วไม่เกิน 20 ms |
 | S4 | T2 กับทาง tool | ระบบเฝ้าไฟล์ยืนยันว่าไม่มีการเขียนของจริงเลยตลอดทั้งชุดทดสอบ |
+| S4.1 | L1 และ L2 ใน box เทียบกับ `read` ทั้งไฟล์ | Token ต่องานลดโดยแก้ถูกตำแหน่งไม่น้อยลง |
+| S4.2 | L3 สำหรับ Python และ C++ | ตัด references ที่ผิดลงจริง คุ้มกับเวลาเริ่มและหน่วยความจำ |
 | S5 | `sandbox_apply`, gate, สถานะหน้าเว็บ | ทุก apply มี checkpoint และ rewind ได้ |
 | S6 | ทางระหว่างคิด พร้อมงบ | เทียบคู่กับทาง tool บน token และเวลา |
 | S7 | วัดสมมติฐานหลักบนชุดแก้บัคจริง เช่น SWE-bench subset | จำนวน edit ที่พังในของจริงลด โดยคำตอบถูกไม่ลด |
@@ -367,6 +429,8 @@ Gate จะเตือนเพิ่มเมื่อ diff แก้ไฟล
 - ProjFS ทำงานร่วมกับตัวกั้นได้ไหม
 - Windows Sandbox เปิดแบบไม่มีหน้าต่างได้ไหม
 - ทางระหว่างคิดประหยัดเวลากว่าทาง tool เท่าไหร่ ยังไม่เคยวัด round trip ของ tool บน D2x
+- tree-sitter เร็วแค่ไหนใน box และอ่าน header C++ ขนาดนี้ได้แม่นแค่ไหน
+- Gyro-M จะใช้คำสั่งระดับ symbol เองไหม หรือยังถนัด `grep` ทั้งไฟล์
 - สมมติฐานหลักยังไม่มีข้อมูลจาก Gyro-M
 
 ## แหล่งอ้างอิง
@@ -379,6 +443,9 @@ Gate จะเตือนเพิ่มเมื่อ diff แก้ไฟล
 - [Microsoft Execution Containers](https://learn.microsoft.com/en-us/windows/apps/develop/mxc/)
 - [microsoft/mxc](https://github.com/microsoft/mxc)
 - [CreateProcessInSandbox](https://learn.microsoft.com/en-us/windows/win32/secauthz/createprocessinsandbox)
+- [Serena](https://github.com/oraios/serena)
+- [Aider: repository map](https://aider.chat/docs/repomap.html)
+- [Deep Agentic Search for Repository-Level Code Question Answering](https://arxiv.org/abs/2608.01507)
 - [Morph: Python Sandbox](https://www.morphllm.com/python-sandbox)
 - [Fly.io: Firecracker vs gVisor](https://fly.io/learn/firecracker-vs-gvisor/)
 - [ReFS block cloning on Dev Drive](https://www.elevenforum.com/t/microsoft-improves-refs-file-system-to-block-cloning-on-dev-drive-in-windows-11-24h2.29068/latest)
