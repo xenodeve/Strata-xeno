@@ -38,7 +38,9 @@ TOOL_SPENT='[no more runs: finish the thinking and write the answer]'
 TOOL_AFTER=4
 # --hint-after N: every call of 205 in five arms came after the whole thinking, so the program checked an answer already reached by hand. START's
 # Hint-infer (2503.04625) puts its own words in the reasoning and the model goes on into a call; here they open the call in the model's format.
-HINT='\n\nWait, maybe using Python here is a good idea.\n\n<tool_call>\n<function=run_python>\n<parameter=code>\n'
+# The hint closes the thinking first: with the response inside the thinking, 4 of 22 rows of m5h2 ended the turn at once (`</tool_call>` ends
+# an assistant turn in the model's training), with no answer. As a reply call the response comes as the tool's turn and a new thinking reads it.
+HINT='\n\nWait, maybe using Python here is a good idea.\n</think>\n\n<tool_call>\n<function=run_python>\n<parameter=code>\n'
 HINT_MAX=2
 TOOL_END={248059}   # `</tool_call>` is one token in the Gyro-M pack
 TOOL_OUTPUT=4096
@@ -311,7 +313,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                     if hinted:   # the model writes the program on from the hint's open call
                         hints.append(dict(turn=turn,after=quiet));asked=asked+tokens+tokenizer.encode(HINT);lead=HINT;quiet=0
                         continue
-                    code=inner if inner is not None else None if stuck or not tool_loop else tool_call(tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
+                    code=inner if inner is not None else None if stuck or not tool_loop else tool_call(lead+tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                     if code is None:break
                     quiet=0;lead=''
                     if turn<TOOL_ROUNDS:

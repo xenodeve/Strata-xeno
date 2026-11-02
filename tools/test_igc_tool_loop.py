@@ -24,9 +24,11 @@ assert called_in_thinking('a call ' + CALL + ' and more thinking') is None, 'onl
 
 # --hint-after: the hint opens the call, the model writes the program and closes it; the bench reads the two together
 from tools.igc.external_bench import HINT
-assert called_in_thinking(HINT + 'print(6 * 7)\n</parameter>\n</function>\n</tool_call>') == 'print(6 * 7)'
-assert called_in_thinking('print(6 * 7)\n</parameter>\n</function>\n</tool_call>') is None, 'without the hint the open is missing'
-assert HINT.count('<tool_call>') == 1 and 'Python here is a good idea' in HINT
+WRITTEN = 'print(6 * 7)\n</parameter>\n</function>\n</tool_call>'
+assert tool_call(HINT + WRITTEN) == 'print(6 * 7)', 'the hint closes the thinking: a reply call, answered in the tool turn'
+assert called_in_thinking(HINT + WRITTEN) is None, 'never answered inside the thinking (4 of 22 rows of m5h2 ended the turn)'
+assert tool_call(WRITTEN) is None, 'without the hint the open is missing'
+assert HINT.count('<tool_call>') == 1 and HINT.index('</think>') < HINT.index('<tool_call>') and 'Python here is a good idea' in HINT
 
 # One row's engine lines: m5t's loop rule closed the thinking on 2 rows, and nothing in the records said which (#288)
 import tempfile
