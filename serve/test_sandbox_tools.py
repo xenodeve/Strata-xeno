@@ -197,6 +197,21 @@ class ALazySession(Case):
         self.assertFalse(old.exists())
         self.assertTrue(root.exists(), "this server's own stays")
 
+    def test_a_copy_is_swept_by_whether_its_server_lives_not_by_its_age(self):
+        self.call("sandbox_diff")
+        root = Path(self.session().ws.root)
+        self.assertTrue(root.name.startswith(f"ws-{os.getpid()}-"))
+        ended = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True, text=True, creationflags=0x08000000 if WINDOWS else 0)
+        dead = root.parent / f"ws-{int(ended.stdout)}-left"
+        (dead / "copy").mkdir(parents=True)
+        long_ago = time.time() - 30 * 86400
+        for p in (root, root / "copy", root / "base.pack"):
+            os.utime(p, (long_ago, long_ago))                                 # a chat that has not touched its copy for a month: its server lives, so it stays
+        session_mod.sweep(self.base / "sandbox-root", keep=3600)
+        self.assertFalse(dead.exists(), "a dead server's copy goes at any age")
+        self.assertTrue(root.exists())
+        self.assertIn("one", self.call("sandbox_read", path="a.txt"))
+
 
 class Off(Case):
     """The key for real Python is off by default (design D1): no box starts at all, and the rest works."""

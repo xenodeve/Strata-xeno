@@ -872,14 +872,7 @@ if sys.platform == "win32":
         def sweep(self) -> None:
             """Remove what a crashed server left: its job died with it, its folders, profiles and half-built runtimes did not."""
             def gone(pid: str) -> bool:
-                if not pid.isdigit() or int(pid) == os.getpid():
-                    return False
-                process = _k32.OpenProcess(0x00100000, False, int(pid))
-                if not process:
-                    return True
-                ended = _k32.WaitForSingleObject(process, 0) == _WAIT_OBJECT_0    # any open handle keeps a dead one openable
-                _k32.CloseHandle(process)
-                return ended
+                return pid.isdigit() and int(pid) != os.getpid() and process_gone(int(pid))
 
             for entry in (self.root / "boxes").iterdir():
                 parts = entry.name.split(".")
@@ -890,6 +883,15 @@ if sys.platform == "win32":
                 parts = entry.name.split("-")
                 if parts[0] == ".building" and gone(parts[1]):
                     _remove_tree(entry)
+
+    def process_gone(pid: int) -> bool:
+        """Whether a process has ended. Not os.kill(pid, 0): on Windows that terminates the process."""
+        process = _k32.OpenProcess(0x00100000, False, pid)
+        if not process:
+            return True
+        ended = _k32.WaitForSingleObject(process, 0) == _WAIT_OBJECT_0    # any open handle keeps a dead one openable
+        _k32.CloseHandle(process)
+        return ended
 
     def _site_dirs() -> List[Path]:
         import site
@@ -1383,6 +1385,18 @@ class MxcBackend:
     def start(cls, policy: Policy, root=None) -> Box:
         ok, why = cls.available()
         raise IsolationError(f"MXC backend: {why or 'present, but it has not passed the escape suite'}")
+
+
+if sys.platform != "win32":
+    def process_gone(pid: int) -> bool:
+        """Whether a process has ended."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:    # it exists, as another user's
+            return False
+        return False
 
 
 class _PosixBox(Box):

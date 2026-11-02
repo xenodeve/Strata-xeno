@@ -247,7 +247,7 @@ class Workspace:
         self._used: int | None = None
 
         os.makedirs(scratch, exist_ok=True)
-        self.root = tempfile.mkdtemp(prefix="ws-", dir=scratch)
+        self.root = tempfile.mkdtemp(prefix=f"ws-{os.getpid()}-", dir=scratch)   # the server's pid: a sweep removes only a dead server's copies, as the box's sweep does
         self.copy = os.path.join(self.root, "copy")
         self._pack = os.path.join(self.root, "base.pack")                     # outside the copy, so the box has no way to change what a change is measured against
         try:

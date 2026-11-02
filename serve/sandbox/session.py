@@ -22,7 +22,7 @@ from typing import Callable
 from serve import checkpoints
 from serve.sandbox import testrun
 from serve.sandbox.exec_bridge import throwaway
-from serve.sandbox.isolation import ROOT_ENV, Isolation, IsolationError, Policy, RunResult, _remove_tree
+from serve.sandbox.isolation import ROOT_ENV, Isolation, IsolationError, Policy, RunResult, _remove_tree, process_gone
 from serve.sandbox.output import RESULT_BYTES, TOUCHED, TURN_BYTES, Output, conflict_lines
 from serve.sandbox.search import Search
 from serve.sandbox.symbols import Symbols
@@ -69,11 +69,20 @@ def scratch_root(root=None) -> Path:
 
 
 def sweep(root=None, keep: float = KEEP_SECONDS) -> None:
-    """Removes the copies a server that ended without closing them left behind (design case 36). The state that would resume one lives in that server's memory, so a copy like that can only go."""
+    """Removes the copies a server that ended without closing them left behind (design case 36). The state that would resume one lives in that server's memory, so a copy like that can only go.
+    A copy is named with its server's pid, and only a dead server's go: every server on this PC shares the folder, and a copy a live chat uses can sit untouched for days, since an edit inside it moves no date this
+    can see. A name with no pid, from before that, goes by its age."""
     try:
         for entry in os.scandir(scratch_root(root)):
+            parts = entry.name.split("-", 2)
+            if parts[0] != "ws":
+                continue
+            if len(parts) == 3 and parts[1].isdigit():
+                if int(parts[1]) != os.getpid() and process_gone(int(parts[1])):
+                    _remove_tree(entry.path)
+                continue
             newest = max((os.path.getmtime(p) for p in (entry.path, os.path.join(entry.path, "copy"), os.path.join(entry.path, "base.pack")) if os.path.exists(p)), default=0.0)
-            if entry.name.startswith("ws-") and time.time() - newest > keep:
+            if time.time() - newest > keep:
                 _remove_tree(entry.path)
     except (OSError, IsolationError):
         pass
