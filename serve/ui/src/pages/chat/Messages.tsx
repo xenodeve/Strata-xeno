@@ -366,7 +366,7 @@ function MessageViewOf({ m, streaming, compacting = false, show, prefill, action
   }
   const waiting = streaming && !m.text && !m.tools?.length
   const phase = replyDesign({ streaming, reasoning: m.reasoning, text: m.text, tools: m.tools })
-  const status = agentStatus({ streaming, reasoning: m.reasoning, text: m.text, tools: m.tools, serverState, hookRunning: m.hookRunning })        // what is going on now, in words (the thinking has its own live block)
+  const status = agentStatus({ streaming, reasoning: m.reasoning, text: m.text, tools: m.tools, serverState, hookRunning: m.hookRunning, thinkingTool: m.thinkingTool })        // what is going on now, in words (the thinking has its own live block)
   const first = m.tools?.length && typeof m.tools[0].rat === "number" ? (m.reasoning || "").slice(0, m.tools[0].rat) : m.reasoning || ""        // with tools: only the thinking before the first one is shown above them
   return (
     <div ref={ref} className="msg-in max-w-[min(100%,65ch)] text-[15px] tracking-[-0.011em] lg:max-w-[72ch]">

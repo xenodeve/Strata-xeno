@@ -247,6 +247,8 @@ export const part: Record<string, string> = {
   "Running the failed tests once more…": "กำลังรัน test ที่ตกซ้ำอีกรอบ…",
   "Putting the change into the real project…": "กำลังนำการแก้ขึ้นของจริง…",
   "Waiting for your approval to put the change into the project…": "รออนุมัติการนำขึ้นของจริง…",
+  "Running the model's program while thinking…": "กำลังรันโปรแกรมของโมเดลระหว่างคิด…",
+  "Running the model's program in the reply…": "กำลังรันโปรแกรมของโมเดลในคำตอบ…",
   "{read} of {total} tokens read": "อ่านแล้ว {read} จาก {total} token",
   "The answer stopped before you answered.": "คำตอบหยุดไปก่อนที่คุณจะตอบ",
   "Sent to the agent: it reads it at its next step": "ส่งให้ agent แล้ว: มันจะอ่านในขั้นตอนถัดไป",

@@ -26,7 +26,14 @@ export interface StatusInput {
   serverState?: string | null
   /** A hook of the user's that belongs to the answer and not to a call (a prompt or an end hook) is running. */
   hookRunning?: string | null
+  /** The reasoning tool (serve/reasoning_tool.py): the engine is running a `run_python` call the model made while thinking. The server says so
+   *  when the call closes and again when its result is in the thinking (the `reasoning_tool` event); the reasoning shows nothing new meanwhile. */
+  thinkingTool?: boolean
 }
+
+// The reasoning tool's own call: run while thinking by the engine, and in the reply by the server. Its words say which, so that a program the
+// model tests its idea with is not taken for a tool of the user's.
+const REASONING_TOOL = "run_python"
 export type StatusKind = "asking" | "hook" | "judging" | "writing" | "running" | "reading" | "planning" | "thinking" | "composing"
 export interface AgentStatus { kind: StatusKind; design: OrbDesign; label: string }
 
@@ -50,12 +57,14 @@ export function agentStatus(i: StatusInput): AgentStatus | null {
   if (hooked || i.hookRunning) return status("hook", "working", t("Running your hook…"))
   const judged = tools.find((c) => c.judging)
   if (judged) return status("judging", "solving", t("Auto mode is checking the call…"))
+  if (i.thinkingTool) return status("running", toolDesign(REASONING_TOOL), t("Running the model's program while thinking…"))
   const doing = [...tools].reverse().find((c) => c.state === "running" || c.state === "writing")
   if (doing) {
     const design = toolDesign(doing.name)
     if (doing.state === "writing") return status("writing", design, t("Writing the call to {tool}…", { tool: doing.name }))
     const step = doing.sandboxStep ? SANDBOX_STEP[doing.sandboxStep] : undefined
     if (step) return status("running", design, t(step))
+    if (doing.name === REASONING_TOOL) return status("running", design, t("Running the model's program in the reply…"))
     return status("running", design, doing.name === "Task" ? t("A helper is working…") : t("Running {tool}…", { tool: doing.name }))
   }
   const text = i.text ?? "", reasoning = i.reasoning ?? ""

@@ -58,7 +58,8 @@ export interface Message {
   todos?: Todo[]                                                 // the coding tools' list of steps, as the model last sent it
   hooks?: HookNote[]                                             // what the user's prompt and stop hooks did (the ones that belong to no call)
   hookRunning?: string | null                                    // one of those is running now (its command)
-  thinkAt?: number                                               // when the thinking began (epoch ms): the timer is counted from it, so it goes on when the page is left and opened again
+  thinkingTool?: boolean                                         // the engine is running a run_python call the model made while thinking (serve/reasoning_tool.py)
+  thinkAt?: number                                              // when the thinking began (epoch ms): the timer is counted from it, so it goes on when the page is left and opened again
 }
 
 /** The line under an answer ("40 tokens · 38.2 tok/s · 1 tool call"), in the language in use now. An answer stored by an
@@ -150,6 +151,7 @@ interface ToolEvent {
   state?: string; kind?: string; description?: string; steps?: number; answer?: string; answers?: unknown
   on?: string; hook?: string; command?: string; code?: number | null; blocked?: boolean; timeout?: boolean; error?: string | null; step?: string
   call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string; questions?: AskedQuestion["questions"]      // the coding tools
+  phase?: string                                                                     // the reasoning tool: "thinking" (the engine runs the call) or "reply" (the server does)
 }
 
 // a tool event from the stream (the `strata_mcp` field of a chunk)
@@ -190,6 +192,10 @@ function onTool(m: Message, x: ToolEvent, at = Date.now()) {
     else m.hookRunning = null
     const list = c ? (c.hooks = c.hooks || []) : (m.hooks = m.hooks || [])
     if (list.length < 20) list.push(note)
+    return
+  }
+  if (x.event === "reasoning_tool") {                                                        // a run_python call made while thinking: the engine runs it from its closing tag until its result is in the thinking
+    m.thinkingTool = x.phase === "thinking" && x.state === "running"
     return
   }
   if (x.event === "sandbox") {                                                               // a step of the sandbox has begun: the status says which from its start, not when the call is over
@@ -899,6 +905,7 @@ export class ChatController {
       if (tc.state === "writing" || tc.state === "running" || (cut && tc.state === "asking")) { tc.state = "skipped"; tc.ms = null }
     }
     m.hookRunning = null
+    m.thinkingTool = false
     const ran = (m.tools || []).filter((tc) => tc.state === "done" || tc.state === "error").length
     if (ran) stats.tools = ran
     if (m.limit) stats.limit = m.limit

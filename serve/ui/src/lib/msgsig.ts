@@ -14,7 +14,7 @@ const toolSig = (c: ToolCall): string => [
 
 export function messageSig(m: Message): string {
   return [
-    m.role, m.time, m.text.length, m.reasoning?.length, m.thinkSecs, m.thinkAt, m.error, m.stopped ? 1 : 0, m.limit, m.hookRunning, m.meta,
+    m.role, m.time, m.text.length, m.reasoning?.length, m.thinkSecs, m.thinkAt, m.error, m.stopped ? 1 : 0, m.limit, m.hookRunning, m.thinkingTool ? 1 : 0, m.meta,
     m.images?.length, m.files?.length, m.hooks?.length, m.stats && JSON.stringify(m.stats), m.compact && JSON.stringify(m.compact),
     m.prefill && JSON.stringify(m.prefill), m.todos && JSON.stringify(m.todos), m.tools?.map(toolSig).join(";"),
   ].join("~")
