@@ -2,7 +2,8 @@
 writes the same tokens as the base arm until a new rule first fires, so a row on which the rule cannot fire is the base arm's row, token for token. 3781
 took 113,756 tokens, 19 minutes, in each of two arms that could not touch it (#288).
 
-The base arm must differ from the new one only by the rules named. Each check reads the base row's thinking, or its engine log, and errs toward running."""
+The base arm must differ from the new one only by the rules named, and run the same engine: a build changes the tokens too (3460 took 10,995 and 11,556 tokens
+in two builds with no rule between them). Each check reads the base row's thinking, or its engine log, and errs toward running."""
 import json
 import re
 from pathlib import Path
@@ -76,11 +77,17 @@ def silent(record, events, rules, after=512):
 
 
 class ArmPlan:
-    def __init__(self, base=None, rules=(), short_first=False, verdicts=None):
+    def __init__(self, base=None, rules=(), short_first=False, verdicts=None, engine_sha=None):
         self.base, self.rules = {}, list(rules)
         self.events = {}
+        self.why_not = None
         if base:
             base = Path(base)
+            report = base / 'report.json'
+            built = json.loads(report.read_text(encoding='utf-8')).get('executable_sha256') if report.exists() else None
+            if engine_sha and built != engine_sha:
+                self.why_not = f'the base arm ran engine {str(built)[:16]}, this one {engine_sha[:16]}: nothing is reused'
+                self.rules = []
             records = json.loads((base / 'records.json').read_text(encoding='utf-8'))
             log = (base / 'engine.log').read_text(encoding='utf-8', errors='replace') if (base / 'engine.log').exists() else ''
             # a log that does not pair with the records cannot say how a row ended: nothing is reused then

@@ -41,6 +41,10 @@ with tempfile.TemporaryDirectory() as d:
     assert p.reusable('long')['tokens'] == 900, 'no block and a forced close: the base row stands'
     assert p.reusable('short') is None and p.reusable('new') is None
     assert p.lost('long', 'wrong') and not p.lost('short', 'wrong') and not p.lost('long', 'ok')
+    (d / 'report.json').write_text(json.dumps(dict(executable_sha256='aa' * 32)), encoding='utf-8')
+    assert ArmPlan(d, ['draft', 'gate'], engine_sha='aa' * 32).reusable('long'), 'the same engine'
+    other = ArmPlan(d, ['draft', 'gate'], engine_sha='bb' * 32)
+    assert other.reusable('long') is None and 'nothing is reused' in other.why_not, 'another engine writes other tokens'
     (d / 'engine.log').write_text('strata serve: request metrics: a\n', encoding='utf-8')
     assert ArmPlan(d, ['draft']).reusable('long') is None, 'a log that does not pair reuses nothing'
 print('ok')

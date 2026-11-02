@@ -140,7 +140,8 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     if tool_loop:hint=(hint or '')+TOOL_HINT
     if hint:prefix=prefix.replace(b'<|im_end|>',b' '+hint.encode('utf-8')+b'<|im_end|>',1)
     rows=cases(data,arithmetic,gsm,bigbench,math,gsm_file,math_file,rows_file)
-    plan=ArmPlan(reuse_from,[r for r in (reuse_rules or '').split(',') if r],short_first,stop_on_loss)
+    plan=ArmPlan(reuse_from,[r for r in (reuse_rules or '').split(',') if r],short_first,stop_on_loss,hashlib.sha256(executable.read_bytes()).hexdigest())
+    if plan.why_not:print(plan.why_not,flush=True)
     rows=plan.order(rows)
     if shots:rows=[{**row,'prompt':few_shot(row['prompt'],shots)} if row['suite']=='gsm8k' else row for row in rows]
     if plain:rows=[{**row,'prompt':plain_prompt(row)} for row in rows]
