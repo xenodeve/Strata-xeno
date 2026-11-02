@@ -21,4 +21,28 @@ assert called_in_thinking("Let's call.\n\n" + CALL) == 'print(1 + 1)\nprint(2)',
 assert called_in_thinking("Let's call.\n\n" + JSON) == 'print(3)\nprint(4)'
 assert called_in_thinking('done</think>\n\n' + CALL) is None, 'after the thinking it is a reply'
 assert called_in_thinking('a call ' + CALL + ' and more thinking') is None, 'only one that just closed'
+
+# One row's engine lines: m5t's loop rule closed the thinking on 2 rows, and nothing in the records said which (#288)
+import tempfile
+from tools.igc.external_bench import read_events
+with tempfile.TemporaryDirectory() as d:
+    log = Path(d) / 'engine.log'
+    log.write_text('strata serve: request metrics: row 1\n', encoding='utf-8')
+    mark = log.stat().st_size
+    with open(log, 'a', encoding='utf-8') as f:
+        f.write('strata IGC learned audit: head_status=4294967295 record=00\nstrata igc loop: counting, closed the thinking\n'
+                'strata serve: request metrics: a\nstrata igc sandbox: ran a block\nstrata IGC learned audit: head_status=3 record=00\n'
+                'strata serve: request metrics: b\n')
+    got = read_events(log, mark)
+    assert got == dict(requests=2, rules=['loop: counting, closed the thinking', 'sandbox: ran a block'], heads=['3']), got
+    assert read_events(Path(d) / 'none.log', 0) is None
+    assert read_events(log, mark, mark + 60)['rules'] == [], "a row ends at the next row's offset"
+
+    # the report says what ran: the command, the code, the bundle and the tokenizer bytes
+    from tools.igc.external_bench import provenance
+    (Path(d) / 'tokenizer').mkdir()
+    (Path(d) / 'tokenizer' / 'vocab.json').write_bytes(b'{}')
+    p = provenance(None, d)
+    assert set(p) == {'argv', 'git', 'bundle_sha256', 'tokenizer_sha256'} and p['bundle_sha256'] is None, p
+    assert p['tokenizer_sha256']['vocab.json'] == '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a', p
 print('ok')

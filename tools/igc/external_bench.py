@@ -104,6 +104,42 @@ def score(records):
     return suites
 
 
+def log_size(path):
+    try:return path.stat().st_size
+    except OSError:return 0
+
+
+def read_events(path,start,end=None):
+    """What the engine logged while one row ran, cut by byte offset: the log has no row ids, and a tool round is a request of its own, so a
+    count of requests cannot pair them (m5t: 92 requests for 60 rows, and its loop closes landed on the wrong rows). The MIP rule lines
+    (`strata igc <kind>: ...`), the requests, and every learned head that fired."""
+    try:
+        with open(path,'rb') as f:f.seek(start);text=f.read(-1 if end is None else max(end-start,0)).decode('utf-8','replace')
+    except OSError:return None
+    heads=[h for h in re.findall(r'IGC learned audit: head_status=(\d+)',text) if h!='4294967295']
+    return dict(requests=text.count('request metrics'),rules=re.findall(r'strata igc ([a-z]+: [^\r\n]*)',text),heads=heads)
+
+
+def provenance(bundle,pack):
+    """What a pair's two arms must share but the flag under test: the command, the code, the bundle and the tokenizer bytes it binds (#293)."""
+    def sha(path):
+        try:return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        except OSError:return None
+    try:git=subprocess.run(['git','rev-parse','HEAD'],capture_output=True,text=True,cwd=Path(__file__).resolve().parent).stdout.strip() or None
+    except OSError:git=None
+    return dict(argv=sys.argv[1:],git=git,bundle_sha256=sha(bundle) if bundle else None,
+                tokenizer_sha256={n:sha(Path(pack)/'tokenizer'/n) for n in ('merges.txt','tokenizer.json','vocab.json')})
+
+
+def injected_text(rules,tokenizer):
+    """The engine's `inject: <why> at=<n> ids=<a,b,...>` lines with the text they put in the model's stream, read back by the tokenizer."""
+    out=[]
+    for line in rules:
+        m=re.match(r'inject: (.*?) at=(\d+) ids=([\d,]*)',line)
+        if m:out.append(dict(why=m.group(1),at=int(m.group(2)),text=tokenizer.decode_bytes([int(x) for x in m.group(3).split(',') if x]).decode('utf-8','replace')))
+    return out
+
+
 def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_context,stuck_rounds,output,cancel,sampling):
     """The questions through batch slots, each as `BGEN`; with `pair` each also runs with `igc=0`, written to records-off.json."""
     jobs=[(row,True) for row in rows]+[(row,False) for row in rows if pair]
@@ -240,12 +276,12 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             if cancel.is_set():raise RuntimeError('bench stopped before request')
             old=plan.reusable(row['id'])
             if old:   # this machine repeats itself, and no rule of this arm could fire on the base row
-                records.append({**old,'reused':True})
+                records.append({**{k:v for k,v in old.items() if k!='log_from'},'reused':True})   # its events are the base run's; its offsets were in that log
                 (output/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
                 print(row['id'],'reused',old['tokens'],flush=True)
                 continue
             ids=tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8'))
-            active[0]=start=time.monotonic()
+            active[0]=start=time.monotonic();mark=log_size(output/'engine.log')
             limit=262144-len(ids)-64 if whole_context else row['limit']
             # Greedy repeats itself, so a retry samples. It starts from the prompt: a wrong draft left in the context costs far more than a blank one (2602.04288).
             attempts=[]
@@ -270,11 +306,13 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                     if turn<TOOL_ROUNDS:
                         from serve.sandbox.exec_bridge import Kernel
                         if kernel and not kernel.alive():kernel.close();kernel=None   # a call that ran past its time took the kernel with it
-                        kernel=kernel or Kernel()
-                        _,shown=kernel.run(code)
-                        shown=(shown or '[it ran and printed nothing]')[:TOOL_OUTPUT]
-                    else:shown=TOOL_SPENT
-                    ran.append(dict(code=code[:4000],shown=shown[:4000],thinking=inner is not None))
+                        restarted=kernel is None and bool(ran);kernel=kernel or Kernel()
+                        began=time.monotonic();ok,shown=kernel.run(code);took=time.monotonic()-began
+                        full=len(shown or '');shown=(shown or '[it ran and printed nothing]')[:TOOL_OUTPUT]
+                    else:shown=TOOL_SPENT;ok=None;took=0.;full=0;restarted=False
+                    # each call whole enough to audit: what ran, what came back and how much was cut, whether it failed, its seconds
+                    ran.append(dict(turn=turn,thinking=inner is not None,code=code[:20000],code_chars=len(code),shown=shown[:20000],shown_chars=full,
+                                    ok=ok,seconds=round(took,3),restarted=restarted))
                     if inner is not None:   # the answer goes into the thinking, which goes on
                         asked=asked+tokens+tokenizer.encode('\n<tool_response>\n'+shown+'\n</tool_response>\n')
                         continue
@@ -284,7 +322,8 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                 tokens=[t for s in said for t in s]
                 text=tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace')
                 if no_think:text='</think>\n\n'+text   # the close is in the prompt; the readers look for it here
-                attempts.append(dict(tokens=len(tokens),text=text,finish='stuck' if stuck else engine.last.get('finish'),check=last_check(text),turns=len(said),ran=ran))
+                attempts.append(dict(tokens=len(tokens),text=text,finish='stuck' if stuck else engine.last.get('finish'),check=last_check(text),turns=len(said),ran=ran,
+                                     turn_tokens=[len(x) for x in said]))
                 if attempts[-1]['check'] not in ('mismatch','stub'):break
             seconds=time.monotonic()-start;active[0]=None
             # The first whose tests did not fail, else the first: a sampled run has no claim over the greedy one.
@@ -292,7 +331,10 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             text=kept['text'];final=final_number(text)
             records.append(dict(id=row['id'],suite=row['suite'],answer=row['answer'],final=final,correct=final==row['answer'],
                                 tokens=sum(a['tokens'] for a in attempts),seconds=seconds,finish=kept['finish'],prompt_tokens=len(ids),text=text,
-                                attempts=[dict(tokens=a['tokens'],check=a['check'],turns=a['turns'],ran=a['ran']) for a in attempts]))
+                                attempts=[dict(tokens=a['tokens'],check=a['check'],turns=a['turns'],turn_tokens=a['turn_tokens'],ran=a['ran']) for a in attempts],
+                                tool_seconds=round(sum(c['seconds'] for a in attempts for c in a['ran']),3),log_from=mark))
+            ev=read_events(output/'engine.log',mark)
+            if ev is not None:records[-1]['events']={**ev,'injected':injected_text(ev['rules'],tokenizer)}
             if plan.verdicts is not None:
                 records[-1]['verdict']=judge(records[-1]) if judge else 'ok' if records[-1]['correct'] else 'wrong'
             (output/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
@@ -303,6 +345,12 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     finally:
         if engine is not None:engine.close()
         stop.set();thread.join(timeout=3);subprocess.Popen=original
+    # A row's last lines can land after its record was written: read each row again, from its offset to the next row's.
+    ends=[r.get('log_from') for r in records][1:]+[None]
+    for r,end in zip(records,ends):
+        if r.get('log_from') is None:continue
+        ev=read_events(output/'engine.log',r['log_from'],end)
+        if ev is not None:r['events']={**ev,'injected':injected_text(ev['rules'],tokenizer)}
     if bundle and not slots and not retries and not tool_loop and not plan.rules:   # one audit a request: a retry or a tool round is a request, a reused row none
         lines=(output/'engine.log').read_text(encoding='utf-8',errors='replace')
         audits=[parse_audit(bytes.fromhex(h)) for h in re.findall(r'strata IGC learned audit: head_status=\d+ record=([0-9a-f]{576})',lines)]
@@ -310,7 +358,8 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
         for record,audit in zip(records,audits,strict=True):
             record.update(evaluations=audit['evaluations'],request=audit['request'],result=audit['result'],status=audit['status'])
     report=dict(kind='external comparison, fixed first-N subset, greedy; not published-protocol scores',arm='on' if bundle else 'off',
-                executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),suites=score(records),failure=failure)
+                executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),suites=score(records),failure=failure,
+                **provenance(bundle,pack))
     (output/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
     (output/'report.json').write_text(json.dumps(report,indent=2),encoding='utf-8');print(json.dumps(report),flush=True)
 
