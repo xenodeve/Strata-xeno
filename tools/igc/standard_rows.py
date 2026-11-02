@@ -34,7 +34,6 @@ def bbh_rows(data):
 
 LETTERS = 'ABCDEFGHIJKLMNOP'
 LETTER_TAIL = '\n\nFinish your answer with "the answer is (X)" where X is the correct letter.'
-MATH_TAIL = '\n\nPlease reason step by step, and put your final answer within \\boxed{}.'
 
 
 HLE_TAIL = ('\n\nYour response should be in the following format:\nExplanation: {your explanation for your final answer}\n'
