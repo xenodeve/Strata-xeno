@@ -76,6 +76,21 @@ class Rule(unittest.TestCase):
         self.assertFalse(right(row, 'x</think>The answer is **41**'))
         self.assertFalse(right(row, 'thinking that never closed 42'))
 
+    def test_math_reads_the_answer_a_thinking_reply_gives(self):
+        """m5o/m5t: four right replies scored wrong in both arms - a bold answer, a last display line, and 5/2 for 2.5 (#288)."""
+        row = dict(suite='stdmath')
+        self.assertTrue(right(dict(row, answer='16'), 'x</think>So the answer is **16**.'))
+        self.assertTrue(right(dict(row, answer='\\frac{161}{36}'), 'x</think>Thus\n\n\\[\nE=\\sum_k k p_k\n=\\frac{161}{36}.\n\\]'))
+        self.assertTrue(right(dict(row, answer='2.5'), 'x</think>\\[\n\\boxed{\\frac52}\n\\]'))
+        self.assertTrue(right(dict(row, answer='-\\frac{3}{4}'), 'x</think>\\boxed{-0.75}'))
+        self.assertFalse(right(dict(row, answer='2.5'), 'x</think>\\boxed{\\frac53}'))
+        self.assertFalse(right(dict(row, answer='16'), 'thinking never closed **16**'))
+
+    def test_the_plain_math_prompt_asks_for_a_box(self):
+        from tools.igc.standard_rows import plain_prompt
+        text = plain_prompt(dict(suite='stdmath', prompt='Problem:\nWhat is 1+1?\n\nSolution:'))
+        self.assertTrue(text.startswith('What is 1+1?') and text.endswith('\\boxed{}.'))
+
     def test_verdicts_for_stop_on_loss(self):
         records = [dict(id='a', suite='gsm8k', answer=3, text='x</think>\\boxed{3}'), dict(id='b', suite='mmlupro', answer='A', text='x</think>the answer is (B)')]
         self.assertEqual(verdicts(records), {'a': 'ok', 'b': 'wrong'})

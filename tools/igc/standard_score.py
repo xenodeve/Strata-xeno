@@ -71,15 +71,51 @@ def reply(text):
 
 def math_answer(text):
     # The base model copies the exemplars' `I hope it is correct.`; a post-trained model stops at the answer.
-    found = re.search(r'[Tt]he final answer is(.*?)(?:\.\s*I hope it is correct|\.?\s*(?:\n|$))', reply(text), re.S)
+    said = reply(text)
+    found = re.search(r'[Tt]he final answer is(.*?)(?:\.\s*I hope it is correct|\.?\s*(?:\n|$))', said, re.S)
     if found:
         return found.group(1).strip()
-    return last_boxed(reply(text))   # a reply with the thinking on ends in a box, not in the exemplars' sentence
+    boxed = last_boxed(said)   # a reply with the thinking on ends in a box, not in the exemplars' sentence
+    if boxed is not None:
+        return boxed
+    # No box, when the prompt asked for none (m5o/m5t, #288): the last bold answer, else the last displayed line
+    bold = re.findall(r'\*\*\s*\$?\\?\(?\s*([^*]+?)\s*\\?\)?\$?\s*\*\*', said)
+    if bold:
+        return bold[-1].rstrip('.')
+    shown = re.findall(r'\\\[(.*?)\\\]|\$\$(.*?)\$\$', said, re.S)
+    if shown:
+        last = next(x for x in shown[-1] if x).strip()
+        return last.splitlines()[-1].strip().rstrip('.,') if last else None
+    return None
+
+
+def math_value(answer):
+    """The number a normalized answer spells, as a Fraction, or None: `\\frac{5}{2}`, `-\\frac{3}{4}`, `5/2`, `2.5`."""
+    s = answer.strip()
+    if s.startswith('{') and s.endswith('}') and s.count('{') == 1:
+        s = s[1:-1]
+    sign = -1 if s.startswith('-') else 1
+    s = s.lstrip('-')
+    m = re.fullmatch(r'\\frac\{(-?\d+(?:\.\d+)?)\}\{(-?\d+(?:\.\d+)?)\}', s) or re.fullmatch(r'(-?\d+(?:\.\d+)?)/(-?\d+(?:\.\d+)?)', s)
+    try:
+        if m:
+            return sign * Fraction(m.group(1)) / Fraction(m.group(2))
+        if re.fullmatch(r'\d+(?:\.\d+)?', s):
+            return sign * Fraction(s)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return None
 
 
 def math_right(text, gold):
     answer = math_answer(text)
-    return answer is not None and normalize_math(answer) == normalize_math(gold)
+    if answer is None:
+        return False
+    got, want = normalize_math(answer), normalize_math(gold)
+    if got == want:
+        return True
+    a, b = math_value(got), math_value(want)   # the same number in another spelling: 5/2 and 2.5
+    return a is not None and a == b
 
 
 def bbh_answer(text):

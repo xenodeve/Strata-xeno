@@ -34,6 +34,7 @@ def bbh_rows(data):
 
 LETTERS = 'ABCDEFGHIJKLMNOP'
 LETTER_TAIL = '\n\nFinish your answer with "the answer is (X)" where X is the correct letter.'
+MATH_TAIL = '\n\nPlease reason step by step, and put your final answer within \\boxed{}.'
 
 
 HLE_TAIL = ('\n\nYour response should be in the following format:\nExplanation: {your explanation for your final answer}\n'
@@ -54,8 +55,8 @@ def hle_rows(path, categories=('Math', 'Physics', 'Computer Science/AI'), sample
 def plain_prompt(row):
     """The question alone, with no exemplars, for the arms with the thinking on."""
     text = row['prompt']
-    if row['suite'] == 'stdmath':
-        return text.rsplit('Problem:\n', 1)[1].rsplit('\n\nSolution:', 1)[0]
+    if row['suite'] == 'stdmath':   # with Qwen's own math instruction: without it the replies ended in bold or a display, not a box
+        return text.rsplit('Problem:\n', 1)[1].rsplit('\n\nSolution:', 1)[0] + MATH_TAIL
     if row['suite'] == 'mmlupro':
         return text.rsplit('Question:\n', 1)[1].rsplit("Answer: Let's think", 1)[0].strip() + LETTER_TAIL
     if row['suite'] == 'supergpqa':
