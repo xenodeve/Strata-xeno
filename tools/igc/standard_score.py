@@ -123,6 +123,7 @@ def hle_right(text, gold):
 
 
 def letter_answer(text):
-    """MMLU-Pro: `the answer is (X)`, then `Answer: X`. SuperGPQA ends in `Answer: X.`; the last such line counts, as both evaluators read it."""
-    found = re.findall(r'answer is \(?\$?([A-P])\b', reply(text)) or re.findall(r'[Aa]nswer:\s*\(?\$?([A-P])\b', reply(text))
+    """MMLU-Pro: `the answer is (X)`. SuperGPQA ends in `Answer: X.` The last one in the reply counts, whichever form: a reply weighs options on its
+    way there, and `Maybe the answer is A?` settles nothing."""
+    found = re.findall(r'[Aa]nswer(?: is|:)\s*\(?\$?\*{0,2}([A-P])\b(?!\s*\?)', reply(text))
     return found[-1] if found else None
