@@ -446,10 +446,6 @@ public:
         }
         const auto call=strata::igc::parse_inline(generated_);
         if(!call)return true;
-        if(!thinking_closed_ && ++inline_values_>strata::igc::inline_tokens::kMaxValues) {
-            std::fprintf(stderr,"strata igc loop: too many values, closed the thinking\n");
-            bridge_tokens_={198,kThinkClose,271};bridge_at_=0;called=true;return true;
-        }
         if(!inline_request_ && (cudaMalloc(&inline_request_,sizeof(*inline_request_))!=cudaSuccess
                 || cudaMalloc(&inline_result_,sizeof(*inline_result_))!=cudaSuccess)){error="igc inline device buffers";return false;}
         std::vector<int32_t> value;
@@ -529,6 +525,11 @@ public:
             const bool sum=!top.number && (top.operation==strata::igc::InlineOperation::Add || top.operation==strata::igc::InlineOperation::Subtract);
             const auto after=strata::igc::inline_tokens::after_value(static_cast<int>(seen),inline_notes_,close_repeat_,static_cast<int32_t>(kThinkClose),sum?sum_note_:strata::igc::inline_tokens::SumNote::Open,repeat_note_);
             bridge_tokens_.insert(bridge_tokens_.end(),after.begin(),after.end());
+        }
+        if(!thinking_closed_ && ++inline_values_>=strata::igc::inline_tokens::kMaxValues
+                && std::find(bridge_tokens_.begin(),bridge_tokens_.end(),static_cast<int32_t>(kThinkClose))==bridge_tokens_.end()) {
+            std::fprintf(stderr,"strata igc loop: too many values, closed the thinking\n");
+            bridge_tokens_.insert(bridge_tokens_.end(),{198,kThinkClose,271});
         }
         ++inline_calls_;called=true;return true;
     }
