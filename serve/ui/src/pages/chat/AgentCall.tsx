@@ -35,12 +35,15 @@ const WHY: Record<string, string> = {
   "it writes to a file or hides what runs (a substitution, a redirection)": msg("It writes to a file or hides what runs (a substitution, a redirection)."),
   "this git command can change something": msg("This git command can change something."),
   "approve the plan to leave plan mode": msg("Approve the plan to leave plan mode."),
+  "it changes the real project": msg("It changes the real project."),
+  "it changes the real project, and it did not pass a test": msg("It changes the real project, and it did not pass a test."),
 }
 const why = (s: string) => (WHY[s] ? t(WHY[s]) : s)
 
 const QUESTION: Record<string, string> = {
   Bash: msg("Run this command?"), Read: msg("Read this file?"), Glob: msg("Look for files here?"), Grep: msg("Search here?"),
   Write: msg("Write this file?"), Edit: msg("Change this file?"), NotebookEdit: msg("Change this notebook?"), ExitPlanMode: msg("Approve this plan?"),
+  sandbox_apply: msg("Put this change from the sandbox into the project?"),
 }
 
 const str = (x: unknown) => (typeof x === "string" ? x : "")
@@ -123,6 +126,14 @@ function Question({ call }: { call: ToolCall }) {
       {ask.tool === "NotebookEdit" && <div className="font-mono text-[12px] [overflow-wrap:anywhere]">{get("notebook_path")}{get("cell_id") ? ` — ${get("cell_id")}` : ""}</div>}
       {(ask.tool === "Glob" || ask.tool === "Grep") && <div className="font-mono text-[12px] [overflow-wrap:anywhere]">{get("pattern")}{get("path") ? ` — ${get("path")}` : ""}</div>}
       {ask.tool === "ExitPlanMode" && <div className="prose-chat max-h-72 overflow-auto text-[13px]" dangerouslySetInnerHTML={{ __html: markdown(get("plan")) }} />}
+      {ask.tool === "sandbox_apply" && (                                                         // what was tried in the copy, how it was tested, and the diff itself: the user approves what they can read
+        <div className="space-y-1 text-[12.5px]" data-sandbox-apply>
+          <div className="font-medium">{get("stat")}</div>
+          <div>{t("Tested: {line}", { line: get("tested") })}</div>
+          {(Array.isArray((a as Record<string, unknown> | null)?.notes) ? ((a as Record<string, unknown>).notes as unknown[]) : []).filter((n): n is string => typeof n === "string").map((n) => <div key={n} className="text-ink-2">{n}</div>)}
+          <Out text={get("diff")} />
+        </div>
+      )}
       <div className="text-[12px] text-ink-2">{why(ask.why)}</div>
       {ask.danger && <div className="text-[12px] font-medium text-bad">{t("It can do harm that is hard to undo. Only allow it if you meant it.")}</div>}
       <div className="flex flex-wrap items-center gap-2 pt-1">

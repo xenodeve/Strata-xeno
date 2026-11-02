@@ -1,5 +1,5 @@
 import { afterToolStep, toolDesign, type OrbDesign } from "./orbs"
-import { t } from "./i18n"
+import { msg, t } from "./i18n"
 
 // What the agent is doing at this moment, in words, as one status that never goes quiet (issue #99 follow-up).
 //
@@ -9,7 +9,14 @@ import { t } from "./i18n"
 // the next step being planned, the thinking, the writing. A change from one to the next is a change of words, not a gap.
 
 /** What the status needs of a tool call. `at` and `rat` are the lengths of the text and of the thinking when the call began. */
-export interface StatusTool { name: string; state: string; at?: number; rat?: number; judging?: boolean; hookRunning?: string | null }
+export interface StatusTool { name: string; state: string; at?: number; rat?: number; judging?: boolean; hookRunning?: string | null; sandboxStep?: string | null }
+
+// The sandbox's steps (serve/sandbox/tools.py sends a `sandbox` event as each one begins): a call of it can copy the project, run the tests on the copy, run them on the project as it was, run the failed ones again
+// and put the change into the project, and each of those has its own words while it lasts. A step this page does not know falls back to the tool's name.
+const SANDBOX_STEP: Record<string, string> = {
+  copying: msg("Making a copy of the project…"), trying: msg("Trying it in the copy…"), testing: msg("Running the tests in the copy…"),
+  comparing: msg("Comparing with before the change…"), retrying: msg("Running the failed tests once more…"), applying: msg("Putting the change into the real project…"),
+}
 export interface StatusInput {
   streaming: boolean
   reasoning?: string
@@ -38,7 +45,7 @@ export function agentStatus(i: StatusInput): AgentStatus | null {
   if (!i.streaming) return null
   const tools = i.tools ?? []
   const waiting = tools.find((c) => c.state === "asking")
-  if (waiting) return status("asking", "listening", t("Waiting for you…"))
+  if (waiting) return status("asking", "listening", waiting.name === "sandbox_apply" ? t("Waiting for your approval to put the change into the project…") : t("Waiting for you…"))
   const hooked = tools.find((c) => c.hookRunning && (c.state === "running" || c.state === "writing" || c.state === "done" || c.state === "error"))
   if (hooked || i.hookRunning) return status("hook", "working", t("Running your hook…"))
   const judged = tools.find((c) => c.judging)
@@ -47,6 +54,8 @@ export function agentStatus(i: StatusInput): AgentStatus | null {
   if (doing) {
     const design = toolDesign(doing.name)
     if (doing.state === "writing") return status("writing", design, t("Writing the call to {tool}…", { tool: doing.name }))
+    const step = doing.sandboxStep ? SANDBOX_STEP[doing.sandboxStep] : undefined
+    if (step) return status("running", design, t(step))
     return status("running", design, doing.name === "Task" ? t("A helper is working…") : t("Running {tool}…", { tool: doing.name }))
   }
   const text = i.text ?? "", reasoning = i.reasoning ?? ""

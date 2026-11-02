@@ -452,6 +452,30 @@ describe("the coding tools in the chat", () => {
     expect(c.messages[1].tools![0].ask).toBeUndefined()
   })
 
+  test("the sandbox's step is on its call from when it begins, and gone with the result", async () => {
+    keep()
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const bytes = (text: string) => new TextEncoder().encode(text)
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(new ReadableStream({
+      async start(out) {
+        out.enqueue(bytes(sse(...call("c1", "sandbox_test", {}), { strata_mcp: { event: "sandbox", call_id: "c1", step: "testing" } }, { strata_mcp: { event: "sandbox", call_id: "c1", step: "comparing" } },
+          { strata_mcp: { event: "sandbox", call_id: "nope", step: "testing" } })))
+        await gate
+        out.enqueue(bytes(sse({ strata_mcp: { event: "result", id: "c1", ok: true, text: "x", chars: 1, truncated: false, ms: 5 } }, ...finish)))
+        out.close()
+      },
+    }), { status: 200 })
+    const c = new ChatController()
+    const sent = c.send("go", [], { ...ctx, agent: ON })
+    for (let i = 0; i < 400 && c.messages[1]?.tools?.[0]?.sandboxStep !== "comparing"; i++) await new Promise((r) => setTimeout(r, 5))
+    expect(c.messages[1].tools![0].sandboxStep).toBe("comparing")                      // while the step lasts, the call says which it is
+    expect(c.messages[1].tools).toHaveLength(1)                                        // a step for a call that is not shown is dropped
+    release()
+    await sent
+    expect(c.messages[1].tools![0].sandboxStep).toBeNull()
+  })
+
   test("a todo list from the stream is the answer's list, and a later one replaces it", async () => {
     keep()
     const t1 = [{ content: "a", status: "in_progress", activeForm: "Doing a" }]

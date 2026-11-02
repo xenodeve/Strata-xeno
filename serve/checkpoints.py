@@ -52,6 +52,9 @@ class Scope:
     def before(self, path: str) -> None:
         self.store.before(self.session, self.cp, path)
 
+    def before_all(self, paths: list[str]) -> str | None:
+        return self.store.before_all(self.session, self.cp, paths)
+
     def after(self, path: str) -> None:
         self.store.after(self.session, self.cp, path)
 
@@ -95,29 +98,57 @@ class Checkpoints:
             files = data["cps"][c]["files"]
             if path in files:
                 return
-            if len(files) >= MAX_FILES:
-                files[path] = {"skipped": "too many files in one prompt"}
-            elif not os.path.exists(path):
-                files[path] = {"existed": False, "wrote": None}
-            else:
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    size = -1
-                used = sum(f.get("size", 0) for f in files.values())
-                if size < 0 or not os.path.isfile(path):
-                    files[path] = {"skipped": "it cannot be read"}
-                elif size > MAX_FILE or used + size > MAX_BYTES:
-                    files[path] = {"skipped": "it is too big to keep"}
-                else:
-                    name = hashlib.sha1(path.encode("utf-8", "replace")).hexdigest()[:16]
-                    (d / c).mkdir(parents=True, exist_ok=True)
-                    try:
-                        shutil.copy2(path, d / c / name)
-                        files[path] = {"existed": True, "backup": name, "size": size, "wrote": None}
-                    except OSError:
-                        files[path] = {"skipped": "it cannot be read"}
+            self._keep(d, c, files, path)
             self._save(d, data)
+
+    def _keep(self, d: Path, c: str, files: dict, path: str) -> None:
+        if len(files) >= MAX_FILES:
+            files[path] = {"skipped": "too many files in one prompt"}
+        elif not os.path.exists(path):
+            files[path] = {"existed": False, "wrote": None}
+        else:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = -1
+            used = sum(f.get("size", 0) for f in files.values())
+            if size < 0 or not os.path.isfile(path):
+                files[path] = {"skipped": "it cannot be read"}
+            elif size > MAX_FILE or used + size > MAX_BYTES:
+                files[path] = {"skipped": "it is too big to keep"}
+            else:
+                name = hashlib.sha1(path.encode("utf-8", "replace")).hexdigest()[:16]
+                (d / c).mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(path, d / c / name)
+                    files[path] = {"existed": True, "backup": name, "size": size, "wrote": None}
+                except OSError:
+                    files[path] = {"skipped": "it cannot be read"}
+
+    def before_all(self, session: str, cp: str, paths: list[str]) -> str | None:
+        """Keeps all of these files as they are or none of them, and says why not. For a change that may not start without a way back for each file: `before` skips a file it cannot keep, and a file kept but never written would be put back over the user's own later edits."""
+        d, c = self._dir(session), _safe(cp)
+        if d is None or c is None:
+            return "this prompt has no checkpoint"
+        with self.lock:
+            data = self._load(d)
+            entry = data["cps"].get(c) or {"time": time.time(), "files": {}}
+            files = dict(entry["files"])
+            added = []
+            for path in paths:
+                if path not in files:
+                    self._keep(d, c, files, path)
+                    added.append(path)
+                if "skipped" in files[path]:
+                    for p in added:
+                        if "backup" in files[p]:
+                            (d / c / files[p]["backup"]).unlink(missing_ok=True)
+                    return f"{path}: {files[path]['skipped']}"
+            data["cps"][c] = {**entry, "files": files}
+            if c not in data["order"]:
+                data["order"].append(c)
+            self._save(d, data)
+        return None
 
     def after(self, session: str, cp: str, path: str) -> None:
         """Notes what the file is after a change of the tools' own, to tell later whether someone else changed it."""

@@ -35,7 +35,8 @@ export interface ToolCall {
   hooks?: HookNote[]                                                                 // what the user's hooks did about this call
   judging?: boolean                                                                  // auto mode is checking this call now
   hookRunning?: string | null                                                        // a hook of the user's is running for this call now (its command)
-  doneAt?: number                                                                    // when its result came (epoch ms): the thinking after it began then
+  sandboxStep?: string | null                                                        // the step the sandbox has begun for this call (serve/sandbox/tools.py): copying, testing, comparing, ...
+  doneAt?: number                                                                   // when its result came (epoch ms): the thinking after it began then
   helper?: { kind: string; description: string; state: "running" | "done" | "failed"; steps: number }      // a Task call: the helper that works on it
   steps?: Step[]                                                                     // and what that helper did, step by step
   server?: string; tool?: string; arguments?: unknown; round?: number
@@ -147,7 +148,7 @@ interface ToolEvent {
   event: string; id: string; name: string; server?: string; tool?: string; arguments?: unknown; round?: number
   text?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number; skipped?: boolean; max_rounds?: number
   state?: string; kind?: string; description?: string; steps?: number; answer?: string; answers?: unknown
-  on?: string; hook?: string; command?: string; code?: number | null; blocked?: boolean; timeout?: boolean; error?: string | null
+  on?: string; hook?: string; command?: string; code?: number | null; blocked?: boolean; timeout?: boolean; error?: string | null; step?: string
   call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string; questions?: AskedQuestion["questions"]      // the coding tools
 }
 
@@ -191,6 +192,11 @@ function onTool(m: Message, x: ToolEvent, at = Date.now()) {
     if (list.length < 20) list.push(note)
     return
   }
+  if (x.event === "sandbox") {                                                               // a step of the sandbox has begun: the status says which from its start, not when the call is over
+    const c = (m.tools || []).find((y) => y.id === x.call_id)
+    if (c) c.sandboxStep = typeof x.step === "string" ? x.step : null
+    return
+  }
   if (x.event === "question") {                                                              // the model asks the user: a form on its call
     const c = (m.tools || []).find((y) => y.id === x.call_id)
     if (c && Array.isArray(x.questions)) { c.question = { id: x.id, questions: x.questions }; c.state = "asking" }
@@ -212,7 +218,7 @@ function onTool(m: Message, x: ToolEvent, at = Date.now()) {
   if (x.event === "call") {
     Object.assign(t, { name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running" })
   } else if (x.event === "result") {
-    Object.assign(t, { result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, state: x.skipped ? "skipped" : x.ok ? "done" : "error", judging: false, doneAt: at })
+    Object.assign(t, { result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, state: x.skipped ? "skipped" : x.ok ? "done" : "error", judging: false, sandboxStep: null, doneAt: at })
   }
 }
 
@@ -886,7 +892,7 @@ export class ChatController {
     }
     if (usage?.prompt_tokens && !m.error) stats.ctx = usage.prompt_tokens + (usage.completion_tokens ?? 0)       // how much of the context the conversation uses now (after every tool round)
     for (const tc of m.tools || []) {
-      tc.judging = false; tc.hookRunning = null
+      tc.judging = false; tc.hookRunning = null; tc.sandboxStep = null
       const cut = !!(m.stopped || m.error)                                                                     // Stop, or the answer failed: a question that was open is closed, no card is left waiting for a click that cannot reach anything
       if (cut && tc.ask && !tc.ask.answer) { tc.ask.answer = "deny"; tc.ask.stopped = true }
       if (cut && tc.question && tc.question.answers === undefined) { tc.question.answers = null; tc.question.stopped = true }

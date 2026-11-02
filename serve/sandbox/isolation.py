@@ -78,7 +78,7 @@ class RunResult:
     stdout: bytes
     stderr: bytes
     wall_ms: float
-    killed: Optional[str] = None    # "timeout", "time", "output", "disk" or "kill"; None if it ended by itself
+    killed: Optional[str] = None    # "timeout", "time", "output", "disk", "stop" or "kill"; None if it ended by itself
     truncated: bool = False
 
 
@@ -167,7 +167,8 @@ class Box:
     workdir: Path
     tmpdir: Path
 
-    def run(self, argv: Sequence[str], stdin: Union[bytes, str, None] = None, timeout: Optional[float] = None) -> RunResult:
+    def run(self, argv: Sequence[str], stdin: Union[bytes, str, None] = None, timeout: Optional[float] = None, cwd=None) -> RunResult:
+        """`cwd`: a folder the policy gave this box, or one inside it; the box's own folder when there is none."""
         raise NotImplementedError
 
     def popen(self, argv: Sequence[str]):
@@ -178,6 +179,10 @@ class Box:
     def kill(self) -> None:
         raise NotImplementedError
 
+    def stop(self) -> None:
+        """Ends what runs in the box and keeps the box: the next `run` starts clean. `kill` does this too and also gives up the box's grants, which is a walk of all they cover."""
+        self._terminate("stop")
+
     def usage(self) -> Usage:
         raise NotImplementedError
 
@@ -186,6 +191,17 @@ class Box:
 
     def __exit__(self, *exc) -> None:
         self.kill()
+
+    def _start_folder(self, cwd) -> str:
+        """Where a program starts. A folder the policy did not name is refused here: the wall would stop the program too, but later and with a worse message."""
+        if cwd is None:
+            return str(self.workdir)
+        where = os.path.normcase(os.path.abspath(cwd))
+        for top in (*self.policy.readwrite, *self.policy.readonly):
+            top = os.path.normcase(os.path.abspath(top))
+            if where == top or where.startswith(top + os.sep):
+                return os.path.abspath(cwd)
+        raise IsolationError(f"{cwd} is not a folder this box was given")
 
     def _start_watch(self) -> None:
         self._began = time.monotonic()
@@ -856,14 +872,7 @@ if sys.platform == "win32":
         def sweep(self) -> None:
             """Remove what a crashed server left: its job died with it, its folders, profiles and half-built runtimes did not."""
             def gone(pid: str) -> bool:
-                if not pid.isdigit() or int(pid) == os.getpid():
-                    return False
-                process = _k32.OpenProcess(0x00100000, False, int(pid))
-                if not process:
-                    return True
-                ended = _k32.WaitForSingleObject(process, 0) == _WAIT_OBJECT_0    # any open handle keeps a dead one openable
-                _k32.CloseHandle(process)
-                return ended
+                return pid.isdigit() and int(pid) != os.getpid() and process_gone(int(pid))
 
             for entry in (self.root / "boxes").iterdir():
                 parts = entry.name.split(".")
@@ -874,6 +883,15 @@ if sys.platform == "win32":
                 parts = entry.name.split("-")
                 if parts[0] == ".building" and gone(parts[1]):
                     _remove_tree(entry)
+
+    def process_gone(pid: int) -> bool:
+        """Whether a process has ended. Not os.kill(pid, 0): on Windows that terminates the process."""
+        process = _k32.OpenProcess(0x00100000, False, pid)
+        if not process:
+            return True
+        ended = _k32.WaitForSingleObject(process, 0) == _WAIT_OBJECT_0    # any open handle keeps a dead one openable
+        _k32.CloseHandle(process)
+        return ended
 
     def _site_dirs() -> List[Path]:
         import site
@@ -962,6 +980,7 @@ if sys.platform == "win32":
             self._spent = {"cpu": 0.0, "peak": 0, "processes": 0, "written": 0}    # of the jobs a kill has ended
             self._grants: List[Path] = []
             self._rw: List[Path] = []
+            self._parents: List[Path] = []    # stat only and not inherited: what lies beside a granted folder stays shut
             self.name = f"strata.box.{os.getpid()}.{uuid.uuid4().hex[:12]}"
             self.dir = scratch.root / "boxes" / self.name
             self._watcher = None
@@ -999,6 +1018,9 @@ if sys.platform == "win32":
                     self._grants.append(path)
                     if writable:
                         self._rw.append(path)
+                    if path.parent not in self._parents:    # pytest stats the parent of what it collects: the box's own folder has this for the same reason
+                        _edit_dacl(path.parent, sid, _GRANT, _STAT_ONLY, 0)
+                        self._parents.append(path.parent)
             for raw in self.policy.denied:
                 path = self._scratch.inside(raw)
                 if path is not None:
@@ -1041,9 +1063,10 @@ if sys.platform == "win32":
                         return candidate
             raise IsolationError(f"{program} was not found on the box's PATH")
 
-        def _spawn(self, argv: Sequence[str], handles: Sequence[int]) -> _ProcessInformation:
+        def _spawn(self, argv: Sequence[str], handles: Sequence[int], cwd=None) -> _ProcessInformation:
             """Start suspended, confirm the wall from the outside, and only then let the first instruction run."""
             exe = self._resolve(argv[0])
+            folder = self._start_folder(cwd)
             line = ctypes.create_unicode_buffer(subprocess.list2cmdline([exe, *argv[1:]]))
             text = "".join(f"{k}={v}\0" for k, v in sorted(self._env.items(), key=lambda kv: kv[0].upper())) + "\0"
             block = ctypes.create_unicode_buffer(text, len(text))
@@ -1068,7 +1091,7 @@ if sys.platform == "win32":
                 info.lpAttributeList = ctypes.cast(attributes, w.LPVOID)
                 process = _ProcessInformation()
                 flags = _EXTENDED_STARTUPINFO | _UNICODE_ENVIRONMENT | _SUSPENDED | CREATE_NO_WINDOW
-                _check(_k32.CreateProcessW(exe, line, None, None, True, flags, block, str(self.workdir), byref(info),
+                _check(_k32.CreateProcessW(exe, line, None, None, True, flags, block, folder, byref(info),
                                            byref(process)), f"starting {exe}")
             finally:
                 _k32.DeleteProcThreadAttributeList(attributes)
@@ -1110,7 +1133,7 @@ if sys.platform == "win32":
             finally:
                 _k32.CloseHandle(token)
 
-        def run(self, argv, stdin=None, timeout=None) -> RunResult:
+        def run(self, argv, stdin=None, timeout=None, cwd=None) -> RunResult:
             if isinstance(stdin, str):
                 stdin = stdin.encode("utf-8")
             with self._lock:
@@ -1125,7 +1148,7 @@ if sys.platform == "win32":
                 child_out, read_out = _pipe(False)
                 child_err, read_err = _pipe(False)
                 try:
-                    process = self._spawn(argv, (child_in, child_out, child_err))
+                    process = self._spawn(argv, (child_in, child_out, child_err), cwd)
                 except BaseException:
                     for handle in (feed, read_out, read_err):
                         _k32.CloseHandle(handle)
@@ -1262,6 +1285,9 @@ if sys.platform == "win32":
                         self._job.close()
                     for path in self._grants:
                         self._revoke(path)
+                    for path in self._parents:
+                        if path.exists():
+                            _edit_dacl(path, self._profile.sid, _REVOKE, 0, 0)
                     _remove_tree(self.dir)
                     if self._desktop:
                         _u32.CloseDesktop(self._desktop)
@@ -1361,10 +1387,22 @@ class MxcBackend:
         raise IsolationError(f"MXC backend: {why or 'present, but it has not passed the escape suite'}")
 
 
+if sys.platform != "win32":
+    def process_gone(pid: int) -> bool:
+        """Whether a process has ended."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:    # it exists, as another user's
+            return False
+        return False
+
+
 class _PosixBox(Box):
     """A session of its own with rlimits, behind `bwrap` or behind nothing at all."""
 
-    def __init__(self, policy: Policy, backend: str, isolated: bool, wrap: Callable[["_PosixBox", List[str]], List[str]]):
+    def __init__(self, policy: Policy, backend: str, isolated: bool, wrap: Callable[["_PosixBox", List[str], str], List[str]]):
         self.policy = policy
         self.backend = backend
         self.isolated = isolated
@@ -1397,7 +1435,7 @@ class _PosixBox(Box):
                "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0", "MPLBACKEND": "Agg"}
         return env
 
-    def run(self, argv, stdin=None, timeout=None) -> RunResult:
+    def run(self, argv, stdin=None, timeout=None, cwd=None) -> RunResult:
         import selectors
         if isinstance(stdin, str):
             stdin = stdin.encode("utf-8")
@@ -1406,8 +1444,9 @@ class _PosixBox(Box):
             wait, out_of_time = (left, "time") if timeout is None or left <= timeout else (timeout, "timeout")
             self._reason = None
             began = time.perf_counter()
-            process = subprocess.Popen(self._wrap(self, list(argv)), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, cwd=self.workdir, env=self._environment(),
+            folder = self._start_folder(cwd)
+            process = subprocess.Popen(self._wrap(self, list(argv), folder), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, cwd=folder, env=self._environment(),
                                        start_new_session=True, preexec_fn=self._limits)
             self._group = process.pid
             self._spawned += 1
@@ -1450,7 +1489,7 @@ class _PosixBox(Box):
     def popen(self, argv):
         with self._lock:
             self._still_open()
-            process = subprocess.Popen(self._wrap(self, list(argv)), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=self.workdir,
+            process = subprocess.Popen(self._wrap(self, list(argv), str(self.workdir)), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=self.workdir,
                                        env=self._environment(), start_new_session=True, preexec_fn=self._limits, text=True, encoding="utf-8")
             self._group = process.pid
             self._spawned += 1
@@ -1507,7 +1546,7 @@ class _PosixBox(Box):
             shutil.rmtree(self.dir, ignore_errors=True)
 
 
-def bwrap_argv(policy: Policy, box: "_PosixBox", argv: Sequence[str]) -> List[str]:
+def bwrap_argv(policy: Policy, box: "_PosixBox", argv: Sequence[str], cwd: Optional[str] = None) -> List[str]:
     """Nothing is visible but the system's read-only folders and what the policy names. `--unshare-all` includes the
     network. A denied file becomes /dev/null and a denied folder an empty tmpfs."""
     if policy.network:
@@ -1523,7 +1562,7 @@ def bwrap_argv(policy: Policy, box: "_PosixBox", argv: Sequence[str]) -> List[st
     line += ["--bind", str(box.workdir), str(box.workdir), "--bind", str(box.tmpdir), str(box.tmpdir)]
     for path in policy.denied:
         line += ["--tmpfs", str(path)] if os.path.isdir(path) else ["--ro-bind", "/dev/null", str(path)]
-    return line + ["--chdir", str(box.workdir), "--", *argv]
+    return line + ["--chdir", cwd or str(box.workdir), "--", *argv]
 
 
 class BubblewrapBackend:
@@ -1542,7 +1581,7 @@ class BubblewrapBackend:
             raise IsolationError(f"bubblewrap backend: {why}")
         if policy.network:
             raise IsolationError("network is not built for this backend")
-        box = _PosixBox(policy, cls.name, True, lambda b, argv: bwrap_argv(policy, b, argv))
+        box = _PosixBox(policy, cls.name, True, lambda b, argv, cwd: bwrap_argv(policy, b, argv, cwd))
         probe = box.run(["/usr/bin/true"], timeout=10)
         if probe.exit_code != 0:
             box.kill()
@@ -1570,7 +1609,7 @@ class NoneBackend:
         ok, why = cls.available()
         if not ok:
             raise IsolationError(f"none backend: {why}")
-        return _PosixBox(policy, cls.name, False, lambda b, argv: argv)
+        return _PosixBox(policy, cls.name, False, lambda b, argv, cwd: argv)
 
 
 BACKENDS = {cls.name: cls for cls in (AppContainerBackend, MxcBackend, BubblewrapBackend, NoneBackend)}

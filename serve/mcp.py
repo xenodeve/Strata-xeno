@@ -585,7 +585,7 @@ class McpHub:
                     if out.get("images"):
                         res = {**res, "content": [b for b in res.get("content") or [] if not (isinstance(b, dict) and b.get("type") == "image")]}
                 text, ok = result_text(res), not res.get("isError")
-                if not ok:
+                if not ok and not getattr(server, "fixed_first_line", False):     # the sandbox's first line says where a result comes from, and nothing goes in front of it
                     text = "error: " + (text or "the tool reported an error")
             except McpCancelled:
                 raise

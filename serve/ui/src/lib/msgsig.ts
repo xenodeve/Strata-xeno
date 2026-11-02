@@ -7,7 +7,7 @@ import type { Message, ToolCall } from "./chat"
 // Strings are counted by length (a tool's result can be 20,000 characters, and this runs for every message at every draw).
 
 const toolSig = (c: ToolCall): string => [
-  c.id, c.state, c.open ? 1 : 0, c.ms, c.result?.length, c.chars, c.truncated ? 1 : 0, c.ok ? 1 : 0, c.judging ? 1 : 0, c.hookRunning, c.doneAt, c.at, c.rat, c.round,
+  c.id, c.state, c.open ? 1 : 0, c.ms, c.result?.length, c.chars, c.truncated ? 1 : 0, c.ok ? 1 : 0, c.judging ? 1 : 0, c.hookRunning, c.sandboxStep, c.doneAt, c.at, c.rat, c.round,
   c.hooks?.length, c.helper && `${c.helper.state}:${c.helper.steps}`, c.steps && c.steps.map((s) => `${s.state}${s.text?.length ?? 0}`).join(","),
   c.ask && `${c.ask.answer}:${c.ask.stopped ? 1 : 0}:${c.ask.kept?.scope}`, c.question && `${c.question.stopped ? 1 : 0}:${JSON.stringify(c.question.answers ?? null)}`, c.judge && `${c.judge.verdict}${c.judge.severity}`,
 ].join("|")
