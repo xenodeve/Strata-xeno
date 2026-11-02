@@ -455,7 +455,7 @@ struct Options {
     std::string igc_output_artifact,igc_output_fixture,igc_learned_bundle;
     bool igc_result_bridge=false,igc_inline_exec=false,igc_no_note=false,igc_no_reply=false,igc_sandbox=false,igc_sandbox_close=false,igc_sandbox_close_line=false,igc_sandbox_call=false;
     int igc_close_repeat=3,igc_sum_note=1,igc_repeat_note=0,igc_sandbox_after=0,igc_sandbox_read=0;
-    bool igc_sandbox_expect=false,igc_sandbox_why=false,igc_sandbox_gate=false,igc_sandbox_exec=false,igc_sandbox_draft=false,igc_sandbox_falsify=false,igc_sandbox_pass_close=false,igc_sandbox_brute=false;
+    bool igc_sandbox_expect=false,igc_sandbox_why=false,igc_sandbox_gate=false,igc_sandbox_exec=false,igc_sandbox_draft=false,igc_sandbox_falsify=false,igc_sandbox_pass_close=false,igc_sandbox_brute=false,igc_sandbox_verify=false;
     std::string igc_sidecar;
     std::string igc_observation_plan,igc_observation_root;
 #endif
@@ -966,6 +966,7 @@ void usage() {
                  "  --igc-sandbox-draft   a bare fence holding a whole draft runs too, and each new draft gets its call (with --igc-sandbox-call)\n"
                  "  --igc-sandbox-falsify after a passing check, write the model's own question of what input would break it\n"
                  "  --igc-sandbox-pass-close  end the thinking once every check of a run has passed, anywhere in the reasoning\n"
+                 "  --igc-sandbox-verify  finish the model's `Let's verify` as a check by program, 3 times a reasoning\n"
                  "  --igc-sandbox-brute   the block opened by --igc-sandbox-after asks for a brute force from the statement; with --igc-sandbox-falsify a draft that passes is set against it\n"
                  "  --igc-sandbox-exec    what the interpreter refuses goes to the server's real Python in its box (SBX, SBXR; not with --batch)\n"
                  "  --igc-sandbox-after N  open a ```python block after N tokens of reasoning, 0 never (default 0, with --igc-sandbox)\n"
@@ -2590,6 +2591,7 @@ int main(int argc, char** argv) {
         else if (a == "--igc-sandbox-falsify") o.igc_sandbox_falsify = true;
         else if (a == "--igc-sandbox-pass-close") o.igc_sandbox_pass_close = true;
         else if (a == "--igc-sandbox-brute") o.igc_sandbox_brute = true;
+        else if (a == "--igc-sandbox-verify") o.igc_sandbox_verify = true;
         else if (a == "--igc-sandbox-exec") o.igc_sandbox_exec = true;
         else if (a == "--igc-close-repeat") o.igc_close_repeat = std::atoi(next("--igc-close-repeat"));
         else if (a == "--igc-sum-note") o.igc_sum_note = std::atoi(next("--igc-sum-note"));
@@ -3608,6 +3610,7 @@ int main(int argc, char** argv) {
             igc_learned->set_sandbox_falsify(o.igc_sandbox_falsify);
             igc_learned->set_sandbox_pass_close(o.igc_sandbox_pass_close);
             igc_learned->set_sandbox_brute(o.igc_sandbox_brute);
+            igc_learned->set_sandbox_verify(o.igc_sandbox_verify);
             igc_learned->set_sandbox_close(o.igc_sandbox_close);
             igc_learned->set_sandbox_close_line(o.igc_sandbox_close_line);
             igc_learned->set_sandbox_call(o.igc_sandbox_call);

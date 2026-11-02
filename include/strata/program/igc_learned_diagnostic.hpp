@@ -32,6 +32,8 @@ struct InlineTurn {
     int sandbox_reading_=-1;   // tokens left to read a result in before the close, -1 when none is due
     int sandbox_gates_=0;      // times this turn the end of the thinking was held for a check
     std::string sandbox_draft_;   // the last program that defined a function and ran
+    std::string sandbox_tail_;    // the last bytes of the reasoning, for the words before a check
+    int sandbox_checks_=0;        // times this turn the model's check by hand became a program
     bool sandbox_oracle_=false,sandbox_compared_=false,sandbox_passed_=false;   // a brute force ran; this draft was set against it; this draft passed its checks
     strata::igc::inline_tokens::LineRepeat thinking_lines_;
     std::vector<int32_t> thinking_masked_;
@@ -61,7 +63,7 @@ class IgcLearnedDiagnostic : InlineTurn {
     std::unique_ptr<strata::igc::sandbox::TokenText> sandbox_text_;
     int sandbox_after_=0,sandbox_read_=0;
     strata::igc::sandbox::Session::Exec sandbox_exec_;
-    bool sandbox_close_=false,sandbox_close_line_=false,sandbox_call_=false,sandbox_expect_=false,sandbox_why_=false,sandbox_gate_=false,sandbox_drafts_=false,sandbox_falsify_=false,sandbox_pass_close_=false,sandbox_brute_=false;
+    bool sandbox_close_=false,sandbox_close_line_=false,sandbox_call_=false,sandbox_expect_=false,sandbox_why_=false,sandbox_gate_=false,sandbox_drafts_=false,sandbox_falsify_=false,sandbox_pass_close_=false,sandbox_brute_=false,sandbox_verify_=false;
     bool inline_notes_=true,inline_reply_=true;int close_repeat_=3;strata::igc::inline_tokens::SumNote sum_note_=strata::igc::inline_tokens::SumNote::Stop;strata::igc::inline_tokens::RepeatNote repeat_note_=strata::igc::inline_tokens::RepeatNote::Stop;
     std::vector<int64_t> prefix_;
     bool inline_exec_=false;int64_t inline_calls_=0;
@@ -213,7 +215,7 @@ public:
                 context_->states(strata::igc::ContextTap::FirstAttention),context_->mask(),
                 invocation_,anchor_,available,stream_,true,error))return false;
         staged_=true;invocation_known_=false;generated_.clear();inline_seen_.clear();thinking_tail_.clear();thinking_lines_={};thinking_masked_.clear();inline_values_=0;thinking_closed_=strata::igc::inline_tokens::thinking_off(prefix_,kThinkClose);
-        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_fence_.read_drafts(sandbox_drafts_);sandbox_draft_.clear();sandbox_oracle_=false;sandbox_compared_=false;sandbox_passed_=false;sandbox_session_=strata::igc::sandbox::Session{};sandbox_session_.set_exec(sandbox_exec_);sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;sandbox_reading_=-1;sandbox_gates_=0;bridged_unread_=0;
+        sandbox_fence_=strata::igc::sandbox::Fence{};sandbox_fence_.read_drafts(sandbox_drafts_);sandbox_draft_.clear();sandbox_oracle_=false;sandbox_compared_=false;sandbox_passed_=false;sandbox_tail_.clear();sandbox_checks_=0;sandbox_session_=strata::igc::sandbox::Session{};sandbox_session_.set_exec(sandbox_exec_);sandbox_thought_=0;sandbox_block_=0;sandbox_opened_=false;sandbox_called_=false;sandbox_reading_=-1;sandbox_gates_=0;bridged_unread_=0;
         bridge_tokens_.clear();bridge_at_=0;   // an admission never reaches delivering(), and a stopped request can leave a delivery half done
         if(natural_)natural_->begin(prefix_);
         return true;
@@ -323,6 +325,7 @@ public:
     void set_sandbox_falsify(bool on){sandbox_falsify_=on;}
     void set_sandbox_pass_close(bool on){sandbox_pass_close_=on;}
     void set_sandbox_brute(bool on){sandbox_brute_=on;}
+    void set_sandbox_verify(bool on){sandbox_verify_=on;}
     void set_sandbox_close(bool on){sandbox_close_=on;}
     void set_sandbox_close_line(bool on){sandbox_close_line_=on;}
     void set_sandbox_call(bool on){sandbox_call_=on;}
@@ -477,9 +480,10 @@ public:
                     bridge_tokens_.insert(bridge_tokens_.end(),line.begin(),line.end());
                 }
                 sandbox_reading_=-1;
-                if(sandbox_close_ && sandbox_session_.printed() && sandbox_read_>0) {
+                const bool fits=sandbox_session_.printed() && !sandbox_session_.mismatch();   // a failed check is what the thinking must go on for
+                if(sandbox_close_ && fits && sandbox_read_>0) {
                     sandbox_reading_=sandbox_read_;
-                } else if(sandbox_close_ && sandbox_session_.printed()) {
+                } else if(sandbox_close_ && fits) {
                     if(sandbox_close_line_) {
                         const auto line=sandbox_text_->encode(strata::igc::sandbox::kCloseLine);
                         bridge_tokens_.insert(bridge_tokens_.end(),line.begin(),line.end());
@@ -496,6 +500,18 @@ public:
                 bridge_tokens_=sandbox_text_->encode("```"+strata::igc::sandbox::output_block("[too long, not run]"));bridge_at_=0;called=true;return true;
             }
             sandbox_block_=0;
+            if(sandbox_verify_ && sandbox_checks_<strata::igc::sandbox::kMaxChecks) {
+                sandbox_tail_+=sandbox_text_->text(token);
+                if(sandbox_tail_.size()>32)sandbox_tail_.erase(0,sandbox_tail_.size()-32);
+                if(strata::igc::sandbox::about_to_check(sandbox_tail_)) {
+                    std::fprintf(stderr,"strata igc sandbox: the model's check became a program\n");
+                    ++sandbox_checks_;sandbox_tail_.clear();
+                    std::string line(strata::igc::sandbox::kCheckLine),head;
+                    if(!sandbox_draft_.empty())head=strata::igc::sandbox::call_head(sandbox_draft_,sandbox_expect_);
+                    sandbox_fence_.enter(head);
+                    bridge_tokens_=sandbox_text_->encode(line+head);bridge_at_=0;called=true;return true;
+                }
+            }
             if(sandbox_reading_>0)--sandbox_reading_;
             if(sandbox_reading_==0 && (token==198 || token==271)) {
                 std::fprintf(stderr,"strata igc sandbox: closed the thinking after reading the result\n");

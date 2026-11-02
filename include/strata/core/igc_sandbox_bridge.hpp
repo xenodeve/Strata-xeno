@@ -53,6 +53,10 @@ inline constexpr std::string_view kBruteLine = "Let me write a brute force strai
 // A draft that passes the examples, set against the oracle where the examples stop.
 inline constexpr std::string_view kCompareHead = "import random\n";
 inline constexpr std::string_view kCompareLine = "The examples match. Let me compare it with the brute force on random small inputs.\n\n```python\nimport random\n";
+// The model saying it is about to check by hand, finished by us as a check by program. A word cannot find work a program could do in general, but this one is the model's own
+// decision to check: on 273 MATH questions it got right, one stands in 114 with the answer already written, and 54 % of their thinking comes after it (#288).
+inline constexpr std::string_view kCheckLine = " with a short program.\n\n```python\n";
+inline constexpr int kMaxChecks = 3;
 inline constexpr int kMaxGates = 3;
 // stdin holds only what the program fed itself, so a program that read nothing would look like a program that did nothing.
 inline constexpr std::string_view kNoStdin = "[stdin was empty: put feed(\"...\") before the code, with an example from the question]";
@@ -299,6 +303,22 @@ inline std::string call_head(std::string_view program, bool expect = false) {
     const std::string name = last_def(program);
     if (!name.empty()) head += name + "(";
     return head;
+}
+
+// `Let's verify` anywhere; a bare `Check:` only where a sentence starts, since `check` is also a word in the middle of one.
+inline bool about_to_check(std::string_view tail) {
+    for (const std::string_view verb : {"verify", "check", "double-check", "test"}) {
+        for (const std::string_view who : {"let's ", "Let's ", "let me ", "Let me "}) {
+            const std::string word = std::string(who) + std::string(verb);
+            if (tail.ends_with(word)) return true;
+        }
+    }
+    for (const std::string_view word : {"Check:", "Verify:", "Test:", "Double-check", "Double check", "Sanity check"}) {
+        if (!tail.ends_with(word)) continue;
+        const std::size_t at = tail.size() - word.size();
+        if (at == 0 || tail[at - 1] == '\n' || (tail[at - 1] == ' ' && at >= 2 && (tail[at - 2] == '.' || tail[at - 2] == '?' || tail[at - 2] == '!'))) return true;
+    }
+    return false;
 }
 
 // Whether a program is the oracle or a test of it, so that a pass here says nothing of the model's answer.
