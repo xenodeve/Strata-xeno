@@ -14,6 +14,7 @@ import threading
 import time
 from tools.igc.external_score import final_number, question_id, repeating
 from tools.igc.hypothesis_read import last_check
+from tools.igc.arm_plan import ArmPlan
 from tools.igc.hub_contract import validate_launcher_env
 from tools.igc.learned_integration import parse_audit
 from tools.igc.output_examples import wrapped_prefix
@@ -128,7 +129,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -139,6 +140,8 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     if tool_loop:hint=(hint or '')+TOOL_HINT
     if hint:prefix=prefix.replace(b'<|im_end|>',b' '+hint.encode('utf-8')+b'<|im_end|>',1)
     rows=cases(data,arithmetic,gsm,bigbench,math,gsm_file,math_file,rows_file)
+    plan=ArmPlan(reuse_from,[r for r in (reuse_rules or '').split(',') if r],short_first,stop_on_loss)
+    rows=plan.order(rows)
     if shots:rows=[{**row,'prompt':few_shot(row['prompt'],shots)} if row['suite']=='gsm8k' else row for row in rows]
     if plain:rows=[{**row,'prompt':plain_prompt(row)} for row in rows]
     (output/'cases.json').write_text(json.dumps(rows,ensure_ascii=False),encoding='utf-8')
@@ -199,9 +202,21 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
         if keep_prefix:   # the turn every question shares is read once: the engine keeps a checkpoint at its end
             all_ids=[tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8')) for row in rows]
             sampling['_ckpt_at']=len(os.path.commonprefix(all_ids))
+        judge=None
+        if stop_on_loss and lcb_tests:   # each row is scored as it ends, so a loss stops the arm at once
+            import multiprocessing
+            from tools.igc import lcb_score
+            tests=json.loads(Path(lcb_tests).read_text(encoding='utf-8'));runner=output/'lcb.runner.py';runner.write_text(lcb_score.CHECK,encoding='utf-8')
+            pool=multiprocessing.Pool(8);judge=lambda r:lcb_score.judge(r,tests,str(runner),pool)
         if slots:records=run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_context,stuck_rounds,output,cancel,sampling)
         for row in rows if not slots else ():
             if cancel.is_set():raise RuntimeError('bench stopped before request')
+            old=plan.reusable(row['id'])
+            if old:   # this machine repeats itself, and no rule of this arm could fire on the base row
+                records.append({**old,'reused':True})
+                (output/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
+                print(row['id'],'reused',old['tokens'],flush=True)
+                continue
             ids=tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8'))
             active[0]=start=time.monotonic()
             limit=262144-len(ids)-64 if whole_context else row['limit']
@@ -239,12 +254,17 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             records.append(dict(id=row['id'],suite=row['suite'],answer=row['answer'],final=final,correct=final==row['answer'],
                                 tokens=sum(a['tokens'] for a in attempts),seconds=seconds,finish=kept['finish'],prompt_tokens=len(ids),text=text,
                                 attempts=[dict(tokens=a['tokens'],check=a['check'],turns=a['turns']) for a in attempts]))
+            if plan.verdicts is not None:
+                records[-1]['verdict']=judge(records[-1]) if judge else 'ok' if records[-1]['correct'] else 'wrong'
             (output/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
-            print(row['id'],row['answer'],final,records[-1]['tokens'],round(seconds,1),flush=True)
+            print(row['id'],row['answer'],final,records[-1]['tokens'],round(seconds,1),records[-1].get('verdict',''),flush=True)
+            if plan.verdicts is not None and plan.lost(row['id'],records[-1]['verdict']):
+                print('LOST',row['id'],'right in the base arm: stopped, read it first',flush=True)
+                break
     finally:
         if engine is not None:engine.close()
         stop.set();thread.join(timeout=3);subprocess.Popen=original
-    if bundle and not slots and not retries and not tool_loop:   # one audit a request, and a retry or a tool round is a request
+    if bundle and not slots and not retries and not tool_loop and not plan.rules:   # one audit a request: a retry or a tool round is a request, a reused row none
         lines=(output/'engine.log').read_text(encoding='utf-8',errors='replace')
         audits=[parse_audit(bytes.fromhex(h)) for h in re.findall(r'strata IGC learned audit: head_status=\d+ record=([0-9a-f]{576})',lines)]
         if len(audits)!=len(records):raise ValueError('incomplete audit pairing')
@@ -288,6 +308,11 @@ if __name__=='__main__':
     parser.add_argument('--pair',action='store_true',help='with --slots: run each question with MIP and with igc=0, in one engine')
     parser.add_argument('--stuck-rounds',type=int,default=20,help='rounds of a cycle before the bench gives up; 40 leaves a loop of up to 3 tokens to the engine, which closes at 64')
     parser.add_argument('--no-think',action='store_true',help='close the thinking in the prompt')
+    parser.add_argument('--reuse-from',type=Path,help='a base arm on this machine; its rows where none of --reuse-rules could fire are taken as they are')
+    parser.add_argument('--reuse-rules',help='comma list of the rules this arm adds: draft, gate, verify, pass-close, falsify, brute, after')
+    parser.add_argument('--short-first',action='store_true',help='rows in the order of the base arm\'s tokens, fewest first')
+    parser.add_argument('--stop-on-loss',type=Path,help='verdicts of the base arm: stop at the first row it got right and this arm did not')
+    parser.add_argument('--lcb-tests',type=Path,help='LiveCodeBench tests, to score each row as it ends (throwaway VM only)')
     parser.add_argument('--tool-loop',action='store_true',help='declare run_python in the model\'s own tool format and answer its calls: throwaway VM only')
     parser.add_argument('--retries',type=int,default=0,help='sampled runs from the prompt after one that ended with its tests failing')
     parser.add_argument('--retry-temperature',type=float,default=0.6)
