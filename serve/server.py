@@ -4904,6 +4904,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             break
         rounds += 1
         results = []
+        if agent_run is not None:
+            agent_run.ctx.round = rounds
         for c in calls:
             s, tool = hub.routes().get(c.name, (None, c.name))
             yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
@@ -5957,6 +5959,9 @@ def make_handler(svc: Service):
                     return self._json(400, {"error": {"message": "send {\"session\": the chat's id, \"checkpoint\": the prompt's id}"}})
                 if path == "/agent/checkpoints/forget":
                     svc.checkpoints.forget(body["session"])
+                    sandbox = svc.mcp.servers.get("sandbox") if svc.mcp is not None else None
+                    if sandbox is not None:
+                        sandbox.forget(body["session"])              # the chat was deleted: its copy of the project goes too
                     return self._json(200, {"ok": True})
                 if not isinstance(body.get("checkpoint"), str):
                     return self._json(400, {"error": {"message": "send the checkpoint, the prompt's id"}})
@@ -6544,9 +6549,9 @@ def make_handler(svc: Service):
                 off = req.get("strata_mcp_off")                   # servers the page's list switched off for this chat; anything but a list of names is ignored
                 skip = {x for x in off if isinstance(x, str)} if isinstance(off, list) and all(isinstance(x, str) for x in off) else set()
                 if req.get("strata_mcp") is not True:
-                    skip |= {n for n in svc.mcp.servers if n != "agent"}      # the coding tools alone: no MCP server
+                    skip |= {n for n in svc.mcp.servers if n not in ("agent", "sandbox")}      # the coding tools alone, with the sandbox when the run config has it: no MCP server
                 if arun is None:
-                    skip.add("agent")                             # and the coding tools only when the request asks for them
+                    skip |= {"agent", "sandbox"}                  # and the coding tools only when the request asks for them
                 extra = svc.mcp.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
@@ -7515,7 +7520,12 @@ def main() -> int:
         shell_mod.install(agent_server, shell_mod.find_shell())
         web_mod.install(agent_server)                         # WebFetch and WebSearch: offered to a chat only when the user has switched web access on
         subagent_mod.install(agent_server)                    # Task: the same, for helpers
-    hub = hub_from_config(cfg, a.mcp_config, builtins={**importer.builtins(), **({"agent": agent_server} if agent_server else {})})     # before the minutes of loading: a bad entry stops here
+    in_process = {**importer.builtins(), **({"agent": agent_server} if agent_server else {})}
+    if agent_server is not None and isinstance(cfg.get("sandbox"), dict) and cfg["sandbox"].get("on") is True:      # imported only when it is on, so a server without it stays as it was
+        from serve.sandbox import session as sandbox_session, tools as sandbox_tools
+        in_process["sandbox"] = sandbox_tools.SandboxServer(sandbox_session.settings(cfg), log_dir=sandbox_session.log_folder())
+        print(f"[strata] sandbox tools on; real Python {'on' if cfg['sandbox'].get('real_python') is True else 'off (design D1)'}", flush=True)
+    hub = hub_from_config(cfg, a.mcp_config, builtins=in_process)     # before the minutes of loading: a bad entry stops here
     placeholder = None
     if a.engine == "strata":
         if not cfg:

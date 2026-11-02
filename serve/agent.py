@@ -68,6 +68,7 @@ class AgentContext:
     web: object | None = None                              # serve/web.py Web: set only when the user switched web access on (WebFetch and WebSearch run only with it)
     spawn: Callable | None = None                          # serve/subagent.py: runs a helper (kind, prompt, description) -> (ok, report); set only when the user switched helpers on
     in_helper: bool = False                                # this call is a helper's: it cannot start a helper
+    round: int = 0                                         # the rounds of tool calls this request has had (serve/server.py run_with_mcp): a new round is a new turn for the sandbox's output budget
 
 
 class Session:
@@ -99,11 +100,15 @@ def _is_binary(path: str) -> bool:
 
 
 def _write_atomic(path: str, text: str) -> None:
+    write_bytes_atomic(path, text.encode("utf-8"))
+
+
+def write_bytes_atomic(path: str, data: bytes) -> None:
     d = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".strata-")
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(text.encode("utf-8"))
+            f.write(data)
         try:
             os.chmod(tmp, os.stat(path).st_mode & 0o7777)
         except OSError:

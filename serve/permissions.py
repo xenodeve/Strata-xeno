@@ -410,6 +410,25 @@ def _file_target(tool: str, args: dict, pol: Policy) -> tuple[str | None, str]:
     return r, ""
 
 
+def decide_apply(paths: list[str], pol: Policy) -> Decision:
+    """`sandbox_apply`: the one point where the sandbox touches the real project (design 4.7 and 12). Every file answers to the rules of Write, so a deny rule, plan mode, a secret and the server's own config hold as they do for the tool.
+    Past those it asks, whatever the folder: the question is how the user sees the diff and the test result. In mode auto the judge may settle it, unless a file is one no judge may settle. A rule `sandbox_apply` in the allow list takes the question away, and in the deny list closes the route."""
+    verdicts = []
+    for path in paths:
+        d = decide("Write", {"file_path": path}, pol)
+        if d.kind == "deny":
+            return Decision("deny", f"{path}: {d.why}", rule=d.rule)
+        verdicts.append(d)
+    for rule in pol.deny:
+        if _rule_parts(rule)[0] == "sandbox_apply":
+            return Decision("deny", f"denied by the rule {rule}", rule=rule)
+    free = all(d.kind == "allow" for d in verdicts)
+    for rule in pol.allow:
+        if _rule_parts(rule)[0] == "sandbox_apply" and free:
+            return Decision("allow", f"allowed by the rule {rule}", rule=rule)
+    return Decision("ask", "it changes the real project", judgeable=pol.mode == "auto" and all(d.kind == "allow" or d.judgeable for d in verdicts))
+
+
 def decide(tool: str, args: dict, pol: Policy) -> Decision:
     args = args if isinstance(args, dict) else {}
     # 1. deny rules
