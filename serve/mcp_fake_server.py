@@ -4,9 +4,11 @@
     python serve/mcp_fake_server.py --http 8765      Streamable HTTP on 127.0.0.1:8765/mcp
 
 Tools: echo (returns its text), fail (a tool error, isError), sleep (answers after `seconds`), big (`n` characters),
-die (the process exits mid-call), add (two integers).  tools/list pages two tools at a time (`--page N`), so the
-client's pagination is exercised.  `--crash-at-start` exits before answering anything.  With FAKE_MCP_LOG set, the
-server appends what it saw (calls, cancellations) to that file, one JSON line each.
+die (the process exits mid-call), add (two integers), weather (fields in structuredContent beside a long text), save
+(says it changes something).  The ones that only read carry `annotations.readOnlyHint`; die has no annotations and
+save says false, for serve/test_mip_adapter.py.  tools/list pages two tools at a time (`--page N`), so the client's
+pagination is exercised.  `--crash-at-start` exits before answering anything.  With FAKE_MCP_LOG set, the server
+appends what it saw (calls, cancellations) to that file, one JSON line each.
 """
 from __future__ import annotations
 
@@ -17,18 +19,26 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+READ_ONLY = {"annotations": {"readOnlyHint": True}}
 TOOLS = [
-    {"name": "echo", "description": "Returns the text it is given.",
+    {"name": "echo", "description": "Returns the text it is given.", **READ_ONLY,
      "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
-    {"name": "fail", "description": "Always fails.", "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "sleep", "description": "Waits, then answers.",
+    {"name": "fail", "description": "Always fails.", **READ_ONLY, "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "sleep", "description": "Waits, then answers.", **READ_ONLY,
      "inputSchema": {"type": "object", "properties": {"seconds": {"type": "number"}}}},
-    {"name": "big", "description": "Returns n characters.",
-     "inputSchema": {"type": "object", "properties": {"n": {"type": "integer"}}}},
+    {"name": "big", "description": "Returns n characters.", **READ_ONLY,
+     "inputSchema": {"type": "object", "properties": {"n": {"type": "integer"}, "structured": {"type": "boolean"}}}},
     {"name": "die", "description": "Ends the server.", "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "add", "description": "Adds two integers.",
+    {"name": "add", "description": "Adds two integers.", **READ_ONLY,
      "inputSchema": {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}}},
+    {"name": "weather", "description": "The weather of a city, as fields.", **READ_ONLY,
+     "inputSchema": {"type": "object", "required": ["city"], "additionalProperties": False,
+                     "properties": {"city": {"type": "string"}, "units": {"enum": ["c", "f"]}, "days": {"type": "integer"},
+                                    "tags": {"type": "array", "items": {"type": "string"}}}}},
+    {"name": "save", "description": "Writes a note down.", "annotations": {"readOnlyHint": False},
+     "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}},
 ]
+REPORT = "a report that must stay out of the context " * 40
 PAGE = 2
 cancelled: set = set()
 
@@ -74,12 +84,20 @@ def handle(msg: dict):
             result = text("slept")
         elif name == "big":
             result = text("y" * int(args.get("n", 100000)))
+            if args.get("structured"):
+                result["structuredContent"] = {"rows": ["y" * 10] * (int(args.get("n", 100000)) // 10)}
         elif name == "die":
             sys.stderr.write("dying on purpose\n")
             sys.stderr.flush()
             os._exit(3)
         elif name == "add":
             result = text(str(int(args.get("a", 0)) + int(args.get("b", 0))))
+        elif name == "weather":
+            result = text(REPORT)                       # the content blocks: what the tool path puts in the context
+            result["structuredContent"] = {"city": args.get("city"), "temp": 31, "units": args.get("units", "c"),
+                                           "days": args.get("days", 1), "report": REPORT}
+        elif name == "save":
+            result = text("saved")
         else:
             return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": f"unknown tool {name}"}}
         return {"jsonrpc": "2.0", "id": rid, "result": result}

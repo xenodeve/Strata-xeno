@@ -41,6 +41,10 @@ class McpError(RuntimeError):
     """A server answered with an error, stopped, or could not be reached."""
 
 
+class McpRpcError(McpError):
+    """The server answered the call with a JSON-RPC error: its own words, not the state of the connection."""
+
+
 class McpTimeout(McpError):
     pass
 
@@ -71,7 +75,7 @@ def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str
     msg = slot.msg
     if "error" in msg:
         err = msg["error"] if isinstance(msg["error"], dict) else {"message": str(msg["error"])}
-        raise McpError(f"{err.get('message') or 'error'} (code {err.get('code')})")
+        raise McpRpcError(f"{err.get('message') or 'error'} (code {err.get('code')})")
     return msg.get("result") or {}
 
 
@@ -487,6 +491,14 @@ def result_text(result: dict) -> str:
     return "\n".join(parts)
 
 
+def cut_text(text: str, cap: int) -> str:
+    """At most `cap` characters, with a note that says so (0: no limit)."""
+    if cap <= 0 or len(text) <= cap:
+        return text
+    return text[:cap] + (f"\n\n[... truncated: the tool returned {len(text):,} characters; only the first "
+                         f"{cap:,} are shown]")
+
+
 def _clean(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", str(name)) or "x"
 
@@ -583,10 +595,7 @@ class McpHub:
         if server is not None and getattr(server, "wants_context", False) and cap > 0:
             cap = max(cap, 60000)                                 # a file or a command's output is the point of the coding tools: they cut their own
         full = len(text)
-        if cap > 0 and full > cap:
-            text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
-                                 f"{cap:,} are shown]")
-        out.update(ok=ok, text=text, chars=full, truncated=cap > 0 and full > cap,
+        out.update(ok=ok, text=cut_text(text, cap), chars=full, truncated=cap > 0 and full > cap,
                    ms=int((time.monotonic() - t0) * 1000))
         return out
 
