@@ -20,8 +20,8 @@
 namespace strata::igc::sandbox {
 
 inline constexpr std::size_t kShownOutput = 1024;   // one forced token per byte: a long output costs seconds of decode
-inline constexpr int kMaxRuns = 32;
-inline constexpr int kMaxBlockTokens = 1024;   // the model can drop its program and reason on inside the open block: one ran to 36607 characters
+inline constexpr int kMaxRuns = 128;
+inline constexpr int kMaxBlockTokens = 2048;   // the model can drop its program and reason on inside the open block: one ran to 36607 characters
 // Told plainly: on a bare `[nothing printed]` the model decided it cannot execute anything, and looped on that.
 inline constexpr std::string_view kNothingPrinted = "[it ran and printed nothing: call your function and print the result]";
 // 8 of 32 imports were sympy: told only that it is missing, the model went on by hand for 1820 to 9189 tokens (#279).
