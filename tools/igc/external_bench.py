@@ -47,6 +47,8 @@ HINT_MAX=2
 # Intro and A.4), where it is already reconsidering, and words them as a check of the approach and of the reading. The rest of its first hint follows
 # the model's word, so the sentence stays the model's.
 HINT_WAIT=', I can use Python to check if my approach is correct and refine it, if necessary.\n</think>\n\n<tool_call>\n<function=run_python>\n<parameter=code>\n'
+# --hint-at stop: START's own comparison on QwQ put hints only before the stop token, to leave the reasoning whole; GPQA did not drop (58.5 -> 59.6).
+HINT_STOP='\n\nWait, I can use Python to check if my approach is correct and refine it, if necessary.'+HINT_WAIT[HINT_WAIT.index('\n</think>'):]
 RECONSIDER=re.compile(r'(?:^|[\n.!?]\s*)(?:Wait|Alternatively)$')
 
 
@@ -314,10 +316,13 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                         if t is None:continue
                         tokens.append(int(t))
                         if len(tokens)%64==0 and repeating(tokens,rounds=stuck_rounds):stuck=True;break
+                        if (hint_at=='stop' and hint_after and tool_loop and not sandbox_tool and int(t)==248069 and thinking and not ran and not hints
+                                and quiet>=hint_after):   # before the stop token, as START's QwQ comparison: the reasoning is whole
+                            tokens.pop();hinted=True;break
                         thinking=thinking and int(t)!=248069
                         quiet+=thinking
                         if (hint_after and tool_loop and not sandbox_tool and thinking and not lead and quiet>=hint_after and len(hints)<HINT_MAX
-                                and (int(t) in (198,271) if hint_at=='line' else hint_point(hint_at,tokenizer.decode_bytes(tokens[-16:]).decode('utf-8','replace')))):
+                                and hint_at!='stop' and (int(t) in (198,271) if hint_at=='line' else hint_point(hint_at,tokenizer.decode_bytes(tokens[-16:]).decode('utf-8','replace')))):
                             hinted=True;break   # N thinking tokens with no call, at a hint point: the hint goes in
                         if tool_loop and not sandbox_tool and thinking and int(t) in TOOL_END:   # the close of a call while thinking: run it before the model writes an answer of its own
                             inner=called_in_thinking(lead+tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
@@ -325,7 +330,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                         if tool_loop and not thinking and int(t) in TOOL_END:break   # a reply call ends here: ddfff815 wrote a user turn of its own after it
                     said.append(tokens)
                     if hinted:   # the model writes the program on from the hint's open call
-                        words=HINT if hint_at=='line' else HINT_WAIT
+                        words=HINT if hint_at=='line' else HINT_WAIT if hint_at=='wait' else HINT_STOP
                         hints.append(dict(turn=turn,after=quiet,at=hint_at));asked=asked+tokens+tokenizer.encode(words);lead=words;quiet=0
                         continue
                     code=inner if inner is not None else None if stuck or not tool_loop else tool_call(lead+tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
@@ -431,7 +436,7 @@ if __name__=='__main__':
     parser.add_argument('--stop-on-loss',type=Path,help='verdicts of the base arm: stop at the first row it got right and this arm did not')
     parser.add_argument('--hint-after',type=int,default=0,help='with --tool-loop and not --sandbox-tool: after N thinking tokens with no call, at a line end, '
                         'START\'s hint closes the thinking and opens a run_python call (at most 2 a row; 0 never)')
-    parser.add_argument('--hint-at',choices=('line','wait'),default='line',help='with --hint-after: at any line end, or after the model\'s own Wait / Alternatively')
+    parser.add_argument('--hint-at',choices=('line','wait','stop'),default='line',help='with --hint-after: at any line end, after the model\'s own Wait / Alternatively, or in place of its </think> in a row with no call (once)')
     parser.add_argument('--lcb-tests',type=Path,help='LiveCodeBench tests, to score each row as it ends (throwaway VM only)')
     parser.add_argument('--tool-loop',action='store_true',help='declare run_python in the model\'s own tool format and answer its calls: throwaway VM only')
     parser.add_argument('--retries',type=int,default=0,help='sampled runs from the prompt after one that ended with its tests failing')
