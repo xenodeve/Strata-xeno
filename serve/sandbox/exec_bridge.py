@@ -6,8 +6,10 @@ thrown away. Anything else with no box answers that the block cannot run, so not
 import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 KERNEL = Path(__file__).with_name('kernel_main.py')
@@ -21,10 +23,11 @@ def throwaway() -> bool:
 class Kernel:
     def __init__(self, box=None):
         self.box = box
-        argv = [sys.executable, '-I', '-B', str(KERNEL)]
-        if box is not None:
-            self.proc = box.popen(argv)
+        if box is not None:   # the box reads no repository: the kernel goes in as a copy of its one file
+            shutil.copyfile(KERNEL, Path(box.workdir) / KERNEL.name)
+            self.proc = box.popen(['python', '-I', '-B', KERNEL.name])
         elif throwaway():
+            argv = [sys.executable, '-I', '-B', str(KERNEL)]
             self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding='utf-8')
         else:
             raise RuntimeError('no isolation box')
@@ -33,17 +36,24 @@ class Kernel:
             raise RuntimeError('the kernel did not start')
 
     def run(self, code: str) -> tuple[bool, str]:
-        self.proc.stdin.write(json.dumps({'code': code}) + '\n')
-        self.proc.stdin.flush()
-        line = self.proc.stdout.readline()
+        timer = threading.Timer(BLOCK_SECONDS, self.proc.kill)
+        timer.start()
+        try:
+            self.proc.stdin.write(json.dumps({'code': code}) + '\n')
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline()
+        finally:
+            timer.cancel()
         if not line:
-            return False, '[the block ended the sandbox]'
+            return False, f'[the block ended the sandbox, or ran past {BLOCK_SECONDS:.0f} s]'
         reply = json.loads(line)
         return reply['ok'], reply['output']
 
     def close(self):
         self.proc.kill()
         self.proc.wait()
+        if self.box is not None:
+            self.box.kill()
 
 
 class ExecBridge:
