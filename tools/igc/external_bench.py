@@ -32,6 +32,10 @@ TOOL_HINT=('\n\n# Tools\n\nYou have access to the following functions:\n\n<tools
 TOOL_CALL=re.compile(r'<tool_call>\s*<function=run_python>\s*<parameter=code>\n?(.*?)\n?</parameter>',re.S)
 TOOL_JSON=re.compile(r'<tool_call>\s*(\{.*\})\s*</tool_call>',re.S)
 TOOL_ROUNDS=24
+# Past the runs, a call is answered with this and nothing runs. Cut off at the 24th, 3478 was still testing its program against a grid it walked as
+# an oracle, and ended with no code (#288).
+TOOL_SPENT='[no more runs: finish the thinking and write the answer]'
+TOOL_AFTER=4
 TOOL_END={248059}   # `</tool_call>` is one token in the Gyro-M pack
 TOOL_OUTPUT=4096
 
@@ -245,8 +249,8 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             for attempt in range(retries+1):
                 tokens=[];stuck=False
                 keys=sampling if not attempt else {**sampling,'temperature':retry_temperature,'seed':attempt}
-                said=[];kernel=None;asked=list(ids)
-                for turn in range(TOOL_ROUNDS if tool_loop else 1):
+                said=[];kernel=None;asked=list(ids);ran=[]
+                for turn in range(TOOL_ROUNDS+TOOL_AFTER if tool_loop else 1):
                     tokens=[]
                     thinking=True;inner=None
                     for t in engine.generate(asked,262144-len(asked)-64 if whole_context else limit-sum(len(s) for s in said),keys,cancel):
@@ -260,10 +264,13 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                     said.append(tokens)
                     code=inner if inner is not None else None if stuck or not tool_loop else tool_call(tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace'))
                     if code is None:break
-                    from serve.sandbox.exec_bridge import Kernel
-                    kernel=kernel or Kernel()
-                    ran,shown=kernel.run(code)
-                    shown=(shown or '[it ran and printed nothing]')[:TOOL_OUTPUT]
+                    if turn<TOOL_ROUNDS:
+                        from serve.sandbox.exec_bridge import Kernel
+                        kernel=kernel or Kernel()
+                        _,shown=kernel.run(code)
+                        shown=(shown or '[it ran and printed nothing]')[:TOOL_OUTPUT]
+                    else:shown=TOOL_SPENT
+                    ran.append(dict(code=code[:4000],shown=shown[:4000],thinking=inner is not None))
                     if inner is not None:   # the answer goes into the thinking, which goes on
                         asked=asked+tokens+tokenizer.encode('\n<tool_response>\n'+shown+'\n</tool_response>\n')
                         continue
@@ -273,7 +280,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
                 tokens=[t for s in said for t in s]
                 text=tokenizer.decode_bytes(tokens).decode('utf-8',errors='replace')
                 if no_think:text='</think>\n\n'+text   # the close is in the prompt; the readers look for it here
-                attempts.append(dict(tokens=len(tokens),text=text,finish='stuck' if stuck else engine.last.get('finish'),check=last_check(text),turns=len(said)))
+                attempts.append(dict(tokens=len(tokens),text=text,finish='stuck' if stuck else engine.last.get('finish'),check=last_check(text),turns=len(said),ran=ran))
                 if attempts[-1]['check'] not in ('mismatch','stub'):break
             seconds=time.monotonic()-start;active[0]=None
             # The first whose tests did not fail, else the first: a sampled run has no claim over the greedy one.
@@ -281,7 +288,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
             text=kept['text'];final=final_number(text)
             records.append(dict(id=row['id'],suite=row['suite'],answer=row['answer'],final=final,correct=final==row['answer'],
                                 tokens=sum(a['tokens'] for a in attempts),seconds=seconds,finish=kept['finish'],prompt_tokens=len(ids),text=text,
-                                attempts=[dict(tokens=a['tokens'],check=a['check'],turns=a['turns']) for a in attempts]))
+                                attempts=[dict(tokens=a['tokens'],check=a['check'],turns=a['turns'],ran=a['ran']) for a in attempts]))
             if plan.verdicts is not None:
                 records[-1]['verdict']=judge(records[-1]) if judge else 'ok' if records[-1]['correct'] else 'wrong'
             (output/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
