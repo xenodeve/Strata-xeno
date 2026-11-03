@@ -124,6 +124,7 @@ class Rollout:
         self.started = time.monotonic()
         self.seconds = None
         self.cap = 0   # --max-tokens: training data only; an answer past it is never the shortest right one kept
+        self.checked = 0   # len(out) at the last loop check
 
     def left(self):
         room = CONTEXT - len(self.prompt) - len(self.out) - 64
@@ -189,7 +190,16 @@ class Rollout:
                 self.events[-1].update(expr=_TAIL.search(text[:text.rstrip().rfind('=')].rsplit('\n', 1)[-1]).group(1).strip()[:200], value=value)
             if self.left() <= 0:
                 self.done('length')
+            elif len(self.out) - self.checked >= CHUNK:   # a request that ends at `=` skips the checks below: a loop of equations would run on
+                self.checked = len(self.out)
+                if looping(self.out):
+                    if self.phase == 'think' and self.arm.loop_close:
+                        self.inject(LOOP_CLOSE, 'loop close')
+                        self.phase = 'answer'
+                    else:
+                        self.done('stuck')
             return False
+        self.checked = len(self.out)
         if last in self.ids.ends:
             if self.phase == 'answer':
                 self.done('stop')
@@ -345,35 +355,57 @@ def seed_of(seed, row_id, sample):
 
 
 def drive(llm, rollouts, kernel_factory, live_most=256, workers=32, on_round=None):
-    """Every live answer's next request goes out in one batch; the blocks closed in that round run side by side; then the next round. At most
-    `live_most` answers are live at once, each holding its kernel until it ends, so a few thousand answers do not hold a few thousand kernels."""
+    """Continuous: an answer's next request goes into the engine the moment its last one returns, and a block it closed runs on a worker
+    meanwhile. Lock-step rounds (one generate() for every live answer, then the next) held each answer to the longest request of its round:
+    the inline arm stops at every `=` and ran 5x slower than its control (r1 on the A100, 2 rows to 11 in 20 minutes). At most `live_most`
+    answers are live at once, each holding its kernel until it ends, so a few thousand answers do not hold a few thousand kernels."""
+    from concurrent.futures import FIRST_COMPLETED, wait
     from vllm import SamplingParams, TokensPrompt
+    engine = llm.llm_engine
     pool = ThreadPoolExecutor(workers)
     waiting_rows = list(rollouts)
-    live = []
-    while live or waiting_rows:
-        while waiting_rows and len(live) < live_most:
+    flying, running = {}, {}   # request id -> answer; a block's future -> answer
+    serial = iter(range(1 << 62))
+
+    def ask(r):
+        """Sends r's next request; False once r has ended."""
+        q = r.request()
+        if not q:
+            return False
+        most, stops = q
+        params = SamplingParams(**SAMPLING, max_tokens=most, stop_token_ids=sorted(stops), seed=(r.seed + len(r.out)) % 2**31,
+                                skip_special_tokens=False, detokenize=False)
+        rid = str(next(serial))
+        engine.add_request(rid, TokensPrompt(prompt_token_ids=r.prompt + r.out), params)
+        flying[rid] = r
+        return True
+
+    while waiting_rows or flying or running:
+        ended = False
+        while waiting_rows and len(flying) + len(running) < live_most:
             r = waiting_rows.pop(0)
             r.started = time.monotonic()
-            live.append(r)
-        asks = [(r, r.request()) for r in live]
-        asks = [(r, q) for r, q in asks if q]
-        if asks:
-            prompts = [TokensPrompt(prompt_token_ids=r.prompt + r.out) for r, _ in asks]
-            params = [SamplingParams(**SAMPLING, max_tokens=most, stop_token_ids=sorted(stops), seed=(r.seed + len(r.out)) % 2**31,
-                                     skip_special_tokens=False, detokenize=False) for r, (most, stops) in asks]
-            outs = llm.generate(prompts, params, use_tqdm=False)
-            waiting = []
-            for (r, _), o in zip(asks, outs):
+            ended |= not ask(r)
+        if flying:
+            for o in engine.step():
+                if not o.finished:
+                    continue
+                r = flying.pop(o.request_id)
                 c = o.outputs[0]
                 new = list(c.token_ids)
                 if isinstance(c.stop_reason, int) and (not new or new[-1] != c.stop_reason):
                     new.append(c.stop_reason)
                 if r.take(new):
-                    waiting.append(r)
-            list(pool.map(lambda r: r.run_pending(kernel_factory), waiting))
-        live = [r for r in live if not r.finish]
-        if on_round:
+                    running[pool.submit(r.run_pending, kernel_factory)] = r
+                else:
+                    ended |= not ask(r)
+        else:
+            wait(list(running), return_when=FIRST_COMPLETED)
+        for f in [f for f in running if f.done()]:
+            r = running.pop(f)
+            f.result()
+            ended |= not ask(r)
+        if ended and on_round:
             on_round()
     pool.shutdown()
 

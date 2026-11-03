@@ -1,6 +1,6 @@
 """tools/igc/tir4b.py and tir4b_train.py without a GPU: a scripted model drives the forced-block state machine through each path the
 engine's rules take, and the training labels mask what the kernel printed. python tools/test_igc_tir4b.py"""
-import sys, unittest
+import sys, types, unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.igc import tir4b
@@ -215,6 +215,70 @@ class InlineCalc(unittest.TestCase):
         r = rollout()
         play(r, 'so 6 \\times 7 = 41</think>\n\nx<|im_end|>', Kernel([]))
         self.assertEqual(r.events, [])
+
+    def test_a_loop_of_equations_is_stuck(self):
+        # every request ends at an `=`, never at a chunk: the loop check must still come round, or it runs to the end of the context
+        r = rollout(inline_calc=True)
+        play(r, 'so 1 + 1 = ' * 3000, Kernel([]))
+        self.assertEqual(r.finish, 'stuck')
+        self.assertLess(len(r.out), 3 * tir4b.CHUNK)
+
+
+class FakeEngine:
+    """vLLM's LLMEngine as drive() uses it: each request finishes on a later step, one at a time, so answers interleave."""
+    def __init__(self, scripts):
+        self.streams = {tuple(p): TOK.encode(s) for p, s in scripts}
+        self.queue = []
+
+    def add_request(self, rid, prompt, params):
+        self.queue.append((rid, prompt['prompt_token_ids'], params))
+
+    def step(self):
+        if not self.queue:
+            return []
+        rid, ids, params = self.queue.pop(0)
+        stream = next(s for p, s in self.streams.items() if tuple(ids[:len(p)]) == p)
+        new = []
+        while stream and len(new) < params.max_tokens:
+            new.append(stream.pop(0))
+            if new[-1] in params.stop_token_ids:
+                break
+        new = new or [SPECIAL['<|im_end|>']]
+        out = types.SimpleNamespace(token_ids=new, stop_reason=None)
+        return [types.SimpleNamespace(request_id=rid, finished=True, outputs=[out])]
+
+
+class Drive(unittest.TestCase):
+    def setUp(self):
+        fake = types.ModuleType('vllm')
+        fake.SamplingParams = lambda **kw: types.SimpleNamespace(**kw)
+        fake.TokensPrompt = lambda prompt_token_ids: dict(prompt_token_ids=prompt_token_ids)
+        self.saved = sys.modules.get('vllm')
+        sys.modules['vllm'] = fake
+
+    def tearDown(self):
+        if self.saved is None:
+            sys.modules.pop('vllm')
+        else:
+            sys.modules['vllm'] = self.saved
+
+    def test_continuous_drive_writes_what_one_answer_alone_writes(self):
+        scripts = ['a 2 + 3 = and 4 \\times 5 = done</think>\n\n25<|im_end|>',
+                   'let me check ```python\nprint(7)\n```</think>\n\n7<|im_end|>',
+                   'plain thinking</think>\n\nok<|im_end|>']
+        arms = [dict(inline_calc=True), dict(execute=True, close_fit=True), dict()]
+        alone = []
+        for s, a in zip(scripts, arms):
+            r = tir4b.Rollout(ROW, 0, [1], tir4b.Arm(**a), IDS, TOK, seed=1)
+            play(r, s, Kernel([(True, '7')]))
+            alone.append(r.text())
+        rs = [tir4b.Rollout(ROW, 0, [1, 100 + i], tir4b.Arm(**a), IDS, TOK, seed=1) for i, a in enumerate(arms)]
+        engine = FakeEngine([(r.prompt, s) for r, s in zip(rs, scripts)])
+        saves = []
+        tir4b.drive(types.SimpleNamespace(llm_engine=engine), rs, lambda: Kernel([(True, '7')]), live_most=2, on_round=lambda: saves.append(1))
+        self.assertEqual([r.text() for r in rs], alone)
+        self.assertTrue(all(r.finish == 'stop' for r in rs))
+        self.assertTrue(saves)
 
 
 class Training(unittest.TestCase):
