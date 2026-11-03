@@ -148,10 +148,31 @@ def hle_number(text):
         return None
 
 
+UNDETERMINED = re.compile(r'cannot be (?:determined|found|computed)|not (?:enough|sufficient) information|undetermined|indeterminate', re.I)
+
+
+def hle_committed(answer):
+    """The answer line commits to one value: not 'cannot be determined', and after its last `=` no second, different number. hle-on1's
+    6721b01e63e0 said the answer cannot be determined and offered 'at most 5' and '0'; taking the first number scored it right (#288)."""
+    if UNDETERMINED.search(answer):
+        return False
+    # A caveat in brackets after the value is not a second answer: '3 (for smooth functions; 4 if Morse is required)' commits to 3, as the reader read it.
+    head = answer.split('(', 1)[0] or answer
+    tail = re.sub(r'\\d?frac\{(\d+)\}\{(\d+)\}', r'\1/\2', head).replace(',', '').rsplit('=', 1)[-1]
+    values = set()
+    for n in re.findall(r'-?\d+(?:\.\d+)?(?:/\d+)?', tail):
+        try:
+            values.add(Fraction(n))
+        except (ValueError, ZeroDivisionError):
+            pass
+    return len(values) <= 1
+
+
 def hle_right(text, gold):
-    """Exact, except that a gold with decimals allows one unit in its last place. Only numeric golds are scored here, which needs no judge."""
+    """Exact, except that a gold with decimals allows one unit in its last place. Only numeric golds are scored here, which needs no judge.
+    An answer line that hedges between values or says it cannot be determined is no answer."""
     got, want = hle_answer(text), hle_number(gold)
-    value = None if got is None else hle_number(got)
+    value = None if got is None or not hle_committed(got) else hle_number(got)
     if value is None or want is None:
         return False
     places = len(str(gold).split('.')[1]) if '.' in str(gold) else None
