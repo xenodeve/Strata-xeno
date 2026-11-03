@@ -51,6 +51,12 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276), ผลแ�
 2. **RL แบบให้รางวัลตามความยาก (EAPO 2606.02132)** ทำเมื่อข้อ 1 ได้ผล ใส่เส้นทางที่ไม่ใช้ tool ไว้ในกลุ่ม rollout และหักคะแนนการเรียกเกินจำเป็นเฉพาะข้อง่าย ไม่ใช้การหักเท่ากันทุกข้อแบบ OTC เพราะทำให้โมเดลเลี่ยง tool ในข้อยาก ASPO (2508.19201) ขยับ call แรกจากราว 4,000 มาที่ราว 1,000 token ตรงกับปัญหา 203 จาก 205 ข้างบน
 3. **เกณฑ์:** 4B + RFT ต้องชนะ 4B + ชั้นที่ 1 บนข้อ held-out ทั้งจำนวนข้อถูกและ token รายข้อ
 4. **วัดสัญญาณของข้อมูลจากแขนที่เก็บไว้ (2026-11-03, ไม่ใช้ CU):** เลือกเส้นทางที่ถูกและสั้นที่สุดของแต่ละข้อจากทุกแขน MATH long เลือกเส้นทางที่เรียก tool 16 จาก 22 ข้อ MMLU long 13 จาก 19 ข้อ ใช้ token median 0.47x และ 0.30x ของ base แต่ไม่มีข้อไหนที่ base ผิดแล้วแขน tool ถูกเลย ส่วน GSM8K และ MATH L5 ข้อสั้นแทบไม่มีเส้นทางที่เรียก tool ข้อมูลจาก Flash-Next จึงสอนเรื่องเรียกเพื่อลด token ได้ แต่สอนเรื่องแก้ข้อยากไม่ได้ ข้อมูลส่วนนั้นต้องมาจากโมเดลที่ผิดมากกว่า เช่น 4B การเลือกค่าน้อยสุดจากหลายแขนเอนไปทางสั้น อัตราส่วนจริงจะสูงกว่านี้
+5. **ผู้พัฒนาตัดสินใจ (2026-11-03, #296):** เลิกหาวิธีใหม่ในชั้น 1 แล้วเริ่มชั้นนี้ทันที โดยใช้การบังคับเปิด block (#279) คู่กับ fine-tune ไปเลย ส่วนการแยกว่าผลมาจากส่วนไหนเท่าไหร่ให้ทำทีหลังเมื่อได้ผลดี
+   - **แขน:** FT + MIP + Sandbox กับ Base รันบนสองเครื่อง จากนั้นรัน Base + MIP + Sandbox อีกรอบ
+   - **ความแม่น:** bf16 ทั้งเทรนและประเมิน เท่ากับงานวิจัย จึงใช้ LoRA แบบ bf16 แทน QLoRA ในข้อ 1
+   - **context:** เต็ม 262,144
+   - **ตัวรัน:** `tools/igc/tir4b.py` บน vLLM เขียนกฎ sandbox ของ engine ใหม่ด้วย Python การคำนวณเลข inline ของ MIP ไม่ได้ port
+   - **ผลต่อแผน:** ถ้าพฤติกรรมเปลี่ยน 4B จะเป็นโมเดลหลักในการทดสอบ ข้อความ "เริ่มหลังระบบบน Flash-Next เสถียรแล้ว" ในแผนทดสอบจึงไม่ใช้แล้ว
 
 **ชั้นที่ 3: เทรนบน Flash-Next** เริ่มเมื่อชั้นที่ 2 พิสูจน์ผลแล้ว และผู้พัฒนาเป็นผู้ตัดสิน เพราะต้องสร้าง pack ใหม่และใช้ CU มาก engine ไม่มี LoRA มีสองทาง
 - merge adapter เข้า weight ความละเอียดสูงแล้ว quantize ใหม่ ห้าม merge เข้า base ที่ quantize แล้ว
@@ -97,6 +103,12 @@ Tracker: [#276](https://github.com/xenodeve/Strata-xeno/issues/276), ผลแ�
 2. RL with a difficulty-aware reward (EAPO 2606.02132), only if step 1 shows a gain. Put tool-free trajectories in each rollout group and penalise redundant calls mainly on easy questions, not with OTC's uniform penalty, which makes the policy avoid tools on hard questions too. ASPO (2508.19201) moved the first call from about 4,000 to about 1,000 tokens, the problem the 203 of 205 above describes.
 3. Criterion: 4B with RFT beats 4B with layer 1 on held-out questions, in right answers and in per-row tokens.
 4. Data signal measured from stored arms (2026-11-03, no compute). Taking the right and shortest trajectory per question over every arm: MATH long keeps a calling trajectory on 16 of 22 questions, MMLU long on 13 of 19, at a median 0.47x and 0.30x of the base's tokens. No question that the base got wrong was right in a tool arm, and GSM8K and the shorter MATH L5 rows keep almost no calling trajectories. Flash-Next's data can therefore teach calling to save tokens, not fixing hard questions; that part has to come from a model that errs more, such as the 4B. The minimum over several arms leans short, so the true ratios are higher.
+5. **The developer's decision (2026-11-03, #296).** Stop looking for new layer-1 methods and start this layer now, with the forced block (#279) combined with the fine-tune. The split of the gain by part comes later, once the result is good.
+   - Arms: FT + MIP + Sandbox and Base, on two machines, then Base + MIP + Sandbox.
+   - Precision: bf16 in training and evaluation, as in the research. So step 1 uses a bf16 LoRA, not QLoRA.
+   - Context: the full 262,144.
+   - Runner: `tools/igc/tir4b.py`, on vLLM. It rebuilds the engine's sandbox rules in Python; MIP's inline arithmetic is not ported.
+   - If the behaviour changes, the 4B becomes the main test model, and the test plan's "start after Flash-Next is stable" no longer holds.
 
 *Layer 3: training on Flash-Next.* Only once layer 2 has shown a gain, and the developer decides: it needs a new pack and much compute. The engine has no LoRA, so there are two ways:
 - Merge the adapter into high-precision weights and quantize again. Never merge into the quantized base.
