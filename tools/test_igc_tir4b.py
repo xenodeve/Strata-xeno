@@ -191,6 +191,13 @@ class InlineCalc(unittest.TestCase):
         self.assertEqual(v('7.95922042 \\times 5 '), '39.7961021')
         self.assertEqual(v('1/3 + 1 '), '4/3')                                  # no terminating decimal: the reduced fraction
         self.assertEqual(v('0.5 - 0.75 '), '-0.25')                             # a negative decimal keeps its sign
+        # long division by hand (dm div_big 5866, 6311, 8989): `21 \div 19 =` asks for a quotient digit, and 21/19 back, then 21/19 again for
+        # `21/19 =`, looped until stuck where base finished the division and was right
+        self.assertIsNone(v('21 \\div 19 '))                     # an integer quotient that does not come out: the model's own long division
+        self.assertIsNone(v('15/13 '))                           # the value spelled as the expression: nothing new, and it loops
+        self.assertIsNone(v('\\frac{-2142}{-7037} '))
+        self.assertEqual(v('84 \\div 7 '), '12')                 # a division that comes out is still given
+        self.assertEqual(v('1 \\div 8 '), '0.125')
         self.assertEqual(v('\\frac{3}{4} + 1/4 '), '1')
         self.assertEqual(v('(140 + 56) / 28 '), '7')
         self.assertEqual(v('2^{10} '), '1024')

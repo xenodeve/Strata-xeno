@@ -168,7 +168,13 @@ def inline_value(before):
         return None
     if value is None or abs(value.numerator) > 10 ** 30 or value.denominator > 10 ** 12:
         return None
-    return spelled(value)
+    said = spelled(value)
+    bare = re.sub(r'[\s()]', '', s)
+    if '/' in said and re.fullmatch(r'-?\d+/-?\d+', bare):
+        return None   # an integer quotient that does not come out: the model is doing long division and wants a digit, not 21/19 (dm div_big)
+    if said == bare:
+        return None   # nothing new, and `= 15/13 = 15/13 = ...` looped until stuck
+    return said
 
 
 def spelled(value):
