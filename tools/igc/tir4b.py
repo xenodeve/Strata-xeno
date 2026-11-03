@@ -12,8 +12,9 @@ Not here: MIP's inline arithmetic, which lives in the CUDA engine. Every text th
 tir4b.py run --model M --rows R.jsonl --out DIR [--force-after 512] [--execute] [--close-fit] [--loop-close] [--samples K] [--seed S] [--ids]
 tir4b.py math-train OUT.jsonl --n N [--levels 3,4,5] [--exclude ROWS.jsonl ...]     (on the VM: MATH train, never a test row)
 tir4b.py keep DIR [DIR ...] --out TRAIN.jsonl [--max-len 32768]                      (the trajectory each question trains on)"""
-import argparse, hashlib, json, random, sys, time
+import argparse, hashlib, json, random, re, sys, time
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
 from pathlib import Path
 
 OPEN_LINE = 'Need a short Python program here.\n\n```python\n'   # kOpenBlock, as text
@@ -32,7 +33,7 @@ CONTEXT = 262144   # the model card's native context, all of it (developer, 2026
 SAMPLING = dict(temperature=0.6, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0)
 MATH_TAIL = '\n\nPlease reason step by step, and put your final answer within \\boxed{}.'   # the model card's own math prompt
 TRAIN_KINDS = ('forced open', 'close after a fitting result')   # the words the model should learn to write itself, as START's Hint-RFT
-MASK_KINDS = ('output',)   # what the kernel printed: read, never learned
+MASK_KINDS = ('output', 'inline value')   # what the kernel printed and the values software computed: read, never learned
 
 
 def output_block(body):
@@ -60,11 +61,52 @@ class Ids:
             raise RuntimeError('tokenizer: no fence, line or </think> token')
         # repeating() and line_back() read 198 and 271 as the line ends, the Flash-Next pack's ids: a tokenizer with others would blind them
         self.same_lines = self.lines == {198, 271}
+        self.equals = {i for i in range(len(tokenizer)) if tokenizer.decode([i]).strip() == '='}   # the tokens an inline value follows
 
 
 class Arm:
-    def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0):
+    def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False):
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
+        self.inline_calc = inline_calc
+
+
+# --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
+# When the reasoning writes an arithmetic expression and `=`, the value is computed exactly and put in, with the engine's ` (exact)`; the
+# model never does the arithmetic itself. On 82 base answers the 4B wrote 7,283 such equations, 504 of them wrong, in 12 of its 24 misses.
+_LATEX = [(r'\\times|\\cdot', '*'), (r'\\div', '/'), (r'\\left|\\right', ''), (r'\^\{([^{}]*)\}', r'**(\1)'), (r'\^', '**'),
+          (r'\\frac\{([^{}]*)\}\{([^{}]*)\}', r'((\1)/(\2))'), (r'\{', '('), (r'\}', ')'), (r'\\,|\\!|\\;', '')]
+_TAIL = re.compile(r'([0-9(\\][0-9+\-*/^(). \\a-z{}]*[0-9)}])[ ]*$')   # may open with a LaTeX command: \frac{3}{4} + 1/4
+_OPS = re.compile(r'[+\-*/^]|\\times|\\cdot|\\frac|\\div')
+_BOUNDARY = re.compile(r'(?:^|[\s$:;,]|\\\(|\\\[|=)$')
+
+
+def inline_value(before):
+    """The exact value of the arithmetic expression that ends the text before an `=`, as the model would write it, or None when that text
+    does not end in one: a symbol (algebra), no operator, unbalanced brackets, a number that is the tail of a longer expression, a root."""
+    line = before.rsplit('\n', 1)[-1]
+    m = _TAIL.search(line)
+    if not m:
+        return None
+    expr, head = m.group(1).strip(), line[:m.start(1)]
+    if not _OPS.search(expr) or expr.count('(') != expr.count(')') or expr.count('{') != expr.count('}'):
+        return None
+    if head and not head[-1].isspace() and not _BOUNDARY.search(head[-3:]):   # the expression starts after a space or a mark, not inside a word
+        return None
+    s = expr.replace(',', '')
+    for a, b in _LATEX:
+        s = re.sub(a, b, s)
+    if re.search(r'[a-zA-Z_\\]', s) or len(s) > 200 or not re.fullmatch(r'[0-9+\-*/(). ]+', s):
+        return None
+    if any(int(e) > 64 for e in re.findall(r'\*\*\s*\(?\s*(\d+)', s)):   # 9**9**9 would not finish
+        return None
+    exact = re.sub(r'\d+(?:\.\d+)?', lambda n: f"F('{n.group()}')", s)   # every literal a Fraction: 0.1 + 0.2 is 3/10, not a float
+    try:
+        value = Fraction(eval(compile(exact, '<inline>', 'eval'), {'__builtins__': {}}, {'F': Fraction}))
+    except (ArithmeticError, SyntaxError, TypeError, ValueError, OverflowError):
+        return None
+    if value is None or abs(value.numerator) > 10 ** 30 or value.denominator > 10 ** 12:
+        return None
+    return str(value.numerator) if value.denominator == 1 else f'{value.numerator}/{value.denominator}'
 
 
 class Rollout:
@@ -115,6 +157,8 @@ class Rollout:
             self.done('length')
             return None
         stops = set(self.ids.ends)
+        if self.arm.inline_calc and self.phase in ('think', 'answer'):
+            stops |= self.ids.equals
         if self.phase == 'answer':
             return min(left, CHUNK), stops
         stops.add(self.ids.think_close)
@@ -137,6 +181,15 @@ class Rollout:
         if self.phase != 'answer' and self.phase != 'block':
             self.thought += len(new)
         last = new[-1] if new else None
+        if self.arm.inline_calc and last in self.ids.equals and self.phase in ('think', 'answer'):
+            text = self.text()
+            value = inline_value(text[:text.rstrip().rfind('=')])
+            if value is not None:   # the value the model would have computed, computed: the reasoning goes on from it
+                self.inject(f' {value} (exact)', 'inline value')
+                self.events[-1].update(expr=_TAIL.search(text[:text.rstrip().rfind('=')].rsplit('\n', 1)[-1]).group(1).strip()[:200], value=value)
+            if self.left() <= 0:
+                self.done('length')
+            return False
         if last in self.ids.ends:
             if self.phase == 'answer':
                 self.done('stop')
@@ -248,6 +301,7 @@ class Rollout:
                     right=right(self.row, text), finish=self.finish, tokens=self.model_tokens(), injected=len(self.out) - self.model_tokens(),
                     prompt_tokens=len(self.prompt), thinking_tokens=self.thought, seconds=self.seconds, events=self.events,
                     runs=len(runs), runs_by_model=sum(e['by'] == 'model' for e in runs), runs_forced=sum(e['by'] == 'forced' for e in runs),
+                    inline_values=sum(e['kind'] == 'inline value' for e in self.events),
                     first_run_at=runs[0]['model_tokens'] if runs else None, tool_seconds=round(sum(e['seconds'] for e in runs), 3))
 
 
@@ -337,7 +391,7 @@ def run(args):
     rows = rows[args.offset:args.offset + args.limit] if args.limit else rows[args.offset:]
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
-    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat)
+    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     # --resume: answers already written are kept and not run again. A restart to fix the live count lost every answer in flight but not these.
@@ -483,6 +537,7 @@ def main(argv=None):
     r.add_argument('--close-fit', action='store_true')
     r.add_argument('--loop-close', action='store_true')
     r.add_argument('--close-repeat', type=int, default=0)
+    r.add_argument('--inline-calc', action='store_true')
     r.add_argument('--ids', action='store_true')
     r.add_argument('--memory', type=float, default=0.9)
     r.add_argument('--live', type=int, default=256)

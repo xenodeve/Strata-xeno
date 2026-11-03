@@ -181,6 +181,42 @@ class ForcedBlock(unittest.TestCase):
         self.assertEqual(tir4b.shown_text(False, ''), '')
 
 
+class InlineCalc(unittest.TestCase):
+    def test_value_of_the_expression_before_equals(self):
+        v = tir4b.inline_value
+        self.assertEqual(v('so 3 \\times 4 \\times 7 '), '84')
+        self.assertEqual(v('then 14641 - 2662 - 4235 + 352 + 324 '), '8420')   # a sum the 4B got wrong by hand (4d822b73)
+        self.assertEqual(v('$0.1 + 0.2 '), '3/10')                              # exact, not a float
+        self.assertEqual(v('\\frac{3}{4} + 1/4 '), '1')
+        self.assertEqual(v('(140 + 56) / 28 '), '7')
+        self.assertEqual(v('2^{10} '), '1024')
+
+    def test_not_arithmetic_is_left_to_the_model(self):
+        v = tir4b.inline_value
+        self.assertIsNone(v('2x + 3 '))              # algebra
+        self.assertIsNone(v('so x '))                # an assignment
+        self.assertIsNone(v('a3 + 4 '))              # the tail of a word
+        self.assertIsNone(v('9^{999} '))             # too large to compute in a step
+        self.assertIsNone(v('\\sqrt{8} + 1 '))       # not rational
+        self.assertIsNone(v('(3 + 4 '))              # unbalanced
+        self.assertIsNone(v('17 '))                  # no operator
+
+    def test_the_rollout_puts_the_value_in(self):
+        r = rollout(inline_calc=True)
+        play(r, 'so 6 \\times 7 = and on</think>\n\n42<|im_end|>', Kernel([]))
+        self.assertIn('6 \\times 7 = 42 (exact) and on', r.text())
+        self.assertEqual(kinds(r), ['inline value'])
+        self.assertEqual((r.events[0]['expr'], r.events[0]['value']), ('6 \\times 7', '42'))
+        self.assertEqual(r.record(lambda *_: True)['inline_values'], 1)
+        out = [s for s in r.spans if s[2] == 'inline value'][0]
+        self.assertEqual(TOK.decode(r.out[out[0]:out[1]]), ' 42 (exact)')
+
+    def test_off_by_default(self):
+        r = rollout()
+        play(r, 'so 6 \\times 7 = 41</think>\n\nx<|im_end|>', Kernel([]))
+        self.assertEqual(r.events, [])
+
+
 class Training(unittest.TestCase):
     def test_labels_mask_prompt_and_output(self):
         self.assertEqual(labels_of([1, 2], [3, 4, 5, 6], [[1, 3]]), [-100, -100, 3, -100, -100, 6])
