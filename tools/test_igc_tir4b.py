@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.igc import tir4b
 from tools.igc.tir4b_train import labels_of
 
-SPECIAL = {'</think>': 5, '<|im_end|>': 6, '```python': 7, '```': 8, '\n\n': 271, '\n': 198}
+SPECIAL = {'</think>': 5, '<|im_end|>': 6, '```python': 7, '```': 8, '</tool_call>': 9, '<tool_call>': 10, '<|im_start|>': 11, '\n\n': 271, '\n': 198}
 
 
 class Tok:
@@ -222,6 +222,41 @@ class InlineCalc(unittest.TestCase):
         play(r, 'so 1 + 1 = ' * 3000, Kernel([]))
         self.assertEqual(r.finish, 'stuck')
         self.assertLess(len(r.out), 3 * tir4b.CHUNK)
+
+
+CALL = '<tool_call>\n<function=python>\n<parameter=code>\nprint(6*7)\n</parameter>\n</function>\n</tool_call>'
+
+
+class NativeTool(unittest.TestCase):
+    def test_a_call_in_the_reply_gets_a_tool_turn_and_thinks_again(self):
+        r = rollout(native_tool=True)
+        k = Kernel([(True, '42')])
+        play(r, 'plan</think>\n\n' + CALL + 'it printed 42</think>\n\n42<|im_end|>', k)
+        self.assertEqual(k.ran, ['print(6*7)'])
+        self.assertEqual(r.text(), 'plan</think>\n\n' + CALL + '<|im_end|>\n<|im_start|>user\n<tool_response>\n42\n</tool_response><|im_end|>\n'
+                         '<|im_start|>assistant\n<think>\nit printed 42</think>\n\n42<|im_end|>')
+        self.assertEqual(r.finish, 'stop')
+        rec = r.record(lambda *_: True)
+        self.assertEqual((rec['runs'], rec['runs_by_tool']), (1, 1))
+        out = [e for e in r.events if e['kind'] == 'output'][0]
+        self.assertEqual((out['by'], out['shown']), ('tool', '42'))
+
+    def test_a_call_inside_thinking_is_answered_inside_thinking(self):
+        r = rollout(native_tool=True)
+        k = Kernel([(True, '42')])
+        play(r, 'hm ' + CALL + 'so 42</think>\n\n42<|im_end|>', k)
+        self.assertIn(CALL + '\n<tool_response>\n42\n</tool_response>\nso 42</think>', r.text())
+        self.assertEqual([e['by'] for e in r.events if e['kind'] == 'output'], ['tool in thinking'])
+
+    def test_a_call_with_no_code_is_told_so(self):
+        r = rollout(native_tool=True)
+        play(r, 'x</think>\n\n<tool_call>\n<function=python>\n</function>\n</tool_call>ok</think>\n\n1<|im_end|>', Kernel([]))
+        self.assertIn(tir4b.NO_CODE, r.text())
+        self.assertEqual(r.finish, 'stop')
+
+    def test_the_prompt_offers_the_tool(self):
+        self.assertEqual(tir4b.PYTHON_TOOL['function']['name'], 'python')
+        self.assertEqual(tir4b.PYTHON_TOOL['function']['parameters']['required'], ['code'])
 
 
 class FakeEngine:

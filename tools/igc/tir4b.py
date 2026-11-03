@@ -32,8 +32,17 @@ CONTEXT = 262144   # the model card's native context, all of it (developer, 2026
 # answers starts a new request and would reset it, so an arm with blocks would sample differently from one without.
 SAMPLING = dict(temperature=0.6, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0)
 MATH_TAIL = '\n\nPlease reason step by step, and put your final answer within \\boxed{}.'   # the model card's own math prompt
+# --native-tool: Qwen3.5's own tool format (the checkpoint's chat_template.jinja), not a fence the runner watches. The tool goes in the system
+# turn, the model calls it after its thinking, the answer comes back as a user turn of <tool_response>, and a new thinking opens.
+PYTHON_TOOL = dict(type='function', function=dict(
+    name='python', description='Runs Python 3 code in a sandbox and returns what it prints. Use it to compute, check or search instead of '
+                               'working numbers out by hand. Print every value you need.',
+    parameters=dict(type='object', properties=dict(code=dict(type='string', description='The program to run.')), required=['code'])))
+TOOL_TURN = '<|im_end|>\n<|im_start|>user\n<tool_response>\n{}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n'
+NO_CODE = '[no code parameter: call python with <parameter=code>]'
+_CODE = re.compile(r'<parameter=code>\n?(.*?)\n?</parameter>', re.S)
 TRAIN_KINDS = ('forced open', 'close after a fitting result')   # the words the model should learn to write itself, as START's Hint-RFT
-MASK_KINDS = ('output', 'inline value')   # what the kernel printed and the values software computed: read, never learned
+MASK_KINDS = ('output', 'inline value', 'tool response')   # what the kernel printed and the values software computed: read, never learned
 
 
 def output_block(body):
@@ -62,12 +71,13 @@ class Ids:
         # repeating() and line_back() read 198 and 271 as the line ends, the Flash-Next pack's ids: a tokenizer with others would blind them
         self.same_lines = self.lines == {198, 271}
         self.equals = {i for i in range(len(tokenizer)) if tokenizer.decode([i]).strip() == '='}   # the tokens an inline value follows
+        self.tool_close = tokenizer.convert_tokens_to_ids('</tool_call>')
 
 
 class Arm:
-    def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False):
+    def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False):
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
-        self.inline_calc = inline_calc
+        self.inline_calc, self.native_tool = inline_calc, native_tool
 
 
 # --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
@@ -160,6 +170,8 @@ class Rollout:
         stops = set(self.ids.ends)
         if self.arm.inline_calc and self.phase in ('think', 'answer'):
             stops |= self.ids.equals
+        if self.arm.native_tool and self.phase in ('think', 'answer'):
+            stops.add(self.ids.tool_close)
         if self.phase == 'answer':
             return min(left, CHUNK), stops
         stops.add(self.ids.think_close)
@@ -200,6 +212,16 @@ class Rollout:
                         self.done('stuck')
             return False
         self.checked = len(self.out)
+        if self.arm.native_tool and last == self.ids.tool_close and self.phase in ('think', 'answer'):
+            text = self.text()
+            m = _CODE.search(text[text.rfind('<tool_call>'):])
+            self.by = 'tool' if self.phase == 'answer' else 'tool in thinking'
+            self.events.append(dict(kind='tool call', by=self.by, at=len(self.out), model_tokens=self.model_tokens()))
+            self.pending = m.group(1) if m and m.group(1).strip() else None
+            if self.pending is None:
+                self.tool_reply(NO_CODE)
+                return False
+            return True
         if last in self.ids.ends:
             if self.phase == 'answer':
                 self.done('stop')
@@ -274,14 +296,17 @@ class Rollout:
     def enter(self, by):
         self.code_at, self.by, self.block, self.phase = len(self.text()), by, 0, 'block'
 
-    def run_pending(self, kernel_factory):
-        """Runs the block the model closed, then puts its output and, after a fitting result, the close into the thinking."""
-        code, self.pending = self.pending, None
-        if self.arm.close_repeat and self.seen.get(code, 0) + 1 >= self.arm.close_repeat:
-            self.inject(LOOP_CLOSE, 'repeated program close')
-            self.phase = 'answer'
-            return
-        self.seen[code] = self.seen.get(code, 0) + 1
+    def tool_reply(self, body):
+        """The tool's answer in the template's own shape: a user turn of <tool_response>, then a new thinking; or, for a call the model wrote
+        inside its thinking (not the template's place), the response inline where it stands."""
+        if self.by == 'tool':
+            self.inject(TOOL_TURN.format(body), 'tool response')
+        else:
+            self.inject(f'\n<tool_response>\n{body}\n</tool_response>\n', 'tool response')
+        self.phase = 'think'
+
+    def execute(self, code, kernel_factory):
+        """(finished, printed, seconds) of one run in this answer's kernel, which keeps its state across runs."""
         began = time.monotonic()
         if self.runs >= MAX_RUNS:
             ok, shown = None, SPENT
@@ -292,7 +317,27 @@ class Rollout:
             self.kernel = self.kernel or kernel_factory()
             ok, shown = self.kernel.run(code)
         self.runs += 1
-        took = round(time.monotonic() - began, 3)
+        return ok, shown, round(time.monotonic() - began, 3)
+
+    def run_tool(self, code, kernel_factory):
+        ok, shown, took = self.execute(code, kernel_factory)
+        at = len(self.out)
+        self.tool_reply(shown_text(ok, shown))
+        self.events[-1].update(kind='output', by=self.by, code=code[:20000], code_chars=len(code), shown=(shown or '')[:4096],
+                               shown_chars=len(shown or ''), ok=ok, seconds=took, fits=bool(ok) and bool((shown or '').strip()), run_at=at)
+
+    def run_pending(self, kernel_factory):
+        """Runs the block the model closed, then puts its output and, after a fitting result, the close into the thinking."""
+        code, self.pending = self.pending, None
+        if self.by in ('tool', 'tool in thinking'):
+            self.run_tool(code, kernel_factory)
+            return
+        if self.arm.close_repeat and self.seen.get(code, 0) + 1 >= self.arm.close_repeat:
+            self.inject(LOOP_CLOSE, 'repeated program close')
+            self.phase = 'answer'
+            return
+        self.seen[code] = self.seen.get(code, 0) + 1
+        ok, shown, took = self.execute(code, kernel_factory)
         fits = bool(ok) and bool((shown or '').strip())   # printed(): it finished and said something
         at = len(self.out)
         self.inject(output_block(shown_text(ok, shown)), 'output')
@@ -311,6 +356,7 @@ class Rollout:
                     right=right(self.row, text), finish=self.finish, tokens=self.model_tokens(), injected=len(self.out) - self.model_tokens(),
                     prompt_tokens=len(self.prompt), thinking_tokens=self.thought, seconds=self.seconds, events=self.events,
                     runs=len(runs), runs_by_model=sum(e['by'] == 'model' for e in runs), runs_forced=sum(e['by'] == 'forced' for e in runs),
+                    runs_by_tool=sum(e['by'] in ('tool', 'tool in thinking') for e in runs),
                     inline_values=sum(e['kind'] == 'inline value' for e in self.events),
                     first_run_at=runs[0]['model_tokens'] if runs else None, tool_seconds=round(sum(e['seconds'] for e in runs), 3))
 
@@ -417,13 +463,15 @@ def run(args):
     from tools.igc.select_rows import right
     from transformers import AutoTokenizer, GenerationConfig
     from vllm import LLM
-    if args.execute and not throwaway():
+    if (args.execute or args.native_tool) and not throwaway():
         raise SystemExit('a block runs only on a throwaway VM')
     rows = [json.loads(l) for l in Path(args.rows).read_text(encoding='utf-8').splitlines() if l.strip()]
     rows = rows[args.offset:args.offset + args.limit] if args.limit else rows[args.offset:]
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
-    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc)
+    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool)
+    if args.native_tool and tok.convert_tokens_to_ids('</tool_call>') == tok.unk_token_id:
+        raise SystemExit('the tokenizer has no </tool_call> token')
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     # --resume: answers already written are kept and not run again. A restart to fix the live count lost every answer in flight but not these.
@@ -432,7 +480,8 @@ def run(args):
     rollouts = []
     for row in rows:
         # As text, then encoded: transformers 5 returns a dict from tokenize=True, and list() of it gave the keys as the prompt.
-        text = tok.apply_chat_template([{'role': 'user', 'content': prompt_text(row)}], tokenize=False, add_generation_prompt=True, enable_thinking=True)
+        text = tok.apply_chat_template([{'role': 'user', 'content': prompt_text(row)}], tokenize=False, add_generation_prompt=True, enable_thinking=True,
+                                       tools=[PYTHON_TOOL] if args.native_tool else None)
         prompt = tok.encode(text, add_special_tokens=False)
         if not text.rstrip().endswith('<think>') or not all(isinstance(t, int) for t in prompt):
             raise SystemExit('the chat template did not end in an open <think>: ' + repr(text[-80:]))
@@ -570,6 +619,7 @@ def main(argv=None):
     r.add_argument('--loop-close', action='store_true')
     r.add_argument('--close-repeat', type=int, default=0)
     r.add_argument('--inline-calc', action='store_true')
+    r.add_argument('--native-tool', action='store_true', help="offer a python tool in Qwen3.5's own tool format and answer its calls")
     r.add_argument('--ids', action='store_true')
     r.add_argument('--memory', type=float, default=0.9)
     r.add_argument('--live', type=int, default=256)
