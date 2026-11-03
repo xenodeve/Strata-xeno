@@ -114,7 +114,7 @@ class Rollout:
             return None
         stops = set(self.ids.ends)
         if self.phase == 'answer':
-            return left, stops
+            return min(left, CHUNK), stops
         stops.add(self.ids.think_close)
         if self.phase == 'peek':
             return min(2, left), stops
@@ -122,11 +122,9 @@ class Rollout:
             return min(64, left), stops | self.ids.lines
         if self.phase == 'block':
             return min(MAX_BLOCK - self.block, left), stops | self.ids.fence
-        most = left
+        most = min(left, CHUNK)   # every arm is read for a loop between chunks: the stuck stop of the bench, or the close
         if self.arm.execute:
             stops |= self.ids.fence
-        if self.arm.loop_close:
-            most = min(most, CHUNK)
         if self.arm.force_after and not self.forced and self.thought < self.arm.force_after:
             most = min(most, self.arm.force_after - self.thought)
         return most, stops
@@ -150,6 +148,8 @@ class Rollout:
         if self.phase == 'answer':
             if self.left() <= 0:
                 self.done('length')
+            elif looping(self.out):
+                self.done('stuck')
             return False
         if last == self.ids.think_close:
             if self.phase == 'block':
@@ -198,9 +198,12 @@ class Rollout:
         if self.arm.force_after and not self.forced and self.thought >= self.arm.force_after:
             self.phase = 'seek'
             return False
-        if self.arm.loop_close and looping(self.out):
-            self.inject(LOOP_CLOSE, 'loop close')
-            self.phase = 'answer'
+        if looping(self.out):
+            if self.arm.loop_close:
+                self.inject(LOOP_CLOSE, 'loop close')
+                self.phase = 'answer'
+            else:   # the bench's guard in every arm, MIP or not: a loop that cannot leave would run to the end of the context alone (external_bench)
+                self.done('stuck')
         return False
 
     def enter(self, by):
@@ -334,8 +337,8 @@ def run(args):
             rollouts.append(Rollout(row, k, list(prompt), arm, ids, tok, seed_of(args.seed, row['id'], k)))
     if args.force_after and not args.execute:
         raise SystemExit('--force-after opens a block that only --execute runs')
-    if args.loop_close and not ids.same_lines:
-        raise SystemExit(f'--loop-close: the line ends are {sorted(ids.lines)}, not the 198 and 271 the loop checks read')
+    if not ids.same_lines:   # the stuck stop and the loop close both read them
+        raise SystemExit(f'the line ends are {sorted(ids.lines)}, not the 198 and 271 the loop checks read')
     began = time.monotonic()
     kwargs = dict(model=args.model, dtype='bfloat16', max_model_len=CONTEXT, gpu_memory_utilization=args.memory, enable_prefix_caching=True,
                   language_model_only=True, seed=args.seed)

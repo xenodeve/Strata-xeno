@@ -153,6 +153,15 @@ class ForcedBlock(unittest.TestCase):
         self.assertEqual((r.runs, r.events, r.spans), (0, [], []))
         self.assertEqual(r.text(), 'a ```python\nprint(1)\n``` b</think>\n\nx<|im_end|>')
 
+    def test_a_loop_stops_a_plain_arm_and_closes_a_sandbox_arm(self):
+        plain = rollout()
+        play(plain, 'ab' * 700 + '</think>\n\nx<|im_end|>', Kernel([]))
+        self.assertEqual(plain.finish, 'stuck')
+        self.assertEqual(len(plain.out), tir4b.CHUNK)   # read between chunks, as the bench reads every 64 tokens
+        closed = rollout(execute=True, loop_close=True)
+        play(closed, 'ab' * 700, Kernel([]))
+        self.assertIn('loop close', kinds(closed))
+
     def test_end_of_turn_in_thinking_after_a_run_closes(self):
         r = rollout(execute=True)
         play(r, '```python\nprint(2)\n```hm<|im_end|>2<|im_end|>', Kernel([(True, '2')]))
