@@ -51,13 +51,18 @@ HINT_GAP = 1024   # thinking tokens between two hints
 # value put in at `=` came for a piece, in a form the method could not use, and looped. This opens the reply asking for the whole step as
 # one expression; its value is computed whole, sign and uneven quotient included, as Qwenputer's model writes `48213 x 9917 =`.
 WHOLE_HINT = 'Let me compute the whole expression exactly in one step:\n'
+# --check-hand: what the model already worked out by hand is checked at the end of its line, and a wrong value is answered with the right
+# one (developer, 2026-11-04). On 82 Base answers 462 of 8,924 hand values were wrong, 5.6 an answer; rewrites (`= 189 + 7 = 196`), rounding
+# to the places written and a long division's uneven quotient digit are not wrong.
+CORRECTION = 'Correction: {expr} = {right}, not {wrote}.\n'
+_WROTE = re.compile(r'\s*(-?\d[\d,]*(?:\.\d+)?)(?![\d.,]*\d)(?![ ]*(?:[+\-*/^(]|\\times|\\cdot|\\frac|\\div|\\sqrt|\d))')
 # --loop-hint: 14 of the control's 16 misses on the r1 rows were loops, 13 of them mid-work, several of them searches by hand. A loop in the
 # thinking is cut back to one round and a program opens to test the idea, LOOP_HINTS times; the next loop ends the answer as before.
 LOOP_HINT = 'I keep going around the same idea. Let me test it with python instead.\n```python\n'
 LOOP_HINTS = 3
 # The words the model should learn to write itself, as START's Hint-RFT keeps its hints in the text it trains on.
 TRAIN_KINDS = ('forced open', 'close after a fitting result', 'hint open', 'trust hint', 'loop hint')
-MASK_KINDS = ('output', 'inline value', 'tool response')   # what the kernel printed and the values software computed: read, never learned
+MASK_KINDS = ('output', 'inline value', 'tool response', 'hand check')   # what the kernel printed and the values software computed: read, never learned
 
 
 def output_block(body):
@@ -91,10 +96,10 @@ class Ids:
 
 class Arm:
     def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
-                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False):
+                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False):
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
         self.inline_calc, self.native_tool, self.hint_calc, self.loop_hint = inline_calc, native_tool, hint_calc, loop_hint
-        self.inline_plain, self.whole_hint = inline_plain, whole_hint
+        self.inline_plain, self.whole_hint, self.check_hand = inline_plain, whole_hint, check_hand
 
 
 # --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
@@ -162,6 +167,8 @@ def inline_value(before, whole=False):
         return None
     if head and not head[-1].isspace() and not _BOUNDARY.search(head[-3:]):   # the expression starts after a space or a mark, not inside a word
         return None
+    if re.search(r'\d[.,]$', head) or re.match(r'-?0\d', expr):
+        return None   # the tail of a longer number: `12,510,204 \times 100` was read as 204 x 100 and "corrected" (dm mul_big 4617)
     s = expr.replace(',', '')
     for a, b in _LATEX:
         s = re.sub(a, b, s)
@@ -219,6 +226,7 @@ class Rollout:
         if not thinking:
             self.phase = 'answer'
         self.whole_pending = False   # the next value is the whole step the --whole-hint asked for
+        self.checks = []   # --check-hand: (index of the `=` in text(), expression, exact value) whose line has not ended yet
         if arm.whole_hint:
             self.inject(WHOLE_HINT, 'whole hint')
             self.whole_pending = True
@@ -270,6 +278,10 @@ class Rollout:
             stops |= self.ids.equals
         if self.arm.native_tool and self.phase in ('think', 'answer'):
             stops.add(self.ids.tool_close)
+        if self.arm.check_hand and self.phase in ('think', 'answer'):
+            stops |= self.ids.equals
+            if self.checks:   # the line end, so a correction follows the line it corrects
+                stops |= self.ids.lines
         if self.phase == 'answer':
             return min(left, CHUNK), stops
         stops.add(self.ids.think_close)
@@ -292,6 +304,18 @@ class Rollout:
         if self.phase != 'answer' and self.phase != 'block':
             self.thought += len(new)
         last = new[-1] if new else None
+        if self.arm.check_hand and self.phase in ('think', 'answer'):
+            if self.checks:
+                self.run_checks()
+            if last in self.ids.equals and not self.arm.inline_calc:
+                text = self.text()
+                at = len(text.rstrip()) - 1
+                value = inline_value(text[:at])
+                line = text[:at].rsplit('\n', 1)[-1]
+                m = _TAIL.search(line)
+                # a minus before the expression is its sign: `-(25 * 130) = -3250` was "corrected" to 3250 (dm 3578)
+                if value is not None and m and not line[:m.start(1)].rstrip().endswith('-'):
+                    self.checks.append((at, m.group(1).strip(), value))
         if self.arm.hint_calc and last in self.ids.equals and self.phase == 'think' and self.hint_due():
             return False
         if (self.arm.inline_calc or self.arm.hint_calc) and last in self.ids.equals and self.phase in ('think', 'answer'):
@@ -405,6 +429,41 @@ class Rollout:
             self.phase = 'answer'
         else:
             self.done('stuck')
+
+    def run_checks(self):
+        """The hand values whose line has ended, against their exact values; a correction for each wrong one, after the line."""
+        text = self.text()
+        wrong, left = [], []
+        for at, expr, value in self.checks:
+            end = text.find('\n', at)
+            if end < 0:
+                left.append((at, expr, value))
+                continue
+            got = _WROTE.match(text[at + 1:end])
+            if not got:
+                continue   # no number after the `=`, or one the line goes on computing from: a rewrite
+            wrote = got.group(1).replace(',', '')
+            try:
+                places = len(wrote.split('.')[1]) if '.' in wrote else 0
+                off = abs(Fraction(wrote) - Fraction(value))
+            except (ValueError, ZeroDivisionError):
+                continue
+            if off <= (Fraction(1, 2 * 10 ** places) if places else 0):   # rounded to the places written is right
+                continue
+            bare = re.sub(r'[\s(){}]', '', expr).replace('\\div', '/').replace('\\frac', '')
+            if not places and re.fullmatch(r'\d+/\d+', bare) and Fraction(wrote) == Fraction(value).numerator // Fraction(value).denominator:
+                continue   # a long division's quotient digit, `13 \div 2 = 6 remainder 1` (dm mul_big 4267)
+            if '/' in value:   # an uneven quotient the model wrote as a decimal: the right one in its own places, not 5000000000/6744908131
+                f = Fraction(value)
+                scaled = (abs(f) * 10 ** max(places, 1) * 2 + 1) // 2   # rounded half up
+                digits = str(scaled).rjust(max(places, 1) + 1, '0')
+                value = ('-' if f < 0 else '') + digits[:-max(places, 1)] + '.' + digits[-max(places, 1):]
+            wrong.append((expr, value, got.group(1)))
+        self.checks = left
+        for expr, value, wrote in wrong:
+            self.inject(('' if self.out and self.out[-1] in self.ids.lines else '\n') + CORRECTION.format(expr=expr, right=value, wrote=wrote),
+                        'hand check')
+            self.events[-1].update(expr=expr[:200], value=value, wrote=wrote)
 
     def hint_due(self):
         """At an `=` that ends tedious arithmetic, spaced HINT_GAP apart: the line goes back and a hinted program opens. True when it opened."""
@@ -614,7 +673,7 @@ def run(args):
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint, args.inline_plain,
-              args.whole_hint)
+              args.whole_hint, args.check_hand)
     if args.whole_hint and not args.inline_calc:
         raise SystemExit('--whole-hint asks for a value that only --inline-calc puts in')
     if args.greedy:   # drive() and arm.json read SAMPLING: temperature 0 is vLLM's greedy
@@ -770,6 +829,7 @@ def main(argv=None):
     r.add_argument('--loop-close', action='store_true')
     r.add_argument('--close-repeat', type=int, default=0)
     r.add_argument('--inline-calc', action='store_true')
+    r.add_argument('--check-hand', action='store_true', help='check every hand value at the end of its line; a wrong one gets a correction')
     r.add_argument('--whole-hint', action='store_true', help='open the reply asking for the whole step as one expression, computed whole')
     r.add_argument('--inline-plain', action='store_true', help="the value alone, as Qwenputer prints it, without the engine's ' (exact)'")
     r.add_argument('--native-tool', action='store_true', help="offer a python tool in Qwen3.5's own tool format and answer its calls")

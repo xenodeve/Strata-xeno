@@ -213,6 +213,8 @@ class InlineCalc(unittest.TestCase):
         self.assertIsNone(v('17 '))                  # no operator
         self.assertIsNone(v('1.2.3 + 1 '))           # a section number: F('1.2').F('3') killed the whole runner (gen-mt5)
         self.assertIsNone(v('(1)(2) + 3 '))          # a call on a number
+        self.assertIsNone(v('so 12,510,204 \\times 100 '))   # a thousands separator is not a boundary: it was read as 204 x 100 (dm 4617)
+        self.assertIsNone(v('so 030 \\times 2 '))            # a number that starts with 0 is a cut one
 
     def test_the_rollout_puts_the_value_in(self):
         r = rollout(inline_calc=True)
@@ -411,6 +413,39 @@ class WholeHint(unittest.TestCase):
         play(r, '$-6 \\div 4 =$ then 21 \\div 19 = x<|im_end|>', Kernel([]))
         self.assertIn('$-6 \\div 4 = -1.5$', r.text())
         self.assertIn('21 \\div 19 = x', r.text())   # after the whole value, an uneven piece is left alone again
+
+
+class CheckHand(unittest.TestCase):
+    """--check-hand: what the model already worked out by hand is checked, and a wrong value is answered with the right one."""
+    def test_a_wrong_hand_value_gets_a_correction(self):
+        r = rollout(check_hand=True)
+        play(r, 'so 144 - 144 - 572 - 168 + 96 = -744.\nthen 2 + 2 = 4 and</think>\n\nx<|im_end|>', Kernel([]))
+        self.assertIn('= -744.\n' + tir4b.CORRECTION.format(expr='144 - 144 - 572 - 168 + 96', right='-644', wrote='-744'), r.text())
+        ev = [e for e in r.events if e['kind'] == 'hand check']
+        self.assertEqual([(e['wrote'], e['value']) for e in ev], [('-744', '-644')])
+
+    def test_right_values_rounding_and_rewrites_pass(self):
+        r = rollout(check_hand=True)
+        # e: a long division's quotient digit with its remainder (dm mul_big 4267 would have been "corrected" to 6.5 six times)
+        play(r, 'a 9 \\cdot 21 + 7 = 189 + 7 = 196.\nb 151.45 - 51.47 = 99.98\nc 2 / 3 = 0.67\nd 1 + 1 = 2\ne 13 \\div 2 = 6 remainder 1\n'
+                '</think>\n\nx<|im_end|>', Kernel([]))
+        self.assertEqual([e for e in r.events if e['kind'] == 'hand check'], [])
+
+    def test_a_minus_before_the_expression_is_left_alone(self):
+        r = rollout(check_hand=True)   # dm 3578: `-(25 * 130) = -3250` read as (25 * 130) and "corrected" to 3250
+        play(r, 'so -(25 * 130) = -3250\nok</think>\n\nx<|im_end|>', Kernel([]))
+        self.assertEqual([e for e in r.events if e['kind'] == 'hand check'], [])
+
+    def test_an_uneven_quotient_is_corrected_in_the_places_written(self):
+        r = rollout(check_hand=True)   # dm div 7815-like: a decimal written for 5 / 6.744908131, wrong in its 4th place
+        play(r, 'so 5 / 6.744908131 = 0.7419\nok</think>\n\nx<|im_end|>', Kernel([]))
+        self.assertIn(tir4b.CORRECTION.format(expr='5 / 6.744908131', right='0.7413', wrote='0.7419'), r.text())
+
+    def test_checked_at_the_end_of_its_line_only(self):
+        # the value is only known once the model has moved on: a check at the `=` itself would see no value yet
+        r = rollout(check_hand=True)
+        play(r, '123 \\times 2 = 247 so\nok</think>\n\nx<|im_end|>', Kernel([]))
+        self.assertIn('247 so\n' + tir4b.CORRECTION.format(expr='123 \\times 2', right='246', wrote='247'), r.text())
 
 
 class FakeEngine:
