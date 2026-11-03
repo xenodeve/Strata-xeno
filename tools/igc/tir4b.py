@@ -81,9 +81,11 @@ class Rollout:
         self.kernel = None
         self.started = time.monotonic()
         self.seconds = None
+        self.cap = 0   # --max-tokens: training data only; an answer past it is never the shortest right one kept
 
     def left(self):
-        return CONTEXT - len(self.prompt) - len(self.out) - 64
+        room = CONTEXT - len(self.prompt) - len(self.out) - 64
+        return min(room, self.cap - len(self.out)) if self.cap else room
 
     def model_tokens(self):
         return len(self.out) - sum(e - s for s, e, _ in self.spans)
@@ -323,8 +325,7 @@ def run(args):
     if args.execute and not throwaway():
         raise SystemExit('a block runs only on a throwaway VM')
     rows = [json.loads(l) for l in Path(args.rows).read_text(encoding='utf-8').splitlines() if l.strip()]
-    if args.limit:
-        rows = rows[:args.limit]
+    rows = rows[args.offset:args.offset + args.limit] if args.limit else rows[args.offset:]
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat)
@@ -339,6 +340,7 @@ def run(args):
             raise SystemExit('the chat template did not end in an open <think>: ' + repr(text[-80:]))
         for k in range(args.samples):
             rollouts.append(Rollout(row, k, list(prompt), arm, ids, tok, seed_of(args.seed, row['id'], k)))
+            rollouts[-1].cap = args.max_tokens
     if args.force_after and not args.execute:
         raise SystemExit('--force-after opens a block that only --execute runs')
     if not ids.same_lines:   # the stuck stop and the loop close both read them
@@ -452,6 +454,8 @@ def main(argv=None):
     r.add_argument('--samples', type=int, default=1)
     r.add_argument('--seed', type=int, default=1)
     r.add_argument('--limit', type=int, default=0)
+    r.add_argument('--offset', type=int, default=0)
+    r.add_argument('--max-tokens', type=int, default=0)   # 0: the whole context, as every evaluated arm runs
     r.add_argument('--force-after', type=int, default=0)
     r.add_argument('--execute', action='store_true')
     r.add_argument('--close-fit', action='store_true')
