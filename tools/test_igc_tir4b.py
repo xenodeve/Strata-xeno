@@ -186,7 +186,11 @@ class InlineCalc(unittest.TestCase):
         v = tir4b.inline_value
         self.assertEqual(v('so 3 \\times 4 \\times 7 '), '84')
         self.assertEqual(v('then 14641 - 2662 - 4235 + 352 + 324 '), '8420')   # a sum the 4B got wrong by hand (4d822b73)
-        self.assertEqual(v('$0.1 + 0.2 '), '3/10')                              # exact, not a float
+        self.assertEqual(v('$0.1 + 0.2 '), '0.3')                               # exact, not a float, and in the model's own decimals
+        self.assertEqual(v('0.9 \\times 5 '), '4.5')                             # dm 6890: 9/2 here broke the model's decimal sum into a loop
+        self.assertEqual(v('7.95922042 \\times 5 '), '39.7961021')
+        self.assertEqual(v('1/3 + 1 '), '4/3')                                  # no terminating decimal: the reduced fraction
+        self.assertEqual(v('0.5 - 0.75 '), '-0.25')                             # a negative decimal keeps its sign
         self.assertEqual(v('\\frac{3}{4} + 1/4 '), '1')
         self.assertEqual(v('(140 + 56) / 28 '), '7')
         self.assertEqual(v('2^{10} '), '1024')
@@ -212,6 +216,12 @@ class InlineCalc(unittest.TestCase):
         self.assertEqual(r.record(lambda *_: True)['inline_values'], 1)
         out = [s for s in r.spans if s[2] == 'inline value'][0]
         self.assertEqual(TOK.decode(r.out[out[0]:out[1]]), ' 42 (exact)')
+
+    def test_plain_puts_in_only_the_number(self):
+        # --inline-plain, as Qwenputer prints: ` (exact)` inside `$...$` left the model's math unclosed, and it copied the tag
+        r = rollout(inline_calc=True, inline_plain=True)
+        play(r, 'so $6 \\times 7 =$ and on</think>\n\n42<|im_end|>', Kernel([]))
+        self.assertIn('$6 \\times 7 = 42$ and on', r.text())
 
     def test_off_by_default(self):
         r = rollout()

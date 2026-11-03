@@ -87,9 +87,10 @@ class Ids:
 
 class Arm:
     def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
-                 hint_calc=False, loop_hint=False):
+                 hint_calc=False, loop_hint=False, inline_plain=False):
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
         self.inline_calc, self.native_tool, self.hint_calc, self.loop_hint = inline_calc, native_tool, hint_calc, loop_hint
+        self.inline_plain = inline_plain
 
 
 # --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
@@ -167,7 +168,27 @@ def inline_value(before):
         return None
     if value is None or abs(value.numerator) > 10 ** 30 or value.denominator > 10 ** 12:
         return None
-    return str(value.numerator) if value.denominator == 1 else f'{value.numerator}/{value.denominator}'
+    return spelled(value)
+
+
+def spelled(value):
+    """An integer as itself, a value with a terminating decimal as that decimal (the model's own spelling: 9/2 written for 0.9 x 5 broke its
+    decimal sum into a loop, dm 6890), and only the rest as a reduced fraction, as Qwenputer's library prints."""
+    if value.denominator == 1:
+        return str(value.numerator)
+    d = value.denominator
+    twos = fives = 0
+    while d % 2 == 0:
+        d //= 2
+        twos += 1
+    while d % 5 == 0:
+        d //= 5
+        fives += 1
+    if d != 1:
+        return f'{value.numerator}/{value.denominator}'
+    places = max(twos, fives)
+    digits = str(abs(value.numerator) * 10 ** places // value.denominator).rjust(places + 1, '0')
+    return ('-' if value < 0 else '') + digits[:-places] + '.' + digits[-places:]
 
 
 class Rollout:
@@ -257,7 +278,7 @@ class Rollout:
             text = self.text()
             value = inline_value(text[:text.rstrip().rfind('=')]) if self.arm.inline_calc else None
             if value is not None:   # the value the model would have computed, computed: the reasoning goes on from it
-                self.inject(f' {value} (exact)', 'inline value')
+                self.inject(f' {value}' if self.arm.inline_plain else f' {value} (exact)', 'inline value')
                 self.events[-1].update(expr=_TAIL.search(text[:text.rstrip().rfind('=')].rsplit('\n', 1)[-1]).group(1).strip()[:200], value=value)
             if self.left() <= 0:
                 self.done('length')
@@ -569,7 +590,7 @@ def run(args):
     rows = rows[args.offset:args.offset + args.limit] if args.limit else rows[args.offset:]
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
-    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint)
+    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint, args.inline_plain)
     if args.greedy:   # drive() and arm.json read SAMPLING: temperature 0 is vLLM's greedy
         SAMPLING.update(temperature=0.0)
     if args.native_tool and tok.convert_tokens_to_ids('</tool_call>') == tok.unk_token_id:
@@ -723,6 +744,7 @@ def main(argv=None):
     r.add_argument('--loop-close', action='store_true')
     r.add_argument('--close-repeat', type=int, default=0)
     r.add_argument('--inline-calc', action='store_true')
+    r.add_argument('--inline-plain', action='store_true', help="the value alone, as Qwenputer prints it, without the engine's ' (exact)'")
     r.add_argument('--native-tool', action='store_true', help="offer a python tool in Qwen3.5's own tool format and answer its calls")
     r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")
     r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
