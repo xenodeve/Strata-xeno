@@ -51,6 +51,11 @@ HINT_GAP = 1024   # thinking tokens between two hints
 # value put in at `=` came for a piece, in a form the method could not use, and looped. This opens the reply asking for the whole step as
 # one expression; its value is computed whole, sign and uneven quotient included, as Qwenputer's model writes `48213 x 9917 =`.
 WHOLE_HINT = 'Let me compute the whole expression exactly in one step:\n'
+# --whole-plain: v1 above took base's 121 to 127 of 160 at 0.41x tokens, but lost 14 mul_div_multiple_longer rows: the model rewrote the
+# question's plain nested expression as LaTeX \frac inside \frac in a $$ block with no `=`, so the whole was never computed. The question's
+# own form is what the evaluator reads exactly (-303, 78 and 319 for three of those rows), so this asks for that form.
+WHOLE_HINT_PLAIN = ('Let me write the whole calculation as one plain expression, with +, -, *, / and parentheses, in the order the question '
+                    'gives, and compute it exactly:\n')
 # --check-hand: what the model already worked out by hand is checked at the end of its line, and a wrong value is answered with the right
 # one (developer, 2026-11-04). On 82 Base answers 462 of 8,924 hand values were wrong, 5.6 an answer; rewrites (`= 189 + 7 = 196`), rounding
 # to the places written and a long division's uneven quotient digit are not wrong.
@@ -96,10 +101,11 @@ class Ids:
 
 class Arm:
     def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
-                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False):
+                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False, whole_plain=False):
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
         self.inline_calc, self.native_tool, self.hint_calc, self.loop_hint = inline_calc, native_tool, hint_calc, loop_hint
         self.inline_plain, self.whole_hint, self.check_hand = inline_plain, whole_hint, check_hand
+        self.whole_plain = whole_plain
 
 
 # --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
@@ -228,7 +234,7 @@ class Rollout:
         self.whole_pending = False   # the next value is the whole step the --whole-hint asked for
         self.checks = []   # --check-hand: (index of the `=` in text(), expression, exact value) whose line has not ended yet
         if arm.whole_hint:
-            self.inject(WHOLE_HINT, 'whole hint')
+            self.inject(WHOLE_HINT_PLAIN if arm.whole_plain else WHOLE_HINT, 'whole hint')
             self.whole_pending = True
         self.code_at = self.fence_at = None
         self.by = None
@@ -673,7 +679,7 @@ def run(args):
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint, args.inline_plain,
-              args.whole_hint, args.check_hand)
+              args.whole_hint, args.check_hand, args.whole_plain)
     if args.whole_hint and not args.inline_calc:
         raise SystemExit('--whole-hint asks for a value that only --inline-calc puts in')
     if args.greedy:   # drive() and arm.json read SAMPLING: temperature 0 is vLLM's greedy
@@ -829,6 +835,7 @@ def main(argv=None):
     r.add_argument('--loop-close', action='store_true')
     r.add_argument('--close-repeat', type=int, default=0)
     r.add_argument('--inline-calc', action='store_true')
+    r.add_argument('--whole-plain', action='store_true', help="--whole-hint asking for one plain expression in the question's order, not LaTeX")
     r.add_argument('--check-hand', action='store_true', help='check every hand value at the end of its line; a wrong one gets a correction')
     r.add_argument('--whole-hint', action='store_true', help='open the reply asking for the whole step as one expression, computed whole')
     r.add_argument('--inline-plain', action='store_true', help="the value alone, as Qwenputer prints it, without the engine's ' (exact)'")

@@ -408,6 +408,13 @@ class WholeHint(unittest.TestCase):
         self.assertTrue(r.events[1]['whole'])
         self.assertTrue(r.record(__import__('tools.igc.select_rows', fromlist=['right']).right)['right'])
 
+    def test_the_plain_hint_and_a_nested_expression(self):
+        # dm mul_div_multiple_longer 1020: the question's own nested form, which v1 rewrote as \frac inside \frac and never computed
+        r = tir4b.Rollout(dict(id='a', suite='arith', answer='319'), 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True,
+                          whole_plain=True), IDS, TOK, seed=1, thinking=False)
+        play(r, '(-1*-638*(-7)/(-7))/(((-62)/(-279))/(((-170)/3060)/(1/(-2)))) = so \\boxed{319}<|im_end|>', Kernel([]))
+        self.assertTrue(r.text().startswith(tir4b.WHOLE_HINT_PLAIN + '(-1*-638*(-7)/(-7))/(((-62)/(-279))/(((-170)/3060)/(1/(-2)))) = 319 so'))
+
     def test_later_pieces_follow_the_usual_rules(self):
         r = tir4b.Rollout(ROW, 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True), IDS, TOK, seed=1, thinking=False)
         play(r, '$-6 \\div 4 =$ then 21 \\div 19 = x<|im_end|>', Kernel([]))
