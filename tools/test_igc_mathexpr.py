@@ -116,6 +116,28 @@ class WrongRelations(unittest.TestCase):
                          [('1/731721563', '1.36664166 \\times 10^{-9}', '1.36664006 \\times 10^{-9}')])
         self.assertEqual(wrong_relations('$-3312 / 96 = -104 / 3$'), [('-3312 / 96', '-104 / 3', '-34.5')])   # 0.5 % off is wrong
 
+    def test_aime_style_lines_that_are_right(self):
+        # real lines of the 4B's AIME / HMMT answers the line checker once "corrected"
+        for line in ('*   $12^2 = 6^2 + (\\frac{s-r}{2})^2$.', '$$576 + (144 \\times 3) = 2(r^2 + s^2)$$',
+                     'Alternatively, $9! / (6! 2! 1!) = \\binom{9}{6} \\binom{3}{2} \\binom{1}{1} = \\binom{9}{6} \\binom{3}{2} = 84 \\times 3 = 252$.',
+                     '$3+1 \\times 1+1 = 8$.', 'Check: $12(-66^2) - (-66)(99) - 6(99^2) = 0$. Yes.',
+                     'If $(x,y)$ is in both, then $3/4 = -2/3$ (for $y \\ne 0$).',
+                     "$y' = \\frac{\\sqrt{3}}{2}(1.31) + \\frac{1}{2}(-2.28) \\approx 0.866(1.31) - 1.14 \\approx 1.13 - 1.14 \\approx -0.01$.",
+                     "$x'^2 - 4 \\approx 2.6269^2 - 4 \\approx 6.89 - 4 = 2.89$.", '$9(-1.55)^4 \\approx 9(5.78) = 52$.',
+                     '$-508/9 + 152 = -56.44 + 152 \\neq 0$.', '$0.23 + 1.152 - 22.88 + 33.6 + 96 = 130.98 - 22.88 = 108$.',
+                     '$464.7 - 483 = -18$.', '$6^9 \\approx 10^7$.', '*   $= 126 + 50/3 = 126 + 16.67 = 142.67$.',
+                     'Then $u^2 (1 + \\frac{169 \\times 3}{841}) = 169$.'):
+            self.assertEqual(wrong_relations(line), [], line)
+
+    def test_aime_style_lines_that_are_wrong(self):
+        for line, right in (('Why did I think $288 \\times 315 = 90360$?', '90720'), ('$\\frac{9!}{4!} = 9 \\times 8 \\times 7 \\times 6 = 3024$.', '15120'),
+                            ('*   So expected number of intersections with base lines is $25 \\times 2/3 + 25 \\times 2/3 = 50/3$.', '100/3'),
+                            ('*   So $E[R] = 29 + 478/3 = 562/3$.', '565/3'), ('*   $R = 1 + 3 + (3-1) = 5$.', '6'),
+                            ('$9.74 + 19.10 - 148.78 + 181.68 = 187.92 - 148.78 = 39.14$.', '61.74'),
+                            ('$94080 = 9408 \\times 10 = 2 \\times 4704 \\times 5 = 10 \\times 4704$.', '94080')):
+            got = wrong_relations(line)
+            self.assertTrue(got and got[0][2] == right, (line, got))
+
     def test_other_relations(self):
         self.assertEqual(wrong_relations('$115/18 \\approx 6.83$'), [('115/18', '6.83', '6.39')])
         self.assertEqual(wrong_relations('$2016 \\equiv 18 \\pmod{1000}$'), [('2016', '18 \\pmod{1000}', '16 \\pmod{1000}')])

@@ -112,8 +112,10 @@ class _Parser:
                     value = value * right if v == MUL else value / right
             elif kind == 'num' and self.i and self.t[self.i - 1][1] == '!':
                 value = value * self.unary()   # \frac{9!}{4! 3! 2!}
-            elif v in ('(', 'frac', 'sqrt', '{') and self.i and self.t[self.i - 1][1] in (')', '}', '!', '%') or \
-                    v in ('(', 'sqrt') and self.i and self.t[self.i - 1][0] == 'num' and self.i not in self.spaced:
+            elif v in ('(', 'frac', 'sqrt', '{', 'binom') and self.i and self.t[self.i - 1][1] in (')', '}', '!', '%') or \
+                    v in ('(', 'sqrt') and self.i and self.t[self.i - 1][0] == 'num' and self.i not in self.spaced or \
+                    v == 'binom' and self.i and self.t[self.i - 1][0] == 'num':
+                # 2(3 + 4), (2)(3), \binom{9}{6} \binom{3}{2}, 3\binom{4}{2}
                 value = value * self.unary()   # 2(3 + 4), (2)(3), (a)\frac{..}{..}
             elif v == 'frac' and self.i and self.t[self.i - 1][0] == 'num':
                 raise _NotExact('a mixed number: 2\\frac{1}{3} is 2 1/3 or 2/3')
@@ -279,8 +281,8 @@ def _symbol_before(head):
         return False
     if h[-1].isdigit() or h[-1] in ')]}':
         return True
-    word = re.search(r'([A-Za-z]+)(?:_\{?\w+\}?|\d*)$', h)
-    return bool(word) and (len(word.group(1)) == 1 or '_' in h[word.start():])
+    word = re.search(r'([A-Za-z]+)(?:_\{?\w+\}?|\^\{?\w+\}?|\d*|\')*$', h)
+    return bool(word) and (len(word.group(1)) == 1 or '_' in h[word.start():] or '^' in h[word.start():])
 
 
 def expression_before(text):
@@ -293,6 +295,8 @@ def expression_before(text):
             continue
         if line[i] in '-−' and _symbol_before(line[:i]):
             continue
+        if line[i] == '(' and re.search(r'[A-Za-z]\S*\s*$', line[:i]) and _symbol_before(line[:i]):
+            continue   # `u^2 (1 + \frac{169 \times 3}{841})`: a factor of a product on a symbol, no value of its own
         if re.search(r'(?:[+\-*/^×÷·⋅−]|\\times|\\cdot|\\div)\s*$', line[:i]) and _symbol_before(re.sub(
                 r'(?:[+\-*/^×÷·⋅−]|\\times|\\cdot|\\div)\s*$', '', line[:i])):
             continue   # `Z / (7/3)`: the tail of an expression on a symbol, not a value of its own
@@ -333,6 +337,7 @@ _RELATION = re.compile(r'(?<![<>!=])(=|\\approx|≈|\\to\b|\\rightarrow|→|->)(
 _PLAIN = re.compile(r'-?\d[\d,]*(?:\.(\d+))?')
 _SCIENTIFIC = re.compile(r'-?\d+(?:\.(\d+))?\s*(?:\\times|×|\*|\\cdot)\s*(?:10\s*\^\s*\{?\s*(-?\d+)\s*\}?|1(0+)(?![\d.]))')
 _ROUGH = re.compile(r'\s*(?:\.\.\.|\\dots|\\ldots|…)')
+_GOES_ON = re.compile(r'\s*(?:[+\-*/^(×÷·⋅−]|\\times|\\cdot|\\div|\\d?t?frac|\\sqrt|\\left|\\binom)')
 
 
 def _value_after(segment):
@@ -348,8 +353,10 @@ def _value_after(segment):
         if value is None:
             continue
         rest = s[end:]
-        if rest[:1].isalpha() or _ROUGH.match(rest):
-            return None
+        if rest[:1].isalpha() or rest[:1] and rest[0] in '_\\' and not rest.startswith(('\\ne', '\\le', '\\ge', '\\quad', '\\text', '\\implies', '\\Rightarrow',
+                                                                            '\\approx', '\\equiv', '\\pmod', '\\to', '\\rightarrow', '\\\\')) \
+                or _ROUGH.match(rest) or _GOES_ON.match(rest):
+            return None   # 4.8k; 20.1852...; `6^2 + (\frac{s-r}{2})^2` or `2(r^2 + s^2)`: algebra goes on, the number is no value
         return head.strip(), value, rest
     return None
 
@@ -408,6 +415,48 @@ def _estimate(before, after):
     return True
 
 
+_POWER_OF_TEN = re.compile(r'10\s*\^\s*\{?\s*-?\d+\s*\}?|10{2,}')
+_LONE = re.compile(r'\(?\s*-?\d[\d,]*(?:\.\d+)?\s*(?:/\s*-?\d[\d,]*(?:\.\d+)?)?\s*\)?')
+_MUL_SPLIT = re.compile(r'\\times|\\cdot|×|\*|·')
+
+
+def _constants(left, right):
+    """A fraction in lowest terms set equal to another fraction: `then 3/4 = -2/3` states a contradiction, it computes nothing. A fraction
+    reduced (-3312 / 96 = -104 / 3) or turned into a decimal (115/18 \\approx 6.83) is a calculation, and checked."""
+    m = re.fullmatch(r'\(?\s*(-?\d+)\s*/\s*(-?\d+)\s*\)?', left.strip())
+    if not m or not re.fullmatch(r'\(?\s*-?\d+\s*/\s*-?\d+\s*\)?', right.strip()):
+        return False
+    from math import gcd
+    return gcd(int(m.group(1)), int(m.group(2))) == 1
+
+
+def _reads_otherwise(expr, wrote):
+    """True when a looser reading of `expr` gives what was written: `3+1 \\times 1+1` meant as (3+1)(1+1), or `(-66^2)` meant as
+    (-66)^2. Models write both; a correction by the strict reading would be wrong to them."""
+    if re.search(r'[+\-]', expr) and _MUL_SPLIT.search(expr) and '(' not in expr:
+        loose = evaluate('(' + _MUL_SPLIT.sub(')*(', expr) + ')')
+        if loose is not None and loose == wrote:
+            return True
+    if re.search(r'\(\s*-\s*\d', expr):
+        loose = evaluate(re.sub(r'\(\s*-\s*(\d+(?:\.\d+)?)\s*\^', r'((-\1)^', expr))
+        if loose is not None and loose == wrote:
+            return True
+    return False
+
+
+def _decimals_slack(text, rough):
+    """An expression on the right with rounded decimals in it (`-56.44 + 152`, `1.13 - 1.14`): half a unit of each decimal's last place,
+    a whole unit in an approximate chain. A plain number has its own tolerance; integers add none."""
+    if _PLAIN.fullmatch(text.strip()) or _SCIENTIFIC.fullmatch(text.strip()):
+        return Fraction(0)
+    slack = Fraction(0)
+    for places in re.findall(r'\d\.(\d+)', text):
+        slack += Fraction(1, 10 ** len(places)) * (1 if rough else Fraction(1, 2))
+    if rough:
+        slack += sum(Fraction(1) for _ in re.findall(r'(?<![\d.])\d+(?![\d.])', text)) and Fraction(1)
+    return slack
+
+
 def wrong_relations(line):
     """[(expression, what was written, the right value)] for each relation on the line whose sides differ: `=` chains (each part against the
     first: `= 189 + 17 = 196` is a wrong rewrite of 196), \\approx and ≈ (to the places written), arrows (`7+3+5 \\to 15`), and congruences
@@ -429,16 +478,20 @@ def wrong_relations(line):
     if not marks:
         return wrong
     base = expression_before(line[:marks[0].start()])
+    rough = False   # the chain has said \approx: its later `=` parts are approximate too
     for n, mark in enumerate(marks):
         end = marks[n + 1].start() if n + 1 < len(marks) else len(line)
+        rough = rough or mark.group(1) in ('\\approx', '≈')
         got = _value_after(line[mark.end():end])
         if got is None:
-            base = expression_before(line[:end])
+            base, rough = expression_before(line[:end]), False
             continue
         text, value, rest = got
         first = _PLAIN.match(text.lstrip('-−'))
         if base is None:
             base = (text, value)
+        elif _POWER_OF_TEN.fullmatch(text.strip()) or _constants(base[0], text) or _reads_otherwise(base[0], value):
+            pass   # `6^9 \approx 10^7`; `then 3/4 = -2/3`; `3+1 \times 1+1 = 8` meant as (3+1)(1+1), `(-66^2)` as (-66)^2
         elif _OPERATOR.search(text.lstrip('-−')) and first and Fraction(first.group().replace(',', '')) == abs(base[1]):
             base = (text, value)   # `5 \times 2 = 10 + 1 = 11`: the value, then a carry added to it, a new step and not a wrong rewrite
         elif _estimate(base[0], text) or (_OPERATOR.search(text.lstrip('-−')) and not _SCIENTIFIC.fullmatch(text.strip())
@@ -454,7 +507,10 @@ def wrong_relations(line):
                 value == (right * 10 ** j).numerator // (right * 10 ** j).denominator for j in range(4) if j == 0 or 0 <= value <= 9)
             unit = _unit(text)   # 438 + 2/3 = 438.666: cut off in its last place, not rounded
             cut = unit is not None and unit < 1 and (right >= 0) == (value >= 0) and 0 <= abs(right) - abs(value) < unit
-            if off > _tolerance(text, mark.group(1)) and not quotient and not cut:
+            tolerance = _tolerance(text, '\\approx' if rough else mark.group(1)) + _decimals_slack(text, rough)
+            if unit == 1 and right.denominator != 1:
+                tolerance = max(tolerance, Fraction(1))   # 130.98 - 22.88 = 108: rounded or cut to an integer
+            if off > tolerance and not quotient and not cut:
                 m, sci = _PLAIN.fullmatch(text), _SCIENTIFIC.fullmatch(text)
                 places = len(m.group(1) or '') if m else 0
                 said = spelled(right)
@@ -465,6 +521,8 @@ def wrong_relations(line):
                 elif places and (len(said.split('.')[-1]) > places if '.' in said else '/' in said):
                     said = rounded(right, places)
                 wrong.append((base[0], text, said))
+        if rough:
+            base = (text, value)   # an approximate chain goes on from its last approximation: `\approx 6.89 - 4 = 2.89`
         if rest.strip(' $.,;:)') and not _RELATION.match(rest.strip()):
             base = None   # a new statement: `$x = 3$, $y = 5$` is two, not a chain
     return wrong
