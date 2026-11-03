@@ -173,10 +173,14 @@ def inline_value(before):
 class Rollout:
     """One answer, a state machine the driver asks for its next request and hands each result to. Phases: think, seek (a line end for the
     forced open), peek (whether a bare fence opens python), block, answer."""
-    def __init__(self, row, sample, prompt, arm, ids, tokenizer, seed):
+    def __init__(self, row, sample, prompt, arm, ids, tokenizer, seed, thinking=True):
         self.row, self.sample, self.prompt, self.arm, self.ids, self.tok, self.seed = row, sample, prompt, arm, ids, tokenizer, seed
         self.out, self.spans, self.events = [], [], []
         self.phase, self.thought, self.forced, self.block, self.runs, self.seen = 'think', 0, False, 0, 0, {}
+        # --no-think: the prompt already ends in an empty thinking (enable_thinking=False), so the reply is the answer from its first token
+        self.thinking = thinking
+        if not thinking:
+            self.phase = 'answer'
         self.code_at = self.fence_at = None
         self.by = None
         self.pending = None
@@ -449,7 +453,7 @@ class Rollout:
         text = self.text()
         runs = [e for e in self.events if e['kind'] == 'output']
         return dict(id=self.row['id'], suite=self.row['suite'], answer=self.row['answer'], sample=self.sample, seed=self.seed, text=text,
-                    right=right(self.row, text), finish=self.finish, tokens=self.model_tokens(), injected=len(self.out) - self.model_tokens(),
+                    right=right(self.row, text if self.thinking else CLOSE + text), finish=self.finish, tokens=self.model_tokens(), injected=len(self.out) - self.model_tokens(),
                     prompt_tokens=len(self.prompt), thinking_tokens=self.thought, seconds=self.seconds, events=self.events,
                     runs=len(runs), runs_by_model=sum(e['by'] == 'model' for e in runs), runs_forced=sum(e['by'] == 'forced' for e in runs),
                     runs_by_tool=sum(e['by'] in ('tool', 'tool in thinking') for e in runs),
@@ -566,6 +570,8 @@ def run(args):
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint)
+    if args.greedy:   # drive() and arm.json read SAMPLING: temperature 0 is vLLM's greedy
+        SAMPLING.update(temperature=0.0)
     if args.native_tool and tok.convert_tokens_to_ids('</tool_call>') == tok.unk_token_id:
         raise SystemExit('the tokenizer has no </tool_call> token')
     out = Path(args.out)
@@ -578,14 +584,15 @@ def run(args):
         # As text, then encoded: transformers 5 returns a dict from tokenize=True, and list() of it gave the keys as the prompt.
         system = [{'role': 'system', 'content': args.system}] if args.system else []
         text = tok.apply_chat_template(system + [{'role': 'user', 'content': prompt_text(row)}], tokenize=False, add_generation_prompt=True,
-                                       enable_thinking=True, tools=[PYTHON_TOOL] if args.native_tool else None)
+                                       enable_thinking=not args.no_think, tools=[PYTHON_TOOL] if args.native_tool else None)
         prompt = tok.encode(text, add_special_tokens=False)
-        if not text.rstrip().endswith('<think>') or not all(isinstance(t, int) for t in prompt):
-            raise SystemExit('the chat template did not end in an open <think>: ' + repr(text[-80:]))
+        opened = text.rstrip().endswith('</think>') if args.no_think else text.rstrip().endswith('<think>')
+        if not opened or not all(isinstance(t, int) for t in prompt):
+            raise SystemExit('the chat template did not end as --no-think asks: ' + repr(text[-80:]))
         for k in range(args.samples):
             if (row['id'], k) in have:
                 continue
-            rollouts.append(Rollout(row, k, list(prompt), arm, ids, tok, seed_of(args.seed, row['id'], k)))
+            rollouts.append(Rollout(row, k, list(prompt), arm, ids, tok, seed_of(args.seed, row['id'], k), thinking=not args.no_think))
             rollouts[-1].cap = args.max_tokens
     if args.force_after and not args.execute:
         raise SystemExit('--force-after opens a block that only --execute runs')
@@ -719,6 +726,8 @@ def main(argv=None):
     r.add_argument('--native-tool', action='store_true', help="offer a python tool in Qwen3.5's own tool format and answer its calls")
     r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")
     r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
+    r.add_argument('--no-think', action='store_true', help='enable_thinking=False: the reply is the answer, as Qwenputer measures arithmetic')
+    r.add_argument('--greedy', action='store_true', help='temperature 0, for a protocol that publishes greedy numbers (Qwenputer)')
     r.add_argument('--system', default='', help='a system turn before the question (with --native-tool it follows the tool list)')
     r.add_argument('--ids', action='store_true')
     r.add_argument('--memory', type=float, default=0.9)

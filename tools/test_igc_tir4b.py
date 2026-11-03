@@ -218,6 +218,24 @@ class InlineCalc(unittest.TestCase):
         play(r, 'so 6 \\times 7 = 41</think>\n\nx<|im_end|>', Kernel([]))
         self.assertEqual(r.events, [])
 
+    def test_an_answer_with_no_thinking_gets_values_too(self):
+        # --no-think, as Qwenputer measures arithmetic (enable_thinking=False): the reply starts as the answer
+        from tools.igc.select_rows import right
+        r = tir4b.Rollout(dict(id='a', suite='arith', answer='478128321'), 0, [1], tir4b.Arm(inline_calc=True), IDS, TOK, seed=1, thinking=False)
+        self.assertEqual(r.phase, 'answer')
+        play(r, '48213 \\times 9917 = so \\boxed{478128321}<|im_end|>', Kernel([]))
+        self.assertIn('48213 \\times 9917 = 478128321 (exact) so', r.text())
+        self.assertEqual(r.finish, 'stop')
+        # the prompt closed the thinking, so the scorer, which reads after </think>, must see the whole reply
+        self.assertTrue(r.record(right)['right'])
+
+    def test_arith_rows_are_scored_by_their_box(self):
+        from tools.igc.select_rows import right
+        row = dict(id='a', suite='arith', answer='-3/7')
+        self.assertTrue(right(row, '</think>\n\nso \\boxed{-3/7}'))
+        self.assertFalse(right(row, '</think>\n\nso \\boxed{3/7}'))
+        self.assertEqual(tir4b.prompt_text(dict(suite='arith', question='What is 2*3?')), 'What is 2*3?')
+
     def test_a_loop_of_equations_is_stuck(self):
         # every request ends at an `=`, never at a chunk: the loop check must still come round, or it runs to the end of the context
         r = rollout(inline_calc=True)

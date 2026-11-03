@@ -10,7 +10,7 @@ LETTER_SUITES = ('mmlupro', 'supergpqa', 'gpqa')
 
 def right(row, text):
     """The one rule each suite is scored by: the bench's early stop, the reader's triage and the row selection all use it."""
-    if row['suite'] == 'stdmath':
+    if row['suite'] in ('stdmath', 'arith'):   # arith: Qwenputer's DeepMind / NUPA sets, boxed numbers
         return math_right(text, row['answer'])
     if row['suite'] == 'bbh':
         return bbh_right(text, row['answer'])
