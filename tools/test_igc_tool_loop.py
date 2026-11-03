@@ -55,6 +55,12 @@ H = dict(A, hinted=True)
 assert not repeated([A, H], 'print(1)'), "m5w 53e605d1: the second hint's rewrite of the last program is not the model's loop"
 assert repeated([A, H, A], 'print(1)'), 'the model-opened calls around it still count'
 
+# --hidpos-from: a labelled window's centre as a token position of the reasoning fed back as a prompt (#288)
+from tools.igc.external_bench import window_positions
+chars = list  # one token per character
+got = window_positions(10, 'abcdefghij', {'r@0.5': dict(at=0.5), 'r@0.0': dict(at=0.0), 'r@1': dict(at=1.0)}, chars)
+assert got == {'r@0.5': 14, 'r@0.0': 10, 'r@1': 19}, got
+
 # One row's engine lines: m5t's loop rule closed the thinking on 2 rows, and nothing in the records said which (#288)
 import tempfile
 from tools.igc.external_bench import read_events

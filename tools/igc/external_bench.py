@@ -45,6 +45,34 @@ def repeated(ran,code,times=3):
     with no answer where m5h3 went on to a new program and got it right. The caller passes only calls the model opened."""
     last=[c['code'] for c in ran if c['ok'] is not None and not c.get('hinted')][-(times-1):]
     return len(last)==times-1 and all(c==code[:20000] for c in last)
+
+
+def window_positions(prompt_len,head,labels,encode):
+    """The token position of each labelled window's centre in a reasoning fed back as a prompt: the label's `at` is its share of the
+    thinking's characters (ana_label.py), the position the last token of the text before it. labels: {key: {'at': share, ...}}."""
+    return {key:prompt_len+max(1,len(encode(head[:round(v['at']*len(head))])))-1 for key,v in labels.items()}
+
+
+def hidpos_collect(engine,tokenizer,prefix,suffix,rows,records,labels,output,cancel):
+    """--hidpos-from: each stored reasoning goes back in as one request's prompt, teacher-forced, and the engine writes the final residual
+    row at every labelled window's centre (STRATA_HIDPOS, #288). Writes hidpos.json: per window its row's byte offset in hidpos.bin."""
+    by_id={r['id']:r for r in rows};out=output/'hidpos.bin';index=[]
+    for rec in records:
+        mine={k:v for k,v in labels.items() if v['id']==rec['id']}
+        if not mine or rec['id'] not in by_id:continue
+        head=rec['text'].split('</think>')[0]
+        ids=tokenizer.encode((prefix+by_id[rec['id']]['prompt'].encode('utf-8')+suffix).decode('utf-8'))
+        body=tokenizer.encode(head)
+        if len(ids)+len(body)>250000:print(rec['id'],'too long',len(ids)+len(body),flush=True);continue
+        pos=window_positions(len(ids),head,mine,tokenizer.encode)
+        (output/'hidpos.txt').write_text(' '.join(str(p) for p in sorted(set(pos.values()))),encoding='utf-8')
+        before=out.stat().st_size if out.exists() else 0
+        for t in engine.generate(ids+body,1,{'temperature':0},cancel):pass
+        after=out.stat().st_size if out.exists() else 0
+        for key,p in pos.items():index.append(dict(key=key,id=rec['id'],pos=p,activity=mine[key].get('activity'),settle=mine[key].get('settle'),
+                                                      file_from=before,file_to=after))
+        print(rec['id'],'windows',len(pos),'tokens',len(ids)+len(body),'bytes',after-before,flush=True)
+    (output/'hidpos.json').write_text(json.dumps(index),encoding='utf-8')
 # --hint-after N: every call of 205 in five arms came after the whole thinking, so the program checked an answer already reached by hand. START's
 # Hint-infer (2503.04625) puts its own words in the reasoning and the model goes on into a call; here they open the call in the model's format.
 # The hint closes the thinking first: with the response inside the thinking, 4 of 22 rows of m5h2 ended the turn at once (`</tool_call>` ends
@@ -216,7 +244,7 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_tool=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None,hint_after=0,hint_at='line',temperature=0.,seed=0):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_tool=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None,hint_after=0,hint_at='line',temperature=0.,seed=0,hidpos_from=None,hidpos_labels=None):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
@@ -270,6 +298,7 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
     cfg.update(exe=str(executable),args=args,log=str(output/'engine.log'))
     env=helper.child_env(cfg);env.pop('STRATA_TIMELINE',None);validate_launcher_env(env)
     if timeline:env['STRATA_TIMELINE']=str(timeline)
+    if hidpos_from:env['STRATA_HIDPOS']=str(output/'hidpos.txt');env['STRATA_HIDPOS_OUT']=str(output/'hidpos.bin')
     original=subprocess.Popen
     subprocess.Popen=lambda *a,**k:original(*a,**{**k,'creationflags':k.get('creationflags',0)|0x08000000})
     cancel=threading.Event();stop=threading.Event();active=[None];failure=[]
@@ -293,6 +322,10 @@ def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,g
         if keep_prefix:   # the turn every question shares is read once: the engine keeps a checkpoint at its end
             all_ids=[tokenizer.encode((prefix+row['prompt'].encode('utf-8')+suffix).decode('utf-8')) for row in rows]
             sampling['_ckpt_at']=len(os.path.commonprefix(all_ids))
+        if hidpos_from:
+            hidpos_collect(engine,tokenizer,prefix,suffix,rows,json.loads(Path(hidpos_from).read_text(encoding='utf-8')),
+                           json.loads(Path(hidpos_labels).read_text(encoding='utf-8')),output,cancel)
+            return
         judge=None
         if stop_on_loss and lcb_tests:   # each row is scored as it ends, so a loss stops the arm at once
             import multiprocessing
@@ -458,5 +491,7 @@ if __name__=='__main__':
     parser.add_argument('--retry-temperature',type=float,default=0.6)
     parser.add_argument('--temperature',type=float,default=0.,help='sample every row at this temperature (0: greedy)')
     parser.add_argument('--seed',type=int,default=0,help='with --temperature: the sampler seed')
+    parser.add_argument('--hidpos-from',type=Path,help='records whose reasoning goes back in teacher-forced, for the hidden rows at --hidpos-labels windows')
+    parser.add_argument('--hidpos-labels',type=Path,help='ana_label.py output: {key: {id, at, activity, settle}}')
     parser.add_argument('--shots',type=int,default=0,help='few-shot exemplars before each GSM8K question')
     run(**vars(parser.parse_args()))

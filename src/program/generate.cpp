@@ -2418,6 +2418,49 @@ struct PcieAuto {
     }
 };
 
+// STRATA_HIDPOS=<file of token positions> with STRATA_HIDPOS_OUT=<path>: each listed prompt position's final residual
+// row (hc x n_embd F32), as the served prompt path computes it, appended as (int64 position, row). A diagnostic for a
+// probe of the hidden state at labelled points of a stored reasoning (#288): the reasoning goes in as a request's prompt,
+// teacher-forced. The positions file is read again at every chunk, so a driver writes the next request's positions before
+// sending it and splits the output by its size between requests. Positions a chunk does not read (a cached prefix) stay
+// absent. Off unless both are set.
+struct HidPosDump {
+    const char* in = nullptr;
+    std::FILE* out = nullptr;
+    static HidPosDump& get() {
+        static HidPosDump d = [] {
+            HidPosDump h;
+            const char* to = std::getenv("STRATA_HIDPOS_OUT");
+            h.in = std::getenv("STRATA_HIDPOS");
+            if (!h.in || !to) return h;
+            h.out = std::fopen(to, "wb");
+            if (!h.out) std::fprintf(stderr, "strata generate: STRATA_HIDPOS_OUT %s cannot be written\n", to);
+            else std::fprintf(stderr, "strata hidpos: positions from %s, rows to %s\n", h.in, to);
+            return h;
+        }();
+        return d;
+    }
+    bool on() const { return out != nullptr; }
+    bool write(const float* dev_rows, int64_t T, int64_t p0, int64_t width, std::string& e) {
+        std::vector<int64_t> pos;
+        std::ifstream f(in);
+        for (int64_t p; f >> p;) pos.push_back(p);
+        std::sort(pos.begin(), pos.end());
+        std::vector<float> row((size_t) width);
+        for (auto it = std::lower_bound(pos.begin(), pos.end(), p0); it != pos.end() && *it < p0 + T; ++it) {
+            if (cudaMemcpy(row.data(), dev_rows + (*it - p0) * width, row.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                e = "hidpos: row copy failed"; return false;
+            }
+            const int64_t p = *it;
+            if (std::fwrite(&p, sizeof p, 1, out) != 1 || std::fwrite(row.data(), sizeof(float), row.size(), out) != row.size()) {
+                e = "hidpos: write failed"; return false;
+            }
+        }
+        std::fflush(out);
+        return true;
+    }
+};
+
 }  // namespace
 
 // #45 exit-hang probe: STRATA_EXIT_TRACE=1 prints as each marked object of main is destroyed (reverse order)
@@ -9894,6 +9937,7 @@ int main(int argc, char** argv) {
                                           row.size_bytes(), cudaMemcpyDeviceToHost) == cudaSuccess;
                     }, e)) return false;
             }
+            if (HidPosDump& hid = HidPosDump::get(); hid.on() && !hid.write(R_rows, T, p0, g.hc * g.n_embd, e)) return false;
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
