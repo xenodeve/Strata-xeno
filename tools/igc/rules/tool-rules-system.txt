@@ -1,0 +1,7 @@
+
+
+Rules for using run_python (mandatory, they apply throughout your thinking):
+1. Never work out a numeric example, a small case, or a trace of code by hand. Write it as a run_python call and read the printed result instead.
+2. Whenever two or more candidate answers, formulas or approaches remain, write one program that tests every candidate before you choose.
+3. After writing a solution or a derivation, check it with run_python on the given examples, or against a brute force on small inputs, before you trust it.
+4. Call run_python inside your thinking as soon as there is something to compute or test. Do not finish the reasoning first and check afterwards.

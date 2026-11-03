@@ -244,10 +244,13 @@ def run_slots(engine,rows,tokenizer,prefix,suffix,slots,pair,no_think,whole_cont
     return [r for r in done if r['mip']]
 
 
-def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_tool=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None,hint_after=0,hint_at='line',temperature=0.,seed=0,hidpos_from=None,hidpos_labels=None):
+def run(profile,server,executable,bundle,data,reference,pack,output,arithmetic,gsm,bigbench=0,bridge=False,inline=False,math=0,no_adapt=False,timeline=None,gsm_file='gsm8k-test.jsonl',math_file='math500.jsonl',sidecar=None,whole_context=False,hint=None,no_note=False,effort_medium=False,close_repeat=None,sum_note=None,no_spec=False,no_reply=False,sandbox=False,think_hint=None,sandbox_after=None,sandbox_close=False,sandbox_close_line=False,sandbox_read=0,sandbox_expect=False,sandbox_why=False,sandbox_gate=False,sandbox_draft=False,sandbox_falsify=False,sandbox_pass_close=False,sandbox_brute=False,sandbox_verify=False,sandbox_tool=False,sandbox_exec=False,repeat_note=None,no_think=False,shots=0,sandbox_call=False,stuck_rounds=20,slots=0,pair=False,keep_prefix=False,rows_file=None,plain=False,retries=0,retry_temperature=0.6,tool_loop=False,reuse_from=None,reuse_rules=None,short_first=False,stop_on_loss=None,lcb_tests=None,hint_after=0,hint_at='line',temperature=0.,seed=0,hidpos_from=None,hidpos_labels=None,hint_file=None,think_hint_file=None):
     validate_launcher_env(os.environ)
     output.mkdir(exist_ok=False)
     cfg=json.loads(profile.read_text(encoding='utf-8-sig'))
+    # --hint-file/--think-hint-file: rules too long for a queue's command line, read from a file (the rule arms of #288)
+    if hint_file:hint=(hint or '')+Path(hint_file).read_text(encoding='utf-8')
+    if think_hint_file:think_hint=(think_hint or '')+Path(think_hint_file).read_text(encoding='utf-8')
     tokenizer=NativeText.from_pack(pack/'tokenizer');prefix,suffix=wrapped_prefix(reference,tokenizer)
     if think_hint:suffix+=think_hint.encode('utf-8')
     if no_think:suffix+=b'\n</think>\n\n'
@@ -493,5 +496,7 @@ if __name__=='__main__':
     parser.add_argument('--seed',type=int,default=0,help='with --temperature: the sampler seed')
     parser.add_argument('--hidpos-from',type=Path,help='records whose reasoning goes back in teacher-forced, for the hidden rows at --hidpos-labels windows')
     parser.add_argument('--hidpos-labels',type=Path,help='ana_label.py output: {key: {id, at, activity, settle}}')
+    parser.add_argument('--hint-file',type=Path,help='text added to the system turn, read from a file')
+    parser.add_argument('--think-hint-file',type=Path,help='text written after the opening of the thinking, read from a file')
     parser.add_argument('--shots',type=int,default=0,help='few-shot exemplars before each GSM8K question')
     run(**vars(parser.parse_args()))

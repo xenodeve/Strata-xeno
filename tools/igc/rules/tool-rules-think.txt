@@ -1,0 +1,2 @@
+I follow the rules: every example, small case and trace goes through run_python, never by hand, and while candidates remain I test them all with one program before choosing.
+
