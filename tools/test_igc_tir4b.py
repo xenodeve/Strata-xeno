@@ -480,6 +480,22 @@ class HttpDrive(unittest.TestCase):
         self.assertEqual(rs[1].text(), 'plain</think>\n\nok<|im_end|>')
         self.assertTrue(all(r.finish == 'stop' for r in rs))
 
+    def test_the_ids_the_server_returns_are_taken_as_they_are(self):
+        # llama-server stopped on '\n' inside the token '\n\n' and returns that token: the text is not encoded again
+        def post(body):
+            self.assertTrue(body['return_tokens'])
+            return dict(content='ab', stop_type='word', stopping_word='\n', tokens=[1000 + ord('a'), 1000 + ord('b'), 271]) \
+                if not post.done else dict(content='', stop_type='eos', stopping_word='', tokens=[6])
+        post.done = False
+        r = tir4b.Rollout(ROW, 0, [1], tir4b.Arm(check_hand=True), IDS, TOK, seed=1, thinking=False)
+
+        def once(body):
+            reply = post(body)
+            post.done = True
+            return reply
+        tir4b.drive_http(once, TOK, IDS, [r], lambda: Kernel([]), live_most=1)
+        self.assertEqual(r.out, [1000 + ord('a'), 1000 + ord('b'), 271, 6])   # 271 kept, and no second end of turn
+
     def test_the_stop_words_of_a_request(self):
         r = tir4b.Rollout(ROW, 0, [1], tir4b.Arm(inline_calc=True, execute=True), IDS, TOK, seed=1)
         most, stops = r.request()

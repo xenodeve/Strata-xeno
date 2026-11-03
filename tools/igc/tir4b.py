@@ -646,11 +646,16 @@ def drive_http(post, tok, ids, rollouts, kernel_factory, live_most=16, on_round=
                 break
             most, stops = ask
             reply = post(dict(prompt=r.prompt + r.out, n_predict=most, stop=stop_words(stops, ids, tok), cache_prompt=True,
-                              seed=(r.seed + len(r.out)) % 2**31, **sampling))
-            text = reply.get('content', '') + (reply.get('stopping_word', '') if reply.get('stop_type') == 'word' else '')
-            new = tok.encode(text, add_special_tokens=False) if text else []
-            if reply.get('stop_type') == 'eos':
-                new.append(im_end)
+                              seed=(r.seed + len(r.out)) % 2**31, return_tokens=True, **sampling))
+            if reply.get('tokens') is not None:
+                # the ids the model generated, its stop token among them: a stop on '\n' inside the token '\n\n' put back as '\n' fed the
+                # model a text it never wrote, every line (pc-check: 21 of 48 answers ran to the cap against base's 7)
+                new = list(reply['tokens'])
+            else:
+                text = reply.get('content', '') + (reply.get('stopping_word', '') if reply.get('stop_type') == 'word' else '')
+                new = tok.encode(text, add_special_tokens=False) if text else []
+                if reply.get('stop_type') == 'eos':
+                    new.append(im_end)
             if not new:
                 r.done('length')   # nothing came back at the limit: no answer can come
                 break
