@@ -17,12 +17,17 @@ _SPACE = re.compile(r'\\[,;:! ]|\\q?quad\b|~')
 _SIZES = re.compile(r'\\(?:left|right|[bB]ig{1,2}[lr]?|middle)\s*')
 _SUPERSCRIPT = {'⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9'}
 _WORDS = {r'\times': MUL, r'\cdot': MUL, r'\ast': MUL, r'\div': DIV, r'\frac': 'frac', r'\dfrac': 'frac', r'\tfrac': 'frac', r'\sqrt': 'sqrt',
-          r'\%': '%', r'\{': '(', r'\}': ')', r'\lbrace': '(', r'\rbrace': ')', r'\lparen': '(', r'\rparen': ')'}
+          r'\%': '%', r'\{': '(', r'\}': ')', r'\lbrace': '(', r'\rbrace': ')', r'\lparen': '(', r'\rparen': ')',
+          r'\bmod': 'mod', r'\mod': 'mod', r'\pmod': 'pmod', r'\lvert': 'abs', r'\rvert': 'abs', r'\vert': 'abs',
+          r'\lfloor': 'lfloor', r'\rfloor': 'rfloor', r'\lceil': 'lceil', r'\rceil': 'rceil', r'\binom': 'binom', r'\dbinom': 'binom',
+          r'\tbinom': 'binom'}
 _SINGLE = {'*': MUL, '×': MUL, '·': MUL, '⋅': MUL, '∙': MUL, '/': DIV, '÷': DIV, '^': POW, '+': '+', '-': '-', '−': '-', '–': '-',
-           '(': '(', ')': ')', '[': '(', ']': ')', '{': '{', '}': '}', '!': '!', '%': '%'}
+           '(': '(', ')': ')', '[': '(', ']': ')', '{': '{', '}': '}', '!': '!', '%': '%', '|': 'abs', '⌊': 'lfloor', '⌋': 'rfloor',
+           '⌈': 'lceil', '⌉': 'rceil', ',': ','}
+_DEGREES = re.compile(r'\^\s*\{?\s*\\circ\s*\}?|°')   # 180^\circ - 30^\circ: a unit, not a power
 _NUMBER = re.compile(r'\d{1,3}(?:,\d{3})+(?:\.\d+)?(?!\d)|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\.\d+')
 LIMIT = 10 ** 40   # a numerator past this is no step of a calculation
-DENOMINATOR = 10 ** 15
+DENOMINATOR = 10 ** 40   # 0.7412898 \times 10^{-9} is a step too: 10^15 refused it and the reader took 10^{-9} alone
 
 
 class _NotExact(Exception):
@@ -31,13 +36,20 @@ class _NotExact(Exception):
 
 def _tokens(text):
     s = re.sub(r'(?<=\d)\\,(?=\d{3}(?!\d))', '', text)   # 1\,000: a thin space between digit groups, before it becomes a space
-    s = _SIZES.sub('', _SPACE.sub(' ', s))
+    s = _SIZES.sub('', _SPACE.sub(' ', _DEGREES.sub('', s)))
     s = ''.join('^' + _SUPERSCRIPT[c] if c in _SUPERSCRIPT else c for c in s).replace('**', '^')
-    out, i = [], 0
+    out, i, spaced, gap = [], 0, set(), False
     while i < len(s):
         c = s[i]
         if c.isspace():
-            i += 1
+            i, gap = i + 1, True
+            continue
+        if gap:   # the next token comes after a space: `2 (2)` is no product
+            spaced.add(len(out))
+            gap = False
+        if s.startswith('mod', i) and (i == 0 or not s[i - 1].isalpha()) and not s[i + 3:i + 4].isalpha():
+            out.append(('op', 'mod'))   # 2016 mod 1000: the one word read as an operator
+            i += 3
             continue
         m = _NUMBER.match(s, i)
         if m and (c.isdigit() or c == '.'):
@@ -60,12 +72,12 @@ def _tokens(text):
             i += 1
             continue
         raise _NotExact(c)   # a letter, a symbol, `$`, `=`
-    return out
+    return out, spaced
 
 
 class _Parser:
-    def __init__(self, tokens):
-        self.t, self.i = tokens, 0
+    def __init__(self, tokens, spaced=frozenset()):
+        self.t, self.i, self.spaced = tokens, 0, spaced
 
     def peek(self):
         return self.t[self.i] if self.i < len(self.t) else (None, None)
@@ -89,14 +101,19 @@ class _Parser:
         value = self.unary()
         while True:
             kind, v = self.peek()
-            if v in (MUL, DIV):
+            if v in (MUL, DIV, 'mod'):
                 self.take()
                 right = self.unary()
-                if v == DIV and right == 0:
+                if v != MUL and right == 0:
                     raise _NotExact('division by zero')
-                value = value * right if v == MUL else value / right
+                if v == 'mod':
+                    value = self.mod(value, right)
+                else:
+                    value = value * right if v == MUL else value / right
+            elif kind == 'num' and self.i and self.t[self.i - 1][1] == '!':
+                value = value * self.unary()   # \frac{9!}{4! 3! 2!}
             elif v in ('(', 'frac', 'sqrt', '{') and self.i and self.t[self.i - 1][1] in (')', '}', '!', '%') or \
-                    v in ('(', 'sqrt') and self.i and self.t[self.i - 1][0] == 'num':
+                    v in ('(', 'sqrt') and self.i and self.t[self.i - 1][0] == 'num' and self.i not in self.spaced:
                 value = value * self.unary()   # 2(3 + 4), (2)(3), (a)\frac{..}{..}
             elif v == 'frac' and self.i and self.t[self.i - 1][0] == 'num':
                 raise _NotExact('a mixed number: 2\\frac{1}{3} is 2 1/3 or 2/3')
@@ -113,7 +130,15 @@ class _Parser:
         return self.power()
 
     def power(self):
+        literal = self.peek()[0] == 'num'
         base = self.postfix()
+        # a number written 1.8329827 \times 10^7 is one number: 37 / 1.8329827 \times 10^7 means 37 / (1.8329827 \times 10^7) (dm div_big 2289)
+        if literal and self.peek()[1] == MUL and self.i + 2 < len(self.t) and self.t[self.i + 1] == ('num', 10) and self.t[self.i + 2][1] == POW:
+            self.i += 3
+            exponent = self.unary_exponent()
+            if exponent.denominator != 1 or abs(exponent) > 64:
+                raise _NotExact('a power of ten that is not a small integer one')
+            return self.bound(base * Fraction(10) ** int(exponent))
         if self.peek()[1] == POW:
             self.take()
             exponent = self.unary_exponent()
@@ -134,15 +159,23 @@ class _Parser:
 
     def postfix(self):
         value = self.primary()
-        while self.peek()[1] in ('!', '%'):
+        while self.peek()[1] in ('!', '%', 'pmod'):
             op = self.take()[1]
             if op == '!':
                 if value.denominator != 1 or not 0 <= value <= 30:
                     raise _NotExact('a factorial past 30!')
                 value = Fraction(factorial(int(value)))
+            elif op == 'pmod':
+                value = self.mod(value, self.argument())   # 2016 \pmod{1000} = 16
             else:
                 value = value / 100
         return value
+
+    @staticmethod
+    def mod(a, m):
+        if a.denominator != 1 or m.denominator != 1 or m == 0:
+            raise _NotExact('mod of a non-integer')
+        return Fraction(int(a) % int(m))
 
     def primary(self):
         kind, v = self.peek()
@@ -160,6 +193,36 @@ class _Parser:
             if bottom == 0:
                 raise _NotExact('division by zero')
             return top / bottom
+        if v == 'abs':
+            self.take()
+            value = self.expr()
+            self.take('abs')
+            return abs(value)
+        if v in ('lfloor', 'lceil'):
+            self.take()
+            value = self.expr()
+            self.take('rfloor' if v == 'lfloor' else 'rceil')
+            return Fraction(value.numerator // value.denominator if v == 'lfloor' else -(-value.numerator // value.denominator))
+        if v == 'binom':
+            self.take()
+            n = self.argument()
+            self.take('{')
+            ks = [self.expr()]
+            while self.peek()[1] == ',':
+                self.take()
+                ks.append(self.expr())
+            self.take('}')
+            if any(x.denominator != 1 or x < 0 for x in [n] + ks) or n > 1000:
+                raise _NotExact('a binomial of a non-integer')
+            if len(ks) == 1:
+                k = int(ks[0])
+                return Fraction(factorial(int(n)) // (factorial(k) * factorial(int(n) - k)) if k <= n else 0)
+            if sum(ks) != n:
+                raise _NotExact('a multinomial whose parts do not add up')
+            out = factorial(int(n))
+            for k in ks:
+                out //= factorial(int(k))
+            return Fraction(out)
         if v == 'sqrt':
             self.take()
             inside = self.argument()
@@ -192,10 +255,10 @@ class _Parser:
 
 def evaluate(text):
     try:
-        tokens = _tokens(text)
+        tokens, spaced = _tokens(text)
         if not tokens:
             return None
-        p = _Parser(tokens)
+        p = _Parser(tokens, spaced)
         value = p.expr()
         if p.i != len(tokens):
             return None
@@ -230,6 +293,9 @@ def expression_before(text):
             continue
         if line[i] in '-−' and _symbol_before(line[:i]):
             continue
+        if re.search(r'(?:[+\-*/^×÷·⋅−]|\\times|\\cdot|\\div)\s*$', line[:i]) and _symbol_before(re.sub(
+                r'(?:[+\-*/^×÷·⋅−]|\\times|\\cdot|\\div)\s*$', '', line[:i])):
+            continue   # `Z / (7/3)`: the tail of an expression on a symbol, not a value of its own
         expr = line[i:].strip()
         if not _OPERATOR.search(expr.lstrip('-−')):
             continue
@@ -237,6 +303,171 @@ def expression_before(text):
         if value is not None:
             return expr, value
     return None
+
+
+def spelled(value):
+    """An integer as itself, a value with a terminating decimal as that decimal, and only the rest as a reduced fraction."""
+    if value.denominator == 1:
+        return str(value.numerator)
+    d, twos, fives = value.denominator, 0, 0
+    while d % 2 == 0:
+        d //= 2
+        twos += 1
+    while d % 5 == 0:
+        d //= 5
+        fives += 1
+    if d != 1:
+        return f'{value.numerator}/{value.denominator}'
+    return rounded(value, max(twos, fives))
+
+
+def rounded(value, places):
+    """`value` as a decimal with `places` places, rounded half away from zero."""
+    scaled = (abs(value) * 10 ** places * 2 + 1) // 2
+    digits = str(scaled).rjust(places + 1, '0')
+    sign = '-' if value < 0 and scaled else ''
+    return sign + (digits[:-places] + '.' + digits[-places:] if places else digits)
+
+
+_RELATION = re.compile(r'(?<![<>!=])(=|\\approx|≈|\\to\b|\\rightarrow|→|->)(?!=)')
+_PLAIN = re.compile(r'-?\d[\d,]*(?:\.(\d+))?')
+_SCIENTIFIC = re.compile(r'-?\d+(?:\.(\d+))?\s*(?:\\times|×|\*|\\cdot)\s*(?:10\s*\^\s*\{?\s*(-?\d+)\s*\}?|1(0+)(?![\d.]))')
+_ROUGH = re.compile(r'\s*(?:\.\.\.|\\dots|\\ldots|…)')
+
+
+def _value_after(segment):
+    """(text, value, rest) for the longest arithmetic that opens `segment` (after spaces and `$`), or None: a number glued to a unit (4.8k)
+    or trailing off into `...` (an approximation) is no value to check."""
+    s = segment.lstrip(' $')
+    for end in range(len(s), 0, -1):
+        head = s[:end]
+        if not head[-1].isdigit() and head[-1] not in ')}|]°' and not head.endswith('\\rfloor') and not head.endswith('\\rceil') \
+                and not head.endswith('\\circ') and not head.endswith('!') and not head.endswith('%'):
+            continue
+        value = evaluate(head)
+        if value is None:
+            continue
+        rest = s[end:]
+        if rest[:1].isalpha() or _ROUGH.match(rest):
+            return None
+        return head.strip(), value, rest
+    return None
+
+
+def _power(m):
+    """The power of ten of a _SCIENTIFIC match: 10^{-7} or 10000."""
+    return int(m.group(2)) if m.group(2) is not None else len(m.group(3))
+
+
+def _digits(text):
+    """Significant digits written in all the numbers of a text: how precise a rewrite is."""
+    return sum(len(n.replace(',', '').replace('.', '').strip('0')) for n in re.findall(r'\d[\d,]*(?:\.\d+)?', text))
+
+
+def _unit(text):
+    """The unit of a written value's last place: 0.01 for 6.83, 10^-11 for 2.01852 \\times 10^{-6}; None for an expression."""
+    m = _SCIENTIFIC.fullmatch(text.strip())
+    if m:
+        return Fraction(10) ** (-len(m.group(1) or '') + _power(m))
+    m = _PLAIN.fullmatch(text.strip())
+    if not m:
+        return None
+    digits = text.strip().replace(',', '').lstrip('-')
+    if m.group(1):   # a float's long zero run is no precision: 5.322000000000000 and 5.3220000000000005 are written to 5.322
+        run = re.match(r'(\d*?)0{4,}\d{0,3}$', m.group(1))
+        return Fraction(1, 10 ** len(run.group(1) if run else m.group(1)))
+    zeros = len(digits) - len(digits.rstrip('0'))
+    return Fraction(10 ** zeros) if zeros and digits.strip('0') else Fraction(1)   # 2190 is rounded to tens, 707889 is exact
+
+
+def _tolerance(text, op):
+    """How far a written value may be from the exact one and still be right: half a unit in its last significant place (2190 for 2189.66,
+    6.84 for 6.8356), a whole unit when it says \\approx or ≈, nothing for an integer with no zeros at its end or for an expression."""
+    unit = _unit(text)
+    if unit is None:
+        return Fraction(0)
+    if op in ('\\approx', '≈'):
+        return unit
+    return unit / 2 if unit != 1 or _SCIENTIFIC.fullmatch(text.strip()) else Fraction(0)
+
+
+def _estimate(before, after):
+    """`after` is `before` on rounded numbers: as many numbers, each within 10 % of its own and written with no more significant digits,
+    one of them changed. 4.2 \\times 53 = 4 \\times 53 is an estimate, 189 + 17 for 9 \\cdot 21 + 7 is not."""
+    a = re.findall(r'\d[\d,]*(?:\.\d+)?', before)
+    b = re.findall(r'\d[\d,]*(?:\.\d+)?', after)
+    if len(a) != len(b) or not a or a == b:
+        return False
+
+    def digits(x):
+        return len(x.replace(',', '').replace('.', '').strip('0'))
+    for x, y in zip(a, b):
+        fx, fy = Fraction(x.replace(',', '')), Fraction(y.replace(',', ''))
+        if fx == 0 or abs(fx - fy) > abs(fx) / 10 or digits(y) > digits(x):
+            return False
+    return True
+
+
+def wrong_relations(line):
+    """[(expression, what was written, the right value)] for each relation on the line whose sides differ: `=` chains (each part against the
+    first: `= 189 + 17 = 196` is a wrong rewrite of 196), \\approx and ≈ (to the places written), arrows (`7+3+5 \\to 15`), and congruences
+    (`2016 \\equiv 16 \\pmod{1000}`). Not wrong: a long division's quotient digit (`13 \\div 2 = 6` remainder 1), rounding or cutting to the
+    places written, a unit after the number (4.8k), an approximation trailing off (20.1852...), a column with a borrow or carry, and two
+    statements on one line (`$x = 3$, $y = 5$`). A relation is checked only when one side computes something."""
+    if re.search(r'borrow|carry', line, re.I):
+        return []
+    wrong = []
+    m = re.search(r'\\equiv\s*(.+?)\\pmod\s*\{?\s*([\d,]+)\s*\}?', line)
+    if m:
+        left = expression_before(line[:m.start()]) or ((lambda v: (line[:m.start()].strip(' $'), v) if v is not None else None)(
+            evaluate(line[:m.start()].strip(' $').rsplit('$', 1)[-1])))
+        right, mod = evaluate(m.group(1).strip(' $')), evaluate(m.group(2))
+        if left and right is not None and mod and left[1].denominator == right.denominator == 1 and (left[1] - right) % mod:
+            wrong.append((left[0], f'{m.group(1).strip()} \\pmod{{{m.group(2)}}}', f'{int(left[1]) % int(mod)} \\pmod{{{m.group(2)}}}'))
+        return wrong
+    marks = list(_RELATION.finditer(line))
+    if not marks:
+        return wrong
+    base = expression_before(line[:marks[0].start()])
+    for n, mark in enumerate(marks):
+        end = marks[n + 1].start() if n + 1 < len(marks) else len(line)
+        got = _value_after(line[mark.end():end])
+        if got is None:
+            base = expression_before(line[:end])
+            continue
+        text, value, rest = got
+        first = _PLAIN.match(text.lstrip('-−'))
+        if base is None:
+            base = (text, value)
+        elif _OPERATOR.search(text.lstrip('-−')) and first and Fraction(first.group().replace(',', '')) == abs(base[1]):
+            base = (text, value)   # `5 \times 2 = 10 + 1 = 11`: the value, then a carry added to it, a new step and not a wrong rewrite
+        elif _estimate(base[0], text) or (_OPERATOR.search(text.lstrip('-−')) and not _SCIENTIFIC.fullmatch(text.strip())
+                                           and _digits(text) < _digits(base[0]) and base[1] and abs(value - base[1]) <= abs(base[1]) / 500):
+            # `0.00431 \times 58463 = 0.004 \times 58500`, or `\frac{27.44 \times 10^9}{22.11 \times 10^6}` for the same quotient: the step
+            # on rounded numbers, an estimate. Within 0.2 %: -104 / 3 for -3312 / 96 is 0.5 % off and wrong
+            base = (text, value)
+        elif _OPERATOR.search(base[0].lstrip('-−')) or _OPERATOR.search(text.lstrip('-−')):
+            right = base[1]
+            off = abs(right - value)
+            # a long division's quotient digit: `13 \div 2 = 6` remainder 1, or `80 / 189 = 4` for 800 / 189 with the zero brought down
+            quotient = value.denominator == 1 and re.search(r'/|\\div|÷|\\frac', base[0]) and right > 0 and any(
+                value == (right * 10 ** j).numerator // (right * 10 ** j).denominator for j in range(4) if j == 0 or 0 <= value <= 9)
+            unit = _unit(text)   # 438 + 2/3 = 438.666: cut off in its last place, not rounded
+            cut = unit is not None and unit < 1 and (right >= 0) == (value >= 0) and 0 <= abs(right) - abs(value) < unit
+            if off > _tolerance(text, mark.group(1)) and not quotient and not cut:
+                m, sci = _PLAIN.fullmatch(text), _SCIENTIFIC.fullmatch(text)
+                places = len(m.group(1) or '') if m else 0
+                said = spelled(right)
+                if sci:   # in the written form: 20.1857 \times 10^{-7}, not 37/18329827
+                    k = _power(sci)
+                    tail = f'10^{{{k}}}' if sci.group(2) is not None else '1' + '0' * k
+                    said = f'{rounded(right / Fraction(10) ** k, len(sci.group(1) or ""))} \\times {tail}'
+                elif places and (len(said.split('.')[-1]) > places if '.' in said else '/' in said):
+                    said = rounded(right, places)
+                wrong.append((base[0], text, said))
+        if rest.strip(' $.,;:)') and not _RELATION.match(rest.strip()):
+            base = None   # a new statement: `$x = 3$, $y = 5$` is two, not a chain
+    return wrong
 
 
 def simple_quotient(expr):

@@ -59,8 +59,9 @@ WHOLE_HINT_PLAIN = ('Let me write the whole calculation as one plain expression,
 # --check-hand: what the model already worked out by hand is checked at the end of its line, and a wrong value is answered with the right
 # one (developer, 2026-11-04). On 82 Base answers 462 of 8,924 hand values were wrong, 5.6 an answer; rewrites (`= 189 + 7 = 196`), rounding
 # to the places written and a long division's uneven quotient digit are not wrong.
-CORRECTION = 'Correction: {expr} = {right}, not {wrote}.\n'
-_WROTE = re.compile(r'\s*(-?\d[\d,]*(?:\.\d+)?)(?![\d.,]*\d)(?![ ]*(?:[+\-*/^(]|\\times|\\cdot|\\frac|\\div|\\sqrt|\d))')
+# The model met 'Correction: X = V, not W.' by redoing the work by hand, and got it wrong again as often as not (dm-check: 116 of 160
+# against base's 121); the correction now says it was computed and is to be used, CoRT's answer to the same distrust.
+CORRECTION = 'Correction (computed exactly): {expr} = {right}, not {wrote}. Use {right} and go on.\n'
 # --loop-hint: 14 of the control's 16 misses on the r1 rows were loops, 13 of them mid-work, several of them searches by hand. A loop in the
 # thinking is cut back to one round and a program opens to test the idea, LOOP_HINTS times; the next loop ends the answer as before.
 LOOP_HINT = 'I keep going around the same idea. Let me test it with python instead.\n```python\n'
@@ -211,7 +212,6 @@ class Rollout:
         if not thinking:
             self.phase = 'answer'
         self.whole_pending = False   # the next value is the whole step the --whole-hint asked for
-        self.checks = []   # --check-hand: (index of the `=` in text(), expression, exact value) whose line has not ended yet
         if arm.whole_hint:
             self.inject(WHOLE_HINT_PLAIN if arm.whole_plain else WHOLE_HINT, 'whole hint')
             self.whole_pending = True
@@ -264,9 +264,7 @@ class Rollout:
         if self.arm.native_tool and self.phase in ('think', 'answer'):
             stops.add(self.ids.tool_close)
         if self.arm.check_hand and self.phase in ('think', 'answer'):
-            stops |= self.ids.equals
-            if self.checks:   # the line end, so a correction follows the line it corrects
-                stops |= self.ids.lines
+            stops |= self.ids.lines   # every line is checked as it ends, so a correction follows the line it corrects
         if self.phase == 'answer':
             return min(left, CHUNK), stops
         stops.add(self.ids.think_close)
@@ -289,15 +287,8 @@ class Rollout:
         if self.phase != 'answer' and self.phase != 'block':
             self.thought += len(new)
         last = new[-1] if new else None
-        if self.arm.check_hand and self.phase in ('think', 'answer'):
-            if self.checks:
-                self.run_checks()
-            if last in self.ids.equals and not self.arm.inline_calc:
-                text = self.text()
-                at = len(text.rstrip()) - 1
-                found = inline_found(text[:at])   # its sign read with it: `-(25 * 130) = -3250` was once "corrected" to 3250 (dm 3578)
-                if found is not None:
-                    self.checks.append((at, found[0], found[1]))
+        if self.arm.check_hand and self.phase in ('think', 'answer') and last in self.ids.lines:
+            self.check_line()
         if self.arm.hint_calc and last in self.ids.equals and self.phase == 'think' and self.hint_due():
             return False
         if (self.arm.inline_calc or self.arm.hint_calc) and last in self.ids.equals and self.phase in ('think', 'answer'):
@@ -412,40 +403,16 @@ class Rollout:
         else:
             self.done('stuck')
 
-    def run_checks(self):
-        """The hand values whose line has ended, against their exact values; a correction for each wrong one, after the line."""
-        text = self.text()
-        wrong, left = [], []
-        for at, expr, value in self.checks:
-            end = text.find('\n', at)
-            if end < 0:
-                left.append((at, expr, value))
-                continue
-            got = _WROTE.match(text[at + 1:end])
-            if not got:
-                continue   # no number after the `=`, or one the line goes on computing from: a rewrite
-            wrote = got.group(1).replace(',', '')
-            try:
-                places = len(wrote.split('.')[1]) if '.' in wrote else 0
-                off = abs(Fraction(wrote) - Fraction(value))
-            except (ValueError, ZeroDivisionError):
-                continue
-            if off <= (Fraction(1, 2 * 10 ** places) if places else 0):   # rounded to the places written is right
-                continue
-            bare = re.sub(r'[\s(){}]', '', expr).replace('\\div', '/').replace('\\frac', '')
-            if not places and re.fullmatch(r'\d+/\d+', bare) and Fraction(wrote) == Fraction(value).numerator // Fraction(value).denominator:
-                continue   # a long division's quotient digit, `13 \div 2 = 6 remainder 1` (dm mul_big 4267)
-            if '/' in value:   # an uneven quotient the model wrote as a decimal: the right one in its own places, not 5000000000/6744908131
-                f = Fraction(value)
-                scaled = (abs(f) * 10 ** max(places, 1) * 2 + 1) // 2   # rounded half up
-                digits = str(scaled).rjust(max(places, 1) + 1, '0')
-                value = ('-' if f < 0 else '') + digits[:-max(places, 1)] + '.' + digits[-max(places, 1):]
-            wrong.append((expr, value, got.group(1)))
-        self.checks = left
-        for expr, value, wrote in wrong:
-            self.inject(('' if self.out and self.out[-1] in self.ids.lines else '\n') + CORRECTION.format(expr=expr, right=value, wrote=wrote),
-                        'hand check')
-            self.events[-1].update(expr=expr[:200], value=value, wrote=wrote)
+    def check_line(self):
+        """The line that just ended, every relation on it checked (tools.igc.mathexpr.wrong_relations), and a correction after it for each
+        wrong one. A correction the runner put in is not checked again."""
+        from tools.igc.mathexpr import wrong_relations
+        line = self.text().rstrip('\n').rsplit('\n', 1)[-1]
+        if line.startswith('Correction'):
+            return
+        for expr, wrote, right in wrong_relations(line):
+            self.inject(CORRECTION.format(expr=expr, right=right, wrote=wrote), 'hand check')
+            self.events[-1].update(expr=expr[:200], value=right, wrote=wrote)
 
     def hint_due(self):
         """At an `=` that ends tedious arithmetic, spaced HINT_GAP apart: the line goes back and a hinted program opens. True when it opened."""
