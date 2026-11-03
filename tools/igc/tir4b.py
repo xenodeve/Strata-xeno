@@ -332,7 +332,11 @@ def run(args):
     out.mkdir(parents=True, exist_ok=True)
     rollouts = []
     for row in rows:
-        prompt = tok.apply_chat_template([{'role': 'user', 'content': prompt_text(row)}], tokenize=True, add_generation_prompt=True, enable_thinking=True)
+        # As text, then encoded: transformers 5 returns a dict from tokenize=True, and list() of it gave the keys as the prompt.
+        text = tok.apply_chat_template([{'role': 'user', 'content': prompt_text(row)}], tokenize=False, add_generation_prompt=True, enable_thinking=True)
+        prompt = tok.encode(text, add_special_tokens=False)
+        if not text.rstrip().endswith('<think>') or not all(isinstance(t, int) for t in prompt):
+            raise SystemExit('the chat template did not end in an open <think>: ' + repr(text[-80:]))
         for k in range(args.samples):
             rollouts.append(Rollout(row, k, list(prompt), arm, ids, tok, seed_of(args.seed, row['id'], k)))
     if args.force_after and not args.execute:
