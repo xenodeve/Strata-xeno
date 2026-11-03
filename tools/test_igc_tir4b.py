@@ -290,6 +290,31 @@ class HintCalc(unittest.TestCase):
         self.assertNotIn(tir4b.TRUST, r.text())
 
 
+class AutoCall(unittest.TestCase):
+    def test_a_function_defined_and_never_called_is_called(self):
+        code = 'def find_n():\n    for n in range(5):\n        print(n)\n'
+        self.assertEqual(tir4b.with_call(code), (code + '\n_r = find_n()\nif _r is not None:\n    print(_r)\n', 'find_n'))
+
+    def test_left_alone(self):
+        for code in ('def f():\n    return 1\nprint(f())\n',          # called
+                     'def f(x):\n    return x\n',                      # needs an argument
+                     'x = 1\nprint(x)\n',                              # no function
+                     'def f(:\n'):                                     # does not parse: the run shows the error
+            self.assertEqual(tir4b.with_call(code), (code, None))
+
+    def test_the_last_uncalled_one(self):
+        code = 'def a():\n    return 1\ndef b():\n    return a() + 1\n'
+        self.assertEqual(tir4b.with_call(code)[1], 'b')
+
+    def test_the_run_records_it(self):
+        r = rollout(hint_calc=True)
+        k = Kernel([(True, '37')])
+        play(r, '\n123 \\times 456 =def f():\n    return 37\n```so</think>\n\n37<|im_end|>', k)
+        self.assertTrue(k.ran[0].endswith('_r = f()\nif _r is not None:\n    print(_r)\n'))
+        out = [e for e in r.events if e['kind'] == 'output'][0]
+        self.assertEqual((out['auto_call'], out['code']), ('f', 'def f():\n    return 37\n'))
+
+
 class FakeEngine:
     """vLLM's LLMEngine as drive() uses it: each request finishes on a later step, one at a time, so answers interleave."""
     def __init__(self, scripts):

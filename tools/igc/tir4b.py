@@ -97,6 +97,26 @@ _OPS = re.compile(r'[+\-*/^]|\\times|\\cdot|\\frac|\\div')
 _BOUNDARY = re.compile(r'(?:^|[\s$:;,]|\\\(|\\\[|=)$')
 
 
+def with_call(code):
+    """(code, name): a program that defines a function of no arguments and never calls it gets the call, and its value printed, as a notebook
+    cell would show it. The 4B ended all 6 hinted programs of its first answer (r1 5456f419) with `def find_n(): ...` and no call: each printed
+    nothing in 0.001 s, the model took the note to call it as a failure and went back to hand algebra, though the search would have printed
+    1, 11, 37. A program that does not parse is left as written, so the run shows the model its error."""
+    import ast
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, None
+    called = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    top_calls = any(isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) for s in tree.body)
+    free = [s.name for s in tree.body if isinstance(s, ast.FunctionDef) and not (s.args.args or s.args.posonlyargs or s.args.kwonlyargs
+                                                                                 or s.args.vararg or s.args.kwarg) and s.name not in called]
+    if not free or top_calls:
+        return code, None
+    name = free[-1]
+    return code + ('' if code.endswith('\n') else '\n') + f'\n_r = {name}()\nif _r is not None:\n    print(_r)\n', name
+
+
 def tedious(expr, value):
     """Arithmetic worth a program: a number of three or more digits, three operators, or a value past 999. `1 + 1` is not."""
     return any(len(n) >= 3 for n in re.findall(r'\d+', expr)) or len(_OPS.findall(expr)) >= 3 or abs(Fraction(value)) >= 1000
@@ -345,8 +365,10 @@ class Rollout:
         self.phase = 'think'
 
     def execute(self, code, kernel_factory):
-        """(finished, printed, seconds) of one run in this answer's kernel, which keeps its state across runs."""
+        """(finished, printed, seconds) of one run in this answer's kernel, which keeps its state across runs. The name of a function the run
+        called for the model (with_call) is left in self.auto_call."""
         began = time.monotonic()
+        self.auto_call = None
         if self.runs >= MAX_RUNS:
             ok, shown = None, SPENT
         else:
@@ -354,7 +376,8 @@ class Rollout:
                 self.kernel.close()
                 self.kernel = None
             self.kernel = self.kernel or kernel_factory()
-            ok, shown = self.kernel.run(code)
+            ran, self.auto_call = with_call(code)
+            ok, shown = self.kernel.run(ran)
         self.runs += 1
         return ok, shown, round(time.monotonic() - began, 3)
 
@@ -363,7 +386,7 @@ class Rollout:
         at = len(self.out)
         self.tool_reply(shown_text(ok, shown))
         self.events[-1].update(kind='output', by=self.by, code=code[:20000], code_chars=len(code), shown=(shown or '')[:4096],
-                               shown_chars=len(shown or ''), ok=ok, seconds=took, fits=bool(ok) and bool((shown or '').strip()), run_at=at)
+                               shown_chars=len(shown or ''), ok=ok, seconds=took, fits=bool(ok) and bool((shown or '').strip()), run_at=at, auto_call=self.auto_call)
 
     def run_pending(self, kernel_factory):
         """Runs the block the model closed, then puts its output and, after a fitting result, the close into the thinking."""
@@ -381,7 +404,7 @@ class Rollout:
         at = len(self.out)
         self.inject(output_block(shown_text(ok, shown)), 'output')
         self.events[-1].update(kind='output', by=self.by, code=code[:20000], code_chars=len(code), shown=(shown or '')[:4096],
-                               shown_chars=len(shown or ''), ok=ok, seconds=took, fits=fits, run_at=at)
+                               shown_chars=len(shown or ''), ok=ok, seconds=took, fits=fits, run_at=at, auto_call=self.auto_call)
         if self.by == 'hint' and fits:
             self.inject(TRUST, 'trust hint')
         if self.arm.close_fit and fits:
