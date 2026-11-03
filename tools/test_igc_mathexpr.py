@@ -129,6 +129,21 @@ class WrongRelations(unittest.TestCase):
                      'Then $u^2 (1 + \\frac{169 \\times 3}{841}) = 169$.'):
             self.assertEqual(wrong_relations(line), [], line)
 
+    def test_modular_work_and_substitutions_pass(self):
+        # a random 50 of the firings on AIME-style answers: arithmetic mod a number the answer named, written with `=`
+        for line in ('$12+3=15=2$.', '$7^3=343=44$. No.', '$16^3 = (-11)^3 = -8 = 19$.', '$2^8 = (2^4)^2 = 3^2 = 9$.'):
+            self.assertEqual(wrong_relations(line, moduli={13, 27, 81}), [], line)
+        self.assertEqual(wrong_relations('$12+3=2$.'), [('12+3', '2', '15')])   # with no modulus named it is wrong
+        for line in ('$1/2 = \\frac{(1/2)^2 - 3(1/2)}{3(1/2 + 1)} = \\frac{1/4 - 3/2}{9/2} = \\frac{-5/4}{9/2} = -5/18$.',   # f at x = 1/2
+                     '$3^3 5^1 = 135$', '$\\log_5 64 = \\log_5 2^6 = 6 \\log_5 2$.', '$19600 (81/196) = 100 \\times 81 = 8100$.',
+                     'Area $= 8 \\left( \\frac{36}{5} \\right) = \\frac{288}{5}$', 'With standard die, $P(S=7) = 1/6 = 48/288$.',
+                     '*   $T_3 = 3! (\\frac{T_0}{0!} + \\frac{T_1}{1!} + \\frac{T_2}{2!}) = 6 (1 + 1 + 2/2) = 6(3) = 18$.'):
+            self.assertEqual(wrong_relations(line), [], line)
+        for line, right in (('$2917 \\times 43175 = 125951675$.', '125941475'), ('$1785 - 549 - 1478 + 208 + 324 = 80$.', '290'),
+                            ('$11^3 = 1331 = 16 \\times 81 + 25$.', '1331'), ('$825 / 117 = 7.04$.', '7.05')):
+            got = wrong_relations(line)
+            self.assertTrue(got and got[0][2] == right, (line, got))
+
     def test_aime_style_lines_that_are_wrong(self):
         for line, right in (('Why did I think $288 \\times 315 = 90360$?', '90720'), ('$\\frac{9!}{4!} = 9 \\times 8 \\times 7 \\times 6 = 3024$.', '15120'),
                             ('*   So expected number of intersections with base lines is $25 \\times 2/3 + 25 \\times 2/3 = 50/3$.', '100/3'),

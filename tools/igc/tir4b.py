@@ -212,6 +212,7 @@ class Rollout:
         if not thinking:
             self.phase = 'answer'
         self.whole_pending = False   # the next value is the whole step the --whole-hint asked for
+        self.moduli = None   # --check-hand: the moduli the question and the answer so far name
         if arm.whole_hint:
             self.inject(WHOLE_HINT_PLAIN if arm.whole_plain else WHOLE_HINT, 'whole hint')
             self.whole_pending = True
@@ -406,11 +407,14 @@ class Rollout:
     def check_line(self):
         """The line that just ended, every relation on it checked (tools.igc.mathexpr.wrong_relations), and a correction after it for each
         wrong one. A correction the runner put in is not checked again."""
-        from tools.igc.mathexpr import wrong_relations
+        from tools.igc.mathexpr import moduli_in, wrong_relations
+        if self.moduli is None:   # the question's moduli first: `the remainder when N is divided by 1000`
+            self.moduli = moduli_in(prompt_text(self.row) if self.row.get('question') else '')
         line = self.text().rstrip('\n').rsplit('\n', 1)[-1]
         if line.startswith('Correction'):
             return
-        for expr, wrote, right in wrong_relations(line):
+        self.moduli |= moduli_in(line)   # `12+3=15=2` is right in an answer working mod 13
+        for expr, wrote, right in wrong_relations(line, self.moduli):
             self.inject(CORRECTION.format(expr=expr, right=right, wrote=wrote), 'hand check')
             self.events[-1].update(expr=expr[:200], value=right, wrote=wrote)
 

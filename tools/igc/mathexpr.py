@@ -297,6 +297,8 @@ def expression_before(text):
             continue
         if line[i] == '(' and re.search(r'[A-Za-z]\S*\s*$', line[:i]) and _symbol_before(line[:i]):
             continue   # `u^2 (1 + \frac{169 \times 3}{841})`: a factor of a product on a symbol, no value of its own
+        if re.search(r'[\d)}\]]\s+$', line[:i]) or _FUNCTION_BEFORE.search(line[:i]):
+            continue   # `3^3 5^1`, `19600 (81/196)`: a factor beside a number; `\log_5 2^6`, `\sin 84^\circ`: a function's argument
         if re.search(r'(?:[+\-*/^×÷·⋅−]|\\times|\\cdot|\\div)\s*$', line[:i]) and _symbol_before(re.sub(
                 r'(?:[+\-*/^×÷·⋅−]|\\times|\\cdot|\\div)\s*$', '', line[:i])):
             continue   # `Z / (7/3)`: the tail of an expression on a symbol, not a value of its own
@@ -337,7 +339,9 @@ _RELATION = re.compile(r'(?<![<>!=])(=|\\approx|≈|\\to\b|\\rightarrow|→|->)(
 _PLAIN = re.compile(r'-?\d[\d,]*(?:\.(\d+))?')
 _SCIENTIFIC = re.compile(r'-?\d+(?:\.(\d+))?\s*(?:\\times|×|\*|\\cdot)\s*(?:10\s*\^\s*\{?\s*(-?\d+)\s*\}?|1(0+)(?![\d.]))')
 _ROUGH = re.compile(r'\s*(?:\.\.\.|\\dots|\\ldots|…)')
-_GOES_ON = re.compile(r'\s*(?:[+\-*/^(×÷·⋅−]|\\times|\\cdot|\\div|\\d?t?frac|\\sqrt|\\left|\\binom)')
+_FUNCTIONS = r'log|ln|lg|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|exp|det|max|min|gcd|lcm|deg|operatorname|pi|mathrm|vec|mathbf|bar|hat'
+_GOES_ON = re.compile(r'\s*(?:[+\-*/^(×÷·⋅−]|\\times|\\cdot|\\div|\\d?t?frac|\\sqrt|\\left|\\binom|\\(?:' + _FUNCTIONS + r')\b)')
+_FUNCTION_BEFORE = re.compile(r'\\(?:' + _FUNCTIONS + r')\b(?:_\{?\w+\}?|\^\{?\w+\}?)*\s*\(?\s*$')
 
 
 def _value_after(segment):
@@ -457,7 +461,20 @@ def _decimals_slack(text, rough):
     return slack
 
 
-def wrong_relations(line):
+_MODULUS = re.compile(r'(?:\\pmod\s*\{?\s*|\\bmod\s*\{?\s*|\bmod(?:ulo)?\s+|\bdivided by\s+|\bremainder (?:when|of) .{0,60}?by\s+)\$?(\d[\d,]*)')
+
+
+def moduli_in(text):
+    """The moduli a text names (`\\pmod{13}`, `mod 27`, `divided by 1000`): arithmetic reduced by one of them, written with `=`, is right."""
+    found = set()
+    for m in _MODULUS.finditer(text):
+        n = int(m.group(1).replace(',', ''))
+        if n >= 2:
+            found.add(n)
+    return found
+
+
+def wrong_relations(line, moduli=()):
     """[(expression, what was written, the right value)] for each relation on the line whose sides differ: `=` chains (each part against the
     first: `= 189 + 17 = 196` is a wrong rewrite of 196), \\approx and ≈ (to the places written), arrows (`7+3+5 \\to 15`), and congruences
     (`2016 \\equiv 16 \\pmod{1000}`). Not wrong: a long division's quotient digit (`13 \\div 2 = 6` remainder 1), rounding or cutting to the
@@ -490,6 +507,9 @@ def wrong_relations(line):
         first = _PLAIN.match(text.lstrip('-−'))
         if base is None:
             base = (text, value)
+        elif _LONE.fullmatch(base[0].strip()) and _OPERATOR.search(text.lstrip('-−')) and not _LONE.fullmatch(text.strip()) \
+                and not _SCIENTIFIC.fullmatch(text.strip()):
+            base = (text, value)   # `1/2 = \frac{(1/2)^2 - 3(1/2)}{...}`: f at x = 1/2, a substitution, not a claim that both are 1/2
         elif _POWER_OF_TEN.fullmatch(text.strip()) or _constants(base[0], text) or _reads_otherwise(base[0], value):
             pass   # `6^9 \approx 10^7`; `then 3/4 = -2/3`; `3+1 \times 1+1 = 8` meant as (3+1)(1+1), `(-66^2)` as (-66)^2
         elif _OPERATOR.search(text.lstrip('-−')) and first and Fraction(first.group().replace(',', '')) == abs(base[1]):
@@ -510,7 +530,8 @@ def wrong_relations(line):
             tolerance = _tolerance(text, '\\approx' if rough else mark.group(1)) + _decimals_slack(text, rough)
             if unit == 1 and right.denominator != 1:
                 tolerance = max(tolerance, Fraction(1))   # 130.98 - 22.88 = 108: rounded or cut to an integer
-            if off > tolerance and not quotient and not cut:
+            modular = right.denominator == value.denominator == 1 and any((right - value) % m == 0 for m in moduli)
+            if off > tolerance and not quotient and not cut and not modular:   # `12+3=15=2` mod 13, in an answer that named 13
                 m, sci = _PLAIN.fullmatch(text), _SCIENTIFIC.fullmatch(text)
                 places = len(m.group(1) or '') if m else 0
                 said = spelled(right)
@@ -523,7 +544,7 @@ def wrong_relations(line):
                 wrong.append((base[0], text, said))
         if rough:
             base = (text, value)   # an approximate chain goes on from its last approximation: `\approx 6.89 - 4 = 2.89`
-        if rest.strip(' $.,;:)') and not _RELATION.match(rest.strip()):
+        if rest.strip(' $.,;:') and not _RELATION.match(rest.strip()):
             base = None   # a new statement: `$x = 3$, $y = 5$` is two, not a chain
     return wrong
 
