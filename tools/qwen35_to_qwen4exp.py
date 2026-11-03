@@ -23,7 +23,8 @@ compute the 4B exactly:
                       with key head h % h_k (gdn.hpp).  Engine head e holds HF head (e % h_k)*r + e // h_k.
                       ssm_a = -exp(A_log).  ssm_norm is the gated norm's weight AS STORED: HF's
                       Qwen3_5RMSNormGated multiplies by w (not 1+w), and so does gdn_out_norm.  HF's output gate is
-                      silu(z); today's engine applies sigmoid(z) (fused_gdn.cu, gdn.cu) - stage 2 adds the switch.
+                      silu(z); Flash-Next's is sigmoid(z), and the engine picks it from ssm.output_gate
+                      (strata::kernels::gdn_gate_silu, #297 stage 2).
   attention           q_proj ([q 256 | gate 256] per head, exactly the engine's q_full), k_proj, v_proj, o_proj;
                       q_norm / k_norm stored as 1+w (rms_norm_weighted multiplies by the stored value).
   head                output.weight is a copy of the tied embedding; output_hc_norm = 2*(1+norm.w) x4.
@@ -33,14 +34,16 @@ Types: every projection, token_embd and output in Q8_0 (the engine's native GEMV
 the small readers the engine takes as BF16 (hc_*, output_hc_down/up, ssm_alpha/beta, ffn_gate_inp_shexp) as BF16,
 exactly as the GSQ-RCO qwen4exp files store them; norms, ssm_a, ssm_dt.bias and ssm_conv1d as F32.
 
-The architecture name defaults to `qwen35dense`, a NEW name: today's engine refuses it (check_architecture wants
-'qwen4exp'), which is right until stage 2 teaches it this geometry.  --arch qwen4exp writes the same tensors under
-the old name, for experiments only.  `--plan` prints the table and what the current loader would still refuse.
+The architecture name defaults to `qwen35dense`, a NEW name.  Since #297 stage 2 the engine reads this geometry from
+the file's `qwen35dense.*` keys (strata::core::geometry_from_metadata), switches the GDN gate to silu, and decodes it
+through the verify windows (run_dense: `strata --pack <pack> --native <gguf> --tokens ...`).  --arch qwen4exp writes
+the same tensors under the old name, for experiments only (the engine then takes it for Flash-Next and refuses it).
+`--plan` prints the table and what the engine still refuses.
 
 The pack (--pack) is tools/iq_pack.py's standalone form: index.txt (Q8_0 rows served natively from the GGUF),
 dense.bin (the BF16/F32 tensors), conversions.json and tokenizer/.  There is no native_experts.txt: the model has no
-routed experts, and that file is iq_pack's completion marker, so today's engine and setup see the pack as
-unfinished - stage 2's list.
+routed experts (that file is iq_pack's completion marker); run_dense does not read the expert table at all.  setup
+still sees such a pack as unfinished.
 
 The numeric gate is tools/test_qwen35_convert.py (tiny random weights in its unit tests; --full on the real model).
 Reading the real model through --hf-repo uses plain HTTP range requests with no token, so nothing of the 9.3 GB
@@ -676,8 +679,25 @@ def write_pack(gguf_path, out_dir) -> int:
 
 
 # ------------------------------------------------------------------ what today's engine would still refuse
+def stage3_refusals(g: Geometry, arch: str) -> list:
+    """What the engine still refuses for this model after #297 stage 2 (read from the code; stage 2 itself boots and
+    decodes it: `strata --pack <pack> --native <gguf> --tokens ...`, run_dense in src/program/generate.cpp)."""
+    if arch != "qwen35dense":
+        return ["--arch %s: the engine reads the qwen35dense geometry only under that name; a qwen4exp-named file is "
+                "taken for Flash-Next (48 layers, 24/2 heads) and refused by the guard" % arch]
+    return [
+        "--serve, --mtp, --batch, a layer split, --vision, --prefill, --logits-stride and every expert-tier flag "
+        "(refused at startup: run_dense is one GPU, generate mode)",
+        "the batched prompt path (Prefill::init refuses a dense geometry; its kernels fix HV 48 / C 10240 and run the "
+        "router): the prompt is read through the verify windows, up to 8 tokens a window (stage 3)",
+        "IGC / MIP: --igc-learned-diagnostic-bundle is bound to Flash-Next's files (stage 4: a sandbox-only mode)",
+        "HIP / SYCL: the new kernel instances (GQA 4 attention, the silu GDN gate) are built for CUDA here and not "
+        "run on AMD or Intel",
+    ]
+
+
 def stage2_refusals(g: Geometry, arch: str) -> list:
-    """Read from the code at this commit (gguf_reader.hpp, layout.cpp/.hpp, iq_pack.py, the kernels); not run."""
+    """Stage 1's list, read from the code at 4cb9855c (before stage 2); kept as the record of what stage 2 changed."""
     n_qsa = sum(g.is_attention(l) for l in range(g.n_layers))
     return [
         "check_architecture (include/strata/artifact/gguf_reader.hpp): general.architecture '%s' != 'qwen4exp'; "
@@ -737,8 +757,8 @@ def main() -> int:
             if not n.startswith("blk.") or n.startswith(("blk.0.", "blk.3.")):
                 print("%-34s %-5s %s" % (n, t, s))
         print("... %d tensors, %.2f GiB" % (len(rows), sum(_nbytes(t, s) for _, t, s in rows) / 2**30))
-        print("\nwhat today's engine still refuses (stage 2):")
-        for r in stage2_refusals(g, a.arch):
+        print("\nwhat the engine still refuses (after #297 stage 2):")
+        for r in stage3_refusals(g, a.arch):
             print("  - " + r)
         if not a.gguf:
             return 0

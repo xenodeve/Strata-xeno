@@ -1879,6 +1879,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
+    if (g.dense) {   // #297: its kernels fix HV 48 / C 10240 and run the router; stage 3 makes them follow the geometry
+        err = "prefill: the batched prompt path does not run a dense (qwen35dense) model yet; it reads its prompt "
+              "through the decode windows (#297 stage 3)";
+        return false;
+    }
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }

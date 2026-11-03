@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/gdn.hpp"   // gdn_gate_silu (#297)
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
 #include "strata/kernels/dp4a.hpp"
@@ -203,7 +204,9 @@ __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t i
     if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
 }
 
-template <bool ALL_OUT, bool Q>
+// SILU (#297, qwen35dense): the output gate silu(z) = z * sigmoid(z); false is Flash-Next's sigmoid(z), the same
+// expression as before (gdn.hpp, gdn_gate_silu)
+template <bool ALL_OUT, bool Q, bool SILU = false>
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
@@ -280,7 +283,8 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
             const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
             const float scale = rsqrtf(ss / (float) S + eps);
             const float zz = z[(size_t) t * value_dim + head * S + col];
-            const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
+            const float sg = 1.0f / (1.0f + __expf(-zz));
+            const float yv = oc * scale * gam * (SILU ? zz * sg : sg);
             y[(size_t) t * value_dim + head * S + col] = yv;
             if constexpr (Q) gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
         }
@@ -430,7 +434,7 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_state_replay_kernel(float* _
 }
 // y = oc * rsqrt(mean(oc^2) + eps) * gamma * sigmoid(z) per head and token: gdn_step_norm_multi_kernel's tail with its
 // code shape (S x RG threads; rg 0 holds oc, the other row groups contribute 0 to wsum), reading oc from y
-template<bool Q>
+template<bool Q, bool SILU = false>
 __global__ void __launch_bounds__(S * RG) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
                                                              float eps, float* __restrict__ y, int h_v, int T,
                                                              const int32_t* __restrict__ n_keep, int t_out_begin,
@@ -453,12 +457,14 @@ __global__ void __launch_bounds__(S * RG) gdn_out_norm_kernel(const float* __res
         const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
         const float scale = rsqrtf(ss / (float) S + eps);
         const float zz = z[(size_t) t * value_dim + head * S + col];
+        const float sg = 1.0f / (1.0f + __expf(-zz));
+        const float gt = SILU ? zz * sg : sg;
         if constexpr (Q) {
-            const float yv = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+            const float yv = oc * scale * gamma[col] * gt;
             y[(size_t) t * value_dim + head * S + col] = yv;
             gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
         } else {
-            y[(size_t) t * value_dim + head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+            y[(size_t) t * value_dim + head * S + col] = oc * scale * gamma[col] * gt;
         }
     }
 }
@@ -930,6 +936,10 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
             gdn_step_split_kernel<true><<<grid, block, 0, (cudaStream_t) stream>>>(
                 state, h, conv_channels, gate, beta, y, h_k, h_v, n_tok, n_keep, t_out_begin);
             const dim3 ng((unsigned) h_v, (unsigned) (n_tok - t_out_begin));
+            if (gdn_gate_silu()) {   // #297: the qwen35dense gate
+                if (xq) gdn_out_norm_kernel<true, true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, xq);
+                else gdn_out_norm_kernel<false, true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, nullptr);
+            } else
             if (xq) gdn_out_norm_kernel<true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, xq);
             else gdn_out_norm_kernel<false><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, nullptr);
         }
@@ -951,6 +961,23 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     }
     const dim3 g1((unsigned) h_v), b1(S, RG);
     const bool all_out = n_keep == nullptr && t_out_begin <= 0;
+    if (gdn_gate_silu()) {   // #297: the qwen35dense gate - the same four variants with silu(z)
+        cudaStream_t cs = (cudaStream_t) stream;
+        if (xq && t_out_begin < n_tok) {
+            if (all_out) gdn_step_norm_multi_kernel<true, true, true><<<g1, b1, 0, cs>>>(
+                state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq);
+            else gdn_step_norm_multi_kernel<false, true, true><<<g1, b1, 0, cs>>>(
+                state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, xq);
+        } else if (all_out) {
+            gdn_step_norm_multi_kernel<true, false, true><<<g1, b1, 0, cs>>>(
+                state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, nullptr);
+        } else {
+            gdn_step_norm_multi_kernel<false, false, true><<<g1, b1, 0, cs>>>(
+                state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, nullptr);
+        }
+        check("gdn_step_norm_multi (silu)");
+        return;
+    }
     if (xq && t_out_begin < n_tok) {
         if (all_out) gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq);

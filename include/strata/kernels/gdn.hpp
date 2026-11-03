@@ -94,4 +94,13 @@ void gdn_beta_gate(float* beta, int64_t h_v, void* stream);
 void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
                   float eps, void* stream);
 
+/// #297 stage 2: THE GDN OUTPUT GATE, for the whole process.  false (the default) is Flash-Next's sigmoid(z); true
+/// is Qwen3.5's silu(z) = z * sigmoid(z) (the GGUF key `qwen35dense.ssm.output_gate = silu`; HF's
+/// Qwen3_5RMSNormGated).  It cannot be folded into a weight.  Set once at startup from the model's geometry, BEFORE
+/// any graph is captured (a captured graph keeps the kernel it was captured with).  Every GDN output-norm site
+/// reads it: gdn_out_norm here, fused_gdn_step_norm, native_gdn_out_norm and the verify window's
+/// gdn_step_norm_multi; with false each launches exactly the kernel it launched before.
+void gdn_gate_silu_set(bool silu);
+bool gdn_gate_silu();
+
 }  // namespace strata::kernels

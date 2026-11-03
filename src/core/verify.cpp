@@ -251,6 +251,8 @@ strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
     s.head_dim = g.head_dim;
     s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
+    // #297: dense attention - a budget no context reaches, so every step's selection width is n_kv (all cells)
+    if (g.dense) s.idx_top_k = strata::kernels::kDenseTopK;
     return s;
 }
 
@@ -505,7 +507,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
-    if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
+    // #297 stage 2: a dense geometry (qwen35dense) has no routed experts, so no expert tier to need
+    if (!g.dense && (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0)) {
         err = "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
               "--expert-cache auto, no VRAM was left for it - the 'no VRAM is left for the expert cache' line above "
               "says how much is short and what makes room (a smaller --max-context, --kv q4_0, setup --draft-vocab en, "
@@ -517,9 +520,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: " + why + " (the verify window reproduces the default native decode path)";
         return false;
     }
-    if (!strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || ss.k != 10 || g.ssm_state_size != 128 ||
-        g.ssm_d_conv != 4) {
+    if (!strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || (!g.dense && ss.k != 10) ||
+        g.ssm_state_size != 128 || g.ssm_d_conv != 4) {
         err = "verify: geometry differs from the artifact's";
+        return false;
+    }
+    if (g.dense && (g.n_expert != 0 || ss.k < 1)) {   // the K-wide buffers keep a width of at least 1 (never read)
+        err = "verify: a dense geometry has no routed experts and a session of k >= 1";
         return false;
     }
     if (le_ < 0) le_ = g.n_layers;
@@ -533,7 +540,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     n_vocab_ = wo->ne1;
 
     const strata::kernels::QsaShapes s = shapes_of(g);
-    cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    // #297: dense attention selects every cell, so the selection is as wide as the context (its rows are the identity,
+    // written once below); QSA keeps its top-k budget
+    cap_ = g.dense ? ss.qsa_states[ss.qsa_primary()].max_cells
+                   : strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
 
@@ -544,7 +554,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
-    const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
+    // the q8_1 activation buffers also hold the shared expert's down input (n_ff wide): Flash-Next's 640 is below
+    // the other widths, so this is the same size there; #297's dense FFN (9216) is the widest input
+    const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD), (uint64_t) g.n_ff);
 
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
@@ -676,6 +688,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             return false;
         }
     }
+    if (g.dense) {   // #297: dense attention's selection - every row is cells 0, 1, ... (the step's width cuts it at n_kv)
+        std::vector<int32_t> ids((size_t) T * (size_t) cap_);
+        for (uint64_t t = 0; t < T; ++t)
+            for (int64_t i = 0; i < cap_; ++i) ids[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
+        if (cudaMemcpy(sel_, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "verify: the dense selection could not be set";
+            return false;
+        }
+    }
     {   // APR (prism.hadamard, hadamard.txt): the sign vectors on this device, before any graph capture
         had_sx_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) g.n_embd), (int) g.n_embd);
         had_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) g.n_ff), (int) g.n_ff);
@@ -734,6 +755,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             all_resident_ = all_ok;
         }
     }
+    // #297: no routed experts - the zero-doorbell graph by construction (the host never serves a layer)
+    if (g.dense) all_resident_ = true;
     // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
@@ -1141,12 +1164,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
                 const QsaState& st = ss.qsa_states[qi];
-                const WeightRef *wik = need(v, "indexer.k_proj.weight", err), *wq = need(v, "attn_q.weight", err),
-                                *wk = need(v, "attn_k.weight", err), *wv = need(v, "attn_v.weight", err),
-                                *wo = need(v, "attn_output.weight", err), *wiq = need(v, "indexer.q_proj.weight", err),
-                                *wqn = need(v, "attn_q_norm.weight", err), *wkn = need(v, "attn_k_norm.weight", err),
-                                *wiqn = need(v, "indexer.q_norm.weight", err), *wikn = need(v, "indexer.k_norm.weight", err);
-                if (!wik || !wq || !wk || !wv || !wo || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
+                // #297: a dense geometry has no indexer - it attends to every cell (sel_ is the identity, init)
+                const bool dense = g.dense;
+                const WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
+                                *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
+                                *wqn = need(v, "attn_q_norm.weight", err), *wkn = need(v, "attn_k_norm.weight", err);
+                const WeightRef *wik = dense ? nullptr : need(v, "indexer.k_proj.weight", err),
+                                *wiq = dense ? nullptr : need(v, "indexer.q_proj.weight", err),
+                                *wiqn = dense ? nullptr : need(v, "indexer.q_norm.weight", err),
+                                *wikn = dense ? nullptr : need(v, "indexer.k_norm.weight", err);
+                if (!wq || !wk || !wv || !wo || !wqn || !wkn || (!dense && (!wik || !wiq || !wiqn || !wikn))) return false;
                 if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
                     !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
                     return false;
@@ -1181,7 +1208,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 // STRATA_DF_BRANCH: the query side (q and its norm/RoPE/rotation on side 0, the indexer query on side 1)
                 // beside the K/V side; the indexer query joins before the block scores, the query before attention
-                const bool qbr = br && qb;
+                const bool qbr = br && qb && !dense;   // (dense: no indexer query for side 1; one stream)
                 if (qbr) {
                     fork(0);
                     native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
@@ -1195,7 +1222,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               IQ * ID, N, IQ * ID, n, df_side_[1]);
                     norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
                 }
-                if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
+                if (dense) {
+                } else if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
                 stamp(l, 7, grp);
@@ -1210,7 +1238,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 }
                 stamp(l, 8, grp);
-                if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
+                if (dense) {   // no indexer tail to snapshot
+                } else if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
                     for (int t = tb; t < te; ++t)
                         if (t == tb || brow_[t] != brow_[t - 1])
                             copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
@@ -1264,7 +1293,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
                                        vcur_ + t * NKV * HD, s, cs, &st.host);
                 }
-                if (dec_batch && !g_no_batch_kv && !batch_rec_) {
+                if (dense) {   // no indexer keys to append
+                } else if (dec_batch && !g_no_batch_kv && !batch_rec_) {
                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
                                                     n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
@@ -1294,9 +1324,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
                     }
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
+                    if (!dense) {
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                               N, IQ * ID, n, cs);
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
+                    }
                 } else {
                 for (int t = tb; t < te; ++t) {
                     float* qc = qcur_ + t * NH * HD;
@@ -1313,7 +1345,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                     if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
                 }
-                for (int t = tb; t < te; ++t) {
+                for (int t = tb; t < te && !dense; ++t) {
                     float* qx = qidx_ + t * IQ * ID;
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
                     norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
@@ -1324,10 +1356,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        if (!dense) {   // (dense: sel_'s rows are the identity)
                         qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
                                          max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
                         qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
                                        sel_ + (size_t) t * cap_, cs);
+                        }
                         qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
                         qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
@@ -1335,10 +1369,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               attn_ + t * NH * HD, 1, cs);
                     }
                 } else {
+                if (!dense) {   // (dense: sel_'s rows are the identity, the step's width is n_kv)
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
                                  s, scores_ + (size_t) tb * max_blocks_, cs);
                 qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                sel_ + (size_t) tb * cap_, cs);
+                }
                 stamp(l, 11, grp);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
@@ -1386,12 +1422,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
-        const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+        // #297: a dense geometry has no router: the FFN is the shared expert alone (no routing, plan or doorbell)
+        const WeightRef* w_router = g.dense ? nullptr : v.get("ffn_gate_inp.weight");
         // S26 STRATA_LFUSE=1: the shared expert's gate row rides in the router GEMV launch, its sigmoid + row scale
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
-        const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
+        const WeightRef* w_sgi = !g.dense && lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        if (g.dense) {
+        } else if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
                     sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
@@ -1430,7 +1468,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
-        if (ar_on()) {
+        if (g.dense) {
+        } else if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
@@ -1496,7 +1535,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
         }
-        if (strata::kernels::cpu::expert_layout().native) {
+        if (g.dense) {   // #297: no routed experts read an input
+        } else if (strata::kernels::cpu::expert_layout().native) {
             // APR: Hadamard-folded gate/up take H (s * x); xm itself stays as it is (the shared expert above and the
             // doorbell copy for the CPU pool, which rotates its own in native_quant_act). The q8_1 image of xm that
             // STRATA_QFUSE / STRATA_VERIFY_QDEDUP may already have written is of the unrotated input, so a folded layer
@@ -1559,7 +1599,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);
             }
         };
-        if (ar_on()) {
+        if (g.dense) {
+            // #297: no routed experts - the block's output is the shared expert's (combined below)
+        } else if (ar_on()) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
@@ -1612,6 +1654,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
+        if (g.dense) {   // #297: the shared expert (its scalar gate applied) is the whole FFN output
+            if (cudaMemcpyAsync(bo_ + tb * N, shared_ + tb * N, (size_t) n * (size_t) N * sizeof(float),
+                                cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                err = "verify: the dense FFN output copy failed";
+                return false;
+            }
+        } else
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
                 native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
@@ -1627,7 +1676,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
         }
-        if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
+        if (remote_opt_ && !g.dense) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
@@ -1934,6 +1983,8 @@ bool Verifier::capture_commit(std::string& err) {
                                     (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_,
                                     (int) MT);   // S26: t_out_begin = MT - the replay's outputs (y_dummy_) are never read
                 ++gdn_index;
+            } else if (g.dense) {   // #297: no indexer; the window has written the K/V cells already
+                ++qsa_index;
             } else {
                 const QsaState& st = ss.qsa_states[qsa_index];
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
@@ -2486,6 +2537,7 @@ bool Verifier::wait_commit(std::string& err) {
 bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& err) {
     const OnDevice on_device(device_);
     if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
+    if (g_->dense) { err = "verify: batch slots do not run a dense (qwen35dense) model yet (#297)"; return false; }
     if (slots.empty()) {
         err = "verify: init_slots needs at least one session";
         return false;

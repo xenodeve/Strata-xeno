@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <string>
 
+namespace strata { class GgufFile; }
+
 namespace strata::core {
 
 /// The model's geometry, taken from `docs/semantics.md` and the artifact's own metadata.  Every field here
@@ -51,6 +53,15 @@ struct ModelGeometry {
     // MoE, on every layer
     int64_t n_expert = 512;
     int64_t n_ff = 640;
+
+    // #297 stage 2: the `qwen35dense` architecture (tools/qwen35_to_qwen4exp.py: Qwen3.5-4B written in qwen4exp's
+    // shape).  Both default to Flash-Next's values, so a qwen4exp geometry is the struct above, field for field.
+    /// No router, no routed experts (n_expert 0: the FFN is the shared expert alone), no indexer (every attention
+    /// layer attends to every cell) and no PLE.
+    bool dense = false;
+    /// The GDN output gate: false is Flash-Next's sigmoid(z), true is Qwen3.5's silu(z) = z * sigmoid(z)
+    /// (`<arch>.ssm.output_gate`).  Read by the GDN kernels through `strata::kernels::gdn_gate_silu()`.
+    bool gdn_silu = false;
 
     int64_t hc_dim() const { return hc * n_embd; }
     /// `layer % qsa_interval == qsa_interval - 1` is full attention.  Derived, not a second list.
@@ -92,6 +103,15 @@ bool check_layer(const WeightTable& table, const ModelGeometry& g, int64_t layer
 
 /// `check_layer` over every layer, plus the cross-layer properties: exactly 12 QSA layers at the right
 /// indices, every GDN layer having the GDN set and no QSA tensor, and vice versa.  Returns the first failure.
+/// A dense geometry (`g.dense`) checks the qwen35dense set instead: no `ffn_gate_inp` and no `indexer.*`
+/// tensor on any layer (their presence is an error: the engine would not read them), the rest as above.
 bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& err);
+
+/// #297 stage 2: the geometry from a model file's metadata.  `qwen4exp` leaves `g` as Flash-Next's defaults
+/// (the caller keeps reading the expert shape it always read); `qwen35dense` fills every field from the
+/// `qwen35dense.*` keys and refuses a value the kernels cannot run (n_embd 2560 / hc 4 / hc_lr 320 for the fused
+/// hyper-connection read, GDN state 128 and conv 4, head_dim 256 and rope 64, GQA 4 or 12, 0 experts).
+/// `arch` returns the architecture name.  Returns false with `err` set on a refusal.
+bool geometry_from_metadata(const strata::GgufFile& file, ModelGeometry& g, std::string& arch, std::string& err);
 
 }  // namespace strata::core

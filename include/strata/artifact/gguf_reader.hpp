@@ -612,10 +612,29 @@ struct Qwen4ExpGuard {
                                   // fewer experts than the canonical 512; the graph reads the true value
 };
 
+/// #297 stage 2: the second architecture, `qwen35dense` (tools/qwen35_to_qwen4exp.py: Qwen3.5-4B in qwen4exp's
+/// tensor shapes, with no routed experts, no indexer and no PLE).  Only what every reader of the file can check is
+/// here - the keys are present and the model has no routed experts; the geometry the kernels need is checked where
+/// it is read (`strata::core::geometry_from_metadata`).
+inline std::string check_qwen35dense(const GgufFile& g) {
+    static const char* const keys[] = {
+        "qwen35dense.block_count", "qwen35dense.embedding_length", "qwen35dense.feed_forward_length",
+        "qwen35dense.expert_count", "qwen35dense.attention.head_count", "qwen35dense.attention.head_count_kv",
+    };
+    for (const char* k : keys)
+        if (!g.get(k)) return std::string("missing ") + k;
+    if (g.get("qwen35dense.expert_count")->u != 0)
+        return "qwen35dense.expert_count = " + std::to_string(g.get("qwen35dense.expert_count")->u) +
+               ", expected 0 (a dense model)";
+    return {};
+}
+
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
-    if (arch->s != "qwen4exp") return "architecture is '" + arch->s + "', this engine requires 'qwen4exp'";
+    if (arch->s == "qwen35dense") return check_qwen35dense(g);
+    if (arch->s != "qwen4exp")
+        return "architecture is '" + arch->s + "', this engine requires 'qwen4exp' (or 'qwen35dense')";
     struct Req {
         const char* key;
         uint64_t want;

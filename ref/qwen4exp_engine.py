@@ -10,8 +10,8 @@ first), so converted weights can be checked against Hugging Face without a GPU o
              silu; q, k L2-normalised per head with eps on the SUM (gdn_l2_norm); q *= 1/sqrt(S);
              gate = softplus(alpha + dt) * ssm_a, dec = exp(gate); beta = sigmoid(beta); the delta rule with value
              head h reading key head h % h_k; y = rms_norm(o per head) * ssm_norm * act(z).
-             act is SIGMOID in today's kernels (fused_gdn.cu:69, gdn_out_norm).  `gdn_gate="silu"` is the switch
-             stage 2 adds for Qwen3.5 - it does not exist in the engine yet.
+             act is SIGMOID for Flash-Next; `gdn_gate="silu"` is Qwen3.5's, which the engine runs since #297
+             stage 2 (strata::kernels::gdn_gate_silu, set from qwen35dense.ssm.output_gate).
   attention  layer.cpp qsa_layer, DENSE (no indexer; the 4B has none): q_full (n_head, 2*head_dim), q = first half
              and gate = second half of each head's row; rms_norm_weighted(q / k per head, stored gamma) then NEOX rope
              on the first n_rot dims (rope.cu, the table built in float64); softmax(q.k / sqrt(head_dim)) over every

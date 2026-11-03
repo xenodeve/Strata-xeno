@@ -1,5 +1,6 @@
 // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/gdn.hpp"
 
 #include <cuda_runtime.h>
 
@@ -13,6 +14,8 @@ constexpr int S = 128;          // state size (rows = cols = 128)
 constexpr int RG = 4;           // row groups
 constexpr int RPG = S / RG;     // 32 rows per thread
 
+// SILU (#297, qwen35dense): the output gate silu(z) instead of sigmoid(z) (gdn.hpp, gdn_gate_silu)
+template <bool SILU>
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict__ state, const float* __restrict__ q,
                                                                const float* __restrict__ k, const float* __restrict__ v,
                                                                const float* __restrict__ gate,
@@ -66,7 +69,8 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
         const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
         const float scale = rsqrtf(ss / (float) S + eps);
         const float zz = z[head * S + col];
-        y[head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+        const float sg = 1.0f / (1.0f + __expf(-zz));
+        y[head * S + col] = oc * scale * gamma[col] * (SILU ? zz * sg : sg);
     }
 }
 
@@ -154,8 +158,12 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
-                                                                                   gamma, eps, y, h_k, h_v);
+    if (gdn_gate_silu())
+        gdn_step_norm_kernel<true><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
+                                                                                         gamma, eps, y, h_k, h_v);
+    else
+        gdn_step_norm_kernel<false><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
+                                                                                          gamma, eps, y, h_k, h_v);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));

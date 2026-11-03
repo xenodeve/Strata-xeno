@@ -870,6 +870,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(verify_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(verify_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME verify_parity COMMAND verify_parity --selftest)
+    # #297 stage 2: the qwen35dense switches (GDN silu gate, GQA 4, dense selection) against the reference math
+    add_executable(qwen35dense_parity src/kernels/qwen35dense_parity.cpp)
+    target_include_directories(qwen35dense_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(qwen35dense_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME qwen35dense_parity COMMAND qwen35dense_parity --selftest)
   endif()
 
   add_executable(fused_gr_bench src/kernels/fused_gr_bench.cpp)

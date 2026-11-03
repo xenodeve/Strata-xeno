@@ -428,6 +428,9 @@ struct Options {
     /// combination recorded in bench/results/2026-09-23-attention-ple plus the native indexer, and never the
     /// <=256-token attention adapter. It becomes the default once P0 shows it is not slower.
     std::string native_preset;
+    /// #297 stage 2: --native's model is `qwen35dense` (general.architecture of its first shard) - no routed experts,
+    /// no indexer, no PLE; it runs through run_dense, not the expert machinery.  Set by the preset expansion.
+    bool dense_model = false;
     /// The token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py: BF16 as shipped)
     std::string embd_gguf;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
@@ -2494,6 +2497,158 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     return el > 0 ? (double) done / el : -1.0;
 }
 
+// ================================ #297 stage 2: A DENSE (qwen35dense) MODEL ================================
+//
+// tools/qwen35_to_qwen4exp.py writes Qwen3.5-4B in qwen4exp's tensor shapes: zero hyper-connection projections (a
+// plain residual), the dense FFN as the shared expert, no router, no routed experts, no indexer, no PLE, no MTP.
+// Every token runs through the verify window (Verifier, the default native decode path) with the geometry's dense
+// skips: the FFN is the shared expert alone, attention reads every cell, the GDN gate is the model's.  There is no
+// expert tier, cache, pool or profile to build, so this path boots the session, the head and one verifier and
+// nothing else: the prompt is read through the windows too (the batched prompt path is #297 stage 3), and each
+// generated token is a one-token window.  Not --serve yet (refused at startup).
+//
+// --dump-logits PATH  the raw logits of every position, in the generate format (int32 n_vocab, int32 rows, then
+//                     rows x n_vocab f32; row p = after reading token p, p < n_prompt - 1 + max_new)
+// STRATA_LOGPOS=PATH  the teacher-forced log-probability of every prompt token (Verifier::window_logprobs, the
+//                     serve path's format; STRATA_LOGPOS_TOPK=K adds the K most likely)
+int run_dense(const Options& o, const strata::core::ModelGeometry& g, const strata::core::WeightTable& wt,
+              cudaStream_t stream) {
+    std::string err;
+    if (!strata::core::check_all(wt, g, err)) {
+        std::fprintf(stderr, "strata generate: qwen35dense: %s\n", err.c_str());
+        return 1;
+    }
+    const strata::core::WeightRef* wo = wt.find("output.weight");
+    if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
+    const int64_t n_vocab = wo->ne1;
+    strata::core::NativeHead head;
+    if (!head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
+    }
+    // one unused expert slot keeps the K-wide buffers their shapes; the dense window never reads them
+    constexpr int64_t K = 1;
+    strata::core::SessionState ss;
+    void* sbuf = nullptr;
+    if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, -1)) != cudaSuccess ||
+        strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, -1) == 0) {
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "strata generate: qwen35dense: the session state (%lld cells) does not fit\n",
+                     (long long) o.max_context);
+        return 1;
+    }
+    ss.ple.hist = ss.ple_hist;
+    strata::core::session_zero(ss, g, nullptr, stream);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
+        return 1;
+    }
+    const int max_t = (int) std::clamp<int64_t>(o.spec >= 2 ? o.spec : strata::kernels::kVerifyMaxT, 2,
+                                                strata::kernels::kVerifyMaxT);
+    strata::core::Verifier ver;
+    strata::core::VerifyHits vh{};   // no expert tier
+    if (!ver.init(wt, g, ss, vh, &head, max_t, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
+    }
+    strata::kernels::SamplerParams sp;
+    sp.greedy = o.greedy;
+    sp.seed = o.seed;
+    sp.top_k = o.top_k;
+    sp.top_p = o.top_p;
+    sp.temperature = o.temperature;
+    ver.set_sampling(sp);
+    std::fprintf(stderr, "strata generate: qwen35dense: %lld layers (%lld attention, dense; %lld GDN, %s gate), "
+                         "FFN %lld, %lld/%lld heads, no routed experts; windows of up to %d tokens, %lld cells; "
+                         "sampling %s\n",
+                 (long long) g.n_layers, (long long) g.n_qsa_layers(), (long long) g.n_gdn_layers(),
+                 g.gdn_silu ? "silu" : "sigmoid", (long long) g.n_ff, (long long) g.n_head, (long long) g.n_head_kv,
+                 max_t, (long long) o.max_context, sp.greedy || sp.temperature <= 0.0f ? "greedy" : "sampled");
+
+    const int64_t n_prompt = (int64_t) o.tokens.size();
+    const int64_t dump_rows = n_prompt - 1 + o.max_new;
+    std::FILE* dump = nullptr;
+    if (!o.dump_logits.empty()) {
+        dump = std::fopen(o.dump_logits.c_str(), "wb");
+        const int32_t hdr[2] = {(int32_t) n_vocab, (int32_t) dump_rows};
+        if (dump == nullptr || std::fwrite(hdr, sizeof hdr, 1, dump) != 1) {
+            std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_logits.c_str());
+            return 1;
+        }
+    }
+    std::FILE* logpos = nullptr;
+    if (const char* p = std::getenv("STRATA_LOGPOS"); p != nullptr && (logpos = std::fopen(p, "ab")) == nullptr) {
+        std::fprintf(stderr, "strata generate: cannot append to STRATA_LOGPOS=%s\n", p);
+        return 1;
+    }
+    const int32_t logpos_extra = [] {
+        const char* p = std::getenv("STRATA_LOGPOS_EXTRA");
+        return p != nullptr ? (int32_t) std::atoi(p) : (int32_t) 248046;
+    }();
+    std::vector<float> row((size_t) n_vocab);
+    int64_t rows_written = 0;
+    auto dump_window = [&](int T) -> bool {
+        for (int t = 0; t < T && dump != nullptr && rows_written < dump_rows; ++t, ++rows_written) {
+            if (!ver.copy_logits(t, row.data()) ||
+                std::fwrite(row.data(), sizeof(float), row.size(), dump) != row.size()) {
+                std::fprintf(stderr, "strata generate: writing the logits of row %lld failed\n", (long long) rows_written);
+                return false;
+            }
+        }
+        return true;
+    };
+    std::vector<int32_t> win((size_t) max_t), out((size_t) max_t), nxt((size_t) max_t);
+    // ---- the prompt, through the windows; every token is committed, so each row is teacher-forced
+    const auto t_prompt = Clock::now();
+    int64_t pos = 0;
+    int32_t next = -1;
+    while (pos < n_prompt) {
+        const int T = (int) std::min<int64_t>(max_t, n_prompt - pos);
+        for (int t = 0; t < T; ++t) {
+            win[(size_t) t] = (int32_t) o.tokens[(size_t) (pos + t)];
+            nxt[(size_t) t] = pos + t + 1 < n_prompt ? (int32_t) o.tokens[(size_t) (pos + t + 1)] : -1;
+        }
+        if (!ver.run(T, win.data(), pos, nullptr, nullptr, out.data(), err) || !dump_window(T) ||
+            (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, pos, logpos_extra, logpos, err)) ||
+            !ver.commit(T, err)) {
+            std::fprintf(stderr, "strata generate: qwen35dense prompt window at %lld: %s\n", (long long) pos, err.c_str());
+            return 1;
+        }
+        next = out[(size_t) (T - 1)];
+        pos += T;
+    }
+    const double ms_prompt = std::chrono::duration<double, std::milli>(Clock::now() - t_prompt).count();
+    // ---- the answer, one token a window
+    std::vector<int32_t> produced;
+    const auto t_decode = Clock::now();
+    while ((int64_t) produced.size() < o.max_new) {
+        produced.push_back(next);
+        const bool eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) next) != o.eos_ids.end();
+        if (eos || (int64_t) produced.size() >= o.max_new || pos >= o.max_context) break;
+        win[0] = next;
+        if (!ver.run(1, win.data(), pos, nullptr, nullptr, out.data(), err) || !dump_window(1) || !ver.commit(1, err)) {
+            std::fprintf(stderr, "strata generate: qwen35dense decode at %lld: %s\n", (long long) pos, err.c_str());
+            return 1;
+        }
+        next = out[0];
+        ++pos;
+    }
+    const double ms_decode = std::chrono::duration<double, std::milli>(Clock::now() - t_decode).count();
+    if (dump != nullptr) std::fclose(dump);
+    if (logpos != nullptr) std::fclose(logpos);
+    std::printf("%-24s", "generated");
+    for (int32_t t : produced) std::printf(" %d", (int) t);
+    std::printf("\n%-24s %lld tokens in %.1f ms (%.1f tok/s, windows of up to %d)\n", "prompt (windows)",
+                (long long) n_prompt, ms_prompt, ms_prompt > 0 ? 1000.0 * (double) n_prompt / ms_prompt : 0.0, max_t);
+    const int64_t decoded = (int64_t) produced.size() - 1;
+    std::printf("%-24s %lld tokens in %.1f ms (%.2f tok/s)\n", "decode", (long long) decoded, ms_decode,
+                ms_decode > 0 && decoded > 0 ? 1000.0 * (double) decoded / ms_decode : 0.0);
+    if (dump != nullptr) std::printf("%-24s %s (%lld rows)\n", "logits dumped", o.dump_logits.c_str(), (long long) rows_written);
+    std::fflush(stdout);
+    cudaFree(sbuf);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     strata::platform::install_crash_report();   // #62 crash: where a crashed engine was, in its log
     strata::core::start_end_engine_deadline(20000);   // #203: before any failure path can need it (#185)
@@ -3352,9 +3507,14 @@ int main(int argc, char** argv) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
             // here: it used to be skipped, leaving a model with some tensors absent and a later error, or none.
             o.native_shards = strata::gguf_split_paths(o.native_preset);
+            {   // #297 stage 2: the architecture decides what the preset expands to
+                strata::GgufFile meta(o.native_shards.front());
+                const strata::MetaValue* a = meta.get("general.architecture");
+                o.dense_model = a != nullptr && a->s == "qwen35dense";
+            }
             // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
             // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's
-            if (o.ple_gguf.empty() && !o.no_ple) {
+            if (o.ple_gguf.empty() && !o.no_ple && !o.dense_model) {
                 const strata::GgufModel model(o.native_shards);
                 size_t at = 0;
                 if (model.find("per_layer_token_embd.weight", &at) != nullptr) o.ple_gguf = o.native_shards[at];
@@ -3363,6 +3523,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), e.what());
             return 2;
         }
+        if (o.dense_model) {
+            // #297 stage 2: a qwen35dense model has no PLE, no router and no indexer - the native set without them
+            if (!o.ple_gguf.empty()) {
+                std::fprintf(stderr, "strata generate: --ple-gguf: a qwen35dense model has no PLE\n");
+                return 2;
+            }
+            o.no_ple = true;
+        } else
         if (o.no_ple || o.ple_gguf.empty()) {
             std::fprintf(stderr, "strata generate: --native requires --ple-gguf (the PLE key is native too), and no "
                                  "shard of the model holds per_layer_token_embd.weight\n");
@@ -3384,10 +3552,11 @@ int main(int argc, char** argv) {
                 strata::GgufFile pg(o.ple_gguf);
                 if (const strata::MetaValue* v = pg.get("general.architecture")) ple_only = v->s == "strata-ple";
             } catch (const std::exception&) {}
-            if (!ple_only &&
+            if (!ple_only && !o.dense_model &&
                 std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
                 o.native_dense_gguf.push_back(o.ple_gguf);
         }
+        if (o.dense_model) o.native_ple_key = o.native_ple_postops = false;   // #297: nothing to run them on
         // Plan v0.3 (24 Sep): the CPU experts stay on the VNNI kernel.  The llama.cpp-CPU-exact q8_0 contract
         // cost 27.0 vs 17.2 ms/token of pool time and G-C does not need it; `--cpu-oracle-q8-0` still selects it.
     }
@@ -3409,6 +3578,33 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+    if (o.dense_model) {
+        // #297 stage 2: a qwen35dense model decodes through run_dense (the verify windows, one GPU, generate mode).
+        // Every option that path would not honour is refused here rather than silently dropped.
+        const char* why = o.serve ? "--serve"
+                        : !o.mtp.empty() ? "--mtp (the model has no MTP layer)"
+                        : o.batch > 0 ? "--batch"
+                        : !split_devs.empty() || !o.layer_split.empty() ? "a layer split"
+                        : o.vision ? "--vision"
+                        : o.secondary_expert_mib > 0 ? "--secondary-expert-mib (no routed experts)"
+                        : o.peer_device >= 0 ? "--peer-device"
+                        : (o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)
+                            ? "--expert-cache-remote (no routed experts)"
+                        : !o.expert_profile.empty() ? "--expert-profile (no routed experts)"
+                        : o.ram_cache_gib > 0.0 ? "--ram-cache-gib (no routed experts)"
+                        : o.prefill_chunk != 0 ? "--prefill (the batched prompt path is #297 stage 3; the prompt is read "
+                                                 "through the decode windows)"
+                        : o.logits_stride > 1 ? "--logits-stride"
+#ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
+                        : !o.igc_learned_bundle.empty() ? "--igc-learned-diagnostic-bundle (bound to Flash-Next's files)"
+#endif
+                        : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: %s does not run with a qwen35dense model yet (#297 stage 2: one GPU, "
+                                 "generate mode, the prompt through the decode windows)\n", why);
+            return 2;
+        }
+    }
     if (o.logits_stride > 1 && (o.max_new != 1 || o.dump_logits.empty())) {
         std::fprintf(stderr, "strata generate: --logits-stride > 1 requires --max-new 1 and --dump-logits\n");
         return 2;
@@ -3714,7 +3910,7 @@ int main(int argc, char** argv) {
     // Plan v0.3 P6: where the experts live.  A native pack (tools/iq_pack.py: the IQ2_XS / IQ3_XXS files) keeps
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
-    {
+    if (!o.dense_model) {   // #297: a qwen35dense pack has no expert table (and no native_experts.txt)
         const strata::core::ModelGeometry g0;
         if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -3868,7 +4064,8 @@ int main(int argc, char** argv) {
     }
     if (o.adapt_secondary < 0) o.adapt_secondary = o.secondary_expert_mib > 0 && !(o.exclusive_secondary && o.serve) ? 8 : 0;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
-    if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
+    if (o.dense_model) {   // #297: no CPU experts at all
+    } else if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (pack_formats.all_q2)
         std::fprintf(stderr, "strata generate: native Q2_0 expert rows use %s\n",
                      strata::kernels::cpu::cpu_avx512_ok() ? "AVX-512" :
@@ -3902,12 +4099,24 @@ int main(int argc, char** argv) {
             // is the authority on its own MoE shape - everything else in the geometry is unchanged
             try {
                 strata::GgufFile model_gguf(o.native_shards.front());   // the metadata shard
+                // #297 stage 2: a qwen35dense file states its whole geometry (layout.cpp); a qwen4exp file keeps the
+                // compiled-in one and only its MoE shape and rope keys are read, exactly as before
+                std::string arch, gerr;
+                if (!strata::core::geometry_from_metadata(model_gguf, g, arch, gerr)) {
+                    std::fprintf(stderr, "strata generate: %s: %s\n", o.native_preset.c_str(), gerr.c_str());
+                    return 2;
+                }
+                const std::string ap = g.dense ? "qwen35dense." : "qwen4exp.";
+                if (g.dense) {
+                    K = 1;   // run_dense's session: one unused expert slot
+                } else {
                 if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
                 if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.freq_base")) gguf_rope_base = v->num();
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.type")) gguf_rope_type = v->s;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.factor")) gguf_rope_factor = v->num();
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.original_context_length"))
+                }
+                if (const strata::MetaValue* v = model_gguf.get(ap + "rope.freq_base")) gguf_rope_base = v->num();
+                if (const strata::MetaValue* v = model_gguf.get(ap + "rope.scaling.type")) gguf_rope_type = v->s;
+                if (const strata::MetaValue* v = model_gguf.get(ap + "rope.scaling.factor")) gguf_rope_factor = v->num();
+                if (const strata::MetaValue* v = model_gguf.get(ap + "rope.scaling.original_context_length"))
                     gguf_rope_orig_ctx = v->num();
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
@@ -3987,22 +4196,47 @@ int main(int argc, char** argv) {
                              rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
     }
+    // #297 stage 2: the GDN output gate is the model's (qwen35dense: silu), set before any graph is captured
+    strata::kernels::gdn_gate_silu_set(g.gdn_silu);
+    if (o.dense_model != g.dense) {   // (both read general.architecture; a mismatch is a bug, not a model)
+        std::fprintf(stderr, "strata generate: internal: the preset and the geometry disagree on the architecture\n");
+        return 1;
+    }
     strata::core::NativeEmbed native_embed;
-    if (native_pack) {
-        if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
-            (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
+    if (native_pack || g.dense) {
+        if (!g.dense && (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
+            (o.prefill_chunk <= 0 && o.tokens.size() > 1))) {
             std::fprintf(stderr, "strata generate: %s is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) "
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
         const strata::core::ModelGeometry g0;
         const auto embed_t0 = std::chrono::steady_clock::now();
+        // #297: a dense model's vocabulary is its own token_embd's rows (the 4B's is Flash-Next's 248320)
+        int64_t embed_vocab = 248320;
+        if (g.dense) {
+            try {
+                const strata::GgufModel model(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf});
+                const strata::TensorInfo* t = model.find("token_embd.weight");
+                if (t == nullptr || t->shape.size() != 2) throw std::runtime_error("no 2-D token_embd.weight");
+                embed_vocab = (int64_t) t->shape[1];
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata generate: qwen35dense embedding: %s\n", e.what());
+                return 1;
+            }
+        }
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
-                               248320, err)) {
+                               embed_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         strata::core::set_native_embed(&native_embed);
+        if (g.dense)
+            std::fprintf(stderr, "strata generate: qwen35dense pack %s (no routed experts), token embedding %s in mapped "
+                                 "host memory (%lld rows, %.0f MiB)\n", o.pack.c_str(),
+                         strata::ggml_type_name((uint32_t) native_embed.type()), (long long) embed_vocab,
+                         (double) native_embed.bytes() / 1048576.0);
+        else
         std::fprintf(stderr, "strata generate: native pack: %s experts (largest blob %.2f MB), token embedding "
                              "%s in mapped host memory (%.0f MiB, %.1f s)\n",
                      o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
@@ -4065,7 +4299,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        if (native_pack) skip.insert("token_embd.weight");
+        if (native_pack || g.dense) skip.insert("token_embd.weight");   // (#297: mapped by native_embed above)
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
     // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the
@@ -4227,6 +4461,18 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --max-context %lld cannot hold %zu prompt + %lld new tokens\n",
                      (long long) o.max_context, o.tokens.size(), (long long) o.max_new);
         return 2;
+    }
+    if (g.dense) {   // #297 stage 2: the weights, the embedding and the kernel switches are set; the rest is run_dense's
+        cudaStream_t dense_stream = nullptr;
+        if (cudaStreamCreateWithFlags(&dense_stream, cudaStreamNonBlocking) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: cannot create the main stream\n");
+            return 1;
+        }
+        const int rc = run_dense(o, g, wt, dense_stream);
+        cudaStreamSynchronize(dense_stream);
+        cudaStreamDestroy(dense_stream);
+        cudaFree(arena);
+        return rc;
     }
 
     strata::core::SessionState ss;

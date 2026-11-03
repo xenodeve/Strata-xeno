@@ -1,6 +1,8 @@
 // src/core/layout.cpp - the shape checks.  See the header for why this exists.
 #include "strata/core/layout.hpp"
+#include "strata/artifact/gguf_reader.hpp"
 
+#include <cmath>
 #include <cstdio>
 
 namespace strata::core {
@@ -14,6 +16,7 @@ struct Want2 {
     int64_t ne1;
     bool qsa_only;
     bool gdn_only;
+    bool sparse_only = false;   ///< #297: a router or indexer tensor - a dense geometry has none (and must not)
 };
 
 /// A required element count and ENGINE FORM for a 1-D tensor.
@@ -31,7 +34,17 @@ struct Want1 {
     WeightKind kind;
     bool qsa_only;
     bool gdn_only;
+    bool sparse_only = false;   ///< #297: as Want2's
 };
+
+/// #297: a router / indexer tensor in a dense model is refused, not ignored - nothing would read it, so a file that
+/// carries one was not made for this geometry.
+bool present_in_dense(std::string& err, const LayerView& v, const char* suffix) {
+    if (v.get(suffix) == nullptr) return false;
+    err = "layer " + std::to_string(v.layer()) + ": " + v.name(suffix) +
+          " is present in a dense (qwen35dense) model, which has no router and no indexer";
+    return true;
+}
 
 bool fail(std::string& err, const LayerView& v, const char* suffix, const char* what, int64_t got,
           int64_t want) {
@@ -57,7 +70,7 @@ bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std:
         {"hc_ffn_up.weight", g.hc_lr, g.hc_dim(), false, false},
         {"hc_ffn_inject.weight", g.hc_dim(), g.hc, false, false},
         // MoE, EVERY layer
-        {"ffn_gate_inp.weight", g.n_embd, g.n_expert, false, false},
+        {"ffn_gate_inp.weight", g.n_embd, g.n_expert, false, false, true},
         {"ffn_gate_shexp.weight", g.n_embd, g.n_ff, false, false},
         {"ffn_up_shexp.weight", g.n_embd, g.n_ff, false, false},
         {"ffn_down_shexp.weight", g.n_ff, g.n_embd, false, false},
@@ -75,12 +88,16 @@ bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std:
         {"attn_output.weight", g.n_head * g.head_dim, g.n_embd, true, false},
         // THE INDEXER.  `q_proj` is the QUERY count and `k_proj` is the KEY width, and they are different
         // numbers - conflating them is what made the planner's indexer term 4x too big in round 194.
-        {"indexer.q_proj.weight", g.n_embd, g.idx_q_heads * g.idx_key_dim, true, false},
-        {"indexer.k_proj.weight", g.n_embd, g.idx_key_dim, true, false},
+        {"indexer.q_proj.weight", g.n_embd, g.idx_q_heads * g.idx_key_dim, true, false, true},
+        {"indexer.k_proj.weight", g.n_embd, g.idx_key_dim, true, false, true},
     };
     for (const Want2& w : want2) {
         if (w.qsa_only && !qsa) continue;
         if (w.gdn_only && qsa) continue;
+        if (w.sparse_only && g.dense) {
+            if (present_in_dense(err, v, w.suffix)) return false;
+            continue;
+        }
         const WeightRef* r = v.get(w.suffix);
         if (!r) {
             err = "layer " + std::to_string(layer) + ": missing " + v.name(w.suffix);
@@ -102,12 +119,16 @@ bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std:
         {"ssm_norm.weight", g.ssm_state_size, WeightKind::F32, false, true},
         {"attn_q_norm.weight", g.head_dim, WeightKind::F32, true, false},
         {"attn_k_norm.weight", g.head_dim, WeightKind::F32, true, false},
-        {"indexer.q_norm.weight", g.idx_key_dim, WeightKind::F32, true, false},
-        {"indexer.k_norm.weight", g.idx_key_dim, WeightKind::F32, true, false},
+        {"indexer.q_norm.weight", g.idx_key_dim, WeightKind::F32, true, false, true},
+        {"indexer.k_norm.weight", g.idx_key_dim, WeightKind::F32, true, false, true},
     };
     for (const Want1& w : want1) {
         if (w.qsa_only && !qsa) continue;
         if (w.gdn_only && qsa) continue;
+        if (w.sparse_only && g.dense) {
+            if (present_in_dense(err, v, w.suffix)) return false;
+            continue;
+        }
         const WeightRef* r = v.get(w.suffix);
         if (!r) {
             err = "layer " + std::to_string(layer) + ": missing " + v.name(w.suffix);
@@ -167,6 +188,77 @@ bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& er
         err = buf;
         return false;
     }
+    return true;
+}
+
+bool geometry_from_metadata(const strata::GgufFile& file, ModelGeometry& g, std::string& arch, std::string& err) {
+    const strata::MetaValue* a = file.get("general.architecture");
+    arch = a != nullptr ? a->s : std::string();
+    if (arch != "qwen35dense") return true;   // qwen4exp (or a refusal elsewhere): the defaults stay as they are
+    if (const std::string why = strata::check_qwen35dense(file); !why.empty()) {
+        err = why;
+        return false;
+    }
+    // every key is required: a geometry the file does not state is not one to guess
+    auto u = [&](const char* key, int64_t& out) {
+        const strata::MetaValue* v = file.get(std::string("qwen35dense.") + key);
+        if (v == nullptr || !v->is_num()) {
+            if (err.empty()) err = std::string("missing qwen35dense.") + key;
+            return false;
+        }
+        out = (int64_t) v->u;
+        return true;
+    };
+    ModelGeometry d;   // Flash-Next's defaults, then every field the file states
+    int64_t heads_k = 0, rope = 0, inner = 0, key_len = 0, value_len = 0;
+    if (!u("block_count", d.n_layers) || !u("embedding_length", d.n_embd) || !u("feed_forward_length", d.n_ff) ||
+        !u("expert_count", d.n_expert) || !u("attention.head_count", d.n_head) ||
+        !u("attention.head_count_kv", d.n_head_kv) || !u("attention.key_length", key_len) ||
+        !u("attention.value_length", value_len) || !u("rope.dimension_count", rope) ||
+        !u("ssm.conv_kernel", d.ssm_d_conv) || !u("ssm.state_size", d.ssm_state_size) ||
+        !u("ssm.group_count", heads_k) || !u("ssm.time_step_rank", d.ssm_v_heads) || !u("ssm.inner_size", inner) ||
+        !u("full_attention_interval", d.qsa_interval) || !u("hyper_connection.count", d.hc) ||
+        !u("hyper_connection.low_rank", d.hc_lr))
+        return false;
+    d.ssm_k_heads = heads_k;
+    d.head_dim = key_len;
+    d.ssm_value_dim = d.ssm_state_size * d.ssm_v_heads;
+    d.ssm_conv_channels = 2 * d.ssm_state_size * d.ssm_k_heads + d.ssm_value_dim;
+    d.dense = true;
+    const strata::MetaValue* gate = file.get("qwen35dense.ssm.output_gate");
+    if (gate == nullptr || (gate->s != "silu" && gate->s != "sigmoid")) {
+        err = "qwen35dense.ssm.output_gate must be 'silu' or 'sigmoid'";
+        return false;
+    }
+    d.gdn_silu = gate->s == "silu";
+    // what the kernels are written for; anything else is refused here, not mis-run
+    const strata::MetaValue* eps = file.get("qwen35dense.attention.layer_norm_rms_epsilon");
+    char buf[320];
+    auto refuse = [&](const char* what, long long got, const char* want) {
+        std::snprintf(buf, sizeof buf, "qwen35dense: %s is %lld; the engine's kernels need %s", what, got, want);
+        err = buf;
+        return false;
+    };
+    if (d.n_embd != 2560) return refuse("embedding_length", (long long) d.n_embd, "2560");
+    if (d.hc != 4 || d.hc_lr != 320) return refuse("hyper_connection.count/low_rank", (long long) (d.hc * 1000 + d.hc_lr),
+                                                    "4 / 320 (4320)");
+    if (d.n_expert != 0) return refuse("expert_count", (long long) d.n_expert, "0");
+    if (d.ssm_state_size != 128 || inner != d.ssm_value_dim)
+        return refuse("ssm.state_size", (long long) d.ssm_state_size, "128 with ssm.inner_size = 128 x time_step_rank");
+    if (d.ssm_d_conv != 4) return refuse("ssm.conv_kernel", (long long) d.ssm_d_conv, "4");
+    if (d.ssm_k_heads <= 0 || d.ssm_v_heads % d.ssm_k_heads != 0)
+        return refuse("ssm.time_step_rank", (long long) d.ssm_v_heads, "a multiple of ssm.group_count");
+    if (d.head_dim != 256 || value_len != 256) return refuse("attention.key_length", (long long) d.head_dim, "256");
+    if (rope != 64) return refuse("rope.dimension_count", (long long) rope, "64");
+    if (d.n_head_kv <= 0 || (d.n_head != 4 * d.n_head_kv && d.n_head != 12 * d.n_head_kv))
+        return refuse("attention.head_count", (long long) d.n_head, "4 or 12 x head_count_kv (the GQA groups built)");
+    if (d.qsa_interval < 1 || d.n_layers < d.qsa_interval || d.n_layers % d.qsa_interval != 0)
+        return refuse("block_count", (long long) d.n_layers, "a multiple of full_attention_interval");
+    if (d.n_ff <= 0 || d.n_ff % 256 != 0) return refuse("feed_forward_length", (long long) d.n_ff, "a multiple of 256");
+    if (eps == nullptr || std::fabs(eps->num() - 1e-6) > 1e-12)
+        return refuse("attention.layer_norm_rms_epsilon (x 1e9)", eps ? (long long) std::llround(eps->num() * 1e9) : -1,
+                      "1e-6 (1000)");
+    g = d;
     return true;
 }
 

@@ -124,6 +124,10 @@ inline float qsa_rms_eps() { return 1e-6f; }
 /// constant is what that config's `freq_base` defaults to and what CLI `--rope-freq-base` overrides.
 inline double qsa_freq_base() { return 1e7; }
 
+/// #297 stage 2: the `idx_top_k` of a DENSE geometry (qwen35dense: no indexer).  Far above any context, so the
+/// width below is n_kv at every step and attention reads every cell; the selection rows are the identity.
+inline constexpr int64_t kDenseTopK = int64_t(1) << 30;
+
 /// The selection width: `min(n_kv, idx_top_k + idx_block - 1)`.
 ///
 /// The `r - 1 = 3` is not slack, it is the incomplete tail: the budget is whole blocks PLUS whatever cells do

@@ -23,6 +23,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_gdn_preprocess.hpp"
+#include "strata/kernels/gdn.hpp"   // gdn_gate_silu (#297)
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstddef>
@@ -96,6 +97,7 @@ __global__ void gate_softplus(const float* __restrict__ alpha, const float* __re
     gate[i] = softplus * ssm_a[i];
 }
 
+template <bool SILU>   // #297: silu(z) = z * sigmoid(z) as the output gate (gdn.hpp, gdn_gate_silu)
 __global__ void out_norm(const float* __restrict__ input, const float* __restrict__ z,
                           const float* __restrict__ gamma, float* __restrict__ output, float epsilon) {
     const int col = threadIdx.x;
@@ -109,7 +111,8 @@ __global__ void out_norm(const float* __restrict__ input, const float* __restric
     if (col < S) {
         // RMSNorm+gamma is one pinned fused operator, followed by sigmoid*mul.
         const float weighted = __fmul_rn(__fmul_rn(scale, value), gamma[col]);
-        output[offset + col] = weighted * sigmoid(z[offset + col]);
+        const float zc = z[offset + col];
+        output[offset + col] = weighted * (SILU ? zc * sigmoid(zc) : sigmoid(zc));
     }
 }
 
@@ -193,7 +196,10 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
         valid(input);
         disjoint(writable, input);
     }
-    out_norm<<<unsigned(heads), 256, 0, static_cast<cudaStream_t>(stream)>>>(output, z, gamma, destination, epsilon);
+    if (gdn_gate_silu())
+        out_norm<true><<<unsigned(heads), 256, 0, static_cast<cudaStream_t>(stream)>>>(output, z, gamma, destination, epsilon);
+    else
+        out_norm<false><<<unsigned(heads), 256, 0, static_cast<cudaStream_t>(stream)>>>(output, z, gamma, destination, epsilon);
     check_launch();
 }
 } // namespace strata::kernels
