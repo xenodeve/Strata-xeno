@@ -331,6 +331,9 @@ def run(args):
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    # --resume: answers already written are kept and not run again. A restart to fix the live count lost every answer in flight but not these.
+    kept = json.loads((out / 'records.json').read_text(encoding='utf-8')) if args.resume and (out / 'records.json').exists() else []
+    have = {(r['id'], r['sample']) for r in kept}
     rollouts = []
     for row in rows:
         # As text, then encoded: transformers 5 returns a dict from tokenize=True, and list() of it gave the keys as the prompt.
@@ -339,6 +342,8 @@ def run(args):
         if not text.rstrip().endswith('<think>') or not all(isinstance(t, int) for t in prompt):
             raise SystemExit('the chat template did not end in an open <think>: ' + repr(text[-80:]))
         for k in range(args.samples):
+            if (row['id'], k) in have:
+                continue
             rollouts.append(Rollout(row, k, list(prompt), arm, ids, tok, seed_of(args.seed, row['id'], k)))
             rollouts[-1].cap = args.max_tokens
     if args.force_after and not args.execute:
@@ -364,7 +369,7 @@ def run(args):
         if len(done) == written[0] or (not last and time.monotonic() - written[1] < 30):
             return
         written[0], written[1] = len(done), time.monotonic()
-        records = [r.record(right) for r in done]
+        records = kept + [r.record(right) for r in done]
         (out / 'records.json').write_text(json.dumps(records, ensure_ascii=False), encoding='utf-8')
         if args.ids:
             with open(out / 'ids.jsonl', 'w', encoding='utf-8') as f:
@@ -373,7 +378,7 @@ def run(args):
         print(f'{len(done)}/{len(rollouts)} done, {sum(x["right"] for x in records)} right, {round(time.monotonic() - began)} s', flush=True)
     drive(llm, rollouts, Kernel, live_most=args.live, on_round=save)
     save(last=True)
-    records = [r.record(right) for r in rollouts]
+    records = kept + [r.record(right) for r in rollouts]
     (out / 'report.json').write_text(json.dumps(dict(rows=len(rows), samples=args.samples, answers=len(records), right=sum(r['right'] for r in records),
                                                       tokens=sum(r['tokens'] for r in records), seconds=round(time.monotonic() - began, 1),
                                                       runs=sum(r['runs'] for r in records), runs_by_model=sum(r['runs_by_model'] for r in records),
@@ -464,6 +469,7 @@ def main(argv=None):
     r.add_argument('--ids', action='store_true')
     r.add_argument('--memory', type=float, default=0.9)
     r.add_argument('--live', type=int, default=256)
+    r.add_argument('--resume', action='store_true')
     m = sub.add_parser('math-train')
     m.add_argument('out')
     m.add_argument('--n', type=int, required=True)
