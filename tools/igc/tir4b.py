@@ -47,6 +47,10 @@ _CODE = re.compile(r'<parameter=code>\n?(.*?)\n?</parameter>', re.S)
 HINT_OPEN = 'It looks tedious, and we can use python code to simplify the reasoning.\n```python\n'
 TRUST = "We don't need to doubt the accuracy of python calculations.\n"
 HINT_GAP = 1024   # thinking tokens between two hints
+# --whole-hint: on Qwenputer's DeepMind rows the 4B cut each step into the pieces of its own method (a long division's `21 \div 19 =`), so a
+# value put in at `=` came for a piece, in a form the method could not use, and looped. This opens the reply asking for the whole step as
+# one expression; its value is computed whole, sign and uneven quotient included, as Qwenputer's model writes `48213 x 9917 =`.
+WHOLE_HINT = 'Let me compute the whole expression exactly in one step:\n'
 # --loop-hint: 14 of the control's 16 misses on the r1 rows were loops, 13 of them mid-work, several of them searches by hand. A loop in the
 # thinking is cut back to one round and a program opens to test the idea, LOOP_HINTS times; the next loop ends the answer as before.
 LOOP_HINT = 'I keep going around the same idea. Let me test it with python instead.\n```python\n'
@@ -87,10 +91,10 @@ class Ids:
 
 class Arm:
     def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
-                 hint_calc=False, loop_hint=False, inline_plain=False):
+                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False):
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
         self.inline_calc, self.native_tool, self.hint_calc, self.loop_hint = inline_calc, native_tool, hint_calc, loop_hint
-        self.inline_plain = inline_plain
+        self.inline_plain, self.whole_hint = inline_plain, whole_hint
 
 
 # --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
@@ -142,14 +146,18 @@ def tedious(expr, value):
     return any(len(n) >= 3 for n in re.findall(r'\d+', expr)) or len(_OPS.findall(expr)) >= 3 or abs(Fraction(value)) >= 1000
 
 
-def inline_value(before):
+def inline_value(before, whole=False):
     """The exact value of the arithmetic expression that ends the text before an `=`, as the model would write it, or None when that text
-    does not end in one: a symbol (algebra), no operator, unbalanced brackets, a number that is the tail of a longer expression, a root."""
+    does not end in one: a symbol (algebra), no operator, unbalanced brackets, a number that is the tail of a longer expression, a root.
+    `whole`: the expression the --whole-hint asked for. Its leading minus is its own, and its value is given even as an uneven quotient,
+    since it is the step itself, not a piece of the model's long division."""
     line = before.rsplit('\n', 1)[-1]
     m = _TAIL.search(line)
     if not m:
         return None
     expr, head = m.group(1).strip(), line[:m.start(1)]
+    if whole and head.rstrip().endswith('-'):
+        expr, head = '-' + expr, head.rstrip()[:-1]
     if not _OPS.search(expr) or expr.count('(') != expr.count(')') or expr.count('{') != expr.count('}'):
         return None
     if head and not head[-1].isspace() and not _BOUNDARY.search(head[-3:]):   # the expression starts after a space or a mark, not inside a word
@@ -169,6 +177,8 @@ def inline_value(before):
     if value is None or abs(value.numerator) > 10 ** 30 or value.denominator > 10 ** 12:
         return None
     said = spelled(value)
+    if whole:
+        return said
     bare = re.sub(r'[\s()]', '', s)
     if '/' in said and re.fullmatch(r'-?\d+/-?\d+', bare):
         return None   # an integer quotient that does not come out: the model is doing long division and wants a digit, not 21/19 (dm div_big)
@@ -208,6 +218,10 @@ class Rollout:
         self.thinking = thinking
         if not thinking:
             self.phase = 'answer'
+        self.whole_pending = False   # the next value is the whole step the --whole-hint asked for
+        if arm.whole_hint:
+            self.inject(WHOLE_HINT, 'whole hint')
+            self.whole_pending = True
         self.code_at = self.fence_at = None
         self.by = None
         self.pending = None
@@ -282,10 +296,13 @@ class Rollout:
             return False
         if (self.arm.inline_calc or self.arm.hint_calc) and last in self.ids.equals and self.phase in ('think', 'answer'):
             text = self.text()
-            value = inline_value(text[:text.rstrip().rfind('=')]) if self.arm.inline_calc else None
+            whole = self.whole_pending
+            value = inline_value(text[:text.rstrip().rfind('=')], whole=whole) if self.arm.inline_calc else None
             if value is not None:   # the value the model would have computed, computed: the reasoning goes on from it
+                self.whole_pending = False
                 self.inject(f' {value}' if self.arm.inline_plain else f' {value} (exact)', 'inline value')
-                self.events[-1].update(expr=_TAIL.search(text[:text.rstrip().rfind('=')].rsplit('\n', 1)[-1]).group(1).strip()[:200], value=value)
+                self.events[-1].update(expr=_TAIL.search(text[:text.rstrip().rfind('=')].rsplit('\n', 1)[-1]).group(1).strip()[:200], value=value,
+                                       whole=whole)
             if self.left() <= 0:
                 self.done('length')
             elif len(self.out) - self.checked >= CHUNK:   # a request that ends at `=` skips the checks below: a loop of equations would run on
@@ -596,7 +613,10 @@ def run(args):
     rows = rows[args.offset:args.offset + args.limit] if args.limit else rows[args.offset:]
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
-    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint, args.inline_plain)
+    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint, args.inline_plain,
+              args.whole_hint)
+    if args.whole_hint and not args.inline_calc:
+        raise SystemExit('--whole-hint asks for a value that only --inline-calc puts in')
     if args.greedy:   # drive() and arm.json read SAMPLING: temperature 0 is vLLM's greedy
         SAMPLING.update(temperature=0.0)
     if args.native_tool and tok.convert_tokens_to_ids('</tool_call>') == tok.unk_token_id:
@@ -750,6 +770,7 @@ def main(argv=None):
     r.add_argument('--loop-close', action='store_true')
     r.add_argument('--close-repeat', type=int, default=0)
     r.add_argument('--inline-calc', action='store_true')
+    r.add_argument('--whole-hint', action='store_true', help='open the reply asking for the whole step as one expression, computed whole')
     r.add_argument('--inline-plain', action='store_true', help="the value alone, as Qwenputer prints it, without the engine's ' (exact)'")
     r.add_argument('--native-tool', action='store_true', help="offer a python tool in Qwen3.5's own tool format and answer its calls")
     r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")

@@ -387,6 +387,32 @@ class LoopHint(unittest.TestCase):
         self.assertEqual(tir4b.loop_start(tokens), 6)   # keeps [7, 8, 9] once
 
 
+class WholeHint(unittest.TestCase):
+    """--whole-hint: the software computes the whole step, not the pieces the model would cut it into (dm div_big 5866: `21 \\div 19 =`
+    of a long division got 21/19 and looped; the whole -2119381524 / 19 is one value)."""
+    def test_the_whole_value_keeps_its_sign_and_its_fraction(self):
+        v = tir4b.inline_value
+        self.assertEqual(v('$-2119381524 \\div 19 ', whole=True), '-111546396')
+        self.assertEqual(v('$-2142 \\div -7037 ', whole=True), '2142/7037')   # dm 8989's gold: an uneven quotient is the answer here
+        self.assertEqual(v('so -3 \\times 0.2 ', whole=True), '-0.6')
+        self.assertIsNone(v('$-2142 \\div -7037 '))                           # not asked for: still the model's long division
+
+    def test_the_hint_opens_the_answer_and_its_first_value_is_whole(self):
+        r = tir4b.Rollout(dict(id='a', suite='arith', answer='-111546396'), 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True),
+                          IDS, TOK, seed=1, thinking=False)
+        play(r, '$-2119381524 \\div 19 =$ so \\boxed{-111546396}<|im_end|>', Kernel([]))
+        self.assertTrue(r.text().startswith(tir4b.WHOLE_HINT + '$-2119381524 \\div 19 = -111546396$ so'))
+        self.assertEqual([e['kind'] for e in r.events], ['whole hint', 'inline value'])
+        self.assertTrue(r.events[1]['whole'])
+        self.assertTrue(r.record(__import__('tools.igc.select_rows', fromlist=['right']).right)['right'])
+
+    def test_later_pieces_follow_the_usual_rules(self):
+        r = tir4b.Rollout(ROW, 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True), IDS, TOK, seed=1, thinking=False)
+        play(r, '$-6 \\div 4 =$ then 21 \\div 19 = x<|im_end|>', Kernel([]))
+        self.assertIn('$-6 \\div 4 = -1.5$', r.text())
+        self.assertIn('21 \\div 19 = x', r.text())   # after the whole value, an uneven piece is left alone again
+
+
 class FakeEngine:
     """vLLM's LLMEngine as drive() uses it: each request finishes on a later step, one at a time, so answers interleave."""
     def __init__(self, scripts):
