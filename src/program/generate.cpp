@@ -83,6 +83,7 @@
 #include "strata/platform/direct_file.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/dense_prefill.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
@@ -2504,7 +2505,8 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
 // Every token runs through the verify window (Verifier, the default native decode path) with the geometry's dense
 // skips: the FFN is the shared expert alone, attention reads every cell, the GDN gate is the model's.  There is no
 // expert tier, cache, pool or profile to build, so this path boots the session, the head and one verifier and
-// nothing else: the prompt is read through the windows too (the batched prompt path is #297 stage 3), and each
+// nothing else: the prompt but its last token goes through strata::prefill::DensePrefill (#297 stage 3; GEMMs over
+// chunks of --prefill N rows, default 2048; STRATA_DENSE_PREFILL=0: the windows), the last one through a window, and each
 // generated token is a one-token window.  Not --serve yet (refused at startup).
 //
 // --dump-logits PATH  the raw logits of every position, in the generate format (int32 n_vocab, int32 rows, then
@@ -2598,10 +2600,47 @@ int run_dense(const Options& o, const strata::core::ModelGeometry& g, const stra
         return true;
     };
     std::vector<int32_t> win((size_t) max_t), out((size_t) max_t), nxt((size_t) max_t);
-    // ---- the prompt, through the windows; every token is committed, so each row is teacher-forced
+    // ---- the prompt.  #297 stage 3: every token but the last through the dense prompt path (GEMMs, chunks of
+    // --prefill N rows, default 2048; STRATA_DENSE_PREFILL=0 reads them through the windows as stage 2 did); the last
+    // one (or all of them) through the windows, so the first answer token is the window's own pick.  Every row is
+    // teacher-forced either way.
     const auto t_prompt = Clock::now();
     int64_t pos = 0;
     int32_t next = -1;
+    static const bool pf_env_off = [] { const char* v = std::getenv("STRATA_DENSE_PREFILL"); return v && v[0] == '0'; }();
+    std::string pf_phases;
+    if (!pf_env_off && n_prompt >= 2) {
+        const int64_t chunk = std::min<int64_t>(o.prefill_chunk > 0 && !o.prefill_auto ? o.prefill_chunk : 2048,
+                                                std::min<int64_t>(n_prompt - 1, 65535));
+        strata::prefill::DensePrefill pf;
+        if (!pf.init(wt, g, ss, &head, chunk, (void*) stream, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        const bool want_rows = dump != nullptr || logpos != nullptr;
+        std::vector<float> rows(want_rows ? (size_t) chunk * (size_t) n_vocab : 0);
+        std::vector<int32_t> ids((size_t) chunk), tgt((size_t) chunk);
+        while (pos < n_prompt - 1) {
+            const int64_t n = std::min<int64_t>(chunk, n_prompt - 1 - pos);
+            for (int64_t t = 0; t < n; ++t) {
+                ids[(size_t) t] = (int32_t) o.tokens[(size_t) (pos + t)];
+                tgt[(size_t) t] = (int32_t) o.tokens[(size_t) (pos + t + 1)];
+            }
+            if (!pf.run(ids.data(), n, pos, want_rows ? rows.data() : nullptr, err)) {
+                std::fprintf(stderr, "strata generate: qwen35dense prompt at %lld: %s\n", (long long) pos, err.c_str());
+                return 1;
+            }
+            for (int64_t t = 0; t < n && dump != nullptr && rows_written < dump_rows; ++t, ++rows_written)
+                if (std::fwrite(rows.data() + (size_t) t * n_vocab, sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
+                    std::fprintf(stderr, "strata generate: writing the logits of row %lld failed\n", (long long) rows_written);
+                    return 1;
+                }
+            if (logpos != nullptr)
+                strata::core::write_logprob_rows(rows.data(), (int) n, n_vocab, tgt.data(), pos, logpos_extra, logpos);
+            pos += n;
+        }
+        pf_phases = pf.phase_report();
+    }
     while (pos < n_prompt) {
         const int T = (int) std::min<int64_t>(max_t, n_prompt - pos);
         for (int t = 0; t < T; ++t) {
@@ -2638,8 +2677,11 @@ int run_dense(const Options& o, const strata::core::ModelGeometry& g, const stra
     if (logpos != nullptr) std::fclose(logpos);
     std::printf("%-24s", "generated");
     for (int32_t t : produced) std::printf(" %d", (int) t);
-    std::printf("\n%-24s %lld tokens in %.1f ms (%.1f tok/s, windows of up to %d)\n", "prompt (windows)",
-                (long long) n_prompt, ms_prompt, ms_prompt > 0 ? 1000.0 * (double) n_prompt / ms_prompt : 0.0, max_t);
+    const bool pf_used = !pf_env_off && n_prompt >= 2;
+    std::printf("\n%-24s %lld tokens in %.1f ms (%.1f tok/s, %s)\n", pf_used ? "prompt (batched)" : "prompt (windows)",
+                (long long) n_prompt, ms_prompt, ms_prompt > 0 ? 1000.0 * (double) n_prompt / ms_prompt : 0.0,
+                pf_used ? "all but the last token batched, the last in a window" : "windows of up to 8");
+    if (!pf_phases.empty()) std::printf("%-24s %s\n", "prompt phases (GPU)", pf_phases.c_str());
     const int64_t decoded = (int64_t) produced.size() - 1;
     std::printf("%-24s %lld tokens in %.1f ms (%.2f tok/s)\n", "decode", (long long) decoded, ms_decode,
                 ms_decode > 0 && decoded > 0 ? 1000.0 * (double) decoded / ms_decode : 0.0);
@@ -3592,8 +3634,6 @@ int main(int argc, char** argv) {
                             ? "--expert-cache-remote (no routed experts)"
                         : !o.expert_profile.empty() ? "--expert-profile (no routed experts)"
                         : o.ram_cache_gib > 0.0 ? "--ram-cache-gib (no routed experts)"
-                        : o.prefill_chunk != 0 ? "--prefill (the batched prompt path is #297 stage 3; the prompt is read "
-                                                 "through the decode windows)"
                         : o.logits_stride > 1 ? "--logits-stride"
 #ifdef STRATA_IGC_NATIVE_DIAGNOSTIC
                         : !o.igc_learned_bundle.empty() ? "--igc-learned-diagnostic-bundle (bound to Flash-Next's files)"

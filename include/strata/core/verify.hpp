@@ -535,4 +535,9 @@ private:
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 
+/// window_logprobs' writer over host rows (T x n_vocab): one STRATA_LOGPOS line per row with a target in range
+/// (#297 stage 3: the dense prompt path writes its rows through it, in the same format).
+void write_logprob_rows(const float* rows, int T, int64_t n_vocab, const int32_t* targets, int64_t pos0,
+                        int32_t extra_id, std::FILE* out);
+
 }  // namespace strata::core

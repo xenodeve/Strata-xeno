@@ -820,6 +820,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t IQ = g.idx_q_heads, ID = g.idx_key_dim, NE = g.n_expert, MT = max_t_;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    // #297 stage 3: a dense geometry's hyper-connection projections are zero by construction - the reads skip them
+    // (dense_gr_read_multi).  STRATA_DENSE_HC_FULL=1: the full read (A/B).
+    static const bool dense_hc_full = [] { const char* v = std::getenv("STRATA_DENSE_HC_FULL"); return v && v[0] == '1'; }();
+    const bool dense_hc_on = g.dense && !dense_hc_full;
+    auto dense_hc = [&] { return dense_hc_on; };
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
@@ -1059,6 +1064,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (half == 0) a.q8_mixed = xq_ + (size_t) (t - tb) * (N / 32) * 36;
                     else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
                 }
+            }
+            if (dense_hc()) {   // #297 stage 3: zero projections, not read (no q8_1 image: the caller quantizes)
+                dense_gr_read_multi(fa, n, cs);
+                return false;
             }
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
@@ -1719,6 +1728,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
         // (no pending write, no inject)
         const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr && head_ != nullptr && head_->loaded();
+        if (dense_hc() && !fuse_head_gr && head_ != nullptr && head_->loaded()) {   // #297 stage 3: zero projections
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = 0; t < T; ++t) {
+                FusedGrArgs& a = fa[t];
+                a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
+                a.w_norm = (const float*) hn->data; a.eps = EPS; a.rs = rs_ + t * HC; a.mixed = head_mixed_ + t * N;
+            }
+            dense_gr_read_multi(fa, T, cs);
+        } else
         if (mix_q8) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
@@ -2437,8 +2455,14 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
         err = "window_logprobs: the head logits copy failed";
         return false;
     }
+    write_logprob_rows(h.data(), T, n_vocab_, targets, pos0, extra_id, out);
+    return true;
+}
+
+void write_logprob_rows(const float* rows, int T, int64_t n_vocab_, const int32_t* targets, int64_t pos0,
+                        int32_t extra_id, std::FILE* out) {
     for (int t = 0; t < T; ++t) {
-        const float* row = h.data() + (size_t) t * (size_t) n_vocab_;
+        const float* row = rows + (size_t) t * (size_t) n_vocab_;
         const int32_t tgt = targets[t];
         if (tgt < 0 || (int64_t) tgt >= n_vocab_) continue;
         int64_t top = 0;
@@ -2476,7 +2500,6 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
         std::fprintf(out, "\n");
     }
     std::fflush(out);
-    return true;
 }
 
 namespace { bool g_commit_async = false; }

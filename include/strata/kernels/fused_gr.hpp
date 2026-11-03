@@ -59,6 +59,14 @@ constexpr int kFusedGrMaxT = 8;
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 
+/// #297 stage 3: the read for a geometry whose hyper-connection projections are all ZERO (qwen35dense, written so by
+/// tools/qwen35_to_qwen4exp.py): lo = silu(0) = 0, every gate sigmoid(0) = 0.5 and every injection 0, so the read is
+/// `mixed = mean_c(rms_norm(R_c) * w_norm_c * 0.5)` and the next write a plain add - computed without reading the
+/// ~13 MB of zero projections per read.  The pending write, `mixed` and `inject_out` (zeros) as fused_gr_read_multi;
+/// w_down / w_up / w_inject are not read (w_inject only says whether to write inject_out); no q8_1 image, no xn.
+/// The same values as the full read up to summation order (not bitwise).
+void dense_gr_read_multi(const FusedGrArgs* a, int n_tok, void* stream);
+
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);
 /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing

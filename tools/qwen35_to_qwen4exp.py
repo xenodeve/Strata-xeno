@@ -686,10 +686,10 @@ def stage3_refusals(g: Geometry, arch: str) -> list:
         return ["--arch %s: the engine reads the qwen35dense geometry only under that name; a qwen4exp-named file is "
                 "taken for Flash-Next (48 layers, 24/2 heads) and refused by the guard" % arch]
     return [
-        "--serve, --mtp, --batch, a layer split, --vision, --prefill, --logits-stride and every expert-tier flag "
+        "--serve, --mtp, --batch, a layer split, --vision, --logits-stride and every expert-tier flag "
         "(refused at startup: run_dense is one GPU, generate mode)",
-        "the batched prompt path (Prefill::init refuses a dense geometry; its kernels fix HV 48 / C 10240 and run the "
-        "router): the prompt is read through the verify windows, up to 8 tokens a window (stage 3)",
+        "KV streaming (--kv-resident) with the batched prompt (strata::prefill::DensePrefill, #297 stage 3; the "
+        "Flash-Next Prefill still refuses a dense geometry)",
         "IGC / MIP: --igc-learned-diagnostic-bundle is bound to Flash-Next's files (stage 4: a sandbox-only mode)",
         "HIP / SYCL: the new kernel instances (GQA 4 attention, the silu GDN gate) are built for CUDA here and not "
         "run on AMD or Intel",

@@ -27,6 +27,15 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0, bool commit = false);
 /// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
+/// #297 stage 3 (the dense prompt path): gdn_step_norm_multi's commit form (outputs for every row, the state written
+/// after the last) for any number of rows; `*n_tok_dev` must equal n_tok
+void gdn_step_norm_rows(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                        const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                        const int32_t* n_tok_dev, void* stream);
+/// #297 stage 3 (the dense prompt path): gdn_conv_l2_multi's arithmetic for any number of rows (n_tok up to 65535),
+/// then the history advanced past all of them (`*n_tok_dev` must equal n_tok: gdn_conv_commit's kernel).
+void gdn_conv_l2_rows(float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                      float eps, int n_tok, const int32_t* n_tok_dev, void* stream);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);

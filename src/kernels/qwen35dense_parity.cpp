@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -167,6 +168,33 @@ void test_gdn_gate() {
                     silu ? "  ... the same window against the sigmoid reference" : "  ... against the silu reference",
                     off, off > 1e-1 ? "ok" : "FAIL");
         if (!(off > 1e-1)) ++g_fail;
+    }
+    {   // #297 stage 3: the prompt path's whole-chunk recurrence (gdn_step_norm_rows) against 8-row commits, bitwise
+        gdn_gate_silu_set(true);
+        constexpr int R = 3 * T;   // 9 rows: the windows' path commits 8 + 1
+        std::vector<float> hr = vec((size_t) R * C, 0.05f), gr = vec((size_t) R * HV, 0.3f), br((size_t) R * HV, 0.4f),
+                           zr = vec((size_t) R * V, 1.0f);
+        for (auto& g : gr) g = -std::fabs(g);
+        float *d_hr = up(hr), *d_gr = up(gr), *d_br = up(br), *d_zr = up(zr), *d_s1 = up(state0), *d_s2 = up(state0);
+        float *d_y1 = nullptr, *d_y2 = nullptr;
+        ck(cudaMalloc(&d_y1, (size_t) R * V * 4), "y1");
+        ck(cudaMalloc(&d_y2, (size_t) R * V * 4), "y2");
+        int32_t* d_counts = up(std::vector<int32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, R});
+        gdn_step_norm_rows(d_s1, d_hr, C, d_gr, d_br, d_zr, d_gamma, eps, d_y1, HK, HV, R, d_counts + 9, cs);
+        for (int t0 = 0; t0 < R; t0 += 8) {
+            const int k = std::min(8, R - t0);
+            gdn_step_norm_multi(d_s2, d_hr + (size_t) t0 * C, C, d_gr + (size_t) t0 * HV, d_br + (size_t) t0 * HV,
+                                d_zr + (size_t) t0 * V, d_gamma, eps, d_y2 + (size_t) t0 * V, HK, HV, k, d_counts + k, cs, 0);
+        }
+        ck(cudaStreamSynchronize(cs), "rows");
+        const auto y1 = down(d_y1, (size_t) R * V), y2 = down(d_y2, (size_t) R * V);
+        const auto s1 = down(d_s1, state0.size()), s2 = down(d_s2, state0.size());
+        const bool same = std::memcmp(y1.data(), y2.data(), y1.size() * 4) == 0 &&
+                          std::memcmp(s1.data(), s2.data(), s1.size() * 4) == 0;
+        std::printf("%-58s %s\n", "GDN rows (one launch, 9 rows) vs 8-row commits: bitwise", same ? "ok" : "FAIL");
+        if (!same) ++g_fail;
+        for (float* p : {d_hr, d_gr, d_br, d_zr, d_s1, d_s2, d_y1, d_y2}) cudaFree(p);
+        cudaFree(d_counts);
     }
     gdn_gate_silu_set(false);   // the process default again
     cudaFree(d_h); cudaFree(d_gate); cudaFree(d_beta); cudaFree(d_z); cudaFree(d_gamma); cudaFree(d_state);

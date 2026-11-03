@@ -1987,5 +1987,76 @@ void fused_gr_check() {
                                    "for the earlier ones)" : "");
 }
 
+// ---------------------------------------------------------------- #297 stage 3: the read with zero projections
+namespace {
+struct DenseGrMulti {
+    FusedGrArgs a[kFusedGrMaxT];
+};
+// one block per (stream, token): the pending write (as the fused read: R += bo * 2 sigmoid(inj / hc)), then the
+// stream's RMS scale into rs[c]
+__global__ void __launch_bounds__(THREADS) dense_gr_norm_kernel(DenseGrMulti m) {
+    const FusedGrArgs& a = m.a[blockIdx.y];
+    const int c = blockIdx.x;
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    const float* R = a.R + (size_t) c * N;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < N; i += THREADS) {
+        float rv = R[i];
+        if (a.apply) {
+            rv = fmaf(a.bo_prev[i], gw, rv);
+            a.R_out[(size_t) c * N + i] = rv;
+        }
+        ss = fmaf(rv, rv, ss);
+    }
+    __shared__ float part[WARPS];
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < WARPS; ++w) s += part[w];
+        a.rs[c] = rsqrtf(s / (float) N + a.eps);
+    }
+}
+// mixed = mean over streams of xn * sigmoid(0) = xn * 0.5 (zero projections: lo = silu(0) = 0, the gate exactly 0.5),
+// and the injection 0 (zero inject rows), so the next write's weight is 2 sigmoid(0) = 1: a plain residual add
+__global__ void __launch_bounds__(THREADS) dense_gr_mix_kernel(DenseGrMulti m) {
+    const FusedGrArgs& a = m.a[blockIdx.y];
+    const int i = blockIdx.x * THREADS + threadIdx.x;
+    const float* R = a.apply ? a.R_out : a.R;
+    if (i < N) {
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += R[(size_t) c * N + i] * a.rs[c] * a.w_norm[(size_t) c * N + i] * 0.5f;
+        a.mixed[i] = s / (float) HC;
+    }
+    if (blockIdx.x == 0 && threadIdx.x < HC && a.w_inject != nullptr && a.inject_out != nullptr)
+        a.inject_out[threadIdx.x] = 0.0f;
+}
+}  // namespace
+
+void dense_gr_read_multi(const FusedGrArgs* a, int n_tok, void* stream) {
+    if (n_tok < 1 || n_tok > kFusedGrMaxT) {
+        std::fprintf(stderr, "dense_gr_read_multi: invalid arguments\n");
+        std::exit(1);
+    }
+    DenseGrMulti m;
+    for (int t = 0; t < n_tok; ++t) {
+        m.a[t] = a[t];
+        const FusedGrArgs& x = a[t];
+        if (!x.R || !x.w_norm || !x.rs || !x.mixed || (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out))) {
+            std::fprintf(stderr, "dense_gr_read_multi: invalid arguments\n");
+            std::exit(1);
+        }
+    }
+    cudaStream_t cs = (cudaStream_t) stream;
+    dense_gr_norm_kernel<<<dim3(HC, (unsigned) n_tok), THREADS, 0, cs>>>(m);
+    dense_gr_mix_kernel<<<dim3((N + THREADS - 1) / THREADS, (unsigned) n_tok), THREADS, 0, cs>>>(m);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "dense_gr_read_multi: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 
 }  // namespace strata::kernels

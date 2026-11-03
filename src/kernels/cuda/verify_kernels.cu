@@ -889,6 +889,40 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
     check("gdn_conv_l2_multi");
 }
 
+void gdn_step_norm_rows(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                        const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                        const int32_t* n_tok_dev, void* stream) {
+    if (!state || !h || !gate || !beta || !z || !gamma || !y || !n_tok_dev || h_k <= 0 || h_v % h_k || n_tok < 1) {
+        std::fprintf(stderr, "gdn_step_norm_rows: invalid arguments\n");
+        std::exit(1);
+    }
+    // gdn_step_norm_multi_kernel holds the state in registers and walks its rows one after another, so the row count is
+    // a loop bound only; here it is the whole chunk (outputs for every row, the state written after the last)
+    const dim3 g1((unsigned) h_v), b1(S, RG);
+    cudaStream_t cs = (cudaStream_t) stream;
+    if (gdn_gate_silu())
+        gdn_step_norm_multi_kernel<false, false, true><<<g1, b1, 0, cs>>>(state, h, conv_channels, gate, beta, z, gamma,
+                                                                         eps, y, h_k, h_v, n_tok, n_tok_dev, 0, nullptr);
+    else
+        gdn_step_norm_multi_kernel<false, false, false><<<g1, b1, 0, cs>>>(state, h, conv_channels, gate, beta, z, gamma,
+                                                                          eps, y, h_k, h_v, n_tok, n_tok_dev, 0, nullptr);
+    check("gdn_step_norm_rows");
+}
+
+void gdn_conv_l2_rows(float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                      float eps, int n_tok, const int32_t* n_tok_dev, void* stream) {
+    if (!history || !qkv || !conv_w || !h || !n_tok_dev || channels % S != 0 || n_tok < 1 || n_tok > 65535) {
+        std::fprintf(stderr, "gdn_conv_l2_rows: invalid arguments\n");
+        std::exit(1);
+    }
+    // every row reads the history and the rows before it (no commit inside), then the history takes the last three
+    gdn_conv_l2_multi_kernel<<<dim3((unsigned) (channels / S), (unsigned) n_tok), S, 0, (cudaStream_t) stream>>>(
+        history, qkv, conv_w, h, channels, qk_heads, eps, 0, false);
+    gdn_conv_commit_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(history, qkv, channels,
+                                                                                                 n_tok_dev);
+    check("gdn_conv_l2_rows");
+}
+
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {
     gdn_conv_commit_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(history, qkv,
                                                                                                  channels, n_keep);

@@ -614,6 +614,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/frontier.cu src/prefill/prefill.cpp
+              src/prefill/dense_prefill.cpp src/prefill/dense_kernels.cu
               src/prefill/split_plan.cpp
               src/prefill/kv_stage_plan.cpp)
   if(STRATA_ENABLE_HIP)
