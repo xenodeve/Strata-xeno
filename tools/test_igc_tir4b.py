@@ -259,6 +259,37 @@ class NativeTool(unittest.TestCase):
         self.assertEqual(tir4b.PYTHON_TOOL['function']['parameters']['required'], ['code'])
 
 
+class HintCalc(unittest.TestCase):
+    def test_a_tedious_hand_calculation_becomes_a_program(self):
+        r = rollout(hint_calc=True)
+        k = Kernel([(True, '56088')])
+        play(r, 'think a bit\nso 123 \\times 456 =print(123*456)\n```then done</think>\n\n56088<|im_end|>', k)
+        self.assertEqual(k.ran, ['print(123*456)\n'])
+        self.assertEqual(r.text(), 'think a bit\n' + tir4b.HINT_OPEN + 'print(123*456)\n```' + tir4b.output_block('56088') + tir4b.TRUST
+                         + 'then done</think>\n\n56088<|im_end|>')
+        hint = [e for e in r.events if e['kind'] == 'hint open'][0]
+        self.assertEqual((hint['expr'], hint['cut_tokens']), ('123 \\times 456', len(TOK.encode('so 123 \\times 456 ='))))
+        self.assertEqual([e['by'] for e in r.events if e['kind'] == 'output'], ['hint'])
+        self.assertEqual(r.phase, 'answer')
+
+    def test_small_arithmetic_is_left_alone(self):
+        r = rollout(hint_calc=True)
+        play(r, 'so 1 + 1 = 2</think>\n\n2<|im_end|>', Kernel([]))
+        self.assertEqual(r.events, [])
+
+    def test_hints_are_spaced(self):
+        r = rollout(hint_calc=True)
+        k = Kernel([(True, '56088')])
+        play(r, '\n123 \\times 456 =print(1)\n```and 789 \\times 321 = 253269</think>\n\n1<|im_end|>', k)
+        self.assertEqual(len(k.ran), 1)
+        self.assertIn('789 \\times 321 = 253269', r.text())
+
+    def test_no_trust_line_after_an_error(self):
+        r = rollout(hint_calc=True)
+        play(r, '\n123 \\times 456 =1/0\n```hm</think>\n\n1<|im_end|>', Kernel([(False, 'ZeroDivisionError')]))
+        self.assertNotIn(tir4b.TRUST, r.text())
+
+
 class FakeEngine:
     """vLLM's LLMEngine as drive() uses it: each request finishes on a later step, one at a time, so answers interleave."""
     def __init__(self, scripts):

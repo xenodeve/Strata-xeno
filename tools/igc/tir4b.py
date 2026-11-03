@@ -41,6 +41,12 @@ PYTHON_TOOL = dict(type='function', function=dict(
 TOOL_TURN = '<|im_end|>\n<|im_start|>user\n<tool_response>\n{}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n'
 NO_CODE = '[no code parameter: call python with <parameter=code>]'
 _CODE = re.compile(r'<parameter=code>\n?(.*?)\n?</parameter>', re.S)
+# --hint-calc: CoRT's hint-engineering (arXiv 2506.09820) at test time, START's Hint-infer (2503.04625). Where the model begins a tedious hand
+# calculation, its line is taken back and CoRT's own hint opens a program; after a run that printed, CoRT's second hint answers the doubt that
+# made the 4B re-check a sum ten times (r1 5456f419). The thinking goes on: no close, which FT1 learned as an early end.
+HINT_OPEN = 'It looks tedious, and we can use python code to simplify the reasoning.\n```python\n'
+TRUST = "We don't need to doubt the accuracy of python calculations.\n"
+HINT_GAP = 1024   # thinking tokens between two hints
 TRAIN_KINDS = ('forced open', 'close after a fitting result')   # the words the model should learn to write itself, as START's Hint-RFT
 MASK_KINDS = ('output', 'inline value', 'tool response')   # what the kernel printed and the values software computed: read, never learned
 
@@ -75,9 +81,10 @@ class Ids:
 
 
 class Arm:
-    def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False):
+    def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
+                 hint_calc=False):
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
-        self.inline_calc, self.native_tool = inline_calc, native_tool
+        self.inline_calc, self.native_tool, self.hint_calc = inline_calc, native_tool, hint_calc
 
 
 # --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
@@ -88,6 +95,11 @@ _LATEX = [(r'\\times|\\cdot', '*'), (r'\\div', '/'), (r'\\left|\\right', ''), (r
 _TAIL = re.compile(r'([0-9(\\][0-9+\-*/^(). \\a-z{}]*[0-9)}])[ ]*$')   # may open with a LaTeX command: \frac{3}{4} + 1/4
 _OPS = re.compile(r'[+\-*/^]|\\times|\\cdot|\\frac|\\div')
 _BOUNDARY = re.compile(r'(?:^|[\s$:;,]|\\\(|\\\[|=)$')
+
+
+def tedious(expr, value):
+    """Arithmetic worth a program: a number of three or more digits, three operators, or a value past 999. `1 + 1` is not."""
+    return any(len(n) >= 3 for n in re.findall(r'\d+', expr)) or len(_OPS.findall(expr)) >= 3 or abs(Fraction(value)) >= 1000
 
 
 def inline_value(before):
@@ -135,6 +147,7 @@ class Rollout:
         self.seconds = None
         self.cap = 0   # --max-tokens: training data only; an answer past it is never the shortest right one kept
         self.checked = 0   # len(out) at the last loop check
+        self.last_hint = -HINT_GAP   # self.thought at the last hint
 
     def left(self):
         room = CONTEXT - len(self.prompt) - len(self.out) - 64
@@ -168,7 +181,7 @@ class Rollout:
             self.done('length')
             return None
         stops = set(self.ids.ends)
-        if self.arm.inline_calc and self.phase in ('think', 'answer'):
+        if self.arm.inline_calc and self.phase in ('think', 'answer') or self.arm.hint_calc and self.phase == 'think':
             stops |= self.ids.equals
         if self.arm.native_tool and self.phase in ('think', 'answer'):
             stops.add(self.ids.tool_close)
@@ -194,9 +207,11 @@ class Rollout:
         if self.phase != 'answer' and self.phase != 'block':
             self.thought += len(new)
         last = new[-1] if new else None
-        if self.arm.inline_calc and last in self.ids.equals and self.phase in ('think', 'answer'):
+        if self.arm.hint_calc and last in self.ids.equals and self.phase == 'think' and self.hint_due():
+            return False
+        if (self.arm.inline_calc or self.arm.hint_calc) and last in self.ids.equals and self.phase in ('think', 'answer'):
             text = self.text()
-            value = inline_value(text[:text.rstrip().rfind('=')])
+            value = inline_value(text[:text.rstrip().rfind('=')]) if self.arm.inline_calc else None
             if value is not None:   # the value the model would have computed, computed: the reasoning goes on from it
                 self.inject(f' {value} (exact)', 'inline value')
                 self.events[-1].update(expr=_TAIL.search(text[:text.rstrip().rfind('=')].rsplit('\n', 1)[-1]).group(1).strip()[:200], value=value)
@@ -293,6 +308,30 @@ class Rollout:
                 self.done('stuck')
         return False
 
+    def hint_due(self):
+        """At an `=` that ends tedious arithmetic, spaced HINT_GAP apart: the line goes back and a hinted program opens. True when it opened."""
+        if self.runs >= MAX_RUNS or self.thought - self.last_hint < HINT_GAP:
+            return False
+        text = self.text()
+        before = text[:text.rstrip().rfind('=')]
+        value = inline_value(before)
+        if value is None:
+            return False
+        expr = _TAIL.search(before.rsplit('\n', 1)[-1]).group(1).strip()
+        if not tedious(expr, value):
+            return False
+        floor = self.spans[-1][1] if self.spans else 0   # never take back text the runner put in
+        cut = len(self.out)
+        while cut > floor and self.out[cut - 1] not in self.ids.lines:
+            cut -= 1
+        taken = len(self.out) - cut
+        del self.out[cut:]
+        self.last_hint = self.thought
+        self.inject(HINT_OPEN, 'hint open')
+        self.events[-1].update(expr=expr[:200], value=value, cut_tokens=taken)
+        self.enter('hint')
+        return True
+
     def enter(self, by):
         self.code_at, self.by, self.block, self.phase = len(self.text()), by, 0, 'block'
 
@@ -343,6 +382,8 @@ class Rollout:
         self.inject(output_block(shown_text(ok, shown)), 'output')
         self.events[-1].update(kind='output', by=self.by, code=code[:20000], code_chars=len(code), shown=(shown or '')[:4096],
                                shown_chars=len(shown or ''), ok=ok, seconds=took, fits=fits, run_at=at)
+        if self.by == 'hint' and fits:
+            self.inject(TRUST, 'trust hint')
         if self.arm.close_fit and fits:
             self.inject(CLOSE, 'close after a fitting result')
             self.phase = 'answer'
@@ -463,13 +504,13 @@ def run(args):
     from tools.igc.select_rows import right
     from transformers import AutoTokenizer, GenerationConfig
     from vllm import LLM
-    if (args.execute or args.native_tool) and not throwaway():
+    if (args.execute or args.native_tool or args.hint_calc) and not throwaway():
         raise SystemExit('a block runs only on a throwaway VM')
     rows = [json.loads(l) for l in Path(args.rows).read_text(encoding='utf-8').splitlines() if l.strip()]
     rows = rows[args.offset:args.offset + args.limit] if args.limit else rows[args.offset:]
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
-    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool)
+    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc)
     if args.native_tool and tok.convert_tokens_to_ids('</tool_call>') == tok.unk_token_id:
         raise SystemExit('the tokenizer has no </tool_call> token')
     out = Path(args.out)
@@ -621,6 +662,7 @@ def main(argv=None):
     r.add_argument('--close-repeat', type=int, default=0)
     r.add_argument('--inline-calc', action='store_true')
     r.add_argument('--native-tool', action='store_true', help="offer a python tool in Qwen3.5's own tool format and answer its calls")
+    r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")
     r.add_argument('--system', default='', help='a system turn before the question (with --native-tool it follows the tool list)')
     r.add_argument('--ids', action='store_true')
     r.add_argument('--memory', type=float, default=0.9)
