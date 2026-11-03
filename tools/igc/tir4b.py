@@ -47,6 +47,10 @@ _CODE = re.compile(r'<parameter=code>\n?(.*?)\n?</parameter>', re.S)
 HINT_OPEN = 'It looks tedious, and we can use python code to simplify the reasoning.\n```python\n'
 TRUST = "We don't need to doubt the accuracy of python calculations.\n"
 HINT_GAP = 1024   # thinking tokens between two hints
+# --loop-hint: 14 of the control's 16 misses on the r1 rows were loops, 13 of them mid-work, several of them searches by hand. A loop in the
+# thinking is cut back to one round and a program opens to test the idea, LOOP_HINTS times; the next loop ends the answer as before.
+LOOP_HINT = 'I keep going around the same idea. Let me test it with python instead.\n```python\n'
+LOOP_HINTS = 3
 TRAIN_KINDS = ('forced open', 'close after a fitting result')   # the words the model should learn to write itself, as START's Hint-RFT
 MASK_KINDS = ('output', 'inline value', 'tool response')   # what the kernel printed and the values software computed: read, never learned
 
@@ -82,9 +86,9 @@ class Ids:
 
 class Arm:
     def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
-                 hint_calc=False):
+                 hint_calc=False, loop_hint=False):
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
-        self.inline_calc, self.native_tool, self.hint_calc = inline_calc, native_tool, hint_calc
+        self.inline_calc, self.native_tool, self.hint_calc, self.loop_hint = inline_calc, native_tool, hint_calc, loop_hint
 
 
 # --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
@@ -115,6 +119,20 @@ def with_call(code):
         return code, None
     name = free[-1]
     return code + ('' if code.endswith('\n') else '\n') + f'\n_r = {name}()\nif _r is not None:\n    print(_r)\n', name
+
+
+def loop_start(tokens, longest=4096):
+    """Where the second round of the cycle that ends `tokens` begins, so a cut there keeps one round; None when the tail is no cycle of at
+    least four rounds (a counting or line-back loop)."""
+    for period in range(1, min(longest, len(tokens) // 2) + 1):
+        if tokens[-1] != tokens[-1 - period]:
+            continue
+        i = len(tokens) - period - 1
+        while i >= 0 and tokens[i] == tokens[i + period]:
+            i -= 1
+        if len(tokens) - (i + 1) >= 4 * period:
+            return i + 1 + period
+    return None
 
 
 def tedious(expr, value):
@@ -168,6 +186,7 @@ class Rollout:
         self.cap = 0   # --max-tokens: training data only; an answer past it is never the shortest right one kept
         self.checked = 0   # len(out) at the last loop check
         self.last_hint = -HINT_GAP   # self.thought at the last hint
+        self.loop_hints = 0
 
     def left(self):
         room = CONTEXT - len(self.prompt) - len(self.out) - 64
@@ -240,11 +259,7 @@ class Rollout:
             elif len(self.out) - self.checked >= CHUNK:   # a request that ends at `=` skips the checks below: a loop of equations would run on
                 self.checked = len(self.out)
                 if looping(self.out):
-                    if self.phase == 'think' and self.arm.loop_close:
-                        self.inject(LOOP_CLOSE, 'loop close')
-                        self.phase = 'answer'
-                    else:
-                        self.done('stuck')
+                    self.on_loop()
             return False
         self.checked = len(self.out)
         if self.arm.native_tool and last == self.ids.tool_close and self.phase in ('think', 'answer'):
@@ -321,12 +336,26 @@ class Rollout:
             self.phase = 'seek'
             return False
         if looping(self.out):
-            if self.arm.loop_close:
-                self.inject(LOOP_CLOSE, 'loop close')
-                self.phase = 'answer'
-            else:   # the bench's guard in every arm, MIP or not: a loop that cannot leave would run to the end of the context alone (external_bench)
-                self.done('stuck')
+            self.on_loop()
         return False
+
+    def on_loop(self):
+        """A loop in the thinking: a program to test the idea (--loop-hint, at most LOOP_HINTS), else the close (--loop-close), else the
+        bench's guard in every arm, MIP or not: a loop that cannot leave would run to the end of the context alone (external_bench)."""
+        if self.phase == 'think' and self.arm.loop_hint and self.loop_hints < LOOP_HINTS:
+            floor = self.spans[-1][1] if self.spans else 0
+            cut = max(loop_start(self.out) or len(self.out), floor)
+            taken = len(self.out) - cut
+            del self.out[cut:]
+            self.loop_hints += 1
+            self.inject(('' if not self.out or self.out[-1] in self.ids.lines else '\n') + LOOP_HINT, 'loop hint')
+            self.events[-1].update(cut_tokens=taken)
+            self.enter('loop')
+        elif self.phase == 'think' and self.arm.loop_close:
+            self.inject(LOOP_CLOSE, 'loop close')
+            self.phase = 'answer'
+        else:
+            self.done('stuck')
 
     def hint_due(self):
         """At an `=` that ends tedious arithmetic, spaced HINT_GAP apart: the line goes back and a hinted program opens. True when it opened."""
@@ -527,13 +556,13 @@ def run(args):
     from tools.igc.select_rows import right
     from transformers import AutoTokenizer, GenerationConfig
     from vllm import LLM
-    if (args.execute or args.native_tool or args.hint_calc) and not throwaway():
+    if (args.execute or args.native_tool or args.hint_calc or args.loop_hint) and not throwaway():
         raise SystemExit('a block runs only on a throwaway VM')
     rows = [json.loads(l) for l in Path(args.rows).read_text(encoding='utf-8').splitlines() if l.strip()]
     rows = rows[args.offset:args.offset + args.limit] if args.limit else rows[args.offset:]
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
-    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc)
+    arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint)
     if args.native_tool and tok.convert_tokens_to_ids('</tool_call>') == tok.unk_token_id:
         raise SystemExit('the tokenizer has no </tool_call> token')
     out = Path(args.out)
@@ -686,6 +715,7 @@ def main(argv=None):
     r.add_argument('--inline-calc', action='store_true')
     r.add_argument('--native-tool', action='store_true', help="offer a python tool in Qwen3.5's own tool format and answer its calls")
     r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")
+    r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
     r.add_argument('--system', default='', help='a system turn before the question (with --native-tool it follows the tool list)')
     r.add_argument('--ids', action='store_true')
     r.add_argument('--memory', type=float, default=0.9)

@@ -315,6 +315,32 @@ class AutoCall(unittest.TestCase):
         self.assertEqual((out['auto_call'], out['code']), ('f', 'def f():\n    return 37\n'))
 
 
+class LoopHint(unittest.TestCase):
+    def test_the_loop_is_cut_to_one_round_and_a_program_opens(self):
+        r = rollout(loop_hint=True)
+        k = Kernel([(True, 'True')])
+        # 4 + 68 x 15 = 1024 tokens: the loop is read at the end of the first chunk, and what the model writes next answers the hint
+        play(r, 'set\n' + 'Wait, is it 5?\n' * 68 + 'print(5 == 5)\n```so 5</think>\n\n5<|im_end|>', k)
+        text = r.text()
+        self.assertTrue(text.startswith('set\nWait, is it 5?\n' + tir4b.LOOP_HINT))
+        self.assertEqual(text.count('Wait, is it 5?'), 1)
+        self.assertIn(tir4b.LOOP_HINT + 'print(5 == 5)\n```' + tir4b.output_block('True'), text)
+        self.assertEqual(r.finish, 'stop')
+        hint = [e for e in r.events if e['kind'] == 'loop hint'][0]
+        self.assertGreater(hint['cut_tokens'], 1000)
+
+    def test_a_loop_after_the_last_hint_is_stuck(self):
+        r = rollout(loop_hint=True)
+        r.loop_hints = tir4b.LOOP_HINTS
+        play(r, 'Wait, is it 5?\n' * 400, Kernel([]))
+        self.assertEqual([e['kind'] for e in r.events], [])
+        self.assertEqual(r.finish, 'stuck')
+
+    def test_loop_start_finds_the_first_round(self):
+        tokens = [1, 2, 3] + [7, 8, 9] * 30
+        self.assertEqual(tir4b.loop_start(tokens), 6)   # keeps [7, 8, 9] once
+
+
 class FakeEngine:
     """vLLM's LLMEngine as drive() uses it: each request finishes on a later step, one at a time, so answers interleave."""
     def __init__(self, scripts):
