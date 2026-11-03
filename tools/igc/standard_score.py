@@ -73,8 +73,9 @@ def math_answer(text):
     # The base model copies the exemplars' `I hope it is correct.`; a post-trained model stops at the answer.
     said = reply(text)
     found = re.search(r'[Tt]he final answer is(.*?)(?:\.\s*I hope it is correct|\.?\s*(?:\n|$))', said, re.S)
-    if found:
-        return found.group(1).strip()
+    # `The final answer is:` with the value on the next line captured only `:` and scored a right DeepMind answer wrong (dmx_div_big-1649)
+    if found and found.group(1).strip().lstrip(':').strip():
+        return found.group(1).strip().lstrip(':').strip()
     boxed = last_boxed(said)   # a reply with the thinking on ends in a box, not in the exemplars' sentence
     if boxed is not None:
         return boxed

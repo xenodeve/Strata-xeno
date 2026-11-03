@@ -34,5 +34,17 @@ class Hle(unittest.TestCase):
         self.assertFalse(hle_right('<think>a</think>\n\nThe answer is 5.', '5'))
 
 
+
+class Math(unittest.TestCase):
+    def test_final_answer_line_with_the_value_below(self):
+        from tools.igc.standard_score import math_right
+        text = '</think>\n\nThe final answer is:\n\\boxed{-8038578.5}<|im_end|>'
+        self.assertTrue(math_right(text, '-16077157/2'))   # dmx_div_big-1649: was scored on `:`
+
+    def test_final_answer_sentence_still_wins(self):
+        from tools.igc.standard_score import math_right
+        self.assertTrue(math_right('</think>\n\nThe final answer is 12. I hope it is correct.', '12'))
+
+
 if __name__ == '__main__':
     unittest.main()
