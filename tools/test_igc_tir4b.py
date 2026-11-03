@@ -200,6 +200,8 @@ class InlineCalc(unittest.TestCase):
         self.assertIsNone(v('\\sqrt{8} + 1 '))       # not rational
         self.assertIsNone(v('(3 + 4 '))              # unbalanced
         self.assertIsNone(v('17 '))                  # no operator
+        self.assertIsNone(v('1.2.3 + 1 '))           # a section number: F('1.2').F('3') killed the whole runner (gen-mt5)
+        self.assertIsNone(v('(1)(2) + 3 '))          # a call on a number
 
     def test_the_rollout_puts_the_value_in(self):
         r = rollout(inline_calc=True)

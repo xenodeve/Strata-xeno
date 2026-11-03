@@ -163,7 +163,7 @@ def inline_value(before):
     exact = re.sub(r'\d+(?:\.\d+)?', lambda n: f"F('{n.group()}')", s)   # every literal a Fraction: 0.1 + 0.2 is 3/10, not a float
     try:
         value = Fraction(eval(compile(exact, '<inline>', 'eval'), {'__builtins__': {}}, {'F': Fraction}))
-    except (ArithmeticError, SyntaxError, TypeError, ValueError, OverflowError):
+    except Exception:  # noqa: BLE001 - any text the model wrote: `1.2.3` gave F('1.2').F('3'), an AttributeError that ended the whole run
         return None
     if value is None or abs(value.numerator) > 10 ** 30 or value.denominator > 10 ** 12:
         return None
