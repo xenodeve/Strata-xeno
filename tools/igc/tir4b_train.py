@@ -115,7 +115,8 @@ def main(argv=None):
     merged.save_pretrained(out / 'merged', safe_serialization=True)
     AutoTokenizer.from_pretrained(args.model).save_pretrained(out / 'merged')
     for f in Path(args.model).iterdir():   # the chat template, the processor and generation configs the base serves with
-        if f.suffix in ('.json', '.jinja', '.txt') and not (out / 'merged' / f.name).exists():
+        # not the base's weight index: it names the base's shards, and vLLM then looked for files the merge never wrote
+        if f.suffix in ('.json', '.jinja', '.txt') and not f.name.endswith('.index.json') and not (out / 'merged' / f.name).exists():
             shutil.copy(f, out / 'merged' / f.name)
     print('DONE', round(time.monotonic() - began, 1), flush=True)
 
