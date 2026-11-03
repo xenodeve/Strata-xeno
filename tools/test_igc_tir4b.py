@@ -455,6 +455,37 @@ class CheckHand(unittest.TestCase):
         self.assertIn('247 so\n' + tir4b.CORRECTION.format(expr='123 \\times 2', right='246', wrote='247'), r.text())
 
 
+class HttpDrive(unittest.TestCase):
+    """drive_http: llama-server's /completion in place of vLLM, so the 5060 Ti on Windows runs the same rules."""
+    def test_string_stops_and_the_stop_word_put_back(self):
+        scripts = {(1, 200): 'so 6 \\times 7 = and on</think>\n\n42<|im_end|>', (1, 201): 'plain</think>\n\nok<|im_end|>'}
+        cursor = dict.fromkeys(scripts, 0)
+
+        def post(body):   # llama-server's /completion: the text up to a stop word, the word given apart, eos at <|im_end|>
+            key = tuple(body['prompt'][:2])
+            rest = scripts[key][cursor[key]:]
+            cut, word = len(rest), ''
+            for s in body['stop'] + ['<|im_end|>']:
+                j = rest.find(s)
+                if 0 <= j < cut:
+                    cut, word = j, s
+            cursor[key] += cut + len(word)
+            if word == '<|im_end|>':
+                return dict(content=rest[:cut], stop_type='eos', stopping_word='')
+            return dict(content=rest[:cut], stop_type='word' if word else 'limit', stopping_word=word)
+        rs = [tir4b.Rollout(ROW, 0, [1, 200], tir4b.Arm(inline_calc=True), IDS, TOK, seed=1),
+              tir4b.Rollout(ROW, 0, [1, 201], tir4b.Arm(), IDS, TOK, seed=1)]
+        tir4b.drive_http(post, TOK, IDS, rs, lambda: Kernel([]), live_most=2)
+        self.assertEqual(rs[0].text(), 'so 6 \\times 7 = 42 (exact) and on</think>\n\n42<|im_end|>')
+        self.assertEqual(rs[1].text(), 'plain</think>\n\nok<|im_end|>')
+        self.assertTrue(all(r.finish == 'stop' for r in rs))
+
+    def test_the_stop_words_of_a_request(self):
+        r = tir4b.Rollout(ROW, 0, [1], tir4b.Arm(inline_calc=True, execute=True), IDS, TOK, seed=1)
+        most, stops = r.request()
+        self.assertEqual(sorted(tir4b.stop_words(stops, IDS, TOK)), sorted(['=', '```', '</think>']))
+
+
 class FakeEngine:
     """vLLM's LLMEngine as drive() uses it: each request finishes on a later step, one at a time, so answers interleave."""
     def __init__(self, scripts):

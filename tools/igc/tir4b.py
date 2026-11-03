@@ -641,13 +641,64 @@ def drive(llm, rollouts, kernel_factory, live_most=256, workers=32, on_round=Non
     pool.shutdown()
 
 
+def stop_words(stops, ids, tok):
+    """The stop token ids of a request as the strings llama-server stops on: it takes words, not ids. The end of turn is its own eos."""
+    words = set()
+    if stops & ids.equals:
+        words.add('=')
+    if stops & ids.lines:
+        words.add('\n')
+    if stops & ids.fence:
+        words.add('```')
+    if ids.think_close in stops:
+        words.add('</think>')
+    if getattr(ids, 'tool_close', None) in stops:
+        words.add('</tool_call>')
+    return sorted(words)
+
+
+def drive_http(post, tok, ids, rollouts, kernel_factory, live_most=16, on_round=None):
+    """drive() over llama-server's /completion, so the 5060 Ti runs the same rules on Windows, where vLLM does not (developer, 2026-11-04).
+    Each answer runs on its own thread and the server batches its slots. The server stops on words and leaves the word out of the text, so
+    it is put back and the text encoded again: the same Rollout takes it."""
+    import threading
+    im_end = tok.convert_tokens_to_ids('<|im_end|>')
+    lock = threading.Lock()
+    sampling = dict(temperature=SAMPLING['temperature'], top_p=SAMPLING['top_p'], top_k=SAMPLING['top_k'], min_p=SAMPLING['min_p'],
+                    presence_penalty=SAMPLING['presence_penalty'], repeat_penalty=SAMPLING['repetition_penalty'])
+
+    def one(r):
+        r.started = time.monotonic()
+        while True:
+            ask = r.request()
+            if not ask:
+                break
+            most, stops = ask
+            reply = post(dict(prompt=r.prompt + r.out, n_predict=most, stop=stop_words(stops, ids, tok), cache_prompt=True,
+                              seed=(r.seed + len(r.out)) % 2**31, **sampling))
+            text = reply.get('content', '') + (reply.get('stopping_word', '') if reply.get('stop_type') == 'word' else '')
+            new = tok.encode(text, add_special_tokens=False) if text else []
+            if reply.get('stop_type') == 'eos':
+                new.append(im_end)
+            if not new:
+                r.done('length')   # nothing came back at the limit: no answer can come
+                break
+            if r.take(new):
+                r.run_pending(kernel_factory)
+        if on_round:
+            with lock:
+                on_round()
+    with ThreadPoolExecutor(live_most) as pool:
+        list(pool.map(one, rollouts))
+
+
 def run(args):
     import os
     os.environ.setdefault('STRATA_SANDBOX_THROWAWAY', '1')   # the kernel runs bare only on a VM that is thrown away (exec_bridge.throwaway)
     from serve.sandbox.exec_bridge import Kernel, throwaway
     from tools.igc.select_rows import right
     from transformers import AutoTokenizer, GenerationConfig
-    from vllm import LLM
+
     if (args.execute or args.native_tool or args.hint_calc or args.loop_hint) and not throwaway():
         raise SystemExit('a block runs only on a throwaway VM')
     rows = [json.loads(l) for l in Path(args.rows).read_text(encoding='utf-8').splitlines() if l.strip()]
@@ -687,16 +738,19 @@ def run(args):
     if not ids.same_lines:   # the stuck stop and the loop close both read them
         raise SystemExit(f'the line ends are {sorted(ids.lines)}, not the 198 and 271 the loop checks read')
     began = time.monotonic()
-    kwargs = dict(model=args.model, dtype='bfloat16', max_model_len=CONTEXT, gpu_memory_utilization=args.memory, enable_prefix_caching=True,
-                  language_model_only=True, seed=args.seed)
-    try:
-        llm = LLM(**kwargs)
-    except TypeError:   # a vLLM with no text-only switch loads the vision tower too, which costs memory and changes nothing here
-        kwargs.pop('language_model_only')
-        llm = LLM(**kwargs)
-    # Live answers past what the KV cache holds are run in turns and lose their prefix cache: every chunk reads its whole context again.
-    # It stalled three runs (an L4 at 164 and 16 live, an A100 at 32 live on half the memory), so the count follows the cache here.
-    kv = kv_tokens(llm)
+    kwargs, llm, kv = dict(server=args.server), None, None
+    if not args.server:
+        from vllm import LLM
+        kwargs = dict(model=args.model, dtype='bfloat16', max_model_len=CONTEXT, gpu_memory_utilization=args.memory, enable_prefix_caching=True,
+                      language_model_only=True, seed=args.seed)
+        try:
+            llm = LLM(**kwargs)
+        except TypeError:   # a vLLM with no text-only switch loads the vision tower too, which costs memory and changes nothing here
+            kwargs.pop('language_model_only')
+            llm = LLM(**kwargs)
+        # Live answers past what the KV cache holds are run in turns and lose their prefix cache: every chunk reads its whole context again.
+        # It stalled three runs (an L4 at 164 and 16 live, an A100 at 32 live on half the memory), so the count follows the cache here.
+        kv = kv_tokens(llm)
     expect = args.max_tokens or args.expect_len
     if kv and args.live * expect > kv:
         fit = max(1, int(0.85 * kv / expect))
@@ -720,7 +774,17 @@ def run(args):
                 for r in done:
                     f.write(json.dumps(dict(id=r.row['id'], sample=r.sample, prompt_ids=r.prompt, out_ids=r.out, spans=r.spans)) + '\n')
         print(f'{len(done)}/{len(rollouts)} done, {sum(x["right"] for x in records)} right, {round(time.monotonic() - began)} s', flush=True)
-    drive(llm, rollouts, Kernel, live_most=args.live, on_round=save)
+    if args.server:   # llama-server on this PC's 5060 Ti: vLLM does not run on Windows
+        import urllib.request
+
+        def post(body):
+            req = urllib.request.Request(args.server.rstrip('/') + '/completion', data=json.dumps(body).encode('utf-8'),
+                                         headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=3600) as reply:
+                return json.loads(reply.read().decode('utf-8'))
+        drive_http(post, tok, ids, rollouts, Kernel, live_most=args.live, on_round=save)
+    else:
+        drive(llm, rollouts, Kernel, live_most=args.live, on_round=save)
     save(last=True)
     records = kept + [r.record(right) for r in rollouts]
     (out / 'report.json').write_text(json.dumps(dict(rows=len(rows), samples=args.samples, answers=len(records), right=sum(r['right'] for r in records),
@@ -818,6 +882,7 @@ def main(argv=None):
     r.add_argument('--native-tool', action='store_true', help="offer a python tool in Qwen3.5's own tool format and answer its calls")
     r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")
     r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
+    r.add_argument('--server', default='', help='a llama-server URL (127.0.0.1) to run on in place of vLLM: this PC, on Windows')
     r.add_argument('--no-think', action='store_true', help='enable_thinking=False: the reply is the answer, as Qwenputer measures arithmetic')
     r.add_argument('--greedy', action='store_true', help='temperature 0, for a protocol that publishes greedy numbers (Qwenputer)')
     r.add_argument('--system', default='', help='a system turn before the question (with --native-tool it follows the tool list)')
