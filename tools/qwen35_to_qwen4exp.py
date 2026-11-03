@@ -614,6 +614,7 @@ class StreamingGGUF(GGUFWriter):
             head += struct.pack("<IQ", GGML_ID[type_name], off)
         head += b"\0" * ((-len(head)) % self.alignment)
         tmp = pathlib.Path(str(path) + ".tmp")
+        tmp.parent.mkdir(parents=True, exist_ok=True)   # the first full-size write died on a directory that was not there yet
         order = {name: i for i, (name, _, _) in enumerate(rows)}
         nxt = 0
         with open(tmp, "wb") as fo:
