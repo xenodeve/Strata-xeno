@@ -293,8 +293,8 @@ def expression_before(text):
     for i in range(len(line)):
         if not _START.match(line[i]) or (i and line[i - 1] not in _BOUNDARY):
             continue
-        if line[i] in '-−' and _symbol_before(line[:i]):
-            continue
+        if line[i] in '-−' and (_symbol_before(line[:i]) or not line[:i].strip() and line[i + 1:i + 2] == ' '):
+            continue   # a minus after a symbol is binary; `- ` opening a line is a list's bullet (Qwenputer evals.py says the same)
         if line[i] == '(' and re.search(r'[A-Za-z]\S*\s*$', line[:i]) and _symbol_before(line[:i]):
             continue   # `u^2 (1 + \frac{169 \times 3}{841})`: a factor of a product on a symbol, no value of its own
         if re.search(r'[\d)}\]]\s+$', line[:i]) or _FUNCTION_BEFORE.search(line[:i]):

@@ -415,6 +415,14 @@ class WholeHint(unittest.TestCase):
         play(r, '(-1*-638*(-7)/(-7))/(((-62)/(-279))/(((-170)/3060)/(1/(-2)))) = so \\boxed{319}<|im_end|>', Kernel([]))
         self.assertTrue(r.text().startswith(tir4b.WHOLE_HINT_PLAIN + '(-1*-638*(-7)/(-7))/(((-62)/(-279))/(((-170)/3060)/(1/(-2)))) = 319 so'))
 
+    def test_a_whole_line_with_no_equals_gets_its_value(self):
+        # pc-whole dm mul_div 3350: the model wrote the whole expression on its own line, with no `=`, then went on in pieces
+        r = tir4b.Rollout(dict(id='a', suite='arith', answer='228'), 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True,
+                          whole_plain=True), IDS, TOK, seed=1, thinking=False)
+        play(r, '((( -1 ) / ( -15 )) / ( ( -1 ) / 2 ))\nso \\boxed{-2/15}<|im_end|>', Kernel([]))
+        self.assertIn('((( -1 ) / ( -15 )) / ( ( -1 ) / 2 ))\n= -2/15\nso', r.text())
+        self.assertTrue(r.events[1]['whole'])
+
     def test_later_pieces_follow_the_usual_rules(self):
         r = tir4b.Rollout(ROW, 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True), IDS, TOK, seed=1, thinking=False)
         play(r, '$-6 \\div 4 =$ then 21 \\div 19 = x<|im_end|>', Kernel([]))

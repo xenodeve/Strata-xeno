@@ -74,6 +74,12 @@ class ExpressionBefore(unittest.TestCase):
             self.assertIsNone(expression_before(text), text)
         self.assertEqual(expression_before('so the sum - 3 \\times 4 '), ('- 3 \\times 4', -12))   # after a word, the minus is a sign
 
+    def test_a_bullet_is_no_minus(self):
+        # pc-whole dm mul_div 3350: `- (-1)/(-15) =` read as -1/15 put a wrong value into the model's own step list
+        self.assertEqual(expression_before('- (-1)/(-15) '), ('(-1)/(-15)', F(1, 15)))
+        self.assertEqual(expression_before('  - 6 / 4 ')[0], '6 / 4')
+        self.assertEqual(expression_before('-6 / 4 ')[0], '-6 / 4')   # a minus glued to its number is a sign
+
     def test_a_lone_number_or_algebra_is_none(self):
         for text in ('so x ', 'it is 17 ', 'a3 + 4 ', '2x + 3 ', ''):
             self.assertIsNone(expression_before(text), text)

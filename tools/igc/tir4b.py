@@ -266,6 +266,8 @@ class Rollout:
             stops.add(self.ids.tool_close)
         if self.arm.check_hand and self.phase in ('think', 'answer'):
             stops |= self.ids.lines   # every line is checked as it ends, so a correction follows the line it corrects
+        if self.whole_pending:
+            stops |= self.ids.lines   # the whole step may come as a line of its own, with no `=`
         if self.phase == 'answer':
             return min(left, CHUNK), stops
         stops.add(self.ids.think_close)
@@ -290,6 +292,8 @@ class Rollout:
         last = new[-1] if new else None
         if self.arm.check_hand and self.phase in ('think', 'answer') and last in self.ids.lines:
             self.check_line()
+        if self.whole_pending and self.arm.inline_calc and last in self.ids.lines:
+            self.whole_line()
         if self.arm.hint_calc and last in self.ids.equals and self.phase == 'think' and self.hint_due():
             return False
         if (self.arm.inline_calc or self.arm.hint_calc) and last in self.ids.equals and self.phase in ('think', 'answer'):
@@ -403,6 +407,21 @@ class Rollout:
             self.phase = 'answer'
         else:
             self.done('stuck')
+
+    def whole_line(self):
+        """The --whole-hint's step written as a line of its own, with no `=` (pc-whole dm mul_div 3350: the whole expression, then pieces):
+        its value is put after it, computed whole."""
+        from tools.igc.mathexpr import _OPERATOR, evaluate
+        line = self.text().rstrip('\n').rsplit('\n', 1)[-1]
+        expr = re.sub(r'^\s*(?:[A-Za-z][A-Za-z ]*:\s*)?', '', line).strip().strip('$').replace('\\[', '').replace('\\]', '').strip()
+        if not expr or not _OPERATOR.search(expr.lstrip('-−')):
+            return
+        value = evaluate(expr)
+        if value is None:
+            return
+        self.whole_pending = False
+        self.inject(f'= {spelled(value)}\n', 'inline value')
+        self.events[-1].update(expr=expr[:200], value=spelled(value), whole=True)
 
     def check_line(self):
         """The line that just ended, every relation on it checked (tools.igc.mathexpr.wrong_relations), and a correction after it for each
