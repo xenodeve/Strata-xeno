@@ -251,6 +251,21 @@ def looping(tokens):
     return repeating(tokens)
 
 
+def eos_ids(model, tok, generation_config):
+    """The end tokens wherever the checkpoint states them: Qwen3.5-4B ships no generation_config.json, and its config keeps the id under text_config."""
+    ids = {tok.eos_token_id} - {None}
+    try:
+        e = generation_config.from_pretrained(model).eos_token_id
+        ids |= set(e if isinstance(e, list) else [e]) - {None}
+    except OSError:
+        pass
+    config = json.loads((Path(model) / 'config.json').read_text(encoding='utf-8'))
+    for c in (config, config.get('text_config', {})):
+        e = c.get('eos_token_id')
+        ids |= set(e if isinstance(e, list) else [e]) - {None}
+    return sorted(ids)
+
+
 def prompt_text(row):
     from tools.igc.standard_rows import plain_prompt
     text = row.get('question') or plain_prompt(row)
@@ -308,8 +323,7 @@ def run(args):
     if args.limit:
         rows = rows[:args.limit]
     tok = AutoTokenizer.from_pretrained(args.model)
-    eos = GenerationConfig.from_pretrained(args.model).eos_token_id
-    ids = Ids(tok, eos if isinstance(eos, list) else [eos])
+    ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
