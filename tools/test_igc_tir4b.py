@@ -409,7 +409,11 @@ class Training(unittest.TestCase):
         records = [rec('a', 0, True, 100, []), rec('a', 1, True, 300, fit, 1), rec('a', 2, False, 50, fit, 1),
                    rec('b', 0, True, 80, []), rec('b', 1, True, 60, [dict(kind='loop close')]),
                    rec('c', 0, False, 10, [])]
+        hinted = [dict(kind='hint open'), dict(kind='output', fits=True), dict(kind='trust hint'), dict(kind='loop hint'),
+                  dict(kind='output', fits=True)]
+        records.append(rec('d', 0, True, 500, hinted, 2))
         chosen = tir4b.choose(records)
+        self.assertEqual(chosen['d']['sample'], 0)   # Hint-RFT: the hints are taught as the model's own words
         self.assertEqual(chosen['a']['sample'], 1)   # the run that fitted, though longer
         self.assertEqual(chosen['b']['sample'], 0)   # a loop close is never taught
         self.assertNotIn('c', chosen)

@@ -51,7 +51,8 @@ HINT_GAP = 1024   # thinking tokens between two hints
 # thinking is cut back to one round and a program opens to test the idea, LOOP_HINTS times; the next loop ends the answer as before.
 LOOP_HINT = 'I keep going around the same idea. Let me test it with python instead.\n```python\n'
 LOOP_HINTS = 3
-TRAIN_KINDS = ('forced open', 'close after a fitting result')   # the words the model should learn to write itself, as START's Hint-RFT
+# The words the model should learn to write itself, as START's Hint-RFT keeps its hints in the text it trains on.
+TRAIN_KINDS = ('forced open', 'close after a fitting result', 'hint open', 'trust hint', 'loop hint')
 MASK_KINDS = ('output', 'inline value', 'tool response')   # what the kernel printed and the values software computed: read, never learned
 
 
