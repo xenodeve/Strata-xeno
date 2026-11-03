@@ -111,11 +111,7 @@ class Arm:
 # --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
 # When the reasoning writes an arithmetic expression and `=`, the value is computed exactly and put in, with the engine's ` (exact)`; the
 # model never does the arithmetic itself. On 82 base answers the 4B wrote 7,283 such equations, 504 of them wrong, in 12 of its 24 misses.
-_LATEX = [(r'\\times|\\cdot', '*'), (r'\\div', '/'), (r'\\left|\\right', ''), (r'\^\{([^{}]*)\}', r'**(\1)'), (r'\^', '**'),
-          (r'\\frac\{([^{}]*)\}\{([^{}]*)\}', r'((\1)/(\2))'), (r'\{', '('), (r'\}', ')'), (r'\\,|\\!|\\;', '')]
-_TAIL = re.compile(r'([0-9(\\][0-9+\-*/^(). \\a-z{}]*[0-9)}])[ ]*$')   # may open with a LaTeX command: \frac{3}{4} + 1/4
-_OPS = re.compile(r'[+\-*/^]|\\times|\\cdot|\\frac|\\div')
-_BOUNDARY = re.compile(r'(?:^|[\s$:;,]|\\\(|\\\[|=)$')
+_OPS = re.compile(r'[+\-*/^×÷·⋅−]|\\times|\\cdot|\\frac|\\div')
 
 
 def with_call(code):
@@ -157,47 +153,30 @@ def tedious(expr, value):
     return any(len(n) >= 3 for n in re.findall(r'\d+', expr)) or len(_OPS.findall(expr)) >= 3 or abs(Fraction(value)) >= 1000
 
 
-def inline_value(before, whole=False):
-    """The exact value of the arithmetic expression that ends the text before an `=`, as the model would write it, or None when that text
-    does not end in one: a symbol (algebra), no operator, unbalanced brackets, a number that is the tail of a longer expression, a root.
-    `whole`: the expression the --whole-hint asked for. Its leading minus is its own, and its value is given even as an uneven quotient,
-    since it is the step itself, not a piece of the model's long division."""
-    line = before.rsplit('\n', 1)[-1]
-    m = _TAIL.search(line)
-    if not m:
+def inline_found(before, whole=False):
+    """(expression, spelled exact value) for the arithmetic that ends the text before an `=`, or None. The expression is read by
+    tools.igc.mathexpr in every form a model writes (LaTeX at any depth, Unicode, ASCII); it refuses a symbol (algebra), a word, a mixed
+    number, a root or power that is not exact. `whole`: the expression the --whole-hint asked for, whose value is given even as an uneven
+    quotient, since it is the step itself, not a piece of the model's long division."""
+    from tools.igc.mathexpr import expression_before, simple_quotient
+    found = expression_before(before)
+    if found is None:
         return None
-    expr, head = m.group(1).strip(), line[:m.start(1)]
-    if whole and head.rstrip().endswith('-'):
-        expr, head = '-' + expr, head.rstrip()[:-1]
-    if not _OPS.search(expr) or expr.count('(') != expr.count(')') or expr.count('{') != expr.count('}'):
-        return None
-    if head and not head[-1].isspace() and not _BOUNDARY.search(head[-3:]):   # the expression starts after a space or a mark, not inside a word
-        return None
-    if re.search(r'\d[.,]$', head) or re.match(r'-?0\d', expr):
-        return None   # the tail of a longer number: `12,510,204 \times 100` was read as 204 x 100 and "corrected" (dm mul_big 4617)
-    s = expr.replace(',', '')
-    for a, b in _LATEX:
-        s = re.sub(a, b, s)
-    if re.search(r'[a-zA-Z_\\]', s) or len(s) > 200 or not re.fullmatch(r'[0-9+\-*/(). ]+', s):
-        return None
-    if any(int(e) > 64 for e in re.findall(r'\*\*\s*\(?\s*(\d+)', s)):   # 9**9**9 would not finish
-        return None
-    exact = re.sub(r'\d+(?:\.\d+)?', lambda n: f"F('{n.group()}')", s)   # every literal a Fraction: 0.1 + 0.2 is 3/10, not a float
-    try:
-        value = Fraction(eval(compile(exact, '<inline>', 'eval'), {'__builtins__': {}}, {'F': Fraction}))
-    except Exception:  # noqa: BLE001 - any text the model wrote: `1.2.3` gave F('1.2').F('3'), an AttributeError that ended the whole run
-        return None
-    if value is None or abs(value.numerator) > 10 ** 30 or value.denominator > 10 ** 12:
-        return None
+    expr, value = found
     said = spelled(value)
     if whole:
-        return said
-    bare = re.sub(r'[\s()]', '', s)
-    if '/' in said and re.fullmatch(r'-?\d+/-?\d+', bare):
+        return expr, said
+    if '/' in said and simple_quotient(expr):
         return None   # an integer quotient that does not come out: the model is doing long division and wants a digit, not 21/19 (dm div_big)
-    if said == bare:
+    if said == re.sub(r'[\s()]', '', expr):
         return None   # nothing new, and `= 15/13 = 15/13 = ...` looped until stuck
-    return said
+    return expr, said
+
+
+def inline_value(before, whole=False):
+    """The spelled exact value of inline_found, or None."""
+    found = inline_found(before, whole)
+    return found[1] if found else None
 
 
 def spelled(value):
@@ -316,23 +295,20 @@ class Rollout:
             if last in self.ids.equals and not self.arm.inline_calc:
                 text = self.text()
                 at = len(text.rstrip()) - 1
-                value = inline_value(text[:at])
-                line = text[:at].rsplit('\n', 1)[-1]
-                m = _TAIL.search(line)
-                # a minus before the expression is its sign: `-(25 * 130) = -3250` was "corrected" to 3250 (dm 3578)
-                if value is not None and m and not line[:m.start(1)].rstrip().endswith('-'):
-                    self.checks.append((at, m.group(1).strip(), value))
+                found = inline_found(text[:at])   # its sign read with it: `-(25 * 130) = -3250` was once "corrected" to 3250 (dm 3578)
+                if found is not None:
+                    self.checks.append((at, found[0], found[1]))
         if self.arm.hint_calc and last in self.ids.equals and self.phase == 'think' and self.hint_due():
             return False
         if (self.arm.inline_calc or self.arm.hint_calc) and last in self.ids.equals and self.phase in ('think', 'answer'):
             text = self.text()
             whole = self.whole_pending
-            value = inline_value(text[:text.rstrip().rfind('=')], whole=whole) if self.arm.inline_calc else None
-            if value is not None:   # the value the model would have computed, computed: the reasoning goes on from it
+            found = inline_found(text[:text.rstrip().rfind('=')], whole=whole) if self.arm.inline_calc else None
+            if found is not None:   # the value the model would have computed, computed: the reasoning goes on from it
+                expr, value = found
                 self.whole_pending = False
                 self.inject(f' {value}' if self.arm.inline_plain else f' {value} (exact)', 'inline value')
-                self.events[-1].update(expr=_TAIL.search(text[:text.rstrip().rfind('=')].rsplit('\n', 1)[-1]).group(1).strip()[:200], value=value,
-                                       whole=whole)
+                self.events[-1].update(expr=expr[:200], value=value, whole=whole)
             if self.left() <= 0:
                 self.done('length')
             elif len(self.out) - self.checked >= CHUNK:   # a request that ends at `=` skips the checks below: a loop of equations would run on
@@ -477,10 +453,10 @@ class Rollout:
             return False
         text = self.text()
         before = text[:text.rstrip().rfind('=')]
-        value = inline_value(before)
-        if value is None:
+        found = inline_found(before)
+        if found is None:
             return False
-        expr = _TAIL.search(before.rsplit('\n', 1)[-1]).group(1).strip()
+        expr, value = found
         if not tedious(expr, value):
             return False
         floor = self.spans[-1][1] if self.spans else 0   # never take back text the runner put in

@@ -209,12 +209,12 @@ class InlineCalc(unittest.TestCase):
         self.assertIsNone(v('a3 + 4 '))              # the tail of a word
         self.assertIsNone(v('9^{999} '))             # too large to compute in a step
         self.assertIsNone(v('\\sqrt{8} + 1 '))       # not rational
-        self.assertIsNone(v('(3 + 4 '))              # unbalanced
+        self.assertEqual(v('(3 + 4 '), '7')          # inside a bracket the text opened: `(3 + 4 = 7)` (tools.igc.mathexpr)
         self.assertIsNone(v('17 '))                  # no operator
         self.assertIsNone(v('1.2.3 + 1 '))           # a section number: F('1.2').F('3') killed the whole runner (gen-mt5)
-        self.assertIsNone(v('(1)(2) + 3 '))          # a call on a number
-        self.assertIsNone(v('so 12,510,204 \\times 100 '))   # a thousands separator is not a boundary: it was read as 204 x 100 (dm 4617)
-        self.assertIsNone(v('so 030 \\times 2 '))            # a number that starts with 0 is a cut one
+        self.assertEqual(v('(1)(2) + 3 '), '5')      # implicit multiplication
+        self.assertEqual(v('so 12,510,204 \\times 100 '), '1251020400')   # read whole: the old reader took 204 x 100 (dm 4617)
+        self.assertEqual(v('so 511.276030 \\times 10 '), '5112.7603')   # never started inside a number (the old reader took 030 x 10)
 
     def test_the_rollout_puts_the_value_in(self):
         r = rollout(inline_calc=True)
