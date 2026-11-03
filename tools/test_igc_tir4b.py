@@ -286,6 +286,15 @@ class HintCalc(unittest.TestCase):
         self.assertEqual(len(k.ran), 1)
         self.assertIn('789 \\times 321 = 253269', r.text())
 
+    def test_a_hint_that_gets_the_same_program_runs_it_again(self):
+        # the repeat close is for a model that reruns its own program; a second hint at the same sum asks for it (gen-mt5: most answers closed)
+        r = rollout(hint_calc=True, close_repeat=2)
+        k = Kernel([(True, '56088'), (True, '56088')])
+        gap = ' '.join(str(i) for i in range(300)) + '\n'   # past HINT_GAP tokens with no cycle, so the loop check stays quiet
+        play(r, '\n123 \\times 456 =print(123*456)\n```' + gap + '123 \\times 456 =print(123*456)\n```done</think>\n\n56088<|im_end|>', k)
+        self.assertEqual(len(k.ran), 2)
+        self.assertNotIn('repeated program close', [e['kind'] for e in r.events])
+
     def test_no_trust_line_after_an_error(self):
         r = rollout(hint_calc=True)
         play(r, '\n123 \\times 456 =1/0\n```hm</think>\n\n1<|im_end|>', Kernel([(False, 'ZeroDivisionError')]))

@@ -424,7 +424,9 @@ class Rollout:
         if self.by in ('tool', 'tool in thinking'):
             self.run_tool(code, kernel_factory)
             return
-        if self.arm.close_repeat and self.seen.get(code, 0) + 1 >= self.arm.close_repeat:
+        # The repeat close is for a model that reruns its own program; a hinted block that repeats one was asked for by the runner (gen-mt5:
+        # a second hint at the same sum gave the same program and closed most answers)
+        if self.arm.close_repeat and self.by in ('model', 'forced') and self.seen.get(code, 0) + 1 >= self.arm.close_repeat:
             self.inject(LOOP_CLOSE, 'repeated program close')
             self.phase = 'answer'
             return
