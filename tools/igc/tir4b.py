@@ -251,6 +251,15 @@ class Rollout:
                     first_run_at=runs[0]['model_tokens'] if runs else None, tool_seconds=round(sum(e['seconds'] for e in runs), 3))
 
 
+def kv_tokens(llm):
+    """The tokens vLLM's KV cache holds, or None when this vLLM does not say."""
+    try:
+        c = llm.llm_engine.vllm_config.cache_config
+        return int(c.num_gpu_blocks) * int(c.block_size)
+    except Exception:  # noqa: BLE001 - an older or newer engine object: the caller keeps the --live it was given
+        return None
+
+
 def looping(tokens):
     from tools.igc.external_score import repeating
     return repeating(tokens)
@@ -358,7 +367,15 @@ def run(args):
     except TypeError:   # a vLLM with no text-only switch loads the vision tower too, which costs memory and changes nothing here
         kwargs.pop('language_model_only')
         llm = LLM(**kwargs)
-    (out / 'arm.json').write_text(json.dumps(dict(vars(args), sampling=SAMPLING, context=CONTEXT, load_seconds=round(time.monotonic() - began, 1),
+    # Live answers past what the KV cache holds are run in turns and lose their prefix cache: every chunk reads its whole context again.
+    # It stalled three runs (an L4 at 164 and 16 live, an A100 at 32 live on half the memory), so the count follows the cache here.
+    kv = kv_tokens(llm)
+    expect = args.max_tokens or args.expect_len
+    if kv and args.live * expect > kv:
+        fit = max(1, int(0.85 * kv / expect))
+        print(f'--live {args.live} x {expect} tokens is past the KV cache ({kv} tokens): {fit} live', flush=True)
+        args.live = fit
+    (out / 'arm.json').write_text(json.dumps(dict(vars(args), kv_tokens=kv, sampling=SAMPLING, context=CONTEXT, load_seconds=round(time.monotonic() - began, 1),
                                                    llm={k: v for k, v in kwargs.items() if k != 'model'}, think_close=ids.think_close,
                                                    ends=sorted(ids.ends), lines=sorted(ids.lines), fences=len(ids.fence))), encoding='utf-8')
     began = time.monotonic()
@@ -470,6 +487,7 @@ def main(argv=None):
     r.add_argument('--memory', type=float, default=0.9)
     r.add_argument('--live', type=int, default=256)
     r.add_argument('--resume', action='store_true')
+    r.add_argument('--expect-len', type=int, default=24000)   # tokens one live answer may reach, for the KV fit; a capped run uses its cap
     m = sub.add_parser('math-train')
     m.add_argument('out')
     m.add_argument('--n', type=int, required=True)
