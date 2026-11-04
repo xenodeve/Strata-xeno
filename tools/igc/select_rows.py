@@ -12,6 +12,9 @@ def right(row, text):
     """The one rule each suite is scored by: the bench's early stop, the reader's triage and the row selection all use it."""
     if row['suite'] in ('stdmath', 'arith'):   # arith: Qwenputer's DeepMind / NUPA sets, boxed numbers
         return math_right(text, row['answer'])
+    if row['suite'] == 'contest':   # recent public contest problems, a boxed exact answer
+        from tools.igc.contest_math import right as contest_right
+        return contest_right(row, text)
     if row['suite'] == 'livebench':   # LiveBench's own rules, full marks only; `livebench.score` has the partial credit
         from tools.igc.livebench import right as livebench_right
         return livebench_right(row, text)
