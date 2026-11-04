@@ -725,5 +725,52 @@ class LogitValue(unittest.TestCase):
         self.assertEqual(r.plan_own, [-0.25])
 
 
+class SuppressRecheck(unittest.TestCase):
+    """--suppress-recheck: the re-check words' logits are lowered for a number of steps after a value software gave."""
+    def setUp(self):
+        self.kept = IDS.recheck
+        IDS.recheck = {1000 + ord('W')}   # the test tokenizer has one id per character: `W` stands for Wait
+
+    def tearDown(self):
+        IDS.recheck = self.kept
+
+    def test_a_window_follows_an_inline_value(self):
+        r = rollout(inline_calc=True, inline_plain=True, suppress_recheck=5)
+        self.assertIsNone(r.bias())
+        r.take(TOK.encode('so 6 \\times 7 ='))
+        self.assertIn('6 \\times 7 = 42', r.text())
+        self.assertEqual(r.window, 5)
+        self.assertEqual(r.bias(), {1000 + ord('W'): tir4b.SUPPRESS_BIAS})
+        self.assertLessEqual(r.request()[0], 5)   # one static bias covers the request
+        r.take(TOK.encode('abc'))
+        self.assertEqual(r.window, 2)
+        r.take(TOK.encode('def'))
+        self.assertEqual(r.window, 0)
+        self.assertIsNone(r.bias())
+        self.assertGreater(r.request()[0], 5)
+
+    def test_a_window_follows_a_value_the_model_wrote_under_the_bias(self):
+        r = rollout(logit_value=6.0, suppress_recheck=4)
+        r.take(TOK.encode('so 6 \\times 7 ='))
+        self.assertEqual(r.window, 0)   # the value is still being written
+        while r.plan is not None:
+            r.take([next(iter(r.bias()))])
+        self.assertEqual(r.window, 4)
+        self.assertEqual(set(r.bias().values()), {tir4b.SUPPRESS_BIAS})
+
+    def test_a_lost_bias_opens_no_window(self):
+        r = rollout(logit_value=1.0, suppress_recheck=4)
+        r.take(TOK.encode('so 6 \\times 7 ='))
+        r.take([1000 + ord('x')])   # the model's own token wins at the first step
+        self.assertIsNone(r.plan)
+        self.assertEqual(r.window, 0)
+
+    def test_off_by_default(self):
+        r = rollout(inline_calc=True)
+        r.take(TOK.encode('so 6 \\times 7 ='))
+        self.assertEqual(r.window, 0)
+        self.assertIsNone(r.bias())
+
+
 if __name__ == '__main__':
     unittest.main()

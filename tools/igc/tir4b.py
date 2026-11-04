@@ -95,6 +95,10 @@ def shown_text(ok, shown):
     return data[:SHOWN].decode('utf-8', 'ignore') if len(data) > SHOWN else body
 
 
+RECHECK_WORDS = {'wait', 'hmm', 'hmmm', 'verify', 'verifying', 'check', 'checking', 'double', 'recheck', 'rechecking', 'recalculate', 'recompute', 'again'}
+SUPPRESS_BIAS = -30.0   # added to those words' logits: -inf in NoWait, a finite number that no sampled logit climbs back from
+
+
 class Ids:
     """The special tokens of the 4B's tokenizer, looked up, never carried over from the Flash-Next pack."""
     def __init__(self, tokenizer, eos):
@@ -108,14 +112,17 @@ class Ids:
         # repeating() and line_back() read 198 and 271 as the line ends, the Flash-Next pack's ids: a tokenizer with others would blind them
         self.same_lines = self.lines == {198, 271}
         self.equals = {i for i in range(len(tokenizer)) if tokenizer.decode([i]).strip() == '='}   # the tokens an inline value follows
+        # --suppress-recheck: the words a re-check starts with (NoWait / CGRS list, the same words the H-trust tests count)
+        self.recheck = {i for i in range(len(tokenizer)) if tokenizer.decode([i]).strip().lower().rstrip('.,:!') in RECHECK_WORDS}
         self.tool_close = tokenizer.convert_tokens_to_ids('</tool_call>')
 
 
 class Arm:
     def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
                  hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False, whole_plain=False, hand_off=False, question_value=False,
-                 trust='cort', logit_value=0.0):
+                 trust='cort', logit_value=0.0, suppress_recheck=0):
         self.trust = trust   # the line after a hinted program that printed: 'cort' (the original), 'none', 'positive'
+        self.suppress_recheck = suppress_recheck   # --suppress-recheck: this many steps after a value software gave, the re-check words' logits are lowered
         self.logit_value = logit_value   # --logit-value: the logit added to software's next value token while the model writes the value itself
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
         self.inline_calc, self.native_tool, self.hint_calc, self.loop_hint = inline_calc, native_tool, hint_calc, loop_hint
@@ -244,10 +251,19 @@ class Rollout:
         self.loop_hints = 0
         self.plan = None     # --logit-value: the token ids of the value being written, one biased request each
         self.plan_at, self.plan_own, self.plan_event, self.last_lp = 0, [], None, None
+        self.window = 0   # --suppress-recheck: steps left in which the re-check words are held down
 
     def bias(self):
-        """--logit-value: {token id: logit added} for the request now asked, or None. The model writes the value itself; only its prediction moves."""
-        return {self.plan[self.plan_at]: self.arm.logit_value} if self.plan is not None else None
+        """{token id: logit added} for the request now asked, or None. --logit-value: software's next token, the model writes the value itself.
+        --suppress-recheck: the re-check words, in the window after a value."""
+        if self.plan is not None:
+            return {self.plan[self.plan_at]: self.arm.logit_value}
+        if self.window > 0:
+            return {t: SUPPRESS_BIAS for t in self.ids.recheck}
+        return None
+
+    def open_window(self):
+        self.window = self.arm.suppress_recheck
 
     def start_plan(self, expr, value):
         self.plan = self.tok.encode(f' {value}', add_special_tokens=False)
@@ -274,6 +290,8 @@ class Rollout:
     def end_plan(self):
         self.plan_event.update(matched=self.plan_at, own_logprobs=self.plan_own, ok=self.plan_at >= len(self.plan))
         self.plan = None
+        if self.plan_event['ok']:
+            self.open_window()
 
     def left(self):
         room = CONTEXT - len(self.prompt) - len(self.out) - 64
@@ -299,7 +317,14 @@ class Rollout:
             self.kernel = None
 
     def request(self):
-        """(max_tokens, stop token ids) of the next generation, or None once it is done."""
+        """(max_tokens, stop token ids) of the next generation, or None once it is done. In the --suppress-recheck window the request is no
+        longer than what is left of it, so one static logit bias covers it."""
+        q = self._request()
+        if q and self.window > 0 and self.plan is None:
+            return min(q[0], self.window), q[1]
+        return q
+
+    def _request(self):
         if self.finish:
             return None
         left = self.left()
@@ -339,6 +364,7 @@ class Rollout:
     def take(self, new):
         """The tokens of one generation. True when a block waits to run."""
         self.out += new
+        self.window = max(0, self.window - len(new))
         if self.phase != 'answer' and self.phase != 'block':
             self.thought += len(new)
         last = new[-1] if new else None
@@ -367,6 +393,7 @@ class Rollout:
                 self.whole_pending = False
                 # the whole value ends its line: left open, an integer drew `.000...` from the model until the guard stopped it (pc4-whole dm div_big 7815)
                 self.inject((f' {value}' if self.arm.inline_plain else f' {value} (exact)') + ('\n' if whole else ''), 'inline value')
+                self.open_window()
                 self.events[-1].update(expr=expr[:200], value=value, whole=whole)
                 if whole:
                     self.give(value)
@@ -744,7 +771,8 @@ def drive(llm, rollouts, kernel_factory, live_most=256, workers=32, on_round=Non
         most, stops = q
         bias = r.bias()
         params = SamplingParams(**SAMPLING, max_tokens=most, stop_token_ids=sorted(stops), seed=(r.seed + len(r.out)) % 2**31,
-                                skip_special_tokens=False, detokenize=False, **(dict(logit_bias=bias, logprobs=20) if bias else {}))
+                                skip_special_tokens=False, detokenize=False,
+                                **(dict(logit_bias=bias, **(dict(logprobs=20) if r.plan is not None else {})) if bias else {}))
         rid = str(next(serial))
         engine.add_request(rid, TokensPrompt(prompt_token_ids=r.prompt + r.out), params)
         flying[rid] = r
@@ -858,7 +886,10 @@ def run(args):
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint, args.inline_plain,
-              args.whole_hint, args.check_hand, args.whole_plain, args.hand_off, args.question_value, trust=args.trust_line, logit_value=args.logit_value)
+              args.whole_hint, args.check_hand, args.whole_plain, args.hand_off, args.question_value, trust=args.trust_line, logit_value=args.logit_value,
+              suppress_recheck=args.suppress_recheck)
+    if args.suppress_recheck and (args.server or not (args.inline_calc or args.logit_value)):
+        raise SystemExit('--suppress-recheck lowers the re-check words after a value software gave: it needs --inline-calc or --logit-value, and vLLM (not --server)')
     if args.logit_value and (args.inline_calc or args.server or args.whole_hint or args.hand_off):
         raise SystemExit('--logit-value is the value arriving by the prediction: not with --inline-calc (the value as text), --whole-hint, --hand-off, or --server (vLLM only)')
     if args.whole_hint and not args.inline_calc:
@@ -1041,6 +1072,8 @@ def main(argv=None):
                    help="the line after a hinted program that printed: CoRT's \"We don't need to doubt...\" (default, as before), none, or ATTC's positive sentence")
     r.add_argument('--logit-value', type=float, default=0.0,
                    help="MIP's logit override, soft: at an `=` the value is not put in; the model writes it, and the logit of software's next token is raised by this much (vLLM)")
+    r.add_argument('--suppress-recheck', type=int, default=0,
+                   help="for this many steps after a value software gave (inline or logit), the logits of the re-check words (wait, hmm, verify, check, double, again...) are lowered by 30 (vLLM)")
     r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
     r.add_argument('--server', default='', help='a llama-server URL (127.0.0.1) to run on in place of vLLM: this PC, on Windows')
     r.add_argument('--question-value', action='store_true', help='the whole value is the computation the question states, read by software')
