@@ -332,6 +332,22 @@ class HintCalc(unittest.TestCase):
         self.assertEqual(len(k.ran), 2)
         self.assertNotIn('repeated program close', [e['kind'] for e in r.events])
 
+    def test_the_trust_line_is_the_original_by_default_and_can_be_left_out_or_made_positive(self):
+        # lb1: the original line, put after every hinted program, did not stop a 4B from re-checking a printed -530 for 12,000 tokens
+        hinted = '\n123 \\times 456 =print(123*456)\n```hm</think>\n\n56088<|im_end|>'
+        r = rollout(hint_calc=True)
+        play(r, hinted, Kernel([(True, '56088')]))
+        self.assertIn(tir4b.TRUST, r.text())
+        r = rollout(hint_calc=True, trust='none')
+        play(r, hinted, Kernel([(True, '56088')]))
+        self.assertNotIn(tir4b.TRUST, r.text())
+        self.assertNotIn('trust hint', [e['kind'] for e in r.events])
+        self.assertIn('output', [e['kind'] for e in r.events])   # the program still runs and its output is still shown
+        r = rollout(hint_calc=True, trust='positive')
+        play(r, hinted, Kernel([(True, '56088')]))
+        self.assertIn(tir4b.TRUST_LINES['positive'], r.text())
+        self.assertNotIn(tir4b.TRUST, r.text())
+
     def test_no_trust_line_after_an_error(self):
         r = rollout(hint_calc=True)
         play(r, '\n123 \\times 456 =1/0\n```hm</think>\n\n1<|im_end|>', Kernel([(False, 'ZeroDivisionError')]))

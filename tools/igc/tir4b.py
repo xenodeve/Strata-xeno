@@ -46,6 +46,11 @@ _CODE = re.compile(r'<parameter=code>\n?(.*?)\n?</parameter>', re.S)
 # made the 4B re-check a sum ten times (r1 5456f419). The thinking goes on: no close, which FT1 learned as an early end.
 HINT_OPEN = 'It looks tedious, and we can use python code to simplify the reasoning.\n```python\n'
 TRUST = "We don't need to doubt the accuracy of python calculations.\n"
+# --trust-line: lb1 (2026-11-04) put TRUST after every hinted program and the 4B still re-checked a printed -530 for 12,000 tokens (and a printed 320 ten times).
+# Our own H-trust arms found that a line vouching for a value raises the re-check word (+22 to +35 points against a bare new line), and negated
+# instructions can raise the thing they forbid (arXiv 2511.12381). 'none' leaves the line out; 'positive' is the sentence ATTC inserts when its confidence
+# gate passes (arXiv 2604.08281, as the paper's Table 5 is reported to give it; ATTC gates it, this does not).
+TRUST_LINES = {'cort': TRUST, 'positive': 'I have great confidence in the code above, I should believe the code execution result.\n'}
 HINT_GAP = 1024   # thinking tokens between two hints
 # --whole-hint: on Qwenputer's DeepMind rows the 4B cut each step into the pieces of its own method (a long division's `21 \div 19 =`), so a
 # value put in at `=` came for a piece, in a form the method could not use, and looped. This opens the reply asking for the whole step as
@@ -108,7 +113,9 @@ class Ids:
 
 class Arm:
     def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
-                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False, whole_plain=False, hand_off=False, question_value=False):
+                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False, whole_plain=False, hand_off=False, question_value=False,
+                 trust='cort'):
+        self.trust = trust   # the line after a hinted program that printed: 'cort' (the original), 'none', 'positive'
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
         self.inline_calc, self.native_tool, self.hint_calc, self.loop_hint = inline_calc, native_tool, hint_calc, loop_hint
         self.inline_plain, self.whole_hint, self.check_hand = inline_plain, whole_hint, check_hand
@@ -616,8 +623,8 @@ class Rollout:
         self.inject(output_block(shown_text(ok, shown)), 'output')
         self.events[-1].update(kind='output', by=self.by, code=code[:20000], code_chars=len(code), shown=(shown or '')[:4096],
                                shown_chars=len(shown or ''), ok=ok, seconds=took, fits=fits, run_at=at, auto_call=self.auto_call)
-        if self.by == 'hint' and fits:
-            self.inject(TRUST, 'trust hint')
+        if self.by == 'hint' and fits and self.arm.trust != 'none':
+            self.inject(TRUST_LINES[self.arm.trust], 'trust hint')
         if self.arm.close_fit and fits:
             self.inject(CLOSE, 'close after a fitting result')
             self.phase = 'answer'
@@ -807,7 +814,7 @@ def run(args):
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint, args.inline_plain,
-              args.whole_hint, args.check_hand, args.whole_plain, args.hand_off, args.question_value)
+              args.whole_hint, args.check_hand, args.whole_plain, args.hand_off, args.question_value, trust=args.trust_line)
     if args.whole_hint and not args.inline_calc:
         raise SystemExit('--whole-hint asks for a value that only --inline-calc puts in')
     if args.greedy:   # drive() and arm.json read SAMPLING: temperature 0 is vLLM's greedy
@@ -982,6 +989,8 @@ def main(argv=None):
     r.add_argument('--inline-plain', action='store_true', help="the value alone, as Qwenputer prints it, without the engine's ' (exact)'")
     r.add_argument('--native-tool', action='store_true', help="offer a python tool in Qwen3.5's own tool format and answer its calls")
     r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")
+    r.add_argument('--trust-line', choices=('cort', 'none', 'positive'), default='cort',
+                   help="the line after a hinted program that printed: CoRT's \"We don't need to doubt...\" (default, as before), none, or ATTC's positive sentence")
     r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
     r.add_argument('--server', default='', help='a llama-server URL (127.0.0.1) to run on in place of vLLM: this PC, on Windows')
     r.add_argument('--question-value', action='store_true', help='the whole value is the computation the question states, read by software')

@@ -113,14 +113,27 @@ def read_questions(arm):
     return {c['id']: c['prompt'] for c in json.loads((arm / 'cases.json').read_text(encoding='utf-8'))}
 
 
-def follow(env, arm, path, every=15.):
+def with_rows(records, rows_path):
+    """tir4b arms keep no cases.json and their records lack the row's group, subtask and question, which LiveBench's rules read: join them from the rows file."""
+    rows = {}
+    for line in Path(rows_path).read_text(encoding='utf-8').splitlines():
+        row = json.loads(line)
+        rows[row['id']] = row
+    return [{**rows[r['id']], **r} for r in records], {i: row.get('question') or row['prompt'] for i, row in rows.items()}
+
+
+def follow(env, arm, path, rows_path=None, every=15.):
     """Reads a running arm beside it: the bench never waits for a verdict. Ends when the arm's report is written."""
     verdicts = {}
     while True:
         finished = (arm / 'report.json').exists()
         records = read_records(arm)
         if records:
-            verdicts = read_all(env, records, read_questions(arm), path)
+            if rows_path:
+                records, questions = with_rows(records, rows_path)
+            else:
+                questions = read_questions(arm)
+            verdicts = read_all(env, records, questions, path)
         if finished and records is not None:
             return verdicts
         time.sleep(every)
@@ -132,16 +145,21 @@ def main():
     parser.add_argument('arm', type=Path)
     parser.add_argument('--verdicts', type=Path, help='JSON of id -> verdict; default verdicts.json in the arm')
     parser.add_argument('--env', type=Path, default=Path('.env'))
+    parser.add_argument('--rows', type=Path, help="the rows file the arm ran (tir4b arms: no cases.json; the rows give the questions and LiveBench's group and subtask)")
     args = parser.parse_args()
     env = load_env(args.env)
     missing = [k for k in ('ANSWER_CHECK_BASE_URL', 'ANSWER_CHECK_API_KEY', 'ANSWER_CHECK_MODEL') if not env.get(k)]
     if missing:
         raise SystemExit(f'{args.env} has no value for {", ".join(missing)}')
     records = [] if args.follow else read_records(args.arm)
-    questions = None if args.follow else read_questions(args.arm)
+    questions = None if args.follow else (with_rows(records, args.rows)[1] if args.rows else read_questions(args.arm))
+    if args.rows and not args.follow:
+        records = with_rows(records, args.rows)[0]
     path = args.verdicts or args.arm / 'verdicts.json'
-    verdicts = follow(env, args.arm, path) if args.follow else read_all(env, records, questions, path)
+    verdicts = follow(env, args.arm, path, args.rows) if args.follow else read_all(env, records, questions, path)
     records = read_records(args.arm)
+    if args.rows:
+        records = with_rows(records, args.rows)[0]
     rows = triage(records, verdicts)
     (args.arm / 'triage.json').write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding='utf-8')
     print(args.arm.name, dict(Counter(r['route'] for r in rows)))
