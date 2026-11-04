@@ -108,11 +108,11 @@ class Ids:
 
 class Arm:
     def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
-                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False, whole_plain=False, hand_off=False):
+                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False, whole_plain=False, hand_off=False, question_value=False):
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
         self.inline_calc, self.native_tool, self.hint_calc, self.loop_hint = inline_calc, native_tool, hint_calc, loop_hint
         self.inline_plain, self.whole_hint, self.check_hand = inline_plain, whole_hint, check_hand
-        self.whole_plain, self.hand_off = whole_plain, hand_off
+        self.whole_plain, self.hand_off, self.question_value = whole_plain, hand_off, question_value
 
 
 # --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
@@ -314,6 +314,8 @@ class Rollout:
             found = inline_found(text[:text.rstrip().rfind('=')], whole=whole) if self.arm.inline_calc else None
             if found is not None:   # the value the model would have computed, computed: the reasoning goes on from it
                 expr, value = found
+                if whole:
+                    value = self.question_value(value)
                 self.whole_pending = False
                 # the whole value ends its line: left open, an integer drew `.000...` from the model until the guard stopped it (pc4-whole dm div_big 7815)
                 self.inject((f' {value}' if self.arm.inline_plain else f' {value} (exact)') + ('\n' if whole else ''), 'inline value')
@@ -435,9 +437,25 @@ class Rollout:
         if value is None:
             return
         self.whole_pending = False
-        self.inject(f'= {spelled(value)}\n', 'inline value')
-        self.events[-1].update(expr=expr[:200], value=spelled(value), whole=True)
-        self.give(spelled(value))
+        shown = self.question_value(spelled(value))
+        self.inject(f'= {shown}\n', 'inline value')
+        self.events[-1].update(expr=expr[:200], value=shown, whole=True)
+        self.give(shown)
+
+    def question_value(self, value):
+        """--question-value (MIP catch point 1): the whole value is the computation the question states, read by software
+        (tools.igc.question_read), when it states one and the model's copy of it gives another value. pc4/pc8 lost 4 DeepMind rows to a
+        copied sign or term; question_read gives gold on 160 of 160."""
+        if not self.arm.question_value or not self.row.get('question'):
+            return value
+        from tools.igc.mathexpr import evaluate
+        from tools.igc.question_read import read
+        got = read(self.row['question'])
+        if got is None or evaluate(value) == got[1]:
+            return value
+        self.events.append(dict(kind='question value', at=len(self.out), model_tokens=self.model_tokens(), copied=value,
+                                expr=got[0][:200], value=spelled(got[1])))
+        return spelled(got[1])
 
     def give(self, value):
         from tools.igc.mathexpr import evaluate
@@ -472,6 +490,26 @@ class Rollout:
             self.out.append(self.tok.convert_tokens_to_ids('<|im_end|>'))
             self.done('stop')
             return True
+        if self.phase == 'answer' and start >= floor:
+            # a rounded or endless decimal of a fraction software gave (pc8 4104: 1539439/2572, then `= 598.5377138413301`, boxed and
+            # scored wrong; 5081 ran an endless one to the guard): closed with software's exact value (developer, 2026-11-04)
+            near = _EXPANSION.search(line)
+            if not near and m:
+                near = m
+            if near:
+                try:
+                    got = Fraction((near.group(1) if near is m else near.group()).replace(',', ''))
+                except (ValueError, ZeroDivisionError):
+                    got = None
+                exact = next((v for v in self.given if v.denominator != 1 and got is not None and got != v
+                              and abs(got - v) <= abs(v) * Fraction(1, 1000)), None)
+                if exact is not None:
+                    del self.out[start:]
+                    self.inject(f'\\boxed{{{spelled(exact)}}}', 'hand-off close exact')
+                    self.events[-1].update(cut=line[:120])
+                    self.out.append(self.tok.convert_tokens_to_ids('<|im_end|>'))
+                    self.done('stop')
+                    return True
         expansion = _EXPANSION.search(line)
         if not hit and expansion:
             got = Fraction(expansion.group())
@@ -769,7 +807,7 @@ def run(args):
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint, args.inline_plain,
-              args.whole_hint, args.check_hand, args.whole_plain, args.hand_off)
+              args.whole_hint, args.check_hand, args.whole_plain, args.hand_off, args.question_value)
     if args.whole_hint and not args.inline_calc:
         raise SystemExit('--whole-hint asks for a value that only --inline-calc puts in')
     if args.greedy:   # drive() and arm.json read SAMPLING: temperature 0 is vLLM's greedy
@@ -946,6 +984,7 @@ def main(argv=None):
     r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")
     r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
     r.add_argument('--server', default='', help='a llama-server URL (127.0.0.1) to run on in place of vLLM: this PC, on Windows')
+    r.add_argument('--question-value', action='store_true', help='the whole value is the computation the question states, read by software')
     r.add_argument('--hand-off', action='store_true', help='a line that only restates a value software gave is cut, and the model is led to its answer')
     r.add_argument('--box', action='store_true', help="blocks run in the OS isolation box (AppContainer) on this PC: D1, the developer's call")
     r.add_argument('--no-think', action='store_true', help='enable_thinking=False: the reply is the answer, as Qwenputer measures arithmetic')

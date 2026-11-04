@@ -440,8 +440,26 @@ class WholeHint(unittest.TestCase):
         # pc4-whole dm div_big 2289: `= -37/18329827` then the model wrote `= -0.0000020186299999...` to the length cap
         r = self.whole_arm('-37/18329827')
         play(r, '333 / -164968443 =\n= -0.00000201862999999999999999999999999999999999\\boxed{-37/18329827}<|im_end|>', Kernel([]))
-        self.assertIn('= -37/18329827\n\n' + tir4b.HAND_OFF, r.text())
+        self.assertTrue(r.text().endswith('= -37/18329827\n\n\\boxed{-37/18329827}<|im_end|>'), r.text()[-80:])   # closed with the fraction
         self.assertNotIn('0.0000020186299999999', r.text())
+
+    def test_a_rounded_decimal_of_a_given_fraction_closes_with_the_fraction(self):
+        # pc8 4104: 1539439/2572 given, then `= 598.5377138413301`, boxed and scored wrong against the fraction (developer, 2026-11-04)
+        r = self.whole_arm('1539439/2572')
+        play(r, '-1539439 / -2572 =\n= 598.5377138413301\n\\boxed{598.5377138413301}<|im_end|>', Kernel([]))
+        self.assertTrue(r.text().endswith('\\boxed{1539439/2572}<|im_end|>'), r.text()[-80:])
+        self.assertNotIn('598.5377', r.text())
+        self.assertEqual([e['kind'] for e in r.events].count('hand-off close exact'), 1)
+
+    def test_the_question_s_own_computation_replaces_a_wrong_copy(self):
+        # pc8 5180: 'What is 3534538042068 less than 1.712?' copied as 3534538042068 - 1.712; the question reads 1.712 - 3534538042068
+        row = dict(id='a', suite='arith', answer='-3534538042066.288', question='What is 3534538042068 less than 1.712?')
+        r = tir4b.Rollout(row, 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True, whole_plain=True, hand_off=True,
+                          question_value=True), IDS, TOK, seed=1, thinking=False)
+        play(r, '3534538042068 - 1.712 =\\boxed{-3534538042066.288}<|im_end|>', Kernel([]))
+        self.assertIn('3534538042068 - 1.712 = -3534538042066.288\n', r.text())
+        ev = [e for e in r.events if e['kind'] == 'question value']
+        self.assertEqual(ev[0]['copied'], '3534538042066.288')
 
     def test_a_new_step_after_the_value_is_left_alone(self):
         r = self.whole_arm('95')
