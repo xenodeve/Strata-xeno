@@ -49,3 +49,20 @@ A point that acts on the model (injects, cuts or corrects) must also show that q
 - **Tests:**
   1. Teacher-forced, the model's probability of each injected value, and whether a low probability predicts a recheck or a loop afterwards.
   2. A/B on DeepMind: the current injection against an injection in the model's own tokens, which is the logit-override equivalent.
+
+## The goal restated (developer, 2026-11-04): software's result acts inside the generation itself
+
+"Not only the LLM calling software and reading the answer: the software's result should influence the LLM's generation mechanism directly."
+
+| level | what MIP does | changes what the model believes | every model |
+|---|---|---|---|
+| logits / sampler | force the value's tokens; suppress reflection words after a verified value | no | yes |
+| **residual stream** | at the position where the model writes a result, read the value it holds, and write software's value in its place, so the model writes the right value itself | **yes** | needs automatic calibration per model, like the probe |
+| KV cache | edit the keys and values at the number's positions | partly | calibration |
+
+**First experiment (4B, HF, offline): read and write a number in the residual stream.**
+1. **Read:** a linear map from the hidden state at `=` (layer L) to the value the model is about to write. How exact is it, at which layer?
+2. **Write:** add Δ = W(software's value) − W(the model's value) at that position. How often, out of how many should, does greedy decoding then write software's value by itself? Compare with no Δ.
+3. **Re-checking:** P('Wait' / 'check' ...) after the value, against forcing the tokens.
+
+The map is fitted from the model's own `a op b = c` runs, so it is calibrated per model automatically.
