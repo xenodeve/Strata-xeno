@@ -79,7 +79,7 @@ LOOP_HINT = 'I keep going around the same idea. Let me test it with python inste
 LOOP_HINTS = 3
 # The words the model should learn to write itself, as START's Hint-RFT keeps its hints in the text it trains on.
 TRAIN_KINDS = ('forced open', 'close after a fitting result', 'hint open', 'trust hint', 'loop hint')
-MASK_KINDS = ('output', 'inline value', 'tool response', 'hand check')   # what the kernel printed and the values software computed: read, never learned
+MASK_KINDS = ('output', 'inline value', 'logit value', 'tool response', 'hand check')   # what the kernel printed and the values software computed: read, never learned
 
 
 def output_block(body):
@@ -114,8 +114,9 @@ class Ids:
 class Arm:
     def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
                  hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False, whole_plain=False, hand_off=False, question_value=False,
-                 trust='cort'):
+                 trust='cort', logit_value=0.0):
         self.trust = trust   # the line after a hinted program that printed: 'cort' (the original), 'none', 'positive'
+        self.logit_value = logit_value   # --logit-value: the logit added to software's next value token while the model writes the value itself
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
         self.inline_calc, self.native_tool, self.hint_calc, self.loop_hint = inline_calc, native_tool, hint_calc, loop_hint
         self.inline_plain, self.whole_hint, self.check_hand = inline_plain, whole_hint, check_hand
@@ -241,6 +242,38 @@ class Rollout:
         self.checked = 0   # len(out) at the last loop check
         self.last_hint = -HINT_GAP   # self.thought at the last hint
         self.loop_hints = 0
+        self.plan = None     # --logit-value: the token ids of the value being written, one biased request each
+        self.plan_at, self.plan_own, self.plan_event, self.last_lp = 0, [], None, None
+
+    def bias(self):
+        """--logit-value: {token id: logit added} for the request now asked, or None. The model writes the value itself; only its prediction moves."""
+        return {self.plan[self.plan_at]: self.arm.logit_value} if self.plan is not None else None
+
+    def start_plan(self, expr, value):
+        self.plan = self.tok.encode(f' {value}', add_special_tokens=False)
+        self.plan_at, self.plan_own = 0, []
+        self.spans.append([len(self.out), len(self.out), 'logit value'])
+        self.plan_event = dict(kind='logit value', at=len(self.out), model_tokens=self.model_tokens(), expr=expr[:200], value=value,
+                               bias=self.arm.logit_value, tokens=len(self.plan))
+        self.events.append(self.plan_event)
+
+    def follow_plan(self, token):
+        """True when the model took the biased token (the value goes on), False when its own prediction won against the bias."""
+        want = self.plan[self.plan_at]
+        lp = self.last_lp.get(want) if self.last_lp else None
+        self.plan_own.append(None if lp is None else round(float(getattr(lp, 'logprob', lp)), 3))   # raw: the model's own log P of the wanted token, None past the top 20
+        if token == want:
+            self.plan_at += 1
+            self.spans[-1][1] = len(self.out)
+            if self.plan_at >= len(self.plan):
+                self.end_plan()
+            return True
+        self.end_plan()
+        return False
+
+    def end_plan(self):
+        self.plan_event.update(matched=self.plan_at, own_logprobs=self.plan_own, ok=self.plan_at >= len(self.plan))
+        self.plan = None
 
     def left(self):
         room = CONTEXT - len(self.prompt) - len(self.out) - 64
@@ -274,7 +307,9 @@ class Rollout:
             self.done('length')
             return None
         stops = set(self.ids.ends)
-        if self.arm.inline_calc and self.phase in ('think', 'answer') or self.arm.hint_calc and self.phase == 'think':
+        if self.plan is not None:
+            return 1, stops   # --logit-value: one token a request, so each carries its own bias
+        if (self.arm.inline_calc or self.arm.logit_value) and self.phase in ('think', 'answer') or self.arm.hint_calc and self.phase == 'think':
             stops |= self.ids.equals
         if self.arm.native_tool and self.phase in ('think', 'answer'):
             stops.add(self.ids.tool_close)
@@ -307,6 +342,10 @@ class Rollout:
         if self.phase != 'answer' and self.phase != 'block':
             self.thought += len(new)
         last = new[-1] if new else None
+        if self.plan is not None and new and self.follow_plan(last) and last not in self.ids.ends:
+            if self.left() <= 0:
+                self.done('length')
+            return False
         if self.arm.check_hand and self.phase in ('think', 'answer') and last in self.ids.lines:
             self.check_line()
         if self.whole_pending and self.arm.inline_calc and last in self.ids.lines:
@@ -315,11 +354,13 @@ class Rollout:
             return False
         if self.arm.hint_calc and last in self.ids.equals and self.phase == 'think' and self.hint_due():
             return False
-        if (self.arm.inline_calc or self.arm.hint_calc) and last in self.ids.equals and self.phase in ('think', 'answer'):
+        if (self.arm.inline_calc or self.arm.hint_calc or self.arm.logit_value) and last in self.ids.equals and self.phase in ('think', 'answer'):
             text = self.text()
             whole = self.whole_pending
-            found = inline_found(text[:text.rstrip().rfind('=')], whole=whole) if self.arm.inline_calc else None
-            if found is not None:   # the value the model would have computed, computed: the reasoning goes on from it
+            found = inline_found(text[:text.rstrip().rfind('=')], whole=whole) if self.arm.inline_calc or self.arm.logit_value else None
+            if found is not None and self.arm.logit_value and not self.arm.inline_calc:
+                self.start_plan(*found)   # the value is not put in: the model writes it, its prediction of each token raised
+            elif found is not None:   # the value the model would have computed, computed: the reasoning goes on from it
                 expr, value = found
                 if whole:
                     value = self.question_value(value)
@@ -701,8 +742,9 @@ def drive(llm, rollouts, kernel_factory, live_most=256, workers=32, on_round=Non
         if not q:
             return False
         most, stops = q
+        bias = r.bias()
         params = SamplingParams(**SAMPLING, max_tokens=most, stop_token_ids=sorted(stops), seed=(r.seed + len(r.out)) % 2**31,
-                                skip_special_tokens=False, detokenize=False)
+                                skip_special_tokens=False, detokenize=False, **(dict(logit_bias=bias, logprobs=20) if bias else {}))
         rid = str(next(serial))
         engine.add_request(rid, TokensPrompt(prompt_token_ids=r.prompt + r.out), params)
         flying[rid] = r
@@ -723,6 +765,8 @@ def drive(llm, rollouts, kernel_factory, live_most=256, workers=32, on_round=Non
                 new = list(c.token_ids)
                 if isinstance(c.stop_reason, int) and (not new or new[-1] != c.stop_reason):
                     new.append(c.stop_reason)
+                lp = getattr(c, 'logprobs', None)
+                r.last_lp = lp[0] if lp else None
                 if r.take(new):
                     running[pool.submit(r.run_pending, kernel_factory)] = r
                 else:
@@ -814,7 +858,9 @@ def run(args):
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint, args.inline_plain,
-              args.whole_hint, args.check_hand, args.whole_plain, args.hand_off, args.question_value, trust=args.trust_line)
+              args.whole_hint, args.check_hand, args.whole_plain, args.hand_off, args.question_value, trust=args.trust_line, logit_value=args.logit_value)
+    if args.logit_value and (args.inline_calc or args.server or args.whole_hint or args.hand_off):
+        raise SystemExit('--logit-value is the value arriving by the prediction: not with --inline-calc (the value as text), --whole-hint, --hand-off, or --server (vLLM only)')
     if args.whole_hint and not args.inline_calc:
         raise SystemExit('--whole-hint asks for a value that only --inline-calc puts in')
     if args.greedy:   # drive() and arm.json read SAMPLING: temperature 0 is vLLM's greedy
@@ -851,6 +897,8 @@ def run(args):
         from vllm import LLM
         kwargs = dict(model=args.model, dtype='bfloat16', max_model_len=CONTEXT, gpu_memory_utilization=args.memory, enable_prefix_caching=True,
                       language_model_only=True, seed=args.seed)
+        if args.logit_value:
+            kwargs['logprobs_mode'] = 'raw_logprobs'   # the model's own log P of the wanted token, read before the bias is added
         try:
             llm = LLM(**kwargs)
         except TypeError:   # a vLLM with no text-only switch loads the vision tower too, which costs memory and changes nothing here
@@ -991,6 +1039,8 @@ def main(argv=None):
     r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")
     r.add_argument('--trust-line', choices=('cort', 'none', 'positive'), default='cort',
                    help="the line after a hinted program that printed: CoRT's \"We don't need to doubt...\" (default, as before), none, or ATTC's positive sentence")
+    r.add_argument('--logit-value', type=float, default=0.0,
+                   help="MIP's logit override, soft: at an `=` the value is not put in; the model writes it, and the logit of software's next token is raised by this much (vLLM)")
     r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
     r.add_argument('--server', default='', help='a llama-server URL (127.0.0.1) to run on in place of vLLM: this PC, on Windows')
     r.add_argument('--question-value', action='store_true', help='the whole value is the computation the question states, read by software')

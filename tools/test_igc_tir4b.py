@@ -655,5 +655,75 @@ class Training(unittest.TestCase):
         self.assertNotIn('c', chosen)
 
 
+def play_biased(rollout, script, kernel, wins=True):
+    """The scripted model with a prediction layer: a request that carries a bias writes the biased token when `wins`, its own when not.
+    Either way the model's own token for that step is consumed from the script, as a replaced prediction would be."""
+    stream = TOK.encode(script)
+    asked = []
+    while True:
+        ask = rollout.request()
+        if not ask:
+            return asked
+        most, stops = ask
+        bias = rollout.bias()
+        own = stream.pop(0) if stream else SPECIAL['<|im_end|>']
+        if bias:
+            asked.append((most, dict(bias)))
+            new = [next(iter(bias)) if wins else own]
+        else:
+            new = [own]
+            while stream and len(new) < most and new[-1] not in stops:
+                new.append(stream.pop(0))
+        rollout.take(new)
+
+
+class LogitValue(unittest.TestCase):
+    """--logit-value (MIP's logit override, soft): the value is not put in as text; the model writes it, with software's token raised."""
+    def test_the_prediction_is_raised_and_the_model_writes_the_value(self):
+        r = rollout(logit_value=6.0)
+        asked = play_biased(r, 'so 6 \\times 7 = 41 and on</think>\n\n42<|im_end|>', Kernel([]))
+        self.assertIn('6 \\times 7 = 42 and on', r.text())
+        self.assertEqual([a[0] for a in asked], [1, 1, 1])   # ' 42' is three tokens, one request each
+        self.assertEqual([list(a[1].values()) for a in asked], [[6.0]] * 3)
+        self.assertEqual(kinds(r), ['logit value'])
+        e = r.events[0]
+        self.assertEqual((e['expr'], e['value'], e['tokens'], e['matched'], e['ok'], e['bias']), ('6 \\times 7', '42', 3, 3, True, 6.0))
+        span = [s for s in r.spans if s[2] == 'logit value'][0]
+        self.assertEqual(TOK.decode(r.out[span[0]:span[1]]), ' 42')
+
+    def test_when_the_model_wins_against_the_bias_its_token_stays(self):
+        r = rollout(logit_value=1.0)
+        play_biased(r, 'so 6 \\times 7 = 41 and on</think>\n\n42<|im_end|>', Kernel([]), wins=False)
+        self.assertIn('6 \\times 7 = 41 and on', r.text())
+        e = r.events[0]
+        self.assertEqual((e['matched'], e['tokens'], e['ok']), (2, 3, False))
+        span = [s for s in r.spans if s[2] == 'logit value'][0]
+        self.assertEqual(TOK.decode(r.out[span[0]:span[1]]), ' 4')   # only what the bias carried is marked, not the model's own token
+        self.assertIsNone(r.bias())
+
+    def test_a_sign_is_a_token_of_the_plan(self):
+        r = rollout(logit_value=6.0)
+        r.start_plan('3 - 21', '-18')
+        self.assertEqual(TOK.decode(r.plan), ' -18')
+        self.assertEqual(r.bias(), {r.plan[0]: 6.0})
+
+    def test_off_by_default_and_not_text(self):
+        r = rollout()
+        play_biased(r, 'so 6 \\times 7 = 41</think>\n\nx<|im_end|>', Kernel([]))
+        self.assertEqual(r.events, [])
+        self.assertIsNone(r.bias())
+        r = rollout(logit_value=6.0)
+        play_biased(r, 'so 6 \\times 7 = 41</think>\n\n42<|im_end|>', Kernel([]))
+        self.assertNotIn('inline value', kinds(r))
+
+    def test_the_wanted_token_own_log_probability_is_kept(self):
+        r = rollout(logit_value=6.0)
+        r.start_plan('3 - 21', '-18')
+        r.out += [r.plan[0]]
+        r.last_lp = {r.plan[0]: types.SimpleNamespace(logprob=-0.25)}
+        self.assertTrue(r.follow_plan(r.plan[0]))
+        self.assertEqual(r.plan_own, [-0.25])
+
+
 if __name__ == '__main__':
     unittest.main()
