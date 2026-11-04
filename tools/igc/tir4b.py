@@ -303,7 +303,8 @@ class Rollout:
             if found is not None:   # the value the model would have computed, computed: the reasoning goes on from it
                 expr, value = found
                 self.whole_pending = False
-                self.inject(f' {value}' if self.arm.inline_plain else f' {value} (exact)', 'inline value')
+                # the whole value ends its line: left open, an integer drew `.000...` from the model until the guard stopped it (pc4-whole dm div_big 7815)
+                self.inject((f' {value}' if self.arm.inline_plain else f' {value} (exact)') + ('\n' if whole else ''), 'inline value')
                 self.events[-1].update(expr=expr[:200], value=value, whole=whole)
             if self.left() <= 0:
                 self.done('length')
@@ -694,8 +695,12 @@ def run(args):
     from tools.igc.select_rows import right
     from transformers import AutoTokenizer, GenerationConfig
 
-    if (args.execute or args.native_tool or args.hint_calc or args.loop_hint) and not throwaway():
-        raise SystemExit('a block runs only on a throwaway VM')
+    kernel_factory = Kernel
+    if args.box:   # D1: approved by the developer on 2026-11-04 for the five-layer test on this PC; every block gets a new box
+        from serve.sandbox.isolation import Isolation, Policy
+        kernel_factory = lambda: Kernel(box=Isolation.start(Policy()))
+    elif (args.execute or args.native_tool or args.hint_calc or args.loop_hint) and not throwaway():
+        raise SystemExit('a block runs only on a throwaway VM, or in the isolation box (--box)')
     rows = [json.loads(l) for l in Path(args.rows).read_text(encoding='utf-8').splitlines() if l.strip()]
     rows = rows[args.offset:args.offset + args.limit] if args.limit else rows[args.offset:]
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -777,9 +782,9 @@ def run(args):
                                          headers={'Content-Type': 'application/json'})
             with urllib.request.urlopen(req, timeout=3600) as reply:
                 return json.loads(reply.read().decode('utf-8'))
-        drive_http(post, tok, ids, rollouts, Kernel, live_most=args.live, on_round=save)
+        drive_http(post, tok, ids, rollouts, kernel_factory, live_most=args.live, on_round=save)
     else:
-        drive(llm, rollouts, Kernel, live_most=args.live, on_round=save)
+        drive(llm, rollouts, kernel_factory, live_most=args.live, on_round=save)
     save(last=True)
     records = kept + [r.record(right) for r in rollouts]
     (out / 'report.json').write_text(json.dumps(dict(rows=len(rows), samples=args.samples, answers=len(records), right=sum(r['right'] for r in records),
@@ -878,6 +883,7 @@ def main(argv=None):
     r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")
     r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
     r.add_argument('--server', default='', help='a llama-server URL (127.0.0.1) to run on in place of vLLM: this PC, on Windows')
+    r.add_argument('--box', action='store_true', help="blocks run in the OS isolation box (AppContainer) on this PC: D1, the developer's call")
     r.add_argument('--no-think', action='store_true', help='enable_thinking=False: the reply is the answer, as Qwenputer measures arithmetic')
     r.add_argument('--greedy', action='store_true', help='temperature 0, for a protocol that publishes greedy numbers (Qwenputer)')
     r.add_argument('--system', default='', help='a system turn before the question (with --native-tool it follows the tool list)')

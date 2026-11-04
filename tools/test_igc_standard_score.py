@@ -45,6 +45,12 @@ class Math(unittest.TestCase):
         from tools.igc.standard_score import math_right
         self.assertTrue(math_right('</think>\n\nThe final answer is 12. I hope it is correct.', '12'))
 
+    def test_the_same_number_written_as_another_expression(self):
+        from tools.igc.standard_score import math_right
+        self.assertTrue(math_right('</think>\n\n\\boxed{26! 2^{25}}<|im_end|>', '2^{25}\\cdot26!'))   # r1-ctrl a6f7b142
+        self.assertFalse(math_right('</think>\n\n\\boxed{26! 2^{24}}<|im_end|>', '2^{25}\\cdot26!'))
+        self.assertFalse(math_right('</think>\n\n\\boxed{598.5377138413301}<|im_end|>', '1539439/2572'))   # a rounded quotient stays wrong
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -116,6 +116,11 @@ def math_right(text, gold):
     if got == want:
         return True
     a, b = math_value(got), math_value(want)   # the same number in another spelling: 5/2 and 2.5
+    if a is not None and a == b:
+        return True
+    # The same exact number written as an expression: `26! 2^{25}` for `2^{25}\cdot26!` (r1-ctrl a6f7b142) was scored wrong
+    from tools.igc.mathexpr import evaluate
+    a, b = evaluate(got), evaluate(want)
     return a is not None and a == b
 
 

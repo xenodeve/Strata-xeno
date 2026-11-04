@@ -545,8 +545,25 @@ def wrong_relations(line, moduli=()):
         if rough:
             base = (text, value)   # an approximate chain goes on from its last approximation: `\approx 6.89 - 4 = 2.89`
         if rest.strip(' $.,;:') and not _RELATION.match(rest.strip()):
-            base = None   # a new statement: `$x = 3$, $y = 5$` is two, not a chain
+            # a new statement: `$x = 3$, $y = 5$` is two, not a chain. Its own expression is checked: `12 * 13 = 156 and 7 * 8 = 54` left the
+            # second unread when the base was dropped (found by tools/igc/coverage.py's first test)
+            base, rough = _statement_start(line[:end]), False
     return wrong
+
+
+def _statement_start(text):
+    """The expression a new statement on a line checks, or None. Not one standing after a variable (`\\frac{8}{11} S \\frac{11}{18} = ...`
+    is a product with S, r1-ctrl 06c279c7), nor one in a line that works mod something (`5/4 \\equiv 5 \\cdot 4^{-1} = 20`, d6e306c4)."""
+    if re.search(r'\\equiv|≡', text):
+        return None
+    found = expression_before(text)
+    if found is None:
+        return None
+    before = text[:text.rstrip().rfind(found[0])].rstrip().rstrip('$').rstrip()
+    word = re.search(r'(\\?[A-Za-z]+)$', before)
+    if word and (len(word.group(1)) == 1 or word.group(1).startswith('\\')):
+        return None
+    return found
 
 
 def simple_quotient(expr):

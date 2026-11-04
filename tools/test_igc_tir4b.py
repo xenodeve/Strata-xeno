@@ -403,7 +403,7 @@ class WholeHint(unittest.TestCase):
         r = tir4b.Rollout(dict(id='a', suite='arith', answer='-111546396'), 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True),
                           IDS, TOK, seed=1, thinking=False)
         play(r, '$-2119381524 \\div 19 =$ so \\boxed{-111546396}<|im_end|>', Kernel([]))
-        self.assertTrue(r.text().startswith(tir4b.WHOLE_HINT + '$-2119381524 \\div 19 = -111546396$ so'))
+        self.assertTrue(r.text().startswith(tir4b.WHOLE_HINT + '$-2119381524 \\div 19 = -111546396\n$ so'))
         self.assertEqual([e['kind'] for e in r.events], ['whole hint', 'inline value'])
         self.assertTrue(r.events[1]['whole'])
         self.assertTrue(r.record(__import__('tools.igc.select_rows', fromlist=['right']).right)['right'])
@@ -413,7 +413,14 @@ class WholeHint(unittest.TestCase):
         r = tir4b.Rollout(dict(id='a', suite='arith', answer='319'), 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True,
                           whole_plain=True), IDS, TOK, seed=1, thinking=False)
         play(r, '(-1*-638*(-7)/(-7))/(((-62)/(-279))/(((-170)/3060)/(1/(-2)))) = so \\boxed{319}<|im_end|>', Kernel([]))
-        self.assertTrue(r.text().startswith(tir4b.WHOLE_HINT_PLAIN + '(-1*-638*(-7)/(-7))/(((-62)/(-279))/(((-170)/3060)/(1/(-2)))) = 319 so'))
+        self.assertTrue(r.text().startswith(tir4b.WHOLE_HINT_PLAIN + '(-1*-638*(-7)/(-7))/(((-62)/(-279))/(((-170)/3060)/(1/(-2)))) = 319\n so'))
+
+    def test_the_whole_value_ends_its_line(self):
+        # pc4-whole dm div_big 7815: `= 10097` left open, and the model wrote `.000...` after it until the guard stopped the answer
+        r = tir4b.Rollout(dict(id='a', suite='arith', answer='10097'), 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True,
+                          whole_plain=True), IDS, TOK, seed=1, thinking=False)
+        play(r, '793836237 / 78621 =\\boxed{10097}<|im_end|>', Kernel([]))
+        self.assertIn('793836237 / 78621 = 10097\n\\boxed{10097}', r.text())
 
     def test_a_whole_line_with_no_equals_gets_its_value(self):
         # pc-whole dm mul_div 3350: the model wrote the whole expression on its own line, with no `=`, then went on in pieces
@@ -426,7 +433,7 @@ class WholeHint(unittest.TestCase):
     def test_later_pieces_follow_the_usual_rules(self):
         r = tir4b.Rollout(ROW, 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True), IDS, TOK, seed=1, thinking=False)
         play(r, '$-6 \\div 4 =$ then 21 \\div 19 = x<|im_end|>', Kernel([]))
-        self.assertIn('$-6 \\div 4 = -1.5$', r.text())
+        self.assertIn('$-6 \\div 4 = -1.5\n$', r.text())
         self.assertIn('21 \\div 19 = x', r.text())   # after the whole value, an uneven piece is left alone again
 
 
