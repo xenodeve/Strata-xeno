@@ -12,7 +12,7 @@ Not here: MIP's inline arithmetic, which lives in the CUDA engine. Every text th
 tir4b.py run --model M --rows R.jsonl --out DIR [--force-after 512] [--execute] [--close-fit] [--loop-close] [--samples K] [--seed S] [--ids]
 tir4b.py math-train OUT.jsonl --n N [--levels 3,4,5] [--exclude ROWS.jsonl ...]     (on the VM: MATH train, never a test row)
 tir4b.py keep DIR [DIR ...] --out TRAIN.jsonl [--max-len 32768]                      (the trajectory each question trains on)"""
-import argparse, hashlib, json, random, re, sys, time
+import argparse, hashlib, json, os, random, re, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from pathlib import Path
@@ -866,6 +866,25 @@ def drive_http(post, tok, ids, rollouts, kernel_factory, live_most=16, on_round=
         list(pool.map(one, rollouts))
 
 
+def install_seal(llm, args):
+    """--seal: the SEAL vector (tools/igc/seal.py, built by probe/seal_vector.py) added at block --seal-layer to the state at every `\\n\\n` token the model reads or writes.
+    Returns the counter {'steered', 'calls'} of the hook, read at the end of the run: a run that steered 0 positions did not test SEAL."""
+    import numpy as np
+    import torch
+    from transformers import AutoConfig
+    from tools.igc import seal
+    z = np.load(args.seal)
+    key = f'L{args.seal_layer}'
+    if key not in z.files:
+        raise SystemExit(f'--seal-layer {args.seal_layer}: {args.seal} holds {[k for k in z.files if k.startswith("L")]}')
+    vector, delim = torch.tensor(z[key]), int(z['delim'])
+    n_layers = AutoConfig.from_pretrained(args.model).get_text_config().num_hidden_layers
+    results = llm.apply_model(lambda model: seal.install_steering(model, vector, args.seal_layer, args.seal_alpha, delim, n_layers))
+    count = results[0][1]
+    print(f'SEAL on: layer {args.seal_layer}, alpha {args.seal_alpha}, delimiter token {delim}, |S| {float(vector.norm()):.1f}', flush=True)
+    return count
+
+
 def run(args):
     import os
     os.environ.setdefault('STRATA_SANDBOX_THROWAWAY', '1')   # the kernel runs bare only on a VM that is thrown away (exec_bridge.throwaway)
@@ -923,18 +942,26 @@ def run(args):
     if not ids.same_lines:   # the stuck stop and the loop close both read them
         raise SystemExit(f'the line ends are {sorted(ids.lines)}, not the 198 and 271 the loop checks read')
     began = time.monotonic()
-    kwargs, llm, kv = dict(server=args.server), None, None
+    kwargs, llm, kv, seal_count = dict(server=args.server), None, None, None
+    if args.seal and args.server:
+        raise SystemExit('--seal steers the model inside vLLM: not with --server')
     if not args.server:
+        if args.seal:
+            os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'   # the engine in this process, so a hook installed here reaches the model
         from vllm import LLM
         kwargs = dict(model=args.model, dtype='bfloat16', max_model_len=CONTEXT, gpu_memory_utilization=args.memory, enable_prefix_caching=True,
                       language_model_only=True, seed=args.seed)
         if args.logit_value:
             kwargs['logprobs_mode'] = 'raw_logprobs'   # the model's own log P of the wanted token, read before the bias is added
+        if args.seal:
+            kwargs['enforce_eager'] = True   # no CUDA graph or compiled graph: a forward hook is part of every step
         try:
             llm = LLM(**kwargs)
         except TypeError:   # a vLLM with no text-only switch loads the vision tower too, which costs memory and changes nothing here
             kwargs.pop('language_model_only')
             llm = LLM(**kwargs)
+        if args.seal:
+            seal_count = install_seal(llm, args)
         # Live answers past what the KV cache holds are run in turns and lose their prefix cache: every chunk reads its whole context again.
         # It stalled three runs (an L4 at 164 and 16 live, an A100 at 32 live on half the memory), so the count follows the cache here.
         kv = kv_tokens(llm)
@@ -977,7 +1004,12 @@ def run(args):
     (out / 'report.json').write_text(json.dumps(dict(rows=len(rows), samples=args.samples, answers=len(records), right=sum(r['right'] for r in records),
                                                       tokens=sum(r['tokens'] for r in records), seconds=round(time.monotonic() - began, 1),
                                                       runs=sum(r['runs'] for r in records), runs_by_model=sum(r['runs_by_model'] for r in records),
-                                                      length=sum(r['finish'] == 'length' for r in records))), encoding='utf-8')
+                                                      length=sum(r['finish'] == 'length' for r in records),
+                                                      **(dict(seal_steered=seal_count['steered'], seal_calls=seal_count['calls']) if seal_count else {}))), encoding='utf-8')
+    if seal_count:
+        print(f'SEAL steered {seal_count["steered"]} positions in {seal_count["calls"]} forward passes', flush=True)
+        if not seal_count['steered']:
+            print('SEAL STEERED NOTHING: the hook did not see the ids; this run is a control, not a SEAL arm', flush=True)
     print('DONE', flush=True)
 
 
@@ -1072,6 +1104,9 @@ def main(argv=None):
                    help="the line after a hinted program that printed: CoRT's \"We don't need to doubt...\" (default, as before), none, or ATTC's positive sentence")
     r.add_argument('--logit-value', type=float, default=0.0,
                    help="MIP's logit override, soft: at an `=` the value is not put in; the model writes it, and the logit of software's next token is raised by this much (vLLM)")
+    r.add_argument('--seal', default='', help='SEAL steering vector (.npz from tools/igc/probe/seal_vector.py): added at every \\n\\n token, the reasoning is held to executing (arXiv 2504.07986)')
+    r.add_argument('--seal-layer', type=int, default=20, help='the block whose output is steered (1-based), a layer saved in the .npz')
+    r.add_argument('--seal-alpha', type=float, default=1.0, help='the strength: the stream gets alpha * S (the paper: 1.0)')
     r.add_argument('--suppress-recheck', type=int, default=0,
                    help="for this many steps after a value software gave (inline or logit), the logits of the re-check words (wait, hmm, verify, check, double, again...) are lowered by 30 (vLLM)")
     r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
