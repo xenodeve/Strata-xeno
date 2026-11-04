@@ -30,6 +30,10 @@ yet. They are certain, not guesses. MIP reads the whole window before it is sent
 its `=`, the state rolled back, and software's value put in. Neither the user nor the model ever sees the wrong value. It is a check
 point for layers 3-5. It does not see before the model writes, only before the text goes out. (Developer, 2026-11-04.)
 
+**Raw draft trend**: what the drafter proposes before the model verifies it, rejected proposals included. It is a guess, so it
+only warns: a run of digits or operators in the proposals says the model is close to computing, and MIP gets ready (parser, software)
+or counts it as evidence for layers 1-2. It never acts alone; the confirmed window or another layer decides. (Developer, 2026-11-04.)
+
 **Whole computation**: what a catch layer asks for once it sees a computation coming: the model writes the whole calculation as one
 expression (or one program, for a search over values) and software gives the value, before the model can cut it into small hand steps.
 Layers 1 and 2 ask for it; layer 3 computes it. (Developer, 2026-11-04.)
