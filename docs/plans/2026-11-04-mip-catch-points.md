@@ -66,3 +66,34 @@ A point that acts on the model (injects, cuts or corrects) must also show that q
 3. **Re-checking:** P('Wait' / 'check' ...) after the value, against forcing the tokens.
 
 The map is fitted from the model's own `a op b = c` runs, so it is calibrated per model automatically.
+
+## The plan as of 2026-11-04, afternoon (supersedes the order above where they differ)
+
+### A. Speed on the target, first (developer's decision)
+| step | state |
+|---|---|
+| Merge v0.1.45 | done on `xeno/merge-0145`; GPU gates not run because the D2x shards are missing |
+| Qwen3.6 NVFP4 on q36 | exists on `xeno/q36-nvfp4`; the NVIDIA GGUF loads after the `[2048,1]` shape fix; the logits gate against llama.cpp on this file is not run yet |
+| Speed gap measured | strata-q36 prompt is 3-6.5x slower and decode 2-2.6x slower than llama.cpp on both cards. Root cause: the 5060 Ti on PCIe 4.0 x4 (7.0 GB/s) carries every host expert of every prompt chunk, because q36 has no expert split; the 4070 does 20.8-25 GB/s |
+| Expert split ported to q36 | in progress (agent), `STRATA_Q36_PREFILL_SPLIT=1` opt-in |
+| 4070 window graph (#227) for decode | after the split |
+
+### B. MIP: software's result inside the generation (developer's restated goal)
+Results so far are from the 4B reference runner unless marked. None is on strata-xeno or Qwen3.6 yet.
+
+| # | mechanism | result | next |
+|---|---|---|---|
+| 1 | the question's own computation (`question_read`) | 160/160 offline; in pc9 it fired on 4 of 4 copy errors | on LiveBench: the share of questions with one stated computation |
+| 2 | hand-off rules | pc6 146, pc7 143 (reverted), pc8 151 (close with the restated value), **pc9 156/160** (+ close with software's fraction, + the question value), 0.05x base tokens | read 5409; move into the engine |
+| 5 | digit confidence | AUROC 0.90 outside one trace (24 wrong values) | on Qwen3.6, more traces |
+| 11 | text layers (inline / whole / check-hand) | whole 118→138 on DeepMind; check-hand 4/14 on reasoning | move into the engine |
+| — | **logit override** (force the value's tokens in the sampler) | design | engine step 4, with the confirmed window |
+| — | **reflection-word suppression after a verified value** (NoWait / CGRS style, only where software verified) | design | 4B llama-server `logit_bias`, on reasoning rows |
+| — | **residual-stream read/write of a number** (the model holds software's value itself) | running (`probe/num_rw.py`, 4B, 3-digit products) | if it reads and writes, port to Qwen3.6 in the engine as MIP's software-linked layer |
+| — | H-trust test 1 (does a low own-probability of a given value predict re-checking) | queued | |
+
+### C. Then
+1. LiveBench: greedy vs T 0.6 pilot, and the MIP-off baseline on Qwen3.6 + strata-xeno.
+2. MIP as one engine module for every model, connected to the q36 path (logit override, confirmed window, residual write).
+3. Catch points 1b/6-10/12 on Qwen3.6 (raw draft trend, router, probes, final check, attention).
+4. SWE-bench Pro or Live later.
