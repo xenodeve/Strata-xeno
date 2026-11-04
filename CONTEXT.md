@@ -20,6 +20,9 @@ A new model connects to it; it is not rewritten for each model. It must not lowe
 
 **Catch layer**: one of the five points where MIP can notice a computation, in the order they happen:
 1. *before writing*: the hidden state says the model is about to compute (a probe);
+1b. *draft lookahead*: the drafter (MTP, or any draft model) proposes the next tokens, and they are numbers, operators or a code
+   fence. It needs no calibration for each model, and it sees one or two tokens before layer 2. Measured beside 1 and 2 before it is
+   used (developer's question, 2026-11-04);
 2. *the expression begins*: the first operator of an expression;
 3. *the expression is complete*: `=`, a code fence, or a tool call;
 4. *after the answer*: the values written are checked;
