@@ -62,6 +62,12 @@ WHOLE_HINT_PLAIN = ('Let me write the whole calculation as one plain expression,
 # The model met 'Correction: X = V, not W.' by redoing the work by hand, and got it wrong again as often as not (dm-check: 116 of 160
 # against base's 121); the correction now says it was computed and is to be used, CoRT's answer to the same distrust.
 CORRECTION = 'Correction (computed exactly): {expr} = {right}, not {wrote}. Use {right} and go on.\n'
+# --hand-off: the model only restating a value software gave it (`= -18` on every line, or `= -0.0000020186299999...` for -37/18329827)
+# lost 28 of 160 DeepMind rows whose value was right in the text (pc4-whole). The restating line is cut and the model is led on to its
+# answer; software does not write the answer (developer, 2026-11-04: rules in MIP first).
+HAND_OFF = 'So the answer is '
+_RESTATE = re.compile(r'\s*=?\s*\$?\s*(-?\d[\d,]*(?:\.\d+)?(?:/\d+)?)\s*\$?\s*\.?\s*')
+_EXPANSION = re.compile(r'-?\d*\.\d{30,}')
 # --loop-hint: 14 of the control's 16 misses on the r1 rows were loops, 13 of them mid-work, several of them searches by hand. A loop in the
 # thinking is cut back to one round and a program opens to test the idea, LOOP_HINTS times; the next loop ends the answer as before.
 LOOP_HINT = 'I keep going around the same idea. Let me test it with python instead.\n```python\n'
@@ -102,11 +108,11 @@ class Ids:
 
 class Arm:
     def __init__(self, force_after=0, execute=False, close_fit=False, loop_close=False, close_repeat=0, inline_calc=False, native_tool=False,
-                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False, whole_plain=False):
+                 hint_calc=False, loop_hint=False, inline_plain=False, whole_hint=False, check_hand=False, whole_plain=False, hand_off=False):
         self.force_after, self.execute, self.close_fit, self.loop_close, self.close_repeat = force_after, execute, close_fit, loop_close, close_repeat
         self.inline_calc, self.native_tool, self.hint_calc, self.loop_hint = inline_calc, native_tool, hint_calc, loop_hint
         self.inline_plain, self.whole_hint, self.check_hand = inline_plain, whole_hint, check_hand
-        self.whole_plain = whole_plain
+        self.whole_plain, self.hand_off = whole_plain, hand_off
 
 
 # --inline-calc: MIP Native's inline value (include/strata/core/igc_inline.hpp parse_inline / after_value) for a model the engine cannot run yet.
@@ -213,6 +219,7 @@ class Rollout:
             self.phase = 'answer'
         self.whole_pending = False   # the next value is the whole step the --whole-hint asked for
         self.moduli = None   # --check-hand: the moduli the question and the answer so far name
+        self.given = []      # --hand-off: the whole values software put in (Fractions)
         if arm.whole_hint:
             self.inject(WHOLE_HINT_PLAIN if arm.whole_plain else WHOLE_HINT, 'whole hint')
             self.whole_pending = True
@@ -268,8 +275,11 @@ class Rollout:
             stops |= self.ids.lines   # every line is checked as it ends, so a correction follows the line it corrects
         if self.whole_pending:
             stops |= self.ids.lines   # the whole step may come as a line of its own, with no `=`
+        if self.arm.hand_off and self.given:
+            stops |= self.ids.lines   # each line after a given value is read for a restatement
         if self.phase == 'answer':
-            return min(left, CHUNK), stops
+            # a decimal expansion has no line end: after a given value, short requests so it is seen while it starts
+            return min(left, 48 if self.arm.hand_off and self.given else CHUNK), stops
         stops.add(self.ids.think_close)
         if self.phase == 'peek':
             return min(2, left), stops
@@ -294,6 +304,8 @@ class Rollout:
             self.check_line()
         if self.whole_pending and self.arm.inline_calc and last in self.ids.lines:
             self.whole_line()
+        if self.arm.hand_off and self.given and self.restated(last in self.ids.lines):
+            return False
         if self.arm.hint_calc and last in self.ids.equals and self.phase == 'think' and self.hint_due():
             return False
         if (self.arm.inline_calc or self.arm.hint_calc) and last in self.ids.equals and self.phase in ('think', 'answer'):
@@ -306,6 +318,8 @@ class Rollout:
                 # the whole value ends its line: left open, an integer drew `.000...` from the model until the guard stopped it (pc4-whole dm div_big 7815)
                 self.inject((f' {value}' if self.arm.inline_plain else f' {value} (exact)') + ('\n' if whole else ''), 'inline value')
                 self.events[-1].update(expr=expr[:200], value=value, whole=whole)
+                if whole:
+                    self.give(value)
             if self.left() <= 0:
                 self.done('length')
             elif len(self.out) - self.checked >= CHUNK:   # a request that ends at `=` skips the checks below: a loop of equations would run on
@@ -423,6 +437,45 @@ class Rollout:
         self.whole_pending = False
         self.inject(f'= {spelled(value)}\n', 'inline value')
         self.events[-1].update(expr=expr[:200], value=spelled(value), whole=True)
+        self.give(spelled(value))
+
+    def give(self, value):
+        from tools.igc.mathexpr import evaluate
+        v = evaluate(value)
+        if v is not None:
+            self.given.append(v)
+
+    def restated(self, line_ended):
+        """--hand-off: the line now being written only restates a value software gave (an ended line that is just that number, or a
+        decimal expansion of it 30 places long). It is cut, and HAND_OFF leads the model to its answer. True when it cut."""
+        from fractions import Fraction
+        floor = self.spans[-1][1] if self.spans else 0   # never take back what the runner put in
+        start = len(self.out)
+        while start > floor and (start == len(self.out) or self.out[start - 1] not in self.ids.lines):
+            start -= 1
+        if start <= floor and floor:
+            start = floor
+        line = self.tok.decode(self.out[start:]).rstrip('\n')
+        hit = False
+        m = _RESTATE.fullmatch(line) if line_ended else None
+        if m:
+            try:
+                got = Fraction(m.group(1).replace(',', ''))
+                hit = any(got == v for v in self.given)
+            except (ValueError, ZeroDivisionError):
+                hit = False
+        expansion = _EXPANSION.search(line)
+        if not hit and expansion:
+            got = Fraction(expansion.group())
+            # the model's own digits drift (pc4-whole 2289: -0.00000201862999... for -37/18329827 = -0.0000020185...): within 0.1 %
+            hit = any(abs(got - v) <= abs(v) * Fraction(1, 1000) for v in self.given)
+        if not hit or start < floor:
+            return False
+        del self.out[start:]
+        self.inject(HAND_OFF, 'hand-off')
+        self.events[-1].update(cut=line[:120])
+        self.given = []   # once: a second restatement is the model's own, the loop guard's
+        return True
 
     def check_line(self):
         """The line that just ended, every relation on it checked (tools.igc.mathexpr.wrong_relations), and a correction after it for each
@@ -708,7 +761,7 @@ def run(args):
     tok = AutoTokenizer.from_pretrained(args.model)
     ids = Ids(tok, eos_ids(args.model, tok, GenerationConfig))
     arm = Arm(args.force_after, args.execute, args.close_fit, args.loop_close, args.close_repeat, args.inline_calc, args.native_tool, args.hint_calc, args.loop_hint, args.inline_plain,
-              args.whole_hint, args.check_hand, args.whole_plain)
+              args.whole_hint, args.check_hand, args.whole_plain, args.hand_off)
     if args.whole_hint and not args.inline_calc:
         raise SystemExit('--whole-hint asks for a value that only --inline-calc puts in')
     if args.greedy:   # drive() and arm.json read SAMPLING: temperature 0 is vLLM's greedy
@@ -885,6 +938,7 @@ def main(argv=None):
     r.add_argument('--hint-calc', action='store_true', help="CoRT's hint where a tedious hand calculation begins, and its trust line after a run")
     r.add_argument('--loop-hint', action='store_true', help='a loop in the thinking is cut to one round and a program opens to test the idea')
     r.add_argument('--server', default='', help='a llama-server URL (127.0.0.1) to run on in place of vLLM: this PC, on Windows')
+    r.add_argument('--hand-off', action='store_true', help='a line that only restates a value software gave is cut, and the model is led to its answer')
     r.add_argument('--box', action='store_true', help="blocks run in the OS isolation box (AppContainer) on this PC: D1, the developer's call")
     r.add_argument('--no-think', action='store_true', help='enable_thinking=False: the reply is the answer, as Qwenputer measures arithmetic')
     r.add_argument('--greedy', action='store_true', help='temperature 0, for a protocol that publishes greedy numbers (Qwenputer)')

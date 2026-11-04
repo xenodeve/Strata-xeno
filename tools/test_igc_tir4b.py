@@ -422,6 +422,30 @@ class WholeHint(unittest.TestCase):
         play(r, '793836237 / 78621 =\\boxed{10097}<|im_end|>', Kernel([]))
         self.assertIn('793836237 / 78621 = 10097\n\\boxed{10097}', r.text())
 
+    def whole_arm(self, answer, **more):
+        return tir4b.Rollout(dict(id='a', suite='arith', answer=answer), 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True,
+                             whole_hint=True, whole_plain=True, hand_off=True, **more), IDS, TOK, seed=1, thinking=False)
+
+    def test_a_line_that_only_restates_the_value_is_cut(self):
+        # pc4-whole dm mul_div 1618: `= -18` written again on every line until the guard stopped the answer, never boxed
+        r = self.whole_arm('-18')
+        play(r, '(360/27)/4*(-5)/((-20)/4)*-1*3*(-12)/180*-27 =\n= -18\n\\boxed{-18}<|im_end|>', Kernel([]))
+        self.assertIn('= -18\n\n' + tir4b.HAND_OFF + '\\boxed{-18}', r.text())
+        self.assertNotIn('= -18\n= -18', r.text())
+        self.assertEqual([e['kind'] for e in r.events].count('hand-off'), 1)
+
+    def test_a_decimal_expansion_of_the_value_is_cut(self):
+        # pc4-whole dm div_big 2289: `= -37/18329827` then the model wrote `= -0.0000020186299999...` to the length cap
+        r = self.whole_arm('-37/18329827')
+        play(r, '333 / -164968443 =\n= -0.00000201862999999999999999999999999999999999\\boxed{-37/18329827}<|im_end|>', Kernel([]))
+        self.assertIn('= -37/18329827\n\n' + tir4b.HAND_OFF, r.text())
+        self.assertNotIn('0.0000020186299999999', r.text())
+
+    def test_a_new_step_after_the_value_is_left_alone(self):
+        r = self.whole_arm('95')
+        play(r, '190 / 2 =\nso the total is 95 apples\n\\boxed{95}<|im_end|>', Kernel([]))
+        self.assertNotIn(tir4b.HAND_OFF, r.text())
+
     def test_a_whole_line_with_no_equals_gets_its_value(self):
         # pc-whole dm mul_div 3350: the model wrote the whole expression on its own line, with no `=`, then went on in pieces
         r = tir4b.Rollout(dict(id='a', suite='arith', answer='228'), 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True, whole_hint=True,
