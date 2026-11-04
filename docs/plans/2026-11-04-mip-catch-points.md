@@ -38,3 +38,14 @@ A point that acts on the model (injects, cuts or corrects) must also show that q
 - Speed (first, decided): strata-q36 on the NVIDIA NVFP4 GGUF needed a loader fix (`[2048, 1]` shared-expert gate, `family_layout.hpp`). Next: baseline against llama.cpp on both cards in one session, then nsys on the 2K prompt.
 - Point 1 offline, on stored DeepMind rows.
 - Point 5 offline, once the GPU has a free slot.
+
+## Hypothesis H-trust (developer, 2026-11-04): open, to be tested
+
+> A model re-checks a value software gave it, again and again until the context is full, because the value arrives in a form the model can tell is not its own. A logit override, where the model writes the right value itself, should reduce that more than injected text does.
+
+- **For it:** the developer has seen the behaviour many times, across many models. In this session it showed up three times: dm-check redid the work by hand after a Correction line, pc4-whole looped on `= -18`, and pc4-whole expanded a fraction into an endless decimal.
+- **Against it, or at least to be explained:** the sign case. The model's own `= -18` line was kept, and P('-') was still only 0.014-0.225 (`probe/sign_drop.py`). That looks like belief, not form.
+- **What could make an injection detectable:** a note or correction text the model never writes, and a tokenization that differs from the model's own. Token for token, identical text cannot be told apart.
+- **Tests:**
+  1. Teacher-forced, the model's probability of each injected value, and whether a low probability predicts a recheck or a loop afterwards.
+  2. A/B on DeepMind: the current injection against an injection in the model's own tokens, which is the logit-override equivalent.
