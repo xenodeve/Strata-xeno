@@ -703,6 +703,17 @@ if sys.platform == "win32":
                 pass
             _k32.CloseHandle(handle)
 
+        def poll(self) -> Optional[int]:
+            """None while the program runs, else its exit code. Without it a kernel the box's clock had ended looked alive,
+            and the next block met a closed pipe: every second block of an answer failed in 0.0 s (pc5-full, 2026-11-04)."""
+            if self._process is None:
+                return _KILLED_EXIT_CODE
+            if _k32.WaitForSingleObject(self._process.hProcess, 0) != 0:   # WAIT_OBJECT_0: it has ended
+                return None
+            code = w.DWORD()
+            _k32.GetExitCodeProcess(self._process.hProcess, byref(code))
+            return code.value
+
         def kill(self) -> None:
             if self._process is not None:
                 _k32.TerminateProcess(self._process.hProcess, _KILLED_EXIT_CODE)

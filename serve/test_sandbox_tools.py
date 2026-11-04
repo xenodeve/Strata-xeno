@@ -1549,5 +1549,26 @@ class ThroughTheServer(unittest.TestCase):
         self.assertEqual(len(self.sandbox._sessions), 0)
 
 
+@unittest.skipUnless(box_ready(), "no isolation backend on this machine")
+class KernelInABox(unittest.TestCase):
+    """A kernel whose box has ended is seen as ended, so the next block starts another instead of meeting a closed pipe
+    (pc5-full, 2026-11-04: the box's clock ended the kernel between two blocks and every second block failed in 0.0 s)."""
+
+    def test_a_kernel_the_box_clock_ended_is_not_alive(self):
+        from serve.sandbox.exec_bridge import Kernel
+        from serve.sandbox.isolation import Policy
+        kernel = Kernel(box=Isolation.start(Policy(seconds=3.0)))
+        self.addCleanup(kernel.close)
+        self.assertEqual(kernel.run("print(6 * 7)"), (True, "42\n"))
+        self.assertTrue(kernel.alive())
+        deadline = time.monotonic() + 15
+        while kernel.alive() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertFalse(kernel.alive())
+        ok, shown = kernel.run("print(1)")
+        self.assertFalse(ok)
+        self.assertIn("this kernel has ended", shown)
+
+
 if __name__ == "__main__":
     unittest.main()

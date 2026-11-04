@@ -696,9 +696,11 @@ def run(args):
     from transformers import AutoTokenizer, GenerationConfig
 
     kernel_factory = Kernel
-    if args.box:   # D1: approved by the developer on 2026-11-04 for the five-layer test on this PC; every block gets a new box
-        from serve.sandbox.isolation import Isolation, Policy
-        kernel_factory = lambda: Kernel(box=Isolation.start(Policy()))
+    if args.box:   # D1: approved by the developer on 2026-11-04 for the five-layer test on this PC; a box per answer's kernel
+        # the server's own box (2 GB, 3600 s): Policy()'s 60 s clock ended each kernel between two blocks of an answer (pc5-full)
+        from serve.reasoning_tool import box_factory
+        start = box_factory()
+        kernel_factory = lambda: Kernel(box=start())
     elif (args.execute or args.native_tool or args.hint_calc or args.loop_hint) and not throwaway():
         raise SystemExit('a block runs only on a throwaway VM, or in the isolation box (--box)')
     rows = [json.loads(l) for l in Path(args.rows).read_text(encoding='utf-8').splitlines() if l.strip()]
