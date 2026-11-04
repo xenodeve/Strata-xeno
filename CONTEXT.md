@@ -20,13 +20,15 @@ A new model connects to it; it is not rewritten for each model. It must not lowe
 
 **Catch layer**: one of the five points where MIP can notice a computation, in the order they happen:
 1. *before writing*: the hidden state says the model is about to compute (a probe);
-1b. *draft lookahead*: the drafter (MTP, or any draft model) proposes the next tokens, and they are numbers, operators or a code
-   fence. It needs no calibration for each model, and it sees one or two tokens before layer 2. Measured beside 1 and 2 before it is
-   used (developer's question, 2026-11-04);
 2. *the expression begins*: the first operator of an expression;
 3. *the expression is complete*: `=`, a code fence, or a tool call;
 4. *after the answer*: the values written are checked;
 5. *hand values*: a value the model computed itself is checked, and a wrong one is answered with the right one.
+
+**Confirmed window**: the drafted tokens the model has verified (accepted) in a verify window but that have not been sent out
+yet. They are certain, not guesses. MIP reads the whole window before it is sent, so a wrong hand value (`7 × 8 = 54`) can be cut at
+its `=`, the state rolled back, and software's value put in. Neither the user nor the model ever sees the wrong value. It is a check
+point for layers 3-5. It does not see before the model writes, only before the text goes out. (Developer, 2026-11-04.)
 
 **Whole computation**: what a catch layer asks for once it sees a computation coming: the model writes the whole calculation as one
 expression (or one program, for a search over values) and software gives the value, before the model can cut it into small hand steps.
