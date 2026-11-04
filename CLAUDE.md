@@ -6,7 +6,7 @@ The rules for every coding agent on this repository live in `AGENTS.md`, so Clau
 real Claude Code turn on the served D2x profile, fix root causes rather than work around them, and name the issue that removes any
 latency a change adds. In full: `AGENTS.md` → "The goal".
 
-The nine rules agents miss most, all in full in `AGENTS.md`:
+The ten rules agents miss most, all in full in `AGENTS.md`:
 
 1. **Run everything in the background,** with no window on the developer's display.
 2. **Update the issue as soon as a piece of work is done,** and open a new issue the moment a problem (perf, bug,
@@ -34,6 +34,8 @@ The nine rules agents miss most, all in full in `AGENTS.md`:
    replies, a run stops the moment its question has an answer, and what repeats is scripted.
 9. **Idle means scrutinize the tests and the mechanism.** When both tracks wait on a run, run `/scrutinize` on the test procedure and the
    mechanism under work. Most results of 2026-11-02 came from bugs in the system, so a number is not evidence until its code has been read.
+10. **Report a mechanism as caught / should have caught,** with the denominator, never as a count of times it fired. A small denominator is not a weak
+   mechanism: say how many cases there were to catch, and let the reader judge.
 
 ## CLAUDE.md and AGENTS.md mirror each other (developer, 2026-11-02)
 
@@ -96,5 +98,20 @@ Each of these looked like a result on 2026-11-02: a reply cap turned 93.3 % into
 reported 45 %; a bench check stopped at 512 tokens, missed a longer cycle and ran 31 minutes to the end of the context; MIP in slots was reported done while a
 boot refusal kept it from running, and then the bench did not read the slots' lines; the sandbox refused every `class Solution`; the close
 came in the same delivery as the output, so the model never read it.
+
+## Report what a mechanism caught out of what it should have caught (developer, 2026-11-04 and 2026-11-05)
+
+"A mechanism is judged by how many of the cases it should have caught it did catch." The denominator is always given.
+
+- **Write caught / should have caught,** for example "checked 8/10", never "it fired 8 times". "Fired once" sounded like a result when it was not:
+  pc4-full's check-hand fired once, and nobody knew how many errors it should have caught.
+- **Say where the denominator comes from** (the `=` the extractor reads, the onsets in the control traces, the points where the model wrote another
+  value) and name the cases nothing can count, such as arithmetic in the head with no expression written. `tools/igc/coverage.py` counts it from a
+  run's `ids.jsonl` (pass `--ids` to the run); the engine's MIP lines need the same denominators.
+- **A small denominator is not a weak mechanism.** There may be little to catch. Never write "it did little" or "there was little to correct" in
+  place of the fraction: write "4-7 of 9 fix points" and let the reader judge. A limit means what could not be tested, not that the mechanism was weak.
+- **A mechanism that can do its job is kept; how much it changes is a separate number.** Judge it first by whether it does what it is for (writes
+  software's value, takes the extra re-checks away, closes a loop), and give its effect on the answers beside it. Reconsider it only when it cannot do
+  what it is for. The kind of question decides what it can reach, so report by kind of question too.
 
 @AGENTS.md

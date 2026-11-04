@@ -211,6 +211,21 @@ reported 45 %; a bench check stopped at 512 tokens, missed a longer cycle and ra
 boot refusal kept it from running, and then the bench did not read the slots' lines; the sandbox refused every `class Solution`; the close
 came in the same delivery as the output, so the model never read it.
 
+## Report what a mechanism caught out of what it should have caught (developer, 2026-11-04 and 2026-11-05)
+
+"A mechanism is judged by how many of the cases it should have caught it did catch." The denominator is always given.
+
+- **Write caught / should have caught,** for example "checked 8/10", never "it fired 8 times". "Fired once" sounded like a result when it was not:
+  pc4-full's check-hand fired once, and nobody knew how many errors it should have caught.
+- **Say where the denominator comes from** (the `=` the extractor reads, the onsets in the control traces, the points where the model wrote another
+  value) and name the cases nothing can count, such as arithmetic in the head with no expression written. `tools/igc/coverage.py` counts it from a
+  run's `ids.jsonl` (pass `--ids` to the run); the engine's MIP lines need the same denominators.
+- **A small denominator is not a weak mechanism.** There may be little to catch. Never write "it did little" or "there was little to correct" in
+  place of the fraction: write "4-7 of 9 fix points" and let the reader judge. A limit means what could not be tested, not that the mechanism was weak.
+- **A mechanism that can do its job is kept; how much it changes is a separate number.** Judge it first by whether it does what it is for (writes
+  software's value, takes the extra re-checks away, closes a loop), and give its effect on the answers beside it. Reconsider it only when it cannot do
+  what it is for. The kind of question decides what it can reach, so report by kind of question too.
+
 ## Run every speed measurement at high CPU priority
 
 Other programs on this machine (browser, Discord, Wallpaper Engine, Defender scans) take CPU time from the pool's
