@@ -97,3 +97,19 @@ Results so far are from the 4B reference runner unless marked. None is on strata
 2. MIP as one engine module for every model, connected to the q36 path (logit override, confirmed window, residual write).
 3. Catch points 1b/6-10/12 on Qwen3.6 (raw draft trend, router, probes, final check, attention).
 4. SWE-bench Pro or Live later.
+
+## Detection coverage study (developer, 2026-11-04 evening): the guideline needs detection first
+
+The developer's sharpest statement of the goal: software's results should not only change the output, they should shape the model's behaviour afterwards, like a guideline present all the time, so the model does not walk in the dark. How far it gets then depends on how smart the model is at finding the way with the guideline in hand. That needs detection that covers as much as possible, so detection is measured first, every signal on the same traces and the same set of computations (`scratchpad/probe/detect_cov.py`, run on the A100 on the stored control traces `pc5-ctrl`: 10 rows, up to 30,000 tokens each, no MIP in them).
+
+**Ground truth (text only).** A computation is a `=` whose left side ends in an arithmetic expression `mathexpr.expression_before` reads and that has an operator. Its onset is the first token of that expression. Right or wrong: the value written after the `=` against the exact value (a rounded value is right). On the 10 rows: 579 computations, 19 wrong (the first reader called 132 wrong: fractions read as their numerator, rounded values, chained equalities; read before use).
+
+**What is measured, per signal and per window k (2, 8, 32 tokens before the onset).**
+- AUROC for "an onset is within the next k tokens";
+- coverage = onsets with an alarm in the k tokens before them, out of all onsets, with the threshold set so that 1 % of all positions alarm; `random` is 1 - 0.99^k;
+- the median lead in tokens and the precision of the alarms;
+- separately, for a wrong value: AUROC of the digit's confidence and of a probe at the position before its first digit, with the counts.
+
+**Signals.** `next` (mass of digit and operator tokens in the next-token distribution: the stand-in for the MTP draft proposals; the real MTP head is read in the engine), `probe_L` (a linear probe on the residual stream after layer L, fitted on the first rows and tested on the last), `router` (which experts were picked, Qwen3.6 only). Hidden state at the end of the prompt (point 9), the final-answer substitution (point 10), the shape of the thinking (point 4) and attention (point 12) are next. Text layers 2-5 are the baseline: they see a computation when it is written (lead 0).
+
+**Reading the table.** A signal is useful for the guideline if it covers many onsets above `random` at a low alarm rate with a lead of at least a few tokens. Covering few onsets with a long lead is a different tool from covering most with lead 0. Held-out rows are 3 of 10: the numbers are a first read, not a verdict; the models are the 4B and Qwen3.6-35B-A3B bf16 reading the same stored tokens (the traces were written by the 4B).
