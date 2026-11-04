@@ -39,10 +39,11 @@ ap.add_argument('--router', action='store_true')
 ap.add_argument('--dry', action='store_true')
 ap.add_argument('--maxtok', type=int, default=30000)
 ap.add_argument('--limit', type=int, default=0)
+ap.add_argument('--loop-run', type=int, default=10, help='how many lines in a row that already appeared make a loop')
 args = ap.parse_args()
 LAYERS = [int(x) for x in args.layers.split(',')]
 KS, FA, FOLDS = (2, 8, 32), 0.01, 3
-LOOP_RUN = 10   # lines in a row that already appeared: on the 36 control rows 10 flags 11 rows, 10 of the 14 the runner called stuck, 1 right one
+LOOP_RUN = args.loop_run   # lines in a row that already appeared. On the 36 control rows: 10 flags 11 rows (10 of the 14 the runner called stuck, 1 right one), 6 flags 17 (12 stuck, 5 right)
 DEV = 'cpu' if args.dry else 'cuda:0'
 rng = np.random.default_rng(0)
 torch.manual_seed(0)
@@ -229,6 +230,12 @@ for r in rows:
     print(r['id'], r['src'], 'tokens', r['n'], {k: len(v) for k, v in r['events'].items()}, f'{time.time() - t0:.0f}s', flush=True)
     r['ids_np'] = np.array(r['out_ids'])
 
+if not args.dry:   # the features are in memory: the weights are not needed for the learning (a 35B model left no room for it)
+    del model, lm, blocks
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
 # ------------------------------------------------------------------------------------------------ learning on the GPU
 def labels(r, kind, k):
     y = np.zeros(r['n'], dtype=bool)
@@ -304,9 +311,11 @@ def make_scorers(kind, k, train_rows):
     sc = {}
     if kind in start_mask or args.dry:
         sc['next'] = lambda r: torch.tensor(r['nxt'][kind] if kind in r['nxt'] else r['nxt']['comp'])
-    X = {L: torch.cat([r['caps'][L][idx].float() for r, idx, _ in sm]).to(DEV) for L in LAYERS}
     for L in LAYERS:
-        f = fit_dense(X[L], ytr)
+        XL = torch.cat([r['caps'][L][idx].float() for r, idx, _ in sm]).to(DEV)   # one layer at a time: all of them together did not fit beside the model
+        f = fit_dense(XL, ytr)
+        del XL
+        torch.cuda.empty_cache() if not args.dry else None
         sc[f'probe_L{L}'] = (lambda r, f=f, L=L: torch.cat([f(r['caps'][L][i:i + 8192].float().to(DEV)).cpu() for i in range(0, r['n'], 8192)]))
     TX = torch.cat([text_idx(r)[torch.tensor(idx, device=DEV)] for r, idx, _ in sm])
     ft = fit_bag(TX, ytr, DT)

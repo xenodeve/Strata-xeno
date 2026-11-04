@@ -9,6 +9,7 @@ tracker comment quotes. Inputs are stored traces (tir4b `--ids` files, or a reco
 | `h_trust.py` | does the model re-check a value software gave it more than one it wrote? | re-check rate by who wrote it and by the model's own probability of the value |
 | `htab.py` | the same, as an intervention at one point: software's value inserted against the model writing its own; also forcing the tokens through a logits processor against inserting them | re-check and recompute rates per arm; greedy agreement of the two ways to force |
 | `htab2.py` | two guideline arms at those points: the re-check starters taken out for 60 steps; a short guideline sentence after the value | the same table, with A and B read back |
+| `htab3.py` | the controls for `htab2.py`: the value then only a newline (N), and the value then ` (exact)` and a newline (G) | the same table, with A, B and E read back |
 | `numnoise.py` | control for `htab.py` part 1: the same insertion at two batch sizes | how often bf16 noise alone parts the greedy text |
 
 `detect_cov2.py --dry` runs the whole pipeline on random features on a CPU (no model), to test the code.
