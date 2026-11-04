@@ -426,13 +426,15 @@ class WholeHint(unittest.TestCase):
         return tir4b.Rollout(dict(id='a', suite='arith', answer=answer), 0, [1], tir4b.Arm(inline_calc=True, inline_plain=True,
                              whole_hint=True, whole_plain=True, hand_off=True, **more), IDS, TOK, seed=1, thinking=False)
 
-    def test_a_line_that_only_restates_the_value_is_cut(self):
-        # pc4-whole dm mul_div 1618: `= -18` written again on every line until the guard stopped the answer, never boxed
+    def test_a_line_that_only_restates_the_value_closes_the_answer_with_it(self):
+        # pc4-whole dm mul_div 1618: `= -18` written again on every line, never boxed; pc6 led it on and it answered 18 (P('-') 0.07).
+        # The model's own restated value closes the answer, as it wrote it (developer, 2026-11-04)
         r = self.whole_arm('-18')
-        play(r, '(360/27)/4*(-5)/((-20)/4)*-1*3*(-12)/180*-27 =\n= -18\n\\boxed{-18}<|im_end|>', Kernel([]))
-        self.assertIn('= -18\n\n' + tir4b.HAND_OFF + '\\boxed{-18}', r.text())
-        self.assertNotIn('= -18\n= -18', r.text())
-        self.assertEqual([e['kind'] for e in r.events].count('hand-off'), 1)
+        play(r, '(360/27)/4*(-5)/((-20)/4)*-1*3*(-12)/180*-27 =\n= -18\nSo the answer is 18. \\boxed{18}<|im_end|>', Kernel([]))
+        self.assertTrue(r.text().endswith('= -18\n\\boxed{-18}<|im_end|>'), r.text()[-60:])
+        self.assertEqual(r.finish, 'stop')
+        self.assertEqual([e['kind'] for e in r.events].count('hand-off close'), 1)
+        self.assertTrue(r.record(__import__('tools.igc.select_rows', fromlist=['right']).right)['right'])
 
     def test_a_decimal_expansion_of_the_value_is_cut(self):
         # pc4-whole dm div_big 2289: `= -37/18329827` then the model wrote `= -0.0000020186299999...` to the length cap

@@ -464,6 +464,14 @@ class Rollout:
                 hit = any(got == v for v in self.given)
             except (ValueError, ZeroDivisionError):
                 hit = False
+        if hit and self.phase == 'answer' and start >= floor:
+            # the model wrote the value itself: its answer is closed with that value as it wrote it. A lead let the model answer from its
+            # own belief instead: pc6/pc7 `= -18`, then 18 (P('-') 0.02-0.22 after the lead, HF 4B, probe/sign_drop.py). Developer, 2026-11-04
+            self.inject(f'\\boxed{{{m.group(1)}}}', 'hand-off close')
+            self.events[-1].update(cut=line[:120])
+            self.out.append(self.tok.convert_tokens_to_ids('<|im_end|>'))
+            self.done('stop')
+            return True
         expansion = _EXPANSION.search(line)
         if not hit and expansion:
             got = Fraction(expansion.group())
