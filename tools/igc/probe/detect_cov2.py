@@ -20,6 +20,7 @@ Also: wrong values (digit confidence, probe before the first digit); the end of 
 trace's answer was right, leave-one-out) when the traces carry `right`.
 --dry: random features, CPU, no model: only to run the code."""
 import argparse, bisect, json, re, sys, time
+from pathlib import Path
 from fractions import Fraction
 import numpy as np
 import torch
@@ -33,10 +34,12 @@ except ImportError:   # on a VM the file sits next to the script
 ap = argparse.ArgumentParser()
 ap.add_argument('--model', required=True)
 ap.add_argument('--traces', required=True)
+ap.add_argument('--train-traces', default='', help='fit every detector on these (the control arm), then read --traces arm by arm; without it the traces are cross-validated by trace')
 ap.add_argument('--out', required=True)
 ap.add_argument('--layers', default='8,16,24,31')
 ap.add_argument('--router', action='store_true')
 ap.add_argument('--dry', action='store_true')
+ap.add_argument('--check', action='store_true', help='test every detector against the real decode (alignment, extractors, shifted labels) and stop')
 ap.add_argument('--maxtok', type=int, default=30000)
 ap.add_argument('--limit', type=int, default=0)
 ap.add_argument('--loop-run', type=int, default=10, help='how many lines in a row that already appeared make a loop')
@@ -145,9 +148,9 @@ if not args.dry:
         print('start tokens', kind, int(mk.sum()), flush=True)
 
 
-def load_traces():
+def load_traces(paths, role):
     rows = []
-    for path in args.traces.split(','):
+    for path in paths.split(','):
         for line in open(path, encoding='utf-8'):
             r = json.loads(line)
             if 'out_ids' in r:
@@ -157,7 +160,8 @@ def load_traces():
                 p_ids = tok.encode(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True),
                                    add_special_tokens=False)
                 o_ids = tok.encode(r['text'], add_special_tokens=False)[:args.maxtok]
-            rows.append(dict(id=r['id'], prompt_ids=p_ids, out_ids=o_ids, right=r.get('right'), src=path.split('/')[-1]))
+            rows.append(dict(id=r['id'], prompt_ids=p_ids, out_ids=o_ids, right=r.get('right'), src=path.split('/')[-1], role=role, spans=r.get('spans', []),
+                             arm=Path(path).parent.name or Path(path).stem))
             if args.limit and len(rows) >= args.limit:
                 return rows
     return rows
@@ -170,7 +174,7 @@ def features(r):
         d = 32
         return dict(caps={L: torch.randn(n, d).half() for L in LAYERS}, hp={L: torch.randn(d) for L in LAYERS},
                     router=(torch.randint(0, 256, (n, 6, 8)).to(torch.uint8) if args.router else None),
-                    top1=np.random.rand(n), ent=np.random.rand(n), nxt={k: np.random.rand(n) for k in ('comp', 'reflect')})
+                    top1=np.random.rand(n), ent=np.random.rand(n), am=np.random.randint(0, 1000, n), nxt={k: np.random.rand(n) for k in ('comp', 'reflect')})
     x = torch.tensor([r['prompt_ids'] + out], device=DEV)
     caps, hp, hooks = {}, {}, []
     for L in LAYERS:
@@ -192,7 +196,7 @@ def features(r):
                 rt = torch.stack([q[base:].topk(8, -1).indices.to(torch.uint8) for q in o.router_logits], 1).cpu()
             h = o.last_hidden_state[0, base:]
             nxt = {k: [] for k in start_mask}
-            ent, top1 = [], []
+            ent, top1, am = [], [], []
             for k in range(0, h.shape[0], 1024):
                 lp = torch.log_softmax(model.lm_head(h[k:k + 1024]).float(), -1)
                 p = lp.exp()
@@ -200,14 +204,16 @@ def features(r):
                     nxt[kind].append((p * mk).sum(-1).cpu())
                 ent.append(-(p * lp).sum(-1).cpu())
                 top1.append(p.max(-1).values.cpu())
+                am.append(lp.argmax(-1).cpu())
     finally:
         for hk in hooks:
             hk.remove()
-    return dict(caps=caps, hp=hp, router=rt, top1=torch.cat(top1).numpy(), ent=torch.cat(ent).numpy(),
+    return dict(caps=caps, hp=hp, router=rt, top1=torch.cat(top1).numpy(), ent=torch.cat(ent).numpy(), am=torch.cat(am).numpy(),
                 nxt={k: torch.cat(v).numpy() for k, v in nxt.items()})
 
 
-rows = load_traces()
+APPLY = bool(args.train_traces)
+rows = (load_traces(args.train_traces, 'train') if APPLY else []) + load_traces(args.traces, 'test')
 print('traces', len(rows), 'tokens', sum(len(r['out_ids']) for r in rows), flush=True)
 for r in rows:
     ps = [tok.decode([t]) for t in r['out_ids']]
@@ -216,6 +222,7 @@ for r in rows:
         offs.append(n)
         n += len(p)
     text = ''.join(ps)
+    r['text'], r['offs'], r['pieces'] = text, offs, ps
     r['n'] = len(r['out_ids'])
     r['events'] = {}
     for kind, fn in EXTRACT.items():
@@ -224,7 +231,10 @@ for r in rows:
             e['tok'] = bisect.bisect_right(offs, e['onset']) - 1
             if e.get('vstart') is not None:
                 e['vtok'] = bisect.bisect_right(offs, e['vstart']) - 1
-        r['events'][kind] = evs
+        own = np.zeros(r['n'] + 1, dtype=bool)
+        for s_, e_, _ in r['spans']:
+            own[s_:e_] = True
+        r['events'][kind] = [e for e in evs if not own[min(e['tok'], r['n'])]]
     t0 = time.time()
     r.update(features(r))
     print(r['id'], r['src'], 'tokens', r['n'], {k: len(v) for k, v in r['events'].items()}, f'{time.time() - t0:.0f}s', flush=True)
@@ -341,9 +351,175 @@ def auroc(y, s):
     return float('nan') if n1 == 0 or n0 == 0 else float((ranks[y].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
 
 
+
+def run_checks():
+    print('\n######## CHECK 1: the state at token t must predict token t+1 (top-1 against what the trace says came next)')
+    hit = [(r['am'][:-1] == np.array(r['out_ids'][1:])).mean() for r in rows]
+    s1 = [(r['am'][:-2] == np.array(r['out_ids'][2:])).mean() for r in rows]
+    s0 = [(r['am'] == np.array(r['out_ids'])).mean() for r in rows]
+    print(f'  aligned (t -> t+1): mean {np.mean(hit):.3f}, min {np.min(hit):.3f}, max {np.max(hit):.3f} over {len(rows)} traces; '
+          f'shifted t -> t+2: {np.mean(s1):.3f}; shifted t -> t: {np.mean(s0):.3f}   (a right alignment is far above both)')
+    # the prompt end predicts the first token of the trace
+    print('\n######## CHECK 2: the start-token masses of "next" sit where the next token really is a start token')
+    for kind in start_mask:
+        mk = start_mask[kind].cpu().numpy() if not args.dry else np.zeros(V, bool)
+        on, off, on_m1, on_p1 = [], [], [], []
+        for r in rows:
+            nxt_is = mk[np.array(r['out_ids'][1:])] if len(mk) > 1 else np.zeros(r['n'] - 1, bool)
+            m = r['nxt'][kind][:-1]
+            on += list(m[nxt_is]); off += list(m[~nxt_is])
+            on_m1 += list(r['nxt'][kind][1:][nxt_is])   # the same starters, read one position late
+        print(f'  {kind}: mass where the next token is one of its starters {np.mean(on) if on else float("nan"):.3f} ({len(on)} positions), elsewhere {np.mean(off):.3f}; '
+              f'one position late {np.mean(on_m1) if on_m1 else float("nan"):.3f}')
+    print('\n######## CHECK 3: the token index of every event points at the text it names; 8 random events of each kind to READ')
+    for kind in EXTRACT:
+        bad, total = 0, 0
+        for r in rows:
+            for e in r['events'][kind]:
+                total += 1
+                piece = r['pieces'][e['tok']].strip()
+                if not piece or not r['text'][e['onset']:e['onset'] + 40].lstrip().startswith(piece[:max(1, min(len(piece), 6))]):
+                    bad += 1
+        print(f'  {kind}: {total} events, the token at the index does not open the named text in {bad}')
+        pool = [(r, e) for r in rows for e in r['events'][kind]]
+        for r, e in [pool[i] for i in rng.choice(len(pool), size=min(8, len(pool)), replace=False)] if pool else []:
+            a = e['onset']
+            print('     ', r['id'], repr(r['text'][max(0, a - 50):a]) + ' >>> ' + repr(r['text'][a:a + 70]))
+    print('\n######## CHECK 4: what the extractors miss (lines with an arithmetic `=` and a number, outside every extracted window); 8 to READ')
+    import re as _re
+    pat = _re.compile(r'=[ ]*-?[0-9]')
+    numeric_left = _re.compile(r'[0-9 .,()+*/^-]+')   # digits and operators only: no letter, no backslash command (a symbolic equation is not a computation)
+    miss, seen = [], 0
+    for r in rows:
+        spots = [e['onset'] for e in r['events']['comp']]
+        for m in pat.finditer(r['text']):
+            left = _re.split(r'[\n$]|=|\\times|\\cdot', r['text'][max(0, m.start() - 70):m.start()])[-1].strip()
+            if not (numeric_left.fullmatch(left) and _re.search(r'[0-9)][ ]*[+*/^-][ ]*[0-9(]', left)):
+                continue
+            seen += 1
+            if not any(abs(m.start() - o) < 90 for o in spots):
+                miss.append((r['id'], r['text'][max(0, m.start() - 40):m.end() + 20]))
+    print(f'  {seen} arithmetic-looking `=` lines, {len(miss)} with no comp event near them ({100 * len(miss) / max(seen, 1):.0f} %)')
+    for i in (rng.choice(len(miss), size=min(8, len(miss)), replace=False) if miss else []):
+        print('     ', miss[i][0], repr(miss[i][1]))
+    print('\n######## CHECK 5: a detector trained on labels shifted by s tokens, scored on the true labels (s = 0 must be the best); labels shuffled must be ~0.5')
+    L = LAYERS[-1]
+    half = [r for i, r in enumerate(rows) if i % 2 == 0], [r for i, r in enumerate(rows) if i % 2 == 1]
+    for kind in ('comp', 'reflect'):
+        if sum(len(r['events'][kind]) for r in rows) < 20:
+            continue
+        for what in ('probe', 'router') if (args.router and rows[0]['router'] is not None) else ('probe',):
+            line = []
+            for sh in (-4, -2, 0, 2, 4, 'shuffled'):
+                ys, ss = [], []
+                for tr, te in ((half[0], half[1]), (half[1], half[0])):
+                    xs, yl = [], []
+                    for r in tr:
+                        y = labels(r, kind, 2)
+                        if sh == 'shuffled':
+                            ys_ = rng.permutation(y)
+                        elif sh >= 0:
+                            ys_ = np.concatenate([y[sh:], np.zeros(sh, bool)])
+                        else:
+                            ys_ = np.concatenate([np.zeros(-sh, bool), y[:sh]])
+                        pos, neg = np.flatnonzero(ys_), np.flatnonzero(~ys_)
+                        neg = rng.choice(neg, size=min(len(neg), 10 * max(len(pos), 1)), replace=False)
+                        idx = np.concatenate([pos, neg])
+                        xs.append((r, idx)); yl.append(ys_[idx])
+                    ytr = torch.tensor(np.concatenate(yl), device=DEV)
+                    if ytr.sum() < 3:
+                        continue
+                    if what == 'probe':
+                        f = fit_dense(torch.cat([r['caps'][L][idx].float() for r, idx in xs]).to(DEV), ytr)
+                        score = lambda r, f=f: torch.cat([f(r['caps'][L][i:i + 8192].float().to(DEV)).cpu() for i in range(0, r['n'], 8192)]).numpy()
+                    else:
+                        f = fit_bag(torch.cat([router_idx(r)[torch.tensor(idx, device=DEV)] for r, idx in xs]), ytr, 40 * 256 + 1 if not args.dry else 6 * 256 + 1)
+                        score = lambda r, f=f: f(router_idx(r)).cpu().numpy()
+                    for r in te:
+                        ys.append(labels(r, kind, 2)); ss.append(score(r))
+                line.append(f'{sh}: {auroc(np.concatenate(ys), np.concatenate(ss)):.3f}')
+            print(f'  {kind} {what}' + (f' L{L}' if what == "probe" else '') + ' (k=2, AUROC on the true labels)  ' + '   '.join(line))
+    print('\n######## CHECK 6: the digit-confidence state (the one before a value\'s first digit) predicts that digit')
+    W = [(r, e['vtok'] - 1) for r in rows for e in r['events']['comp'] if e.get('vtok') is not None and e['vtok'] >= 1]
+    agree = np.mean([r['am'][t] == r['out_ids'][t + 1] for r, t in W]) if W else float('nan')
+    early = np.mean([r['am'][t - 1] == r['out_ids'][t + 1] for r, t in W if t >= 1]) if W else float('nan')
+    print(f'  {len(W)} values: top-1 equals the value\'s first token in {agree:.3f}; one position earlier {early:.3f}')
+    print('\n######## CHECK 7: tokens of the software\'s own text are not events')
+    n_own = sum(int(sum(e_ - s_ for s_, e_, _ in r['spans'])) for r in rows)
+    print(f'  {n_own} tokens inside the software\'s own spans in these traces; events kept only outside them')
+
+
+if args.check:
+    run_checks()
+    sys.exit(0)
+
+results = []
+
+
+def accumulate(agg, te, scorers, kind, k):
+    """Score the traces `te` with each detector; the threshold is set so 1 % of this set's positions alarm."""
+    for name, sc in scorers.items():
+        scores = [np.asarray(sc(r)) for r in te]
+        thr = np.quantile(np.concatenate(scores), 1 - FA)
+        a = agg.setdefault(name, dict(y=[], s=[], caught=0, onsets=0, leads=[], ahit=0, atot=0))
+        for r, s_ in zip(te, scores):
+            y = labels(r, kind, k)
+            al = s_ >= thr
+            a['y'].append(y)
+            a['s'].append(s_)
+            a['atot'] += int(al.sum())
+            a['ahit'] += int((al & y).sum())
+            for e in r['events'][kind]:
+                o = e['tok']
+                a['onsets'] += 1
+                w = np.flatnonzero(al[max(0, o - k):o])
+                if len(w):
+                    a['caught'] += 1
+                    a['leads'].append(o - (max(0, o - k) + w[0]))
+
+
+def emit(agg, kind, k, arm=''):
+    for name, a in agg.items():
+        res = dict(arm=arm, kind=kind, k=k, signal=name, auroc=round(auroc(np.concatenate(a['y']), np.concatenate(a['s'])), 3),
+                   caught=a['caught'], onsets=a['onsets'], lead=(float(np.median(a['leads'])) if a['leads'] else None),
+                   precision=round(a['ahit'] / max(a['atot'], 1), 3), random=round(1 - (1 - FA) ** k, 3))
+        results.append(res)
+        print(f'{arm:14s} {kind:7s} k={k:2d} {name:10s} AUROC {res["auroc"]:.3f}  caught {res["caught"]}/{res["onsets"]}  '
+              f'(random {res["random"]:.3f})  median lead {res["lead"]}  precision {res["precision"]:.3f}', flush=True)
+
+
+if APPLY:
+    train_rows = [r for r in rows if r['role'] == 'train']
+    arms = {}
+    for r in rows:
+        if r['role'] == 'test':
+            arms.setdefault(r['arm'], []).append(r)
+    print('detectors fitted on', len(train_rows), 'control traces; read on', {a: len(v) for a, v in arms.items()}, flush=True)
+    for kind in EXTRACT:
+        total = sum(len(r['events'][kind]) for r in train_rows)
+        print(f'\n######## {kind}: {total} onsets in the control traces; per arm: ' +
+              str({a: sum(len(r['events'][kind]) for r in v) for a, v in arms.items()}), flush=True)
+        if total < 10:
+            continue
+        for k in KS:
+            scorers = make_scorers(kind, k, train_rows)
+            for arm, te in arms.items():
+                agg = {}
+                accumulate(agg, te, scorers, kind, k)
+                emit(agg, kind, k, arm)
+    print('\n######## wrong values, per arm (digit confidence, 1 - top-1 probability, at the state before the first digit)')
+    wrong_res = {}
+    for arm, te in arms.items():
+        W = [(r, e['vtok'] - 1, not e['right']) for r in te for e in r['events']['comp'] if e['right'] is not None and e.get('vtok') is not None and e['vtok'] >= 1]
+        yw = np.array([w[2] for w in W])
+        if 3 <= yw.sum() < len(yw):
+            wrong_res[arm] = round(auroc(yw, np.array([1 - r['top1'][t] for r, t, _ in W])), 3)
+        print(f'  {arm}: values read {len(W)}, wrong {int(yw.sum()) if len(W) else 0}, AUROC {wrong_res.get(arm)}')
+    json.dump(dict(model=args.model, mode='apply', arms={a: len(v) for a, v in arms.items()}, results=results, wrong=wrong_res), open(args.out, 'w'))
+    sys.exit(0)
+
 order = rng.permutation(len(rows))
 fold_of = {int(i): j % FOLDS for j, i in enumerate(order)}
-results = []
 for kind in EXTRACT:
     total = sum(len(r['events'][kind]) for r in rows)
     print(f'\n######## {kind}: {total} onsets in {len(rows)} traces', flush=True)
@@ -354,32 +530,8 @@ for kind in EXTRACT:
         for f in range(FOLDS):
             tr = [r for i, r in enumerate(rows) if fold_of[i] != f]
             te = [r for i, r in enumerate(rows) if fold_of[i] == f]
-            scorers = make_scorers(kind, k, tr)
-            for name, sc in scorers.items():
-                scores = [np.asarray(sc(r)) for r in te]
-                thr = np.quantile(np.concatenate(scores), 1 - FA)
-                a = agg.setdefault(name, dict(y=[], s=[], caught=0, onsets=0, leads=[], ahit=0, atot=0))
-                for r, s in zip(te, scores):
-                    y = labels(r, kind, k)
-                    al = s >= thr
-                    a['y'].append(y)
-                    a['s'].append(s)
-                    a['atot'] += int(al.sum())
-                    a['ahit'] += int((al & y).sum())
-                    for e in r['events'][kind]:
-                        o = e['tok']
-                        a['onsets'] += 1
-                        w = np.flatnonzero(al[max(0, o - k):o])
-                        if len(w):
-                            a['caught'] += 1
-                            a['leads'].append(o - (max(0, o - k) + w[0]))
-        for name, a in agg.items():
-            res = dict(kind=kind, k=k, signal=name, auroc=round(auroc(np.concatenate(a['y']), np.concatenate(a['s'])), 3),
-                       caught=a['caught'], onsets=a['onsets'], lead=(float(np.median(a['leads'])) if a['leads'] else None),
-                       precision=round(a['ahit'] / max(a['atot'], 1), 3), random=round(1 - (1 - FA) ** k, 3))
-            results.append(res)
-            print(f'{kind:7s} k={k:2d} {name:10s} AUROC {res["auroc"]:.3f}  caught {res["caught"]}/{res["onsets"]}  '
-                  f'(random {res["random"]:.3f})  median lead {res["lead"]}  precision {res["precision"]:.3f}', flush=True)
+            accumulate(agg, te, make_scorers(kind, k, tr), kind, k)
+        emit(agg, kind, k)
 
 # ------------------------------------------------------------------------------------------------ a wrong value
 print('\n######## wrong values')
