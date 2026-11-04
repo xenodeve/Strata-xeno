@@ -65,8 +65,7 @@ CORRECTION = 'Correction (computed exactly): {expr} = {right}, not {wrote}. Use 
 # --hand-off: the model only restating a value software gave it (`= -18` on every line, or `= -0.0000020186299999...` for -37/18329827)
 # lost 28 of 160 DeepMind rows whose value was right in the text (pc4-whole). The restating line is cut and the model is led on to its
 # answer; software does not write the answer (developer, 2026-11-04: rules in MIP first).
-# 'So the answer is ' lost the sign on 4 of the 18 rows it led on (pc6: `= -18`, then 'So the answer is 18'); the box asks for the value as given
-HAND_OFF = 'So the final answer is \\boxed{'
+HAND_OFF = 'So the answer is '
 _RESTATE = re.compile(r'\s*=?\s*\$?\s*(-?\d[\d,]*(?:\.\d+)?(?:/\d+)?)\s*\$?\s*\.?\s*')
 _EXPANSION = re.compile(r'-?\d*\.\d{30,}')
 # --loop-hint: 14 of the control's 16 misses on the r1 rows were loops, 13 of them mid-work, several of them searches by hand. A loop in the
@@ -462,8 +461,7 @@ class Rollout:
         if m:
             try:
                 got = Fraction(m.group(1).replace(',', ''))
-                # the value again, or a rounded decimal of it (pc6 4104: 1539439/2572, then `= 598.5377138413301`, boxed and scored wrong)
-                hit = any(got == v or (v.denominator != 1 and abs(got - v) <= abs(v) * Fraction(1, 1000)) for v in self.given)
+                hit = any(got == v for v in self.given)
             except (ValueError, ZeroDivisionError):
                 hit = False
         expansion = _EXPANSION.search(line)
@@ -476,9 +474,7 @@ class Rollout:
         del self.out[start:]
         self.inject(HAND_OFF, 'hand-off')
         self.events[-1].update(cut=line[:120])
-        self.hand_offs = getattr(self, 'hand_offs', 0) + 1
-        if self.hand_offs >= 2:   # twice at most: pc6 2407 expanded the fraction again after the first lead
-            self.given = []
+        self.given = []   # once: a second restatement is the model's own, the loop guard's
         return True
 
     def check_line(self):

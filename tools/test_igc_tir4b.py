@@ -429,8 +429,8 @@ class WholeHint(unittest.TestCase):
     def test_a_line_that_only_restates_the_value_is_cut(self):
         # pc4-whole dm mul_div 1618: `= -18` written again on every line until the guard stopped the answer, never boxed
         r = self.whole_arm('-18')
-        play(r, '(360/27)/4*(-5)/((-20)/4)*-1*3*(-12)/180*-27 =\n= -18\n-18}<|im_end|>', Kernel([]))
-        self.assertIn('= -18\n\n' + tir4b.HAND_OFF + '-18}', r.text())
+        play(r, '(360/27)/4*(-5)/((-20)/4)*-1*3*(-12)/180*-27 =\n= -18\n\\boxed{-18}<|im_end|>', Kernel([]))
+        self.assertIn('= -18\n\n' + tir4b.HAND_OFF + '\\boxed{-18}', r.text())
         self.assertNotIn('= -18\n= -18', r.text())
         self.assertEqual([e['kind'] for e in r.events].count('hand-off'), 1)
 
@@ -440,13 +440,6 @@ class WholeHint(unittest.TestCase):
         play(r, '333 / -164968443 =\n= -0.00000201862999999999999999999999999999999999\\boxed{-37/18329827}<|im_end|>', Kernel([]))
         self.assertIn('= -37/18329827\n\n' + tir4b.HAND_OFF, r.text())
         self.assertNotIn('0.0000020186299999999', r.text())
-
-    def test_a_rounded_decimal_of_a_fraction_is_a_restatement(self):
-        # pc6 4104: the exact 1539439/2572, then `= 598.5377138413301`, boxed, and scored wrong against the fraction
-        r = self.whole_arm('1539439/2572')
-        play(r, '-1539439 / -2572 =\n= 598.5377138413301\n1539439/2572}<|im_end|>', Kernel([]))
-        self.assertIn(tir4b.HAND_OFF + '1539439/2572}', r.text())
-        self.assertNotIn('598.5377', r.text())
 
     def test_a_new_step_after_the_value_is_left_alone(self):
         r = self.whole_arm('95')
