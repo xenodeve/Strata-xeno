@@ -241,6 +241,7 @@ def _sympy_parse(x):
 
 
 def _sympy_compare(x1, x2):
+    import lark   # noqa: F401 - sympy's LaTeX reader needs it; without it every parse comes back empty and every answer "unverified" in silence (lb1, 2026-11-04)
     import sympy
     one, two = _sympy_parse(x1), _sympy_parse(x2)
     for a in one:
@@ -313,7 +314,7 @@ def amps_hard(ground_truth, answer):
             if _sympy_equal(ground_truth, parsed):
                 return 1, 'sympy'
         except ImportError:
-            return 0, 'unverified'
+            return 0, 'unverified: sympy or lark is not installed'   # not a wrong answer: the scorer could not look
         return 0, 'unverified'   # the original asks an LLM here
     tail = answer[:-1] if answer.endswith('.') else answer
     return (1, 'string') if ground_truth == tail[-len(ground_truth):] else (0, 'wrong')
