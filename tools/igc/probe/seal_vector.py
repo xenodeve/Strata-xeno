@@ -69,7 +69,7 @@ def main():
         print(f'  trace {k + 1}/{len(rows)} {row["id"]}: {len(th)} thoughts {dict(zip(*np.unique([t for _, _, t in th], return_counts=True)))}', flush=True)
     cut = int(0.7 * len(data))
     fit, held = data[:cut], data[cut:]
-    save = {}
+    save, best = {}, (-1.0, None)
     print(f'\nfit on {len(fit)} traces, held out {len(held)}')
     print(f'{"layer":>5s} {"E fit":>6s} {"RT fit":>7s} {"AUROC held":>11s} {"gap held":>9s} {"|S|":>8s}')
     for L in layers:

@@ -456,10 +456,38 @@ if args.check:
 results = []
 
 
+# Detectors read together (the developer, 2026-11-05: the signals err in different places, so the signals together should be sharper). Parameter-free: each member's
+# score becomes its rank percentile among all positions of the set being read, and the fused score is the mean of the members' percentiles. Nothing is fitted on the
+# set, so there is nothing to over-fit; the threshold is the same 1 %-of-positions rule as for the single signals.
+FUSIONS = {'fuse_all': None, 'fuse_next_p24_p31': ('next', 'probe_L24', 'probe_L31'), 'fuse_next_p24_text': ('next', 'probe_L24', 'text_lr'),
+           'fuse_p24_p31_text': ('probe_L24', 'probe_L31', 'text_lr')}
+
+
+def fused(allscores):
+    """{fusion name: [fused score per trace]} from {signal: [score per trace]}; a fusion with fewer than two of its members present is skipped."""
+    out = {}
+    for fname, members in FUSIONS.items():
+        names = [n for n in allscores if n != 'router'] if members is None else [m for m in members if m in allscores]
+        if len(names) < 2:
+            continue
+        pct = []
+        for n in names:
+            pooled = np.concatenate(allscores[n])
+            order = np.argsort(pooled, kind='mergesort')
+            rank = np.empty(len(pooled))
+            rank[order] = (np.arange(len(pooled)) + 0.5) / len(pooled)
+            pct.append(rank)
+        mean = np.mean(pct, 0)
+        cuts = np.cumsum([0] + [len(s) for s in allscores[names[0]]])
+        out[fname] = [mean[cuts[i]:cuts[i + 1]] for i in range(len(cuts) - 1)]
+    return out
+
+
 def accumulate(agg, te, scorers, kind, k):
-    """Score the traces `te` with each detector; the threshold is set so 1 % of this set's positions alarm."""
-    for name, sc in scorers.items():
-        scores = [np.asarray(sc(r)) for r in te]
+    """Score the traces `te` with each detector, and with the fusions of them; the threshold is set so 1 % of this set's positions alarm."""
+    allscores = {name: [np.asarray(sc(r)) for r in te] for name, sc in scorers.items()}
+    allscores.update(fused(allscores))
+    for name, scores in allscores.items():
         thr = np.quantile(np.concatenate(scores), 1 - FA)
         a = agg.setdefault(name, dict(y=[], s=[], caught=0, onsets=0, leads=[], ahit=0, atot=0))
         for r, s_ in zip(te, scores):
