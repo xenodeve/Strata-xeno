@@ -3009,7 +3009,17 @@ def evaluate_numeric(expr, values=None, digits=30, e_is_euler=False):
     for q in vals.values():
         if q.symbols():
             raise BadInput('values must be constants')
-    r = subs_many(e, vals)                         # exact substitution first, so floor(1/3*9) is floor(3), not floor(2.999...)
+    try:
+        r = subs_many(e, vals)                     # exact substitution first, so floor(1/3*9) is floor(3), not floor(2.999...)
+    except NotCovered as ex:
+        # log of a rational whose prime factors cannot be found in the bound: evaluate in Decimal instead (not with floor, which needs the exact value)
+        if 'too large to factor' not in str(ex) or any(a.kind == 'f' and a.name == 'floor' for a in e.atoms()):
+            raise
+        free = e.symbols() - set(vals)
+        if free:
+            raise BadInput('free symbols: ' + ', '.join(sorted(free)))
+        env = {k: _decimal_value(v, {}, digits + 15) for k, v in vals.items()}
+        return _decimal_value(e, env, digits)
     if r.symbols():
         raise BadInput('free symbols: ' + ', '.join(sorted(r.symbols())))
     return _decimal_value(r, {}, digits)
