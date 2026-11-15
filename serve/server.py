@@ -3796,8 +3796,8 @@ class Service:
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None,
                 # #310: the identity whose request has the engine (with "parallel": each busy slot's "who"), and the
-                # ones waiting for it, in arrival order
-                "holder": s.get("who") if s.get("busy") else None, "waiting": waiting}
+                # ones waiting for it, in arrival order (in both modes; "waiting" is #465's count, with "parallel" only)
+                "holder": s.get("who") if s.get("busy") else None, "waiting_who": waiting}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         par = int(getattr(self.engine, "batch", 0) or 0)
@@ -3807,11 +3807,10 @@ class Service:
             slots = self.engine.slots_view() if hasattr(self.engine, "slots_view") else []
             # the requests in flight that are not in a slot: the one alone on the solo path, or waiting their turn
             in_slots = sum(1 for x in slots if x["state"] != "idle")
-            # "waiting" stays the count of requests waiting for a slot or the control lines (#465); the names of
-            # those waiting for the engine's turn are "waiting_who" here (#310), and "holder" is each slot's "who"
+            # "holder" is each busy slot's "who" here (#310)
             live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
-                        admitting=int(getattr(self.engine, "admitting", 0) or 0), holder=None, waiting_who=waiting)
+                        admitting=int(getattr(self.engine, "admitting", 0) or 0), holder=None)
             if running and state == "idle":
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it

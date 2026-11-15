@@ -118,7 +118,8 @@ class Monitor(unittest.TestCase):
         self.assertIn("Say hello.", record["input"])
         metrics = self.request("/metrics")[1]
         self.assertIsNone(metrics["live"]["holder"])
-        self.assertEqual(metrics["live"]["waiting"], [])
+        self.assertEqual(metrics["live"]["waiting_who"], [])
+        self.assertNotIn("waiting", metrics["live"])              # as before: #465's count only with "parallel"
         self.assertEqual(metrics["requests"][0]["who"], "owner")
         self.assertEqual(metrics["requests"][0]["preview"], "Say hello.")
 

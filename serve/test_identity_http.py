@@ -605,10 +605,11 @@ class MonitorByIdentity(Base):
         a, ra = self.ask_on_a_thread(self.ann, DEV1, "ann first")
         self.wait_for(lambda: self.live(self.bob, DEV2)["holder"] == "ann")
         b, rb = self.ask_on_a_thread(self.bob, DEV2, "bob second")
-        live = self.wait_for(lambda: (x := self.live(self.bob, DEV2))["waiting"] and x)
+        live = self.wait_for(lambda: (x := self.live(self.bob, DEV2))["waiting_who"] and x)
         self.assertEqual(live["holder"], "ann")
-        self.assertEqual([w["who"] for w in live["waiting"]], ["bob"])
-        self.assertIsInstance(live["waiting"][0]["since"], float)
+        self.assertEqual([w["who"] for w in live["waiting_who"]], ["bob"])
+        self.assertIsInstance(live["waiting_who"][0]["since"], float)
+        self.assertNotIn("waiting", live)                         # #465's count exists only with "parallel"
         self.assertEqual(live["queued"], 1)
         self.engine.go.set()
         a.join(20)
@@ -616,7 +617,7 @@ class MonitorByIdentity(Base):
         self.assertEqual((ra["status"], rb["status"]), (200, 200))
         live = self.live(self.boss, DEV1)
         self.assertIsNone(live["holder"])
-        self.assertEqual(live["waiting"], [])
+        self.assertEqual(live["waiting_who"], [])
         self.assertEqual(live["queued"], 0)
 
     def test_status_shows_the_answer_only_to_its_holder_and_the_owner(self):
