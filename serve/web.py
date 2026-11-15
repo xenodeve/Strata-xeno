@@ -81,20 +81,35 @@ def check_settings(value) -> tuple[dict | None, list[dict]]:
 
 
 # ------------------------------------------------------------------------------------------------ which addresses
-def public_ip(ip: str, port: int | None = None) -> bool:
-    """True for an address on the open internet: not this PC, not a private, link-local, shared (100.64/10), reserved or multicast one, also when written as an IPv4 address inside an IPv6 one."""
+def _address(ip: str):
+    """The address, with an IPv4 address written inside an IPv6 one taken out; None for no address or a Teredo one."""
     try:
         a = ipaddress.ip_address(ip.split("%")[0])
     except ValueError:
-        return False
+        return None
     if isinstance(a, ipaddress.IPv6Address):
         if a.ipv4_mapped is not None:
             a = a.ipv4_mapped
         elif a.sixtofour is not None:
             a = a.sixtofour
         elif a.teredo is not None:
-            return False
-    return a.is_global and not a.is_multicast
+            return None
+    return a
+
+
+def public_ip(ip: str, port: int | None = None) -> bool:
+    """True for an address on the open internet: not this PC, not a private, link-local, shared (100.64/10), reserved or multicast one, also when written as an IPv4 address inside an IPv6 one."""
+    a = _address(ip)
+    return a is not None and a.is_global and not a.is_multicast
+
+
+VPN_NETS = (ipaddress.ip_network("26.0.0.0/8"),)   # Radmin VPN's network: global on paper, a team's own network in use (#311)
+
+
+def public_not_vpn(ip: str, port: int | None = None) -> bool:
+    """public_ip, and not in a VPN's range that public_ip counts as global (VPN_NETS) - the guard a team guest's image URL is fetched through (#311)."""
+    a = _address(ip)
+    return public_ip(ip, port) and not any(a in n for n in VPN_NETS)
 
 
 def split_url(url) -> tuple[tuple[str, str, int, str] | None, str]:
@@ -135,6 +150,10 @@ class Refused(Exception):
     """An address or a reply the fetch will not take: the message is for the model."""
 
 
+class NotPublic(Refused):
+    """The address is on this PC or a private network (by its name, or where the name led), refused before connecting to it."""
+
+
 # ------------------------------------------------------------------------------------------------ fetching
 @dataclass
 class Page:
@@ -155,7 +174,7 @@ class Fetcher:
 
     def _connect(self, scheme: str, host: str, port: int, deadline: float, private_ok: bool):
         if not private_ok and looks_private_name(host):
-            raise Refused(f"{host} is a name on this PC or a private network; only addresses on the public internet can be fetched")
+            raise NotPublic(f"{host} is a name on this PC or a private network; only addresses on the public internet can be fetched")
         try:
             infos = self.resolve(host, port)
         except OSError:
@@ -165,7 +184,7 @@ class Fetcher:
         if not private_ok:
             for info in infos:
                 if not self.guard(info[4][0], port):
-                    raise Refused(f"{host} is at {info[4][0]}, which is on this PC or a private network; only addresses on the public internet can be fetched")
+                    raise NotPublic(f"{host} is at {info[4][0]}, which is on this PC or a private network; only addresses on the public internet can be fetched")
         last: Exception | None = None
         for fam, typ, proto, _canon, sa in infos:
             left = deadline - time.monotonic()
@@ -199,7 +218,9 @@ class Fetcher:
             raise Refused(f"the server did not answer properly ({type(e).__name__})") from None
         return resp, s
 
-    def get(self, url: str, private_ok: bool = False, headers: dict | None = None, cancel=None) -> Page:
+    def get(self, url: str, private_ok: bool = False, headers: dict | None = None, cancel=None, limit: int | None = None) -> Page:
+        """`limit`: the most bytes of the body that are read (a longer one is cut there); MAX_BYTES when not given."""
+        limit = MAX_BYTES if limit is None else limit
         deadline = time.monotonic() + self.timeout
         via: list[str] = []
         first, _ = split_url(url)
@@ -232,11 +253,11 @@ class Fetcher:
                     if not chunk:
                         break
                     body += chunk
-                    if len(body) > MAX_BYTES:
+                    if len(body) > limit:
                         cut = True
                         break
-                data = _decode(bytes(body), enc, cut)
-                return Page(url, resp.status, (resp.getheader("Content-Type") or "").split(";")[0].strip().lower(), data[:MAX_BYTES], cut or len(data) > MAX_BYTES, via)
+                data = _decode(bytes(body), enc, cut, limit)
+                return Page(url, resp.status, (resp.getheader("Content-Type") or "").split(";")[0].strip().lower(), data[:limit], cut or len(data) > limit, via)
             finally:
                 try:
                     resp.close()
@@ -245,13 +266,13 @@ class Fetcher:
         raise Refused(f"more than {MAX_REDIRECTS} redirects")
 
 
-def _decode(data: bytes, enc: str, partial: bool) -> bytes:
+def _decode(data: bytes, enc: str, partial: bool, limit: int) -> bytes:
     """The body as it is after its content encoding (gzip is asked for); a decoded size is capped, so a small file cannot become a huge one."""
     try:
         if "gzip" in enc:
-            return zlib.decompressobj(31).decompress(data, MAX_BYTES + 1)
+            return zlib.decompressobj(31).decompress(data, limit + 1)
         if "deflate" in enc:
-            return zlib.decompressobj().decompress(data, MAX_BYTES + 1)
+            return zlib.decompressobj().decompress(data, limit + 1)
     except zlib.error:
         if partial:
             return b""

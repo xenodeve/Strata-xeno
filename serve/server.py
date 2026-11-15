@@ -2233,10 +2233,28 @@ class Vision:
         raise ValueError("an image must be a data: URL, an http(s) URL or a local file path")
 
     @staticmethod
-    def download(url: str) -> bytes:
+    def download(url: str, guard=None) -> bytes:
         """An image URL's bytes, at most IMAGE_URL_MAX of them: the whole response was read, so a huge or endless one
-        filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection."""
+        filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection.
+        `guard(ip, port)` (#311: a team guest's URL, web.public_not_vpn): fetched by web.Fetcher, which checks every
+        address it connects to - after the name is looked up, and again on every redirect - and the refusal says only
+        that the address is not public, before anything is sent to it."""
         too_big = f"the image URL's file is over {IMAGE_URL_MAX >> 20} MiB"
+        if guard is not None:
+            try:
+                page = web_mod.Fetcher(guard=guard, timeout=60).get(url, headers={"Accept": "image/*,*/*;q=0.5", "Accept-Encoding": "identity"},
+                                                                    limit=IMAGE_URL_MAX)
+            except web_mod.NotPublic:
+                raise ValueError("an image URL must be an address on the public internet: send the image as a data: "
+                                 "URL") from None
+            except web_mod.Refused as e:
+                raise ValueError(f"the image URL could not be read: {e}") from None
+            if page.cut:
+                raise ValueError(too_big if len(page.body) >= IMAGE_URL_MAX else "the image URL could not be read whole (too slow, or the "
+                                 "connection ended)")
+            if not 200 <= page.status < 300:
+                raise ValueError(f"the image URL could not be read: HTTP {page.status}")
+            return page.body
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
                 size = r.headers.get("Content-Length") or ""
@@ -6669,16 +6687,38 @@ def make_handler(svc: Service):
             and http(s) images are the page's own to send; files come from Strata's own page, a trusted origin or a
             client that is no browser.  #310: in team mode only an owner key may name a file on this PC - a guest's
             files are on the guest's own PC, and the refusal comes before anything looks at the path, so it does not
-            tell whether the path exists.  `foreign`: False checks only the team rule.  ValueError (a 400)."""
-            if not any(not src.startswith(("data:", "http://", "https://")) for src in images_of(messages)):
-                return
-            if foreign and self._foreign_origin():
-                raise ValueError("a web page of another origin cannot have a file on this computer read as an "
-                                 "image: send it as a data: URL (or add the page's origin to the config's "
-                                 "trusted_origins)")
-            if self.team and not (self.identity is not None and self.identity.is_owner):
-                raise ValueError("a file on the server's computer can be read as an image only with an owner key: "
-                                 "send the image as a data: URL")
+            tell whether the path exists.  `foreign`: False checks only the team rule.  A guest's http(s) images go
+            through _guest_image_urls (#311).  ValueError (a 400)."""
+            guest = self.team and not (self.identity is not None and self.identity.is_owner)
+            if any(not src.startswith(("data:", "http://", "https://")) for src in images_of(messages)):
+                if foreign and self._foreign_origin():
+                    raise ValueError("a web page of another origin cannot have a file on this computer read as an "
+                                     "image: send it as a data: URL (or add the page's origin to the config's "
+                                     "trusted_origins)")
+                if guest:
+                    raise ValueError("a file on the server's computer can be read as an image only with an owner key: "
+                                     "send the image as a data: URL")
+            if guest:
+                self._guest_image_urls(messages)
+
+        def _guest_image_urls(self, messages):
+            """#311: a team guest's http(s) image is fetched here, only from an address on the public internet - not
+            this PC, a private or link-local network, CGNAT 100.64/10 (Tailscale) or 26.0.0.0/8 (Radmin VPN) - checked
+            on the address connected to and on every redirect (Vision.download with web.public_not_vpn).  Its item then
+            carries the bytes as a data: URL, so nothing later (prepare, a tool round) holds the URL to fetch it again
+            without the check.  Every role's images, as images_of reads them.  ValueError (a 400)."""
+            fetched: dict[str, str] = {}
+            for m in messages:
+                content = m.get("content")
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    src = item.get("source") if isinstance(item, dict) and item.get("type") == "image" else None
+                    if isinstance(src, str) and src.startswith(("http://", "https://")):
+                        if src not in fetched:
+                            data = Vision.download(src, guard=web_mod.public_not_vpn)
+                            fetched[src] = "data:;base64," + base64.b64encode(data).decode("ascii")
+                        item["source"] = fetched[src]
 
         def _settings(self):
             # They change what every client gets, so only the app's own page may set them

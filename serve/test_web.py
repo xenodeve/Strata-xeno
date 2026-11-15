@@ -114,6 +114,17 @@ class Addresses(unittest.TestCase):
                    "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:192.168.0.1", "2002:7f00:1::", "2001::1", "not an address", ""):
             self.assertFalse(web.public_ip(ip), ip)
 
+    def test_an_image_url_reaches_neither_a_private_address_nor_the_radmin_range(self):
+        """#311: public_not_vpn is public_ip with 26.0.0.0/8 refused too (Radmin VPN's range, this workstation's team
+        network - global on paper), also written inside an IPv6 address."""
+        for ip in ("93.184.216.34", "8.8.8.8", "25.255.255.255", "27.0.0.1", "2606:4700:4700::1111"):
+            self.assertTrue(web.public_not_vpn(ip), ip)
+        for ip in ("26.0.0.1", "26.1.2.3", "26.255.255.255", "::ffff:26.1.2.3", "2002:1a01:203::", "127.0.0.1", "10.0.0.1", "172.16.0.1",
+                   "192.168.1.1", "169.254.169.254", "100.64.0.1", "100.127.255.255", "0.0.0.0", "224.0.0.1", "::1", "::", "fe80::1", "fc00::1",
+                   "fd12::1", "ff02::1", "::ffff:127.0.0.1", "not an address", ""):
+            self.assertFalse(web.public_not_vpn(ip), ip)
+        self.assertTrue(web.public_ip("26.1.2.3"))                                          # WebFetch's own rule is unchanged
+
     def test_a_name_that_says_it_is_inside_a_network_is_refused_before_any_lookup(self):
         for host in ("localhost", "printer", "nas.local", "router.lan", "api.internal", "x.localhost", "my.corp", "host.home", "db.localdomain"):
             self.assertTrue(web.looks_private_name(host), host)
@@ -225,6 +236,28 @@ class Fetching(unittest.TestCase):
         self.assertTrue(r["isError"])
         self.assertIn("public internet", text_of(r))
         self.assertEqual(other.seen, [])                                                   # it was never connected to
+
+    def test_a_refused_address_is_its_own_kind_of_refusal(self):
+        """#311: the image fetch tells a guest only that the address is not public, so the refusal says which it is."""
+        other = self.site({"/": html("<p>the second server</p>")})
+        s = self.site({"/go": (302, {"Location": other.url("/")}, b"")})
+        f = web.Fetcher(guard=lambda ip, port: port == s.port, timeout=5)
+        with self.assertRaises(web.NotPublic):
+            f.get(s.url("/go"))
+        with self.assertRaises(web.NotPublic):
+            f.get("http://localhost/")                                                     # by its name, before any lookup
+        self.assertEqual(other.seen, [])
+
+    def test_a_size_limit_of_its_own(self):
+        """#311: the image fetch reads up to its own limit (32 MiB), not a page's 2 MB."""
+        big = b"x" * (web.MAX_BYTES + 10)
+        s = self.site({"/big": (200, {"Content-Type": "image/png"}, big)})
+        p = reach(s).get(s.url("/big"), limit=web.MAX_BYTES + 100)
+        self.assertEqual((p.body, p.cut), (big, False))
+        p = reach(s).get(s.url("/big"), limit=1000)
+        self.assertEqual((len(p.body), p.cut), (1000, True))
+        p = reach(s).get(s.url("/big"))                                                    # the default is unchanged
+        self.assertEqual((len(p.body), p.cut), (web.MAX_BYTES, True))
 
     def test_a_redirect_to_a_file_or_a_user_name_is_refused(self):
         s = self.site({"/f": (302, {"Location": "file:///etc/passwd"}, b""), "/u": (302, {"Location": "http://user:pw@example.com/"}, b"")})

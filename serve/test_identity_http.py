@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import http.client
 import io
@@ -25,9 +26,11 @@ from serve.history import HistoryStore  # noqa: E402
 from serve import identity as identity_mod  # noqa: E402
 from serve.identity import OWNER, KeyStore  # noqa: E402
 from serve.mcp import hub_from_config  # noqa: E402
+from serve import server as server_mod, web as web_mod  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, keys_file_of, serve  # noqa: E402
 from serve.test_harness import tool_call  # noqa: E402
 from serve.test_mcp import ScriptedEngine  # noqa: E402
+from serve.test_web import Site  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DEV1, DEV2 = "device-0001", "device-0002"         # valid X-Strata-Device ids (8-64 of [A-Za-z0-9_-])
@@ -533,6 +536,87 @@ class LocalImages(Base):
         for path, body in self.bodies(str(self.img)).items():
             self.assertEqual(self.req("POST", path, body, key="k")[0], 200, path)
         self.assertEqual(self.vision.seen.count(str(self.img)), 4)
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"not decoded by the fake encoder"
+
+
+class GuestImageUrls(Base):
+    """An image given by http(s) URL: in team mode a guest's is fetched only from an address on the public internet
+    (#311) - never this PC, a private or link-local network, CGNAT (Tailscale) or 26.0.0.0/8 (Radmin VPN) - checked on
+    the address connected to and on every redirect.  The owner, and every caller outside team mode, as before."""
+
+    def setUp(self):
+        super().setUp()
+        self.vision = FakeVision(self.dir)
+        self.img = self.dir / "secret.png"
+        self.img.write_bytes(PNG)
+        self.site = Site({"/x.png": (200, {"Content-Type": "image/png"}, PNG)})
+        self.addCleanup(self.site.close)
+
+    def bodies(self, src):
+        return LocalImages.bodies(self, src)
+
+    def refused_like_a_file(self, ann, src):
+        """Every route answers a guest's URL with a 400 of the type a guest's local file gets on the same route."""
+        files = self.bodies(str(self.img))
+        for path, body in self.bodies(src).items():
+            with self.subTest(src=src, path=path):
+                code, r = self.req("POST", path, body, key=ann, device=DEV1)
+                self.assertEqual(code, 400, r)
+                self.assertIn("public internet", json.dumps(r))
+                fcode, fr = self.req("POST", path, files[path], key=ann, device=DEV1)
+                self.assertEqual((fcode, fr["error"]["type"]), (400, r["error"]["type"]))
+
+    def test_guest_image_url_to_loopback_refused(self):
+        self.start(api_key="k", peer_override=REMOTE, vision=self.vision)
+        ann = self.approved("ann")
+        self.refused_like_a_file(ann, self.site.url("/x.png"))
+        self.assertEqual(self.site.seen, [])                     # never connected to
+        self.assertEqual(self.vision.seen, [])
+
+    def test_guest_image_url_to_private_names_refused(self):
+        self.start(api_key="k", peer_override=REMOTE, vision=self.vision)
+        ann = self.approved("ann")
+        for src in ("http://localhost/x.png", "http://10.0.0.1/x.png", "http://26.1.2.3/x.png", "http://100.64.0.1/x.png",
+                    "https://169.254.169.254/latest", "http://[::1]/x.png", "http://[::ffff:26.1.2.3]/x.png"):
+            self.refused_like_a_file(ann, src)
+        self.assertEqual(self.vision.seen, [])
+
+    def test_guest_redirect_to_private_refused(self):
+        """A public address that sends the fetch on to this PC: only the first server counts as public here."""
+        hop = Site({"/go": (302, {"Location": self.site.url("/x.png")}, b"")})
+        self.addCleanup(hop.close)
+        with self.assertRaises(ValueError) as e:
+            server_mod.Vision.download(hop.url("/go"), guard=lambda ip, port: port == hop.port or web_mod.public_not_vpn(ip, port))
+        self.assertIn("public internet", str(e.exception))
+        self.assertEqual(len(hop.seen), 1)
+        self.assertEqual(self.site.seen, [])
+
+    def test_guest_public_image_is_fetched_once_and_sent_as_its_bytes(self):
+        """What a guest's public URL holds reaches the encoder as a data: URL - nothing later holds the URL to fetch it
+        again without the check.  The test's server stands in for a public one."""
+        self.start(api_key="k", peer_override=REMOTE, vision=self.vision)
+        ann = self.approved("ann")
+        allow = lambda ip, port: port == self.site.port                                     # noqa: E731
+        with mock.patch.object(web_mod, "public_not_vpn", allow):
+            for path, body in self.bodies(self.site.url("/x.png")).items():
+                self.assertEqual(self.req("POST", path, body, key=ann, device=DEV1)[0], 200, path)
+        self.assertEqual(len(self.site.seen), 4)
+        self.assertEqual([base64.b64decode(s.split(",", 1)[1]) for s in self.vision.seen], [PNG] * 4)
+
+    def test_owner_and_outside_team_mode_unchanged(self):
+        self.start(api_key="k", vision=self.vision)                                         # the owner, from this PC
+        for path, body in self.bodies(self.site.url("/x.png")).items():
+            self.assertEqual(self.req("POST", path, body, key="k")[0], 200, path)
+        self.assertEqual((len(self.site.seen), self.vision.seen), (4, [PNG] * 4))           # fetched as before: bytes
+        self.tearDown()
+        self.vision.seen.clear()
+        self.keys_path.unlink()
+        self.start(api_key="k", team=False, peer_override=REMOTE, vision=self.vision)
+        for path, body in self.bodies(self.site.url("/x.png")).items():
+            self.assertEqual(self.req("POST", path, body, key="k")[0], 200, path)
+        self.assertEqual((len(self.site.seen), self.vision.seen), (8, [PNG] * 4))
 
 
 class RunsBelongToTheirIdentity(Base):
