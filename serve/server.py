@@ -73,6 +73,7 @@ from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mo
 from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import runner_hub  # noqa: E402  (#310 part 2: the runner channel)
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -3100,6 +3101,7 @@ class Service:
         self.agent = None                                # serve/agent.py's AgentServer: the chat's coding tools (Read, Write, Edit, Bash, ...); None: switched off
         self.broker = agent_run.Broker()                 # the questions the coding tools have asked the page and not had answered yet
         self.runs = runs_mod.RunStore()                  # the answers that use the coding tools: they go on when the page that asked is refreshed or closed (serve/runs.py)
+        self.runner_hub = runner_hub.RunnerHub()         # #310 part 2: the runners on the engineers' own PCs (serve/runner_hub.py)
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
@@ -5369,6 +5371,11 @@ OWNER_POSTS = {"/settings": "settings can be changed", "/config": "the run confi
                "/v1/unload": "the model can be loaded or unloaded", "/v1/load": "the model can be loaded or unloaded",
                "/v1/vram": "the VRAM reserve can be changed", "/metrics/keep": "prompts can be kept"}
 NO_RUN = "there is no such run (it ended long ago, or the server was restarted)"
+# #310 part 2: the runner channel's bodies (a reply carries a tool's result: a Read image fits) and answers
+RUNNER_HELLO_MAX, RUNNER_REPLY_MAX = 4 << 20, 32 << 20
+NO_RUNNER = "there is no such runner (say hello again)"
+RUNNER_REPLACED = {"error": {"type": "runner_replaced", "message": "a newer Strata Desktop runner on this PC took this "
+                                                                   "runner's place; this one stops"}}
 
 
 def make_handler(svc: Service):
@@ -5905,6 +5912,12 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._config_get()
                 return
+            if path in ("/runner/next", "/runners"):         # #310 part 2: a runner's long poll, and who has one
+                if self._authorized() and self._runner_gate():
+                    if path == "/runners":
+                        return self._json(200, {"runners": svc.runner_hub.view(self._acting())})
+                    self._runner_next()
+                return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():                       # #310 R11: a team guest sees only the servers she may use
@@ -6128,6 +6141,10 @@ def make_handler(svc: Service):
                 return
             if path == "/settings":
                 self._settings()
+                return
+            if path in ("/runner/hello", "/runner/reply"):   # #310 part 2: a runner says hello, or answers a job
+                if self._runner_gate():
+                    self._runner_post(path)
                 return
             if path in ("/keys", "/devices"):                # #310: named keys and device approval, managed live
                 n = int(self.headers.get("Content-Length", 0))
@@ -6594,6 +6611,7 @@ def make_handler(svc: Service):
                     new = body["to"].strip()
                     svc.runs.move(name, new)                # the holder keeps her runs and prompts; a later key named
                     svc.broker.move(name, new)              # `name` inherits none of them
+                    svc.runner_hub.move(name, new)          # and her runners (their ids follow the name)
                     return self._json(200, {"ok": True, "name": new})
                 if action == "role":
                     role = body.get("role")
@@ -6604,6 +6622,7 @@ def make_handler(svc: Service):
                 if not svc.keys.revoke(name, by=by):
                     return self._json(404, missing)
                 stopped = self._stop_identity(name)
+                svc.runner_hub.end_all(name)                # her runners end (a demotion keeps them: not in _stop_identity)
                 svc.runs.move(name, identity_mod.REVOKED)   # a later key with this name inherits nothing
                 svc.broker.move(name, identity_mod.REVOKED)
                 return self._json(200, {"ok": True, **stopped})
@@ -6645,6 +6664,8 @@ def make_handler(svc: Service):
                                                   if self.identity.is_owner else
                                                   "the keys file on the server could not be written: tell the owner"}})
             if ok:
+                if clear or not body["approve"]:             # #310 part 2: a refused or cleared device keeps no runner
+                    svc.runner_hub.end_device(key, device)
                 return self._json(200, {"ok": True})
             status = next((d["status"] for r in svc.keys.view() if r["name"] == key for d in r["devices"]
                            if d["device"] == device), None)
@@ -6652,6 +6673,109 @@ def make_handler(svc: Service):
                 return self._json(403, {"error": {"type": "forbidden", "message": "a refused device is let in again only "
                                                   "by an owner key"}})
             return self._json(404, missing)
+
+        def _runner_gate(self) -> bool:
+            """#310 part 2: the runner routes, after `_authorized`.  In team mode every key (the device gate has run);
+            outside it the owner, as `may_edit` decides - a runner runs its holder's tools on her own PC.  No
+            `_own_page`: a runner is no page."""
+            return True if self.team else self._owner_only("a runner can connect")
+
+        def _runner_device(self) -> str:
+            """The device a runner's hello comes from: the gate's in team mode; outside it `_authorized` records none,
+            so it is read here the same way (two PCs on a single-user server get two runners)."""
+            if self.team:
+                return self.device_id
+            h = self.headers
+            return identity_mod.device_of(h.get("X-Strata-Device"), h.get("X-Strata-Device-Name"), h.get("User-Agent"),
+                                          self._peer())[0]
+
+        def _runner_body(self, limit: int) -> dict | None:
+            """A runner's POST body: JSON only, at most `limit` bytes, an object.  None after an answer (415, 413, 400)."""
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                self._json(415, {"error": {"message": "send application/json"}})
+                return None
+            if self._chunked():
+                self.body_read = True
+                raw = self._read_chunked(limit)              # BadBody 413 / 400: do_POST answers it
+            else:
+                try:
+                    n = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    n = -1
+                if n > limit:
+                    self._json(413, {"error": {"message": f"send a body of up to {limit >> 20} MB"}})
+                    return None
+                if n < 0:
+                    self._json(400, {"error": {"message": "invalid Content-Length"}})
+                    return None
+                self.body_read = True
+                raw = self.rfile.read(n)
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                self._json(400, {"error": {"message": "send a JSON object"}})
+                return None
+            return body
+
+        def _runner_post(self, path: str):
+            """#310 part 2: POST /runner/hello and /runner/reply (serve/runner_hub.py)."""
+            body = self._runner_body(RUNNER_HELLO_MAX if path == "/runner/hello" else RUNNER_REPLY_MAX)
+            if body is None:
+                return
+            who = self._acting()
+            if path == "/runner/reply":
+                if not all(isinstance(body.get(k), str) for k in ("id", "instance", "job")):
+                    return self._json(400, {"error": {"message": 'send {"id", "instance", "job", ...}'}})
+                r = svc.runner_hub.get_for(body["id"], who)         # another identity's runner: as one not there
+                if r is None:
+                    return self._json(404, {"error": {"message": NO_RUNNER}})
+                if r.instance != body["instance"]:
+                    return self._json(409, RUNNER_REPLACED)
+                if not r.deliver(body):
+                    return self._json(404, {"error": {"message": "there is no such job (it finished, or was never sent)"}})
+                return self._json(200, {"ok": True})
+            protocol = body.get("protocol")                          # first: a runner of another version may send another shape
+            if type(protocol) is not int or protocol != runner_hub.RUNNER_PROTOCOL:
+                return self._json(409, {"error": {"type": "runner_protocol", "server_protocol": runner_hub.RUNNER_PROTOCOL,
+                                                  "message": f"update Strata Desktop (the server speaks runner protocol "
+                                                             f"{runner_hub.RUNNER_PROTOCOL})"}})
+            got = runner_hub.check_hello(body)
+            if isinstance(got, str):
+                return self._json(400, {"error": {"message": got}})
+            info, groups, skills = got
+            r = svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
+            poll = runner_hub.POLL_MAX_S
+            return self._json(200, {"runner": r.id, "who": r.who, "protocol": runner_hub.RUNNER_PROTOCOL,
+                                    "poll_s": int(poll) if float(poll).is_integer() else poll})
+
+        def _runner_next(self):
+            """#310 part 2: GET /runner/next?id=&instance=&wait= - the messages for the runner, held at most
+            POLL_MAX_S.  A runner that ended while the poll was held is told why: replaced 409, revoked 401, its
+            device refused or cleared 404 (a new hello meets the device gate), the server stopping 503."""
+            q = parse_qs(urlsplit(self.path).query)
+            r = svc.runner_hub.get_for(q.get("id", [""])[0], self._acting())
+            if r is None:
+                return self._json(404, {"error": {"message": NO_RUNNER}})
+            if r.instance != q.get("instance", [""])[0]:
+                return self._json(409, RUNNER_REPLACED)
+            try:
+                wait = float(q.get("wait", [str(runner_hub.POLL_MAX_S)])[0])
+            except ValueError:
+                wait = math.nan
+            if not math.isfinite(wait):
+                return self._json(400, {"error": {"message": "wait is a number of seconds"}})
+            messages = r.take(min(max(wait, 0.0), runner_hub.POLL_MAX_S))
+            if r.ended == "replaced":
+                return self._json(409, RUNNER_REPLACED)
+            if r.ended == "revoked":
+                return self._json(401, {"error": {"type": "authentication_error", "message": "the key was revoked"}})
+            if r.ended == "closed":
+                return self._json(503, {"error": {"message": "the server is stopping"}})
+            if r.ended is not None:
+                return self._json(404, {"error": {"message": NO_RUNNER}})
+            return self._json(200, {"messages": messages})
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -8169,7 +8293,7 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        closers = [svc.runner_hub.close, httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:
