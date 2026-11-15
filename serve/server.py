@@ -6748,11 +6748,11 @@ def make_handler(svc: Service):
             r = svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
             poll = runner_hub.POLL_MAX_S
             return self._json(200, {"runner": r.id, "who": r.who, "protocol": runner_hub.RUNNER_PROTOCOL,
-                                    "poll_s": int(poll) if float(poll).is_integer() else poll})
+                                    "poll_s": int(poll) if float(poll).is_integer() else poll, "channel": r.channel})
 
         def _runner_next(self):
-            """#310 part 2: GET /runner/next?id=&instance=&wait= - the messages for the runner, held at most
-            POLL_MAX_S.  A runner that ended while the poll was held is told why: replaced 409, revoked 401, its
+            """#310 part 2: GET /runner/next?id=&instance=&wait=&ack= - the messages for the runner, held at most
+            POLL_MAX_S; `ack` (the highest `seq` received on this channel, default 0) lets the acknowledged ones go.  A runner that ended while the poll was held is told why: replaced 409, revoked 401, its
             device refused or cleared 404 (a new hello meets the device gate), the server stopping 503."""
             q = parse_qs(urlsplit(self.path).query)
             r = svc.runner_hub.get_for(q.get("id", [""])[0], self._acting())
@@ -6766,10 +6766,13 @@ def make_handler(svc: Service):
                 wait = math.nan
             if not math.isfinite(wait):
                 return self._json(400, {"error": {"message": "wait is a number of seconds"}})
+            ack = q.get("ack", ["0"])[0]
+            if not (ack.isascii() and ack.isdigit() and len(ack) <= 18):
+                return self._json(400, {"error": {"message": "ack is the highest seq received, a whole number"}})
             gone = threading.Event()                 # the runner hung up: the held poll ends and takes nothing
             self._watch_client(gone)
             try:
-                messages = r.take(min(max(wait, 0.0), runner_hub.POLL_MAX_S), gone=gone)
+                messages = r.take(min(max(wait, 0.0), runner_hub.POLL_MAX_S), gone=gone, ack=int(ack))
             finally:
                 self.watch_done.set()
             if gone.is_set():

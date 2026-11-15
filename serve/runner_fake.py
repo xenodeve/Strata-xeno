@@ -4,12 +4,18 @@ message to `on_job(msg, reply)` on a thread of the message's own (so jobs run si
 an answer does not stop the polling); `reply(more)` posts {"id", "instance", "job": msg["job"], **more} to
 POST /runner/reply and returns (status, body).
 
+It keeps the delivery rules a real runner keeps (serve/runner_hub.py): every poll sends `ack=` the highest `seq` it
+has received on this channel, a message whose `seq` it already handled is ignored, and a hello that answers another
+`channel` starts both again.  Two switches script a lossy network: `drop = n` throws the next n non-empty poll results
+away unread (as if the connection died on the way back), `lose_ack = n` handles the next n but does not advance the
+ack (as if the next poll's ack never arrived), so the server sends them again.
+
     fake = FakeRunner(port, key, device, groups, on_job)
     ...
     fake.stop()
 
 Polling ends on `stop()` or on any answer but 200 (401 revoked, 404, 409 replaced): `ended` then holds (status,
-body).  Standard library only.
+body).  `polls` holds each poll's duration in seconds.  Standard library only.
 """
 from __future__ import annotations
 
@@ -36,6 +42,14 @@ class FakeRunner:
         self.stopped = threading.Event()
         self.ended: tuple[int, object] | None = None      # the answer that ended the polling
         self.replies: list[tuple[dict, int]] = []         # every reply posted, with its status
+        self.received: list[dict] = []                    # every message handed to on_job (not the ignored repeats)
+        self.repeats = 0                                  # messages received again and ignored
+        self.polls: list[float] = []                      # each poll's duration, s
+        self.channel: str | None = None
+        self.ack = 0                                      # the highest seq received on this channel
+        self.handled: set[int] = set()                    # the seqs already handed to on_job on this channel
+        self.drop = 0                                     # throw the next n non-empty poll results away
+        self.lose_ack = 0                                 # handle the next n, but do not advance the ack
         self._conn: http.client.HTTPConnection | None = None
         self._lock = threading.Lock()
         code, body = self.hello()
@@ -73,10 +87,14 @@ class FakeRunner:
             conn.close()
 
     def hello(self) -> tuple[int, object]:
-        """POST /runner/hello with this runner's facts (again: the lists only change)."""
-        return self._request("POST", "/runner/hello", {
+        """POST /runner/hello with this runner's facts (again: the lists only change).  Another channel in the
+        answer (a new registration on the server) starts the ack and the handled seqs again."""
+        code, body = self._request("POST", "/runner/hello", {
             "protocol": self.protocol, "instance": self.instance, "machine": self.machine, "platform": "win32",
             "shell": "Git Bash", "home": "C:\\Users\\fake", "groups": self.groups, "skills": self.skills})
+        if code == 200 and isinstance(body, dict) and body.get("channel") != self.channel:
+            self.channel, self.ack, self.handled = body.get("channel"), 0, set()
+        return code, body
 
     def reply_for(self, job) -> Callable[[dict], tuple]:
         def reply(more: dict) -> tuple:
@@ -90,20 +108,41 @@ class FakeRunner:
     def _loop(self):
         while not self.stopped.is_set():
             wait = runner_hub.POLL_MAX_S if self.wait is None else self.wait
+            t0 = time.monotonic()
             try:
-                code, body = self._request("GET", f"/runner/next?id={self.id}&instance={self.instance}&wait={wait}",
-                                           held=True)
+                code, body = self._request(
+                    "GET", f"/runner/next?id={self.id}&instance={self.instance}&wait={wait}&ack={self.ack}", held=True)
             except (OSError, http.client.HTTPException, ValueError):   # a stop() closes the held poll's socket
                 if self.stopped.is_set():
                     return
                 time.sleep(0.05)
                 continue
+            self.polls.append(time.monotonic() - t0)
             if code != 200:
                 self.ended = (code, body)
                 return
-            for msg in body.get("messages", []):
+            messages = body.get("messages", [])
+            if messages and self.drop > 0:                    # lost on the way back: never read
+                self.drop -= 1
+                continue
+            if self.stopped.is_set():                         # stopped while the poll was on its way: hand out nothing
+                return
+            top = self.ack
+            for msg in messages:
+                seq = msg.get("seq")
+                if isinstance(seq, int):
+                    top = max(top, seq)
+                if seq in self.handled:                       # sent again: it was handled once already
+                    self.repeats += 1
+                    continue
+                self.handled.add(seq)
+                self.received.append(msg)
                 threading.Thread(target=self.on_job, args=(msg, self.reply_for(msg.get("job"))), daemon=True,
                                  name="fake-runner-job").start()
+            if messages and self.lose_ack > 0:
+                self.lose_ack -= 1
+            else:
+                self.ack = top
 
     def stop(self) -> None:
         """End the polling at once (the held poll's socket is shut) and wait for the thread."""

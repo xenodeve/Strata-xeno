@@ -550,10 +550,12 @@ class McpHub:
     def openai_tools(self) -> list[dict]:
         return [{"type": "function", "function": t} for t in self.template_tools()]
 
-    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None, ctx=None) -> dict:
+    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None, ctx=None,
+             progress=None) -> dict:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
         "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised.
-        `ctx`: the request's AgentContext, handed to a built-in server that asks for it (the coding tools)."""
+        `ctx`: the request's AgentContext, handed to a built-in server that asks for it (the coding tools).
+        `progress(word)`: handed only to a server with `wants_progress` (a runner's group, serve/runner_hub.py)."""
         t0 = time.monotonic()
         server, tool = self._routes.get(name) or self.routes().get(name, (None, name))
         out = {"server": server.name if server else None, "tool": tool}
@@ -561,11 +563,12 @@ class McpHub:
             text, ok = f"error: there is no tool named {name!r}", False
         else:
             try:
+                more = {"progress": progress} if getattr(server, "wants_progress", False) else {}
                 if getattr(server, "wants_context", False):
-                    res = server.call(tool, arguments if isinstance(arguments, dict) else {}, 0, cancel, ctx)       # a command's own timeout is its own parameter
+                    res = server.call(tool, arguments if isinstance(arguments, dict) else {}, 0, cancel, ctx, **more)       # a command's own timeout is its own parameter
                 else:
                     res = server.call(tool, arguments if isinstance(arguments, dict) else {},
-                                      float(self.settings["timeout_s"]), cancel)
+                                      float(self.settings["timeout_s"]), cancel, **more)
                 if getattr(server, "wants_context", False):               # the coding tools may give the model an image (Read): it goes with the result, not as text
                     for b in res.get("content") or []:
                         if isinstance(b, dict) and b.get("type") == "image" and isinstance(b.get("data"), str) and isinstance(b.get("mimeType"), str):

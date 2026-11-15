@@ -1,5 +1,5 @@
-"""serve/test_runner_hub.py - the runner channel's server side without HTTP (#310 part 2, task 1): runner ids,
-long-poll, presence, a second instance, the identity a runner belongs to.
+"""serve/test_runner_hub.py - the runner channel's server side without HTTP (#310 part 2, tasks 1-2): runner ids,
+long-poll, presence, a second instance, the identity a runner belongs to; jobs, seq / ack, the groups, the spans.
 
     python -m pytest serve/test_runner_hub.py -q
 """
@@ -165,7 +165,7 @@ class Hub(unittest.TestCase):
         self.assertLess(older[0][1] - t0, 0.5)
         r.push({"job": "j1", "answer": "allow"})
         t2.join(2.0)
-        self.assertEqual(newer, [[{"job": "j1", "answer": "allow"}]])   # the message reaches the live poll
+        self.assertEqual(newer, [[{"job": "j1", "answer": "allow", "seq": 1}]])   # the message reaches the live poll
 
     def test_hung_up_poll_takes_nothing(self):
         with mock.patch.object(runner_hub, "OFFLINE_S", 0.3):
@@ -186,7 +186,7 @@ class Hub(unittest.TestCase):
             gone2 = threading.Event()
             gone2.set()
             self.assertEqual(r.take(1.0, gone=gone2), [])       # a poll already hung up takes nothing either
-            self.assertEqual(r.take(0.0), [{"job": "j1", "answer": "allow"}])   # the message stayed queued
+            self.assertEqual(r.take(0.0), [{"job": "j1", "answer": "allow", "seq": 1}])   # the message stayed queued
 
     def test_close_wakes_held_polls(self):
         r = self.hello()
@@ -201,6 +201,208 @@ class Hub(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 1.0)
         self.assertEqual(got, [[]])
         self.assertEqual(r.ended, "closed")
+
+
+CODING = {"name": "agent", "kind": "coding", "status": "ready", "error": None,
+          "tools": [{"name": "Read", "description": "Reads a file.", "inputSchema": {"type": "object"}}]}
+
+
+def ctx(session="s1", **over):
+    """A stub of the request's AgentContext: what RunnerGroup.call reads and calls."""
+    c = SimpleNamespace(session=session, run_key="run-1", policy=SimpleNamespace(mode="ask"), in_helper=False,
+                        vision=True, asked=[], emitted=[], ask=None, question=None, emit=None)
+    c.ask = over.pop("ask", lambda card: c.asked.append(card) or "allow")
+    c.question = over.pop("question", lambda qs: {"answers": None})
+    c.emit = over.pop("emit", c.emitted.append)
+    for k, v in over.items():
+        setattr(c, k, v)
+    return c
+
+
+class Jobs(unittest.TestCase):
+    """Task 2: jobs, their delivery (seq / ack) and the groups, without HTTP."""
+
+    def setUp(self):
+        self.hub = runner_hub.RunnerHub()
+        self.addCleanup(self.hub.close)
+
+    def hello(self, groups=None, instance="inst-aaaa"):
+        return self.hub.hello("ann", "device-0001", instance, dict(INFO), groups or [CODING], [])
+
+    def test_messages_are_sent_again_until_acked(self):
+        r = self.hello()
+        r.push({"job": "j1", "answer": "allow"})
+        r.push({"job": "j1", "cancel": True})
+        first = r.take(0.0)
+        self.assertEqual([m["seq"] for m in first], [1, 2])
+        self.assertEqual(r.take(0.0), first)                    # the answer was lost on the way: sent again
+        self.assertEqual(r.take(0.0, ack=1), first[1:])         # what the runner confirmed leaves the outbox
+        t0 = time.monotonic()
+        self.assertEqual(r.take(0.3, ack=2), [])                # all confirmed: the poll waits again
+        self.assertGreaterEqual(time.monotonic() - t0, 0.25)
+        r.push({"job": "j1", "answer": "deny"})
+        self.assertEqual(r.take(0.0, ack=99), [{"job": "j1", "answer": "deny", "seq": 3}])   # an ack from another channel
+        self.assertEqual(r.take(0.0, ack=2), [{"job": "j1", "answer": "deny", "seq": 3}])
+
+    def test_channel_names_the_registration(self):
+        r = self.hello()
+        self.assertRegex(r.channel, r"^[0-9a-f]{16}$")
+        self.assertEqual(self.hello().channel, r.channel)       # the same process says hello again: same channel
+        new = self.hello(instance="inst-bbbb")                  # a new registration: seq starts again, so a new channel
+        self.assertNotEqual(new.channel, r.channel)
+        new.push({"job": "x"})
+        self.assertEqual(new.take(0.0)[0]["seq"], 1)
+
+    def test_submit_and_withdraw_before_pickup(self):
+        r = self.hello()
+        job = r.submit("tool", {"tool": "Read"})
+        self.assertIs(r.jobs[job.id], job)
+        self.assertIsNone(job.t_picked)
+        self.assertIsInstance(job.t_queued, float)
+        self.assertTrue(r.withdraw(job))                        # never handed out: taken back
+        self.assertEqual(r.take(0.0), [])
+        self.assertNotIn(job.id, r.jobs)
+        job2 = r.submit("tool", {"tool": "Read"})
+        self.assertEqual(r.take(0.0)[0]["job"], job2.id)
+        self.assertIsNotNone(job2.t_picked)
+        self.assertFalse(r.withdraw(job2))                      # a poll took it: the runner may be running it
+        self.assertIn(job2.id, r.jobs)
+
+    def test_finished_job_keeps_only_its_cancel(self):
+        r = self.hello()
+        job = r.submit("tool", {"tool": "Bash"})
+        r.take(0.0)
+        r.push({"job": job.id, "answer": "allow"})
+        r.push({"job": job.id, "cancel": True})
+        r.finish(job)
+        self.assertEqual(r.take(0.0), [{"job": job.id, "cancel": True, "seq": 3}])   # a lost cancel is sent again
+        self.assertFalse(r.deliver({"job": job.id, "result": {}}))
+
+    def test_submit_to_an_ended_runner_fails_at_once(self):
+        r = self.hello()
+        self.hub.end_all("ann")
+        job = r.submit("tool", {"tool": "Read"})
+        self.assertEqual(job.inbox.get_nowait(), {"job": job.id, "failed": runner_hub.REVOKED})
+        self.assertEqual(r.jobs, {})
+
+    def test_request_result_offline_and_timeout(self):
+        r = self.hello()
+
+        def answer():
+            msg = r.take(2.0)[0]
+            r.deliver({"job": msg["job"], "result": {"folders": ["C:\\work"]}})
+        t = threading.Thread(target=answer)
+        t.start()
+        self.assertEqual(r.request("page", {"route": "folders"}), {"folders": ["C:\\work"]})
+        t.join()
+        got = r.request("page", {"route": "folders"}, timeout=0.3)
+        self.assertEqual(got["error"], "timeout")
+        self.assertIn("ann-pc", got["message"])
+        self.assertEqual(r.jobs, {})
+        with mock.patch.object(runner_hub, "OFFLINE_S", 0.0):
+            got = r.request("page", {"route": "folders"}, timeout=5)
+        self.assertEqual(got["error"], "offline")
+        self.assertEqual(r.take(0.0, ack=99), [])               # the withdrawn page job is never handed out
+
+    def test_servers_are_named_for_the_server_side(self):
+        groups = [CODING, {"name": "skills", "kind": "skills", "status": "ready", "error": None, "tools": []},
+                  {"name": "github", "kind": "mcp", "status": "ready", "error": None, "tools": []},
+                  {"name": "agent", "kind": "mcp", "status": "failed", "error": "no npx", "tools": []},
+                  dict(CODING, name="second")]                  # a second coding group is not offered
+        r = self.hello(groups)
+        s = r.servers()
+        self.assertEqual(list(s), ["my_agent", "my_skills", "my_github", "my_agent_2"])
+        coding, mcp = s["my_agent"], s["my_github"]
+        self.assertEqual((coding.name, coding.kind, coding.machine, coding.local), ("my_agent", "runner", "my", "agent"))
+        self.assertTrue(coding.wants_progress and coding.wants_context and coding.plain_names and coding.hidden)
+        self.assertTrue(mcp.wants_progress)
+        self.assertFalse(getattr(mcp, "wants_context", False) or getattr(mcp, "plain_names", False)
+                         or getattr(mcp, "hidden", False))
+        self.assertEqual((s["my_agent_2"].status, s["my_agent_2"].error), ("failed", "no npx"))
+        self.assertEqual(coding.tools[0]["name"], "Read")
+        coding.start()
+        coding.close()
+
+    def test_revoke_fails_the_call_with_its_text(self):
+        r = self.hello()
+        group = r.servers()["my_agent"]
+        out = []
+        t = threading.Thread(target=lambda: out.append(group.call("Read", {}, 0, threading.Event(), ctx())))
+        t.start()
+        self.assertEqual(r.take(2.0)[0]["tool"], "Read")
+        t0 = time.monotonic()
+        self.hub.end_all("ann")
+        t.join(2.0)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertEqual(out[0], {"content": [{"type": "text", "text": "the key of this chat was revoked, so Read was "
+                                                                        "not finished."}], "isError": True})
+
+    def test_spans_written(self):
+        import json
+        import tempfile
+        from serve import timeline
+        path = str(Path(tempfile.mkdtemp()) / "tl.json")
+        timeline.configure(path)
+        self.addCleanup(timeline.configure, None)
+        r = self.hello()
+        group = r.servers()["my_agent"]
+        out = []
+        t = threading.Thread(target=lambda: out.append(group.call("Read", {}, 0, threading.Event(), ctx())))
+        t.start()
+        msg = r.take(2.0)[0]
+        time.sleep(0.05)
+        r.deliver({"job": msg["job"], "result": {"content": [{"type": "text", "text": "12345"}]}, "exec_ms": 7})
+        t.join(2.0)
+        self.assertEqual(out[0]["content"][0]["text"], "12345")
+        timeline.configure(None)
+        recs = [json.loads(line.rstrip().rstrip(",")) for line in open(path, encoding="utf-8") if line.startswith("{")]
+        spans = [x for x in recs if x.get("ph") == "X"]
+        self.assertEqual(sorted(x["name"] for x in spans), ["runner.call", "runner.call wait"])
+        call = next(x for x in spans if x["name"] == "runner.call")
+        wait = next(x for x in spans if x["name"] == "runner.call wait")
+        self.assertEqual(call["args"], {"a": 7, "b": 5})        # exec_ms, characters
+        self.assertEqual(call["ts"], wait["ts"])                # both start when the job was queued
+        self.assertLess(wait["dur"], call["dur"])               # picked up before the result came
+        self.assertGreaterEqual(call["dur"], 40_000)            # us: the 50 ms between pick-up and result
+
+
+class HubProgress(unittest.TestCase):
+    """McpHub.call's `progress`: only a server that asks for it gets it."""
+
+    class Plain:
+        name, kind, status, error, info = "plain", "builtin", "ready", None, {}
+        tools = [{"name": "echo", "description": "", "inputSchema": {"type": "object"}}]
+
+        def call(self, tool, arguments, timeout, cancel):          # no progress parameter: passing one would raise
+            return {"content": [{"type": "text", "text": f"echo {arguments.get('x')}"}], "isError": False}
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+    class Wants(Plain):
+        name, wants_progress = "wants", True
+        tools = [{"name": "say", "description": "", "inputSchema": {"type": "object"}}]
+
+        def call(self, tool, arguments, timeout, cancel, progress=None):
+            progress("running")
+            return {"content": [{"type": "text", "text": "said"}], "isError": False}
+
+    def test_hub_call_without_progress_unchanged(self):
+        from serve.mcp import McpHub
+        hub = McpHub({}, builtins={"plain": self.Plain(), "wants": self.Wants()})
+        before = hub.call("plain__echo", {"x": 1})
+        seen = []
+        after = hub.call("plain__echo", {"x": 1}, None, None, progress=seen.append)
+        before.pop("ms"), after.pop("ms")
+        self.assertEqual(before, after)
+        self.assertEqual(before, {"server": "plain", "tool": "echo", "ok": True, "text": "echo 1", "chars": 6,
+                                  "truncated": False})
+        self.assertEqual(seen, [])
+        self.assertEqual(hub.call("wants__say", {}, progress=seen.append)["text"], "said")
+        self.assertEqual(seen, ["running"])
 
 
 if __name__ == "__main__":

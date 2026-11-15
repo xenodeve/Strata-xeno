@@ -1,5 +1,6 @@
-"""serve/test_runner_http.py - the runner channel over HTTP (#310 part 2, task 1): POST /runner/hello, GET
-/runner/next, POST /runner/reply, GET /runners, against the mock engine in team mode and outside it.
+"""serve/test_runner_http.py - the runner channel over HTTP (#310 part 2, tasks 1-2): POST /runner/hello, GET
+/runner/next, POST /runner/reply, GET /runners, and tool jobs with their calls back through `FakeRunner`, against the
+mock engine in team mode and outside it.
 
     python -m pytest serve/test_runner_http.py -q
 """
@@ -18,7 +19,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import runner_hub  # noqa: E402
 from serve.identity import OWNER  # noqa: E402
+from serve.mcp import McpHub  # noqa: E402
 from serve.runner_fake import FakeRunner  # noqa: E402
+from serve.test_runner_hub import ctx  # noqa: E402
 from serve.test_identity_http import DEV1, DEV2, REMOTE, Base  # noqa: E402
 
 DEV0, DEV3 = "device-0000", "device-0003"
@@ -77,6 +80,7 @@ class Channel(RunnerBase):
         self.team()
         code, body = self.hello(self.ann)
         self.assertEqual(code, 200, body)
+        self.assertRegex(body.pop("channel"), r"^[0-9a-f]{16}$")
         self.assertEqual(body, {"runner": runner_hub.runner_id("ann", DEV1), "who": "ann", "protocol": 1, "poll_s": 2})
         code, got = self.poll(self.ann, body["runner"])
         self.assertEqual((code, got), (200, {"messages": []}))
@@ -125,7 +129,7 @@ class Channel(RunnerBase):
         self.assertEqual(self.reply("k", rid, device=DEV0, result={"content": []})[0], 404)   # the owner neither
         self.assertTrue(r.jobs["j1"].inbox.empty())                 # nothing reached ann's PC's job
         code, body = self.poll(self.ann, rid)
-        self.assertEqual((code, body), (200, {"messages": [{"job": "j1", "kind": "tool"}]}))
+        self.assertEqual((code, body), (200, {"messages": [{"job": "j1", "kind": "tool", "seq": 1}]}))
         self.assertEqual(self.reply(self.ann, rid, job="j9")[0], 404)   # unknown or finished job
         self.assertEqual(self.reply(self.ann, rid, result={"content": []}), (200, {"ok": True}))
 
@@ -154,6 +158,9 @@ class Channel(RunnerBase):
             self.assertLess(time.monotonic() - t0, 1.5)
         self.assertEqual(self.poll(self.ann, rid, wait="soon")[0], 400)
         self.assertEqual(self.poll(self.ann, rid, wait="nan")[0], 400)
+        for ack in ("-1", "x", "1.5", "9" * 19):
+            code, _ = self.req("GET", f"/runner/next?id={rid}&instance=inst-aaaa&wait=0&ack={ack}", key=self.ann, device=DEV1)
+            self.assertEqual(code, 400, ack)
 
     def test_overlapping_polls_newest_wins(self):
         self.team()
@@ -171,7 +178,7 @@ class Channel(RunnerBase):
         self.assertLess(older[0][1] - t0, 1.0)
         r.push({"job": "j1", "answer": "allow"})
         t2.join()
-        self.assertEqual(newer[0], (200, {"messages": [{"job": "j1", "answer": "allow"}]}))
+        self.assertEqual(newer[0], (200, {"messages": [{"job": "j1", "answer": "allow", "seq": 1}]}))
 
     def test_hung_up_poll_leaves_message_queued(self):
         self.team()
@@ -192,7 +199,7 @@ class Channel(RunnerBase):
             self.assertEqual(r._held, 0)
             self.assertLess(time.monotonic() - t0, 2.0)             # ended by the hang-up, not by the 10 s wait
             r.push({"job": "j1", "answer": "allow"})
-            self.assertEqual(self.poll(self.ann, rid), (200, {"messages": [{"job": "j1", "answer": "allow"}]}))
+            self.assertEqual(self.poll(self.ann, rid), (200, {"messages": [{"job": "j1", "answer": "allow", "seq": 1}]}))
 
     def test_runners_view_by_identity(self):
         self.team()
@@ -280,6 +287,269 @@ class Channel(RunnerBase):
         t0 = time.monotonic()
         fake.stop()
         self.assertLess(time.monotonic() - t0, 2.5)
+
+
+def text(t, error=False):
+    return {"content": [{"type": "text", "text": t}], "isError": error}
+
+
+class Calls(RunnerBase):
+    """Task 2: tool jobs over the channel, and the calls back during a job."""
+
+    def fake(self, on_job, **kw):
+        fake = FakeRunner(self.port, self.ann, DEV1, GROUPS, on_job, machine="ann-pc", **kw)
+        self.fakes.append(fake)
+        return fake
+
+    def hub_for(self, rid):
+        r = self.svc.runner_hub.get_for(rid, SimpleNamespace(name="ann"))
+        return McpHub({}, builtins=r.servers())
+
+    def call(self, hub, c=None, cancel=None, name="Read", arguments=None):
+        progress = []
+        r = hub.call(name, arguments or {"file_path": "a.txt"}, cancel or threading.Event(), c or ctx(),
+                     progress=progress.append)
+        return r, progress
+
+    def test_tool_job_round_trip(self):
+        self.team()
+        seen = []
+
+        def on_job(msg, reply):
+            seen.append(msg)
+            reply({"result": text("line 1"), "exec_ms": 3})
+        fake = self.fake(on_job)
+        r, progress = self.call(self.hub_for(fake.id))
+        self.assertEqual((r["ok"], r["text"], r["server"], r["tool"]), (True, "line 1", "my_agent", "Read"))
+        self.assertEqual(progress, ["sending", "running"])
+        msg = dict(seen[0])
+        self.assertIsInstance(msg.pop("job"), str)
+        self.assertIsInstance(msg.pop("seq"), int)
+        self.assertEqual(msg, {"kind": "tool", "group": "agent", "tool": "Read", "arguments": {"file_path": "a.txt"},
+                               "run": "run-1", "session": "s1", "mode": "ask", "helper": False, "vision": True,
+                               "timeout_s": 0})
+
+    def test_ask_is_served_by_ctx_ask(self):
+        self.team()
+        answers = queue.Queue()
+        card = {"tool": "Bash", "arguments": {"command": "rm x"}, "why": "outside the project", "danger": False}
+
+        def on_job(msg, reply):
+            if "kind" in msg:
+                reply({"ask": card})
+                got = answers.get(timeout=5)
+                reply({"result": text(f"ran after {got['answer']}")})
+            elif "answer" in msg:
+                answers.put(msg)
+        fake = self.fake(on_job)
+        c = ctx()
+        r, _ = self.call(self.hub_for(fake.id), c)
+        self.assertEqual(c.asked, [card])
+        self.assertEqual(r["text"], "ran after allow")
+        got = [m for m in fake.received if "answer" in m]
+        self.assertEqual([m["answer"] for m in got], ["allow"])
+
+    def test_question_and_emit_reach_ctx(self):
+        self.team()
+        answers = queue.Queue()
+        qs = [{"question": "Which one?", "options": [{"label": "A"}, {"label": "B"}]}]
+
+        def on_job(msg, reply):
+            if "kind" in msg:
+                reply({"emit": {"event": "todos", "todos": [{"content": "x", "status": "pending"}]}})
+                reply({"question": qs})
+                got = answers.get(timeout=5)
+                reply({"result": text(f"picked {got['answer']['answers']['Which one?']}")})
+            elif "answer" in msg:
+                answers.put(msg)
+        fake = self.fake(on_job)
+        asked = []
+        c = ctx(question=lambda q: asked.append(q) or {"answers": {"Which one?": "B"}})
+        r, _ = self.call(self.hub_for(fake.id), c)
+        self.assertEqual(r["text"], "picked B")
+        self.assertEqual(asked, [qs])
+        self.assertEqual(c.emitted, [{"event": "todos", "todos": [{"content": "x", "status": "pending"}]}])
+
+    def test_cancel_reaches_runner(self):
+        self.team()
+        cancels = queue.Queue()
+        honour = [True]
+
+        def on_job(msg, reply):
+            if "kind" in msg:
+                cancels.get(timeout=5)
+                if honour[0]:
+                    reply({"result": text("stopped by the user", error=True)})
+            elif msg.get("cancel"):
+                cancels.put(msg)
+        fake = self.fake(on_job)
+        hub = self.hub_for(fake.id)
+        cancel = threading.Event()
+        threading.Timer(0.3, cancel.set).start()
+        t0 = time.monotonic()
+        r, progress = self.call(hub, cancel=cancel)
+        self.assertEqual(r["text"], "error: stopped by the user")     # the runner's own result, within the grace
+        self.assertLess(time.monotonic() - t0, 2.0)
+        honour[0] = False                                             # a runner that never answers the cancel
+        with mock.patch.object(runner_hub, "CANCEL_GRACE_S", 0.5):
+            cancel = threading.Event()
+            threading.Timer(0.3, cancel.set).start()
+            t0 = time.monotonic()
+            r, _ = self.call(hub, cancel=cancel)
+        self.assertEqual(r["text"], "error: The request was cancelled.")
+        self.assertLess(time.monotonic() - t0, 0.3 + 0.5 + 0.6)
+
+    def test_offline_before_pickup(self):
+        self.team()
+        rid = self.hello(self.ann)[1]["runner"]                     # said hello, but nothing polls
+        with mock.patch.object(runner_hub, "OFFLINE_S", 0.3):
+            t0 = time.monotonic()
+            r, progress = self.call(self.hub_for(rid))
+            self.assertLess(time.monotonic() - t0, 1.3)
+        self.assertEqual(r["text"], "error: your PC (ann-pc) is offline, so Read was not run. Tell the user; do not "
+                                    "retry it until they say their PC is back.")
+        self.assertEqual(progress, ["sending", "offline"])
+        self.assertEqual(self.poll(self.ann, rid), (200, {"messages": []}))   # the job is never handed out later
+
+    def test_offline_after_pickup_fails_with_text(self):
+        self.team()
+        picked = threading.Event()
+        with mock.patch.object(runner_hub, "OFFLINE_S", 0.5):
+            fake = self.fake(lambda msg, reply: picked.set())
+            hub = self.hub_for(fake.id)
+            out = []
+            t = threading.Thread(target=lambda: out.append(self.call(hub)))
+            t.start()
+            self.assertTrue(picked.wait(5))
+            fake.stop()                                             # the lid closes: no more polls, no reply
+            t0 = time.monotonic()
+            t.join(5)
+            self.assertLess(time.monotonic() - t0, runner_hub.OFFLINE_S + 1)
+        r, progress = out[0]
+        self.assertEqual(r["text"], "error: your PC (ann-pc) went offline while Read was running; whether it finished "
+                                    "is unknown. Tell the user, and check the state before you repeat it.")
+        self.assertEqual(progress, ["sending", "running", "offline"])
+
+    def test_long_approval_spans_many_polls(self):
+        self.team()
+        answers = queue.Queue()
+
+        def on_job(msg, reply):
+            if "kind" in msg:
+                reply({"ask": {"tool": "Bash", "arguments": {"command": "make"}}})
+                got = answers.get(timeout=10)
+                reply({"result": text(f"answer {got['answer']}")})
+            elif "answer" in msg:
+                answers.put(msg)
+
+        def slow_ask(card):
+            time.sleep(3.0)                                         # the user takes their time
+            return "allow"
+        with mock.patch.object(runner_hub, "POLL_MAX_S", 0.5):
+            fake = self.fake(on_job)
+            r, _ = self.call(self.hub_for(fake.id), ctx(ask=slow_ask))
+        self.assertEqual(r["text"], "answer allow")
+        self.assertGreaterEqual(len(fake.polls), 5)                 # the wait was carried by many short polls
+        self.assertLessEqual(max(fake.polls), 1.5, fake.polls)
+
+    def test_two_chats_share_one_runner(self):
+        self.team()
+        second_done = threading.Event()
+
+        def on_job(msg, reply):
+            if "kind" not in msg:
+                return
+            if msg["session"] == "s1":
+                second_done.wait(5)                                 # the first call is answered last
+                reply({"result": text("for s1")})
+            else:
+                reply({"result": text("for s2")})
+                second_done.set()
+        fake = self.fake(on_job)
+        hub = self.hub_for(fake.id)
+        out, order = {}, []
+
+        def run(s):
+            out[s] = self.call(hub, ctx(session=s))[0]["text"]
+            order.append(s)
+        ts = [threading.Thread(target=run, args=(s,)) for s in ("s1", "s2")]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertEqual(out, {"s1": "for s1", "s2": "for s2"})
+        self.assertEqual(order, ["s2", "s1"])
+
+    def test_revoke_fails_open_job(self):
+        self.team()
+        picked = threading.Event()
+        fake = self.fake(lambda msg, reply: picked.set())           # picks the job up and never answers
+        hub = self.hub_for(fake.id)
+        out = []
+        t = threading.Thread(target=lambda: out.append(self.call(hub)))
+        t.start()
+        self.assertTrue(picked.wait(5))
+        t0 = time.monotonic()
+        code, body = self.req("POST", "/keys", {"action": "revoke", "name": "ann"}, key="k", device=DEV0)
+        self.assertEqual(code, 200, body)
+        t.join(5)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(out[0][0]["text"], "error: the key of this chat was revoked, so Read was not finished.")
+        fake.thread.join(5)
+        self.assertEqual(fake.ended[0], 401)
+
+    def test_dropped_poll_result_is_sent_again(self):
+        """A poll result lost on the way back (the runner's connection died after the server wrote it): the job,
+        the answer and the cancel each arrive on the next poll, and each runs once."""
+        self.team()
+        answers, cancels, ready = queue.Queue(), queue.Queue(), threading.Event()
+        fake = None
+
+        def on_job(msg, reply):
+            if msg.get("kind") and msg["arguments"].get("step") == "job":
+                reply({"result": text("job ran")})
+            elif msg.get("kind") and msg["arguments"].get("step") == "answer":
+                fake.drop = 1                                       # the answer's poll result is lost
+                reply({"ask": {"tool": "Bash"}})
+                reply({"result": text(f"answer {answers.get(timeout=5)['answer']}")})
+            elif msg.get("kind"):
+                fake.drop = 1                                       # the cancel's poll result is lost
+                ready.set()
+                cancels.get(timeout=5)
+                reply({"result": text("cancel seen", error=True)})
+            elif "answer" in msg:
+                answers.put(msg)
+            elif msg.get("cancel"):
+                cancels.put(msg)
+        fake = self.fake(on_job)
+        hub = self.hub_for(fake.id)
+        fake.drop = 1                                               # the job's poll result is lost
+        self.assertEqual(self.call(hub, arguments={"step": "job"})[0]["text"], "job ran")
+        self.assertEqual(self.call(hub, arguments={"step": "answer"})[0]["text"], "answer allow")
+        cancel = threading.Event()
+        threading.Thread(target=lambda: ready.wait(5) and cancel.set()).start()
+        self.assertEqual(self.call(hub, cancel=cancel, arguments={"step": "cancel"})[0]["text"], "error: cancel seen")
+        self.assertEqual(fake.drop, 0)                              # all three were dropped once
+        kinds = [("kind" in m, "answer" in m, "cancel" in m) for m in fake.received]
+        self.assertEqual(kinds.count((True, False, False)), 3)      # each job ran once
+        self.assertEqual(kinds.count((False, True, False)), 1)
+        self.assertEqual(kinds.count((False, False, True)), 1)
+
+    def test_lost_ack_runs_once(self):
+        """The runner got the job but its ack did not arrive: the server sends it again, and the runner ignores it."""
+        self.team()
+        runs = []
+
+        def on_job(msg, reply):
+            if "kind" in msg:
+                runs.append(msg["seq"])
+                time.sleep(0.3)                                     # still running when the job comes again
+                reply({"result": text("ran")})
+        fake = self.fake(on_job)
+        fake.lose_ack = 1
+        self.assertEqual(self.call(self.hub_for(fake.id))[0]["text"], "ran")
+        self.assertEqual(len(runs), 1)
+        self.assertGreaterEqual(fake.repeats, 1)                    # it did come again
 
 
 class OutsideTeamMode(RunnerBase):
