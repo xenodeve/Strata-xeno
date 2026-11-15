@@ -61,6 +61,17 @@ REPLY_KEYS = ("result", "exec_ms", "ask", "question", "emit")   # what a runner'
 INSTANCE = re.compile(r"[A-Za-z0-9_-]{8,64}")     # a runner process's own random id
 KINDS = ("coding", "mcp", "skills")
 MAX_GROUPS, MAX_TOOLS, MAX_SKILLS = 64, 1000, 2000
+RUN_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,80}")     # the run key a runner answers `run.start` with (task 3)
+SERVER_TOOLS = ("WebFetch", "WebSearch", "Task")   # the coding tools that run on the server even for a project on the engineer's PC
+
+
+class RunnerUnavailable(Exception):
+    """A run on the engineer's PC could not start: its runner is offline, did not answer the facts job (`run.start`) in
+    time, or answered what the server cannot read.  `message` says which, in words for the page (task 4: a 409)."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
 
 
 def _text(value, most: int, empty: bool = True) -> bool:
@@ -383,6 +394,41 @@ class Job:
         """Its runner ended (`text`: why, one of the hub's reasons): the waiting call wakes at once."""
         self.failed = text
         self.inbox.put({"job": self.id, "failed": text})
+
+
+def run_facts(res, machine: str, max_dirs: int, max_memory: int) -> dict:
+    """A runner's answer to `run.start` (task 3), checked and copied: {"run", "cwd", "dirs", "shell", "platform", "git",
+    "memory", "tools"}.  `Runner.request`'s error, or any field of the wrong shape, raises RunnerUnavailable, so a
+    run never starts on facts the server cannot read.  No folder means no other folders; the notes' text is cut at
+    `max_memory` characters in all, as on the server (serve/memory.py)."""
+    if isinstance(res, dict) and "error" in res:
+        msg = res.get("message")
+        raise RunnerUnavailable(msg if isinstance(msg, str) and msg else f"your PC ({machine}) did not answer")
+    bad = RunnerUnavailable(f"your PC's runner ({machine}) sent facts about the project that the server could not read")
+    path = lambda v: isinstance(v, str) and 0 < len(v) <= 4096 and "\0" not in v      # noqa: E731
+    if not isinstance(res, dict) or not isinstance(res.get("run"), str) or not RUN_KEY.fullmatch(res["run"]):
+        raise bad
+    cwd, dirs, sh, plat, git = res.get("cwd"), res.get("dirs", []), res.get("shell"), res.get("platform"), res.get("git")
+    memory, tools = res.get("memory", []), res.get("tools", [])
+    if not (cwd is None or path(cwd)) or not isinstance(dirs, list) or not all(path(d) for d in dirs) \
+            or not (sh is None or _text(sh, 80, empty=False)) or not _text(plat, 40, empty=False) \
+            or not isinstance(git, bool) or not isinstance(tools, list) or len(tools) > MAX_TOOLS \
+            or not all(_text(t, 64, empty=False) for t in tools) or not isinstance(memory, list) or len(memory) > 200:
+        raise bad
+    blocks, left = [], max_memory
+    for b in memory:
+        if not isinstance(b, dict) or not _text(b.get("name"), 500, empty=False) or not isinstance(b.get("text"), str) \
+                or not all(b.get(k) is None or _text(b.get(k), 100) for k in ("id", "kind", "label")):
+            raise bad
+        if left <= 0:
+            continue
+        text, cut = b["text"], b.get("cut") is True
+        if len(text) > left:
+            text, cut = text[:left], True
+        left -= len(text)
+        blocks.append({k: b[k] for k in ("id", "kind", "label") if b.get(k) is not None} | {"name": b["name"], "text": text, "cut": cut})
+    return {"run": res["run"], "cwd": cwd, "dirs": list(dirs[:max_dirs]) if cwd else [], "shell": sh, "platform": plat,
+            "git": git, "memory": blocks, "tools": list(dict.fromkeys(tools))}
 
 
 def _error(text: str) -> dict:

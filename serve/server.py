@@ -3147,18 +3147,12 @@ class Service:
             on = []
         return memory_mod.collect(home, folders, on)
 
-    def start_agent_run(self, sa: dict, messages: list, who: str = "owner"):
+    def start_agent_run(self, sa: dict, messages: list, who: str = "owner", runner=None):
         """One request's use of the coding tools: the folder, mode, rules and chat the page named (anything odd is ignored), the rules for the
-        AI as a prompt, and auto mode's judge (serve/agent_run.py).  `who`: the identity whose request it is; only it answers what the run asks (#310)."""
-        raw = sa.get("cwd")
-        folder = os.path.realpath(raw) if isinstance(raw, str) and raw.strip() and "\0" not in raw and os.path.isdir(raw) else None
-        dirs: list[str] = []                                            # the project's other folders: the real ones, once each, not the main one; none without a main one
-        for d in sa.get("dirs") if folder and isinstance(sa.get("dirs"), list) else []:
-            if isinstance(d, str) and d.strip() and "\0" not in d and os.path.isdir(d):
-                r = os.path.realpath(d)
-                if os.path.normcase(r) != os.path.normcase(folder) and os.path.normcase(r) not in [os.path.normcase(x) for x in dirs]:
-                    dirs.append(r)
-        dirs = dirs[:agent_mod.MAX_DIRS]
+        AI as a prompt, and auto mode's judge (serve/agent_run.py).  `who`: the identity whose request it is; only it answers what the run asks (#310).
+        `runner` (#310 part 2): the serve/runner_hub.py Runner of a project on the engineer's own PC.  Its `run.start` job (the facts job) gives
+        the real folders, the shell, the platform, git and the notes, and the server touches none of its own disk, hooks or checkpoints for
+        the run; web access, helpers, vision and the judge stay the server's.  RunnerUnavailable when the job fails (before any run is made)."""
         mode = sa.get("mode") if sa.get("mode") in ("auto", "plan") else None
         rules = lambda v: [x for x in v if isinstance(x, str) and 0 < len(x) <= 500][:200] if isinstance(v, list) else []      # noqa: E731
         sid = sa.get("session") if isinstance(sa.get("session"), str) and 0 < len(sa["session"]) <= 80 else "default"
@@ -3168,27 +3162,38 @@ class Service:
                 c = m.get("content")
                 goal = c if isinstance(c, str) else "".join(p.get("text", "") for p in c if isinstance(p, dict)) if isinstance(c, list) else ""
                 break
+
+        def read_conf() -> dict:
+            try:
+                return harness._cfg(self)
+            except Exception:  # noqa: BLE001 - a config that cannot be read means the defaults: no web access, no hooks
+                return {}
         sh = getattr(self.agent, "shell", None)
-        policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs,
-                                    protected=[p for p in (self.config_path, self.mcp_config_path) if p])   # hooks, web access and keys live there: never changed unasked
-        run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell_mod.describe(sh) if sh else None,
-                                 who=who)
         cp = sa.get("checkpoint")
-        if isinstance(cp, str) and sid != "default":
-            run.ctx.checkpoint = self.checkpoints.scope(sid, cp)                  # this prompt's checkpoint: the files the tools change are kept as they were
-        git, d = False, folder
-        for _ in range(6):                                              # the folder or one of the folders above it holds .git
-            if not d:
-                break
-            if os.path.exists(os.path.join(d, ".git")):
-                git = True
-                break
-            parent = os.path.dirname(d)
-            d = parent if parent != d else None
-        try:
-            conf = harness._cfg(self)
-        except Exception:  # noqa: BLE001 - a config that cannot be read means the defaults: no web access, no hooks
-            conf = {}
+        if runner is None:
+            folder, dirs = folders_mod.resolve(sa.get("cwd"), sa.get("dirs"), agent_mod.MAX_DIRS)     # the real ones, once each, not the main one; none without a main one
+            shell, facts, conf = shell_mod.describe(sh) if sh else None, None, None
+            protected = [p for p in (self.config_path, self.mcp_config_path) if p]                 # hooks, web access and keys live there: never changed unasked
+        else:
+            conf = read_conf()
+            path = lambda v: isinstance(v, str) and bool(v.strip()) and "\0" not in v and len(v) <= 4096    # noqa: E731 - the runner finds the real ones
+            raw_dirs = sa.get("dirs") if isinstance(sa.get("dirs"), list) else []
+            facts = runner_hub.run_facts(runner.request("run.start", {
+                "cwd": sa.get("cwd") if path(sa.get("cwd")) else None, "dirs": [d for d in raw_dirs[:200] if path(d)], "mode": mode,
+                "allow": rules(sa.get("allow")), "deny": rules(sa.get("deny")), "session": sid,
+                "checkpoint": cp if isinstance(cp, str) and len(cp) <= 200 and sid != "default" else None,
+                "memory_on": memory_mod.settings(conf)["on"]}), runner.info.get("machine") or "?", agent_mod.MAX_DIRS, memory_mod.MAX_TOTAL)
+            folder, dirs, shell = facts["cwd"], facts["dirs"], facts["shell"]
+            protected = []                                              # the runner keeps its own files from the tools; the server's are not there
+        policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs, protected=protected)
+        run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell, who=who)
+        if facts is None:
+            if isinstance(cp, str) and sid != "default":
+                run.ctx.checkpoint = self.checkpoints.scope(sid, cp)              # this prompt's checkpoint: the files the tools change are kept as they were
+            git = folders_mod.in_git(folder)                            # the folder or one of the folders above it holds .git
+            conf = read_conf()
+        else:                                                           # the runner keeps the checkpoint and found .git
+            run.ctx.run_key, run.coding, run.runner, git = facts["run"], "my_agent", runner, facts["git"]
         web = web_mod.settings(conf)
         run.hidden = set() if web["on"] else set(getattr(self.agent, "web_tools", ()))          # web access is off until the user switches it on: the model is not even offered the tools
         if web["on"]:
@@ -3198,14 +3203,22 @@ class Service:
             run.ctx.spawn = lambda kind, prompt, description: subagent_mod.execute(self, run, kind, prompt, description, run_with_mcp)
         else:
             run.hidden |= set(helpers)
-        tools = [t["name"] for t in self.agent.tools if (t["name"] != "ExitPlanMode" or mode == "plan") and t["name"] not in run.hidden]
-        run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
-        defined, _problems = hooks_mod.load(conf)
+        if facts is None:
+            tools = [t["name"] for t in self.agent.tools if (t["name"] != "ExitPlanMode" or mode == "plan") and t["name"] not in run.hidden]
+            run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
+        else:                                                           # the runner's coding tools, then the server's own that run here
+            ours = {t["name"] for t in getattr(self.agent, "tools", None) or []}
+            names = [n for n in facts["tools"] if n not in runner_hub.SERVER_TOOLS] + [n for n in runner_hub.SERVER_TOOLS if n in ours]
+            tools = [n for n in names if (n != "ExitPlanMode" or mode == "plan") and n not in run.hidden]
+            run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), facts["platform"], git, None, tools, dirs, facts["memory"])
         run.ctx.vision = self.vision is not None and not self._vision_down()          # Read can give an image to the model only when the vision encoder is there
-        runner = hooks_mod.Runner(defined, sh, folder, sid, run._emit, lambda: run.cancel.is_set(), begin=run._emit)
-        if runner:
-            run.ctx.hooks = run.hooks = runner
-            said = runner.prompt(goal)                                   # the user's own prompt hooks: what they print goes to the model with the rules
+        if facts is not None:                                           # no hooks for a project on the engineer's PC (v1): the server's run on the server
+            return run
+        defined, _problems = hooks_mod.load(conf)
+        hooks = hooks_mod.Runner(defined, sh, folder, sid, run._emit, lambda: run.cancel.is_set(), begin=run._emit)
+        if hooks:
+            run.ctx.hooks = run.hooks = hooks
+            said = hooks.prompt(goal)                                    # the user's own prompt hooks: what they print goes to the model with the rules
             if said:
                 run.prompt += "\n\n" + said
         return run

@@ -64,6 +64,42 @@ class Look(unittest.TestCase):
         self.assertTrue(seen["truncated"])
 
 
+class Helpers(unittest.TestCase):
+    """#310 part 2: the folder rules of a coding run, shared by the server and the runner on the engineer's PC."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name).resolve()
+
+    def test_resolve_matches_old_rules(self):
+        main, other, third = self.base / "main", self.base / "other", self.base / "third"
+        for d in (main, other, third):
+            d.mkdir()
+        (self.base / "a-file.txt").write_text("x", encoding="utf-8")
+        real = lambda p: os.path.realpath(str(p))      # noqa: E731
+        self.assertEqual(folders.resolve(str(main), [], 20), (real(main), []))
+        for bad in (None, "", "   ", "a\0b", str(self.base / "nope"), str(self.base / "a-file.txt"), 7):
+            self.assertEqual(folders.resolve(bad, [str(other)], 20), (None, []), bad)       # no main folder: no other folders either
+        flip = str(other).swapcase() if os.name == "nt" else str(other)
+        got = folders.resolve(str(main), [str(main), str(other), flip, "", "a\0b", 3, str(self.base / "nope"),
+                                          str(self.base / "a-file.txt"), str(third)], 20)
+        self.assertEqual(got, (real(main), [real(other), real(third)]))   # the main one, a repeat (any case on Windows) and non-folders are dropped
+        self.assertEqual(folders.resolve(str(main), [str(other), str(third)], 1), (real(main), [real(other)]))
+        self.assertEqual(folders.resolve(str(main), "not a list", 20), (real(main), []))
+
+    def test_in_git_walks_six_parents(self):
+        deep = self.base.joinpath("a", "b", "c", "d", "e", "f")
+        deep.mkdir(parents=True)
+        self.assertFalse(folders.in_git(str(deep)))
+        self.assertFalse(folders.in_git(None))
+        (self.base / ".git").mkdir()                    # seven levels up from `deep`: past the walk
+        self.assertFalse(folders.in_git(str(deep)))
+        self.assertTrue(folders.in_git(str(self.base / "a")))
+        (self.base / "a" / ".git").write_text("gitdir: elsewhere", encoding="utf-8")      # a worktree's .git file counts; the folder and five above it
+        self.assertTrue(folders.in_git(str(deep)))
+
+
 class TheRoute(Fixture):
     def get(self, path, headers=None):
         req = urllib.request.Request(self.base_url + path, headers=headers or {})

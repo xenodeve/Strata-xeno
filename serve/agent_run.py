@@ -112,6 +112,9 @@ class AgentRun:
         self.prompt = ""                                       # the rules for the AI (serve/agent_prompt.py), set by the server
         self.hidden: set = set()                               # coding tools that are not offered to the model in this request (web access, until it is switched on)
         self.hooks = None                                      # serve/hooks.py Runner, when the user has hooks
+        self.hub = None                                        # #310 part 2: the request's own view of the tool groups (task 4); None: the server's hub
+        self.coding = "agent"                                  # #310 part 2: the coding group the run's calls go to: "my_agent" for a project on the engineer's PC
+        self.runner = None                                     # #310 part 2: the serve/runner_hub.py Runner of a project on the engineer's PC, else None
         self.kw, self.sampling = {}, {}                        # the request's template settings and sampling: a helper (serve/subagent.py) runs with the same
         self.limit_hit = False                                 # the tool loop stopped at its limit of rounds
         self.steers: queue.Queue = queue.Queue()               # what the user sent while the agent worked: read by the model at the next step (serve/server.py run_with_mcp)
