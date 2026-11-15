@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import queue
+import socket
 import sys
 import threading
 import time
@@ -153,6 +154,45 @@ class Channel(RunnerBase):
             self.assertLess(time.monotonic() - t0, 1.5)
         self.assertEqual(self.poll(self.ann, rid, wait="soon")[0], 400)
         self.assertEqual(self.poll(self.ann, rid, wait="nan")[0], 400)
+
+    def test_overlapping_polls_newest_wins(self):
+        self.team()
+        rid = self.hello(self.ann)[1]["runner"]
+        r = self.svc.runner_hub.get_for(rid, SimpleNamespace(name="ann"))
+        older, newer = [], []
+        t1 = threading.Thread(target=lambda: older.append((self.poll(self.ann, rid, wait=2), time.monotonic())))
+        t1.start()
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        t2 = threading.Thread(target=lambda: newer.append(self.poll(self.ann, rid, wait=2)))
+        t2.start()
+        t1.join()
+        self.assertEqual(older[0][0], (200, {"messages": []}))
+        self.assertLess(older[0][1] - t0, 1.0)
+        r.push({"job": "j1", "answer": "allow"})
+        t2.join()
+        self.assertEqual(newer[0], (200, {"messages": [{"job": "j1", "answer": "allow"}]}))
+
+    def test_hung_up_poll_leaves_message_queued(self):
+        self.team()
+        rid = self.hello(self.ann)[1]["runner"]
+        r = self.svc.runner_hub.get_for(rid, SimpleNamespace(name="ann"))
+        with mock.patch.object(runner_hub, "POLL_MAX_S", 10.0):
+            sock = socket.create_connection(("127.0.0.1", self.port))
+            sock.sendall((f"GET /runner/next?id={rid}&instance=inst-aaaa&wait=10 HTTP/1.0\r\nHost: 127.0.0.1\r\n"
+                          f"Authorization: Bearer {self.ann}\r\nX-Strata-Device: {DEV1}\r\n\r\n").encode())
+            deadline = time.monotonic() + 2
+            while r._held == 0 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(r._held, 1)                            # the poll is held
+            sock.close()                                            # the runner's network drops
+            t0 = time.monotonic()
+            while r._held and time.monotonic() - t0 < 5:
+                time.sleep(0.02)
+            self.assertEqual(r._held, 0)
+            self.assertLess(time.monotonic() - t0, 2.0)             # ended by the hang-up, not by the 10 s wait
+            r.push({"job": "j1", "answer": "allow"})
+            self.assertEqual(self.poll(self.ann, rid), (200, {"messages": [{"job": "j1", "answer": "allow"}]}))
 
     def test_runners_view_by_identity(self):
         self.team()

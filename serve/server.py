@@ -6766,7 +6766,14 @@ def make_handler(svc: Service):
                 wait = math.nan
             if not math.isfinite(wait):
                 return self._json(400, {"error": {"message": "wait is a number of seconds"}})
-            messages = r.take(min(max(wait, 0.0), runner_hub.POLL_MAX_S))
+            gone = threading.Event()                 # the runner hung up: the held poll ends and takes nothing
+            self._watch_client(gone)
+            try:
+                messages = r.take(min(max(wait, 0.0), runner_hub.POLL_MAX_S), gone=gone)
+            finally:
+                self.watch_done.set()
+            if gone.is_set():
+                return                                       # nobody to answer: the messages stay for the next poll
             if r.ended == "replaced":
                 return self._json(409, RUNNER_REPLACED)
             if r.ended == "revoked":

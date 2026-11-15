@@ -70,14 +70,17 @@ def check_hello(body: dict) -> tuple[dict, list, list] | str:
     for g in groups:
         if not isinstance(g, dict) or not _text(g.get("name"), 64, empty=False) or g.get("kind") not in KINDS:
             return 'groups: each one {"name", "kind": "coding" | "mcp" | "skills", "status", "error", "tools"}'
-        if g.get("status") is not None and not _text(g["status"], 40) or                 g.get("error") is not None and not _text(g["error"], 4000):
+        if (g.get("status") is not None and not _text(g["status"], 40)
+                or g.get("error") is not None and not _text(g["error"], 4000)):
             return "groups: status and error are text or null"
         tools = g.get("tools") or []
         if not isinstance(tools, list) or len(tools) > MAX_TOOLS:
             return f"groups: tools is a list of at most {MAX_TOOLS}"
         out_tools = []
         for t in tools:
-            if not isinstance(t, dict) or not _text(t.get("name"), 128, empty=False) or                     t.get("description") is not None and not _text(t["description"], 100_000) or                     t.get("inputSchema") is not None and not isinstance(t["inputSchema"], dict):
+            if (not isinstance(t, dict) or not _text(t.get("name"), 128, empty=False)
+                    or t.get("description") is not None and not _text(t["description"], 100_000)
+                    or t.get("inputSchema") is not None and not isinstance(t["inputSchema"], dict)):
                 return 'groups: each tool {"name", "description", "inputSchema"}'
             out_tools.append({"name": t["name"], "description": t.get("description") or "",
                               "inputSchema": t.get("inputSchema") or {"type": "object"}})
@@ -85,7 +88,9 @@ def check_hello(body: dict) -> tuple[dict, list, list] | str:
                            "tools": out_tools})
     out_skills = []
     for k in skills:
-        if not isinstance(k, dict) or not _text(k.get("name"), 200, empty=False) or                 k.get("description") is not None and not _text(k["description"], 10_000) or                 k.get("app") is not None and not _text(k["app"], 80):
+        if (not isinstance(k, dict) or not _text(k.get("name"), 200, empty=False)
+                or k.get("description") is not None and not _text(k["description"], 10_000)
+                or k.get("app") is not None and not _text(k["app"], 80)):
             return 'skills: each one {"name", "description", "app"}'
         out_skills.append({"name": k["name"], "description": k.get("description") or "", "app": k.get("app")})
     info = {"machine": body["machine"], "platform": body["platform"], "shell": body.get("shell"), "home": body["home"]}
@@ -115,7 +120,8 @@ class Runner:
         self.ended: str | None = None
         self.cond = threading.Condition()
         self._out: list[dict] = []              # messages for the next poll
-        self._held = 0                          # polls held now
+        self._held = 0                          # polls held now (at most one waits: the newest wins)
+        self._poll = 0                          # the newest poll's number: an older one stops waiting
         self._seen = time.monotonic()           # the last hello, or the start or end of a poll
 
     def online(self, now: float | None = None) -> bool:
@@ -137,21 +143,33 @@ class Runner:
             self.cond.notify_all()
             return True
 
-    def take(self, wait: float) -> list[dict]:
+    def take(self, wait: float, gone: threading.Event | None = None) -> list[dict]:
         """The messages queued for this runner, waiting at most `wait` seconds for the first one; [] at the end of the
         wait, or at once when the runner ends meanwhile (the route then tells the poll why).  A message that starts a
-        job (it has a "kind") marks that job picked up (`t_picked`, time.monotonic())."""
+        job (it has a "kind") marks that job picked up (`t_picked`, time.monotonic()).
+
+        The newest poll wins: a poll still held when a newer one arrives returns [] at once, so a stale connection (the
+        runner reconnected after its network dropped) never takes the messages meant for the live one, and at most
+        one poll per runner waits.  `gone` is set when the poll's client hung up (the route's watcher): the poll then
+        returns [] without taking anything, and the messages stay for the next poll."""
         deadline = time.monotonic() + max(0.0, wait)
         with self.cond:
+            self._poll += 1
+            mine = self._poll
+            self.cond.notify_all()                  # an older held poll sees it is no longer the newest
             self._held += 1
             self._seen = time.monotonic()
+            dead = False
             try:
-                while not self._out and self.ended is None:
+                while not self._out and self.ended is None and self._poll == mine:
+                    if gone is not None and gone.is_set():
+                        break
                     left = deadline - time.monotonic()
                     if left <= 0:
                         break
-                    self.cond.wait(left)
-                if self.ended is not None:
+                    self.cond.wait(left if gone is None else min(left, 0.25))
+                dead = gone is not None and gone.is_set()
+                if self.ended is not None or self._poll != mine or dead:
                     return []
                 out, self._out = self._out, []
                 now = time.monotonic()
@@ -163,7 +181,8 @@ class Runner:
                 return out
             finally:
                 self._held -= 1
-                self._seen = time.monotonic()
+                if not dead:                        # a hang-up is no sign of life
+                    self._seen = time.monotonic()
 
     def deliver(self, msg: dict) -> bool:
         """A message from the runner for one of its jobs (POST /runner/reply); False for a job that is unknown or

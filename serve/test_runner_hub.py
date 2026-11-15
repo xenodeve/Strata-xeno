@@ -150,6 +150,44 @@ class Hub(unittest.TestCase):
         self.assertEqual([v["who"] for v in self.hub.view(OWNER)], ["bob"])
         self.assertIsNone(b.ended)
 
+    def test_newest_poll_wins(self):
+        r = self.hello()
+        older, newer = [], []
+        t1 = threading.Thread(target=lambda: older.append((r.take(5.0), time.monotonic())))
+        t1.start()
+        time.sleep(0.1)
+        t0 = time.monotonic()
+        t2 = threading.Thread(target=lambda: newer.append(r.take(5.0)))
+        t2.start()
+        t1.join(2.0)
+        self.assertFalse(t1.is_alive())
+        self.assertEqual(older[0][0], [])                       # the stale poll ends at once, empty
+        self.assertLess(older[0][1] - t0, 0.5)
+        r.push({"job": "j1", "answer": "allow"})
+        t2.join(2.0)
+        self.assertEqual(newer, [[{"job": "j1", "answer": "allow"}]])   # the message reaches the live poll
+
+    def test_hung_up_poll_takes_nothing(self):
+        with mock.patch.object(runner_hub, "OFFLINE_S", 0.3):
+            r = self.hello()
+            gone = threading.Event()
+            got = []
+            t = threading.Thread(target=lambda: got.append(r.take(5.0, gone=gone)))
+            t.start()
+            time.sleep(0.4)
+            t0 = time.monotonic()
+            gone.set()
+            t.join(2.0)
+            self.assertFalse(t.is_alive())
+            self.assertLess(time.monotonic() - t0, 0.5)
+            self.assertEqual(got, [[]])
+            self.assertFalse(r.online())                        # a hang-up is no sign of life
+            r.push({"job": "j1", "answer": "allow"})
+            gone2 = threading.Event()
+            gone2.set()
+            self.assertEqual(r.take(1.0, gone=gone2), [])       # a poll already hung up takes nothing either
+            self.assertEqual(r.take(0.0), [{"job": "j1", "answer": "allow"}])   # the message stayed queued
+
     def test_close_wakes_held_polls(self):
         r = self.hello()
         got = []
