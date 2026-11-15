@@ -1,23 +1,25 @@
 """serve/test_runner_http.py - the runner channel over HTTP (#310 part 2, tasks 1-2): POST /runner/hello, GET
 /runner/next, POST /runner/reply, GET /runners, and tool jobs with their calls back through `FakeRunner`, against the
-mock engine in team mode and outside it.
+mock engine in team mode and outside it; and (task 5) the page routes and GET /mcp with `runner=`.
 
     python -m pytest serve/test_runner_http.py -q
 """
 from __future__ import annotations
 
+import json
 import queue
 import socket
 import sys
 import threading
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve import agent_run, runner_hub  # noqa: E402
+from serve import agent_run, folders, runner_hub  # noqa: E402
 from serve.identity import OWNER  # noqa: E402
 from serve.mcp import McpHub  # noqa: E402
 from serve.permissions import Policy  # noqa: E402
@@ -664,7 +666,200 @@ class Calls(RunnerBase):
         self.assertTrue(r.jobs["j1"].inbox.empty())
 
 
+PAGE_GETS = ("/agent/folders", "/agent/git", "/agent/git/diff", "/agent/files", "/agent/mention", "/agent/memory",
+             "/agent/memory/file")
+
+
+class PageRoutes(RunnerBase):
+    """Task 5: the nine page routes and GET /mcp with `runner=` act on the caller's own PC, through a `page` job."""
+
+    def fake(self, on_job=None, answer=None, key=None, **kw):
+        seen = []
+
+        def job(msg, reply):
+            seen.append(msg)
+            if on_job is not None:
+                return on_job(msg, reply)
+            reply({"result": answer if answer is not None else {"status": 200, "body": {"ok": True}}, "exec_ms": 1})
+        fake = FakeRunner(self.port, key or self.ann, DEV1, kw.pop("groups", GROUPS), job, machine="ann-pc", **kw)
+        fake.seen = seen
+        self.fakes.append(fake)
+        return fake
+
+    @staticmethod
+    def plain(msg):
+        msg = dict(msg)
+        msg.pop("job")
+        msg.pop("seq")
+        return msg
+
+    def test_page_route_forwarded_to_runner(self):
+        self.team()
+        fake = self.fake(answer={"status": 200, "body": {"branch": "main", "files": []}})
+        code, body = self.req("GET", f"/agent/git?path=X&runner={fake.id}", key=self.ann, device=DEV1)
+        self.assertEqual((code, body), (200, {"branch": "main", "files": []}))
+        self.assertEqual(self.plain(fake.seen[0]), {"kind": "page", "path": "/agent/git", "query": {"path": ["X"]},
+                                                    "body": None, "memory_on": []})
+        # every GET route goes the same way, with its query (blank values dropped, as the server parses them)
+        for i, path in enumerate(PAGE_GETS):
+            code, body = self.req("GET", f"{path}?path=X&dirs=Y&dirs=Z&q=&runner={fake.id}", key=self.ann, device=DEV1)
+            self.assertEqual((code, body), (200, {"branch": "main", "files": []}), path)
+            self.assertEqual(self.plain(fake.seen[i + 1])["path"], path)
+            self.assertEqual(self.plain(fake.seen[i + 1])["query"], {"path": ["X"], "dirs": ["Y", "Z"]})
+        # the notes' "apps switched on" come from the server's run config, for the notes' routes only
+        self.cfg_path.write_text(json.dumps({"import": {"memory": {"on": ["claude:instructions"]}}}), encoding="utf-8")
+        self.req("GET", f"/agent/memory?path=X&runner={fake.id}", key=self.ann, device=DEV1)
+        self.assertEqual(self.plain(fake.seen[-1])["memory_on"], ["claude:instructions"])
+        self.req("GET", f"/agent/files?path=X&runner={fake.id}", key=self.ann, device=DEV1)
+        self.assertEqual(self.plain(fake.seen[-1])["memory_on"], [])
+        # the runner's 400 / 404 answers reach the page as they are
+        fake2 = self.fake(answer={"status": 404, "body": {"ok": False, "error": "no such file"}}, key=self.bob)
+        self.assertEqual(self.req("GET", f"/agent/memory/file?runner={fake2.id}", key=self.bob, device=DEV1),
+                         (404, {"ok": False, "error": "no such file"}))
+
+    def test_page_route_with_another_runner_is_404(self):
+        self.team()
+        fake = self.fake()
+        nf = (404, {"error": {"type": "runner_not_found", "message": "there is no runner with that id for this key"}})
+        for key, dev in ((self.bob, DEV1), ("k", DEV0)):              # a guest and the owner naming ann's runner
+            for path in PAGE_GETS:
+                self.assertEqual(self.req("GET", f"{path}?path=X&runner={fake.id}", key=key, device=dev), nf, (key, path))
+            for path in ("/agent/rewind", "/agent/checkpoints/forget"):
+                self.assertEqual(self.req("POST", path, {"session": "s1", "checkpoint": "c1", "runner": fake.id},
+                                          key=key, device=dev), nf, (key, path))
+            self.assertEqual(self.req("GET", f"/mcp?runner={fake.id}", key=key, device=dev), nf, key)
+        for bad in ("r0000000000000000", ""):                          # an unknown id, a blank one
+            self.assertEqual(self.req("GET", f"/agent/git?path=X&runner={bad}", key=self.ann, device=DEV1), nf, bad)
+            self.assertEqual(self.req("GET", f"/mcp?runner={bad}", key=self.ann, device=DEV1), nf, bad)
+        for bad in (5, "", ["x"], {"id": fake.id}):                    # a body field that names no runner
+            self.assertEqual(self.req("POST", "/agent/rewind", {"session": "s1", "checkpoint": "c1", "runner": bad},
+                                      key=self.ann, device=DEV1), nf, bad)
+        # "runner": null is no runner: the workstation's route, owner-only
+        self.assertEqual(self.req("POST", "/agent/rewind", {"session": "s1", "checkpoint": "c1", "runner": None},
+                                  key=self.ann, device=DEV1)[0], 403)
+        time.sleep(0.3)
+        self.assertEqual(fake.seen, [])                                # nothing reached ann's PC
+
+    def test_page_route_without_runner_stays_owner_only(self):
+        self.team()
+        self.fake()
+        texts = {"/agent/folders": "this PC's folders can be listed", "/agent/git": "a folder's Git state can be read",
+                 "/agent/git/diff": "a folder's Git state can be read", "/agent/files": "the project's files can be read",
+                 "/agent/mention": "the project's files can be read", "/agent/memory": "the project's notes can be read",
+                 "/agent/memory/file": "the project's notes can be read"}
+        for path, what in texts.items():
+            self.assertEqual(self.req("GET", f"{path}?path=X", key=self.ann, device=DEV1),
+                             (403, {"error": {"type": "forbidden", "message": f"{what} only with an owner key"}}), path)
+        for path in ("/agent/rewind", "/agent/checkpoints/forget"):
+            for body in ({"session": "s1", "checkpoint": "c1"}, {"x": 1}, b"not json"):
+                self.assertEqual(self.req("POST", path, body, key=self.ann, device=DEV1, headers={"Content-Type": "application/json"}),
+                                 (403, {"error": {"type": "forbidden", "message": "files can be put back only with an owner key"}}), (path, body))
+        # the owner still reads the workstation's own disk, as before
+        here = str(self.dir)
+        self.assertEqual(self.req("GET", f"/agent/folders?path={urllib.parse.quote(here)}", key="k", device=DEV0),
+                         (200, json.loads(json.dumps(folders.look(here)))))
+        self.assertEqual(self.req("POST", "/agent/rewind", {"session": "s1"}, key="k", device=DEV0),
+                         (400, {"error": {"message": "send the checkpoint, the prompt's id"}}))
+        self.assertEqual(self.req("POST", "/agent/checkpoints/forget", {"session": "s1"}, key="k", device=DEV0), (200, {"ok": True}))
+
+    def test_rewind_with_runner_in_body(self):
+        self.team()
+        fake = self.fake(answer={"status": 200, "body": {"ok": True, "files": [{"path": "C:\\p\\a.txt", "action": "restore"}], "known": True}})
+        code, body = self.req("POST", "/agent/rewind", {"session": "s1", "checkpoint": "c1", "apply": True, "runner": fake.id},
+                              key=self.ann, device=DEV1)
+        self.assertEqual((code, body), (200, {"ok": True, "files": [{"path": "C:\\p\\a.txt", "action": "restore"}], "known": True}))
+        self.assertEqual(self.plain(fake.seen[0]), {"kind": "page", "path": "/agent/rewind", "query": {},
+                                                    "body": {"session": "s1", "checkpoint": "c1", "apply": True}, "memory_on": []})
+        code, body = self.req("POST", "/agent/checkpoints/forget", {"session": "s1", "runner": fake.id}, key=self.ann, device=DEV1)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.plain(fake.seen[1])["body"], {"session": "s1"})
+        # a foreign page reaches neither PC
+        self.assertEqual(self.req("POST", "/agent/rewind", {"session": "s1", "runner": fake.id}, key=self.ann, device=DEV1,
+                                  headers={"Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(len(fake.seen), 2)
+
+    def test_mcp_listing_for_runner(self):
+        self.team()
+        groups = GROUPS + [
+            {"name": "fs", "kind": "mcp", "status": "ready", "error": None,
+             "tools": [{"name": "read", "description": "Reads.", "inputSchema": {"type": "object"}},
+                       {"name": "list", "description": "Lists.", "inputSchema": {"type": "object"}}]},
+            {"name": "notion", "kind": "mcp", "status": "failed", "error": "no token", "tools": []},
+            {"name": "skills", "kind": "skills", "status": "ready", "error": None,
+             "tools": [{"name": "Skill", "description": "Use a skill.", "inputSchema": {"type": "object"}}]}]
+        skills = [{"name": "pdf", "description": "PDFs", "app": "claude"}]
+        fake = self.fake(groups=groups, skills=skills)
+        code, body = self.req("GET", f"/mcp?runner={fake.id}", key=self.ann, device=DEV1)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(set(body), {"servers", "tools", "skills", "machine", "online"})
+        self.assertEqual([s["name"] for s in body["servers"]], ["my_skills", "my_fs", "my_notion"])      # no my_agent
+        fs = body["servers"][1]
+        self.assertEqual((fs["transport"], fs["status"], fs["info"]), ("runner", "ready", {"machine": "ann-pc", "group": "fs"}))
+        self.assertEqual([t["name"] for t in fs["tools"]], ["my_fs__read", "my_fs__list"])
+        self.assertEqual((body["servers"][2]["status"], body["servers"][2]["error"]), ("failed", "no token"))
+        self.assertEqual(body["tools"], 3)
+        self.assertEqual((body["skills"], body["machine"], body["online"]), (skills, "ann-pc", True))
+        self.assertEqual(fake.seen, [])                                # from the hello: no job
+        # without runner= the server's own list, as before
+        self.assertEqual(self.req("GET", "/mcp", key=self.ann, device=DEV1), (200, {"servers": [], "tools": 0}))
+
+    def test_slow_runner_is_504(self):
+        self.team()
+        with mock.patch.object(runner_hub, "REQUEST_TIMEOUT_S", 0.5):
+            fake = self.fake(on_job=lambda msg, reply: None)
+            t0 = time.monotonic()
+            code, body = self.req("GET", f"/agent/git?path=X&runner={fake.id}", key=self.ann, device=DEV1)
+            took = time.monotonic() - t0
+        self.assertEqual((code, body["error"]["type"]), (504, "runner_timeout"))
+        self.assertEqual(body["error"]["message"], "your PC (ann-pc) did not answer within 0.5 s")
+        self.assertLess(took, 2.5)
+        deadline = time.monotonic() + 3                                # it was taken: a cancel follows it
+        while time.monotonic() < deadline and not any(m.get("cancel") for m in fake.received):
+            time.sleep(0.05)
+        self.assertTrue(any(m.get("cancel") for m in fake.received))
+
+    def test_offline_runner_is_409(self):
+        self.team()
+        with mock.patch.object(runner_hub, "OFFLINE_S", 0.3):
+            fake = self.fake()
+            fake.stop()
+            time.sleep(0.5)
+            code, body = self.req("GET", f"/agent/git?path=X&runner={fake.id}", key=self.ann, device=DEV1)
+            self.assertEqual((code, body), (409, {"error": {"type": "runner_offline",
+                                                            "message": "your PC (ann-pc) is offline: start the runner on it and send again"}}))
+            code, body = self.req("POST", "/agent/rewind", {"session": "s1", "runner": fake.id}, key=self.ann, device=DEV1)
+            self.assertEqual(code, 409)
+            code, body = self.req("GET", f"/mcp?runner={fake.id}", key=self.ann, device=DEV1)   # the lists it said hello with
+            self.assertEqual((code, body["online"]), (200, False))
+        self.assertEqual(fake.seen, [])
+
+    def test_bad_runner_answers_are_502(self):
+        self.team()
+        for answer in ({"status": 401, "body": {"error": {"message": "missing or wrong API key"}}}, {"status": 200, "body": []},
+                       {"status": 200, "body": {"text": "x" * 2_100_000}}, {"body": {}}):
+            fake = self.fake(answer=answer)
+            code, body = self.req("GET", f"/agent/mention?path=X&rel=a&runner={fake.id}", key=self.ann, device=DEV1)
+            self.assertEqual((code, body["error"]["type"]), (502, "runner_answer"), answer)
+            fake.stop()
+
+
 class OutsideTeamMode(RunnerBase):
+    def test_page_routes_with_runner_are_the_owners(self):
+        self.start(api_key="k", team=False, peer_override=REMOTE)
+        seen = []
+        fake = FakeRunner(self.port, "k", DEV1, GROUPS, lambda m, reply: (seen.append(m), reply(
+            {"result": {"status": 200, "body": {"ok": True}}})), machine="ann-pc")
+        self.fakes.append(fake)
+        self.assertEqual(self.req("GET", f"/agent/folders?runner={fake.id}", key="k", device=DEV1), (200, {"ok": True}))
+        self.assertEqual(self.req("GET", f"/mcp?runner={fake.id}", key="k", device=DEV1)[0], 200)
+        self.svc.api_key = ""                                       # no key: a remote caller is no owner here
+        for path in (f"/agent/folders?runner={fake.id}", f"/agent/git?runner={fake.id}", f"/mcp?runner={fake.id}"):
+            code, body = self.req("GET", path)
+            self.assertEqual(code, 403, (path, body))
+        code, _ = self.req("POST", "/agent/rewind", {"session": "s1", "runner": fake.id})
+        self.assertEqual(code, 403)
+        self.assertEqual(len(seen), 1)
+
     def test_outside_team_mode_runner_is_owner(self):
         self.start(api_key="k", team=False, peer_override=REMOTE)
         code, body = self.hello("k")

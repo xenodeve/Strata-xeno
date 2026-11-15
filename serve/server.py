@@ -70,10 +70,11 @@ from serve import harness, mcp_admin  # noqa: E402
 from serve import identity as identity_mod  # noqa: E402  (#310: named keys, roles, the approval of devices)
 from serve import skills as skills_mod  # noqa: E402
 from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, runs as runs_mod, shell as shell_mod, subagent as subagent_mod, web as web_mod  # noqa: E402
-from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
+from serve import checkpoints as checkpoints_mod, folders as folders_mod, memory as memory_mod  # noqa: E402
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import runner_hub  # noqa: E402  (#310 part 2: the runner channel)
+from serve import page_routes  # noqa: E402  (#310 part 2: the page routes that act on a project's machine)
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -5402,6 +5403,13 @@ OWNER_POSTS = {"/settings": "settings can be changed", "/config": "the run confi
                "/v1/unload": "the model can be loaded or unloaded", "/v1/load": "the model can be loaded or unloaded",
                "/v1/vram": "the VRAM reserve can be changed", "/metrics/keep": "prompts can be kept"}
 NO_RUN = "there is no such run (it ended long ago, or the server was restarted)"
+# the owner gate's words of the page routes on the workstation (serve/page_routes.py; with `runner=` they act on the
+# caller's own PC instead, #310 part 2)
+PAGE_GATES = {"/agent/folders": "this PC's folders can be listed", "/agent/git": "a folder's Git state can be read",
+              "/agent/git/diff": "a folder's Git state can be read", "/agent/files": "the project's files can be read",
+              "/agent/mention": "the project's files can be read", "/agent/memory": "the project's notes can be read",
+              "/agent/memory/file": "the project's notes can be read", "/agent/rewind": "files can be put back",
+              "/agent/checkpoints/forget": "files can be put back"}
 # #310 part 2: the runner channel's bodies (a reply carries a tool's result: a Read image fits) and answers
 RUNNER_HELLO_MAX, RUNNER_REPLY_MAX = 4 << 20, 32 << 20
 NO_RUNNER = "there is no such runner (say hello again)"
@@ -5746,6 +5754,49 @@ def make_handler(svc: Service):
             m = runner.info.get("machine") or "?"
             return {"error": {"type": "runner_offline", "message": f"your PC ({m}) is offline: start the runner on it and send again"}}
 
+        def _runner_param(self, q: dict, body, online: bool = True):
+            """#310 part 2, task 5: the runner a page route names - `runner` in the query (`q`: parse_qs with blank values
+            kept) or in the JSON body.  None: it names none (no key, or the body's "runner" is null), the route acts on
+            the workstation.  The Runner when it is the caller's own (RunnerHub.get_for: the same identity exactly, the
+            owner role too) and, with `online`, online.  False after answering: 404 runner_not_found for another
+            identity's id, an unknown, blank or non-string one (the same answer, so ids cannot be probed); 409
+            runner_offline.  Outside team mode a runner is the owner's: the owner gate comes first."""
+            if "runner" in q:
+                rid = q["runner"][0]
+            elif isinstance(body, dict) and body.get("runner") is not None:
+                rid = body["runner"]
+            else:
+                return None
+            if not self.team and not self._owner_only("a runner can be used"):
+                return False
+            r = svc.runner_hub.get_for(rid, self._acting()) if isinstance(rid, str) and rid else None
+            if r is None:
+                self._json(404, {"error": {"type": "runner_not_found", "message": "there is no runner with that id for this key"}})
+                return False
+            if online and not r.online():
+                self._json(409, self._runner_offline(r))
+                return False
+            return r
+
+        def _page_job(self, runner, path: str, query: dict, body) -> None:
+            """#310 part 2, task 5: a page route on the caller's own PC - one `page` job (Runner.request, at most
+            REQUEST_TIMEOUT_S), its answer checked by page_routes.relay (409 offline, 504 no answer in time, 502 a
+            status or body the page must not get).  The notes' "apps switched on" come from the server's run config,
+            for the notes' routes only."""
+            on = memory_mod.settings(harness._cfg(svc))["on"] if path in page_routes.MEMORY_PATHS else []
+            res = runner.request("page", {"path": path, "query": query, "body": body, "memory_on": on})
+            self._json(*page_routes.relay(res, runner.info.get("machine") or "?"))
+
+        def _page_here(self, path: str, q: dict, body) -> tuple[int, dict]:
+            """A page route on the workstation itself (page_routes.answer): its home and run config for the notes, the
+            server's checkpoints for the way back."""
+            home, on = "", []
+            if path in page_routes.MEMORY_PATHS:
+                imp = getattr(svc, "importer", None)
+                home = str(imp.home) if imp is not None else str(harness.home_dir())
+                on = memory_mod.settings(harness._cfg(svc))["on"]
+            return page_routes.answer(path, q, body, home=home, memory_on=on, checkpoints=svc.checkpoints)
+
         def _peer(self) -> str:
             """The client's address as the socket has it (#310 tests put another one in svc.peer_override)."""
             return svc.peer_override or self.client_address[0]
@@ -5972,6 +6023,14 @@ def make_handler(svc: Service):
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():                       # #310 R11: a team guest sees only the servers she may use
+                    q = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    if "runner" in q:                        # #310 part 2: the caller's own PC's groups, from its hello (no job)
+                        r = self._runner_param(q, None, online=False)
+                        if r is not False:
+                            st = McpHub({}, builtins=r.servers()).status()   # its own routes: names as my_<x>__<tool>
+                            self._json(200, {"servers": st["servers"], "tools": st["tools"], "skills": [dict(s) for s in r.skills],
+                                             "machine": r.info.get("machine"), "online": r.online()})
+                        return
                     self._json(200, mcp_admin.status_for(svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0},
                                                          self._mcp_allowed()))
                 return
@@ -6038,61 +6097,21 @@ def make_handler(svc: Service):
                     self._json(200, {**web_mod.public_view(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "web_tools", ())), "editable": bool(svc.config_path),
                                      "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
                 return
-            if path == "/agent/folders":
-                # the folders of this PC, to choose a project's folder from (only the names of folders, and only for who may use the coding tools)
+            if path in page_routes.GET_PATHS:
+                # the folders of this PC (the project picker), a folder's Git state (the Chat's right panel), `@file`, and
+                # the notes the chat reads for a project (serve/page_routes.py): on the workstation for who may use the
+                # coding tools; with `runner=<id>` on the caller's own PC, through its runner (#310 part 2)
                 if self._authorized():
-                    if not self._owner_only("this PC's folders can be listed"):
+                    query = urlsplit(self.path).query
+                    runner = self._runner_param(parse_qs(query, keep_blank_values=True), None)
+                    if runner is False:
                         return
-                    seen = folders_mod.look(parse_qs(urlsplit(self.path).query).get("path", [""])[0])
-                    # a path that is no folder is an answer, not an error (a 404 would be logged as one in the browser's console)
-                    self._json(200, seen if seen is not None else {"ok": False, "error": "That is not a folder on this PC"})
-                return
-            if path in ("/agent/git", "/agent/git/diff"):
-                # the Git state of a folder, read only, for the Chat's right panel (serve/gitview.py); for who may use the coding tools
-                if self._authorized():
-                    if not self._owner_only("a folder's Git state can be read"):
+                    q = parse_qs(query)
+                    if runner is not None:
+                        return self._page_job(runner, path, {k: v for k, v in q.items() if k != "runner"}, None)
+                    if not self._owner_only(PAGE_GATES[path]):
                         return
-                    q = parse_qs(urlsplit(self.path).query)
-                    folder = q.get("path", [""])[0]
-                    if path == "/agent/git":
-                        return self._json(200, gitview.info(folder))
-                    return self._json(200, gitview.diff(folder, q.get("file", [""])[0], q.get("staged", ["0"])[0] == "1", q.get("untracked", ["0"])[0] == "1"))
-                return
-            if path in ("/agent/files", "/agent/mention"):
-                # `@file` in the prompt: the files of the project's folders that go with typed letters, and the text of one that was mentioned (serve/files.py); for who may use the coding tools
-                if self._authorized():
-                    if not self._owner_only("the project's files can be read"):
-                        return
-                    q = parse_qs(urlsplit(self.path).query)
-                    folders = [f for f in [q.get("path", [""])[0], *q.get("dirs", [])] if f.strip() and "\0" not in f][:agent_mod.MAX_DIRS + 1]
-                    if path == "/agent/files":
-                        return self._json(200, {"files": files_mod.find(folders, q.get("q", [""])[0])})
-                    return self._json(200, files_mod.read(folders, q.get("rel", [""])[0]))
-                return
-            if path in ("/agent/memory", "/agent/memory/file"):
-                # the notes the chat reads for a project: the project's own files and what the user's other apps wrote down (serve/memory.py); for who may use the coding tools
-                if self._authorized():
-                    if not self._owner_only("the project's notes can be read"):
-                        return
-                    q = parse_qs(urlsplit(self.path).query)
-                    folders = [f for f in [q.get("path", [""])[0], *q.get("dirs", [])] if f.strip() and "\0" not in f][:agent_mod.MAX_DIRS + 1]
-                    imp = getattr(svc, "importer", None)
-                    home = str(imp.home) if imp is not None else str(harness.home_dir())
-                    on = memory_mod.settings(harness._cfg(svc))["on"]
-                    sources = memory_mod.discover(home, folders, on)
-                    if path == "/agent/memory":
-                        return self._json(200, {"max": memory_mod.MAX_TOTAL, "sources": [{k: s[k] for k in ("id", "app", "label", "kind", "shown", "bytes", "on")} for s in sources]})
-                    src = next((s for s in sources if s["id"] == q.get("id", [""])[0]), None)
-                    try:
-                        n = int(q.get("n", ["0"])[0])
-                    except ValueError:
-                        n = -1
-                    if src is None or not 0 <= n < len(src["files"]):
-                        return self._json(404, {"ok": False, "error": "no such file"})
-                    got = memory_mod._read(src["files"][n], 200_000)
-                    if got is None:
-                        return self._json(200, {"ok": False, "error": "cannot be read"})
-                    return self._json(200, {"ok": True, "name": os.path.basename(src["files"][n]), "text": got[0], "cut": got[1]})
+                    self._json(*self._page_here(path, q, None))
                 return
             if path == "/mcp/config":
                 # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)
@@ -6238,27 +6257,23 @@ def make_handler(svc: Service):
                     return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
                 code, out = mcp_admin.apply(svc, body)
                 return self._json(code, out if code != 200 else self._mcp_view())
-            if path in ("/agent/rewind", "/agent/checkpoints/forget"):         # the way back for the files the tools changed (serve/checkpoints.py)
+            if path in page_routes.POST_PATHS:               # the way back for the files the tools changed (serve/checkpoints.py, serve/page_routes.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("files can be put back"):
-                    return
-                if not self._owner_only("files can be put back"):
                     return
                 try:
                     body = json.loads(raw)
                 except ValueError:
                     body = None
-                if not isinstance(body, dict) or not isinstance(body.get("session"), str):
-                    return self._json(400, {"error": {"message": "send {\"session\": the chat's id, \"checkpoint\": the prompt's id}"}})
-                if path == "/agent/checkpoints/forget":
-                    svc.checkpoints.forget(body["session"])
-                    return self._json(200, {"ok": True})
-                if not isinstance(body.get("checkpoint"), str):
-                    return self._json(400, {"error": {"message": "send the checkpoint, the prompt's id"}})
-                if body.get("apply") is True:
-                    return self._json(200, svc.checkpoints.apply(body["session"], body["checkpoint"], body.get("include_changed") is True))
-                return self._json(200, svc.checkpoints.preview(body["session"], body["checkpoint"]))
+                runner = self._runner_param({}, body)          # #310 part 2: the body's "runner" - the files on the caller's own PC
+                if runner is False:
+                    return
+                if runner is not None:
+                    return self._page_job(runner, path, {}, {k: v for k, v in body.items() if k != "runner"})
+                if not self._owner_only(PAGE_GATES[path]):
+                    return
+                return self._json(*self._page_here(path, {}, body))
             if path == "/agent/steer":                       # what the user sends while the agent works: the agent reads it at its next step (serve/runs.py, run_with_mcp)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
