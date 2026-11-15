@@ -112,6 +112,10 @@ def check_hello(body: dict) -> tuple[dict, list, list] | str:
                     or t.get("description") is not None and not _text(t["description"], 100_000)
                     or t.get("inputSchema") is not None and not isinstance(t["inputSchema"], dict)):
                 return 'groups: each tool {"name", "description", "inputSchema"}'
+            if g["kind"] == "coding" and not plain_name_ok(t["name"]):
+                print(f"[strata] runner {body.get('machine')!r}: coding tool {t['name'][:128]!r} left out (a plain name "
+                      "has no '__' and does not start with 'my_': those are the names of tool groups)", flush=True)
+                continue
             out_tools.append({"name": t["name"], "description": t.get("description") or "",
                               "inputSchema": t.get("inputSchema") or {"type": "object"}})
         out_groups.append({"name": g["name"], "kind": g["kind"], "status": g.get("status"), "error": g.get("error"),
@@ -125,6 +129,13 @@ def check_hello(body: dict) -> tuple[dict, list, list] | str:
         out_skills.append({"name": k["name"], "description": k.get("description") or "", "app": k.get("app")})
     info = {"machine": body["machine"], "platform": body["platform"], "shell": body.get("shell"), "home": body["home"]}
     return info, out_groups, out_skills
+
+
+def plain_name_ok(name: str) -> bool:
+    """A coding tool's plain name (`Read`, `Bash`) may be offered as it is: it has no `__` (the hub's
+    `<group>__<tool>` separator) and does not start with `my_` (the runner's groups), so it can never be the name of
+    another group's tool (task 4)."""
+    return isinstance(name, str) and "__" not in name and not name.startswith("my_")
 
 
 def runner_id(who: str, device: str) -> str:
@@ -474,7 +485,8 @@ class RunnerGroup:
             self.wants_context = True           # and no entry in GET /mcp (they have their own switch)
             self.plain_names = True
             self.hidden = True
-            self.tools = [t for t in self.tools if t.get("name") not in SERVER_TOOLS]   # those run on the server (task 4)
+            self.tools = [t for t in self.tools if t.get("name") not in SERVER_TOOLS      # those run on the server, and
+                          and plain_name_ok(t.get("name"))]                              # no group's name (task 4)
 
     def start(self):
         pass

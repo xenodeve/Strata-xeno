@@ -3208,7 +3208,7 @@ class Service:
             run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
         else:                                                           # the runner's coding tools, then the server's own that run here
             ours = {t["name"] for t in getattr(self.agent, "tools", None) or []}
-            names = [n for n in facts["tools"] if n not in runner_hub.SERVER_TOOLS] + [n for n in runner_hub.SERVER_TOOLS if n in ours]
+            names = [n for n in facts["tools"] if n not in runner_hub.SERVER_TOOLS and runner_hub.plain_name_ok(n)] + [n for n in runner_hub.SERVER_TOOLS if n in ours]
             tools = [n for n in names if (n != "ExitPlanMode" or mode == "plan") and n not in run.hidden]
             run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), facts["platform"], git, None, tools, dirs, facts["memory"])
         run.ctx.vision = self.vision is not None and not self._vision_down()          # Read can give an image to the model only when the vision encoder is there
@@ -7120,6 +7120,8 @@ def make_handler(svc: Service):
                 allowed = self._mcp_allowed()                     # #310 R11: a team guest, only the servers marked for guests
                 if allowed is not None:                           # (the server's WebFetch / WebSearch / Task of a run on My PC stay)
                     skip |= {n for n in (svc.mcp.servers if svc.mcp is not None else ()) if n not in allowed and not (subset and n == "agent")}
+                if hub is not svc.mcp:                            # #310 part 2: a run on My PC keeps the names it is offered now, for every
+                    hub.pin(skip)                                 # call of this request and its helpers; a skipped server is never called
                 extra = hub.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None

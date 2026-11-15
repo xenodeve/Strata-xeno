@@ -8,7 +8,9 @@ one a 409; a request without a runner is unchanged.  Over real HTTP with a scrip
 """
 from __future__ import annotations
 
+import contextlib
 import http.client
+import io
 import json
 import sys
 import threading
@@ -84,6 +86,9 @@ class Fixture(RunnerBase):
 
         def wrap(svc, hub, messages, tools_, *a, **k):
             self.offered.append(([t["name"] for t in tools_ or []], hub))
+            hook, self.on_offer = getattr(self, "on_offer", None), None     # once, between the list and the first call
+            if hook is not None:
+                hook()
             return orig(svc, hub, messages, tools_, *a, **k)
         p = mock.patch.object(server_mod, "run_with_mcp", wrap)
         p.start()
@@ -304,6 +309,65 @@ class Routing(Fixture):
         k = self.fake("k", device=DEV0, machine="owner-pc")
         self.assertEqual(self.chat("k", {"cwd": CWD, "runner": k.id}, device=DEV0, mcp=True)[0], 200)
         self.assertEqual(self.offered[3][0], ["agent__x", *CODING_NAMES, "my_fs__x"])
+
+    def starting_fs(self):
+        """A server MCP `fs` still starting (no tools yet), and the hook that makes it ready."""
+        fs = FakeMcp("fs", ("x",))
+        tools, fs.status, fs.tools = fs.tools, "starting", []
+
+        def ready():
+            fs.status, fs.tools = "ready", tools
+        return fs, ready
+
+    def test_a_server_ready_later_never_takes_an_offered_name(self):
+        """Review I-1: the request's names are pinned when its list is made.  `fs` (not marked for guests) becomes
+        ready between the list and the call; the guest's `fs__x` still goes to her runner, never to the server's `fs`."""
+        fs, ready = self.starting_fs()
+        self.start_routing(tool_call("fs__x", path="p"), DONE, servers={"fs": fs})
+        with mock.patch.object(runner_hub, "plain_name_ok", lambda n: True, create=True):     # a runner that names a tool fs__x
+            f = self.fake(self.ann, groups=[coding(CODING_NAMES + ["fs__x"]), FS])
+            self.on_offer = ready
+            code, events, _ = self.chat(self.ann, {"cwd": CWD, "runner": f.id}, mcp=True)
+        self.assertEqual(code, 200, events)
+        self.assertIn("fs__x", self.offered[0][0])
+        self.assertEqual(fs.status, "ready")
+        self.assertEqual([(j["group"], j["tool"]) for j in self.tool_jobs()], [("agent", "fs__x")])
+        self.assertEqual(fs.calls, [])
+        hub = self.offered[0][1]
+        self.assertEqual(hub.routes()["fs__x"][0].name, "my_agent")       # still pinned after fs is ready
+        self.assertEqual(hub.call("fs__x_2", {})["text"], "error: there is no tool named 'fs__x_2'")
+        self.assertEqual(fs.calls, [])
+
+    def test_a_helper_uses_the_pinned_names(self):
+        fs, ready = self.starting_fs()
+        self.start_routing(tool_call("Task", description="look around", prompt="read a.txt", subagent_type="explore"),
+                           tool_call("Read", file_path=CWD + "\\a.txt"), tool_call("fs__x", path="p"), DONE,
+                           servers={"fs": fs}, cfg={"agents": {"on": True}})
+        with mock.patch.object(runner_hub, "plain_name_ok", lambda n: True, create=True):
+            f = self.fake(self.ann, groups=[coding(CODING_NAMES + ["fs__x"]), FS])
+            self.on_offer = ready
+            code, events, _ = self.chat(self.ann, {"cwd": CWD, "runner": f.id}, mcp=True)
+        self.assertEqual(code, 200, events)
+        self.assertEqual([j["tool"] for j in self.tool_jobs()], ["Read"])      # the helper's Read, on the PC
+        self.assertEqual(fs.calls, [])
+        helper_hub = self.offered[1][1]
+        self.assertIs(helper_hub, self.offered[0][1])
+        self.assertEqual(helper_hub.routes()["fs__x"][0].name, "my_agent")
+        self.assertNotIn("fs", {s.name for s, _ in helper_hub.routes().values()})
+
+    def test_a_coding_tool_named_like_a_group_is_left_out(self):
+        self.start_routing(DONE, servers={"fs": FakeMcp("fs", ("x",))}, cfg={"guest_mcp": ["fs"]})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            f = self.fake(self.ann, groups=[coding(CODING_NAMES + ["fs__x", "my_fs", "a__b"]), FS])
+        self.assertIn("coding tool 'fs__x' left out", out.getvalue())
+        self.assertIn("coding tool 'my_fs' left out", out.getvalue())
+        code, body = self.req("GET", f"/agent?runner={f.id}", key=self.ann, device=DEV1)
+        self.assertEqual(body["tools"], CODING_NAMES)
+        code, events, _ = self.chat(self.ann, {"cwd": CWD, "runner": f.id}, mcp=True)
+        self.assertEqual(code, 200, events)
+        self.assertEqual(self.offered[0][0], ["fs__x", *CODING_NAMES, "my_fs__x"])     # fs__x is the server's (marked)
+        self.assertIs(self.offered[0][1].routes()["fs__x"][0], self.svc.mcp.servers["fs"])
 
     def test_runner_without_server_hub(self):
         self.start_routing(tool_call("Read", file_path=CWD + "\\a.txt"), DONE, with_agent=False, with_hub=False)

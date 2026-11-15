@@ -538,9 +538,26 @@ class McpHub:
             view.servers[key] = s
         return view
 
+    _pinned: dict | None = None             # a pinned view's route table (pin)
+    _refused: frozenset = frozenset()       # ... and the servers it never calls
+
+    def pin(self, skip_servers=()) -> dict:
+        """#310 part 2, on a request's view only: build the route table once, without the servers in `skip_servers`,
+        and keep it for the rest of the request - routes(), template_tools() and call() (the request's and its
+        helpers') use it from now on, and a call never reaches a server in `skip_servers`.  So a server that becomes
+        ready later (an MCP server still starting when the list was made) cannot take a name the model was offered for
+        another group.  The table."""
+        self._pinned = None
+        self._refused = frozenset(skip_servers)
+        self._pinned = {n: r for n, r in self.routes().items() if r[0].name not in self._refused}
+        self._routes = self._pinned
+        return self._pinned
+
     def routes(self) -> dict[str, tuple[McpServer, str]]:
         """tool name the model sees -> (server, the tool's own name).  A server that stopped after it was ready keeps
-        its tools here: a call starts it again."""
+        its tools here: a call starts it again.  A pinned view (pin) answers its table."""
+        if self._pinned is not None:
+            return self._pinned
         out = {}
         for s in self.servers.values():
             if s.status not in ("ready", "stopped"):
@@ -562,7 +579,9 @@ class McpHub:
         for name, (s, tool) in self.routes().items():
             if name in exclude or s.name in skip_servers:
                 continue
-            t = next(x for x in s.tools if x["name"] == tool)
+            t = next((x for x in s.tools if x["name"] == tool), None)
+            if t is None:                                # a pinned table outlived the tool (its server listed again)
+                continue
             schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
             out.append({"name": name, "description": str(t.get("description") or t.get("title") or ""),
                         "parameters": schema or {"type": "object", "properties": {}}})
@@ -579,6 +598,8 @@ class McpHub:
         `progress(word)`: handed only to a server with `wants_progress` (a runner's group, serve/runner_hub.py)."""
         t0 = time.monotonic()
         server, tool = self._routes.get(name) or self.routes().get(name, (None, name))
+        if server is not None and server.name in self._refused:   # a pinned view: never a server the request skipped
+            server = None
         out = {"server": server.name if server else None, "tool": tool}
         if server is None:
             text, ok = f"error: there is no tool named {name!r}", False
