@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import agent  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.history import HistoryStore  # noqa: E402
+from serve import identity as identity_mod  # noqa: E402
 from serve.identity import OWNER, KeyStore  # noqa: E402
 from serve.mcp import hub_from_config  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, keys_file_of, serve  # noqa: E402
@@ -323,6 +324,16 @@ class KeysAndDevices(Base):
         self.assertEqual(self.req("POST", "/keys", b"{}", key="k", headers={"Content-Type": "text/plain"})[0], 415)
         code, got = self.keys({"action": "revoke", "name": "anna"})
         self.assertEqual(code, 200, got)
+        view = self.req("GET", "/keys", key="k")[1]
+        self.assertEqual((view["keys"], view["retired"]), ([], ["ann", "anna"]))
+
+    def test_a_revoked_name_is_not_used_again(self):
+        self.start(api_key="k")
+        self.assertEqual(self.keys({"action": "create", "name": "ann", "role": "guest"})[0], 200)
+        self.assertEqual(self.keys({"action": "revoke", "name": "ann"})[0], 200)
+        code, err = self.keys({"action": "create", "name": "Ann", "role": "guest"})
+        self.assertEqual(code, 400)
+        self.assertIn("used before", err["error"]["message"])
         self.assertEqual(self.req("GET", "/keys", key="k")[1]["keys"], [])
 
     def test_the_first_create_turns_team_mode_on(self):
@@ -647,8 +658,12 @@ class RunsBelongToTheirIdentity(Base):
         self.assertEqual(self.svc.broker.pending, {})
         self.svc.peer_override = REMOTE
         self.assertEqual(self.req("GET", "/props", key=ann, device=DEV1)[0], 401)
-        ann2 = self.approved("ann", "guest", device=DEV2)          # a new key with the old name
-        self.assertEqual(self.req("GET", f"/agent/run?id={self.RID}&from=0", key=ann2, device=DEV2)[0], 404)
+        self.assertEqual(self.svc.runs.get(self.RID).who, identity_mod.REVOKED)
+        self.assertIsNone(self.svc.runs.get_for(self.RID, identity_mod.Identity("ann", "guest")))   # nothing for the name
+        self.svc.peer_override = None
+        code, err = self.req("POST", "/keys", {"action": "create", "name": "ann", "role": "guest"}, key="k")
+        self.assertEqual(code, 400)                                # and the name is never used again
+        self.assertIn("used before", err["error"]["message"])
 
     def test_a_key_made_a_guest_keeps_no_run_going(self):
         """The coding tools are an owner key's (part 1): demoting a key stops its runs and closes its prompts; the key
@@ -686,13 +701,13 @@ class RunsBelongToTheirIdentity(Base):
                          (200, {"ok": True, "name": "anna"}))
         self.svc.peer_override = REMOTE
         self.assertEqual(self.svc.runs.get(self.RID).who, "anna")
-        old = self.approved("ann", "guest", device=DEV2)           # a new key with the old name
-        self.assertEqual(self.req("POST", "/agent/permission", {"id": first, "decision": "allow"}, key=old, device=DEV2)[0], 404)
+        old = identity_mod.Identity("ann", "guest")               # the old name holds nothing (and is never a key again)
+        self.assertFalse(self.svc.broker.answer(first, "allow", old))
         self.assertEqual(self.req("POST", "/agent/permission", {"id": first, "decision": "allow"}, key=ann, device=DEV1),
                          (200, {"ok": True}))
         second = self.wait_for_event(events, lambda e: e.get("event") == "permission" and e["id"] != first)["id"]
-        self.assertEqual(self.req("POST", "/agent/permission", {"id": second, "decision": "deny"}, key=old, device=DEV2)[0], 404)
-        self.assertEqual(self.req("GET", f"/agent/run?id={self.RID}&from=0", key=old, device=DEV2)[0], 404)
+        self.assertFalse(self.svc.broker.answer(second, "deny", old))
+        self.assertIsNone(self.svc.runs.get_for(self.RID, old))
         self.assertEqual(self.req("POST", "/agent/permission", {"id": second, "decision": "deny"}, key=ann, device=DEV1),
                          (200, {"ok": True}))
         t.join(20)

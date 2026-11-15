@@ -139,6 +139,38 @@ class Keys(Base):
         self.assertIs(s.revoke("chief"), True)
         s.create("ann2", "guest", owner_first=True)
 
+    def test_a_name_is_never_used_again(self):
+        """A revoked key's name and a renamed key's old name are retired: no new key and no rename takes them again
+        (any case), so a later key never reads the history recorded under the name of another."""
+        s = self.store()
+        s.create("ann", "guest")
+        s.create("bob", "guest")
+        s.revoke("ann")
+        s.rename("bob", "rob")
+        for name in ("ann", "ANN", " Ann ", "bob", "Bob"):
+            with self.assertRaisesRegex(ValueError, "used before"):
+                s.create(name, "guest")
+        s.create("cat", "guest")
+        with self.assertRaisesRegex(ValueError, "used before"):
+            s.rename("cat", "Ann")
+        with self.assertRaisesRegex(ValueError, "used before"):
+            s.rename("rob", "bob")                                     # not even back to its own old name
+        self.assertIs(s.rename("rob", "Rob"), True)                    # the same name in another case is not retired
+        self.assertEqual(s.retired(), ["ann", "bob"])
+        self.assertEqual(self.read()["retired"], ["ann", "bob"])
+        self.assertEqual(self.store().retired(), ["ann", "bob"])      # kept in the file, read again at start
+        with self.assertRaisesRegex(ValueError, "exists"):
+            s.create("ROB", "guest")
+
+    def test_a_file_without_retired_names_or_with_odd_ones_reads(self):
+        Path(self.path).write_text(json.dumps({"keys": [], "log": [], "retired": ["ann", 5, None, "bob"]}), encoding="utf-8")
+        s = self.store()
+        self.assertEqual(s.retired(), ["ann", "bob"])
+        with self.assertRaisesRegex(ValueError, "used before"):
+            s.create("Bob", "guest")
+        Path(self.path).write_text(json.dumps({"keys": [], "log": []}), encoding="utf-8")
+        self.assertEqual(self.store().retired(), [])
+
     def test_rename_and_set_role_take_effect_at_once(self):
         s = self.store()
         k = s.create("ann", "guest")
@@ -195,7 +227,7 @@ class Keys(Base):
         s = self.store()
         k = s.create("ann", "guest")
         for i in range(520):
-            s.rename("ann", "n%d" % i) if i % 2 == 0 else s.rename("n%d" % (i - 1), "ann")
+            s.rename("n%d" % (i - 1) if i else "ann", "n%d" % i)                   # a name is never used twice (retired)
         log = self.read()["log"]
         self.assertEqual(len(log), 500)
         self.assertNotIn(k, json.dumps(log))

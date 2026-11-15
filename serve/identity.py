@@ -84,7 +84,7 @@ class KeyStore:
         self.path = os.fspath(path) if path else None
         self._legacy = _legacy_list(legacy)
         self._lock = threading.Lock()
-        self._data: dict = {"keys": [], "log": []}
+        self._data: dict = {"keys": [], "log": [], "retired": []}
         self._index: list[tuple[str, Identity]] = []      # (sha256 hex, identity) of every key in the file
         self._sig = None                                  # (mtime_ns, size) of the file as last read or written
         self._checked = -RELOAD_EVERY_S                   # when match() last looked at the file
@@ -163,8 +163,9 @@ class KeyStore:
             else:
                 clean["sha256"] = sha
             keys.append(clean)
-        log = raw.get("log")
-        return {"keys": keys, "log": [x for x in log if isinstance(x, dict)][-LOG_CAP:] if isinstance(log, list) else []}
+        log, retired = raw.get("log"), raw.get("retired")
+        return {"keys": keys, "log": [x for x in log if isinstance(x, dict)][-LOG_CAP:] if isinstance(log, list) else [],
+                "retired": [x for x in retired if isinstance(x, str)] if isinstance(retired, list) else []}
 
     def _rebuild(self) -> None:
         self._index = [(e["sha256"], Identity(e["name"], e["role"])) for e in self._data["keys"] if "sha256" in e]
@@ -298,6 +299,9 @@ class KeyStore:
     def _unique(data: dict, name: str) -> None:
         if any(e["name"].casefold() == name.casefold() for e in data["keys"]):
             raise ValueError(f"a key named {name!r} exists")
+        if any(r.casefold() == name.casefold() for r in data["retired"]):
+            raise ValueError(f"the name {name!r} was used before (by a revoked key, or as a key's old name): a name is "
+                             f"never used again, so that a new key never reads the history recorded under it")
 
     @staticmethod
     def _by(by: Identity | None) -> str:
@@ -342,6 +346,7 @@ class KeyStore:
                 return False
             if new.casefold() != name.casefold():
                 self._unique(data, new)
+                data["retired"].append(name)              # the old name is never a key again
             e["name"] = new
             self._log(data, f"renamed from {name}", new, by=self._by(by))
             return True
@@ -373,9 +378,16 @@ class KeyStore:
                 return False
             self._keep_an_owner(data, e)
             data["keys"].remove(e)
+            data["retired"].append(name)                  # never a key again
             self._log(data, "revoked", name, by=self._by(by))
             return True
         return self._change(go)
+
+    def retired(self) -> list[str]:
+        """The names that are never used again: every revoked key's and every renamed key's old one."""
+        with self._lock:
+            self._reload_locked()
+            return list(self._data["retired"])
 
     def log(self, last: int = 100) -> list[dict]:
         """The last `last` entries of the log (who did what to which key or device, and when), oldest first; a copy."""

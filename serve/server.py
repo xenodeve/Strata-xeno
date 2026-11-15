@@ -5830,7 +5830,8 @@ def make_handler(svc: Service):
                 return
             if path == "/keys":                              # #310: the named keys and what was done to them, for the owner's Settings
                 if self._authorized() and self._owner_only("keys can be managed"):
-                    self._json(200, {"keys": svc.keys.view(), "log": svc.keys.log(100), "team": self.team,
+                    self._json(200, {"keys": svc.keys.view(), "log": svc.keys.log(100), "retired": svc.keys.retired(),
+                                     "team": self.team,
                                      "keys_file": os.path.basename(svc.keys.path) if svc.keys.path else None})
                 return
             if path == "/devices/pending":                   # #310: the devices waiting for approval that this caller may decide
