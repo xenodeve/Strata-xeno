@@ -296,6 +296,34 @@ class Reload(Base):
                 s.reload_if_changed()
             self.assertEqual(s.match(k), ANN, text)
 
+    def test_a_deleted_file_keeps_team_mode_and_says_so_once(self):
+        """Final review M0: team mode, once the file was seen, lasts until a restart; the file's going is one line."""
+        s = self.store()
+        k = s.create("ann", "guest")
+        os.unlink(self.path)
+        with mock.patch("builtins.print") as log:
+            s.reload_if_changed()
+            s.reload_if_changed()
+        self.assertEqual(log.call_count, 1)
+        line = log.call_args[0][0]
+        self.assertIn("gone", line)
+        self.assertIn("until a restart", line)
+        self.assertIs(s.team_mode(), True)
+        self.assertEqual(s.match(k), ANN)
+        s.create("bob", "guest")                                          # written back: the file is there again
+        os.unlink(self.path)
+        with mock.patch("builtins.print") as log:
+            s.reload_if_changed()
+        self.assertEqual(log.call_count, 1)                                # a second disappearance, a second line
+
+    def test_a_file_never_seen_is_never_reported_gone(self):
+        s = self.store()
+        with mock.patch("builtins.print") as log:
+            s.reload_if_changed()
+            s.reload_if_changed()
+        self.assertEqual(log.call_count, 0)
+        self.assertIs(s.team_mode(), False)
+
     def test_a_broken_file_at_start_never_opens_the_server(self):
         Path(self.path).write_text("{", encoding="utf-8")
         s = self.store()
@@ -535,8 +563,17 @@ class Devices(Base):
     def test_no_entry_means_approved_whatever_the_device_id(self):
         for bad in ("", None, "x" * 500):
             self.assertEqual(self.s.device(LOCAL_GUEST, bad, "", "127.0.0.1", 1.0), "approved")
-        self.assertEqual(self.s.device(Identity("ghost", "guest"), "", "", "", 1.0), "approved")
         self.assertEqual(self.s.device(ANN, "", "", "", 1.0), "refused")            # a key's own bad id stays refused
+
+    def test_a_named_identity_whose_key_is_gone_is_refused(self):
+        """Final review M1: only LOCAL_GUEST has no entry by design.  A named identity with none had its key removed
+        or renamed between match() and device(): refused, at both sites, and nothing is recorded."""
+        self.assertEqual(self.s.device(Identity("ghost", "guest"), "d1", "", "", 1.0), "refused")
+        self.assertEqual(self.s.device(Identity("ghost", "owner"), "d1", "", "", 1.0), "refused")
+        self.assertTrue(self.s.revoke("ann", OWNER))
+        self.assertEqual(self.s.device(ANN, "d9", "", "", 2.0), "refused")
+        self.assertEqual(self.s._new_device(ANN, False, "d9", "", "", 2.0), "refused")     # the second site
+        self.assertEqual(self.s.pending(), [])
 
     def test_a_store_without_a_file_path_records_nothing(self):
         s = KeyStore(None, "abc")

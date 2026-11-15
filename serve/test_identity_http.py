@@ -1131,5 +1131,284 @@ class KeysFile(unittest.TestCase):
             self.run_main({"keys_file": 5})
 
 
+
+# ---------------------------------------------------------------------------------------------- the final review's fixes
+class FakeMcp:
+    """A built-in MCP server in the process (as serve/skills.SkillsServer): what the hub needs, and the calls it got."""
+    kind = "builtin"
+
+    def __init__(self, name, tools=("read",)):
+        self.name, self.status, self.error, self.info = name, "ready", None, {"name": name}
+        self.transport, self.lock, self.last_start = None, threading.Lock(), 0.0
+        self.tools = [{"name": t, "description": f"{name} {t}",
+                       "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}} for t in tools]
+        self.calls = []
+
+    def start(self):
+        return True
+
+    def close(self):
+        return None
+
+    def call(self, tool, arguments, timeout=0, cancel=None):
+        self.calls.append((tool, arguments))
+        return {"content": [{"type": "text", "text": f"{self.name} ran {tool}"}]}
+
+
+class GuestMcp(Base):
+    """Ruling R11 (final review I1): in team mode a non-owner gets only the server MCP servers the owner marked for
+    guests (the run config's "guest_mcp", default none), and the skills; never the coding tools.  The owner, and every
+    caller outside team mode, as before."""
+
+    def setUp(self):
+        super().setUp()
+        self.servers = {n: FakeMcp(n) for n in ("files", "notes", "skills")}
+
+    def start_mcp(self, *scripts, cfg=None, **attrs):
+        hub = hub_from_config({}, None, builtins=dict(self.servers))
+        hub.start(wait=True)
+        self.addCleanup(hub.close)
+        tok = ByteTokenizer()
+        self.engine = ScriptedEngine(tok, list(scripts) or ["</think>\n\nok"], max_context=200_000)
+        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.mcp = hub
+        self.start(**attrs)
+        self.cfg_path.write_text(json.dumps(cfg or {}), encoding="utf-8")
+
+    def mcp_chat(self, **kw):
+        return self.req("POST", "/v1/chat/completions", {"model": "m", "max_tokens": 1000, "strata_mcp": True,
+                                                         "messages": [{"role": "user", "content": "look"}]}, **kw)
+
+    def offered(self, i):
+        text = self.engine.prompt_text(i)
+        return {n for n in ("files__read", "notes__read", "skills__read") if f'"name": "{n}"' in text}
+
+    def test_a_guest_gets_only_the_marked_servers_and_the_skills(self):
+        self.start_mcp(tool_call("files__read", path="C:/secret.txt"), tool_call("notes__read", path="n"),
+                       "</think>\n\ndone", cfg={"guest_mcp": ["notes"]}, api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann")
+        code, body = self.mcp_chat(key=ann, device=DEV1)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.offered(0), {"notes__read", "skills__read"})
+        msg = body["choices"][0]["message"]                 # the unmarked server's call is not run here: it ends the turn
+        self.assertEqual(body["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(msg["tool_calls"][0]["function"]["name"], "files__read")
+        self.assertEqual(self.servers["files"].calls, [])
+        code, body = self.mcp_chat(key=ann, device=DEV1)    # a marked server's call runs
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.servers["notes"].calls, [("read", {"path": "n"})])
+        self.assertEqual(self.servers["files"].calls, [])
+
+    def test_nothing_marked_means_only_the_skills(self):
+        self.start_mcp(cfg={}, api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann")
+        self.assertEqual(self.mcp_chat(key=ann, device=DEV1)[0], 200)
+        self.assertEqual(self.offered(0), {"skills__read"})
+        self.cfg_path.write_text(json.dumps({"guest_mcp": ["agent", "files"]}), encoding="utf-8")   # read live
+        self.assertEqual(self.mcp_chat(key=ann, device=DEV1)[0], 200)
+        self.assertEqual(self.offered(1), {"files__read", "skills__read"})
+        self.cfg_path.write_text(json.dumps({"guest_mcp": "files"}), encoding="utf-8")             # not a list: none
+        self.assertEqual(self.mcp_chat(key=ann, device=DEV1)[0], 200)
+        self.assertEqual(self.offered(2), {"skills__read"})
+
+    def test_the_owner_is_unchanged(self):
+        self.start_mcp(tool_call("files__read", path="C:/secret.txt"), "</think>\n\ndone", cfg={"guest_mcp": []},
+                       api_key="k")
+        code, body = self.mcp_chat(key="k")
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.offered(0), {"files__read", "notes__read", "skills__read"})
+        self.assertEqual(self.servers["files"].calls, [("read", {"path": "C:/secret.txt"})])
+
+    def test_outside_team_mode_unchanged(self):
+        self.start_mcp(tool_call("files__read", path="x"), "</think>\n\ndone", cfg={"guest_mcp": []}, team=False,
+                       peer_override=REMOTE)
+        code, body = self.mcp_chat()
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.offered(0), {"files__read", "notes__read", "skills__read"})
+        self.assertEqual(self.servers["files"].calls, [("read", {"path": "x"})])
+        code, body = self.req("GET", "/mcp/config")
+        self.assertNotIn("guest", json.dumps(body))         # the answer as before: no guest field
+
+    def test_mcp_lists_show_a_guest_only_what_she_may_use(self):
+        cfg = {"mcp_servers": {"files": {"command": "x", "disabled": True}, "notes": {"command": "y", "disabled": True}},
+               "guest_mcp": ["notes"]}
+        self.start_mcp(cfg=cfg, api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann")
+        code, body = self.req("GET", "/mcp/config", key=ann, device=DEV1)
+        self.assertEqual(code, 200)
+        self.assertEqual([s["name"] for s in body["servers"]], ["notes"])
+        self.assertNotIn("guest", body["servers"][0])
+        code, body = self.req("GET", "/mcp", key=ann, device=DEV1)
+        self.assertEqual(sorted(s["name"] for s in body["servers"]), ["notes", "skills"])
+        self.assertEqual(body["tools"], 2)
+        self.svc.peer_override = None                                       # the owner sees every server, and the marks
+        code, body = self.req("GET", "/mcp/config", key="k")
+        self.assertEqual({s["name"]: s["guest"] for s in body["servers"]}, {"files": False, "notes": True})
+        self.assertEqual(self.req("GET", "/mcp", key="k")[1]["tools"], 3)
+
+    def test_the_owner_marks_servers_and_a_deleted_one_is_unmarked(self):
+        cfg = {"mcp_servers": {"files": {"command": "x", "disabled": True}, "notes": {"command": "y", "disabled": True}}}
+        self.start_mcp(cfg=cfg, api_key="k")
+        both = {"files": {"command": "x", "disabled": True}, "notes": {"command": "y", "disabled": True}}
+        code, body = self.req("POST", "/mcp/config", {"servers": both, "guest_mcp": ["files"]}, key="k")
+        self.assertEqual(code, 200, body)
+        self.assertEqual(json.loads(self.cfg_path.read_text(encoding="utf-8"))["guest_mcp"], ["files"])
+        code, body = self.req("POST", "/mcp/config", {"servers": both}, key="k")           # no guest_mcp: kept
+        self.assertEqual(code, 200, body)
+        self.assertEqual(json.loads(self.cfg_path.read_text(encoding="utf-8"))["guest_mcp"], ["files"])
+        code, body = self.req("POST", "/mcp/config", {"servers": {"notes": both["notes"]}}, key="k")   # files deleted
+        self.assertEqual(code, 200, body)
+        self.assertEqual(json.loads(self.cfg_path.read_text(encoding="utf-8"))["guest_mcp"], [])
+        for bad in (["nope"], "files", [5], ["agent"]):
+            code, body = self.req("POST", "/mcp/config", {"servers": both, "guest_mcp": bad}, key="k")
+            self.assertEqual(code, 400, bad)
+            self.assertIn("guest_mcp", json.dumps(body))
+        ann = self.svc.keys.create("ann", "guest")                         # from this PC, but a guest: not hers to set
+        code, body = self.req("POST", "/mcp/config", {"servers": both, "guest_mcp": ["notes"]}, key=ann)
+        self.assertEqual((code, body["error"]["type"]), (403, "forbidden"))
+
+
+class FinalReviewFixes(Base):
+    def raw(self, method, path, headers, key, device=None):
+        """A request with headers as (name, value) pairs, so that one header can be sent on two lines."""
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            c.putrequest(method, path)
+            for name, value in [("Authorization", "Bearer " + key), *([("X-Strata-Device", device)] if device else []),
+                                *headers]:
+                c.putheader(name, value)
+            c.endheaders()
+            r = c.getresponse()
+            return r.status, r.read()
+        finally:
+            c.close()
+
+    def test_the_last_forwarding_line_names_the_client(self):
+        """Final review M2: a proxy that adds a second header line instead of joining the first: its line counts."""
+        self.start(api_key="k", trust_loopback=False)
+        ann = self.svc.keys.create("ann", "guest")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.raw("GET", "/props", [("X-Forwarded-For", "26.9.9.1"), ("X-Forwarded-For", "26.9.9.2")], ann, DEV1)
+            self.raw("GET", "/props", [("Forwarded", "for=26.9.9.3"), ("Forwarded", "for=26.9.9.4")], ann, DEV2)
+        rows = {r["device"]: r["addr"] for r in self.svc.keys.pending()}
+        self.assertEqual(rows, {DEV1: "26.9.9.2", DEV2: "26.9.9.4"})
+
+    def test_a_guest_does_not_rescan_the_workstations_apps(self):
+        """T2-m2: GET /import?rescan=1 rescans only for an owner in team mode; a guest gets the view as it is."""
+        self.start(api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann")
+        with mock.patch.object(server_mod.harness, "view", return_value={"available": False}) as view:
+            self.assertEqual(self.req("GET", "/import?rescan=1", key=ann, device=DEV1)[0], 200)
+            self.svc.peer_override = None
+            self.assertEqual(self.req("GET", "/import?rescan=1", key="k")[0], 200)
+        self.assertEqual([c.kwargs["rescan"] for c in view.call_args_list], [False, True])
+
+    def test_rescan_outside_team_mode_unchanged(self):
+        self.start(team=False, peer_override=REMOTE)
+        with mock.patch.object(server_mod.harness, "view", return_value={"available": False}) as view:
+            self.assertEqual(self.req("GET", "/import?rescan=1")[0], 200)
+        self.assertIs(view.call_args.kwargs["rescan"], True)
+
+    def test_a_guest_is_never_shown_the_keys_files_path(self):
+        """T5-m1: POST /devices answers 409 / 500 to a non-owner without the path of the keys file."""
+        self.start(api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann")
+        self.req("GET", "/props", key=ann, device=DEV2)                          # a second device, pending
+        good = self.keys_path.read_text(encoding="utf-8")
+        self.keys_path.write_text("{ not json", encoding="utf-8")
+        code, body = self.req("POST", "/devices", {"key": "ann", "device": DEV2, "approve": True}, key=ann, device=DEV1)
+        self.assertEqual(code, 409, body)
+        self.assertNotIn(self.dir.name, json.dumps(body))
+        self.assertNotIn("strata-keys", json.dumps(body))
+        self.keys_path.write_text(good, encoding="utf-8")
+        st = os.stat(self.keys_path)
+        os.utime(self.keys_path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        with mock.patch.object(KeyStore, "_save", side_effect=OSError(f"[Errno 28] No space left: {self.keys_path}")):
+            code, body = self.req("POST", "/devices", {"key": "ann", "device": DEV2, "approve": True}, key=ann,
+                                  device=DEV1)
+        self.assertEqual(code, 500, body)
+        self.assertNotIn(self.dir.name, json.dumps(body))
+        self.assertNotIn("strata-keys", json.dumps(body))
+
+    def test_guest_image_urls_without_vision_fetch_nothing(self):
+        """T5b-m5: with no vision encoder a guest's image URL is refused before anything is downloaded."""
+        site = Site({"/x.png": (200, {"Content-Type": "image/png"}, PNG)})
+        self.addCleanup(site.close)
+        self.start(api_key="k", peer_override=REMOTE)                           # no vision encoder
+        ann = self.approved("ann")
+        allow = lambda ip, port: port == site.port                                          # noqa: E731
+        with mock.patch.object(web_mod, "public_not_vpn", allow):
+            for path, body in LocalImages.bodies(self, site.url("/x.png")).items():
+                code, r = self.req("POST", path, body, key=ann, device=DEV1)
+                if path == "/v1/chat/completions":
+                    self.assertEqual(code, 400, r)
+                    self.assertIn("vision encoder", json.dumps(r))
+        self.assertEqual(site.seen, [])
+
+    def test_a_guest_sends_at_most_16_image_urls(self):
+        """T5b-m7: each image URL is fetched and held in memory, so a guest's request names at most 16."""
+        site = Site({f"/{i}.png": (200, {"Content-Type": "image/png"}, PNG) for i in range(17)})
+        self.addCleanup(site.close)
+        self.start(api_key="k", peer_override=REMOTE, vision=FakeVision(self.dir))
+        ann = self.approved("ann")
+
+        def body(n):
+            return {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what are they?"},
+                *({"type": "image_url", "image_url": {"url": site.url(f"/{i}.png")}} for i in range(n))]}]}
+        allow = lambda ip, port: port == site.port                                          # noqa: E731
+        with mock.patch.object(web_mod, "public_not_vpn", allow):
+            code, r = self.req("POST", "/v1/chat/completions", body(17), key=ann, device=DEV1)
+            self.assertEqual(code, 400, r)
+            self.assertIn("16", r["error"]["message"])
+            self.assertEqual(site.seen, [])
+            self.assertEqual(self.req("POST", "/v1/chat/completions", body(16), key=ann, device=DEV1)[0], 200)
+        self.assertEqual(len(site.seen), 16)
+
+
+class StartLines(unittest.TestCase):
+    """M3: the start-up lines say whether a key is needed from key_required(), so a team-mode server with no api_key
+    does not say it is open.  Outside team mode the lines are as before, word for word."""
+
+    def svc(self, api_key="", team=False):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        path = Path(d.name) / "strata-keys.json"
+        if team:
+            path.write_text(json.dumps({"keys": [], "log": []}), encoding="utf-8")
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.api_key, svc.keys = api_key, KeyStore(str(path), api_key)
+        return svc
+
+    def test_ready_lines(self):
+        lines = server_mod.start_lines(self.svc(), "0.0.0.0", 8091, 4096, False, ["26.1.2.3"])
+        self.assertEqual(lines, [
+            "ready: http://127.0.0.1:8091/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context 4096 tokens)",
+            "       open http://127.0.0.1:8091/ in a browser to chat; close this window to stop the model",
+            "       from other devices: http://26.1.2.3:8091/   (API: http://26.1.2.3:8091/v1)",
+            "       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" to the "
+            "config (clients send it as their API key; the web page asks for it)"])
+        lines = server_mod.start_lines(self.svc("k"), "127.0.0.1", 8091, 4096, True, [])
+        self.assertEqual(lines, ["ready: http://127.0.0.1:8091/v1  (OpenAI: /v1/chat/completions, Anthropic: "
+                                 "/v1/messages, context 4096 tokens, images on, API key required)",
+                                 "       open http://127.0.0.1:8091/ in a browser to chat; close this window to stop "
+                                 "the model"])
+        team = "\n".join(server_mod.start_lines(self.svc(team=True), "0.0.0.0", 8091, 4096, False, []))
+        self.assertIn("API key required", team)
+        self.assertNotIn("no API key", team)
+        self.assertIn("from other devices: http://<this PC's IP address>:8091/", team)
+
+    def test_monitor_and_cors_lines(self):
+        run = KeysFile("run_main").run_main
+        cfg = {"api_monitor": True, "cors_origins": ["*"]}
+        _, out, _ = run(cfg)
+        self.assertEqual(out.count("(no API key)"), 2)                        # as before: the server is open
+        _, out, _ = run(cfg, keys={"keys": [], "log": []})
+        self.assertNotIn("no API key", out)                                   # team mode: every request needs a key
+        self.assertIn("API request monitor on", out)
+        self.assertIn("CORS on /v1/* for *", out)
+
+
 if __name__ == "__main__":
     unittest.main()

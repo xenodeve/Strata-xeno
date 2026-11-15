@@ -2065,6 +2065,7 @@ class StrataEngine:
 
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
+GUEST_IMAGE_URLS = 16           # #311: the image URLs one request of a team guest may name (each is held in memory)
 
 
 def network_path(path: str) -> bool:
@@ -5638,7 +5639,7 @@ def make_handler(svc: Service):
             self.identity = ident
             peer, h = self._peer(), self.headers
             addr = identity_mod.device_addr(peer, mcp_admin.is_loopback(peer), h.get("Cf-Connecting-Ip"),
-                                            h.get("X-Forwarded-For"), h.get("Forwarded"))
+                                            self._all_lines("X-Forwarded-For"), self._all_lines("Forwarded"))
             self.device_id, label = identity_mod.device_of(h.get("X-Strata-Device"), h.get("X-Strata-Device-Name"),
                                                            h.get("User-Agent"), addr)
             if self._loopback_local():                       # the workstation itself: approved without asking
@@ -5659,6 +5660,12 @@ def make_handler(svc: Service):
                                  f"this device may not use the key {ident.name!r} (the owner refused it, or the key has "
                                  f"too many devices); the owner can clear it"}})
             return False
+
+        def _all_lines(self, name: str) -> str | None:
+            """A list header as one value: every line it came on, in order, joined by commas (as RFC 9110 reads it), so
+            the last entry is the nearest proxy's even when that proxy added a line of its own (final review M2)."""
+            lines = self.headers.get_all(name)
+            return ", ".join(lines) if lines else None
 
         def _given_key(self) -> str:
             auth = self.headers.get("Authorization", "")
@@ -5712,6 +5719,23 @@ def make_handler(svc: Service):
             else:
                 self._json(403, {"error": {"message": why}})
             return False
+
+        def _mcp_allowed(self) -> set[str] | None:
+            """#310 ruling R11: the server MCP servers this request may use - None for all of them (the owner, and every
+            caller outside team mode, as before: the run config is not read).  A team guest gets the servers the owner
+            marked for guests (the run config's "guest_mcp", read on each request like the other tool settings) and the
+            skills, never the coding tools: an MCP server runs on this PC with its owner's rights."""
+            if not self.team or (self.identity is not None and self.identity.is_owner):
+                return None
+            return mcp_admin.guest_allowed(harness._cfg(svc), svc.mcp)
+
+        def _mcp_view(self) -> dict:
+            """GET /mcp/config's answer for this caller (#79): a team guest's lists only her servers (R11), the team owner's
+            says which servers guests may use."""
+            may = self._edit_answer()
+            marks = mcp_admin.guest_servers(harness._cfg(svc)) if self.team and may[0] else None
+            return mcp_admin.view(svc, self._peer(), self.headers.get("Host", ""), may=may, allowed=self._mcp_allowed(),
+                                  guests=marks)
 
         def _runs_gate(self, what: str) -> bool:
             """#310: the gate of a run's routes and of the answers to its prompts.  In team mode every key passes it: a
@@ -5883,8 +5907,9 @@ def make_handler(svc: Service):
                 return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
-                if self._authorized():
-                    self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
+                if self._authorized():                       # #310 R11: a team guest sees only the servers she may use
+                    self._json(200, mcp_admin.status_for(svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0},
+                                                         self._mcp_allowed()))
                 return
             if path == "/agent":
                 # the chat's coding tools: whether they are on, which shell commands run in, and whether this caller may use them (only from this PC, or with the key)
@@ -5996,12 +6021,14 @@ def make_handler(svc: Service):
             if path == "/mcp/config":
                 # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)
                 if self._authorized():
-                    self._json(200, mcp_admin.view(svc, self._peer(), self.headers.get("Host", ""), may=self._edit_answer()))
+                    self._json(200, self._mcp_view())
                 return
             if path == "/import":
                 # the skills and the MCP servers of the other coding apps on this PC, with what may be changed (#94)
                 if self._authorized():
-                    self._json(200, harness.view(svc, self._peer(), self.headers.get("Host", ""), rescan="rescan=1" in self.path, may=self._edit_answer()))
+                    may = self._edit_answer()                     # #310: in team mode only an owner makes the server rescan this PC's apps
+                    self._json(200, harness.view(svc, self._peer(), self.headers.get("Host", ""),
+                                                 rescan="rescan=1" in self.path and (not self.team or may[0]), may=may))
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
@@ -6130,7 +6157,7 @@ def make_handler(svc: Service):
                 except ValueError:
                     return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
                 code, out = mcp_admin.apply(svc, body)
-                return self._json(code, out if code != 200 else mcp_admin.view(svc, self._peer(), self.headers.get("Host", ""), may=self._edit_answer()))
+                return self._json(code, out if code != 200 else self._mcp_view())
             if path in ("/agent/rewind", "/agent/checkpoints/forget"):         # the way back for the files the tools changed (serve/checkpoints.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
@@ -6609,10 +6636,14 @@ def make_handler(svc: Service):
             try:
                 ok = svc.keys.clear_device(key, device, by=self.identity) if clear else \
                     svc.keys.decide_device(key, device, body["approve"], self.identity)
-            except identity_mod.KeysFileBad as e:
-                return self._json(409, {"error": {"message": str(e)}})
+            except identity_mod.KeysFileBad as e:            # where the file lives is the owner's to know
+                return self._json(409, {"error": {"message": str(e) if self.identity.is_owner else
+                                                  "the keys file on the server does not parse, so nothing can be "
+                                                  "changed now: tell the owner"}})
             except OSError as e:
-                return self._json(500, {"error": {"message": f"the keys file could not be written: {e}"}})
+                return self._json(500, {"error": {"message": f"the keys file could not be written: {e}"
+                                                  if self.identity.is_owner else
+                                                  "the keys file on the server could not be written: tell the owner"}})
             if ok:
                 return self._json(200, {"ok": True})
             status = next((d["status"] for r in svc.keys.view() if r["name"] == key for d in r["devices"]
@@ -6706,7 +6737,15 @@ def make_handler(svc: Service):
             this PC, a private or link-local network, CGNAT 100.64/10 (Tailscale) or 26.0.0.0/8 (Radmin VPN) - checked
             on the address connected to and on every redirect (Vision.download with web.public_not_vpn).  Its item then
             carries the bytes as a data: URL, so nothing later (prepare, a tool round) holds the URL to fetch it again
-            without the check.  Every role's images, as images_of reads them.  ValueError (a 400)."""
+            without the check.  Every role's images, as images_of reads them.  With no vision encoder nothing is
+            fetched (prepare refuses the image, or notes a tool's, as for anyone), and a request names at most
+            GUEST_IMAGE_URLS of them: each is held in memory (final review T5b-m5, m7).  ValueError (a 400)."""
+            if svc.vision is None:
+                return
+            urls = [src for src in images_of(messages) if src.startswith(("http://", "https://"))]
+            if len(urls) > GUEST_IMAGE_URLS:
+                raise ValueError(f"a request with a guest key may name at most {GUEST_IMAGE_URLS} image URLs (this one "
+                                 f"names {len(urls)}): send the others as data: URLs, or in another request")
             fetched: dict[str, str] = {}
             for m in messages:
                 content = m.get("content")
@@ -6855,6 +6894,9 @@ def make_handler(svc: Service):
                     skip |= {n for n in svc.mcp.servers if n != "agent"}      # the coding tools alone: no MCP server
                 if arun is None:
                     skip.add("agent")                             # and the coding tools only when the request asks for them
+                allowed = self._mcp_allowed()                     # #310 R11: a team guest, only the servers marked for guests
+                if allowed is not None:
+                    skip |= {n for n in svc.mcp.servers if n not in allowed}
                 extra = svc.mcp.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
@@ -7434,6 +7476,25 @@ def api_key_of(value):
     return key.strip()
 
 
+def start_lines(svc, host: str, port: int, max_context: int, vision: bool, ips: list[str]) -> list[str]:
+    """What main() prints once it serves: where, and whether a request needs a key - `key_required()`, so a team-mode
+    server with no api_key does not say it is open (#310, final review M3).  `ips`: this PC's LAN addresses, asked only
+    when `host` is not a loopback name (issue #26: reachable from other devices - say at which address)."""
+    here = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+    keyed = svc.key_required()
+    lines = [f"ready: http://{here}:{port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
+             f"context {max_context} tokens{', images on' if vision else ''}{', API key required' if keyed else ''})",
+             f"       open http://{here}:{port}/ in a browser to chat; close this window to stop the model"]
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        lines += [f"       from other devices: http://{ip}:{port}/   (API: http://{ip}:{port}/v1)" for ip in ips]
+        if not ips:
+            lines.append("       from other devices: http://<this PC's IP address>:" + str(port) + "/")
+        if not keyed:
+            lines.append("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": "
+                         "\"...\" to the config (clients send it as their API key; the web page asks for it)")
+    return lines
+
+
 def keys_file_of(cfg: dict, config_path) -> str | None:
     """#310: where the named keys are kept: the run config's "keys_file" (a path relative to the config's folder), by
     default strata-keys.json beside the run config.  No run config, no keys file (and no team mode)."""
@@ -7974,13 +8035,13 @@ def main() -> int:
         print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
-    if svc.api_monitor:
+    if svc.api_monitor:                                  # #310: a team-mode server needs a key even with no api_key
         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
-              "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
+              "memory" + ("" if svc.key_required() else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
     if svc.cors_origins:
         print(f"[strata] CORS on /v1/* for {', '.join(svc.cors_origins)}"
-              + ("" if svc.api_key or "*" not in svc.cors_origins else
+              + ("" if svc.key_required() or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
@@ -8082,21 +8143,10 @@ def main() -> int:
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     svc.start_engine_watch()                            # #59: a dead engine comes back without waiting for a request
-    here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
-    print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
-          f"context {engine.max_context} tokens{', images on' if vision else ''}"
-          f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
-    if a.host not in ("127.0.0.1", "localhost", "::1"):
-        # issue #26: reachable from other devices - say at which address, and what can still block it
-        ips = lan_addresses()
-        for ip in ips:
-            print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
-        if not ips:
-            print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
-        if not svc.api_key:
-            print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
-                  "to the config (clients send it as their API key; the web page asks for it)", flush=True)
+    lan = a.host not in ("127.0.0.1", "localhost", "::1")
+    for line in start_lines(svc, a.host, a.port, engine.max_context, bool(vision), lan_addresses() if lan else []):
+        print(line, flush=True)
+    if lan:
         if os.name == "nt":
             print("       nothing arrives? Windows Firewall blocks it until allowed: accept its prompt for Python, or run "
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Strata " + str(a.port) + "\" "

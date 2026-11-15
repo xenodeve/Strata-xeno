@@ -11,7 +11,10 @@ the server runs and the change counts at the next request.
     any other is `LOCAL_GUEST` (as mcp_admin.may_edit decided before).
   * `KeyStore`: matches a given key to an identity, keeps the keys and each key's devices, and answers who may approve
     a device.  A new key is "sk-strata-" + 24 random bytes, shown once and kept only as its sha256.
-  * Team mode is the keys file existing.  Without it nothing here changes how the server behaves today.
+  * Team mode is the keys file existing.  Without it nothing here changes how the server behaves today.  Once the
+    store has seen the file, team mode lasts until a restart: a file deleted while the server runs is written back
+    from the keys held (by the next change or device write) and its going is printed once.  To leave team mode: stop
+    the server, delete the keys file, start it again.
   * `device_of`, `device_addr`: which device a request came from (the X-Strata-Device header, else "addr:<ip>") and
     the address it is recorded with (forwarding headers count only from a proxy on this PC).
   * `visible_record`: what another person's request record may show a guest.
@@ -91,6 +94,7 @@ class KeyStore:
         self._seen_saved: dict = {}                       # (key, device) -> last_seen as last written
         self._team = False
         self._bad = False                                 # the file on disk failed to parse when it was last read
+        self._gone = False                                # the file was seen, then went away while the server runs
         with self._lock:
             self._reload_locked()
 
@@ -108,8 +112,14 @@ class KeyStore:
         sig = self._stat_sig()
         if sig is None:                                   # no file (yet), or gone: keep what is held
             self._bad = False                             # nothing on disk to destroy; a write makes a new file
+            if self._team and not self._gone:             # seen before: team mode stays on, said once per going
+                self._gone = True
+                print(f"strata serve: the keys file {self.path} is gone; team mode stays on until a restart, and the "
+                      f"file is written again from the keys held (to leave team mode: stop the server, delete the keys "
+                      f"file, start it again)", flush=True)
             return
         self._team = True
+        self._gone = False
         if sig == self._sig:
             return
         try:
@@ -195,6 +205,7 @@ class KeyStore:
             raise
         self._sig = self._stat_sig()
         self._team = True
+        self._gone = False
 
     def _change(self, fn):
         """Run fn(copy of the data) and write the result.  The file is read first (an outside edit is kept), and a
@@ -224,8 +235,10 @@ class KeyStore:
             self.reload_if_changed()
 
     def team_mode(self) -> bool:
-        """True when the keys file exists (or a key has been created): only then do device checks and the owner-only
-        routes apply.  A store with no file path is never in team mode."""
+        """True when the keys file exists, or existed at any time since the store was made (a key was created, or
+        the file was read): only then do device checks and the owner-only routes apply.  A file deleted while the
+        server runs does not end team mode before a restart (to leave team mode: stop the server, delete the keys
+        file, start it again).  A store with no file path is never in team mode."""
         if not self.path:
             return False
         with self._lock:
@@ -417,16 +430,17 @@ class KeyStore:
     # ------------------------------------------------------------------------------------------ devices
     def device(self, ident: Identity, device_id: str, label: str, addr: str, now: float) -> str:
         """The state of the device this request came from, "approved", "pending" or "refused".  A device seen for the
-        first time is recorded as pending with a short code the owner compares.  Devices are kept per key: an
-        identity with no key entry (the unauthenticated LOCAL_GUEST) is approved and nothing is recorded."""
+        first time is recorded as pending with a short code the owner compares.  Devices are kept per key: the one
+        identity with no key entry by design (the unauthenticated LOCAL_GUEST) is approved and nothing is recorded;
+        any other identity with no entry had its key removed or renamed since match(), and is refused."""
         if not self.path:
             return "approved"
         legacy_owner = ident == OWNER
         with self._lock:
             self._reload_locked()
             e = self._entry(self._data, ident.name)
-            if e is None and not legacy_owner:            # no key, no devices: nothing to check, whatever the id
-                return "approved"
+            if e is None and not legacy_owner:            # no key, no devices: nothing to check, whatever the id -
+                return "approved" if ident == LOCAL_GUEST else "refused"     # but a named key gone since match()
             if not isinstance(device_id, str) or not 0 < len(device_id) <= 128:
                 return "refused"
             label, addr = str(label or "")[:MAX_TEXT], str(addr or "")[:MAX_TEXT]
@@ -457,8 +471,8 @@ class KeyStore:
         def go(data):
             e = self._entry(data, ident.name)
             if e is None:                                 # the legacy owner's reserved entry, made on first use
-                if not legacy_owner:
-                    return "approved"
+                if not legacy_owner:                      # a named key removed or renamed meanwhile
+                    return "refused"
                 e = {"name": "owner", "legacy": True, "role": "owner", "created": now, "devices": {}}
                 data["keys"].append(e)
             d = e["devices"].get(device_id)
