@@ -197,8 +197,8 @@ function Shell() {
           <AvatarMenu />
           <LangSwitch />
         </div>
+        <ApprovalNotice />                                                                             {/* hangs under the bar, out of the page's flow and scroll (#310) */}
       </header>
-      <ApprovalNotice />
       <ToastHost />
       <ReelFilter />
       <main key={route.page} className={cn("page-in mx-auto w-full flex-1 px-4 pb-16 pt-6 sm:px-6", wide ? "max-w-[1800px]" : "max-w-5xl")}>

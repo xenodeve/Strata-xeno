@@ -83,7 +83,7 @@ export function DeviceGate({ children }: { children: ReactNode }) {
           <label className="block text-[13px]" htmlFor="gate-key">{t("Have another key? Use it on this device:")}</label>
           <div className="mt-1.5 flex gap-2">
             <input id="gate-key" className={inputCls} type="password" autoComplete="off" value={key} placeholder={t("API key")} onChange={(e) => setKey(e.target.value)} />
-            <Button type="submit" disabled={!key.trim()}>{t("Use this key")}</Button>
+            <span className="shrink-0 whitespace-nowrap"><Button type="submit" disabled={!key.trim()}>{t("Use this key")}</Button></span>
           </div>
         </form>
       </div>

@@ -30,7 +30,6 @@ export function ApprovalNotice() {
     return () => { stop = true; clearTimeout(timer); document.removeEventListener("visibilitychange", visible) }
   }, [team, look])
 
-  if (!rows.length) return null
   const decide = async (d: PendingDevice, how: "approve" | "refuse") => {
     const id = d.key + "/" + d.device
     setBusy((b) => ({ ...b, [id]: how }))
@@ -40,27 +39,39 @@ export function ApprovalNotice() {
     else toast("success", how === "approve" ? t("Device approved") : t("Device refused"), d.label || d.device)
     await look()
   }
+  return <ApprovalBanners rows={rows} busy={busy} onDecide={(d, how) => void decide(d, how)} />
+}
+
+/** The banners, one per device. A layer out of the page's flow, hung under the sticky header (App puts it inside the header): the page's
+ *  scroll never takes it out of view (the chat's composer, focused on open, scrolls the page), and it is never taller than 45 % of the
+ *  screen (more devices scroll inside it), so the composer at the bottom stays free on a phone too. */
+export function ApprovalBanners({ rows, busy, onDecide }: {
+  rows: PendingDevice[]; busy: Record<string, "approve" | "refuse">; onDecide: (d: PendingDevice, how: "approve" | "refuse") => void
+}) {
+  if (!rows.length) return null
   return (
-    <div className="mx-auto w-full max-w-5xl space-y-2 px-3 pt-3 sm:px-6" data-approval-notice>
-      {rows.map((d) => {
-        const id = d.key + "/" + d.device
-        const doing = busy[id]
-        return (
-          <div key={id} role="alert" data-pending-device={d.device} className="toast-in flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-line bg-surface px-4 py-3 shadow-[0_6px_24px_-12px_rgb(0_0_0/0.25)]">
-            <div className="min-w-0 flex-1 basis-64 text-[13px]">
-              <div className="font-medium">{t("A new device asks to use the key {key}", { key: d.key })}</div>
-              <div className="mt-0.5 text-ink-2 [overflow-wrap:anywhere]">
-                {t("{label} at {addr} · code {code}", { label: d.label || t("(no name)"), addr: d.addr || t("an unknown address"), code: d.code })}
+    <div data-approval-notice className="pointer-events-none absolute inset-x-0 top-full z-10">
+      <div className="pointer-events-auto mx-auto max-h-[45dvh] w-full max-w-5xl space-y-2 overflow-y-auto overscroll-contain px-3 pb-2 pt-2 sm:px-6">
+        {rows.map((d) => {
+          const id = d.key + "/" + d.device
+          const doing = busy[id]
+          return (
+            <div key={id} role="alert" data-pending-device={d.device} className="toast-in flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-line bg-surface px-4 py-3 shadow-[0_6px_24px_-12px_rgb(0_0_0/0.25)]">
+              <div className="min-w-0 flex-1 basis-64 text-[13px]">
+                <div className="font-medium">{t("A new device asks to use the key {key}", { key: d.key })}</div>
+                <div className="mt-0.5 text-ink-2 [overflow-wrap:anywhere]">
+                  {t("{label} at {addr} · code {code}", { label: d.label || t("(no name)"), addr: d.addr || t("an unknown address"), code: d.code })}
+                </div>
+                <div className="mt-0.5 text-[12px] text-ink-3">{t("Approve it only if the device shows the same code.")}</div>
               </div>
-              <div className="mt-0.5 text-[12px] text-ink-3">{t("Approve it only if the device shows the same code.")}</div>
+              <div className="flex shrink-0 gap-2">
+                <Button kind="primary" disabled={!!doing} onClick={() => onDecide(d, "approve")}>{doing === "approve" ? t("Approving…") : t("Approve")}</Button>
+                <Button disabled={!!doing} onClick={() => onDecide(d, "refuse")}>{doing === "refuse" ? t("Refusing…") : t("Refuse")}</Button>
+              </div>
             </div>
-            <div className="flex shrink-0 gap-2">
-              <Button kind="primary" disabled={!!doing} onClick={() => void decide(d, "approve")}>{doing === "approve" ? t("Approving…") : t("Approve")}</Button>
-              <Button disabled={!!doing} onClick={() => void decide(d, "refuse")}>{doing === "refuse" ? t("Refusing…") : t("Refuse")}</Button>
-            </div>
-          </div>
-        )
-      })}
+          )
+        })}
+      </div>
     </div>
   )
 }
