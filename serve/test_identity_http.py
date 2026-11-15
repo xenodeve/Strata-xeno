@@ -270,6 +270,66 @@ class Devices(Base):
         self.assertEqual(self.keys_path.read_text(encoding="utf-8"), before)
 
 
+class FakeVision:
+    """Stands in for the image encoder: records which sources reached it (Vision.load is where a file is read)."""
+
+    def __init__(self, d):
+        self.dir, self.seen = Path(d), []
+
+    def encode(self, source):
+        self.seen.append(source)
+        rows = self.dir / f"img{len(self.seen)}.sve"
+        rows.write_bytes(b"rows")
+        return rows, 3
+
+
+class LocalImages(Base):
+    """A file on the workstation named as an image: in team mode only an owner key has it read (review of #310)."""
+
+    def bodies(self, src):
+        text = {"type": "text", "text": "what is it?"}
+        anth = {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": [
+            text, {"type": "image", "source": {"type": "url", "url": src}}]}]}
+        return {"/v1/chat/completions": {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": [
+                    text, {"type": "image_url", "image_url": {"url": src}}]}]},
+                "/v1/messages": anth,
+                "/v1/messages/count_tokens": anth,
+                "/v1/responses": {"model": "m", "max_output_tokens": 16, "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": "what is it?"}, {"type": "input_image", "image_url": src}]}]}}
+
+    def setUp(self):
+        super().setUp()
+        self.vision = FakeVision(self.dir)
+        self.img = self.dir / "secret.png"
+        self.img.write_bytes(b"PNG not decoded by the fake encoder")
+
+    def test_a_guest_cannot_name_a_file_and_learns_nothing_of_it(self):
+        self.start(api_key="k", peer_override=REMOTE, vision=self.vision)
+        ann = self.approved("ann")
+        for src in (str(self.img), "file:///" + str(self.img).replace("\\", "/"), str(self.dir / "missing.png")):
+            for path, body in self.bodies(src).items():
+                with self.subTest(src=src, path=path):
+                    code, r = self.req("POST", path, body, key=ann, device=DEV1)
+                    self.assertEqual(code, 400, r)
+                    self.assertIn("only with an owner key", json.dumps(r))
+                    self.assertNotIn("missing", json.dumps(r))      # the same answer whether the file exists
+        self.assertEqual(self.vision.seen, [])
+        for path, body in self.bodies("data:image/png;base64,iVBORw0KGgo=").items():     # the guest's own bytes
+            self.assertEqual(self.req("POST", path, body, key=ann, device=DEV1)[0], 200, path)
+
+    def test_the_owner_may(self):
+        self.start(api_key="k", vision=self.vision)                     # the owner, from this PC
+        for path, body in self.bodies(str(self.img)).items():
+            self.assertEqual(self.req("POST", path, body, key="k")[0], 200, path)
+        self.assertEqual(self.vision.seen.count(str(self.img)), 4)
+
+    def test_outside_team_mode_unchanged(self):
+        self.start(api_key="k", team=False, peer_override=REMOTE, vision=self.vision)
+        for path, body in self.bodies(str(self.img)).items():
+            self.assertEqual(self.req("POST", path, body, key="k")[0], 200, path)
+        self.assertEqual(self.vision.seen.count(str(self.img)), 4)
+
+
 class _Reached(Exception):
     """raised by the patched serve(): main() got as far as serving."""
 

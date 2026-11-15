@@ -6464,17 +6464,23 @@ def make_handler(svc: Service):
             return bool(origin) and origin.split("://", 1)[-1] != self.headers.get("Host", "") and \
                 origin not in svc.trusted_origins
 
-        def _no_local_images(self, messages):
+        def _no_local_images(self, messages, foreign: bool = True):
             """A web page of another origin must not have a file on this computer read as an image.  Without an
             api_key, _foreign_page refuses such a page unless cors_origins lets it in - and a page cors_origins lets
             in (["*"]: every page) could name any file and, CORS allowing, read what the model says about it.  data:
             and http(s) images are the page's own to send; files come from Strata's own page, a trusted origin or a
-            client that is no browser.  ValueError (a 400)."""
-            if self._foreign_origin() and any(not src.startswith(("data:", "http://", "https://"))
-                                              for src in images_of(messages)):
+            client that is no browser.  #310: in team mode only an owner key may name a file on this PC - a guest's
+            files are on the guest's own PC, and the refusal comes before anything looks at the path, so it does not
+            tell whether the path exists.  `foreign`: False checks only the team rule.  ValueError (a 400)."""
+            if not any(not src.startswith(("data:", "http://", "https://")) for src in images_of(messages)):
+                return
+            if foreign and self._foreign_origin():
                 raise ValueError("a web page of another origin cannot have a file on this computer read as an "
                                  "image: send it as a data: URL (or add the page's origin to the config's "
                                  "trusted_origins)")
+            if self.team and not (self.identity is not None and self.identity.is_owner):
+                raise ValueError("a file on the server's computer can be read as an image only with an owner key: "
+                                 "send the image as a data: URL")
 
         def _settings(self):
             # They change what every client gets, so only the app's own page may set them
@@ -6843,6 +6849,7 @@ def make_handler(svc: Service):
             gets (xeno #49 S3, think_budget.side_effort) is not applied - this is the main turn's prompt."""
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, vision=svc.vision is not None)
+            self._no_local_images(messages, foreign=False)    # #310: counting reads the image too (team mode only)
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             try:
