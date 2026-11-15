@@ -15,6 +15,7 @@ import queue
 import threading
 import time
 import uuid
+import weakref
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
@@ -31,6 +32,37 @@ class Broker:
     def __init__(self):
         self.lock = threading.Lock()
         self.pending: dict[str, dict] = {}
+        self.runs: weakref.WeakSet = weakref.WeakSet()      # the AgentRuns that ask through this broker (helpers too), while alive
+
+    def track(self, run: AgentRun) -> None:
+        with self.lock:
+            self.runs.add(run)
+
+    def move(self, old: str, new: str) -> int:
+        """#310: a key renamed from `old` to `new`: every open prompt and every live run of `old` (so what it asks next
+        too) is `new`'s.  A later key named `old` inherits nothing.  How many open prompts moved."""
+        with self.lock:
+            for run in list(self.runs):
+                if run.who == old:
+                    run.who = new
+            slots = [s for s in self.pending.values() if s.get("who") == old]
+            for s in slots:
+                s["who"] = new
+        return len(slots)
+
+    def end_all(self, who: str) -> int:
+        """#310: a key that is revoked (or made a guest): every live run of `who` is cancelled and every prompt it holds
+        is closed as refused (a permission as "deny", a question as skipped).  How many prompts were closed."""
+        with self.lock:
+            runs = [run for run in list(self.runs) if run.who == who]
+            gone = [rid for rid, s in self.pending.items() if s.get("who") == who]
+            slots = [self.pending.pop(rid) for rid in gone]
+        for run in runs:
+            run.cancel.set()
+        for s in slots:
+            s["answer"] = "deny" if s.get("kind") == "permission" else {"answers": None}
+            s["event"].set()
+        return len(slots)
 
     def open(self, rid: str, kind: str = "permission", who: str = "owner") -> dict:
         slot = {"event": threading.Event(), "answer": None, "kind": kind, "who": who}
@@ -82,6 +114,7 @@ class AgentRun:
         self.limit_hit = False                                 # the tool loop stopped at its limit of rounds
         self.steers: queue.Queue = queue.Queue()               # what the user sent while the agent worked: read by the model at the next step (serve/server.py run_with_mcp)
         self.ctx = agent.AgentContext(policy=policy, session=session, ask=self.ask, cancel=cancel, emit=self._emit, question=self.question)
+        broker.track(self)                                     # #310: a rename moves it, a revoke stops it
 
     def steer(self, text: str) -> None:
         self.steers.put(text)

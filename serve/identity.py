@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 ROLES = ("owner", "guest")
 RESERVED = ("owner", "anonymous")          # "owner" is the legacy key's identity, "anonymous" the unauthenticated guest
+REVOKED = "\x00revoked"                    # whose a revoked key's runs become: no key can be named so (control character)
 KEY_PREFIX = "sk-strata-"
 LOG_CAP = 500
 MAX_DEVICES = 100                          # per key: a client chooses its device id, so the file must not grow without end
@@ -298,20 +299,39 @@ class KeyStore:
         if any(e["name"].casefold() == name.casefold() for e in data["keys"]):
             raise ValueError(f"a key named {name!r} exists")
 
-    def create(self, name: str, role: str) -> str:
-        """A new key.  The plain key is returned here and nowhere else: only its sha256 is kept."""
+    @staticmethod
+    def _by(by: Identity | None) -> str:
+        return by.name if by is not None else ""
+
+    def _an_owner_left(self, data: dict, without: dict | None = None) -> bool:
+        """Is there an owner key besides `without`?  In team mode every request needs a key, this PC's too (ruling R6),
+        so with no owner key nobody could manage the keys any more.  A legacy api_key is an owner."""
+        return bool(self._legacy) or any(e is not without and e["role"] == "owner" and not e.get("legacy")
+                                         for e in data["keys"])
+
+    def _keep_an_owner(self, data: dict, e: dict) -> None:
+        if e["role"] == "owner" and not self._an_owner_left(data, e):
+            raise ValueError(f"{e['name']!r} is the last owner key: in team mode every request needs a key, so nobody "
+                             f"could manage the keys any more; make another owner key first")
+
+    def create(self, name: str, role: str, by: Identity | None = None, owner_first: bool = False) -> str:
+        """A new key.  The plain key is returned here and nowhere else: only its sha256 is kept.  `owner_first`: refuse
+        a guest key while there is no owner key at all (the route's create: that first key would lock everyone out)."""
         name, role = self._name(name), self._role(role)
         key = KEY_PREFIX + secrets.token_urlsafe(24)
 
         def go(data):
             self._unique(data, name)
+            if owner_first and role != "owner" and not self._an_owner_left(data):
+                raise ValueError("the first key must be an owner key: in team mode every request needs a key, this "
+                                 "PC's too, and only an owner key manages the keys")
             data["keys"].append({"name": name, "role": role, "sha256": _sha(key.encode()),
                                  "created": time.time(), "devices": {}})
-            self._log(data, "created", name)
+            self._log(data, "created", name, by=self._by(by))
         self._change(go)
         return key
 
-    def rename(self, name: str, new: str) -> bool:
+    def rename(self, name: str, new: str, by: Identity | None = None) -> bool:
         if name == "owner":
             raise ValueError("the owner key is built in")
         new = self._name(new)
@@ -323,11 +343,11 @@ class KeyStore:
             if new.casefold() != name.casefold():
                 self._unique(data, new)
             e["name"] = new
-            self._log(data, f"renamed from {name}", new)
+            self._log(data, f"renamed from {name}", new, by=self._by(by))
             return True
         return self._change(go)
 
-    def set_role(self, name: str, role: str) -> bool:
+    def set_role(self, name: str, role: str, by: Identity | None = None) -> bool:
         role = self._role(role)
         if name == "owner":
             raise ValueError("the owner key is built in")
@@ -336,12 +356,14 @@ class KeyStore:
             e = self._entry(data, name)
             if e is None:
                 return False
+            if role != "owner":
+                self._keep_an_owner(data, e)
             e["role"] = role
-            self._log(data, "role:" + role, name)
+            self._log(data, "role:" + role, name, by=self._by(by))
             return True
         return self._change(go)
 
-    def revoke(self, name: str) -> bool:
+    def revoke(self, name: str, by: Identity | None = None) -> bool:
         if name == "owner":
             raise ValueError("the owner key is built in")
 
@@ -349,10 +371,17 @@ class KeyStore:
             e = self._entry(data, name)
             if e is None:
                 return False
+            self._keep_an_owner(data, e)
             data["keys"].remove(e)
-            self._log(data, "revoked", name)
+            self._log(data, "revoked", name, by=self._by(by))
             return True
         return self._change(go)
+
+    def log(self, last: int = 100) -> list[dict]:
+        """The last `last` entries of the log (who did what to which key or device, and when), oldest first; a copy."""
+        with self._lock:
+            self._reload_locked()
+            return copy.deepcopy(self._data["log"][-last:]) if last > 0 else []
 
     @staticmethod
     def _device_row(i: str, d: dict) -> dict:
@@ -462,14 +491,17 @@ class KeyStore:
             return True
         return self._change(go)
 
-    def clear_device(self, key_name: str, device_id: str) -> bool:
-        """Forget a device (a refused one is let in again, as pending, the next time it is seen)."""
+    def clear_device(self, key_name: str, device_id: str, by: Identity | None = None) -> bool:
+        """Forget a device (a refused one is let in again, as pending, the next time it is seen).  As in
+        `decide_device`, a refusal is the owner's: a non-owner `by` cannot clear a refused device (it would come back
+        pending, and she could then approve it).  No `by`: the server's own call."""
         def go(data):
             e = self._entry(data, key_name)
-            if e is None or device_id not in e["devices"]:
+            d = e["devices"].get(device_id) if e else None
+            if d is None or (by is not None and not by.is_owner and d.get("status") == "refused"):
                 return False
             del e["devices"][device_id]
-            self._log(data, "cleared", key_name, device_id)
+            self._log(data, "cleared", key_name, device_id, self._by(by))
             return True
         return self._change(go)
 

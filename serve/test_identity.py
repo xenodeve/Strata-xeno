@@ -119,6 +119,26 @@ class Keys(Base):
         self.assertIs(s.revoke("ann"), False)
         self.assertIsNone(self.store().match(k))
 
+    def test_the_last_owner_key_stays(self):
+        """In team mode every request needs a key, the workstation's too: with no legacy key, the last owner key cannot
+        be revoked or demoted (nobody could manage the keys any more), and the first key made must be an owner's."""
+        s = self.store()
+        with self.assertRaisesRegex(ValueError, "owner key"):
+            s.create("ann", "guest", owner_first=True)
+        self.assertFalse(os.path.exists(self.path))
+        s.create("boss", "owner", owner_first=True)
+        s.create("ann", "guest", owner_first=True)
+        for call in (lambda: s.revoke("boss"), lambda: s.set_role("boss", "guest")):
+            with self.assertRaisesRegex(ValueError, "last owner key"):
+                call()
+        s.create("chief", "owner")
+        self.assertIs(s.set_role("boss", "guest"), True)                  # another owner key is left
+        with self.assertRaisesRegex(ValueError, "last owner key"):
+            s.revoke("chief")
+        s = self.store("abc")                                             # a legacy key is an owner: nothing to keep
+        self.assertIs(s.revoke("chief"), True)
+        s.create("ann2", "guest", owner_first=True)
+
     def test_rename_and_set_role_take_effect_at_once(self):
         s = self.store()
         k = s.create("ann", "guest")
@@ -413,6 +433,39 @@ class Devices(Base):
         self.assertIs(s.decide_device("ann", "d2", True, ANN), False)
         self.assertEqual(s.device(ANN, "d2", "", "", 3.0), "refused")
         self.assertIs(s.decide_device("ann", "d2", True, OWNER), True)        # the owner may change their mind
+
+    def test_a_guest_cannot_clear_a_refused_device(self):
+        """Clearing a refused device lets it come back as pending, which a guest could then approve: so clearing a
+        refused one is the owner's too.  A guest may clear her own approved or pending device (a lost laptop)."""
+        s = self.s
+        s.device(ANN, "d1", "", "", 1.0)
+        s.decide_device("ann", "d1", True, OWNER)
+        s.device(ANN, "d2", "", "", 2.0)
+        s.decide_device("ann", "d2", False, OWNER)
+        s.device(ANN, "d3", "", "", 3.0)
+        self.assertIs(s.clear_device("ann", "d2", by=ANN), False)
+        self.assertEqual(s.device(ANN, "d2", "", "", 4.0), "refused")
+        self.assertIs(s.clear_device("ann", "d3", by=ANN), True)
+        self.assertEqual(self.read()["log"][-1], {**self.read()["log"][-1], "what": "cleared", "device": "d3", "by": "ann"})
+        self.assertIs(s.clear_device("ann", "d2", by=OWNER), True)
+        self.assertIs(s.clear_device("ann", "d1"), True)                   # no `by`: the server's own call, as before
+
+    def test_the_log_names_who_did_it_and_gives_the_last_entries(self):
+        s = self.s
+        s.create("chief", "owner")                                     # so that rob is not the last owner key
+        s.create("bob", "guest", by=OWNER)
+        s.rename("bob", "rob", by=Identity("boss", "owner"))
+        s.set_role("rob", "owner", by=OWNER)
+        s.revoke("rob", by=OWNER)
+        log = s.log(4)
+        self.assertEqual([(x["what"], x["key"], x["by"]) for x in log],
+                         [("created", "bob", "owner"), ("renamed from bob", "rob", "boss"), ("role:owner", "rob", "owner"),
+                          ("revoked", "rob", "owner")])
+        self.assertEqual(len(s.log(2)), 2)
+        self.assertEqual(s.log(2), log[-2:])
+        log[0]["what"] = "changed by the caller"
+        self.assertEqual(s.log(4)[0]["what"], "created")              # a copy: the store's own log is untouched
+        self.assertNotIn("sk-strata-", json.dumps(s.log(100)))
 
     def test_decide_on_an_unknown_device_is_false(self):
         self.assertIs(self.s.decide_device("ann", "nope", True, OWNER), False)

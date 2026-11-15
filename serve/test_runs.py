@@ -231,6 +231,22 @@ class TheStore(unittest.TestCase):
         self.assertFalse(cs["run-all-0003"].is_set())
         self.assertEqual(self.store.cancel_all("nobody"), 0)
 
+    def test_move_hands_every_run_of_a_name_to_another(self):
+        """#310: a renamed key keeps its runs (finished ones too) and a later key with the old name inherits none."""
+        hold = threading.Event()
+        self.addCleanup(hold.set)
+        going = self.launch("run-mv-0001", gen({"n": 1}, hold=hold), who="ann")
+        over = self.launch("run-mv-0002", [{"n": 1}], who="ann")
+        bobs = self.launch("run-mv-0003", gen({"n": 1}, hold=hold), who="bob")
+        deadline = time.time() + 5
+        while not over.done and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.store.move("ann", "anna"), 2)
+        self.assertEqual((going.who, over.who, bobs.who), ("anna", "anna", "bob"))
+        self.assertIsNone(self.store.get_for("run-mv-0001", self.ANN))
+        self.assertIs(self.store.get_for("run-mv-0002", Identity("anna", "guest")), over)
+        self.assertEqual(self.store.move("nobody", "x"), 0)
+
 
 RID = "run-test-0001"
 

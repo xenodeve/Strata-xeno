@@ -276,6 +276,176 @@ class Devices(Base):
         self.assertEqual(self.keys_path.read_text(encoding="utf-8"), before)
 
 
+DEV3 = "device-0003"
+
+
+class KeysAndDevices(Base):
+    """#310 task 5: GET/POST /keys (owner only) and GET /devices/pending, POST /devices (who `may_approve`)."""
+
+    def keys(self, body, key="k", device=None):
+        return self.req("POST", "/keys", body, key=key, device=device)
+
+    def test_owner_creates_and_lists_keys_without_secrets(self):
+        self.start(api_key="k")                                   # the owner, from this PC
+        code, got = self.keys({"action": "create", "name": "ann", "role": "guest"})
+        self.assertEqual(code, 200, got)
+        plain = got["key"]
+        self.assertTrue(plain.startswith("sk-strata-"))
+        self.assertEqual((got["name"], got["role"]), ("ann", "guest"))
+        code, view = self.req("GET", "/keys", key="k")
+        self.assertEqual(code, 200, view)
+        self.assertEqual([(r["name"], r["role"]) for r in view["keys"]], [("ann", "guest")])
+        self.assertIs(view["team"], True)
+        self.assertEqual([(x["what"], x["key"], x["by"]) for x in view["log"]], [("created", "ann", "owner")])
+        text = json.dumps(view)
+        self.assertNotIn(plain, text)
+        self.assertNotIn("sha256", text)
+        self.assertNotIn(plain, self.keys_path.read_text(encoding="utf-8"))   # only its hash is kept
+        self.assertNotIn(plain, json.dumps(self.svc.api_requests, default=str))
+        # the key works at once: from another PC its first device waits for approval
+        self.svc.peer_override = REMOTE
+        self.assertEqual(self.req("GET", "/props", key=plain, device=DEV1)[1]["error"]["type"], "device_pending")
+        self.svc.peer_override = None
+        # rename and role, and what cannot be done
+        self.assertEqual(self.keys({"action": "rename", "name": "ann", "to": "anna"}), (200, {"ok": True, "name": "anna"}))
+        self.assertEqual(self.keys({"action": "role", "name": "anna", "role": "owner"})[0], 200)
+        view = self.req("GET", "/keys", key="k")[1]
+        self.assertEqual([(r["name"], r["role"]) for r in view["keys"]], [("anna", "owner")])
+        for body in ({"action": "rename", "name": "owner", "to": "boss"}, {"action": "revoke", "name": "owner"},
+                     {"action": "role", "name": "owner", "role": "guest"}):
+            code, err = self.keys(body)
+            self.assertEqual(code, 400, body)
+            self.assertIn("run config", err["error"]["message"], body)
+        self.assertEqual(self.keys({"action": "create", "name": "Anna", "role": "guest"})[0], 400)    # the name is taken
+        self.assertEqual(self.keys({"action": "create", "name": "x", "role": "admin"})[0], 400)
+        self.assertEqual(self.keys({"action": "fly", "name": "anna"})[0], 400)
+        self.assertEqual(self.keys({"action": "revoke", "name": "nobody"})[0], 404)
+        self.assertEqual(self.req("POST", "/keys", b"{}", key="k", headers={"Content-Type": "text/plain"})[0], 415)
+        code, got = self.keys({"action": "revoke", "name": "anna"})
+        self.assertEqual(code, 200, got)
+        self.assertEqual(self.req("GET", "/keys", key="k")[1]["keys"], [])
+
+    def test_the_first_create_turns_team_mode_on(self):
+        self.start(api_key="k", team=False)
+        code, view = self.req("GET", "/keys", key="k")
+        self.assertEqual((code, view["keys"], view["team"]), (200, [], False))
+        # nothing but a create makes the file
+        self.assertEqual(self.keys({"action": "revoke", "name": "ann"})[0], 404)
+        self.assertEqual(self.req("POST", "/devices", {"key": "ann", "device": DEV1, "approve": True}, key="k")[0], 404)
+        self.assertEqual(self.req("GET", "/devices/pending", key="k"), (200, {"devices": []}))
+        self.assertFalse(self.keys_path.exists())
+        code, got = self.keys({"action": "create", "name": "ann", "role": "guest"})
+        self.assertEqual(code, 200, got)
+        self.assertTrue(self.keys_path.exists())
+        self.assertIs(self.svc.keys.team_mode(), True)
+        self.assertEqual(self.req("GET", "/props")[0], 401)       # team mode: a key always
+        self.assertEqual(self.req("GET", "/props", key="k")[0], 200)
+
+    def test_without_any_key_only_this_pc_makes_the_first_one_and_it_is_an_owners(self):
+        self.start(team=False)
+        self.svc.peer_override = REMOTE                           # another PC: today's may_edit refusal
+        code, err = self.keys({"action": "create", "name": "boss", "role": "owner"}, key=None)
+        self.assertEqual(code, 403)
+        self.assertEqual(self.req("GET", "/keys")[0], 403)
+        self.assertFalse(self.keys_path.exists())
+        self.svc.peer_override = None
+        code, err = self.keys({"action": "create", "name": "ann", "role": "guest"}, key=None)
+        self.assertEqual(code, 400)
+        self.assertIn("owner key", err["error"]["message"])     # a guest key first would lock this PC out
+        self.assertFalse(self.keys_path.exists())
+        code, got = self.keys({"action": "create", "name": "boss", "role": "owner"}, key=None)
+        self.assertEqual(code, 200, got)
+        self.assertEqual(self.req("GET", "/keys")[0], 401)
+        boss = got["key"]
+        self.assertEqual(self.req("GET", "/keys", key=boss)[0], 200)
+        for body in ({"action": "revoke", "name": "boss"}, {"action": "role", "name": "boss", "role": "guest"}):
+            code, err = self.keys(body, key=boss)
+            self.assertEqual(code, 400, body)
+            self.assertIn("last owner key", err["error"]["message"])
+
+    def test_guest_cannot_manage_keys(self):
+        self.start(api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann")
+        before = self.keys_path.read_text(encoding="utf-8")
+        code, err = self.req("GET", "/keys", key=ann, device=DEV1)
+        self.assertEqual((code, err["error"]["type"]), (403, "forbidden"))
+        for body in ({"action": "create", "name": "eve", "role": "owner"}, {"action": "role", "name": "ann", "role": "owner"},
+                     {"action": "rename", "name": "ann", "to": "x"}, {"action": "revoke", "name": "ann"}):
+            code, err = self.keys(body, key=ann, device=DEV1)
+            self.assertEqual((code, err["error"]["type"]), (403, "forbidden"), body)
+        self.assertEqual(self.keys_path.read_text(encoding="utf-8"), before)
+
+    def test_guest_approves_own_second_device(self):
+        self.start(api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann")                                # approved on DEV1
+        bob = self.svc.keys.create("bob", "guest")
+        self.assertEqual(self.req("GET", "/props", key=bob, device=DEV3)[0], 403)        # bob's first device: pending
+        self.assertEqual(self.req("GET", "/props", key=ann, device=DEV2)[0], 403)        # ann's second: pending
+        code, got = self.req("GET", "/devices/pending", key=ann, device=DEV1)
+        self.assertEqual(code, 200, got)
+        self.assertEqual([(r["key"], r["device"]) for r in got["devices"]], [("ann", DEV2)])
+        self.assertEqual(got["devices"][0]["code"], self.svc.keys.device_code("ann", DEV2))
+        # ann on a device that waits never reaches the routes: the device gate answers first
+        for method, path, body in (("GET", "/devices/pending", None),
+                                   ("POST", "/devices", {"key": "ann", "device": DEV2, "approve": True})):
+            code, err = self.req(method, path, body, key=ann, device=DEV2)
+            self.assertEqual((code, err["error"]["type"]), (403, "device_pending"), path)
+        # not bob's device, and not by a key with no approved device (bob's first)
+        code, err = self.req("POST", "/devices", {"key": "bob", "device": DEV3, "approve": True}, key=ann, device=DEV1)
+        self.assertEqual((code, err["error"]["type"]), (403, "forbidden"))
+        code, err = self.req("POST", "/devices", {"key": "bob", "device": "device-none", "approve": True}, key=ann, device=DEV1)
+        self.assertEqual((code, err["error"]["type"]), (403, "forbidden"))     # the same whether it exists or not
+        self.assertEqual(self.req("GET", "/props", key=bob, device=DEV3)[1]["error"]["type"], "device_pending")
+        # her own second device, from the approved first
+        self.assertEqual(self.req("POST", "/devices", {"key": "ann", "device": DEV2, "approve": True}, key=ann, device=DEV1),
+                         (200, {"ok": True}))
+        self.assertEqual(self.req("GET", "/props", key=ann, device=DEV2)[0], 200)
+        # a refusal is the owner's: ann cannot approve or clear a refused device of hers
+        self.assertEqual(self.req("GET", "/props", key=ann, device=DEV3)[0], 403)
+        self.assertTrue(self.svc.keys.decide_device("ann", DEV3, False, OWNER))
+        for body in ({"key": "ann", "device": DEV3, "approve": True}, {"key": "ann", "device": DEV3, "action": "clear"}):
+            code, err = self.req("POST", "/devices", body, key=ann, device=DEV1)
+            self.assertEqual((code, err["error"]["type"]), (403, "forbidden"), body)
+        self.assertEqual(self.req("GET", "/props", key=ann, device=DEV3)[1]["error"]["type"], "device_refused")
+        # she may clear an approved device of hers (a lost laptop): it waits again
+        self.assertEqual(self.req("POST", "/devices", {"key": "ann", "device": DEV2, "action": "clear"}, key=ann, device=DEV1),
+                         (200, {"ok": True}))
+        self.assertEqual(self.req("GET", "/props", key=ann, device=DEV2)[1]["error"]["type"], "device_pending")
+        # the owner sees every pending device and decides any
+        self.svc.peer_override = None
+        got = self.req("GET", "/devices/pending", key="k")[1]
+        self.assertEqual({(r["key"], r["device"]) for r in got["devices"]}, {("ann", DEV2), ("bob", DEV3)})
+        self.assertEqual(self.req("POST", "/devices", {"key": "bob", "device": DEV3, "approve": True}, key="k"), (200, {"ok": True}))
+        self.assertEqual(self.req("POST", "/devices", {"key": "bob", "device": "device-none", "approve": True}, key="k")[0], 404)
+        for bad in ({"key": "bob", "device": DEV3}, {"key": "bob", "device": DEV3, "approve": "yes"},
+                    {"key": 5, "device": DEV3, "approve": True}, {"key": "bob", "device": DEV3, "action": "forget"}):
+            self.assertEqual(self.req("POST", "/devices", bad, key="k")[0], 400, bad)
+        self.svc.peer_override = REMOTE
+        self.assertEqual(self.req("GET", "/props", key=bob, device=DEV3)[0], 200)
+
+    def test_approvals_are_logged(self):
+        self.start(api_key="k", peer_override=REMOTE)
+        ann = self.svc.keys.create("ann", "guest")
+        self.req("GET", "/props", key=ann, device=DEV1)
+        self.req("GET", "/props", key=ann, device=DEV2)
+        self.req("GET", "/props", key=ann, device=DEV3)
+        self.svc.peer_override = None
+        self.assertEqual(self.req("POST", "/devices", {"key": "ann", "device": DEV1, "approve": True}, key="k")[0], 200)
+        self.svc.peer_override = REMOTE
+        self.assertEqual(self.req("POST", "/devices", {"key": "ann", "device": DEV2, "approve": True}, key=ann, device=DEV1)[0], 200)
+        self.assertEqual(self.req("POST", "/devices", {"key": "ann", "device": DEV3, "approve": False}, key=ann, device=DEV1)[0], 200)
+        self.svc.peer_override = None
+        log = self.req("GET", "/keys", key="k")[1]["log"]
+        self.assertEqual([(x["what"], x["key"], x["device"], x["by"]) for x in log if x["what"] in ("approved", "refused")],
+                         [("approved", "ann", DEV1, "owner"), ("approved", "ann", DEV2, "ann"), ("refused", "ann", DEV3, "ann")])
+        for i in range(60):                                       # 120 more entries: the answer holds the last 100
+            self.svc.keys.create(f"k{i}", "guest")
+            self.svc.keys.revoke(f"k{i}")
+        log = self.req("GET", "/keys", key="k")[1]["log"]
+        self.assertEqual(len(log), 100)
+        self.assertEqual((log[-1]["what"], log[-1]["key"]), ("revoked", "k59"))
+
+
 class FakeVision:
     """Stands in for the image encoder: records which sources reached it (Vision.load is where a file is read)."""
 
@@ -448,6 +618,87 @@ class RunsBelongToTheirIdentity(Base):
         t.join(20)
         self.assertFalse(t.is_alive())
         self.assertEqual([(e["id"], e["answers"]) for e in events[1:] if e["event"] == "question_answered"], [(qid, pick)])
+
+
+    def wait_for_event(self, events, pred, timeout=20.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            got = next((e for e in events[1:] if pred(e)), None)
+            if got is not None:
+                return got
+            time.sleep(0.02)
+        self.fail(f"no such event: {events}")
+
+    def test_revoke_cancels_runs_and_refuses_next_request(self):
+        """RF 3: a revoked key's run stops, the prompt it waits on is closed, its next request is refused, and a later
+        key with the same name inherits nothing."""
+        self.start_agent(tool_call("Read", file_path=str(self.outside / "b.txt")), "</think>\n\nDone.",
+                         api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann", "owner")
+        t, asked, events = self.launch(ann, DEV1)
+        self.assertTrue(asked.wait(20), events)
+        self.svc.peer_override = None                             # the owner, from this PC
+        code, got = self.req("POST", "/keys", {"action": "revoke", "name": "ann"}, key="k")
+        self.assertEqual(code, 200, got)
+        self.assertEqual((got["runs_stopped"], got["prompts_closed"]), (1, 1))
+        t.join(20)
+        self.assertFalse(t.is_alive())
+        self.assertTrue(self.svc.runs.get(self.RID).done)
+        self.assertEqual(self.svc.broker.pending, {})
+        self.svc.peer_override = REMOTE
+        self.assertEqual(self.req("GET", "/props", key=ann, device=DEV1)[0], 401)
+        ann2 = self.approved("ann", "guest", device=DEV2)          # a new key with the old name
+        self.assertEqual(self.req("GET", f"/agent/run?id={self.RID}&from=0", key=ann2, device=DEV2)[0], 404)
+
+    def test_a_key_made_a_guest_keeps_no_run_going(self):
+        """The coding tools are an owner key's (part 1): demoting a key stops its runs and closes its prompts; the key
+        itself still works, as a guest."""
+        self.start_agent(tool_call("Read", file_path=str(self.outside / "b.txt")), "</think>\n\nDone.",
+                         api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann", "owner")
+        t, asked, events = self.launch(ann, DEV1)
+        self.assertTrue(asked.wait(20), events)
+        self.svc.peer_override = None
+        code, got = self.req("POST", "/keys", {"action": "role", "name": "ann", "role": "guest"}, key="k")
+        self.assertEqual((code, got), (200, {"ok": True, "runs_stopped": 1, "prompts_closed": 1}))
+        t.join(20)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(self.svc.broker.pending, {})
+        self.svc.peer_override = REMOTE
+        self.assertEqual(self.req("GET", "/props", key=ann, device=DEV1)[0], 200)
+        self.assertEqual(self.req("GET", f"/agent/run?id={self.RID}&from=0", key=ann, device=DEV1)[0], 200)   # still hers to read
+        self.svc.peer_override = None
+        self.assertEqual(self.req("POST", "/keys", {"action": "role", "name": "ann", "role": "owner"}, key="k"),
+                         (200, {"ok": True}))
+
+    def test_rename_moves_the_run_and_its_prompts(self):
+        """A renamed key keeps its run: the prompt open at the rename and the next one are the new name's to answer;
+        a later key with the old name gets 404 for both."""
+        self.start_agent(tool_call("Read", file_path=str(self.outside / "b.txt")),
+                         tool_call("Read", file_path=str(self.outside / "b.txt"), offset=1),
+                         "</think>\n\nDone.", api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann", "owner")
+        t, asked, events = self.launch(ann, DEV1)
+        self.assertTrue(asked.wait(20), events)
+        first = next(e["id"] for e in events[1:] if e["event"] == "permission")
+        self.svc.peer_override = None
+        self.assertEqual(self.req("POST", "/keys", {"action": "rename", "name": "ann", "to": "anna"}, key="k"),
+                         (200, {"ok": True, "name": "anna"}))
+        self.svc.peer_override = REMOTE
+        self.assertEqual(self.svc.runs.get(self.RID).who, "anna")
+        old = self.approved("ann", "guest", device=DEV2)           # a new key with the old name
+        self.assertEqual(self.req("POST", "/agent/permission", {"id": first, "decision": "allow"}, key=old, device=DEV2)[0], 404)
+        self.assertEqual(self.req("POST", "/agent/permission", {"id": first, "decision": "allow"}, key=ann, device=DEV1),
+                         (200, {"ok": True}))
+        second = self.wait_for_event(events, lambda e: e.get("event") == "permission" and e["id"] != first)["id"]
+        self.assertEqual(self.req("POST", "/agent/permission", {"id": second, "decision": "deny"}, key=old, device=DEV2)[0], 404)
+        self.assertEqual(self.req("GET", f"/agent/run?id={self.RID}&from=0", key=old, device=DEV2)[0], 404)
+        self.assertEqual(self.req("POST", "/agent/permission", {"id": second, "decision": "deny"}, key=ann, device=DEV1),
+                         (200, {"ok": True}))
+        t.join(20)
+        self.assertFalse(t.is_alive())
+        self.assertEqual([(e["id"], e["answer"]) for e in events[1:] if e["event"] == "answered"],
+                         [(first, "allow"), (second, "deny")])
 
 
 class GatedEngine(MockEngine):

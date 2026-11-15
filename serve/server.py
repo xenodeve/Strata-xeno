@@ -5828,6 +5828,16 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared})
                 return
+            if path == "/keys":                              # #310: the named keys and what was done to them, for the owner's Settings
+                if self._authorized() and self._owner_only("keys can be managed"):
+                    self._json(200, {"keys": svc.keys.view(), "log": svc.keys.log(100), "team": self.team,
+                                     "keys_file": os.path.basename(svc.keys.path) if svc.keys.path else None})
+                return
+            if path == "/devices/pending":                   # #310: the devices waiting for approval that this caller may decide
+                if self._authorized():                       # (a caller on a device that waits never gets here: the gate answers 403)
+                    rows = svc.keys.pending() if self.team else []
+                    self._json(200, {"devices": [r for r in rows if svc.keys.may_approve(self.identity, r["key"], self.device_id or None)]})
+                return
             if path == "/config":                            # #564: the Settings view's keys of the run config
                 if self._authorized():
                     self._config_get()
@@ -6053,6 +6063,18 @@ def make_handler(svc: Service):
             if path == "/settings":
                 self._settings()
                 return
+            if path in ("/keys", "/devices"):                # #310: named keys and device approval, managed live
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
+                if not self._own_page("keys and devices can be managed"):
+                    return
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict):
+                    return self._json(400, {"error": {"message": "send a JSON object"}})
+                return self._keys_post(body) if path == "/keys" else self._devices_post(body)
             if path == "/mcp/config":                        # set up the MCP servers: a write that decides which programs Strata starts (#79)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
@@ -6468,6 +6490,92 @@ def make_handler(svc: Service):
             if not complete:
                 self._json(400, {"error": {"message": "incomplete control request body"}})
             return complete
+
+        def _keys_post(self, body: dict):
+            """#310: POST /keys - create, rename, change the role of or revoke a named key (an owner's).  The plain key of a
+            new one is in this answer only: it is not printed, logged or kept (only its sha256 is).  Outside team mode
+            the first create makes the keys file and so turns team mode on; nothing else writes it there."""
+            if not self._owner_only("keys can be managed"):
+                return
+            action, name = body.get("action"), body.get("name")
+            if action not in ("create", "rename", "role", "revoke") or not isinstance(name, str):
+                return self._json(400, {"error": {"message": 'send {"action": "create", "name", "role"}, {"action": "rename", '
+                                                             '"name", "to"}, {"action": "role", "name", "role"} or {"action": '
+                                                             '"revoke", "name"}'}})
+            if not svc.keys.path:
+                return self._json(409, {"error": {"message": "this server was started without a run config (--config), so "
+                                                             "there is no keys file to keep keys in"}})
+            if action != "create" and name.strip().casefold() == "owner":
+                return self._json(400, {"error": {"message": "the owner key is the run config's api_key: change or remove it "
+                                                             "there; it cannot be renamed, made a guest or revoked here"}})
+            if action != "create" and not self.team:        # no keys file: no key to change, and nothing is written
+                return self._json(404, {"error": {"message": f"there is no key named {name!r}"}})
+            by, missing = self.identity, {"error": {"message": f"there is no key named {name!r}"}}
+            try:
+                if action == "create":
+                    role = body.get("role")
+                    key = svc.keys.create(name, role, by=by, owner_first=True)
+                    return self._json(200, {"key": key, "name": name.strip(), "role": role})
+                if action == "rename":
+                    if not svc.keys.rename(name, body.get("to"), by=by):
+                        return self._json(404, missing)
+                    new = body["to"].strip()
+                    svc.runs.move(name, new)                # the holder keeps her runs and prompts; a later key named
+                    svc.broker.move(name, new)              # `name` inherits none of them
+                    return self._json(200, {"ok": True, "name": new})
+                if action == "role":
+                    role = body.get("role")
+                    if not svc.keys.set_role(name, role, by=by):
+                        return self._json(404, missing)
+                    # the coding tools are an owner's (part 1): a key made a guest keeps no run going on this PC
+                    return self._json(200, {"ok": True, **(self._stop_identity(name) if role != "owner" else {})})
+                if not svc.keys.revoke(name, by=by):
+                    return self._json(404, missing)
+                stopped = self._stop_identity(name)
+                svc.runs.move(name, identity_mod.REVOKED)   # a later key with this name inherits nothing
+                svc.broker.move(name, identity_mod.REVOKED)
+                return self._json(200, {"ok": True, **stopped})
+            except identity_mod.KeysFileBad as e:
+                return self._json(409, {"error": {"message": str(e)}})
+            except ValueError as e:
+                return self._json(400, {"error": {"message": str(e)}})
+            except OSError as e:
+                return self._json(500, {"error": {"message": f"the keys file could not be written: {e}"}})
+
+        def _stop_identity(self, name: str) -> dict:
+            """#310: every run of `name` that is going is cancelled, and every prompt it holds is closed as refused."""
+            return {"runs_stopped": svc.runs.cancel_all(name), "prompts_closed": svc.broker.end_all(name)}
+
+        def _devices_post(self, body: dict):
+            """#310: POST /devices - approve, refuse or clear a device of a key.  `may_approve` decides (the owner; a
+            key's holder from an approved device of that key), before anything is looked up, so the answer to anyone else
+            is the same whether the key or device exists."""
+            key, device, clear = body.get("key"), body.get("device"), body.get("action") == "clear"
+            if not isinstance(key, str) or not isinstance(device, str) or not (
+                    clear and "approve" not in body or "action" not in body and isinstance(body.get("approve"), bool)):
+                return self._json(400, {"error": {"message": 'send {"key", "device", "approve": true | false} or {"key", '
+                                                             '"device", "action": "clear"}'}})
+            if not svc.keys.may_approve(self.identity, key, self.device_id or None):
+                return self._json(403, {"error": {"type": "forbidden", "message": "a device is decided only by an owner key, "
+                                                  "or by its own key from a device of that key that is already approved"}})
+            missing = {"error": {"message": "that key has no such device"}}
+            if not self.team:                                # no keys file: no devices are recorded, and nothing is written
+                return self._json(404, missing)
+            try:
+                ok = svc.keys.clear_device(key, device, by=self.identity) if clear else \
+                    svc.keys.decide_device(key, device, body["approve"], self.identity)
+            except identity_mod.KeysFileBad as e:
+                return self._json(409, {"error": {"message": str(e)}})
+            except OSError as e:
+                return self._json(500, {"error": {"message": f"the keys file could not be written: {e}"}})
+            if ok:
+                return self._json(200, {"ok": True})
+            status = next((d["status"] for r in svc.keys.view() if r["name"] == key for d in r["devices"]
+                           if d["device"] == device), None)
+            if status == "refused" and not self.identity.is_owner:
+                return self._json(403, {"error": {"type": "forbidden", "message": "a refused device is let in again only "
+                                                  "by an owner key"}})
+            return self._json(404, missing)
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this

@@ -148,6 +148,15 @@ class RunStore:
             run.cancel.set()
         return len(mine)
 
+    def move(self, old: str, new: str) -> int:
+        """Every run of the identity `old`, going or over, becomes `new`'s (a key that is renamed keeps its runs, and a
+        later key with the old name inherits none; a revoked key's go to a name no key can have).  How many."""
+        with self.lock:
+            mine = [run for run in self.runs.values() if run.who == old]
+            for run in mine:
+                run.who = new
+        return len(mine)
+
     def steer(self, rid, text: str, by: Identity) -> bool:
         """Hand what the user sent while the run works to its agent; False when there is no such run, it is over, or it is not `by`'s own:
         writing into another identity's conversation is nobody else's, the owner role's neither."""

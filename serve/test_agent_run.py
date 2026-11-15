@@ -128,6 +128,55 @@ class Holder(unittest.TestCase):
         t.join(3)
         self.assertEqual(box["a"], {"answers": {"Which?": ["A"]}})
 
+    def test_move_hands_the_open_prompts_and_the_next_ones_to_the_new_name(self):
+        """#310: a renamed key answers what its runs asked before and after the rename; the old name answers nothing."""
+        run, broker = make(who="ann")
+        other, _ = make(who="bob", broker=broker)
+        box = {}
+        t = threading.Thread(target=lambda: box.update(a=run.ctx.ask(dict(REQ)), b=run.ctx.ask(dict(REQ))))
+        t.start()
+        first = wait_event(run)[0]["id"]
+        self.assertEqual(broker.move("ann", "anna"), 1)
+        self.assertEqual((run.who, other.who), ("anna", "bob"))
+        self.assertFalse(broker.answer(first, "allow", self.ANN))
+        self.assertTrue(broker.answer(first, "allow", Identity("anna", "guest")))
+        second = None
+        for _ in range(200):
+            second = next((e["id"] for e in run.drain() if e.get("event") == "permission"), None)
+            if second:
+                break
+            time.sleep(0.02)
+        self.assertEqual(broker.pending[second]["who"], "anna")
+        self.assertTrue(broker.answer(second, "deny", Identity("anna", "guest")))
+        t.join(3)
+        self.assertEqual((box["a"], box["b"]), ("allow", "deny"))
+
+    def test_end_all_stops_a_name_and_closes_what_it_was_asked(self):
+        """#310: a revoked key: its runs are cancelled and every prompt it holds is closed as refused."""
+        run, broker = make(who="ann")
+        bobs, _ = make(who="bob", broker=broker)
+        box = {}
+        t1 = threading.Thread(target=lambda: box.update(a=run.ctx.ask(dict(REQ))))
+        t2 = threading.Thread(target=lambda: box.update(q=run.ctx.question([{"question": "Which?", "options": [{"label": "A"}]}])))
+        t3 = threading.Thread(target=lambda: box.update(b=bobs.ctx.ask(dict(REQ))))
+        for t in (t1, t2, t3):
+            t.start()
+        deadline = time.time() + 5
+        while len(broker.pending) < 3 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(broker.end_all("ann"), 2)
+        t1.join(3)
+        t2.join(3)
+        self.assertTrue(run.cancel.is_set())
+        self.assertFalse(bobs.cancel.is_set())
+        self.assertIn(box["a"], ("deny", "cancelled"))
+        self.assertIn(box["q"], ({"answers": None}, "cancelled"))
+        self.assertEqual([s["who"] for s in broker.pending.values()], ["bob"])
+        bob_id = next(iter(broker.pending))
+        self.assertTrue(broker.answer(bob_id, "deny", self.BOB))
+        t3.join(3)
+        self.assertEqual(broker.end_all("nobody"), 0)
+
     def test_a_run_with_no_who_is_the_owners(self):
         run, broker = make()
         self.assertEqual(run.who, "owner")
