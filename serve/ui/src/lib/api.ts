@@ -4,9 +4,12 @@ import type { McpConfigView } from "./mcpconfig"
 import type { ImportView } from "./importer"
 import type { HooksView } from "./hooks"
 import type { AgentInfo } from "./agent"
+import { deviceHeaders } from "./device"
 
+/** Every request's headers: the API key (when one is entered), and this browser's device id and name (#310; a server outside team
+ *  mode does not look at them). */
 export const apiHeaders = (json = false): Record<string, string> => {
-  const h: Record<string, string> = {}
+  const h: Record<string, string> = deviceHeaders()
   const key = store.get("apikey", "")
   if (key) h.Authorization = "Bearer " + key
   if (json) h["Content-Type"] = "application/json"

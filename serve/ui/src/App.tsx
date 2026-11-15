@@ -18,6 +18,8 @@ import { PageView } from "./pages"
 import { StatusOrb } from "./components/live"
 import { ToastHost } from "./components/toast"
 import { ReelFilter } from "./components/spin"
+import { DeviceGate } from "./components/DeviceGate"
+import { ApprovalNotice } from "./components/ApprovalNotice"
 
 const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
   chat: { label: msg("Chat"), icon: Message01Icon },
@@ -195,6 +197,7 @@ function Shell() {
           <LangSwitch />
         </div>
       </header>
+      <ApprovalNotice />
       <ToastHost />
       <ReelFilter />
       <main key={route.page} className={cn("page-in mx-auto w-full flex-1 px-4 pb-16 pt-6 sm:px-6", wide ? "max-w-[1800px]" : "max-w-5xl")}>
@@ -204,6 +207,7 @@ function Shell() {
   )
 }
 
+// The waiting screen sits above the metrics poll: a device that waits for approval (#310) does not ask for /metrics every second.
 export function App() {
-  return <MetricsProvider><Shell /></MetricsProvider>
+  return <DeviceGate><MetricsProvider><Shell /></MetricsProvider></DeviceGate>
 }

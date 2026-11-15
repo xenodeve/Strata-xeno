@@ -2,6 +2,8 @@
 import { createContext, createElement, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { apiHeaders, url } from "./api"
 import { t } from "./i18n"
+import { noteGate } from "./device"
+import type { LiveWho } from "./keys"
 
 export interface Gpu { index: number; util: number | null; mem_used: number | null; mem_total: number | null; temp: number | null; power: number | null }
 export interface Hardware {
@@ -11,7 +13,7 @@ export interface Hardware {
   cpu?: number | null; ram_used?: number | null; ram_total?: number | null; disk_read_mb?: number | null; disk_write_mb?: number | null
   gpus?: Gpu[]
 }
-export interface Live {
+export interface Live extends LiveWho {
   state: "reading" | "generating" | "idle" | "unloaded"; queued: number; phase: string | null
   prompt_tokens: number | null; prompt_read: number | null; prompt_total: number | null; generated: number | null
   max_tokens: number | null; elapsed_s: number | null; tok_s: number | null; tok_s_mean: number | null
@@ -26,6 +28,7 @@ export interface RequestRow {
   prefill: (Rate & { chunks: number }) | null
   decode: (Rate & { windows: number }) | null
   stats: Record<string, number> | null
+  who?: string                                          // #310: the sending identity ("owner" outside team mode)
 }
 export interface ModelRole { role: string; tensors: number; bytes: number; types: string[]; bpw: number | null }
 export interface ModelInfo {
@@ -68,6 +71,7 @@ function usePoll(): MetricsState {
       let busy = false
       try {
         const r = await fetch(url("metrics"), { headers: apiHeaders() })
+        if (!r.ok) await noteGate(r)                     // a device that waits for approval: the waiting screen takes over (#310)
         if (!r.ok) throw new Error(r.status === 401 ? t("This server needs an API key (Settings).") : `HTTP ${r.status}`)
         const data = (await r.json()) as Metrics
         fails.current = 0

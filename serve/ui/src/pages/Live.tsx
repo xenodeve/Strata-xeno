@@ -11,6 +11,7 @@ import { useMetrics, type Live as LiveT } from "../lib/metrics"
 import { RequestList } from "./Requests"
 import { modelLine } from "../components/ModelBlock"
 import { phaseKind } from "../lib/orbs"
+import { holdersOf, useTeam, waitingText } from "../lib/keys"
 
 function headline(l: LiveT): { tone: "ok" | "busy" | "idle"; text: string } {
   switch (l.state) {
@@ -26,8 +27,22 @@ function headline(l: LiveT): { tone: "ok" | "busy" | "idle"; text: string } {
   }
 }
 
+/** Who holds the engine and who waits for it, by name (#310): "In use by ann · Waiting: bob (1), cat (2)". */
+function WhoLine({ l }: { l: LiveT }) {
+  const holders = holdersOf(l), waiting = waitingText(l)
+  if (!holders.length && !waiting) return null
+  return (
+    <p className="mt-0.5 text-[13px] text-ink-2" data-live-who>
+      {holders.length > 0 && t("In use by {names}", { names: holders.join(", ") })}
+      {holders.length > 0 && waiting && " · "}
+      {waiting && t("Waiting: {list}", { list: waiting })}
+    </p>
+  )
+}
+
 export function Live() {
   const { data: m, error, stale } = useMetrics()
+  const team = useTeam()                                                   // outside team mode every request is the owner's: no names
   if (!m) return <Loading error={error} />
   const l = m.live
   const running = l.state === "reading" || l.state === "generating"       // no request: idle, which is not the same as not measured
@@ -46,6 +61,7 @@ export function Live() {
           <p className="page-sub !mt-1">
             {stale ? t("The server is not answering. Showing the last numbers it gave.") : l.queued ? t("{n} waiting in the queue", { n: l.queued }) : modelLine(m)}
           </p>
+          {team && !stale && <WhoLine l={l} />}
         </div>
       </header>
 
