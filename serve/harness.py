@@ -441,16 +441,17 @@ def _cfg(svc) -> dict:
         return {}
 
 
-def view(svc, client_ip: str, host: str, rescan: bool = False) -> dict:
+def view(svc, client_ip: str, host: str, rescan: bool = False, may: tuple[bool, str] | None = None) -> dict:
     """The answer of GET /import: the apps found with what was read, every skill with its switches, every MCP server by app with its state,
-    and whether this caller may change anything (and, if not, why). A caller who may not sees names only: not a command line or an address."""
+    and whether this caller may change anything (and, if not, why). A caller who may not sees names only: not a command line or an address.
+    `may`: that answer as the server decided it (#310: an owner key in team mode); None asks mcp_admin.may_edit."""
     imp = getattr(svc, "importer", None)
     if imp is None:
         return {"available": False}
     cfg = _cfg(svc)
     if rescan:
         imp.rescan(cfg)
-    ok, why = mcp_admin.may_edit(bool(svc.api_key), client_ip, host)
+    ok, why = may if may is not None else mcp_admin.may_edit(bool(svc.api_key), client_ip, host)
     if ok and not svc.config_path:
         ok, why = False, NO_FILE
     st = skill_settings(cfg)

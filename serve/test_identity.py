@@ -511,6 +511,55 @@ class Devices(Base):
         s.device(ANN, "d1", "", "2.2.2.2", 1101.0)                                       # a new address is written at once
         self.assertEqual(self.read()["keys"][0]["devices"]["d1"]["addr"], "2.2.2.2")
 
+    def test_device_code(self):
+        s = self.s
+        self.assertIsNone(s.device_code("ann", "d1"))                          # not seen yet
+        s.device(ANN, "d1", "", "", 1.0)
+        self.assertEqual(s.device_code("ann", "d1"), s.pending()[0]["code"])
+        self.assertIsNone(s.device_code("bob", "d1"))
+        self.assertIsNone(KeyStore(None, "abc").device_code("owner", "d1"))
+        legacy = self.store("abc")
+        legacy.device(OWNER, "o1", "", "", 1.0)
+        self.assertRegex(legacy.device_code("owner", "o1"), r"^[A-Z0-9]{4}$")
+
+    def test_a_new_device_that_cannot_be_written_is_held_without_a_code(self):
+        s = self.s
+        with mock.patch.object(KeyStore, "_save", side_effect=PermissionError("locked")), \
+                mock.patch("builtins.print"):
+            self.assertEqual(s.device(ANN, "d1", "", "", 1.0), "pending")
+        self.assertIsNone(s.device_code("ann", "d1"))
+        self.assertEqual(s.pending(), [])
+        self.assertEqual(s.device(ANN, "d1", "", "", 2.0), "pending")          # recorded once the file can be written
+        self.assertIsNotNone(s.device_code("ann", "d1"))
+
+
+class RequestFacts(unittest.TestCase):
+    """What a request says about its device (#310): the helpers server.py's handler uses."""
+
+    def test_device_id_from_the_header_or_the_address(self):
+        self.assertEqual(identity.device_of("abcdEFGH_-12", "Ann's PC", "curl/8", "26.1.1.1"),
+                         ("abcdEFGH_-12", "Ann's PC"))
+        self.assertEqual(identity.device_of(None, None, "claude-cli/2.1", "26.1.1.1"),
+                         ("addr:26.1.1.1", "claude-cli/2.1"))
+        for bad in ("short", "x" * 65, "addr:26.1.1.1", "has space1", "", "abcdefgé"):
+            self.assertEqual(identity.device_of(bad, None, None, "26.1.1.1")[0], "addr:26.1.1.1", bad)
+        self.assertEqual(len(identity.device_of("d" * 8, "n" * 200, None, "x")[1]), identity.MAX_TEXT)
+        self.assertEqual(identity.device_of("d" * 8, None, None, "x")[1], "")
+        # a UTF-8 name, as http.server reads it (each byte one character)
+        self.assertEqual(identity.device_of("d" * 8, "แล็ปท็อป".encode().decode("latin-1"), None, "x")[1], "แล็ปท็อป")
+
+    def test_device_address(self):
+        addr = identity.device_addr
+        self.assertEqual(addr("26.1.1.1", False, "203.0.113.5", "1.1.1.1", "for=2.2.2.2"), "26.1.1.1")   # remote peer
+        self.assertEqual(addr("127.0.0.1", True, None, None, None), "127.0.0.1")
+        self.assertEqual(addr("127.0.0.1", True, "203.0.113.5", "1.1.1.1", None), "203.0.113.5")
+        self.assertEqual(addr("127.0.0.1", True, None, "9.9.9.9, 1.1.1.1", None), "1.1.1.1")      # the nearest proxy's
+        self.assertEqual(addr("127.0.0.1", True, None, None, 'for=9.9.9.9, for="[2001:db8::17]:4711";proto=https'),
+                         "2001:db8::17")
+        self.assertEqual(addr("127.0.0.1", True, None, None, "for=192.0.2.60:8080;by=x"), "192.0.2.60")
+        for junk in ("not-an-ip", "unknown", "_hidden", ""):
+            self.assertEqual(addr("127.0.0.1", True, junk, junk, "for=" + junk), "127.0.0.1", junk)
+
 
 class Visible(unittest.TestCase):
     RECORD = {"id": "r1", "who": "bob", "state": "running", "queue_s": 1.5, "preview": "secret prompt",

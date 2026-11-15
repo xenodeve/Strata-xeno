@@ -7,10 +7,13 @@ file is read at start and again when it changes on disk, so the owner can add, r
 the server runs and the change counts at the next request.
 
   * `Identity(name, role)`: the answer to "who".  Roles are exactly "owner" and "guest".  The old single `"api_key"`
-    keys are the identity `OWNER`; a request without any key (loopback, no keys set) is `LOCAL_GUEST`.
+    keys are the identity `OWNER`.  With no key set at all, a request from this PC that names this PC is `OWNER` and
+    any other is `LOCAL_GUEST` (as mcp_admin.may_edit decided before).
   * `KeyStore`: matches a given key to an identity, keeps the keys and each key's devices, and answers who may approve
     a device.  A new key is "sk-strata-" + 24 random bytes, shown once and kept only as its sha256.
   * Team mode is the keys file existing.  Without it nothing here changes how the server behaves today.
+  * `device_of`, `device_addr`: which device a request came from (the X-Strata-Device header, else "addr:<ip>") and
+    the address it is recorded with (forwarding headers count only from a proxy on this PC).
   * `visible_record`: what another person's request record may show a guest.
 
 Standard library only.  Every read and write of the file state is under one lock.  A file that fails to parse keeps
@@ -21,6 +24,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -430,6 +434,17 @@ class KeyStore:
             return self._change(go)
         except KeysFileBad:                               # cannot be recorded: held, not let in
             return "pending"
+        except OSError as e:                              # not written (a full disk, a locked file): held, not let in
+            print(f"strata serve: the keys file {self.path} is not written ({e}); a new device is held", flush=True)
+            return "pending"
+
+    def device_code(self, key_name: str, device_id: str) -> str | None:
+        """The short code of a device the store holds (what the 403 `device_pending` answer shows and the owner
+        compares), or None: not recorded, as while the keys file cannot be read or written."""
+        with self._lock:
+            e = self._entry(self._data, key_name)
+            d = e["devices"].get(device_id) if e else None
+            return d.get("code") if d else None
 
     def decide_device(self, key_name: str, device_id: str, approve: bool, by: Identity) -> bool:
         """Approve or refuse a device.  Who may do so is `may_approve`, asked by the route; one rule is kept here: a
@@ -479,6 +494,61 @@ class KeyStore:
             e = self._entry(self._data, key_name)
             d = e["devices"].get(by_device) if e else None
             return bool(d and d.get("status") == "approved")
+
+
+# ---------------------------------------------------------------------------------------------- what a request says
+DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")              # X-Strata-Device: Strata Desktop's id, or the browser's
+FORWARDING = ("Cf-Connecting-Ip", "X-Forwarded-For", "Forwarded")   # a proxy on this PC relayed the request
+
+
+def _header_text(value) -> str:
+    """A header's text: http.server reads each byte as one character, so a UTF-8 device name arrives as Latin-1."""
+    if not isinstance(value, str):
+        return ""
+    try:
+        value = value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return "".join(c for c in value if ord(c) >= 32 and ord(c) != 127).strip()
+
+
+def device_of(header_id, header_name, user_agent, addr: str) -> tuple[str, str]:
+    """(device id, label) of a request.  The id is X-Strata-Device when it is 8-64 of [A-Za-z0-9_-]; anything else
+    (no header, or a malformed one such as "addr:<an approved address>") is the device of its address, "addr:<ip>", so
+    a client cannot pick the id of another PC's address.  The label is X-Strata-Device-Name, else the User-Agent
+    (Claude Code sends no device header: "claude-cli/..." is what the owner sees)."""
+    did = header_id if isinstance(header_id, str) and DEVICE_ID.fullmatch(header_id) else f"addr:{addr}"
+    return did, (_header_text(header_name) or _header_text(user_agent))[:MAX_TEXT]
+
+
+def _ip(text) -> str | None:
+    t = (text or "").strip().strip('"')
+    if t.startswith("["):                                 # "[2001:db8::17]:4711"
+        t = t[1:t.find("]")] if "]" in t else ""
+    elif t.count(":") == 1:                               # "192.0.2.60:8080"
+        t = t.rsplit(":", 1)[0]
+    try:
+        return str(ipaddress.ip_address(t))
+    except ValueError:
+        return None
+
+
+def device_addr(peer: str, peer_is_loopback: bool, cf_connecting_ip, x_forwarded_for, forwarded) -> str:
+    """The address a device is recorded with.  The socket peer, unless the peer is this PC itself and a proxy on it
+    (cloudflared, tailscale serve, a reverse proxy) named the client: Cf-Connecting-Ip, else the last X-Forwarded-For
+    entry (the one the nearest proxy wrote; the first ones are the client's own words), else the last Forwarded
+    element's for=.  A remote peer's forwarding headers are its own words and are ignored."""
+    if peer_is_loopback:
+        if (ip := _ip(cf_connecting_ip)) is not None:
+            return ip
+        if isinstance(x_forwarded_for, str) and (ip := _ip(x_forwarded_for.split(",")[-1])) is not None:
+            return ip
+        if isinstance(forwarded, str):
+            for part in forwarded.split(",")[-1].split(";"):
+                k, _, v = part.partition("=")
+                if k.strip().lower() == "for" and (ip := _ip(v)) is not None:
+                    return ip
+    return peer
 
 
 HIDDEN = frozenset(("preview", "input", "output", "reasoning", "response", "prompt", "messages"))

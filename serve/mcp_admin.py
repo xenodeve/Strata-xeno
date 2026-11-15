@@ -259,9 +259,10 @@ def read_view(config_path: str | None, mcp_config_path: str | None) -> dict:
     return {"servers": servers}
 
 
-def view(svc, client_ip: str, host: str) -> dict:
+def view(svc, client_ip: str, host: str, may: tuple[bool, str] | None = None) -> dict:
     """The answer of GET /mcp/config: the servers with their state and tools, the limits, and whether (and, if not, why)
-    this caller may change them."""
+    this caller may change them.  `may`: that answer as the server decided it (#310: an owner key in team mode);
+    None asks may_edit."""
     v = read_view(svc.config_path, svc.mcp_config_path)
     status = svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0}
     live = {s["name"]: s for s in status["servers"]}
@@ -271,7 +272,7 @@ def view(svc, client_ip: str, host: str) -> dict:
         s["error"] = r["error"] if r else None
         s["tools"] = r["tools"] if r else []
         s["info"] = r["info"] if r else {}
-    ok, why = may_edit(bool(svc.api_key), client_ip, host)
+    ok, why = may if may is not None else may_edit(bool(svc.api_key), client_ip, host)
     if not ok:                                               # how a server is started (a token can sit in an argument or a URL) is for those who may change it
         for s in v["servers"]:
             for k in ("command", "args", "cwd", "url", "env", "headers"):

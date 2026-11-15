@@ -67,6 +67,7 @@ from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
 from serve import harness, mcp_admin  # noqa: E402
+from serve import identity as identity_mod  # noqa: E402  (#310: named keys, roles, the approval of devices)
 from serve import skills as skills_mod  # noqa: E402
 from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, runs as runs_mod, shell as shell_mod, subagent as subagent_mod, web as web_mod  # noqa: E402
 from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
@@ -3019,6 +3020,12 @@ class Service:
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        # #310: named keys with the roles owner and guest, and the approval of new devices (serve/identity.py); main()
+        # gives it the keys file beside the run config.  Team mode is that file existing; without it every gate below
+        # behaves as before (the one api_key is the owner's)
+        self.keys = identity_mod.KeyStore(None)
+        self.trust_loopback = True                     # #310: a request from this PC to this PC needs no device approval
+        self.peer_override = None                      # #310 tests: the client address the handler sees instead of the socket's
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
@@ -3200,6 +3207,11 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
+
+    def key_required(self) -> bool:
+        """Does a request need a key: the api_key is set, or the server is in team mode (#310: a keys file, even an
+        empty or broken one - it must not turn into an open server)."""
+        return bool(self.api_key) or self.keys.team_mode()
 
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
@@ -5290,6 +5302,13 @@ class BadBody(Exception):
         self.status = status
 
 
+# #310: POST routes that only an owner key may use in team mode (with /slots/*), and what each one does
+OWNER_POSTS = {"/settings": "settings can be changed", "/config": "the run config can be changed",
+               "/unload": "the model can be loaded or unloaded", "/load": "the model can be loaded or unloaded",
+               "/v1/unload": "the model can be loaded or unloaded", "/v1/load": "the model can be loaded or unloaded",
+               "/v1/vram": "the VRAM reserve can be changed", "/metrics/keep": "prompts can be kept"}
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -5297,6 +5316,9 @@ def make_handler(svc: Service):
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
         body_read = False                                   # whether a handler took this request's body
+        identity = None                                     # #310: who sent this request (_authorized sets it)
+        device_id = ""                                      # #310: the device it came from, in team mode
+        team = False                                        # #310: the server was in team mode when _authorized ran
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
 
         def log_message(self, fmt, *args):
@@ -5412,13 +5434,13 @@ def make_handler(svc: Service):
 
         def parse_request(self):
             """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
-            (host_allowed).  With a key a rebinding page cannot authenticate, so the check is skipped: tunnels and
-            proxies that pass their own name on keep working."""
+            (host_allowed).  With a key (the api_key, or team mode's named keys, #310) a rebinding page cannot
+            authenticate, so the check is skipped: tunnels and proxies that pass their own name on keep working."""
             if not super().parse_request():
                 return False
             host = self.headers.get("Host")
             # svc.allowed_hosts again: a name the config adds after serve() worked out host_names (xeno #71)
-            if svc.api_key or host_allowed(host, svc.host_names | set(svc.allowed_hosts), "*" in svc.allowed_hosts):
+            if svc.key_required() or host_allowed(host, svc.host_names | set(svc.allowed_hosts), "*" in svc.allowed_hosts):
                 return True
             print(f"[strata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
                   f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
@@ -5435,7 +5457,7 @@ def make_handler(svc: Service):
             there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
             then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
             origin = self.headers.get("Origin")
-            if svc.api_key or not origin:
+            if svc.key_required() or not origin:
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
@@ -5537,13 +5559,77 @@ def make_handler(svc: Service):
             self.wfile.write(body)
 
         def _authorized(self) -> bool:
-            if not svc.api_key:
-                return True
+            """Who sent this request (self.identity) and, in team mode, from which device (#310).  Outside team mode
+            (no keys file) it is as before: the api_key, when set, is the door and every holder is the owner; with no
+            key the owner is a request from this PC that names this PC (mcp_admin.may_edit), anyone else a guest."""
+            self.team = svc.keys.team_mode()
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if key_matches(given, svc.api_key):
+            if not self.team:
+                if svc.api_key and not key_matches(given, svc.api_key):
+                    self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+                    return False
+                self.identity = identity_mod.OWNER if self._edit_answer()[0] else identity_mod.LOCAL_GUEST
                 return True
-            self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+            ident = svc.keys.match(given)                    # team mode: a key always, even with no api_key set
+            if ident is None:
+                self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+                return False
+            self.identity = ident
+            peer, h = self._peer(), self.headers
+            addr = identity_mod.device_addr(peer, mcp_admin.is_loopback(peer), h.get("Cf-Connecting-Ip"),
+                                            h.get("X-Forwarded-For"), h.get("Forwarded"))
+            self.device_id, label = identity_mod.device_of(h.get("X-Strata-Device"), h.get("X-Strata-Device-Name"),
+                                                           h.get("User-Agent"), addr)
+            if self._loopback_local():                       # the workstation itself: approved without asking
+                return True
+            # every key's first use from a new device waits for the owner, the owner's own key too (spec decision 1)
+            state = svc.keys.device(ident, self.device_id, label, addr, time.time())
+            if state == "approved":
+                return True
+            if state == "pending":
+                code = svc.keys.device_code(ident.name, self.device_id)
+                self._json(403, {"error": {"type": "device_pending", "code": code or "----", "message":
+                                 f"this device waits for the owner's approval to use the key {ident.name!r}; the owner "
+                                 f"sees it with the code {code}" if code else
+                                 "this device waits for the owner's approval, but the keys file on the server cannot be "
+                                 "read or written, so the device is not recorded: the owner must fix the keys file"}})
+            else:
+                self._json(403, {"error": {"type": "device_refused", "message":
+                                 f"this device may not use the key {ident.name!r} (the owner refused it, or the key has "
+                                 f"too many devices); the owner can clear it"}})
+            return False
+
+        def _peer(self) -> str:
+            """The client's address as the socket has it (#310 tests put another one in svc.peer_override)."""
+            return svc.peer_override or self.client_address[0]
+
+        def _loopback_local(self) -> bool:
+            """#310: a request from this PC that names this PC and that no proxy relayed - the only kind whose device is
+            approved without asking.  A tunnel (cloudflared, tailscale serve) connects from 127.0.0.1 too, but names
+            its public Host or adds a forwarding header."""
+            return bool(svc.trust_loopback) and mcp_admin.is_loopback(self._peer()) \
+                and mcp_admin.host_is_loopback(self.headers.get("Host", "")) \
+                and not any(name in self.headers for name in identity_mod.FORWARDING)
+
+        def _edit_answer(self) -> tuple[bool, str]:
+            """(may this request change what runs on this PC, why not).  In team mode: an owner key (#310).  Outside
+            it, as before: mcp_admin.may_edit."""
+            if self.team:
+                ok = self.identity is not None and self.identity.is_owner
+                return ok, "" if ok else "only with an owner key"
+            return mcp_admin.may_edit(bool(svc.api_key), self._peer(), self.headers.get("Host", ""))
+
+        def _owner_only(self, what: str) -> bool:
+            """True for an owner.  Otherwise a 403: in team mode `forbidden` ("<what> only with an owner key", #310);
+            outside it the answer the route gave before, word for word."""
+            ok, why = self._edit_answer()
+            if ok:
+                return True
+            if self.team:
+                self._json(403, {"error": {"type": "forbidden", "message": f"{what} only with an owner key"}})
+            else:
+                self._json(403, {"error": {"message": why}})
             return False
 
         def _ui_prefix(self) -> bool:
@@ -5697,7 +5783,7 @@ def make_handler(svc: Service):
             if path == "/agent":
                 # the chat's coding tools: whether they are on, which shell commands run in, and whether this caller may use them (only from this PC, or with the key)
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    ok, why = self._edit_answer()
                     sh = getattr(svc.agent, "shell", None)
                     self._json(200, {"available": svc.agent is not None, "allowed": ok, "reason": "" if ok else why, "shell": shell_mod.describe(sh) if sh else None,
                                      "tools": [t["name"] for t in svc.agent.tools] if svc.agent else []})
@@ -5705,27 +5791,24 @@ def make_handler(svc: Service):
             if path == "/agent/hooks":
                 # the user's hooks (serve/hooks.py), read only: they are written in the run config; only who may use the coding tools sees the commands
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("the hooks can be read"):
+                        return
                     self._json(200, {**hooks_mod.view(harness._cfg(svc)), "config_file": os.path.basename(svc.config_path) if svc.config_path else None,
                                      "shell": bool(getattr(svc.agent, "shell", None)), "editable": bool(svc.config_path)})
                 return
             if path == "/agent/helpers":
                 # sub-agents (serve/subagent.py): off by default; only who may use the coding tools sees the setting
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("the sub-agent settings can be read"):
+                        return
                     self._json(200, {**subagent_mod.settings(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "helper_tools", ())), "editable": bool(svc.config_path),
                                      "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
                 return
             if path == "/agent/run":
                 # a run that went on while the page was away (serve/runs.py): its events from number `from` on, as they come; only for who may use the coding tools
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("a run can be read"):
+                        return
                     origin = self.headers.get("Origin")
                     if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
                         return self._json(403, {"error": {"message": "a run can be read only from Strata's own page"}})
@@ -5743,18 +5826,16 @@ def make_handler(svc: Service):
             if path == "/agent/web":
                 # web access (serve/web.py): off by default; only who may use the coding tools sees the settings
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("the web access settings can be read"):
+                        return
                     self._json(200, {**web_mod.public_view(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "web_tools", ())), "editable": bool(svc.config_path),
                                      "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
                 return
             if path == "/agent/folders":
                 # the folders of this PC, to choose a project's folder from (only the names of folders, and only for who may use the coding tools)
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("this PC's folders can be listed"):
+                        return
                     seen = folders_mod.look(parse_qs(urlsplit(self.path).query).get("path", [""])[0])
                     # a path that is no folder is an answer, not an error (a 404 would be logged as one in the browser's console)
                     self._json(200, seen if seen is not None else {"ok": False, "error": "That is not a folder on this PC"})
@@ -5762,9 +5843,8 @@ def make_handler(svc: Service):
             if path in ("/agent/git", "/agent/git/diff"):
                 # the Git state of a folder, read only, for the Chat's right panel (serve/gitview.py); for who may use the coding tools
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("a folder's Git state can be read"):
+                        return
                     q = parse_qs(urlsplit(self.path).query)
                     folder = q.get("path", [""])[0]
                     if path == "/agent/git":
@@ -5774,9 +5854,8 @@ def make_handler(svc: Service):
             if path in ("/agent/files", "/agent/mention"):
                 # `@file` in the prompt: the files of the project's folders that go with typed letters, and the text of one that was mentioned (serve/files.py); for who may use the coding tools
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("the project's files can be read"):
+                        return
                     q = parse_qs(urlsplit(self.path).query)
                     folders = [f for f in [q.get("path", [""])[0], *q.get("dirs", [])] if f.strip() and "\0" not in f][:agent_mod.MAX_DIRS + 1]
                     if path == "/agent/files":
@@ -5786,9 +5865,8 @@ def make_handler(svc: Service):
             if path in ("/agent/memory", "/agent/memory/file"):
                 # the notes the chat reads for a project: the project's own files and what the user's other apps wrote down (serve/memory.py); for who may use the coding tools
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("the project's notes can be read"):
+                        return
                     q = parse_qs(urlsplit(self.path).query)
                     folders = [f for f in [q.get("path", [""])[0], *q.get("dirs", [])] if f.strip() and "\0" not in f][:agent_mod.MAX_DIRS + 1]
                     imp = getattr(svc, "importer", None)
@@ -5812,12 +5890,12 @@ def make_handler(svc: Service):
             if path == "/mcp/config":
                 # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)
                 if self._authorized():
-                    self._json(200, mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
+                    self._json(200, mcp_admin.view(svc, self._peer(), self.headers.get("Host", ""), may=self._edit_answer()))
                 return
             if path == "/import":
                 # the skills and the MCP servers of the other coding apps on this PC, with what may be changed (#94)
                 if self._authorized():
-                    self._json(200, harness.view(svc, self.client_address[0], self.headers.get("Host", ""), rescan="rescan=1" in self.path))
+                    self._json(200, harness.view(svc, self._peer(), self.headers.get("Host", ""), rescan="rescan=1" in self.path, may=self._edit_answer()))
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
@@ -5832,7 +5910,7 @@ def make_handler(svc: Service):
                 alive = proc is None or proc.poll() is None or bool(getattr(svc.engine, "unloaded", False))
                 self._json(200 if alive else 503, {"status": "ok" if alive else "engine_exited",
                                      "max_context": svc.reported_ctx(), "model": svc.model,
-                                     "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                     "images": svc.vision is not None, "api_key": svc.key_required(),
                                      "loops_stopped": svc.status["loops_stopped"],
                                      "thinking_cycles_closed": svc.status["thinking_cycles_closed"],   # #199
                                      "loaded": svc.loaded(),
@@ -5908,6 +5986,11 @@ def make_handler(svc: Service):
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
+            # #310: what changes the shared engine, every client's settings or what is recorded is an owner key's in
+            # team mode; outside it these stay open to every key holder, as before
+            if self.team and (path in OWNER_POSTS or path.startswith("/slots/")) and \
+                    not self._owner_only(OWNER_POSTS.get(path, "conversations can be saved or restored")):
+                return
             if path == "/settings":
                 self._settings()
                 return
@@ -5916,9 +5999,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
                 if not self._own_page("MCP servers can be changed"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("MCP servers can be changed"):
+                    return
                 if not svc.config_path:
                     return self._json(409, {"error": {"message": "this server was started without a run config file (--config), so there is nowhere to save the servers"}})
                 if not 0 < n <= 1_000_000:
@@ -5928,15 +6010,14 @@ def make_handler(svc: Service):
                 except ValueError:
                     return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
                 code, out = mcp_admin.apply(svc, body)
-                return self._json(code, out if code != 200 else mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
+                return self._json(code, out if code != 200 else mcp_admin.view(svc, self._peer(), self.headers.get("Host", ""), may=self._edit_answer()))
             if path in ("/agent/rewind", "/agent/checkpoints/forget"):         # the way back for the files the tools changed (serve/checkpoints.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("files can be put back"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("files can be put back"):
+                    return
                 try:
                     body = json.loads(raw)
                 except ValueError:
@@ -5956,9 +6037,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
                 if not self._own_page("A message can be sent to a run"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("A message can be sent to a run"):
+                    return
                 try:
                     body = json.loads(raw)
                 except ValueError:
@@ -5971,9 +6051,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("A run can be stopped"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("A run can be stopped"):
+                    return
                 try:
                     body = json.loads(raw)
                 except ValueError:
@@ -5986,9 +6065,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 50_000 else b""
                 if not self._own_page("A question can be answered"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("A question can be answered"):
+                    return
                 try:
                     body = json.loads(raw)
                 except ValueError:
@@ -6005,9 +6083,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("A question can be answered"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("A question can be answered"):
+                    return
                 try:
                     body = json.loads(raw)
                 except ValueError:
@@ -6022,9 +6099,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("sub-agents can be switched"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("sub-agents can be switched"):
+                    return
                 if not svc.config_path:
                     return self._json(409, {"error": {"message": harness.NO_FILE}})
                 if not 0 < n <= 10_000:
@@ -6047,9 +6123,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
                 if not self._own_page("web access can be changed"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("web access can be changed"):
+                    return
                 if not svc.config_path:
                     return self._json(409, {"error": {"message": harness.NO_FILE}})
                 if not 0 < n <= 100_000:
@@ -6072,9 +6147,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
                 if not self._own_page("the hooks can be switched"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("the hooks can be switched"):
+                    return
                 if not svc.config_path:
                     return self._json(409, {"error": {"message": harness.NO_FILE}})
                 if not 0 < n <= 100_000:
@@ -6098,9 +6172,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
                 if not self._own_page("the import can be changed"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("the import can be changed"):
+                    return
                 if not svc.config_path:
                     return self._json(409, {"error": {"message": harness.NO_FILE}})
                 if not 0 < n <= 1_000_000:
@@ -6110,7 +6183,7 @@ def make_handler(svc: Service):
                 except ValueError:
                     return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
                 code, out = harness.apply(svc, body)
-                return self._json(code, out if code != 200 else harness.view(svc, self.client_address[0], self.headers.get("Host", "")))
+                return self._json(code, out if code != 200 else harness.view(svc, self._peer(), self.headers.get("Host", ""), may=self._edit_answer()))
             if path == "/metrics/keep":                      # keep the full prompt of the next N requests (0: off)
                 raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 if not self._own_page("prompts can be kept"):      # xeno #71: a "simple" cross-site POST must not switch this on
@@ -6498,8 +6571,11 @@ def make_handler(svc: Service):
             if isinstance(sa, dict):
                 if not self._own_page("The coding tools can be used"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                ok, why = self._edit_answer()
                 if not ok:
+                    if self.team:                                 # #310: the coding tools run on this PC: an owner's
+                        self._owner_only("The coding tools can be used")
+                        return
                     return self._json(403, {"error": {"message": "The coding tools change files and run commands on this PC, so they work only from this PC itself (open the page as localhost) or with the API key. " + why}})
                 if svc.agent is None or svc.mcp is None:
                     return self._json(409, {"error": {"message": "the coding tools are switched off on this server (\"agent\": false in the run config)"}})
@@ -7107,6 +7183,17 @@ def api_key_of(value):
     return key.strip()
 
 
+def keys_file_of(cfg: dict, config_path) -> str | None:
+    """#310: where the named keys are kept: the run config's "keys_file" (a path relative to the config's folder), by
+    default strata-keys.json beside the run config.  No run config, no keys file (and no team mode)."""
+    if not config_path:
+        return None
+    name = cfg.get("keys_file", "strata-keys.json")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("keys_file: the path of the keys file, e.g. \"strata-keys.json\"")
+    return os.path.join(os.path.dirname(os.path.abspath(config_path)), os.path.expanduser(name.strip()))
+
+
 def key_matches(given: str, key) -> bool:
     """given: a header's value as http.server read it, each byte one character.  A key with characters outside ASCII
     arrives as UTF-8 from most clients and as Latin-1 from some; the right key passes in both forms (#725: the
@@ -7618,6 +7705,13 @@ def main() -> int:
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    try:                                                 # #310: the named keys; the file existing is team mode
+        svc.keys = identity_mod.KeyStore(keys_file_of(cfg, a.config), svc.api_key)
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    if svc.keys.team_mode():
+        print(f"[strata] team keys: {svc.keys.path} ({len(svc.keys.view())} named); a key used from a new device waits "
+              "for the owner's approval", flush=True)
     svc.cjk_ban = a.engine == "strata" and bool(cfg.get("cjk_guard"))   # xeno #49 S4: --ban-ids was passed
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
