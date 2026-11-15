@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react"
 import { deviceName, setDeviceName } from "../lib/device"
-import { getKeys, logKind, postDevice, postKeys, refreshTeam, type DeviceRow, type KeyRow, type KeysAction, type KeysAnswer, type KeysView, type LogRow, type Role } from "../lib/keys"
+import { browserKeyAfterCreate, getKeys, logKind, postDevice, postKeys, refreshTeam, showFreshKey, type BrowserKey, type DeviceRow, type KeyRow, type KeysAction, type KeysAnswer, type KeysView, type LogRow, type Role } from "../lib/keys"
 import { msg, t } from "../lib/i18n"
 import { store } from "../lib/store"
+import { serverHasKey } from "../lib/api"
 import { when } from "./bits"
 import { ConfirmDialog } from "./ConfirmDialog"
 import { toast } from "./toast"
@@ -56,7 +57,6 @@ function ThisDevice() {
 }
 
 function Owner({ view, reload }: { view: KeysView; reload: () => Promise<void> }) {
-  const [fresh, setFresh] = useState<{ secret: string; name: string; kept: boolean } | null>(null)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
 
@@ -68,9 +68,12 @@ function Owner({ view, reload }: { view: KeysView; reload: () => Promise<void> }
     setBusy(false)
     if ("error" in r) { setNotice(r.error); return r.error }
     if (body.action === "create" && r.key) {
-      // The first key turns team mode on, and from then on this page needs a key too: a browser that has none takes the new one.
-      const kept = !view.team && !store.get("apikey", "") && store.set("apikey", r.key)
-      setFresh({ secret: r.key, name: body.name.trim(), kept })
+      // The first key turns team mode on, and from then on this page needs a key too: a browser with none, or with one the server never
+      // asked for, takes the new one. The text goes to the store App draws above the waiting screen, before anything can take this page away.
+      const first = !view.team
+      const take = browserKeyAfterCreate({ first, stored: store.get("apikey", ""), serverHasKey: first ? await serverHasKey() : null })
+      const browser: BrowserKey = take === "keep" ? "unchanged" : store.set("apikey", r.key) ? "stored" : "failed"
+      showFreshKey({ secret: r.key, name: body.name.trim(), browser })
     }
     if (done) toast("success", done)
     await reload()
@@ -90,11 +93,10 @@ function Owner({ view, reload }: { view: KeysView; reload: () => Promise<void> }
   return (
     <>
       {!view.keys_file && <p role="note" className={note}>{t("This server was started without a run config file, so there is nowhere to keep keys. Start it with --config.")}</p>}
-      {fresh && <NewKey {...fresh} onDone={() => setFresh(null)} />}
       {!view.team ? (
         <div className="mt-4" data-keys-first>
           <h3 className="text-[14px] font-semibold">{t("Turn on team mode by creating the first key")}</h3>
-          <p className="mt-1 text-[13px] text-ink-2">{t("The first key is an owner key. From then on every request needs a key, this PC's too, and each key's first use from a new device waits for approval. A browser here with no key takes the new one.")}</p>
+          <p className="mt-1 text-[13px] text-ink-2">{t("The first key is an owner key. From then on every request needs a key, this PC's too, and each key's first use from a new device waits for approval. This browser takes the new key as its own, unless it holds the server's API key.")}</p>
           {view.keys_file && <CreateKey first busy={busy} onCreate={(name, role) => act({ action: "create", name, role })} />}
         </div>
       ) : (
@@ -111,25 +113,6 @@ function Owner({ view, reload }: { view: KeysView; reload: () => Promise<void> }
       )}
       {notice && <p role="alert" className="mt-2 text-[12px] text-bad">{notice}</p>}
     </>
-  )
-}
-
-/** The new key's text, this once: copy it now. */
-function NewKey({ secret: text, name, kept, onDone }: { secret: string; name: string; kept: boolean; onDone: () => void }) {
-  const copy = async () => {
-    try { await navigator.clipboard.writeText(text); toast("success", t("Key copied")) } catch { toast("error", t("The browser did not copy it: select the key and copy it by hand")) }
-  }
-  return (
-    <div role="alert" className="mt-4 rounded-lg border border-accent px-4 py-3" data-new-key>
-      <div className="text-[13px] font-medium">{t("The key for {name}", { name })}</div>
-      <div className="mt-2 flex items-center gap-2">
-        <code className="min-w-0 flex-1 select-all rounded-sm bg-fill px-2.5 py-1.5 font-mono text-[12.5px] [overflow-wrap:anywhere]">{text}</code>
-        <Button onClick={() => void copy()}>{t("Copy")}</Button>
-      </div>
-      <p className="mt-2 text-[12px] text-ink-2">{t("Shown once: copy it now. Strata keeps only a fingerprint of it, so it cannot show it again.")}</p>
-      {kept && <p className="mt-1 text-[12px] text-ink-2">{t("This browser now uses this key (Settings, API key), so this page keeps working.")}</p>}
-      <div className="mt-2"><Button kind="quiet" onClick={onDone}>{t("Done")}</Button></div>
-    </div>
   )
 }
 

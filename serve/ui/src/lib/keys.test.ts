@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { holdersOf, keysAnswer, logKind, teamOf, waitingText } from "./keys"
+import { browserKeyAfterCreate, dismissFreshKey, getFreshKey, holdersOf, keysAnswer, logKind, showFreshKey, subscribeFreshKey, teamOf, waitingText } from "./keys"
 
 // The page's reading of the #310 routes: GET /keys (who is asking and whether the server is in team mode) and /metrics live (who holds
 // the engine and who waits).
@@ -49,5 +49,40 @@ describe("logKind", () => {
     expect(logKind("renamed from ann")).toEqual({ kind: "renamed", arg: "ann" })
     expect(logKind("role:guest")).toEqual({ kind: "role", arg: "guest" })
     expect(logKind("approved")).toEqual({ kind: "approved", arg: "" })
+  })
+})
+
+// I1 (task 6 review): a new key's text lives in a store of its own, above the waiting screen, until it is dismissed; and the first key
+// replaces a key this browser had stored when the server has no API key (that stored key was never checked, and is not valid after).
+describe("the new key, shown once", () => {
+  test("kept until dismissed, and the listeners hear both", () => {
+    let heard = 0
+    const off = subscribeFreshKey(() => { heard++ })
+    showFreshKey({ secret: "sk-strata-x", name: "boss", browser: "stored" })
+    expect(getFreshKey()).toEqual({ secret: "sk-strata-x", name: "boss", browser: "stored" })
+    expect(getFreshKey()).toEqual({ secret: "sk-strata-x", name: "boss", browser: "stored" })     // reading it does not drop it
+    dismissFreshKey()
+    expect(getFreshKey()).toBeNull()
+    expect(heard).toBe(2)
+    off()
+  })
+})
+
+describe("browserKeyAfterCreate: does this browser take the new key", () => {
+  test("a key that is not the first: the browser keeps its own", () => {
+    expect(browserKeyAfterCreate({ first: false, stored: "", serverHasKey: false })).toBe("keep")
+    expect(browserKeyAfterCreate({ first: false, stored: "k", serverHasKey: true })).toBe("keep")
+  })
+  test("the first key, and the browser has none: it takes it", () => {
+    expect(browserKeyAfterCreate({ first: true, stored: "", serverHasKey: false })).toBe("store")
+    expect(browserKeyAfterCreate({ first: true, stored: "", serverHasKey: true })).toBe("store")
+    expect(browserKeyAfterCreate({ first: true, stored: "  ", serverHasKey: null })).toBe("store")
+  })
+  test("the first key, and the browser has a stale key the server never asked for: it is replaced", () => {
+    expect(browserKeyAfterCreate({ first: true, stored: "old", serverHasKey: false })).toBe("store")
+  })
+  test("the first key, and the browser has the server's API key (still valid), or the server could not be asked: it keeps it", () => {
+    expect(browserKeyAfterCreate({ first: true, stored: "k", serverHasKey: true })).toBe("keep")
+    expect(browserKeyAfterCreate({ first: true, stored: "k", serverHasKey: null })).toBe("keep")
   })
 })

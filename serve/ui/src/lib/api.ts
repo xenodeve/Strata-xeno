@@ -22,12 +22,17 @@ export const rootOf = (pathname: string) => pathname.replace(/next\/$/, "").repl
 export const root = () => rootOf(location.pathname)
 export const url = (path: string) => root() + path
 
-export interface Health { model: string; images: boolean; max_context: number }
+export interface Health { model: string; images: boolean; max_context: number; api_key?: boolean }
 export const NO_HEALTH: Health = { model: "strata", images: false, max_context: 0 }
 
 export async function getHealth(): Promise<Health> {
   const r = await fetch(url("health"))
   return (await r.json()) as Health
+}
+
+/** Whether the server was started with an API key (/health "api_key"); null when it cannot be asked. */
+export async function serverHasKey(): Promise<boolean | null> {
+  try { const h = await getHealth(); return typeof h.api_key === "boolean" ? h.api_key : null } catch { return null }
 }
 
 export interface McpTool { tool: string; description?: string }

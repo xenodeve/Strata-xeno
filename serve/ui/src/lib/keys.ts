@@ -121,3 +121,27 @@ export function logKind(what: string): { kind: string; arg: string } {
   if (what.startsWith("role:")) return { kind: "role", arg: what.slice(5) }
   return { kind: what, arg: "" }
 }
+
+// A new key's text, shown once (I1 of the task 6 review). It is kept here, not in the Settings page's state, and drawn above the waiting
+// screen (App), so it survives anything that takes the page away before it is copied: the first key puts this device in team mode, where
+// it may wait for approval at once. Gone when the user dismisses it, or with the page (never written to storage).
+/** What became of this browser's own API key: it took the new key, it could not keep it, or it kept the key it had. */
+export type BrowserKey = "stored" | "failed" | "unchanged"
+export interface FreshKey { secret: string; name: string; browser: BrowserKey }
+let fresh: FreshKey | null = null
+const freshListeners = new Set<() => void>()
+export const getFreshKey = () => fresh
+export function subscribeFreshKey(f: () => void) { freshListeners.add(f); return () => { freshListeners.delete(f) } }
+export function showFreshKey(k: FreshKey) { fresh = k; freshListeners.forEach((f) => f()) }
+export function dismissFreshKey() { fresh = null; freshListeners.forEach((f) => f()) }
+export const useFreshKey = (): FreshKey | null => useSyncExternalStore(subscribeFreshKey, getFreshKey, () => null)
+
+/** Whether this browser takes a new key as its own API key. Only the first key (it turns team mode on, and from then on this PC needs a
+ *  key too): when the browser has none; or when it has one the server never asked for (no API key, /health "api_key": false), which is
+ *  not valid once team mode is on. A browser holding the server's API key keeps it (it stays valid); so does one whose server could not
+ *  be asked (serverHasKey null). */
+export function browserKeyAfterCreate(o: { first: boolean; stored: string; serverHasKey: boolean | null }): "store" | "keep" {
+  if (!o.first) return "keep"
+  if (!o.stored.trim()) return "store"
+  return o.serverHasKey === false ? "store" : "keep"
+}

@@ -20,6 +20,7 @@ import { ToastHost } from "./components/toast"
 import { ReelFilter } from "./components/spin"
 import { DeviceGate } from "./components/DeviceGate"
 import { ApprovalNotice } from "./components/ApprovalNotice"
+import { FreshKeyCard } from "./components/FreshKey"
 
 const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
   chat: { label: msg("Chat"), icon: Message01Icon },
@@ -207,7 +208,8 @@ function Shell() {
   )
 }
 
-// The waiting screen sits above the metrics poll: a device that waits for approval (#310) does not ask for /metrics every second.
+// The waiting screen sits above the metrics poll: a device that waits for approval (#310) does not ask for /metrics every second. A new
+// key's text sits above both, so the waiting screen never takes it away before it is copied.
 export function App() {
-  return <DeviceGate><MetricsProvider><Shell /></MetricsProvider></DeviceGate>
+  return <><FreshKeyCard /><DeviceGate><MetricsProvider><Shell /></MetricsProvider></DeviceGate></>
 }
