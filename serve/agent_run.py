@@ -4,6 +4,10 @@ The tool runs on a worker thread (serve/server.py run_with_mcp) and calls `ctx.a
 `permission` event on a queue - the request's stream sends it to the page - and waits until the page answers (POST /agent/permission, which
 reaches `Broker.answer`), the request is cancelled, or the time is up (a refusal).  In mode "auto" a call that may be judged goes to the
 judge first (serve/judge.py); a clear verdict settles it, an unclear one asks the user.
+
+#310: a question belongs to the identity whose run asked it (`AgentRun.who`, kept in the slot) and only that identity answers it.  The owner role
+does not answer for another - an approval is the run holder's.  An answer from anyone else is refused as for an id that was not asked, and the
+question stays open for its holder.
 """
 from __future__ import annotations
 
@@ -11,7 +15,10 @@ import queue
 import threading
 import time
 import uuid
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from serve.identity import Identity
 
 from serve import agent, judge, permissions
 
@@ -25,8 +32,8 @@ class Broker:
         self.lock = threading.Lock()
         self.pending: dict[str, dict] = {}
 
-    def open(self, rid: str, kind: str = "permission") -> dict:
-        slot = {"event": threading.Event(), "answer": None, "kind": kind}
+    def open(self, rid: str, kind: str = "permission", who: str = "owner") -> dict:
+        slot = {"event": threading.Event(), "answer": None, "kind": kind, "who": who}
         with self.lock:
             self.pending[rid] = slot
         return slot
@@ -35,25 +42,25 @@ class Broker:
         with self.lock:
             self.pending.pop(rid, None)
 
-    def answer(self, rid, decision) -> bool:
-        """The page's answer; False for an id that was not asked (or is answered already) or an answer that is not one."""
+    def answer(self, rid, decision, by: Identity) -> bool:
+        """The page's answer; False for an id that was not asked (or is answered already), one that `by` did not ask, or an answer that is not one."""
         if decision not in ANSWERS:
             return False
         with self.lock:
             slot = self.pending.get(rid) if isinstance(rid, str) else None
-            if slot is None or slot.get("kind") != "permission":
+            if slot is None or slot.get("kind") != "permission" or slot.get("who") != by.name:
                 return False
             self.pending.pop(rid, None)
         slot["answer"] = decision
         slot["event"].set()
         return True
 
-    def respond(self, rid, answers) -> bool:
+    def respond(self, rid, answers, by: Identity) -> bool:
         """The page's answer to a question the model asked (AskUserQuestion): {question: [labels or the user's own words]}, or None when the user skipped it. False for an id that
-        was not asked, is answered already, or is a permission question."""
+        was not asked, is answered already, is a permission question, or that `by` did not ask."""
         with self.lock:
             slot = self.pending.get(rid) if isinstance(rid, str) else None
-            if slot is None or slot.get("kind") != "question":
+            if slot is None or slot.get("kind") != "question" or slot.get("who") != by.name:
                 return False
             self.pending.pop(rid, None)
         slot["answer"] = {"answers": answers}
@@ -63,8 +70,9 @@ class Broker:
 
 class AgentRun:
     def __init__(self, policy: permissions.Policy, session: str, broker: Broker, goal: str, side: Callable[[str, str], str] | None,
-                 cancel: threading.Event, timeout: float = 600.0, shell: str | None = None):
+                 cancel: threading.Event, timeout: float = 600.0, shell: str | None = None, who: str = "owner"):
         self.policy, self.broker, self.goal, self.side, self.cancel, self.timeout, self.shell = policy, broker, goal, side, cancel, timeout, shell
+        self.who = who                                         # #310: the identity whose request this is: only it answers what the run asks
         self.events: queue.Queue = queue.Queue()
         self.current: str | None = None                      # the id of the model's call that is running (for the page to tie a card to it)
         self.prompt = ""                                       # the rules for the AI (serve/agent_prompt.py), set by the server
@@ -120,7 +128,7 @@ class AgentRun:
     def question(self, questions: list) -> dict | str:
         """The model's questions to the user: a `question` event, and the answer ({"answers": {...} or None}), or "cancelled", or {"answers": None} when nobody answered in time."""
         rid = uuid.uuid4().hex[:16]
-        slot = self.broker.open(rid, "question")
+        slot = self.broker.open(rid, "question", self.who)
         self._emit({"event": "question", "id": rid, "questions": questions})
         end = time.monotonic() + self.timeout
         try:
@@ -141,7 +149,7 @@ class AgentRun:
             settled = self._judge(req, rid)
             if settled:
                 return settled
-        slot = self.broker.open(rid)
+        slot = self.broker.open(rid, "permission", self.who)
         self._emit({"event": "permission", "id": rid, **{k: req.get(k) for k in ("tool", "arguments", "why", "danger", "rule")}})
         end = time.monotonic() + self.timeout
         try:

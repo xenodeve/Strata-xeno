@@ -4,6 +4,9 @@ A request that uses the coding tools can run for many minutes.  If the page that
 names a run id in `strata_agent.run`) runs on its own thread and writes what it would stream into a buffer; the page that asked reads the buffer as it grows, and a page that comes back after a
 refresh reads it again from where it was (GET /agent/run?id=...&from=N) and goes on from there, so the work, its permission questions and its answer are all still there.  The run ends when it is done,
 when the user stops it (POST /agent/cancel), or when nobody has looked at it for a long time.  A run that is over is kept for a while so that a page that was away can still read its end.
+
+#310: a run belongs to the identity that launched it (`Run.who`, an identity's name; "owner" outside team mode).  Only that identity reads it again or
+steers it; the owner role sees and stops every run.  To anyone else a run is not there (`get_for` answers None), so its id cannot be probed.
 """
 from __future__ import annotations
 
@@ -11,7 +14,10 @@ import collections
 import json
 import threading
 import time
-from typing import Callable, Iterator
+from typing import TYPE_CHECKING, Callable, Iterator
+
+if TYPE_CHECKING:
+    from serve.identity import Identity
 
 KEEP_S = 30 * 60              # a finished run can be read again for this long
 IDLE_S = 15 * 60              # a running one that nobody has looked at for this long is stopped
@@ -21,8 +27,9 @@ BEAT_S = 5.0                  # how often a reader that is waiting is given a si
 
 
 class Run:
-    def __init__(self, rid: str, cancel: threading.Event, owner=None):
+    def __init__(self, rid: str, cancel: threading.Event, owner=None, who: str = "owner"):
         self.id, self.cancel, self.owner = rid, cancel, owner         # `owner`: the AgentRun whose steering queue what the user sends meanwhile goes to
+        self.who = who                            # #310: the name of the identity that launched it
         self.events: list[bytes] = []             # each a whole SSE event: b"data: {...}\n\n"
         self.size = 0
         self.done = False
@@ -83,10 +90,16 @@ class RunStore:
         with self.lock:
             return self.runs.get(rid) if isinstance(rid, str) else None
 
-    def launch(self, rid: str, chunks: Iterator, cancel: threading.Event, describe: Callable[[BaseException], dict | None], owner=None) -> Run | None:
+    def get_for(self, rid, viewer: Identity) -> Run | None:
+        """The run as `viewer` may see it: the owner role sees every run, anyone else only their own (None for another's, as for one that is not there)."""
+        run = self.get(rid)
+        return run if run is not None and (viewer.is_owner or run.who == viewer.name) else None
+
+    def launch(self, rid: str, chunks: Iterator, cancel: threading.Event, describe: Callable[[BaseException], dict | None], owner=None,
+               who: str = "owner") -> Run | None:
         """Start a run that writes what `chunks` yields (dicts, None for a keep-alive) into a buffer; None when there is already a run with that id.
-        `describe(exc)`: the error chunk to write when the stream breaks, or None to let it end quietly."""
-        run = Run(rid, cancel, owner)
+        `describe(exc)`: the error chunk to write when the stream breaks, or None to let it end quietly.  `who`: the identity it belongs to (#310)."""
+        run = Run(rid, cancel, owner, who)
         with self.lock:
             if rid in self.runs:
                 return None
@@ -119,17 +132,27 @@ class RunStore:
                 pass
             run.finish()
 
-    def cancel(self, rid) -> bool:
-        run = self.get(rid)
+    def cancel(self, rid, by: Identity) -> bool:
+        """Stop a run: the owner role any run, anyone else their own; False when `by` may not see it or it is not there."""
+        run = self.get_for(rid, by)
         if run is None:
             return False
         run.cancel.set()
         return True
 
-    def steer(self, rid, text: str) -> bool:
-        """Hand what the user sent while the run works to its agent; False when there is no such run, or it is over."""
+    def cancel_all(self, who: str) -> int:
+        """Stop every run of the identity `who` that is still going (for a key that is revoked); how many there were."""
+        with self.lock:
+            mine = [run for run in self.runs.values() if run.who == who and not run.done]
+        for run in mine:
+            run.cancel.set()
+        return len(mine)
+
+    def steer(self, rid, text: str, by: Identity) -> bool:
+        """Hand what the user sent while the run works to its agent; False when there is no such run, it is over, or it is not `by`'s own:
+        writing into another identity's conversation is nobody else's, the owner role's neither."""
         run = self.get(rid)
-        if run is None or run.done or run.owner is None or not hasattr(run.owner, "steer"):
+        if run is None or run.who != by.name or run.done or run.owner is None or not hasattr(run.owner, "steer"):
             return False
         run.owner.steer(text)
         return True

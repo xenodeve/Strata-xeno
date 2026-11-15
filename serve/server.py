@@ -3121,9 +3121,9 @@ class Service:
             on = []
         return memory_mod.collect(home, folders, on)
 
-    def start_agent_run(self, sa: dict, messages: list):
+    def start_agent_run(self, sa: dict, messages: list, who: str = "owner"):
         """One request's use of the coding tools: the folder, mode, rules and chat the page named (anything odd is ignored), the rules for the
-        AI as a prompt, and auto mode's judge (serve/agent_run.py)."""
+        AI as a prompt, and auto mode's judge (serve/agent_run.py).  `who`: the identity whose request it is; only it answers what the run asks (#310)."""
         raw = sa.get("cwd")
         folder = os.path.realpath(raw) if isinstance(raw, str) and raw.strip() and "\0" not in raw and os.path.isdir(raw) else None
         dirs: list[str] = []                                            # the project's other folders: the real ones, once each, not the main one; none without a main one
@@ -3145,7 +3145,8 @@ class Service:
         sh = getattr(self.agent, "shell", None)
         policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs,
                                     protected=[p for p in (self.config_path, self.mcp_config_path) if p])   # hooks, web access and keys live there: never changed unasked
-        run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell_mod.describe(sh) if sh else None)
+        run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell_mod.describe(sh) if sh else None,
+                                 who=who)
         cp = sa.get("checkpoint")
         if isinstance(cp, str) and sid != "default":
             run.ctx.checkpoint = self.checkpoints.scope(sid, cp)                  # this prompt's checkpoint: the files the tools change are kept as they were
@@ -5307,6 +5308,7 @@ OWNER_POSTS = {"/settings": "settings can be changed", "/config": "the run confi
                "/unload": "the model can be loaded or unloaded", "/load": "the model can be loaded or unloaded",
                "/v1/unload": "the model can be loaded or unloaded", "/v1/load": "the model can be loaded or unloaded",
                "/v1/vram": "the VRAM reserve can be changed", "/metrics/keep": "prompts can be kept"}
+NO_RUN = "there is no such run (it ended long ago, or the server was restarted)"
 
 
 def make_handler(svc: Service):
@@ -5632,6 +5634,17 @@ def make_handler(svc: Service):
                 self._json(403, {"error": {"message": why}})
             return False
 
+        def _runs_gate(self, what: str) -> bool:
+            """#310: the gate of a run's routes and of the answers to its prompts.  In team mode every key passes it: a
+            run and a prompt belong to the identity that launched it, and the run store and the broker answer 404 for
+            another's id, as for one that is not there, so ids cannot be probed.  Outside team mode `_owner_only`, as
+            before."""
+            return True if self.team else self._owner_only(what)
+
+        def _acting(self) -> identity_mod.Identity:
+            """Who a run route acts as: the request's identity in team mode; outside it OWNER, whose every run is."""
+            return self.identity if self.team else identity_mod.OWNER
+
         def _ui_prefix(self) -> bool:
             """xeno UI S1: /classic/... is the classic web app under a prefix (its relative URLs then land on the
             same routes), /next/... the new one (serve/ui/dist). True when this call answered."""
@@ -5807,15 +5820,15 @@ def make_handler(svc: Service):
             if path == "/agent/run":
                 # a run that went on while the page was away (serve/runs.py): its events from number `from` on, as they come; only for who may use the coding tools
                 if self._authorized():
-                    if not self._owner_only("a run can be read"):
+                    if not self._runs_gate("a run can be read"):
                         return
                     origin = self.headers.get("Origin")
                     if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
                         return self._json(403, {"error": {"message": "a run can be read only from Strata's own page"}})
                     q = parse_qs(urlsplit(self.path).query)
-                    run = svc.runs.get(q.get("id", [""])[0])
+                    run = svc.runs.get_for(q.get("id", [""])[0], self._acting())          # #310: another identity's run is not there
                     if run is None:
-                        return self._json(404, {"error": {"message": "there is no such run (it ended long ago, or the server was restarted)"}})
+                        return self._json(404, {"error": {"message": NO_RUN}})
                     try:
                         start = int(q.get("from", ["0"])[0])
                     except ValueError:
@@ -6037,7 +6050,7 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
                 if not self._own_page("A message can be sent to a run"):
                     return
-                if not self._owner_only("A message can be sent to a run"):
+                if not self._runs_gate("A message can be sent to a run"):
                     return
                 try:
                     body = json.loads(raw)
@@ -6045,13 +6058,15 @@ def make_handler(svc: Service):
                     body = None
                 if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not isinstance(body.get("text"), str) or not 0 < len(body["text"].strip()) <= 20_000:
                     return self._json(400, {"error": {"message": "send {\"id\": the run's id, \"text\": the message (1 to 20,000 characters)}"}})
-                return self._json(200, {"ok": True, "found": svc.runs.steer(body["id"], body["text"].strip())})
+                if self.team and svc.runs.get_for(body["id"], self.identity) is None:
+                    return self._json(404, {"error": {"message": NO_RUN}})          # #310: another identity's run is not there
+                return self._json(200, {"ok": True, "found": svc.runs.steer(body["id"], body["text"].strip(), self._acting())})
             if path == "/agent/cancel":                      # the user's Stop for an answer that runs on its own (serve/runs.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("A run can be stopped"):
                     return
-                if not self._owner_only("A run can be stopped"):
+                if not self._runs_gate("A run can be stopped"):
                     return
                 try:
                     body = json.loads(raw)
@@ -6059,13 +6074,15 @@ def make_handler(svc: Service):
                     body = None
                 if not isinstance(body, dict) or not isinstance(body.get("id"), str):
                     return self._json(400, {"error": {"message": "send {\"id\": the run's id}"}})
-                return self._json(200, {"ok": True, "found": svc.runs.cancel(body["id"])})
+                if self.team and svc.runs.get_for(body["id"], self.identity) is None:
+                    return self._json(404, {"error": {"message": NO_RUN}})          # #310: another identity's run is not there
+                return self._json(200, {"ok": True, "found": svc.runs.cancel(body["id"], self._acting())})
             if path == "/agent/question":                    # the page's answer to a question the model asked with AskUserQuestion (serve/agent_run.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 50_000 else b""
                 if not self._own_page("A question can be answered"):
                     return
-                if not self._owner_only("A question can be answered"):
+                if not self._runs_gate("A question can be answered"):
                     return
                 try:
                     body = json.loads(raw)
@@ -6075,7 +6092,7 @@ def make_handler(svc: Service):
                 if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not (ans is None or (isinstance(ans, dict) and len(ans) <= 4 and all(
                         isinstance(k, str) and len(k) <= 400 and isinstance(v, list) and 0 < len(v) <= 8 and all(isinstance(x, str) and len(x) <= 500 for x in v) for k, v in ans.items()))):
                     return self._json(400, {"error": {"message": "send {\"id\": the question's id, \"answers\": {question: [choices]} or null to skip}"}})
-                if not svc.broker.respond(body["id"], ans):
+                if not svc.broker.respond(body["id"], ans, self._acting()):          # #310: only the run's holder answers it
                     return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
                 return self._json(200, {"ok": True})
             if path == "/agent/permission":                  # the page's answer to a question of the coding tools (serve/agent_run.py)
@@ -6083,7 +6100,7 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("A question can be answered"):
                     return
-                if not self._owner_only("A question can be answered"):
+                if not self._runs_gate("A question can be answered"):
                     return
                 try:
                     body = json.loads(raw)
@@ -6091,7 +6108,7 @@ def make_handler(svc: Service):
                     body = None
                 if not isinstance(body, dict) or not isinstance(body.get("id"), str) or body.get("decision") not in agent_run.ANSWERS:
                     return self._json(400, {"error": {"message": "send {\"id\": the question's id, \"decision\": \"allow\" | \"allow_chat\" | \"deny\"}"}})
-                if not svc.broker.answer(body["id"], body["decision"]):
+                if not svc.broker.answer(body["id"], body["decision"], self._acting()):     # #310: only the run's holder answers it
                     return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
                 return self._json(200, {"ok": True})
             if path == "/agent/helpers":                     # sub-agents on or off (serve/subagent.py)
@@ -6585,7 +6602,7 @@ def make_handler(svc: Service):
                     return self._json(403, {"error": {"message": "The coding tools change files and run commands on this PC, so they work only from this PC itself (open the page as localhost) or with the API key. " + why}})
                 if svc.agent is None or svc.mcp is None:
                     return self._json(409, {"error": {"message": "the coding tools are switched off on this server (\"agent\": false in the run config)"}})
-                arun = svc.start_agent_run(sa, req.get("messages") or [])
+                arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name)     # #310: the run and what it asks are this identity's
                 req = {**req, "messages": agent_prompt.with_system(req.get("messages") or [], arun.prompt)}
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
@@ -6648,7 +6665,7 @@ def make_handler(svc: Service):
                     if isinstance(e, EngineDied):
                         return {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                     return {"error": {"type": "server_error", "message": str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"}}
-                buf = svc.runs.launch(rid, chunks, cancel, describe, owner=arun)             # the answer is written on its own thread: a refresh of the page does not stop it
+                buf = svc.runs.launch(rid, chunks, cancel, describe, owner=arun, who=arun.who)             # the answer is written on its own thread: a refresh of the page does not stop it
                 if buf is None:
                     return self._json(409, {"error": {"message": "there is a run with that id already"}})
                 self._sse()

@@ -139,14 +139,15 @@ class WithTheChat(Fixture):
     def test_a_permission_question_cannot_be_answered_as_a_question(self):
         self.start(DONE)
         from serve.agent_run import Broker
+        from serve.identity import OWNER
         b = Broker()
         b.open("p1")
-        self.assertFalse(b.respond("p1", None))
-        self.assertTrue(b.answer("p1", "allow"))
+        self.assertFalse(b.respond("p1", None, OWNER))
+        self.assertTrue(b.answer("p1", "allow", OWNER))
         b.open("q1", "question")
-        self.assertFalse(b.answer("q1", "allow"))
-        self.assertTrue(b.respond("q1", {"a": ["b"]}))
-        self.assertFalse(b.respond("q1", None))                                           # once
+        self.assertFalse(b.answer("q1", "allow", OWNER))
+        self.assertTrue(b.respond("q1", {"a": ["b"]}, OWNER))
+        self.assertFalse(b.respond("q1", None, OWNER))                                           # once
 
 
 if __name__ == "__main__":

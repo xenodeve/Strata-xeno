@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from serve import runs  # noqa: E402
+from serve.identity import OWNER, Identity  # noqa: E402
 from serve.test_agent_chat import DONE, Fixture  # noqa: E402
 from serve.test_harness import tool_call  # noqa: E402
 
@@ -31,8 +32,8 @@ class TheStore(unittest.TestCase):
     def setUp(self):
         self.store = runs.RunStore()
 
-    def launch(self, rid, chunks, cancel=None):
-        return self.store.launch(rid, iter(chunks), cancel or threading.Event(), lambda e: {"error": {"message": str(e)}})
+    def launch(self, rid, chunks, cancel=None, owner=None, who="owner"):
+        return self.store.launch(rid, iter(chunks), cancel or threading.Event(), lambda e: {"error": {"message": str(e)}}, owner=owner, who=who)
 
     def read(self, run, start=0, limit=50):
         out = []
@@ -114,10 +115,10 @@ class TheStore(unittest.TestCase):
     def test_stop_sets_the_runs_cancel(self):
         cancel = threading.Event()
         self.launch("run-gggggggg", [{"n": 1}], cancel)
-        self.assertTrue(self.store.cancel("run-gggggggg"))
+        self.assertTrue(self.store.cancel("run-gggggggg", OWNER))
         self.assertTrue(cancel.is_set())
-        self.assertFalse(self.store.cancel("run-nothere"))
-        self.assertFalse(self.store.cancel(5))
+        self.assertFalse(self.store.cancel("run-nothere", OWNER))
+        self.assertFalse(self.store.cancel(5, OWNER))
 
     def test_a_run_that_grows_too_large_is_stopped_with_a_message(self):
         old = runs.MAX_BYTES
@@ -167,6 +168,68 @@ class TheStore(unittest.TestCase):
         self.store._prune()
         self.assertLessEqual(len(self.store.runs), runs.MAX_RUNS)
         self.assertIsNotNone(self.store.get(f"run-many-{runs.MAX_RUNS + 3:04d}"))       # the newest stay
+
+    # #310: a run belongs to the identity that launched it (`who`); the owner role sees and stops every run
+    ANN, BOB = Identity("ann", "guest"), Identity("bob", "guest")
+    BOSS = Identity("boss", "owner")                                        # a named owner key: the role counts, not the name
+
+    def test_get_for_scopes_by_identity(self):
+        hold = threading.Event()
+        self.addCleanup(hold.set)
+        run = self.launch("run-who-0001", gen({"n": 1}, hold=hold), who="ann")
+        self.assertEqual(run.who, "ann")
+        self.assertIs(self.store.get_for("run-who-0001", self.ANN), run)
+        self.assertIsNone(self.store.get_for("run-who-0001", self.BOB))            # another identity's run is not there for bob
+        self.assertIs(self.store.get_for("run-who-0001", self.BOSS), run)
+        self.assertIs(self.store.get_for("run-who-0001", OWNER), run)
+        self.assertIsNone(self.store.get_for("run-nothere", self.ANN))
+        self.assertIsNone(self.store.get_for(5, OWNER))
+        self.assertEqual(self.launch("run-who-0002", [{"n": 1}]).who, "owner")    # launched with no `who`: the owner's, as every run was before
+
+    def test_cancel_by_owner_or_holder_only(self):
+        hold = threading.Event()
+        self.addCleanup(hold.set)
+        c1, c2 = threading.Event(), threading.Event()
+        self.launch("run-who-0003", gen({"n": 1}, hold=hold), c1, who="ann")
+        self.launch("run-who-0004", gen({"n": 1}, hold=hold), c2, who="ann")
+        self.assertFalse(self.store.cancel("run-who-0003", self.BOB))
+        self.assertFalse(c1.is_set())
+        self.assertTrue(self.store.cancel("run-who-0003", self.ANN))
+        self.assertTrue(c1.is_set())
+        self.assertTrue(self.store.cancel("run-who-0004", self.BOSS))             # the owner may stop anyone's run
+        self.assertTrue(c2.is_set())
+
+    def test_steer_only_by_holder(self):
+        class Agent:
+            def __init__(self):
+                self.got = []
+
+            def steer(self, text):
+                self.got.append(text)
+        hold = threading.Event()
+        self.addCleanup(hold.set)
+        a = Agent()
+        self.launch("run-who-0005", gen({"n": 1}, hold=hold), owner=a, who="ann")
+        self.assertFalse(self.store.steer("run-who-0005", "from bob", self.BOB))
+        self.assertFalse(self.store.steer("run-who-0005", "from the owner", self.BOSS))   # stopping is the owner's, writing into ann's conversation is not
+        self.assertTrue(self.store.steer("run-who-0005", "from ann", self.ANN))
+        self.assertEqual(a.got, ["from ann"])
+
+    def test_cancel_all_by_who(self):
+        hold = threading.Event()
+        self.addCleanup(hold.set)
+        cs = {rid: threading.Event() for rid in ("run-all-0001", "run-all-0002", "run-all-0003")}
+        self.launch("run-all-0001", gen({"n": 1}, hold=hold), cs["run-all-0001"], who="ann")
+        self.launch("run-all-0002", gen({"n": 1}, hold=hold), cs["run-all-0002"], who="ann")
+        self.launch("run-all-0003", gen({"n": 1}, hold=hold), cs["run-all-0003"], who="bob")
+        over = self.launch("run-all-0004", [{"n": 1}], who="ann")
+        deadline = time.time() + 5
+        while not over.done and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.store.cancel_all("ann"), 2)                          # the runs still going: one that is over is not counted
+        self.assertTrue(cs["run-all-0001"].is_set() and cs["run-all-0002"].is_set())
+        self.assertFalse(cs["run-all-0003"].is_set())
+        self.assertEqual(self.store.cancel_all("nobody"), 0)
 
 
 RID = "run-test-0001"

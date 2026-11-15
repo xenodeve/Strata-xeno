@@ -6,20 +6,24 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from serve import agent_run, judge  # noqa: E402
+from serve.identity import OWNER, Identity  # noqa: E402
 from serve.permissions import Policy  # noqa: E402
 
 REQ = {"tool": "Bash", "arguments": {"command": "python build.py"}, "why": "a command asks every time", "danger": False, "judgeable": True, "rule": "Bash(python build.py:*)"}
 
 
-def make(mode=None, side=None, timeout=5.0, broker=None, **kw):
+def make(mode=None, side=None, timeout=5.0, broker=None, who="owner", **kw):
     broker = broker or agent_run.Broker()
-    run = agent_run.AgentRun(Policy(cwd="C:/proj", mode=mode, **kw), session="s1", broker=broker, goal="build the project", side=side, cancel=threading.Event(), timeout=timeout)
+    run = agent_run.AgentRun(Policy(cwd="C:/proj", mode=mode, **kw), session="s1", broker=broker, goal="build the project", side=side, cancel=threading.Event(), timeout=timeout,
+                             who=who)
     return run, broker
 
 
@@ -40,7 +44,7 @@ class Asking(unittest.TestCase):
         self.assertEqual(ev["event"], "permission")
         self.assertEqual((ev["tool"], ev["call_id"], ev["why"], ev["rule"]), ("Bash", "call-1", REQ["why"], REQ["rule"]))
         self.assertTrue(ev["id"])
-        self.assertTrue(broker.answer(ev["id"], "allow"))
+        self.assertTrue(broker.answer(ev["id"], "allow", OWNER))
         t.join(3)
         self.assertEqual(box["a"], "allow")
 
@@ -50,11 +54,11 @@ class Asking(unittest.TestCase):
         t.start()
         time.sleep(0.1)
         rid = run.drain()[0]["id"]
-        self.assertFalse(broker.answer(rid, "yes please"))
-        self.assertFalse(broker.answer("nope", "allow"))
-        self.assertTrue(broker.answer(rid, "deny"))
+        self.assertFalse(broker.answer(rid, "yes please", OWNER))
+        self.assertFalse(broker.answer("nope", "allow", OWNER))
+        self.assertTrue(broker.answer(rid, "deny", OWNER))
         t.join(3)
-        self.assertFalse(broker.answer(rid, "allow"))
+        self.assertFalse(broker.answer(rid, "allow", OWNER))
 
     def test_no_answer_in_time_is_a_refusal(self):
         run, _ = make(timeout=0.3)
@@ -74,13 +78,80 @@ class Asking(unittest.TestCase):
         t = threading.Thread(target=lambda: box.update(a=run.ctx.ask(dict(REQ))))
         t.start()
         time.sleep(0.1)
-        broker.answer(run.drain()[0]["id"], "allow_chat")
+        broker.answer(run.drain()[0]["id"], "allow_chat", OWNER)
         t.join(3)
         self.assertEqual(box["a"], "allow_chat")
 
     def test_a_page_may_answer_only_what_this_server_asked(self):
         _, broker = make()
-        self.assertFalse(broker.answer("not-asked", "allow"))
+        self.assertFalse(broker.answer("not-asked", "allow", OWNER))
+
+
+def wait_event(run, n=1):
+    got = []
+    for _ in range(200):
+        got += run.drain()
+        if len(got) >= n:
+            return got
+        time.sleep(0.02)
+    return got
+
+
+class Holder(unittest.TestCase):
+    """#310: a permission or question prompt is answered only by the identity whose run asked it - the owner role does not answer for another."""
+    ANN, BOB, BOSS = Identity("ann", "guest"), Identity("bob", "guest"), Identity("boss", "owner")
+
+    def test_only_the_holder_may_answer_a_permission(self):
+        run, broker = make(who="ann")
+        box = {}
+        t = threading.Thread(target=lambda: box.update(a=run.ctx.ask(dict(REQ))))
+        t.start()
+        rid = wait_event(run)[0]["id"]
+        self.assertEqual(broker.pending[rid]["who"], "ann")
+        self.assertFalse(broker.answer(rid, "allow", self.BOB))
+        self.assertFalse(broker.answer(rid, "allow", self.BOSS))                 # an approval is the run holder's, not the owner's
+        self.assertFalse(broker.answer(rid, "allow", OWNER))
+        self.assertTrue(broker.answer(rid, "deny", self.ANN))                    # the refused tries did not use the slot up
+        t.join(3)
+        self.assertEqual(box["a"], "deny")
+
+    def test_only_the_holder_may_answer_a_question(self):
+        run, broker = make(who="ann")
+        box = {}
+        t = threading.Thread(target=lambda: box.update(a=run.ctx.question([{"question": "Which?", "options": [{"label": "A"}]}])))
+        t.start()
+        rid = wait_event(run)[0]["id"]
+        self.assertEqual(broker.pending[rid]["who"], "ann")
+        self.assertFalse(broker.respond(rid, {"Which?": ["A"]}, self.BOB))
+        self.assertFalse(broker.respond(rid, {"Which?": ["A"]}, self.BOSS))
+        self.assertTrue(broker.respond(rid, {"Which?": ["A"]}, self.ANN))
+        t.join(3)
+        self.assertEqual(box["a"], {"answers": {"Which?": ["A"]}})
+
+    def test_a_run_with_no_who_is_the_owners(self):
+        run, broker = make()
+        self.assertEqual(run.who, "owner")
+        self.assertEqual(broker.open("x" * 16)["who"], "owner")
+        self.assertEqual(broker.open("y" * 16, "question", who="ann")["who"], "ann")
+
+    def test_a_helper_asks_as_its_parents_holder(self):
+        from serve import subagent
+        parent, _ = make(who="ann")
+        made = []
+        real = agent_run.AgentRun.__init__
+
+        def spy(self, *a, **k):
+            real(self, *a, **k)
+            made.append(self.who)
+
+        def prepare(*a, **k):
+            raise ValueError("only the helper's making is looked at")
+        svc = SimpleNamespace(agent=SimpleNamespace(tools=[]), prepare=prepare,
+                              mcp=SimpleNamespace(servers={}, template_tools=lambda skip_servers=(): []))
+        with mock.patch.object(agent_run.AgentRun, "__init__", spy):
+            ok, _ = subagent.execute(svc, parent, "explore", "look", "look around", None)
+        self.assertFalse(ok)
+        self.assertEqual(made, ["ann"])
 
 
 class AutoMode(unittest.TestCase):

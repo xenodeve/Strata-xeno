@@ -86,7 +86,7 @@ def execute(svc, parent, kind: str, prompt: str, description: str, run_loop) -> 
     policy.allow, policy.deny = parent.policy.allow, parent.policy.deny
     if kind == "explore":
         policy.mode = "plan"                                  # nothing is changed, whatever the tools say
-    helper = agent_run_mod.AgentRun(policy, parent.ctx.session, parent.broker, parent.goal, parent.side, cancel, parent.timeout, shell=parent.shell)
+    helper = agent_run_mod.AgentRun(policy, parent.ctx.session, parent.broker, parent.goal, parent.side, cancel, parent.timeout, shell=parent.shell, who=parent.who)
     helper.ctx.checkpoint, helper.ctx.hooks, helper.ctx.vision, helper.ctx.web = parent.ctx.checkpoint, parent.ctx.hooks, parent.ctx.vision, parent.ctx.web
     helper.ctx.in_helper = True
     helper.ctx.question = lambda questions: {"answers": None}                  # a helper cannot ask the user

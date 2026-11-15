@@ -12,14 +12,19 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from serve import agent  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.identity import OWNER, KeyStore  # noqa: E402
+from serve.mcp import hub_from_config  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, keys_file_of, serve  # noqa: E402
+from serve.test_harness import tool_call  # noqa: E402
+from serve.test_mcp import ScriptedEngine  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DEV1, DEV2 = "device-0001", "device-0002"         # valid X-Strata-Device ids (8-64 of [A-Za-z0-9_-])
@@ -155,13 +160,12 @@ class Identity(Base):
         ann = self.approved("ann")
         for path in ("/settings", "/config", "/import", "/unload", "/load", "/v1/load", "/v1/unload", "/v1/vram",
                      "/slots/0?action=save", "/metrics/keep", "/agent/hooks", "/agent/web", "/agent/helpers",
-                     "/agent/rewind", "/agent/steer", "/agent/cancel", "/agent/question", "/agent/permission"):
+                     "/agent/rewind", "/agent/checkpoints/forget"):
             code, body = self.req("POST", path, {}, key=ann, device=DEV1)
             self.assertEqual((code, body["error"]["type"]), (403, "forbidden"), path)
             self.assertIn("only with an owner key", body["error"]["message"], path)
         for path in ("/agent/folders", "/agent/git", "/agent/git/diff", "/agent/files", "/agent/mention",
-                     "/agent/memory", "/agent/memory/file", "/agent/hooks", "/agent/web", "/agent/helpers",
-                     "/agent/run?id=x"):
+                     "/agent/memory", "/agent/memory/file", "/agent/hooks", "/agent/web", "/agent/helpers"):
             code, body = self.req("GET", path, key=ann, device=DEV1)
             self.assertEqual((code, body["error"]["type"]), (403, "forbidden"), path)
         # strata_agent: the coding tools are the owner's
@@ -328,6 +332,100 @@ class LocalImages(Base):
         for path, body in self.bodies(str(self.img)).items():
             self.assertEqual(self.req("POST", path, body, key="k")[0], 200, path)
         self.assertEqual(self.vision.seen.count(str(self.img)), 4)
+
+
+class RunsBelongToTheirIdentity(Base):
+    """A run, and the permission and question prompts it opens, are its holder's (#310 task 3, ruling R3): an owner key
+    "ann" launches a run that waits for her say-so; a guest "bob" cannot read, steer, stop or answer it, and is told
+    404 - the same as for an id that does not exist, so ids cannot be probed."""
+    RID = "run-team-0001"
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.dir / "proj"
+        self.proj.mkdir()
+        (self.proj / "a.txt").write_text("hello\n", encoding="utf-8")
+        self.outside = self.dir / "elsewhere"
+        self.outside.mkdir()
+        (self.outside / "b.txt").write_text("not in the project\n", encoding="utf-8")
+
+    def start_agent(self, *scripts, **attrs):
+        """The coding tools behind a scripted model (as serve/test_agent_chat.Fixture), in team mode."""
+        tools = agent.AgentServer()
+        hub = hub_from_config({}, None, builtins={"agent": tools})
+        hub.start(wait=True)
+        self.addCleanup(hub.close)
+        tok = ByteTokenizer()
+        self.svc = Service(ScriptedEngine(tok, list(scripts), max_context=200_000), tok,
+                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.mcp, self.svc.agent = hub, tools
+        self.start(**attrs)
+
+    def launch(self, key, device):
+        """ann's request, read on a thread of its own: (thread, the permission event once it came, the events read)."""
+        asked, events = threading.Event(), []
+        body = {"model": "m", "stream": True, "messages": [{"role": "user", "content": "look at b.txt"}],
+                "strata_agent": {"cwd": str(self.proj), "session": "chat-1", "run": self.RID}}
+
+        def read():
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+            try:
+                c.request("POST", "/v1/chat/completions", body=json.dumps(body).encode(), headers={
+                    "Content-Type": "application/json", "Authorization": "Bearer " + key, "X-Strata-Device": device})
+                r = c.getresponse()
+                events.append(r.status)
+                for raw in r:
+                    ln = raw.decode().strip()
+                    if ln.startswith("data: {"):
+                        ev = json.loads(ln[6:]).get("strata_mcp")
+                        if ev:
+                            events.append(ev)
+                            if ev.get("event") == "permission":
+                                asked.set()
+            finally:
+                c.close()
+        t = threading.Thread(target=read, daemon=True)
+        t.start()
+        return t, asked, events
+
+    def test_guest_cannot_read_or_answer_another_guest_run(self):
+        self.start_agent(tool_call("Read", file_path=str(self.outside / "b.txt")), "</think>\n\nDone.",
+                         api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann", "owner")                       # R3: only an owner key launches coding runs in part 1
+        bob = self.approved("bob", "guest", device=DEV2)
+        t, asked, events = self.launch(ann, DEV1)
+        self.assertTrue(asked.wait(20), events)
+        pid = next(e["id"] for e in events[1:] if e["event"] == "permission")
+        rid = self.RID
+        nothing = {}
+        for method, path, body in (("GET", f"/agent/run?id={rid}&from=0", None),
+                                   ("POST", "/agent/steer", {"id": rid, "text": "from bob"}),
+                                   ("POST", "/agent/cancel", {"id": rid}),
+                                   ("POST", "/agent/permission", {"id": pid, "decision": "allow"}),
+                                   ("POST", "/agent/question", {"id": pid, "answers": None})):
+            with self.subTest(path=path):
+                code, got = self.req(method, path, body, key=bob, device=DEV2)
+                self.assertEqual(code, 404, got)
+                gone = path.replace(rid, "run-none-0001") if method == "GET" else path
+                other = {**body, "id": "run-none-0001" if body.get("id") == rid else "f" * 16} if body else None
+                nothing[path] = self.req(method, gone, other, key=bob, device=DEV2)
+                self.assertEqual(nothing[path], (code, got))             # word for word what an id that is not there gets
+        self.assertTrue(t.is_alive())                                     # bob's tries neither stopped the run nor used up the prompt
+        self.assertEqual(self.req("POST", "/agent/permission", {"id": pid, "decision": "deny"}, key=ann, device=DEV1),
+                         (200, {"ok": True}))
+        t.join(20)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(events[0], 200)
+        self.assertEqual([(e["id"], e["answer"]) for e in events[1:] if e["event"] == "answered"], [(pid, "deny")])
+        # after the run: still not bob's; ann reads it again; the owner role may stop anyone's run
+        self.assertEqual(self.req("GET", f"/agent/run?id={rid}&from=0", key=bob, device=DEV2)[0], 404)
+        code, raw = self.req("GET", f"/agent/run?id={rid}&from=0", key=ann, device=DEV1)
+        self.assertEqual(code, 200)
+        self.assertIn(b"[DONE]", raw)
+        self.assertEqual(self.req("GET", "/props", key="k", device=DEV1)[0], 403)        # the owner's own device waits for approval too
+        self.assertTrue(self.svc.keys.decide_device("owner", DEV1, True, OWNER))
+        self.assertEqual(self.req("POST", "/agent/cancel", {"id": rid}, key="k", device=DEV1), (200, {"ok": True, "found": True}))
+        self.assertEqual(self.svc.runs.get(rid).who, "ann")
 
 
 class _Reached(Exception):
