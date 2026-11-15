@@ -210,9 +210,9 @@ on the workstation and are owner-only.
 - Every route the runner uses needs a valid key; runner ids and run ids are bound to the identity.
 - A guest's tools that touch files or run commands only ever run on the guest's own PC, by the guest's own runner,
   behind the same permission gate as today (approvals on their own page).
-- Server MCP servers are shared tools: an owner decides which servers exist; a guest can call their tools. (The owner
-  should not configure a server MCP that gives file or shell access to the workstation if guests are trusted only
-  with the model; the Settings page says this next to the server MCP list.)
+- Server MCP servers are shared tools, but in team mode a guest gets only the servers the owner marks for guests
+  (run-config `"guest_mcp"`, default empty; "Guests may use" per server in Settings). Superseded the earlier "notice
+  only" call: see "Changes during part 1" below (R11).
 - Hooks, web-access settings, helpers, run config and imports are owner-only.
 
 ## Decisions by the developer after the builder check (2026-11-15)
@@ -254,6 +254,27 @@ on the workstation and are owner-only.
   the re-read cost is not measured. A timeline run with two runners alternating on D2x gives the number, and an issue
   carries it with the fix to consider (per-identity slots, holding the engine across a run's tool calls).
 - **Cloudflare:** the poll limit above is kept at 25 s, well inside the 125 s idle limit.
+
+## Changes during part 1 (controller rulings, 2026-11-15/16; the developer may overturn any)
+
+Part 1 (team keys, branch `xeno/team-keys`) settled these; parts 2 and 3 plan from this text, not the older wording
+above where they differ.
+
+- **R2 - team mode is opt-in.** Team mode = the keys file exists (created by the owner's first key, from the
+  workstation itself or with the legacy key). Without it the server behaves as before: no device approval, today's
+  edit rules. So a server with only the single `"api_key"` gets no device approval until the first named key exists.
+  To leave team mode: stop the server, delete the keys file, start it again.
+- **R6 -** in team mode every request needs a key, the workstation's own browser included (as with an `api_key`
+  today).
+- **R8 -** the names of waiting requests are in `/metrics` `live.waiting_who: [{"who","since"}]`; `live.waiting` keeps
+  its #465 meaning (a count, only with `"parallel"`).
+- **R9 -** a key's name is never reused (revoked and renamed-from names are retired).
+- **R11 - server MCP for guests is opt-in per server** (`"guest_mcp"`), because an imported filesystem or shell MCP
+  server would otherwise give every guest the workstation's files or shell (anti-goal 1). Skills stay open to guests
+  (read-only, fenced to each skill's folder).
+- **R12 -** an owner-role key sees every run and record (decision 2); owner keys are not isolated from each other, so
+  a team should have one owner.
+- Guests' image inputs: no local paths or `file://`, and http(s) URLs only to public addresses (#311).
 
 ## Left to the builder
 
