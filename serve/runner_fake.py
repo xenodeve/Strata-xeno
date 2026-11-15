@@ -155,10 +155,11 @@ class FakeRunner:
         self.stopped.set()
         with self._lock:
             conn = self._conn
-        if conn is not None and conn.sock is not None:
+        sock = conn.sock if conn is not None else None    # read once: the poll's thread may close it meanwhile
+        if sock is not None:
             try:                                          # close the handle itself: on Windows a shutdown does not
-                conn.sock.shutdown(socket.SHUT_RDWR)      # wake a recv held in another thread, a closesocket does
-                socket.socket(fileno=conn.sock.detach()).close()
-            except OSError:
+                sock.shutdown(socket.SHUT_RDWR)           # wake a recv held in another thread, a closesocket does
+                socket.socket(fileno=sock.detach()).close()
+            except (OSError, ValueError):                 # closed meanwhile (detach() gives -1): nothing is held
                 pass
         self.thread.join(5)

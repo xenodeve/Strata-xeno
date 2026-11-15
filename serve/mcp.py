@@ -19,6 +19,7 @@ breaking.
 from __future__ import annotations
 
 import collections
+import copy
 import json
 import os
 import re
@@ -516,6 +517,26 @@ class McpHub:
         end = None if timeout is None else time.monotonic() + timeout
         for t in self.threads:
             t.join(None if end is None else max(0.0, end - time.monotonic()))
+
+    def with_servers(self, extra: dict, replace: dict | None = None) -> McpHub:
+        """#310 part 2: one request's own view of the hub - the same settings and start threads, `servers` = this
+        hub's in their order with the ones named in `replace` swapped in place (a name the hub does not have is
+        ignored), then `extra` (a runner's groups, serve/runner_hub.py).  An `extra` name the view has already gets
+        `_2`, `_3`, ... on a shallow copy, so a server of the hub is never swapped out and the group's object is not
+        renamed.  Its own `_routes`; this hub is not changed.  Never start(), status() or close() a view: the
+        servers are this hub's (and the runner's)."""
+        view = McpHub.__new__(McpHub)
+        view.settings, view.threads, view._routes = self.settings, self.threads, {}
+        view.servers = {n: (replace[n] if replace and n in replace else s) for n, s in self.servers.items()}
+        for name, s in extra.items():
+            key, n = name, 2
+            while key in view.servers:
+                key, n = f"{name}_{n}", n + 1
+            if key != name:
+                s = copy.copy(s)
+                s.name = key
+            view.servers[key] = s
+        return view
 
     def routes(self) -> dict[str, tuple[McpServer, str]]:
         """tool name the model sees -> (server, the tool's own name).  A server that stopped after it was ready keeps

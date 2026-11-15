@@ -71,7 +71,7 @@ from serve import identity as identity_mod  # noqa: E402  (#310: named keys, rol
 from serve import skills as skills_mod  # noqa: E402
 from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, runs as runs_mod, shell as shell_mod, subagent as subagent_mod, web as web_mod  # noqa: E402
 from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
-from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import runner_hub  # noqa: E402  (#310 part 2: the runner channel)
 from serve import logit_bias as bias_api  # noqa: E402
@@ -4982,19 +4982,35 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         results = []
         for c in calls:
             s, tool = hub.routes().get(c.name, (None, c.name))
+            remote = s is not None and getattr(s, "machine", None) == "my"      # #310 part 2: a group of the engineer's own PC
             yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
-                          "tool": tool, "arguments": c.arguments, "round": rounds}
+                          "tool": tool, "arguments": c.arguments, "round": rounds, **({"machine": "my"} if remote else {})}
+            states: queue.SimpleQueue = queue.SimpleQueue()      # the runner group's progress words, from the worker thread
+            said = "sending"
+            if remote:
+                yield "mcp", {"event": "remote", "id": c.id, "state": said}
             # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
             # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
             box = {}
             if agent_run is not None:
                 agent_run.current = c.id
 
-            def work(c=c, box=box):
+            def work(c=c, box=box, remote=remote, states=states):
                 try:
-                    box["r"] = hub.call(c.name, c.arguments, cancel, agent_run.ctx if agent_run is not None else None)
+                    ctx = agent_run.ctx if agent_run is not None else None
+                    box["r"] = hub.call(c.name, c.arguments, cancel, ctx, progress=states.put) if remote \
+                        else hub.call(c.name, c.arguments, cancel, ctx)
                 except McpCancelled:
                     box["cancelled"] = True
+
+            def progress(c=c, states=states):
+                """The runner's `running` / `offline` as `remote` events, each once in a row (`sending` was said)."""
+                nonlocal said
+                while not states.empty():
+                    word = states.get()
+                    if word in ("running", "offline") and word != said:
+                        said = word
+                        yield "mcp", {"event": "remote", "id": c.id, "state": word}
             worker = threading.Thread(target=work, daemon=True)
             worker.start()
             try:
@@ -5004,12 +5020,14 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                     if agent_run is not None:
                         for e in agent_run.drain():      # a question for the user, a todo list, ...: to the page at once
                             yield "mcp", e
+                    yield from progress()
                     beat += 1
                     if worker.is_alive() and beat % 5 == 0:
                         yield "ping", None
                 if agent_run is not None:
                     for e in agent_run.drain():
                         yield "mcp", e
+                yield from progress()
             except GeneratorExit:
                 cancel.set()                             # the client is gone: stop the tool too (a question that is open ends too)
                 raise
@@ -5694,7 +5712,22 @@ def make_handler(svc: Service):
         def _still_may_run(self, arun) -> bool:
             """#310: right before a coding run starts, after the request may have waited (a model load): its key is still
             there and still an owner's, and no revoke or demotion stopped the run meanwhile.  Otherwise the run's cancel
-            is set and the request is refused (401 revoked, 403 no longer an owner)."""
+            is set and the request is refused (401 revoked, 403 no longer an owner).  A run on My PC (#310 part 2) needs no
+            owner key: its key must still match, the run not be stopped, and its runner still be the caller's and online
+            (else 409 runner_offline)."""
+            if arun.runner is not None:                      # #310 part 2: a run on My PC - any identity whose key still
+                ident = svc.keys.match(self._given_key()) if self.team else identity_mod.OWNER     # matches, while its runner is still there
+                if ident is not None and not arun.stopped \
+                        and svc.runner_hub.get_for(arun.runner.id, ident) is arun.runner and arun.runner.online():
+                    return True
+                arun.cancel.set()
+                if ident is None:
+                    self._json(401, {"error": {"type": "authentication_error", "message": "the key was revoked"}})
+                elif arun.stopped:
+                    self._json(403, {"error": {"type": "forbidden", "message": "the run was stopped (this key was changed meanwhile)"}})
+                else:
+                    self._json(409, self._runner_offline(arun.runner))
+                return False
             if not self.team:
                 return True
             ident = svc.keys.match(self._given_key())
@@ -5707,6 +5740,11 @@ def make_handler(svc: Service):
                 self._json(403, {"error": {"type": "forbidden", "message": "The coding tools can be used only with an "
                                                                           "owner key (this key was changed meanwhile)"}})
             return False
+
+        def _runner_offline(self, runner) -> dict:
+            """#310 part 2: the 409 of a chat whose runner is offline (or gone)."""
+            m = runner.info.get("machine") or "?"
+            return {"error": {"type": "runner_offline", "message": f"your PC ({m}) is offline: start the runner on it and send again"}}
 
         def _peer(self) -> str:
             """The client's address as the socket has it (#310 tests put another one in svc.peer_override)."""
@@ -5941,6 +5979,18 @@ def make_handler(svc: Service):
                 # the chat's coding tools: whether they are on, which shell commands run in, and whether this caller may use them (only from this PC, or with the key)
                 if self._authorized():
                     ok, why = self._edit_answer()
+                    q = parse_qs(urlsplit(self.path).query)
+                    if "runner" in q:                        # #310 part 2: the coding tools of the caller's own PC, from its hello
+                        if not self.team and not self._owner_only("the coding tools of a runner can be read"):
+                            return
+                        r = svc.runner_hub.get_for(q["runner"][0], self._acting())
+                        if r is None:
+                            return self._json(404, {"error": {"type": "runner_not_found", "message": "there is no runner with that id for this key"}})
+                        online = r.online()
+                        coding = r.servers().get("my_agent")             # the first coding group, without the tools the server runs
+                        return self._json(200, {"available": True, "allowed": online, "reason": "" if online else "your PC is offline",
+                                                "shell": r.info.get("shell"), "tools": [t["name"] for t in coding.tools] if coding else [],
+                                                "machine": r.info.get("machine"), "online": online})
                     sh = getattr(svc.agent, "shell", None)
                     self._json(200, {"available": svc.agent is not None, "allowed": ok, "reason": "" if ok else why, "shell": shell_mod.describe(sh) if sh else None,
                                      "tools": [t["name"] for t in svc.agent.tools] if svc.agent else []})
@@ -7005,15 +7055,34 @@ def make_handler(svc: Service):
             if isinstance(sa, dict):
                 if not self._own_page("The coding tools can be used"):
                     return
+                runner = None
                 ok, why = self._edit_answer()
-                if not ok:
+                if isinstance(sa.get("runner"), str) and (self.team or ok):      # #310 part 2: the project is on the caller's own PC
+                    runner = svc.runner_hub.get_for(sa["runner"], self._acting())     # only her own runner, the owner role too
+                    if runner is None:
+                        return self._json(404, {"error": {"type": "runner_not_found", "message": "there is no runner with that id for this key"}})
+                    if not runner.online():
+                        return self._json(409, self._runner_offline(runner))
+                elif not ok:
                     if self.team:                                 # #310: the coding tools run on this PC: an owner's
                         self._owner_only("The coding tools can be used")
                         return
                     return self._json(403, {"error": {"message": "The coding tools change files and run commands on this PC, so they work only from this PC itself (open the page as localhost) or with the API key. " + why}})
-                if svc.agent is None or svc.mcp is None:
+                if runner is None and (svc.agent is None or svc.mcp is None):
                     return self._json(409, {"error": {"message": "the coding tools are switched off on this server (\"agent\": false in the run config)"}})
-                arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name)     # #310: the run and what it asks are this identity's
+                if runner is None:
+                    arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name)     # #310: the run and what it asks are this identity's
+                else:
+                    try:                                          # the facts job: up to REQUEST_TIMEOUT_S, on this request's own thread, no lock held
+                        arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, runner=runner)
+                    except runner_hub.RunnerUnavailable as e:
+                        return self._json(409, {"error": {"type": "runner_offline", "message": e.message[:300]}})
+                    base = svc.mcp if svc.mcp is not None else McpHub({})
+                    mine = runner.servers()               # my_agent, my_skills, my_<name>: after the server's groups
+                    arun.hub = base.with_servers(mine, replace={"agent": runner_hub.agent_subset(svc.agent, runner_hub.SERVER_TOOLS)}
+                                                 if svc.agent is not None else None)        # never two coding groups: the server's keeps WebFetch, WebSearch, Task
+                    arun.coding = next((k for k, s in arun.hub.servers.items() if getattr(s, "runner", None) is runner      # the name its coding
+                                        and getattr(s, "group_kind", "") == "coding"), "my_agent")             # group landed under in the view
                 req = {**req, "messages": agent_prompt.with_system(req.get("messages") or [], arun.prompt)}
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
@@ -7033,22 +7102,23 @@ def make_handler(svc: Service):
             svc.load(wait_for_restart=True, who=self._acting().name)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
-            use_mcp = (req.get("strata_mcp") is True or arun is not None) and svc.mcp is not None      # the web app's opt-in (serve/mcp.py), or the coding tools
+            hub = arun.hub if arun is not None and arun.hub is not None else svc.mcp      # #310 part 2: a run on My PC has its own view
+            use_mcp = (req.get("strata_mcp") is True or arun is not None) and hub is not None      # the web app's opt-in (serve/mcp.py), or the coding tools
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
-                svc.mcp.wait(10)                                  # servers still starting (only right after start)
+                hub.wait(10)                                      # servers still starting (only right after start)
                 off = req.get("strata_mcp_off")                   # servers the page's list switched off for this chat; anything but a list of names is ignored
                 skip = {x for x in off if isinstance(x, str)} if isinstance(off, list) and all(isinstance(x, str) for x in off) else set()
                 if req.get("strata_mcp") is not True:
-                    skip |= {n for n in svc.mcp.servers if n != "agent"}      # the coding tools alone: no MCP server
+                    skip |= {n for n in hub.servers if n not in ("agent", arun.coding)}      # the coding tools alone: no MCP server
                 if arun is None:
                     skip.add("agent")                             # and the coding tools only when the request asks for them
                 allowed = self._mcp_allowed()                     # #310 R11: a team guest, only the servers marked for guests
-                if allowed is not None:
-                    skip |= {n for n in svc.mcp.servers if n not in allowed}
-                extra = svc.mcp.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
+                if allowed is not None:                           # (the server's WebFetch / WebSearch / Task of a run on My PC stay: "agent" is that subset there)
+                    skip |= {n for n in (svc.mcp.servers if svc.mcp is not None else ()) if n not in allowed and n != "agent"}
+                extra = hub.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             if force and use_mcp:
@@ -7071,7 +7141,7 @@ def make_handler(svc: Service):
                     return
             if not detached:
                 self._watch_client(cancel)                   # #430 #431 (a run that goes on when the page goes away is not cancelled by it: serve/runs.py)
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+            run = run_with_mcp(svc, hub, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}, arun) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:

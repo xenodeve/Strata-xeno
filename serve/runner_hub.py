@@ -474,6 +474,7 @@ class RunnerGroup:
             self.wants_context = True           # and no entry in GET /mcp (they have their own switch)
             self.plain_names = True
             self.hidden = True
+            self.tools = [t for t in self.tools if t.get("name") not in SERVER_TOOLS]   # those run on the server (task 4)
 
     def start(self):
         pass
@@ -612,6 +613,41 @@ class RunnerGroup:
                 chars = -1
             r._end_job(job, result, exec_ms, chars)
         return result
+
+
+class _Subset:
+    """The server's coding tools cut to a few names (`agent_subset`)."""
+
+    name = "agent"
+
+    def __init__(self, server, names: tuple[str, ...]):
+        self._server, self._names = server, tuple(names)
+        for attr in ("kind", "wants_context", "plain_names", "hidden", "wants_progress"):
+            if hasattr(server, attr):
+                setattr(self, attr, getattr(server, attr))
+        self.tools = [t for t in server.tools if t["name"] in self._names]
+
+    status = property(lambda self: self._server.status)
+    error = property(lambda self: self._server.error)
+    info = property(lambda self: self._server.info)
+
+    def call(self, tool: str, *args, **kwargs) -> dict:
+        if tool not in self._names:             # the hub routes only the names offered; anything else is refused
+            return _error(f"there is no tool named {tool!r} here")
+        return self._server.call(tool, *args, **kwargs)
+
+    def start(self) -> bool:
+        return True
+
+    def close(self) -> None:                    # a view closes nothing: the server's coding tools are the server's
+        pass
+
+
+def agent_subset(agent_server, names: tuple[str, ...]) -> _Subset:
+    """The server's coding tools (serve/agent.py AgentServer) as a hub server named "agent" that offers only `names`
+    (SERVER_TOOLS: WebFetch, WebSearch, Task) and runs them with the server's own `call`, so a request whose project
+    is on the engineer's PC never carries two coding groups (task 4)."""
+    return _Subset(agent_server, names)
 
 
 class RunnerHub:
