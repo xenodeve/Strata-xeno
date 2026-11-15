@@ -117,6 +117,9 @@ class Identity(Base):
         code, body = self.req("GET", "/mcp/config")
         self.assertIs(body["editable"], True)                     # this PC, naming this PC
         self.assertEqual(self.req("POST", "/agent/hooks", {"off": []})[0], 200)
+        code, body = self.req("POST", "/mcp/config", {"servers": {}})          # past the gate: the servers are saved
+        self.assertEqual(code, 200)
+        self.assertIs(body["editable"], True)
         self.assertIs(self.req("GET", "/agent")[1]["allowed"], True)
         self.svc.peer_override = REMOTE                           # another PC: today's may_edit refusal, word for word
         code, body = self.req("GET", "/mcp/config")

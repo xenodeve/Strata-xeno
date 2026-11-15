@@ -552,7 +552,8 @@ class RequestFacts(unittest.TestCase):
         addr = identity.device_addr
         self.assertEqual(addr("26.1.1.1", False, "203.0.113.5", "1.1.1.1", "for=2.2.2.2"), "26.1.1.1")   # remote peer
         self.assertEqual(addr("127.0.0.1", True, None, None, None), "127.0.0.1")
-        self.assertEqual(addr("127.0.0.1", True, "203.0.113.5", "1.1.1.1", None), "203.0.113.5")
+        self.assertEqual(addr("127.0.0.1", True, "203.0.113.5", "1.1.1.1", None), "1.1.1.1")     # XFF first: a
+        self.assertEqual(addr("127.0.0.1", True, "203.0.113.5", None, None), "203.0.113.5")      # client can write Cf-*
         self.assertEqual(addr("127.0.0.1", True, None, "9.9.9.9, 1.1.1.1", None), "1.1.1.1")      # the nearest proxy's
         self.assertEqual(addr("127.0.0.1", True, None, None, 'for=9.9.9.9, for="[2001:db8::17]:4711";proto=https'),
                          "2001:db8::17")

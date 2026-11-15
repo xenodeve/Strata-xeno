@@ -535,13 +535,14 @@ def _ip(text) -> str | None:
 
 def device_addr(peer: str, peer_is_loopback: bool, cf_connecting_ip, x_forwarded_for, forwarded) -> str:
     """The address a device is recorded with.  The socket peer, unless the peer is this PC itself and a proxy on it
-    (cloudflared, tailscale serve, a reverse proxy) named the client: Cf-Connecting-Ip, else the last X-Forwarded-For
-    entry (the one the nearest proxy wrote; the first ones are the client's own words), else the last Forwarded
-    element's for=.  A remote peer's forwarding headers are its own words and are ignored."""
+    (cloudflared, tailscale serve, a reverse proxy) named the client: the last X-Forwarded-For entry (the one the
+    nearest proxy wrote; the first ones are the client's own words), else Cf-Connecting-Ip (only Cloudflare overwrites
+    it; another proxy may pass on what the client wrote, so it comes second), else the last Forwarded element's for=.
+    A remote peer's forwarding headers are its own words and are ignored."""
     if peer_is_loopback:
-        if (ip := _ip(cf_connecting_ip)) is not None:
-            return ip
         if isinstance(x_forwarded_for, str) and (ip := _ip(x_forwarded_for.split(",")[-1])) is not None:
+            return ip
+        if (ip := _ip(cf_connecting_ip)) is not None:
             return ip
         if isinstance(forwarded, str):
             for part in forwarded.split(",")[-1].split(";"):
