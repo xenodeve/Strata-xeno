@@ -7111,13 +7111,15 @@ def make_handler(svc: Service):
                 hub.wait(10)                                      # servers still starting (only right after start)
                 off = req.get("strata_mcp_off")                   # servers the page's list switched off for this chat; anything but a list of names is ignored
                 skip = {x for x in off if isinstance(x, str)} if isinstance(off, list) and all(isinstance(x, str) for x in off) else set()
-                if req.get("strata_mcp") is not True:
-                    skip |= {n for n in hub.servers if n not in ("agent", arun.coding)}      # the coding tools alone: no MCP server
+                subset = arun is not None and arun.runner is not None and svc.agent is not None    # #310 part 2: the view's "agent" is the server's WebFetch / WebSearch / Task
+                if req.get("strata_mcp") is not True:             # (without server coding tools a config server may be called "agent": it is an MCP server then)
+                    keep = {arun.coding} | ({"agent"} if arun.runner is None or subset else set())
+                    skip |= {n for n in hub.servers if n not in keep}      # the coding tools alone: no MCP server
                 if arun is None:
                     skip.add("agent")                             # and the coding tools only when the request asks for them
                 allowed = self._mcp_allowed()                     # #310 R11: a team guest, only the servers marked for guests
-                if allowed is not None:                           # (the server's WebFetch / WebSearch / Task of a run on My PC stay: "agent" is that subset there)
-                    skip |= {n for n in (svc.mcp.servers if svc.mcp is not None else ()) if n not in allowed and n != "agent"}
+                if allowed is not None:                           # (the server's WebFetch / WebSearch / Task of a run on My PC stay)
+                    skip |= {n for n in (svc.mcp.servers if svc.mcp is not None else ()) if n not in allowed and not (subset and n == "agent")}
                 extra = hub.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None

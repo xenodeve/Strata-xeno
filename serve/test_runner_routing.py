@@ -89,11 +89,13 @@ class Fixture(RunnerBase):
         p.start()
         self.addCleanup(p.stop)
 
-    def fake(self, key, device=DEV1, groups=None, machine="ann-pc", facts=True, delay=0.0, name=None):
-        """A runner for `key` that answers run.start with facts (unless `facts` is False) and every tool job."""
+    def fake(self, key, device=DEV1, groups=None, machine="ann-pc", facts=True, delay=0.0, name=None, vanish=False):
+        """A runner for `key` that answers run.start with facts (unless `facts` is False) and every tool job (unless
+        `vanish`: it takes the tool job and stops polling without an answer, as a PC whose lid was closed)."""
         name = name or machine
         got = self.jobs.setdefault(name, [])
         groups = [coding(), FS] if groups is None else groups
+        me = []
 
         def on_job(msg, reply):
             got.append(msg)
@@ -101,11 +103,14 @@ class Fixture(RunnerBase):
                 names = [t["name"] for g in groups if g["kind"] == "coding" for t in g["tools"]]
                 reply({"result": {"run": "run-" + name, "cwd": msg.get("cwd"), "dirs": [], "shell": "Git Bash",
                                   "platform": "win32", "git": False, "memory": [], "tools": names or []}, "exec_ms": 1})
+            elif msg.get("kind") == "tool" and vanish:
+                me[0].stop()
             elif msg.get("kind") == "tool":
                 time.sleep(delay)
                 reply({"result": {"content": [{"type": "text", "text": f"ran {msg['tool']} on {machine}"}]},
                        "exec_ms": 2})
         f = FakeRunner(self.port, key, device, groups, on_job, machine=machine)
+        me.append(f)
         self.fakes.append(f)
         return f
 
@@ -267,6 +272,38 @@ class Routing(Fixture):
         helper_names, helper_hub = self.offered[1]
         self.assertEqual(helper_names, ["Read", "Glob", "Grep"])
         self.assertIs(helper_hub, self.offered[0][1])        # the run's own view
+
+    def test_runner_goes_offline_during_the_call(self):
+        """Review Focus 1 in the stream: sending, running, offline, then a result the model reads; no fallback."""
+        self.start_routing(tool_call("Read", file_path=CWD + "\\a.txt"), DONE)
+        f = self.fake(self.ann, vanish=True)
+        with mock.patch.object(runner_hub, "OFFLINE_S", 0.5):
+            t0 = time.monotonic()
+            code, events, text = self.chat(self.ann, {"cwd": CWD, "runner": f.id})
+        self.assertEqual(code, 200, events)
+        self.assertLess(time.monotonic() - t0, 10)
+        call = next(e for e in events if e["event"] == "call")
+        mine = [e for e in events if e.get("id") == call["id"] and e["event"] in ("remote", "result")]
+        self.assertEqual([e.get("state") for e in mine[:-1]], ["sending", "running", "offline"])
+        self.assertEqual(mine[-1]["event"], "result")
+        self.assertIn("went offline while Read was running", mine[-1]["text"])
+        self.assertEqual(self.server_calls, [])
+
+    def test_a_server_called_agent_is_an_mcp_server_for_guests(self):
+        """Without server coding tools no subset is put in: a config MCP server named "agent" keeps R11."""
+        self.start_routing(DONE, DONE, with_agent=False, servers={"agent": FakeMcp("agent", ("x",))})
+        f = self.fake(self.ann)
+        self.assertEqual(self.chat(self.ann, {"cwd": CWD, "runner": f.id}, mcp=True)[0], 200)
+        self.assertEqual(self.offered[0][0], [*CODING_NAMES, "my_fs__x"])
+        self.assertEqual(self.chat(self.ann, {"cwd": CWD, "runner": f.id})[0], 200)
+        self.assertEqual(self.offered[1][0], CODING_NAMES)
+        self.cfg_path.write_text(json.dumps({"guest_mcp": ["agent"]}), encoding="utf-8")     # "agent" cannot be marked (mcp_admin)
+        self.assertEqual(self.chat(self.ann, {"cwd": CWD, "runner": f.id}, mcp=True)[0], 200)
+        self.assertEqual(self.offered[2][0], [*CODING_NAMES, "my_fs__x"])
+        self.svc.peer_override = None                                       # the owner gets it, as an MCP server
+        k = self.fake("k", device=DEV0, machine="owner-pc")
+        self.assertEqual(self.chat("k", {"cwd": CWD, "runner": k.id}, device=DEV0, mcp=True)[0], 200)
+        self.assertEqual(self.offered[3][0], ["agent__x", *CODING_NAMES, "my_fs__x"])
 
     def test_runner_without_server_hub(self):
         self.start_routing(tool_call("Read", file_path=CWD + "\\a.txt"), DONE, with_agent=False, with_hub=False)
