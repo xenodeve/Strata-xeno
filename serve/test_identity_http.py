@@ -362,7 +362,7 @@ class RunsBelongToTheirIdentity(Base):
         self.start(**attrs)
 
     def launch(self, key, device):
-        """ann's request, read on a thread of its own: (thread, the permission event once it came, the events read)."""
+        """ann's request, read on a thread of its own: (thread, set once a permission or question prompt came, the events read)."""
         asked, events = threading.Event(), []
         body = {"model": "m", "stream": True, "messages": [{"role": "user", "content": "look at b.txt"}],
                 "strata_agent": {"cwd": str(self.proj), "session": "chat-1", "run": self.RID}}
@@ -380,7 +380,7 @@ class RunsBelongToTheirIdentity(Base):
                         ev = json.loads(ln[6:]).get("strata_mcp")
                         if ev:
                             events.append(ev)
-                            if ev.get("event") == "permission":
+                            if ev.get("event") in ("permission", "question"):
                                 asked.set()
             finally:
                 c.close()
@@ -426,6 +426,26 @@ class RunsBelongToTheirIdentity(Base):
         self.assertTrue(self.svc.keys.decide_device("owner", DEV1, True, OWNER))
         self.assertEqual(self.req("POST", "/agent/cancel", {"id": rid}, key="k", device=DEV1), (200, {"ok": True, "found": True}))
         self.assertEqual(self.svc.runs.get(rid).who, "ann")
+
+    def test_only_the_holder_answers_a_question_the_model_asked(self):
+        q = [{"question": "Which library should we use?", "header": "Library", "multiSelect": False,
+              "options": [{"label": "requests", "description": "the usual one"}, {"label": "httpx", "description": "async too"}]}]
+        self.start_agent(tool_call("AskUserQuestion", questions=json.dumps(q)), "</think>\n\nDone.",
+                         api_key="k", peer_override=REMOTE)
+        ann = self.approved("ann", "owner")
+        bob = self.approved("bob", "guest", device=DEV2)
+        t, asked, events = self.launch(ann, DEV1)
+        self.assertTrue(asked.wait(20), events)
+        qid = next(e["id"] for e in events[1:] if e["event"] == "question")
+        pick = {"Which library should we use?": ["httpx"]}
+        code, got = self.req("POST", "/agent/question", {"id": qid, "answers": pick}, key=bob, device=DEV2)
+        self.assertEqual(code, 404, got)
+        self.assertEqual(self.req("POST", "/agent/question", {"id": "f" * 16, "answers": pick}, key=bob, device=DEV2), (code, got))
+        self.assertTrue(t.is_alive())                                     # bob's try did not use the question up
+        self.assertEqual(self.req("POST", "/agent/question", {"id": qid, "answers": pick}, key=ann, device=DEV1), (200, {"ok": True}))
+        t.join(20)
+        self.assertFalse(t.is_alive())
+        self.assertEqual([(e["id"], e["answers"]) for e in events[1:] if e["event"] == "question_answered"], [(qid, pick)])
 
 
 class _Reached(Exception):
