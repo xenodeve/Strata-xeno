@@ -1,11 +1,12 @@
 """serve/runner_fake.py - a scripted runner over real HTTP, for the runner tests (#310 part 2), as
 serve/mcp_fake_server.py is for MCP.  It says hello, then polls GET /runner/next on a thread of its own and hands each
 message to `on_job(msg, reply)` on a thread of the message's own (so jobs run side by side, and a job that waits for
-an answer does not stop the polling); `reply(more)` posts {"id", "instance", "job": msg["job"], **more} to
-POST /runner/reply and returns (status, body).
+an answer does not stop the polling); `reply(more)` posts {"id", "instance", "job": msg["job"], "rid", **more} to
+POST /runner/reply and returns (status, body) - `rid` numbers the job's replies from 1 unless `more` names one (a
+retried reply sends the same `rid` again).
 
-It keeps the delivery rules a real runner keeps (serve/runner_hub.py): every poll sends `ack=` the highest `seq` it
-has received on this channel, a message whose `seq` it already handled is ignored, and a hello that answers another
+It keeps the delivery rules a real runner keeps (serve/runner_hub.py): every poll sends `channel=` and `ack=` the
+highest `seq` it has received on this channel, a message whose `seq` it already handled is ignored, and a hello that answers another
 `channel` starts both again.  Two switches script a lossy network: `drop = n` throws the next n non-empty poll results
 away unread (as if the connection died on the way back), `lose_ack = n` handles the next n but does not advance the
 ack (as if the next poll's ack never arrived), so the server sends them again.
@@ -50,6 +51,7 @@ class FakeRunner:
         self.handled: set[int] = set()                    # the seqs already handed to on_job on this channel
         self.drop = 0                                     # throw the next n non-empty poll results away
         self.lose_ack = 0                                 # handle the next n, but do not advance the ack
+        self._rids: dict[str, int] = {}                   # the last rid used per job
         self._conn: http.client.HTTPConnection | None = None
         self._lock = threading.Lock()
         code, body = self.hello()
@@ -98,6 +100,10 @@ class FakeRunner:
 
     def reply_for(self, job) -> Callable[[dict], tuple]:
         def reply(more: dict) -> tuple:
+            if "rid" not in more:
+                with self._lock:
+                    self._rids[job] = self._rids.get(job, 0) + 1
+                    more = {"rid": self._rids[job], **more}
             body = {"id": self.id, "instance": self.instance, "job": job, **more}
             code, got = self._request("POST", "/runner/reply", body)
             self.replies.append((body, code))
@@ -111,7 +117,7 @@ class FakeRunner:
             t0 = time.monotonic()
             try:
                 code, body = self._request(
-                    "GET", f"/runner/next?id={self.id}&instance={self.instance}&wait={wait}&ack={self.ack}", held=True)
+                    "GET", f"/runner/next?id={self.id}&instance={self.instance}&wait={wait}&channel={self.channel}&ack={self.ack}", held=True)
             except (OSError, http.client.HTTPException, ValueError):   # a stop() closes the held poll's socket
                 if self.stopped.is_set():
                     return

@@ -167,8 +167,10 @@ class AgentRun:
             return f"blocked: auto mode judged this call too risky (severity {severity} of 5)"
         return None
 
-    def question(self, questions: list) -> dict | str:
-        """The model's questions to the user: a `question` event, and the answer ({"answers": {...} or None}), or "cancelled", or {"answers": None} when nobody answered in time."""
+    def question(self, questions: list, abort: threading.Event | None = None) -> dict | str:
+        """The model's questions to the user: a `question` event, and the answer ({"answers": {...} or None}), or "cancelled", or {"answers": None} when nobody answered in time.
+        `abort` (#310 part 2, a call on the user's own PC): set when that PC went offline, its runner was replaced or its device cleared - the card closes at once
+        with {"answers": None} and a `question_answered` event whose `reason` is `abort.why`."""
         rid = uuid.uuid4().hex[:16]
         slot = self.broker.open(rid, "question", self.who)
         self._emit({"event": "question", "id": rid, "questions": questions})
@@ -177,6 +179,9 @@ class AgentRun:
             while not slot["event"].wait(0.25):
                 if self.cancel.is_set():
                     return "cancelled"
+                if abort is not None and abort.is_set():
+                    self._emit({"event": "question_answered", "id": rid, "answers": None, "reason": getattr(abort, "why", None)})
+                    return {"answers": None}
                 if time.monotonic() > end:
                     self._emit({"event": "question_answered", "id": rid, "answers": None})
                     return {"answers": None}
@@ -185,7 +190,9 @@ class AgentRun:
         finally:
             self.broker.close(rid)
 
-    def ask(self, req: dict) -> str:
+    def ask(self, req: dict, abort: threading.Event | None = None) -> str:
+        """A permission card: "allow" | "allow_chat" | "deny" | "cancelled" | a "blocked:..." verdict.  `abort` (#310 part 2): as for `question` - the card
+        closes at once as "deny", with an `answered` event whose `reason` is `abort.why`."""
         rid = uuid.uuid4().hex[:16]
         if self.policy.mode == "auto" and req.get("judgeable") and not req.get("danger") and self.side is not None:
             settled = self._judge(req, rid)
@@ -198,6 +205,9 @@ class AgentRun:
             while not slot["event"].wait(0.25):
                 if self.cancel.is_set():
                     return "cancelled"
+                if abort is not None and abort.is_set():
+                    self._emit({"event": "answered", "id": rid, "answer": "deny", "reason": getattr(abort, "why", None)})
+                    return "deny"
                 if time.monotonic() > end:
                     self._emit({"event": "answered", "id": rid, "answer": "deny"})
                     return "deny"

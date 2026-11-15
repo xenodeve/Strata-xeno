@@ -225,6 +225,48 @@ class Holder(unittest.TestCase):
         self.assertEqual(made, ["ann"])
 
 
+class Abort(unittest.TestCase):
+    """#310 part 2: a card for a call on the user's own PC closes at once when that PC goes offline, its runner is
+    replaced or its device cleared (the runner's call sets `abort`, with `why`): a refusal, and an event the page
+    reads to drop the card."""
+
+    def aborter(self, run, why):
+        abort = threading.Event()
+        seen = []
+
+        def fire():
+            seen.extend(wait_event(run))                        # the card is open
+            abort.why = why
+            abort.set()
+        threading.Thread(target=fire, daemon=True).start()
+        return abort, seen
+
+    def test_abort_closes_a_permission_card(self):
+        run, broker = make()
+        abort, seen = self.aborter(run, "offline")
+        t0 = time.monotonic()
+        self.assertEqual(run.ctx.ask(dict(REQ), abort=abort), "deny")
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertEqual(broker.pending, {})
+        ev = run.drain()[-1]
+        self.assertEqual((ev["event"], ev["id"], ev["answer"], ev["reason"]), ("answered", seen[0]["id"], "deny", "offline"))
+
+    def test_abort_closes_a_question_card(self):
+        run, broker = make()
+        abort, seen = self.aborter(run, "replaced")
+        self.assertEqual(run.ctx.question([{"question": "Which?", "options": [{"label": "A"}]}], abort=abort),
+                         {"answers": None})
+        self.assertEqual(broker.pending, {})
+        ev = run.drain()[-1]
+        self.assertEqual((ev["event"], ev["id"], ev["answers"], ev["reason"]),
+                         ("question_answered", seen[0]["id"], None, "replaced"))
+
+    def test_without_abort_nothing_changes(self):
+        run, broker = make(timeout=0.3)
+        self.assertEqual(run.ctx.ask(dict(REQ)), "deny")                 # nobody answered: as before
+        self.assertNotIn("reason", run.drain()[-1])
+
+
 class AutoMode(unittest.TestCase):
     def test_a_safe_verdict_runs_it_without_asking_and_the_page_is_told(self):
         calls = []

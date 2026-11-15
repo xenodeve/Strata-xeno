@@ -17,9 +17,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve import runner_hub  # noqa: E402
+from serve import agent_run, runner_hub  # noqa: E402
 from serve.identity import OWNER  # noqa: E402
 from serve.mcp import McpHub  # noqa: E402
+from serve.permissions import Policy  # noqa: E402
 from serve.runner_fake import FakeRunner  # noqa: E402
 from serve.test_runner_hub import ctx  # noqa: E402
 from serve.test_identity_http import DEV1, DEV2, REMOTE, Base  # noqa: E402
@@ -65,8 +66,8 @@ class RunnerBase(Base):
     def poll(self, key, rid, instance="inst-aaaa", device=DEV1, wait=0):
         return self.req("GET", f"/runner/next?id={rid}&instance={instance}&wait={wait}", key=key, device=device)
 
-    def reply(self, key, rid, job="j1", instance="inst-aaaa", device=DEV1, **more):
-        return self.req("POST", "/runner/reply", {"id": rid, "instance": instance, "job": job, **more},
+    def reply(self, key, rid, job="j1", instance="inst-aaaa", device=DEV1, n=1, **more):
+        return self.req("POST", "/runner/reply", {"id": rid, "instance": instance, "job": job, "rid": n, **more},
                         key=key, device=device)
 
     def runners(self, key, device=DEV1):
@@ -550,6 +551,117 @@ class Calls(RunnerBase):
         self.assertEqual(self.call(self.hub_for(fake.id))[0]["text"], "ran")
         self.assertEqual(len(runs), 1)
         self.assertGreaterEqual(fake.repeats, 1)                    # it did come again
+
+    def real_run(self):
+        """A real AgentRun (its Broker, its events): the card the page would show."""
+        run = agent_run.AgentRun(Policy(cwd=None), session="s1", broker=agent_run.Broker(), goal="g", side=None,
+                                 cancel=threading.Event(), who="ann")
+        return run
+
+    def wait_card(self, run, kind):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if any(s["kind"] == kind for s in list(run.broker.pending.values())):
+                return
+            time.sleep(0.02)
+        self.fail(f"no {kind} card opened")
+
+    def test_offline_while_card_open_closes_card(self):
+        """R2-1: the PC goes offline while its approval card is open: the card closes (a refusal, with the reason, for
+        the page) and the call ends within OFFLINE_S with the offline text - not after the user's 600 s."""
+        self.team()
+        run = self.real_run()
+        with mock.patch.object(runner_hub, "OFFLINE_S", 0.5):
+            fake = self.fake(lambda msg, reply: reply({"ask": {"tool": "Bash", "arguments": {"command": "make"}}})
+                             if "kind" in msg else None)
+            hub = self.hub_for(fake.id)
+            out = []
+            t = threading.Thread(target=lambda: out.append(self.call(hub, run.ctx)))
+            t.start()
+            self.wait_card(run, "permission")
+            fake.stop()                                             # the lid closes with the card open
+            t0 = time.monotonic()
+            t.join(5)
+            self.assertLess(time.monotonic() - t0, runner_hub.OFFLINE_S + 1)
+        r, progress = out[0]
+        self.assertTrue(r["text"].startswith("error: your PC (ann-pc) went offline while Read was running"), r["text"])
+        self.assertEqual(progress[-1], "offline")
+        self.assertEqual(run.broker.pending, {})
+        closed = [e for e in run.drain() if e["event"] == "answered"]
+        self.assertEqual([(e["answer"], e["reason"]) for e in closed], [("deny", "offline")])
+
+    def test_replaced_while_question_open_closes_card(self):
+        self.team()
+        run = self.real_run()
+        fake = self.fake(lambda msg, reply: reply({"question": [{"question": "Which?", "options": [{"label": "A"}]}]})
+                         if "kind" in msg else None)
+        hub = self.hub_for(fake.id)
+        out = []
+        t = threading.Thread(target=lambda: out.append(self.call(hub, run.ctx)))
+        t.start()
+        self.wait_card(run, "question")
+        t0 = time.monotonic()
+        self.fake(lambda msg, reply: None)                          # a second runner process on the same PC
+        t.join(5)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(out[0][0]["text"], "error: your PC's runner restarted while Read was running; whether it "
+                                            "finished is unknown.")
+        self.assertEqual(run.broker.pending, {})
+        closed = [e for e in run.drain() if e["event"] == "question_answered"]
+        self.assertEqual([(e["answers"], e["reason"]) for e in closed], [(None, "replaced")])
+
+    def test_retried_ask_opens_one_card(self):
+        """I-2: a reply sent again (its answer was lost) is applied once, and each answer names the ask it answers."""
+        self.team()
+        answers = queue.Queue()
+
+        def on_job(msg, reply):
+            if "kind" in msg:
+                for n, card in ((1, {"tool": "Bash", "n": 1}), (1, {"tool": "Bash", "n": 1}), (2, {"tool": "Edit", "n": 2})):
+                    self.assertEqual(reply({"rid": n, "ask": card})[0], 200)   # the retry is answered 200 too
+                got = [answers.get(timeout=5), answers.get(timeout=5)]
+                reply({"rid": 3, "result": text(" ".join(f"{a['to']}:{a['answer']}" for a in got))})
+            elif "answer" in msg:
+                answers.put(msg)
+        fake = self.fake(on_job)
+        c = ctx(ask=lambda card: c.asked.append(card) or ("allow" if card["n"] == 1 else "deny"))
+        r, _ = self.call(self.hub_for(fake.id), c)
+        self.assertEqual([a["n"] for a in c.asked], [1, 2])         # one card per ask, not per post
+        self.assertEqual(r["text"], "1:allow 2:deny")
+        self.assertEqual(len([m for m in fake.received if "answer" in m]), 2)
+
+    def test_bad_reply_shapes_are_refused_or_dropped(self):
+        """I-4 / M-1: an ask that is no object is refused, a question that is no list gets no answer, an emit that is
+        no object and a key the server keeps for itself ("failed") are dropped."""
+        self.team()
+        answers = queue.Queue()
+
+        def on_job(msg, reply):
+            if "kind" in msg:
+                reply({"ask": "rm -rf /"})
+                reply({"question": "which?"})
+                reply({"emit": ["not", "an", "event"]})
+                reply({"failed": "fake end"})
+                got = [answers.get(timeout=5), answers.get(timeout=5)]
+                reply({"result": text(repr([(a["to"], a["answer"]) for a in got]))})
+            elif "answer" in msg:
+                answers.put(msg)
+        fake = self.fake(on_job)
+        c = ctx()
+        r, _ = self.call(self.hub_for(fake.id), c)
+        self.assertEqual(r["text"], "[(1, 'deny'), (2, {'answers': None})]")
+        self.assertEqual((c.asked, c.emitted), ([], []))
+
+    def test_reply_needs_rid(self):
+        self.team()
+        rid = self.hello(self.ann)[1]["runner"]
+        r = self.svc.runner_hub.get_for(rid, SimpleNamespace(name="ann"))
+        r.jobs["j1"] = SimpleNamespace(id="j1", t_picked=None, inbox=queue.Queue(), fail=lambda text: None)
+        for n in (None, 0, "1", 1.5, True):
+            code, _ = self.req("POST", "/runner/reply", {"id": rid, "instance": "inst-aaaa", "job": "j1", "rid": n,
+                                                         "emit": {}}, key=self.ann, device=DEV1)
+            self.assertEqual(code, 400, n)
+        self.assertTrue(r.jobs["j1"].inbox.empty())
 
 
 class OutsideTeamMode(RunnerBase):

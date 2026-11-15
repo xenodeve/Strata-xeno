@@ -337,6 +337,93 @@ class Jobs(unittest.TestCase):
         self.assertEqual(out[0], {"content": [{"type": "text", "text": "the key of this chat was revoked, so Read was "
                                                                         "not finished."}], "isError": True})
 
+    def call_in_thread(self, group, c=None, **kw):
+        out = []
+        t = threading.Thread(target=lambda: out.append(group.call("Read", {}, 0, threading.Event(), c or ctx(), **kw)))
+        t.start()
+        return t, out
+
+    def test_request_checks_between_messages(self):
+        """I-3: a runner that keeps sending other replies does not hold a request past its timeout, and a request
+        that times out after pick-up leaves a cancel for the runner."""
+        r = self.hello()
+        stop = threading.Event()
+
+        def chatter():
+            msg = r.take(2.0)[0]
+            n = 0
+            while not stop.is_set():
+                n += 1
+                r.deliver({"job": msg["job"], "rid": n, "emit": {"event": "tick"}})
+                time.sleep(0.05)
+        threading.Thread(target=chatter, daemon=True).start()
+        t0 = time.monotonic()
+        got = r.request("page", {"route": "folders"}, timeout=0.5)
+        stop.set()
+        self.assertEqual(got["error"], "timeout")
+        self.assertLess(time.monotonic() - t0, 1.2)
+        self.assertEqual([m.get("cancel") for m in r.take(0.0, ack=1)], [True])
+
+    def test_call_survives_errors(self):
+        """I-4: an exception while serving a call becomes text the model reads; the job is finished and a cancel is
+        left for the runner."""
+        r = self.hello()
+        group = r.servers()["my_agent"]
+
+        def boom(card):
+            raise RuntimeError("the card broke")
+        t, out = self.call_in_thread(group, ctx(ask=boom))
+        msg = r.take(2.0)[0]
+        r.deliver({"job": msg["job"], "rid": 1, "ask": {"tool": "Bash"}})
+        t.join(2.0)
+        self.assertTrue(out[0]["isError"])
+        self.assertIn("the card broke", out[0]["content"][0]["text"])
+        self.assertEqual(r.jobs, {})
+        self.assertEqual([m.get("cancel") for m in r.take(0.0, ack=1)], [True])
+        # a result the server cannot read: an error text, not an exception
+        t, out = self.call_in_thread(group, progress=lambda word: 1 / 0)       # a progress callback that raises
+        msg = r.take(2.0, ack=2)[0]                             # the cancel was received
+        r.deliver({"job": msg["job"], "rid": 1, "result": {"content": [{"type": "resource", "resource": "x"}]}})
+        t.join(2.0)
+        self.assertTrue(out[0]["isError"])
+        self.assertIn("Read", out[0]["content"][0]["text"])
+        self.assertEqual(r.jobs, {})
+
+    def test_repeated_reply_is_applied_once(self):
+        r = self.hello()
+        job = r.submit("tool", {"tool": "Read"})
+        self.assertTrue(r.deliver({"job": job.id, "rid": 1, "emit": {"event": "x"}}))
+        self.assertTrue(r.deliver({"job": job.id, "rid": 1, "emit": {"event": "x"}}))   # answered, not applied
+        self.assertTrue(r.deliver({"job": job.id, "rid": 2, "failed": "fake", "emit": {"event": "y"}}))
+        self.assertEqual(job.inbox.get_nowait(), {"job": job.id, "rid": 1, "emit": {"event": "x"}})
+        self.assertEqual(job.inbox.get_nowait(), {"job": job.id, "rid": 2, "emit": {"event": "y"}})   # no "failed"
+        self.assertTrue(job.inbox.empty())
+
+    def test_submit_to_an_ended_runner_says_not_run(self):
+        """M-2: a job sent through a group whose runner was replaced before it was sent was not run."""
+        r = self.hello()
+        group = r.servers()["my_agent"]
+        self.hello(instance="inst-bbbb")
+        got = group.call("Read", {}, 0, threading.Event(), ctx())
+        self.assertEqual(got["content"][0]["text"], "your PC's runner restarted before Read was sent, so it was not run.")
+
+    def test_ack_from_another_channel_is_ignored(self):
+        """M-3: an ack the runner sends with another channel's name drops nothing."""
+        r = self.hello()
+        r.push({"job": "j1", "answer": "allow"})
+        r.push({"job": "j1", "answer": "deny"})
+        self.assertEqual(len(r.take(0.0, ack=1, channel="0123456789abcdef")), 2)
+        self.assertEqual(len(r.take(0.0, ack=1, channel=r.channel)), 1)
+
+    def test_coding_and_skills_keep_their_names(self):
+        """M-4: an MCP server called agent or skills listed first does not take my_agent / my_skills."""
+        groups = [{"name": "agent", "kind": "mcp", "status": "ready", "error": None, "tools": []},
+                  {"name": "skills", "kind": "mcp", "status": "ready", "error": None, "tools": []},
+                  CODING, {"name": "skills", "kind": "skills", "status": "ready", "error": None, "tools": []}]
+        s = self.hello(groups).servers()
+        self.assertEqual({k: v.group_kind for k, v in s.items()},
+                         {"my_agent": "coding", "my_skills": "skills", "my_agent_2": "mcp", "my_skills_2": "mcp"})
+
     def test_spans_written(self):
         import json
         import tempfile

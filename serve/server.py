@@ -6727,7 +6727,9 @@ def make_handler(svc: Service):
             who = self._acting()
             if path == "/runner/reply":
                 if not all(isinstance(body.get(k), str) for k in ("id", "instance", "job")):
-                    return self._json(400, {"error": {"message": 'send {"id", "instance", "job", ...}'}})
+                    return self._json(400, {"error": {"message": 'send {"id", "instance", "job", "rid", ...}'}})
+                if type(body.get("rid")) is not int or body["rid"] < 1:     # the reply's id in its job: a retry is applied once
+                    return self._json(400, {"error": {"message": "rid numbers the job's replies: a whole number from 1"}})
                 r = svc.runner_hub.get_for(body["id"], who)         # another identity's runner: as one not there
                 if r is None:
                     return self._json(404, {"error": {"message": NO_RUNNER}})
@@ -6751,8 +6753,9 @@ def make_handler(svc: Service):
                                     "poll_s": int(poll) if float(poll).is_integer() else poll, "channel": r.channel})
 
         def _runner_next(self):
-            """#310 part 2: GET /runner/next?id=&instance=&wait=&ack= - the messages for the runner, held at most
-            POLL_MAX_S; `ack` (the highest `seq` received on this channel, default 0) lets the acknowledged ones go.  A runner that ended while the poll was held is told why: replaced 409, revoked 401, its
+            """#310 part 2: GET /runner/next?id=&instance=&wait=&channel=&ack= - the messages for the runner, held at
+            most POLL_MAX_S; `ack` (the highest `seq` received on `channel`, default 0) lets the acknowledged ones go
+            (an ack that names another channel than the runner's is ignored).  A runner that ended while the poll was held is told why: replaced 409, revoked 401, its
             device refused or cleared 404 (a new hello meets the device gate), the server stopping 503."""
             q = parse_qs(urlsplit(self.path).query)
             r = svc.runner_hub.get_for(q.get("id", [""])[0], self._acting())
@@ -6772,7 +6775,8 @@ def make_handler(svc: Service):
             gone = threading.Event()                 # the runner hung up: the held poll ends and takes nothing
             self._watch_client(gone)
             try:
-                messages = r.take(min(max(wait, 0.0), runner_hub.POLL_MAX_S), gone=gone, ack=int(ack))
+                messages = r.take(min(max(wait, 0.0), runner_hub.POLL_MAX_S), gone=gone, ack=int(ack),
+                                  channel=q.get("channel", [None])[0])
             finally:
                 self.watch_done.set()
             if gone.is_set():

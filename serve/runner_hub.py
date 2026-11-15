@@ -32,6 +32,7 @@ may patch them.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import queue
 import re
 import threading
@@ -54,6 +55,7 @@ DEVICE = "the owner refused or cleared this PC's device"
 CLOSED = "the server is stopping"
 ENDED = {"replaced": REPLACED, "revoked": REVOKED, "device": DEVICE, "closed": CLOSED}
 TICK_S = 0.25                   # how often a waiting call looks at its inbox, the cancel and the runner's presence
+REPLY_KEYS = ("result", "exec_ms", "ask", "question", "emit")   # what a runner's reply may carry for its job
 
 
 INSTANCE = re.compile(r"[A-Za-z0-9_-]{8,64}")     # a runner process's own random id
@@ -139,6 +141,7 @@ class Runner:
         self.cond = threading.Condition()
         self._out: list[dict] = []              # the messages the runner has not acknowledged yet, in `seq` order
         self._seq = 0                           # the last `seq` given out
+        self._rids: dict[str, set] = {}         # the reply ids (`rid`) already taken, per open job
         self._held = 0                          # polls held now (at most one waits: the newest wins)
         self._poll = 0                          # the newest poll's number: an older one stops waiting
         self._seen = time.monotonic()           # the last hello, or the start or end of a poll
@@ -167,9 +170,11 @@ class Runner:
             self._queue(msg)
             return True
 
-    def take(self, wait: float, gone: threading.Event | None = None, ack: int = 0) -> list[dict]:
+    def take(self, wait: float, gone: threading.Event | None = None, ack: int = 0,
+             channel: str | None = None) -> list[dict]:
         """The messages for this runner.  First every one up to `ack` (the highest `seq` the runner says it received)
-        leaves the outbox; then the ones left are answered at once, or the poll waits at most `wait` seconds for a new
+        leaves the outbox - unless the poll names another `channel` (its ack counts another registration's seqs), or
+        the ack is above every seq given out; then the ones left are answered at once, or the poll waits at most `wait` seconds for a new
         one.  [] at the end of the wait, or at once when the runner ends meanwhile (the route then tells the poll
         why).  Being answered removes nothing: a message stays, and is answered again, until a later poll
         acknowledges it.  A message that starts a job (it has a "kind") marks that job picked up the first time it is
@@ -180,7 +185,7 @@ class Runner:
         client hung up (the route's watcher): the poll then returns [] at once."""
         deadline = time.monotonic() + max(0.0, wait)
         with self.cond:
-            if 0 < ack <= self._seq:                 # above every seq given out: another channel's ack, ignored
+            if 0 < ack <= self._seq and channel in (None, self.channel):    # another channel's ack: ignored
                 self._out = [m for m in self._out if m["seq"] > ack]
             self._poll += 1
             mine = self._poll
@@ -214,12 +219,20 @@ class Runner:
 
     def deliver(self, msg: dict) -> bool:
         """A message from the runner for one of its jobs (POST /runner/reply); False for a job that is unknown or
-        finished, or once the runner has ended."""
+        finished, or once the runner has ended.  Only `job`, `rid` and REPLY_KEYS reach the job (the server's own
+        signals cannot be sent from outside), and a reply whose `rid` (a whole number per job, from the runner) was
+        taken already is answered True but applied once: a retried ask opens one card."""
         with self.cond:
             job = self.jobs.get(msg.get("job")) if self.ended is None else None
-        if job is None:
-            return False
-        job.inbox.put(msg)
+            if job is None:
+                return False
+            rid = msg.get("rid")
+            if type(rid) is int:
+                seen = self._rids.setdefault(msg["job"], set())
+                if rid in seen:
+                    return True
+                seen.add(rid)
+        job.inbox.put({k: msg[k] for k in ("job", "rid", *REPLY_KEYS) if k in msg})
         return True
 
     def submit(self, kind: str, payload: dict) -> "Job":
@@ -243,6 +256,7 @@ class Runner:
             if job.t_picked is not None:
                 return False
             self.jobs.pop(job.id, None)
+            self._rids.pop(job.id, None)
             self._out = [m for m in self._out if m.get("job") != job.id]
             return True
 
@@ -252,6 +266,7 @@ class Runner:
         even when the server stopped waiting for it)."""
         with self.cond:
             self.jobs.pop(job.id, None)
+            self._rids.pop(job.id, None)
             self._out = [m for m in self._out if m.get("job") != job.id or m.get("cancel")]
         job.done.set()
 
@@ -260,6 +275,7 @@ class Runner:
         job the model was told did not run is never handed out later.  How many there were."""
         with self.cond:
             jobs, self.jobs = self.jobs, {}
+            self._rids = {}
             self._out = [m for m in self._out if m.get("job") not in jobs]
         for job in jobs.values():
             job.fail(text)
@@ -276,7 +292,8 @@ class Runner:
     def request(self, kind: str, payload: dict, timeout: float | None = None) -> dict:
         """A `run.start` or `page` job: the runner's `result` (a dict), or {"error": "offline" | "timeout",
         "message"} - offline when the runner is (or goes) offline or ends, timeout after `timeout` seconds
-        (REQUEST_TIMEOUT_S when None)."""
+        (REQUEST_TIMEOUT_S when None).  Other replies are ignored, and do not put off the checks.  A job the runner
+        took and did not finish gets a cancel."""
         timeout = REQUEST_TIMEOUT_S if timeout is None else timeout
         m = self.info.get("machine") or "?"
         job = self.submit(kind, payload)
@@ -293,14 +310,15 @@ class Runner:
                 res = msg["result"]
                 out = res if isinstance(res, dict) else {"error": "offline", "message": "your PC's runner sent no result"}
                 exec_ms = msg["exec_ms"] if type(msg.get("exec_ms")) is int else -1
-            elif msg is not None:
-                continue                                # nothing else is expected of a page or run.start job
             elif self.ended is not None:                # ended between setting `ended` and failing its jobs
                 out = {"error": "offline", "message": f"your PC ({m}) is not connected: {ENDED.get(self.ended)}"}
             elif not self.online():
-                self.withdraw(job)
+                if not self.withdraw(job):
+                    self.push({"job": job.id, "cancel": True})
                 out = {"error": "offline", "message": f"your PC ({m}) is offline"}
             elif time.perf_counter() >= end:
+                if not self.withdraw(job):              # it is running there: stop it, nobody waits for it now
+                    self.push({"job": job.id, "cancel": True})
                 out = {"error": "timeout", "message": f"your PC ({m}) did not answer within {timeout:g} s"}
         self._end_job(job, out, exec_ms, 0)
         return out
@@ -320,12 +338,9 @@ class Runner:
         the skills `my_skills`, each MCP server `my_<name>`; a name taken already gets `_2`, `_3`, ...  Only the first
         coding and the first skills group are offered (a request never carries two coding groups)."""
         out: dict[str, RunnerGroup] = {}
-        seen_kinds = set()
-        for g in self.groups:
-            if g["kind"] in ("coding", "skills"):
-                if g["kind"] in seen_kinds:
-                    continue
-                seen_kinds.add(g["kind"])
+        firsts = [next((g for g in self.groups if g["kind"] == k), None) for k in ("coding", "skills")]
+        mcps = [g for g in self.groups if g["kind"] == "mcp"]
+        for g in [x for x in firsts if x is not None] + mcps:       # my_agent and my_skills are theirs, whatever the order
             base = {"coding": "my_agent", "skills": "my_skills"}.get(g["kind"]) or f"my_{g['name']}"
             name, n = base, 2
             while name in out:
@@ -362,14 +377,33 @@ class Job:
         self.inbox: queue.Queue = queue.Queue()
         self.done = threading.Event()
         self.result = None
+        self.failed: str | None = None          # why its runner ended, once it did
 
     def fail(self, text: str) -> None:
         """Its runner ended (`text`: why, one of the hub's reasons): the waiting call wakes at once."""
+        self.failed = text
         self.inbox.put({"job": self.id, "failed": text})
 
 
 def _error(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": True}
+
+
+def _readable(res) -> bool:
+    """A tool result the server can read: {"content": [blocks (objects)], ...}; a resource block's resource an object."""
+    if not isinstance(res, dict) or not isinstance(res.get("content", []), list):
+        return False
+    return all(isinstance(b, dict) and (b.get("type") != "resource" or isinstance(b.get("resource", {}), dict))
+               for b in res.get("content", []))
+
+
+def _takes_abort(fn) -> bool:
+    """`fn` (ctx.ask / ctx.question) accepts `abort=` (AgentRun's do; a plain lambda does not)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "abort" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
 
 
 class RunnerGroup:
@@ -401,12 +435,15 @@ class RunnerGroup:
     def close(self):
         pass
 
-    def _ended_text(self, tool: str, why: str) -> str:
-        """What the model reads when the runner ended during the call (`why`: the reason the job failed with)."""
+    def _ended_text(self, tool: str, why: str, sent: bool) -> str:
+        """What the model reads when the runner ended during the call (`why`: the reason the job failed with;
+        `sent`: a poll took the job)."""
         m = self.runner.info.get("machine") or "?"
         if why == REVOKED:
             return f"the key of this chat was revoked, so {tool} was not finished."
         if why == REPLACED:
+            if not sent:
+                return f"your PC's runner restarted before {tool} was sent, so it was not run."
             return f"your PC's runner restarted while {tool} was running; whether it finished is unknown."
         if why == DEVICE:
             return f"the owner refused or cleared your PC ({m}) as a device, so {tool} was not finished."
@@ -414,76 +451,120 @@ class RunnerGroup:
             return f"the server is stopping, so {tool} was not finished."
         return f"your PC ({m}) is not connected ({why}), so {tool} was not finished."
 
+    def _card(self, fn, arg, job: Job, cancel: threading.Event | None):
+        """Serve one card (ctx.ask / ctx.question) on the call's thread, while a watcher closes it at once - `abort`,
+        with `why` - when the runner ends, goes offline or the call is cancelled: an open card never hides them."""
+        r = self.runner
+        abort, done = threading.Event(), threading.Event()
+
+        def watch():
+            while not done.wait(TICK_S):
+                why = (r.ended or "ended" if r.ended is not None or job.failed is not None
+                       else "offline" if not r.online()
+                       else "cancelled" if cancel is not None and cancel.is_set() else None)
+                if why is not None:
+                    abort.why = why
+                    abort.set()
+                    return
+        threading.Thread(target=watch, daemon=True, name="runner-card-watch").start()
+        try:
+            return fn(arg, abort=abort) if _takes_abort(fn) else fn(arg)
+        finally:
+            done.set()
+
     def call(self, tool: str, arguments: dict, timeout: float, cancel: threading.Event | None, ctx=None,
              progress: Callable[[str], None] | None = None) -> dict:
         """Run `tool` on the runner -> an MCP result {"content", "isError"}.  The coding group has no overall
         deadline (a command's timeout is its own parameter, as on the server); an MCP or skills call waits
-        `timeout` + 30 s.  `progress` hears "sending", "running" once a poll took the job, and "offline"."""
+        `timeout` + 30 s.  `progress` hears "sending", "running" once a poll took the job, and "offline".  Whatever
+        happens, the call ends with a result the model reads, the job is finished, and a job the runner took and did
+        not answer gets a cancel."""
         r = self.runner
         m = r.info.get("machine") or "?"
-        say = progress or (lambda word: None)
+
+        def say(word):
+            try:
+                if progress is not None:
+                    progress(word)
+            except Exception:  # noqa: BLE001 - the page's status words are not worth the call
+                pass
         job = r.submit("tool", {"group": self.local, "tool": tool, "arguments": arguments,
                                 "run": getattr(ctx, "run_key", None), "session": getattr(ctx, "session", None),
                                 "mode": getattr(getattr(ctx, "policy", None), "mode", None),
                                 "helper": getattr(ctx, "in_helper", False), "vision": getattr(ctx, "vision", False),
                                 "timeout_s": timeout})
-        say("sending")
         end = None if self.group_kind == "coding" else time.perf_counter() + timeout + 30
-        running, cancelled_at = False, None
+        running, answered, cancelled_at = False, False, None
         exec_ms, result = -1, None
-        while result is None:
-            try:
-                msg = job.inbox.get(timeout=TICK_S)
-            except queue.Empty:
-                msg = None
-            if not running and job.t_picked is not None:
-                running = True
-                say("running")
-            if msg is not None:
-                if "failed" in msg:
-                    result = _error(self._ended_text(tool, msg["failed"]))
-                elif "result" in msg:
-                    res = msg["result"]
-                    ok = isinstance(res, dict) and isinstance(res.get("content", []), list)
-                    result = res if ok else _error(f"your PC's runner sent no result for {tool}.")
-                    exec_ms = msg["exec_ms"] if type(msg.get("exec_ms")) is int else -1
-                elif "ask" in msg:              # a permission card: the user (or auto mode's judge) on the server
-                    answer = ctx.ask(msg["ask"]) if ctx is not None else "deny"
-                    r.push({"job": job.id, "answer": answer})
-                elif "question" in msg:         # AskUserQuestion
-                    answer = ctx.question(msg["question"]) if ctx is not None else {"answers": None}
-                    r.push({"job": job.id, "answer": answer})
-                elif "emit" in msg:             # tool activity for the page (todos, a shell's output)
-                    if ctx is not None and isinstance(msg["emit"], dict):
-                        ctx.emit(msg["emit"])
-                if result is not None:
-                    break
-            now = time.perf_counter()                   # a busy inbox does not put off the cancel or the presence
-            if cancel is not None and cancel.is_set():
-                if cancelled_at is None:
-                    if r.withdraw(job):         # never handed out: nothing runs on the PC
+        try:
+            say("sending")
+            while result is None:
+                try:
+                    msg = job.inbox.get(timeout=TICK_S)
+                except queue.Empty:
+                    msg = None
+                if not running and job.t_picked is not None:
+                    running = True
+                    say("running")
+                if msg is not None:
+                    if "failed" in msg:
+                        result = _error(self._ended_text(tool, msg["failed"], job.t_picked is not None))
+                    elif "result" in msg:
+                        answered = True
+                        res = msg["result"]
+                        result = res if _readable(res) else _error(f"your PC's runner sent a result for {tool} that "
+                                                                   f"the server could not read.")
+                        exec_ms = msg["exec_ms"] if type(msg.get("exec_ms")) is int else -1
+                    elif "ask" in msg:          # a permission card: the user (or auto mode's judge) on the server
+                        card = msg["ask"]
+                        ok = isinstance(card, dict) and ctx is not None
+                        answer = self._card(ctx.ask, card, job, cancel) if ok else "deny"
+                        r.push({"job": job.id, "answer": answer, "to": msg.get("rid")})
+                    elif "question" in msg:     # AskUserQuestion
+                        qs = msg["question"]
+                        ok = isinstance(qs, list) and ctx is not None
+                        answer = self._card(ctx.question, qs, job, cancel) if ok else {"answers": None}
+                        r.push({"job": job.id, "answer": answer, "to": msg.get("rid")})
+                    elif "emit" in msg:         # tool activity for the page (todos, a shell's output)
+                        if ctx is not None and isinstance(msg["emit"], dict):
+                            ctx.emit(msg["emit"])
+                    if result is not None:
+                        break
+                now = time.perf_counter()               # a busy inbox does not put off the cancel or the presence
+                if cancel is not None and cancel.is_set():
+                    if cancelled_at is None:
+                        if r.withdraw(job):     # never handed out: nothing runs on the PC
+                            result = _error("The request was cancelled.")
+                            break
+                        cancelled_at = now
+                        r.push({"job": job.id, "cancel": True})
+                    elif now - cancelled_at > CANCEL_GRACE_S:
                         result = _error("The request was cancelled.")
                         break
-                    cancelled_at = now
-                    r.push({"job": job.id, "cancel": True})
-                elif now - cancelled_at > CANCEL_GRACE_S:
-                    result = _error("The request was cancelled.")
-                    break
-            if r.ended is not None:                     # ended between setting `ended` and failing its jobs
-                result = _error(self._ended_text(tool, ENDED.get(r.ended, r.ended)))
-            elif not r.online():
-                say("offline")
-                if r.withdraw(job):
-                    result = _error(f"your PC ({m}) is offline, so {tool} was not run. Tell the user; do not retry "
-                                    f"it until they say their PC is back.")
-                else:
-                    result = _error(f"your PC ({m}) went offline while {tool} was running; whether it finished is "
-                                    f"unknown. Tell the user, and check the state before you repeat it.")
-            elif end is not None and now > end:
-                if not r.withdraw(job):
-                    r.push({"job": job.id, "cancel": True})
-                result = _error(f"{tool} did not finish on your PC ({m}) within {timeout + 30:g} s.")
-        r._end_job(job, result, exec_ms, len(result_text(result)))
+                if r.ended is not None:                 # ended between setting `ended` and failing its jobs
+                    result = _error(self._ended_text(tool, ENDED.get(r.ended, r.ended), job.t_picked is not None))
+                elif not r.online():
+                    say("offline")
+                    if r.withdraw(job):
+                        result = _error(f"your PC ({m}) is offline, so {tool} was not run. Tell the user; do not "
+                                        f"retry it until they say their PC is back.")
+                    else:
+                        result = _error(f"your PC ({m}) went offline while {tool} was running; whether it finished "
+                                        f"is unknown. Tell the user, and check the state before you repeat it.")
+                elif end is not None and now > end:
+                    result = _error(f"{tool} did not finish on your PC ({m}) within {timeout + 30:g} s.")
+        except Exception as e:  # noqa: BLE001 - whatever broke here, the model gets text and the PC a cancel
+            result = _error(f"the server could not finish {tool} on your PC ({m}): {type(e).__name__}: {e}")
+        finally:
+            if result is None:                          # not an Exception (the thread is stopping): still end the job
+                result = _error(f"{tool} on your PC ({m}) was stopped on the server.")
+            if not answered and cancelled_at is None and r.ended is None and not r.withdraw(job):
+                r.push({"job": job.id, "cancel": True})     # it may be running there, and nobody waits for it now
+            try:
+                chars = len(result_text(result))
+            except Exception:  # noqa: BLE001
+                chars = -1
+            r._end_job(job, result, exec_ms, chars)
         return result
 
 
