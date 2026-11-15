@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react"
 import { deviceName, setDeviceName } from "../lib/device"
-import { browserKeyAfterCreate, getKeys, logKind, postDevice, postKeys, refreshTeam, showFreshKey, type BrowserKey, type DeviceRow, type KeyRow, type KeysAction, type KeysAnswer, type KeysView, type LogRow, type Role } from "../lib/keys"
+import { createKey, getKeys, logKind, postDevice, postKeys, refreshTeam, showFreshKey, type DeviceRow, type KeyRow, type KeysAction, type KeysAnswer, type KeysView, type LogRow, type Role } from "../lib/keys"
 import { msg, t } from "../lib/i18n"
 import { store } from "../lib/store"
 import { serverHasKey } from "../lib/api"
@@ -64,17 +64,15 @@ function Owner({ view, reload }: { view: KeysView; reload: () => Promise<void> }
   const act = async (body: KeysAction, done?: string): Promise<string | null> => {
     setBusy(true)
     setNotice(null)
-    const r = await postKeys(body)
+    // A create: the first key turns team mode on, and from then on this page needs a key too, so createKey reads /health before it (after
+    // it, "api_key" is true either way) and this browser takes the new key when it has none or one the server never asked for. The text
+    // goes to the store App draws above the waiting screen, before anything can take this page away.
+    const r = body.action === "create"
+      ? await createKey(body, !view.team, { serverHasKey, post: postKeys, stored: () => store.get("apikey", ""), keep: (k) => store.set("apikey", k) })
+      : await postKeys(body)
     setBusy(false)
     if ("error" in r) { setNotice(r.error); return r.error }
-    if (body.action === "create" && r.key) {
-      // The first key turns team mode on, and from then on this page needs a key too: a browser with none, or with one the server never
-      // asked for, takes the new one. The text goes to the store App draws above the waiting screen, before anything can take this page away.
-      const first = !view.team
-      const take = browserKeyAfterCreate({ first, stored: store.get("apikey", ""), serverHasKey: first ? await serverHasKey() : null })
-      const browser: BrowserKey = take === "keep" ? "unchanged" : store.set("apikey", r.key) ? "stored" : "failed"
-      showFreshKey({ secret: r.key, name: body.name.trim(), browser })
-    }
+    if ("fresh" in r) showFreshKey(r.fresh)
     if (done) toast("success", done)
     await reload()
     refreshTeam()

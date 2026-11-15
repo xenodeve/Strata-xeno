@@ -125,8 +125,9 @@ export function logKind(what: string): { kind: string; arg: string } {
 // A new key's text, shown once (I1 of the task 6 review). It is kept here, not in the Settings page's state, and drawn above the waiting
 // screen (App), so it survives anything that takes the page away before it is copied: the first key puts this device in team mode, where
 // it may wait for approval at once. Gone when the user dismisses it, or with the page (never written to storage).
-/** What became of this browser's own API key: it took the new key, it could not keep it, or it kept the key it had. */
-export type BrowserKey = "stored" | "failed" | "unchanged"
+/** What became of this browser's own API key: it took the new key, it could not keep it, it kept the key it had, or it kept a key that
+ *  may no longer be valid (the server could not be asked whether it had an API key before the first key). */
+export type BrowserKey = "stored" | "failed" | "unchanged" | "uncertain"
 export interface FreshKey { secret: string; name: string; browser: BrowserKey }
 let fresh: FreshKey | null = null
 const freshListeners = new Set<() => void>()
@@ -144,4 +145,25 @@ export function browserKeyAfterCreate(o: { first: boolean; stored: string; serve
   if (!o.first) return "keep"
   if (!o.stored.trim()) return "store"
   return o.serverHasKey === false ? "store" : "keep"
+}
+
+export interface CreateIO {
+  serverHasKey: () => Promise<boolean | null>                       // /health "api_key"
+  post: (b: KeysAction) => Promise<{ ok: true; key?: string } | { error: string }>
+  stored: () => string                                              // this browser's API key
+  keep: (key: string) => boolean                                    // store it as this browser's API key; false when refused
+}
+
+/** Make a key, and decide whether this browser takes it. /health is read BEFORE the create: its "api_key" is the server's key_required(),
+ *  true as soon as the first key has made the keys file, so only the state before the create tells a stale stored key from the server's own
+ *  API key. */
+export async function createKey(body: { name: string; role: Role }, first: boolean, io: CreateIO): Promise<{ fresh: FreshKey } | { error: string }> {
+  const before = first ? await io.serverHasKey() : null
+  const r = await io.post({ action: "create", name: body.name, role: body.role })
+  if ("error" in r) return { error: r.error }
+  if (!r.key) return { error: "the server did not send the new key" }
+  const stored = io.stored()
+  const take = browserKeyAfterCreate({ first, stored, serverHasKey: before })
+  const browser: BrowserKey = take === "store" ? (io.keep(r.key) ? "stored" : "failed") : first && before === null && stored.trim() ? "uncertain" : "unchanged"
+  return { fresh: { secret: r.key, name: body.name.trim(), browser } }
 }

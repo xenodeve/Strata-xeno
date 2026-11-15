@@ -46,6 +46,7 @@ export const part: Record<string, string> = {
   "The first key is an owner key. From then on every request needs a key, this PC's too, and each key's first use from a new device waits for approval. This browser takes the new key as its own, unless it holds the server's API key.": "คีย์แรกเป็นคีย์ของเจ้าของ หลังจากนั้นทุกคำขอต้องมีคีย์ รวมถึงคำขอจากเครื่องนี้ด้วย และการใช้คีย์จากอุปกรณ์ใหม่ครั้งแรกจะต้องรออนุมัติ เบราว์เซอร์นี้จะใช้คีย์ใหม่เป็นคีย์ของตัวเอง ยกเว้นเมื่อใช้คีย์ API ของเซิร์ฟเวอร์อยู่แล้ว",
   "This browser could not keep the key, and from now on this page needs it: copy it, then enter it under Settings, API key.": "เบราว์เซอร์นี้เก็บคีย์ไว้ไม่ได้ และนับจากนี้หน้านี้ต้องใช้คีย์: คัดลอกไว้ แล้วใส่ที่ ตั้งค่า > คีย์ API",
   "I have copied it": "คัดลอกแล้ว",
+  "This browser kept the API key it had, and the server could not be asked whether that key is still valid. If the page now says it needs an API key, copy this key and enter it under Settings, API key.": "เบราว์เซอร์นี้ยังใช้คีย์ API เดิมอยู่ และถามเซิร์ฟเวอร์ไม่ได้ว่าคีย์นั้นยังใช้ได้หรือไม่ ถ้าหน้านี้บอกว่าต้องใช้คีย์ API ให้คัดลอกคีย์นี้ไปใส่ที่ ตั้งค่า > คีย์ API",
   "New key": "คีย์ใหม่",
   "Names used before, never given again: {names}": "ชื่อที่เคยใช้แล้ว จะไม่นำกลับมาใช้อีก: {names}",
   "Key copied": "คัดลอกคีย์แล้ว",

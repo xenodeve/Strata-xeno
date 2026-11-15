@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { browserKeyAfterCreate, dismissFreshKey, getFreshKey, holdersOf, keysAnswer, logKind, showFreshKey, subscribeFreshKey, teamOf, waitingText } from "./keys"
+import { browserKeyAfterCreate, createKey, dismissFreshKey, getFreshKey, holdersOf, keysAnswer, logKind, showFreshKey, subscribeFreshKey, teamOf, waitingText, type KeysAction } from "./keys"
 
 // The page's reading of the #310 routes: GET /keys (who is asking and whether the server is in team mode) and /metrics live (who holds
 // the engine and who waits).
@@ -84,5 +84,54 @@ describe("browserKeyAfterCreate: does this browser take the new key", () => {
   test("the first key, and the browser has the server's API key (still valid), or the server could not be asked: it keeps it", () => {
     expect(browserKeyAfterCreate({ first: true, stored: "k", serverHasKey: true })).toBe("keep")
     expect(browserKeyAfterCreate({ first: true, stored: "k", serverHasKey: null })).toBe("keep")
+  })
+})
+
+// Re-review of I1: /health "api_key" is the server's key_required(), true as soon as the keys file exists - so it must be read BEFORE the
+// create. These run createKey against a fake server whose /health answers api_key false before the create and true after it.
+describe("createKey: the server's state before the create decides", () => {
+  const fakeServer = (o: { before: boolean | null; stored: string; keeps?: boolean }) => {
+    const calls: string[] = []
+    let created = false
+    let kept = o.stored
+    return {
+      calls, kept: () => kept,
+      io: {
+        serverHasKey: async () => { calls.push("health"); return created ? true : o.before },
+        post: async (b: KeysAction) => { calls.push("post:" + b.action); created = true; return { ok: true as const, key: "sk-strata-new" } },
+        stored: () => kept,
+        keep: (k: string) => { calls.push("keep"); if (o.keeps === false) return false; kept = k; return true },
+      },
+    }
+  }
+  test("a stale key on a server with no API key is replaced: /health is read before the create", async () => {
+    const s = fakeServer({ before: false, stored: "stale" })
+    const r = await createKey({ name: "boss", role: "owner" }, true, s.io)
+    expect(s.calls).toEqual(["health", "post:create", "keep"])
+    expect(r).toEqual({ fresh: { secret: "sk-strata-new", name: "boss", browser: "stored" } })
+    expect(s.kept()).toBe("sk-strata-new")
+  })
+  test("the server's own API key is kept", async () => {
+    const s = fakeServer({ before: true, stored: "k" })
+    expect(await createKey({ name: "boss", role: "owner" }, true, s.io)).toEqual({ fresh: { secret: "sk-strata-new", name: "boss", browser: "unchanged" } })
+    expect(s.kept()).toBe("k")
+  })
+  test("/health could not be read and the browser has a key: kept, and the card is told it may be wrong", async () => {
+    const s = fakeServer({ before: null, stored: "maybe" })
+    expect(await createKey({ name: "boss", role: "owner" }, true, s.io)).toEqual({ fresh: { secret: "sk-strata-new", name: "boss", browser: "uncertain" } })
+    expect(s.kept()).toBe("maybe")
+  })
+  test("the browser refuses to keep it: failed", async () => {
+    const s = fakeServer({ before: false, stored: "", keeps: false })
+    expect(await createKey({ name: "boss", role: "owner" }, true, s.io)).toEqual({ fresh: { secret: "sk-strata-new", name: "boss", browser: "failed" } })
+  })
+  test("a later key: /health is not asked and the browser keeps its key", async () => {
+    const s = fakeServer({ before: true, stored: "mine" })
+    expect(await createKey({ name: "ann", role: "guest" }, false, s.io)).toEqual({ fresh: { secret: "sk-strata-new", name: "ann", browser: "unchanged" } })
+    expect(s.calls).toEqual(["post:create"])
+  })
+  test("a refused create: its reason, nothing kept", async () => {
+    const io = { serverHasKey: async () => false, post: async () => ({ error: "was used before" }), stored: () => "", keep: () => true }
+    expect(await createKey({ name: "x", role: "owner" }, true, io)).toEqual({ error: "was used before" })
   })
 })

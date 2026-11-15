@@ -20,6 +20,7 @@ export function FreshKeyCard() {
       </div>
       <p className="mt-2 text-[12px] text-ink-2">{t("Shown once: copy it now. Strata keeps only a fingerprint of it, so it cannot show it again.")}</p>
       {k.browser === "stored" && <p className="mt-1 text-[12px] text-ink-2">{t("This browser now uses this key (Settings, API key), so this page keeps working.")}</p>}
+      {k.browser === "uncertain" && <p className="mt-1 text-[12px] text-bad">{t("This browser kept the API key it had, and the server could not be asked whether that key is still valid. If the page now says it needs an API key, copy this key and enter it under Settings, API key.")}</p>}
       {k.browser === "failed" && <p className="mt-1 text-[12px] text-bad">{t("This browser could not keep the key, and from now on this page needs it: copy it, then enter it under Settings, API key.")}</p>}
       <div className="mt-2"><Button kind="quiet" onClick={dismissFreshKey}>{t("I have copied it")}</Button></div>
     </div>
