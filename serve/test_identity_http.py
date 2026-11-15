@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -20,6 +21,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import agent  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
+from serve.history import HistoryStore  # noqa: E402
 from serve.identity import OWNER, KeyStore  # noqa: E402
 from serve.mcp import hub_from_config  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, keys_file_of, serve  # noqa: E402
@@ -446,6 +448,177 @@ class RunsBelongToTheirIdentity(Base):
         t.join(20)
         self.assertFalse(t.is_alive())
         self.assertEqual([(e["id"], e["answers"]) for e in events[1:] if e["event"] == "question_answered"], [(qid, pick)])
+
+
+class GatedEngine(MockEngine):
+    """The mock engine, slowed (delay_s) and held before its last two tokens while `go` is clear: a request that holds
+    the engine, part of its answer written, for as long as a test needs."""
+
+    def __init__(self, tok, script):
+        super().__init__(tok, script, max_context=4096, delay_s=0.001)
+        self.go = threading.Event()
+        self.go.set()
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        hold = len(self.script) - 2
+        for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+            if i == hold:
+                while not self.go.wait(0.05):
+                    if cancel.is_set():
+                        return
+            yield t
+
+
+class MonitorByIdentity(Base):
+    """#310 task 4: every request record says who sent it.  Another person's records show who, state, queue place and
+    timings, never what was asked or answered (spec decision 2); the owner sees everything, as everyone does outside
+    team mode.  Live: who holds the engine and who waits, in arrival order."""
+    SCRIPT = "</think>\n\nthe answer is forty-two"
+
+    def setUp(self):
+        super().setUp()
+        tok = ByteTokenizer()
+        self.engine = GatedEngine(tok, self.SCRIPT)
+        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.hstore = HistoryStore(self.dir / "history")
+        self.svc.api_monitor = True
+        self.start(api_key="k", peer_override=REMOTE)
+        self.ann = self.approved("ann")
+        self.bob = self.approved("bob", device=DEV2)
+        self.boss = self.approved("boss", "owner")
+
+    def tearDown(self):
+        self.engine.go.set()                                      # a held request ends before the server closes
+        super().tearDown()
+
+    def ask(self, key, device, text):
+        return self.req("POST", "/v1/chat/completions",
+                        {"model": "m", "messages": [{"role": "user", "content": text}], "max_tokens": 64},
+                        key=key, device=device)
+
+    def ask_on_a_thread(self, key, device, text):
+        """The same request from a thread of its own (no stdout redirect: that is not safe across threads)."""
+        out = {}
+
+        def go():
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+            try:
+                c.request("POST", "/v1/chat/completions", body=json.dumps(
+                    {"model": "m", "messages": [{"role": "user", "content": text}], "max_tokens": 64}).encode(),
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer " + key,
+                             "X-Strata-Device": device})
+                r = c.getresponse()
+                out["status"], out["body"] = r.status, r.read()
+            finally:
+                c.close()
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        return t, out
+
+    def wait_for(self, fn, timeout=20.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            v = fn()
+            if v:
+                return v
+            time.sleep(0.02)
+        self.fail("timed out")
+
+    def live(self, key, device):
+        code, body = self.req("GET", "/metrics", key=key, device=device)
+        self.assertEqual(code, 200, body)
+        return body["live"]
+
+    def test_guest_sees_others_without_content(self):
+        self.assertEqual(self.ask(self.ann, DEV1, "ann asks about apples")[0], 200)
+        self.assertEqual(self.ask(self.bob, DEV2, "bob asks about pears")[0], 200)
+        # the history on disk, the Monitor's last requests and the API monitor, as bob sees them
+        for path, items in (("/metrics/requests", "items"), ("/metrics", "requests"), ("/api/requests", "requests")):
+            with self.subTest(path=path):
+                code, body = self.req("GET", path, key=self.bob, device=DEV2)
+                self.assertEqual(code, 200, body)
+                rows = {r["who"]: r for r in body[items]}
+                self.assertEqual(set(rows), {"ann", "bob"})
+                self.assertNotIn("apples", json.dumps(body))
+                self.assertNotIn("preview", rows["ann"])
+                if path == "/api/requests":
+                    self.assertEqual(rows["ann"]["state"], "completed")
+                    for k in ("started_at", "queue_s", "load_s", "first_token_s", "wallclock_s"):
+                        self.assertIn(k, rows["ann"])
+                else:
+                    self.assertEqual(rows["bob"]["preview"], "bob asks about pears")
+                    for k in ("finish", "time", "duration_s", "output_tokens", "prompt_tokens"):
+                        self.assertIn(k, rows["ann"])
+        # the owner sees both
+        for path, items in (("/metrics/requests", "items"), ("/metrics", "requests")):
+            code, body = self.req("GET", path, key=self.boss, device=DEV1)
+            self.assertEqual({r["who"]: r["preview"] for r in body[items]},
+                             {"ann": "ann asks about apples", "bob": "bob asks about pears"})
+
+    def test_detail_of_another_guest_is_404(self):
+        self.assertEqual(self.ask(self.ann, DEV1, "ann asks about apples")[0], 200)
+        rid = self.svc.hstore.page(0, 1)["items"][0]["id"]
+        mid = self.svc.api_requests[-1]["id"]
+        nothing = self.req("GET", "/metrics/requests/r00000000ffff", key=self.bob, device=DEV2)
+        self.assertEqual(nothing[0], 404)
+        self.assertEqual(self.req("GET", f"/metrics/requests/{rid}", key=self.bob, device=DEV2), nothing)
+        gone = self.req("GET", "/api/requests?id=000000000000", key=self.bob, device=DEV2)
+        self.assertEqual(gone[0], 404)
+        self.assertEqual(self.req("GET", f"/api/requests?id={mid}", key=self.bob, device=DEV2), gone)
+        for key, device in ((self.ann, DEV1), (self.boss, DEV1)):
+            code, body = self.req("GET", f"/metrics/requests/{rid}", key=key, device=device)
+            self.assertEqual(code, 200)
+            self.assertEqual((body["summary"]["who"], body["summary"]["preview"]), ("ann", "ann asks about apples"))
+            self.assertEqual(body["detail"]["who"], "ann")
+            code, body = self.req("GET", f"/api/requests?id={mid}", key=key, device=device)
+            self.assertEqual(code, 200)
+            self.assertIn("ann asks about apples", body["input"])
+
+    def test_live_shows_holder_and_waiting(self):
+        self.engine.go.clear()
+        a, ra = self.ask_on_a_thread(self.ann, DEV1, "ann first")
+        self.wait_for(lambda: self.live(self.bob, DEV2)["holder"] == "ann")
+        b, rb = self.ask_on_a_thread(self.bob, DEV2, "bob second")
+        live = self.wait_for(lambda: (x := self.live(self.bob, DEV2))["waiting"] and x)
+        self.assertEqual(live["holder"], "ann")
+        self.assertEqual([w["who"] for w in live["waiting"]], ["bob"])
+        self.assertIsInstance(live["waiting"][0]["since"], float)
+        self.assertEqual(live["queued"], 1)
+        self.engine.go.set()
+        a.join(20)
+        b.join(20)
+        self.assertEqual((ra["status"], rb["status"]), (200, 200))
+        live = self.live(self.boss, DEV1)
+        self.assertIsNone(live["holder"])
+        self.assertEqual(live["waiting"], [])
+        self.assertEqual(live["queued"], 0)
+
+    def test_status_shows_the_answer_only_to_its_holder_and_the_owner(self):
+        """GET /status carries the end of the answer being written (#212): in team mode only to the identity whose
+        request it is and to the owner; anyone else gets the same shape with no text."""
+        self.engine.go.clear()
+        a, ra = self.ask_on_a_thread(self.ann, DEV1, "ann asks about apples")
+        mine = self.wait_for(lambda: "the answer is" in ((x := self.req("GET", "/status", key=self.ann,
+                                                                          device=DEV1)[1]).get("tail") or "") and x)
+        self.assertEqual(mine["who"], "ann")
+        code, other = self.req("GET", "/status", key=self.bob, device=DEV2)
+        self.assertEqual(code, 200)
+        self.assertEqual((other["who"], other["busy"], other["tail"]), ("ann", True, ""))
+        self.assertEqual(set(other), set(mine))
+        self.assertIn("the answer is", self.req("GET", "/status", key=self.boss, device=DEV1)[1]["tail"])
+        # /v1/status and the Prometheus pages carry counts and timings only, while it runs and after
+        for when in ("running", "done"):
+            for path, headers in (("/v1/status", None), ("/metrics/prometheus", None),
+                                  ("/metrics", {"Accept": "text/plain"})):
+                with self.subTest(when=when, path=path):
+                    code, body = self.req("GET", path, key=self.bob, device=DEV2, headers=headers)
+                    self.assertEqual(code, 200)
+                    text = body if isinstance(body, bytes) else json.dumps(body).encode()
+                    self.assertNotIn(b"apples", text)
+                    self.assertNotIn(b"answer", text)
+            self.engine.go.set()
+            a.join(20)
+        self.assertEqual(ra["status"], 200)
 
 
 class _Reached(Exception):

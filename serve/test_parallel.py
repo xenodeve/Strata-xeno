@@ -236,9 +236,10 @@ class PickSlot(unittest.TestCase):
         e = self.engine(2)
         e.slot_held[1] = [1, 2]
         e.slot_live[0] = {"slot": 0, "state": "decoding", "prompt_tokens": 9, "generated": 4,
-                          "started": time.time() - 2, "first_token": time.time() - 1}
+                          "started": time.time() - 2, "first_token": time.time() - 1, "who": "ann"}
         v = e.slots_view()
         self.assertEqual(v[0]["state"], "decoding")
+        self.assertEqual(v[0]["who"], "ann")                       # #310: whose request the slot runs
         self.assertEqual(v[0]["generated"], 4)
         self.assertEqual(v[1], {"slot": 1, "state": "idle", "held_tokens": 2})
 
@@ -385,6 +386,10 @@ class ParallelService(unittest.TestCase):
         # the slots were reported, and a request was admitted while another decoded in a slot (the fake logs how many
         # slots were active at each admission)
         self.assertTrue(any(m.get("parallel") == 2 and len(m.get("slots", [])) == 2 for m in seen))
+        # #310: a busy slot says whose request it runs (outside team mode every request is the owner's); the count of
+        # requests waiting stays a number, the names are beside it
+        self.assertTrue(any(x.get("who") == "owner" for m in seen for x in m.get("slots", []) if x["state"] != "idle"))
+        self.assertTrue(all(isinstance(m.get("waiting"), int) and isinstance(m.get("waiting_who"), list) for m in seen))
         admitted = [int(x.split()[3]) for x in self.log.read_text().splitlines() if x.startswith("BGEN")]
         self.assertIn(1, admitted)
         # every request recorded its own row; nothing is left running

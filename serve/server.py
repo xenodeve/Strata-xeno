@@ -1541,7 +1541,8 @@ class StrataEngine:
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
-                            "started": time.time(), "first_token": None}
+                            "started": time.time(), "first_token": None,
+                            "who": ((sampling or {}).get("_meta") or {}).get("who") or "owner"}   # #310
                     self.slot_live[slot] = live
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
@@ -1718,7 +1719,8 @@ class StrataEngine:
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
+                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None,
+                         "who": r.get("who")})                  # #310: whose request the slot runs
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -3044,6 +3046,9 @@ class Service:
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0, "loops_stopped": 0, "thinking_cycles_closed": 0}  # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
+        # #310: who waits for the engine, in arrival order ({"who", "since"}), one entry per status["queued"] count
+        # (_queue_enter / _queue_leave change both together)
+        self.queue_who: list[dict] = []
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
@@ -3214,7 +3219,7 @@ class Service:
         empty or broken one - it must not turn into an open server)."""
         return bool(self.api_key) or self.keys.team_mode()
 
-    def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
+    def slot_action(self, slot: str, action: str, filename, who: str = "owner") -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
         to or from a file in slot_save_path.  -> (HTTP status, body)."""
         def error(code, message):
@@ -3241,19 +3246,19 @@ class Service:
                 return error(404, f"no saved session named {filename}")
         self.last_request_at = time.time()                  # the idle unload counts this as activity
         with self.status_lock:
-            self.status["queued"] += 1
+            place = self._queue_enter(who)
         waiting = True
         try:
             with self.fifo:
                 with self.status_lock:
-                    self.status["queued"] -= 1
+                    self._queue_leave(place)
                 waiting = False
                 if not self.loaded():
                     return error(503, "the model is not loaded")
                 with self.status_lock:
                     self.status.update(busy=True, phase="saving the session" if action == "save"
                                        else "restoring a session", started=time.time(), first_token=None,
-                                       prompt_tokens=None, generated=None, max_tokens=None)
+                                       prompt_tokens=None, generated=None, max_tokens=None, who=who)
                 try:
                     if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
                         from serve.session_save_retry import session_file
@@ -3275,7 +3280,7 @@ class Service:
         finally:
             if waiting:                                     # never reached the FIFO (an exception while waiting)
                 with self.status_lock:
-                    self.status["queued"] -= 1
+                    self._queue_leave(place)
         if action == "save":
             return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
@@ -3443,7 +3448,7 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self, wait_for_restart: bool = False):
+    def load(self, wait_for_restart: bool = False, who: str = "owner"):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy).  While
         another request (re)loads it: EngineDied at once (xeno #49 S2, the Anthropic API's retryable 529), or, with
         `wait_for_restart` (the OpenAI API), a turn in the queue until it is loaded (#208, #332).  That wait is this
@@ -3458,12 +3463,12 @@ class Service:
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
         with self.status_lock:                          # #1603: waiting for the fifo to start the engine is queued, not nothing
-            self.status["queued"] += 1
+            place = self._queue_enter(who)
         counted = True
         try:
             with self.fifo:
                 with self.status_lock:
-                    self.status["queued"] -= 1
+                    self._queue_leave(place)
                 counted = False
                 loading = time.perf_counter()
                 if trace is not None:
@@ -3480,7 +3485,23 @@ class Service:
         finally:
             if counted:
                 with self.status_lock:
-                    self.status["queued"] -= 1
+                    self._queue_leave(place)
+
+    def _queue_enter(self, who: str) -> dict:
+        """#310: one more request waits for the engine (the caller holds status_lock): status["queued"] counts it and
+        queue_who names it, in arrival order.  Returns its place, for _queue_leave."""
+        self.status["queued"] += 1
+        place = {"who": who, "since": time.time()}
+        self.queue_who.append(place)
+        return place
+
+    def _queue_leave(self, place: dict) -> None:
+        """It waits no more (the caller holds status_lock): its turn came, it was cancelled or it failed."""
+        self.status["queued"] -= 1
+        for i, x in enumerate(self.queue_who):
+            if x is place:
+                del self.queue_who[i]
+                break
 
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
@@ -3637,10 +3658,11 @@ class Service:
                     req["output_config"] = {"effort": effort}
         return req
 
-    def meta_for(self, dialect, messages, tools, user_agent) -> dict:
+    def meta_for(self, dialect, messages, tools, user_agent, who: str = "owner") -> dict:
         """The request's history meta; while "keep the next N prompts" is on it also carries the full prompt (`_prompt`,
-        which run() moves to the detail file and never into the summary row)."""
-        meta = request_meta(dialect, messages, tools, user_agent)
+        which run() moves to the detail file and never into the summary row).  `who`: the identity that sent it (#310),
+        which run() also shows as the engine's holder or a waiting request."""
+        meta = request_meta(dialect, messages, tools, user_agent, who)
         with self.keep_lock:
             if self.keep_prompts > 0:
                 self.keep_prompts -= 1
@@ -3703,8 +3725,9 @@ class Service:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
-    def begin_request(self, path, req):
-        """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
+    def begin_request(self, path, req, who: str = "owner"):
+        """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then).  `who`: the
+        identity that sent it (#310)."""
         if not self.api_monitor:
             return None
         raw = json.dumps(req, ensure_ascii=False, indent=2)
@@ -3714,35 +3737,45 @@ class Service:
                   if isinstance(req.get("response_format"), dict) else None,
                   "input": raw[:262144], "input_truncated": len(raw) > 262144,
                   "output": "", "reasoning": "", "output_truncated": False, "reasoning_truncated": False,
-                  "queue_s": 0.0, "load_s": 0.0, "first_token_s": None,
+                  "queue_s": 0.0, "load_s": 0.0, "first_token_s": None, "who": who,
                   "_clock": time.perf_counter()}
         with self.status_lock:
             self.api_requests.append(record)
         self.request_trace.record = record
         return record
 
-    def request_records(self, request_id=None):
+    def request_records(self, request_id=None, viewer: identity_mod.Identity = identity_mod.OWNER):
+        """#332's records as `viewer` may see them (#310): another person's request is not found by id, and in the
+        list it shows who, state, queue place and timings only (identity.visible_record)."""
         with self.status_lock:
             records = list(self.api_requests)
             if request_id:
                 record = next((r for r in records if r["id"] == request_id), None)
-                if record is None:
+                if record is None or not self.may_read(record, viewer):
                     return None
                 return {k: v for k, v in record.items() if not k.startswith("_")}
-            return [{k: v for k, v in r.items()
+            return [identity_mod.visible_record(
+                    {k: v for k, v in r.items()
                      if k not in ("input", "output", "reasoning", "response") and not k.startswith("_")}
-                    | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
+                    | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}, viewer)
                     for r in reversed(records)]
 
-    def metrics(self, all_requests=False) -> dict:
+    @staticmethod
+    def may_read(record: dict, viewer: identity_mod.Identity) -> bool:
+        """#310: may `viewer` read what a request asked and answered - the owner, or the identity that sent it."""
+        return viewer.is_owner or record.get("who") == viewer.name
+
+    def metrics(self, all_requests=False, viewer: identity_mod.Identity = identity_mod.OWNER) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
-        the hardware (with a minute of history per series)."""
+        the hardware (with a minute of history per series).  #310: the requests as `viewer` may see them; who holds
+        the engine and who waits for it, by name."""
         with self.status_lock:
             s = dict(self.status)
             if self.live_reqs:                          # parallel requests: the newest one's status
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
             hist = list(self.history)
             totals = dict(self.totals)
+            waiting = [dict(x) for x in self.queue_who]
         now = time.time()
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and s.get("first_token") is None:
@@ -3761,7 +3794,10 @@ class Service:
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
-                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
+                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None,
+                # #310: the identity whose request has the engine (with "parallel": each busy slot's "who"), and the
+                # ones waiting for it, in arrival order
+                "holder": s.get("who") if s.get("busy") else None, "waiting": waiting}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         par = int(getattr(self.engine, "batch", 0) or 0)
@@ -3771,9 +3807,11 @@ class Service:
             slots = self.engine.slots_view() if hasattr(self.engine, "slots_view") else []
             # the requests in flight that are not in a slot: the one alone on the solo path, or waiting their turn
             in_slots = sum(1 for x in slots if x["state"] != "idle")
+            # "waiting" stays the count of requests waiting for a slot or the control lines (#465); the names of
+            # those waiting for the engine's turn are "waiting_who" here (#310), and "holder" is each slot's "who"
             live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
-                        admitting=int(getattr(self.engine, "admitting", 0) or 0))
+                        admitting=int(getattr(self.engine, "admitting", 0) or 0), holder=None, waiting_who=waiting)
             if running and state == "idle":
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
@@ -3784,7 +3822,8 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        return {"engine": engine, "live": live,
+                "requests": [identity_mod.visible_record(r, viewer) for r in hist[::-1][:None if all_requests else 12]],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -4385,6 +4424,8 @@ class Service:
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
         trace = getattr(self.request_trace, "record", None)
+        # #310: the identity whose request this is (its history meta's "who"): the engine's holder while it runs
+        who = ((sampling or {}).get("_meta") or {}).get("who") or "owner"
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
@@ -4392,7 +4433,7 @@ class Service:
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
-            self.status["queued"] += 1
+            place = self._queue_enter(who)
         t_queue = timeline.now_us()
         priority = 0 if (sampling or {}).get("stream") else 1   # xeno #49 S6: main turn first
         try:
@@ -4414,11 +4455,11 @@ class Service:
                             yield "ping", None
                 except BaseException:                    # the consumer closed us at a ping: no longer queued
                     with self.status_lock:
-                        self.status["queued"] -= 1
+                        self._queue_leave(place)
                     raise
                 if not got:                              # cancelled while queued
                     with self.status_lock:
-                        self.status["queued"] -= 1
+                        self._queue_leave(place)
                     yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
                                    "reasoning_tokens": 0, "reasoning_recoveries": 0}
                     return
@@ -4430,7 +4471,7 @@ class Service:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
                             trace["state"] = "generating"
                         if not par:
-                            self.status["queued"] -= 1
+                            self._queue_leave(place)
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that).
                     # #1603: a parallel request stays counted as queued until it is registered as running below -
@@ -4445,14 +4486,14 @@ class Service:
                     except BaseException:
                         if par:
                             with self.status_lock:
-                                self.status["queued"] -= 1
+                                self._queue_leave(place)
                         raise
                     with self.status_lock:
                         if par:
-                            self.status["queued"] -= 1
+                            self._queue_leave(place)
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
+                                  max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget, who=who)
                         if par:
                             self.live_reqs[id(st)] = (st, rate)
                             self.status.update(st)
@@ -4650,7 +4691,7 @@ class Service:
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
-                            meta = dict((sampling or {}).get("_meta") or request_meta("", [], None, None))
+                            meta = dict((sampling or {}).get("_meta") or request_meta("", [], None, None, who))
                             # one request can call run() several times (an MCP tool round, the thinking budget's second call):
                             # the first keeps the request's id, the later ones get -2, -3 ... so no row or detail overwrites another
                             shared = (sampling or {}).get("_meta")
@@ -4691,7 +4732,8 @@ class Service:
                             hw, hw_series = tel.request_hw(started, time.time()) if tel is not None else (None, [])
                             rec["hw"] = hw
                             self.history.append(rec)
-                            to_disk = (rec, {"prefill_chunks": chunks["items"] if chunks else [],
+                            to_disk = (rec, {"who": rec.get("who"),     # #310: whose request (the route checks its summary's)
+                                             "prefill_chunks": chunks["items"] if chunks else [],
                                              "decode_series": decode["series"] if decode else [],
                                              "stats": last.get("stats"),
                                              "hw_series": hw_series,
@@ -5738,10 +5780,13 @@ def make_handler(svc: Service):
                             page, size = int(q.get("page", ["0"])[0]), int(q.get("size", ["50"])[0])
                         except ValueError:
                             return self._json(400, {"error": {"message": "page and size are numbers"}})
-                        return self._json(200, svc.hstore.page(page, size))
+                        viewer = self._acting()              # #310: another's rows show no prompt or answer
+                        got = svc.hstore.page(page, size)
+                        got["items"] = [identity_mod.visible_record(r, viewer) for r in got["items"]]
+                        return self._json(200, got)
                     rid = path[len("/metrics/requests/"):]
                     summary = svc.hstore.summary(rid)
-                    if summary is None:
+                    if summary is None or not svc.may_read(summary, self._acting()):   # #310: another's, as one not there
                         return self._json(404, {"error": {"message": "no such request"}})
                     detail = svc.hstore.detail(rid)
                     return self._json(200, {"summary": summary, "detail": detail,
@@ -5769,12 +5814,12 @@ def make_handler(svc: Service):
                     return
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
-                    self._json(200, svc.metrics(all_requests="requests=all" in self.path))
+                    self._json(200, svc.metrics(all_requests="requests=all" in self.path, viewer=self._acting()))
                 return
             if path == "/api/requests" and svc.api_monitor:
                 if self._authorized():
                     request_id = parse_qs(urlsplit(self.path).query).get("id", [None])[0]
-                    records = svc.request_records(request_id)
+                    records = svc.request_records(request_id, viewer=self._acting())
                     self._json(404 if records is None else 200,
                                {"error": {"message": "request no longer retained"}} if records is None else
                                records if request_id else {"requests": records, "retention": 100, "persistent": False,
@@ -5941,6 +5986,8 @@ def make_handler(svc: Service):
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
                 for k in ("started", "first_token"):
                     s.pop(k, None)
+                if "tail" in s and not svc.may_read(s, self._acting()):   # #310: the answer is its sender's and the owner's
+                    s["tail"] = ""
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
@@ -6238,7 +6285,7 @@ def make_handler(svc: Service):
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
-                    svc.load()
+                    svc.load(who=self._acting().name)
                     self._json(200, {"status": "loaded"})
                 except GpuBusy as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
@@ -6293,14 +6340,14 @@ def make_handler(svc: Service):
                     if slot and int(getattr(svc.engine, "info", {}).get("cache_slots", 4)) == 1:
                         raise ValueError("cache slots require a single-GPU session")
                     # unloaded: _openai / _anthropic load first (or 503 while the GPU is busy)
-                    self.record = svc.begin_request(path, req)
+                    self.record = svc.begin_request(path, req, who=self._acting().name)
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
                     query = parse_qs(self.path.partition("?")[2])
                     try:
                         code, body = svc.slot_action(path[len("/slots/"):], (query.get("action") or [""])[0],
-                                                     req.get("filename"))
+                                                     req.get("filename"), who=self._acting().name)
                     except EngineDied as e:                  # EngineSilent included: the engine was ended
                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
                                                      "the engine again", "type": "server_error"}}
@@ -6619,7 +6666,7 @@ def make_handler(svc: Service):
             # an OpenAI request waits in the queue while another one loads the model (#208, #332) - in load() only, see
             # there; the Anthropic API answers 529 at once instead (xeno #49 S2: Claude Code retries it, rather than
             # wait minutes)
-            svc.load(wait_for_restart=True)
+            svc.load(wait_for_restart=True, who=self._acting().name)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = (req.get("strata_mcp") is True or arun is not None) and svc.mcp is not None      # the web app's opt-in (serve/mcp.py), or the coding tools
@@ -6645,7 +6692,8 @@ def make_handler(svc: Service):
             messages, req, ids, thinking, max_new = svc.prepare_carried(          # #200
                 req, messages, tools, kw, max_new, 0 if req.get("stream") else 1, force=force)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
-            req = {**req, "_meta": svc.meta_for("openai", messages, tools, self.headers.get("User-Agent"))}
+            req = {**req, "_meta": svc.meta_for("openai", messages, tools, self.headers.get("User-Agent"),
+                                               who=self._acting().name)}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             rid = sa.get("run") if isinstance(sa, dict) else None
@@ -6833,7 +6881,7 @@ def make_handler(svc: Service):
                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
-            svc.load()
+            svc.load(who=self._acting().name)
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
@@ -6856,7 +6904,9 @@ def make_handler(svc: Service):
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
-            # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
+            # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...); its
+            # history meta is the empty one run() makes, but with the identity that sent it (#310)
+            req = {**req, "_meta": request_meta("", [], None, None, self._acting().name)}
             return ids, thinking, tools, max_new, asm, validator, req
 
         def _count_tokens(self, req):
@@ -6879,7 +6929,7 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(ids)})
 
         def _anthropic(self, req):
-            svc.load()
+            svc.load(who=self._acting().name)
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, vision=svc.vision is not None)
             req = svc.cjk(req, messages)                                # xeno #49 S4
@@ -6895,7 +6945,8 @@ def make_handler(svc: Service):
             messages, req, ids, thinking, max_new = svc.prepare_carried(          # #200
                 req, messages, tools, kw, max_new, 0 if req.get("stream") else 1, force=force)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
-            req = {**req, "_meta": svc.meta_for("anthropic", messages, tools, self.headers.get("User-Agent"))}
+            req = {**req, "_meta": svc.meta_for("anthropic", messages, tools, self.headers.get("User-Agent"),
+                                               who=self._acting().name)}
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
             if budget and thinking:
                 req = {**req, "_think_budget": budget}

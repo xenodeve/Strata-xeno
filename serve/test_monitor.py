@@ -108,6 +108,20 @@ class Monitor(unittest.TestCase):
                     else:
                         self.assertNotIn("response", record)
 
+    def test_records_say_who_and_nothing_is_filtered_outside_team_mode(self):
+        """#310: outside team mode every request is the owner's; the record gains `who` and loses nothing."""
+        self.assertEqual(self.chat()[0], 200)
+        summary = self.request("/api/requests")[1]["requests"][0]
+        self.assertEqual(summary["who"], "owner")
+        record = self.latest()
+        self.assertEqual(record["who"], "owner")
+        self.assertIn("Say hello.", record["input"])
+        metrics = self.request("/metrics")[1]
+        self.assertIsNone(metrics["live"]["holder"])
+        self.assertEqual(metrics["live"]["waiting"], [])
+        self.assertEqual(metrics["requests"][0]["who"], "owner")
+        self.assertEqual(metrics["requests"][0]["preview"], "Say hello.")
+
     def test_error_and_engine_death_are_not_successes(self):
         self.assertEqual(self.chat(max_tokens=20000)[0], 400)
         self.assertEqual(self.latest()["state"], "error")
