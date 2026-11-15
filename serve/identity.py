@@ -558,7 +558,24 @@ HIDDEN = frozenset(("preview", "input", "output", "reasoning", "response", "prom
 def visible_record(record: dict, viewer: Identity) -> dict:
     """A request record as `viewer` may see it.  The owner sees everything, and so does the person whose request it
     is; anyone else sees who, state, queue place and timings, but not what was asked or answered (the preview, the
-    prompt and answer fields, and every key that holds a detail record)."""
+    prompt and answer fields, and every key that holds a detail record); an error, at any depth, only as its type and
+    code."""
     if viewer.is_owner or record.get("who") == viewer.name:
         return record
-    return {k: v for k, v in record.items() if k not in HIDDEN and "detail" not in k.lower()}
+    return {k: _no_error_text(v) if k != "error" else _error_kind(v)
+            for k, v in record.items() if k not in HIDDEN and "detail" not in k.lower()}
+
+
+def _error_kind(error) -> dict:
+    """An error as another person sees it: its type and code.  The message can quote the model's output (a structured
+    output's JSON Schema failure names the value it rejected), so it and every other field are left out."""
+    return {k: error[k] for k in ("type", "code") if k in error} if isinstance(error, dict) else {}
+
+
+def _no_error_text(value):
+    """`value` with every "error" inside it, at any depth, reduced to _error_kind."""
+    if isinstance(value, dict):
+        return {k: _error_kind(v) if k == "error" else _no_error_text(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_no_error_text(v) for v in value]
+    return value

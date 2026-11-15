@@ -583,6 +583,24 @@ class Visible(unittest.TestCase):
         self.assertEqual((other["prompt_tokens"], other["timings"]), (12, {"decode_ms": 9}))
         self.assertIn("preview", rec)                                  # the stored record is not changed
 
+    def test_an_error_shows_its_kind_not_its_message(self):
+        """An error message can quote the model's output (structured.py: the JSON Schema's message): another person
+        sees only an error's type and code, at any depth of the record."""
+        rec = {"who": "bob", "state": "error",
+               "error": {"type": "structured_output_failed", "code": "structured_output_failed",
+                         "message": "model output failed the JSON Schema at /n: 'secret' is not of type 'integer'",
+                         "param": "x"},
+               "usage": {"error": {"type": "server_error", "message": "secret too"}, "n": 3},
+               "rounds": [{"error": "secret as text"}, {"ok": 1}]}
+        other = visible_record(rec, ANN)
+        self.assertEqual(other["error"], {"type": "structured_output_failed", "code": "structured_output_failed"})
+        self.assertEqual(other["usage"], {"error": {"type": "server_error"}, "n": 3})
+        self.assertEqual(other["rounds"], [{"error": {}}, {"ok": 1}])
+        self.assertNotIn("secret", repr(other))
+        self.assertEqual(visible_record(rec, OWNER), rec)                       # the owner and the sender: all of it
+        self.assertEqual(visible_record(rec, Identity("bob", "guest")), rec)
+        self.assertIn("secret", rec["error"]["message"])                       # the stored record is not changed
+
     def test_a_record_without_who_is_hidden_from_a_guest(self):
         self.assertNotIn("preview", visible_record({"preview": "p", "state": "done"}, ANN))
         self.assertNotIn("preview", visible_record({"preview": "p"}, LOCAL_GUEST))

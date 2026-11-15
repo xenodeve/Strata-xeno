@@ -581,6 +581,30 @@ class MonitorByIdentity(Base):
         t.join(20)
         c.close()
 
+    def test_another_persons_error_shows_its_kind_not_its_message(self):
+        """A structured-output failure's message quotes the model's output (serve/structured.py): bob sees ann's
+        error as its type and code only; ann and the owner see the message."""
+        tok = self.engine.tok
+        self.engine.script = tok.encode('</think>\n\n{"n": "secret-forty-two"}<|im_end|>', parse_special=True)
+        fmt = {"type": "json_schema", "json_schema": {"name": "num", "schema": {
+            "type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}}}
+        code, got = self.req("POST", "/v1/chat/completions", {"model": "m", "max_tokens": 64, "response_format": fmt,
+                             "messages": [{"role": "user", "content": "give n"}]}, key=self.ann, device=DEV1)
+        self.assertEqual(code, 502, got)
+        self.assertIn("secret-forty-two", got["error"]["message"])
+        kind = {"type": "structured_output_failed", "code": "structured_output_failed"}
+        code, mon = self.req("GET", "/api/requests", key=self.bob, device=DEV2)
+        ann_rec = next(r for r in mon["requests"] if r["who"] == "ann")
+        self.assertEqual(ann_rec["error"], kind)
+        self.assertNotIn("secret", json.dumps(mon))
+        code, page = self.req("GET", "/metrics/requests", key=self.bob, device=DEV2)
+        self.assertNotIn("secret", json.dumps(page))
+        code, m = self.req("GET", "/metrics", key=self.bob, device=DEV2)
+        self.assertNotIn("secret", json.dumps(m))
+        for key in (self.ann, self.boss):
+            code, mon = self.req("GET", "/api/requests", key=key, device=DEV1)
+            self.assertIn("secret-forty-two", next(r for r in mon["requests"] if r["who"] == "ann")["error"]["message"])
+
     def test_detail_of_another_guest_is_404(self):
         self.assertEqual(self.ask(self.ann, DEV1, "ann asks about apples")[0], 200)
         rid = self.svc.hstore.page(0, 1)["items"][0]["id"]
