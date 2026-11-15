@@ -42,6 +42,11 @@ CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"      # no 0/O/1/I: the code i
 _clock = time.monotonic
 
 
+class KeysFileBad(ValueError):
+    """The keys file on disk does not parse.  The store answers from the last good keys, but writes nothing until the
+    file is fixed: a write would replace what the owner is in the middle of editing."""
+
+
 @dataclass(frozen=True)
 class Identity:
     name: str
@@ -80,6 +85,7 @@ class KeyStore:
         self._checked = -RELOAD_EVERY_S                   # when match() last looked at the file
         self._seen_saved: dict = {}                       # (key, device) -> last_seen as last written
         self._team = False
+        self._bad = False                                 # the file on disk failed to parse when it was last read
         with self._lock:
             self._reload_locked()
 
@@ -96,17 +102,26 @@ class KeyStore:
             return
         sig = self._stat_sig()
         if sig is None:                                   # no file (yet), or gone: keep what is held
+            self._bad = False                             # nothing on disk to destroy; a write makes a new file
             return
         self._team = True
         if sig == self._sig:
             return
-        self._sig = sig                                   # also for a bad file: it is reported once, not once a second
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 data = self._clean(json.load(f))
-        except (OSError, ValueError) as e:
-            print(f"strata serve: the keys file {self.path} is not read ({e}); keeping the keys held", flush=True)
+        except OSError as e:                              # not read at all (locked for a moment): look again next time
+            if not self._bad:
+                print(f"strata serve: the keys file {self.path} is not read ({e}); keeping the keys held", flush=True)
+            self._bad = True
             return
+        except ValueError as e:
+            self._sig = sig                               # a bad file is reported once, not once a second
+            print(f"strata serve: the keys file {self.path} is not read ({e}); keeping the keys held", flush=True)
+            self._bad = True
+            return
+        self._sig = sig
+        self._bad = False
         self._data = data
         self._rebuild()
 
@@ -126,6 +141,10 @@ class KeyStore:
                 if e["name"] != "owner" or e["role"] != "owner":
                     continue
             elif not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
+                continue
+            if not legacy and e["name"].casefold() in RESERVED:
+                print(f"strata serve: the keys file has a key named {e['name']!r}, a reserved name; it is ignored",
+                      flush=True)
                 continue
             if e["name"].casefold() in names:
                 continue
@@ -178,6 +197,8 @@ class KeyStore:
             if not self.path:
                 raise ValueError("no keys file: the keys are not kept")
             self._reload_locked()
+            if self._bad:
+                raise KeysFileBad(f"the keys file {self.path} does not parse: fix it (or delete it) before changing keys")
             new = copy.deepcopy(self._data)
             result = fn(new)
             new["log"] = new["log"][-LOG_CAP:]
@@ -355,15 +376,15 @@ class KeyStore:
         identity with no key entry (the unauthenticated LOCAL_GUEST) is approved and nothing is recorded."""
         if not self.path:
             return "approved"
-        if not isinstance(device_id, str) or not 0 < len(device_id) <= 128:
-            return "refused"
-        label, addr = str(label or "")[:MAX_TEXT], str(addr or "")[:MAX_TEXT]
         legacy_owner = ident == OWNER
         with self._lock:
             self._reload_locked()
             e = self._entry(self._data, ident.name)
-            if e is None and not legacy_owner:
+            if e is None and not legacy_owner:            # no key, no devices: nothing to check, whatever the id
                 return "approved"
+            if not isinstance(device_id, str) or not 0 < len(device_id) <= 128:
+                return "refused"
+            label, addr = str(label or "")[:MAX_TEXT], str(addr or "")[:MAX_TEXT]
             d = e["devices"].get(device_id) if e else None
             if d is not None:
                 d["last_seen"] = now
@@ -380,6 +401,8 @@ class KeyStore:
         return self._new_device(ident, legacy_owner, device_id, label, addr, now)
 
     def _persist_locked(self) -> None:
+        if self._bad:                                     # the in-memory state still answers; the file is not touched
+            return
         try:
             self._save(self._data)
         except OSError as e:                              # a request is not failed for a note about it
@@ -403,7 +426,10 @@ class KeyStore:
                                        "first_seen": now, "last_seen": now, "decided_by": None}
             self._log(data, "pending", ident.name, device_id)
             return "pending"
-        return self._change(go)
+        try:
+            return self._change(go)
+        except KeysFileBad:                               # cannot be recorded: held, not let in
+            return "pending"
 
     def decide_device(self, key_name: str, device_id: str, approve: bool, by: Identity) -> bool:
         """Approve or refuse a device.  Who may do so is `may_approve`, asked by the route; one rule is kept here: a

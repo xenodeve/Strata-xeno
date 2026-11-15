@@ -271,6 +271,88 @@ class Reload(Base):
         s.create("cy", "guest")                                        # no match() in between
         self.assertEqual([k["name"] for k in self.read()["keys"]], ["ann", "bob", "cy"])
 
+    def _break(self, text="{ typo"):
+        Path(self.path).write_text(text, encoding="utf-8")
+        st = os.stat(self.path)
+        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+
+    def test_no_write_while_the_file_is_broken(self):
+        s = self.store("abc")
+        k = s.create("ann", "guest")
+        s.device(ANN, "d1", "PC", "1.1.1.1", 1000.0)
+        s.decide_device("ann", "d1", True, OWNER)
+        self._break()
+        with mock.patch("builtins.print"):
+            s.reload_if_changed()
+            for call in (lambda: s.create("bob", "guest"), lambda: s.rename("ann", "anna"),
+                         lambda: s.set_role("ann", "owner"), lambda: s.revoke("ann"),
+                         lambda: s.decide_device("ann", "d1", False, OWNER),
+                         lambda: s.clear_device("ann", "d1")):
+                with self.assertRaises(identity.KeysFileBad):
+                    call()
+            self.assertEqual(s.device(OWNER, "o1", "Desk", "2.2.2.2", 1000.0), "pending")     # the legacy owner's first device
+            self.assertEqual(s.device(ANN, "d1", "PC", "3.3.3.3", 5000.0), "approved")        # a last_seen / address change
+            self.assertEqual(s.device(ANN, "d9", "PC", "3.3.3.3", 5000.0), "pending")         # a new device
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), "{ typo")               # the broken bytes are still there
+        self.assertEqual(s.match(k), ANN)                                                     # the last good keys still answer
+        self.assertIsInstance(identity.KeysFileBad("x"), ValueError)
+
+    def test_writes_resume_when_the_file_is_fixed(self):
+        s = self.store()
+        s.create("ann", "guest")
+        good = Path(self.path).read_text(encoding="utf-8")
+        self._break()
+        with mock.patch("builtins.print"):
+            s.reload_if_changed()
+        with self.assertRaises(identity.KeysFileBad):
+            s.create("bob", "guest")
+        Path(self.path).write_text(good, encoding="utf-8")
+        st = os.stat(self.path)
+        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns + 9_000_000_000))
+        s.create("bob", "guest")
+        self.assertEqual([k["name"] for k in self.read()["keys"]], ["ann", "bob"])
+
+    def test_deleting_a_broken_file_lets_a_new_one_be_written(self):
+        s = self.store()
+        s.create("ann", "guest")
+        self._break()
+        with mock.patch("builtins.print"):
+            s.reload_if_changed()
+        os.unlink(self.path)
+        s.reload_if_changed()
+        s.create("bob", "guest")
+        self.assertEqual([k["name"] for k in self.read()["keys"]], ["ann", "bob"])    # the held keys are written back
+
+    def test_a_file_broken_at_start_is_not_overwritten(self):
+        Path(self.path).write_text("{ typo", encoding="utf-8")
+        with mock.patch("builtins.print"):
+            s = self.store()
+            with self.assertRaises(identity.KeysFileBad):
+                s.create("ann", "guest")
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), "{ typo")
+
+    def test_reserved_names_in_the_file_are_dropped(self):
+        import hashlib
+        h = lambda k: hashlib.sha256(k).hexdigest()
+        Path(self.path).write_text(json.dumps({"keys": [
+            {"name": "owner", "role": "guest", "created": 1, "devices": {}, "sha256": h(b"k1")},
+            {"name": "Anonymous", "role": "owner", "created": 1, "devices": {}, "sha256": h(b"k2")},
+            {"name": "ann", "role": "guest", "created": 1, "devices": {}, "sha256": h(b"k3")}]}), encoding="utf-8")
+        with mock.patch("builtins.print") as log:
+            s = self.store("legacy")
+        self.assertEqual(log.call_count, 2)
+        self.assertIsNone(s.match("k1"))
+        self.assertIsNone(s.match("k2"))
+        self.assertEqual(s.match("k3"), ANN)
+        self.assertEqual(s.match("legacy"), OWNER)
+        self.assertEqual([r["name"] for r in s.view()], ["ann"])
+        self.assertIs(s.may_approve(Identity("owner", "guest"), "owner", "d1"), False)
+
+    def test_the_legacy_entry_in_the_file_is_still_kept(self):
+        s = self.store("abc")
+        s.device(OWNER, "o1", "", "", 1.0)
+        self.assertIn("owner", [r["name"] for r in self.store("abc").view()])
+
     def test_a_failed_write_leaves_the_store_as_it_was(self):
         s = self.store()
         s.create("ann", "guest")
@@ -364,6 +446,12 @@ class Devices(Base):
         self.assertEqual(self.s.device(LOCAL_GUEST, "d1", "x", "127.0.0.1", 1.0), "approved")
         self.assertEqual(Path(self.path).read_text(encoding="utf-8"), before)
         self.assertEqual(self.s.pending(), [])
+
+    def test_no_entry_means_approved_whatever_the_device_id(self):
+        for bad in ("", None, "x" * 500):
+            self.assertEqual(self.s.device(LOCAL_GUEST, bad, "", "127.0.0.1", 1.0), "approved")
+        self.assertEqual(self.s.device(Identity("ghost", "guest"), "", "", "", 1.0), "approved")
+        self.assertEqual(self.s.device(ANN, "", "", "", 1.0), "refused")            # a key's own bad id stays refused
 
     def test_a_store_without_a_file_path_records_nothing(self):
         s = KeyStore(None, "abc")
