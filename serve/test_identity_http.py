@@ -555,6 +555,32 @@ class MonitorByIdentity(Base):
             self.assertEqual({r["who"]: r["preview"] for r in body[items]},
                              {"ann": "ann asks about apples", "bob": "bob asks about pears"})
 
+    def test_messages_and_responses_carry_identity_too(self):
+        """Claude Code's /v1/messages and the Responses API record their sender the same way."""
+        for path, body in (("/v1/messages", {"model": "m", "max_tokens": 64,
+                                             "messages": [{"role": "user", "content": "ann asks via messages"}]}),
+                           ("/v1/responses", {"model": "m", "max_output_tokens": 64, "input": "ann asks via responses"})):
+            with self.subTest(path=path):
+                code, got = self.req("POST", path, body, key=self.ann, device=DEV1)
+                self.assertEqual(code, 200, got)
+                self.assertEqual(self.svc.hstore.page(0, 1)["items"][0]["who"], "ann")
+                self.assertEqual(self.svc.api_requests[-1]["who"], "ann")
+                code, page = self.req("GET", "/metrics/requests", key=self.bob, device=DEV2)
+                self.assertNotIn("ann asks", json.dumps(page))
+                self.assertTrue(all("preview" not in r for r in page["items"] if r["who"] == "ann"))
+        # the Responses API's holder is named from its own meta
+        self.engine.go.clear()
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+        t = threading.Thread(target=lambda: (c.request("POST", "/v1/responses", body=json.dumps(
+            {"model": "m", "max_output_tokens": 64, "input": "held"}).encode(), headers={
+            "Content-Type": "application/json", "Authorization": "Bearer " + self.ann, "X-Strata-Device": DEV1}),
+            c.getresponse().read()), daemon=True)
+        t.start()
+        self.wait_for(lambda: self.live(self.bob, DEV2)["holder"] == "ann")
+        self.engine.go.set()
+        t.join(20)
+        c.close()
+
     def test_detail_of_another_guest_is_404(self):
         self.assertEqual(self.ask(self.ann, DEV1, "ann asks about apples")[0], 200)
         rid = self.svc.hstore.page(0, 1)["items"][0]["id"]
