@@ -93,6 +93,9 @@ export const part: Record<string, string> = {
   "{key}: a device refused by {by}": "{key}: ปฏิเสธอุปกรณ์โดย {by}",
   "{key}: a device cleared by {by}": "{key}: ล้างอุปกรณ์โดย {by}",
 
+  // Settings > MCP servers in team mode: which servers guests may use (R11)
+  "Guests may use": "แขกใช้ได้",
+  "Guest keys get only the servers marked “Guests may use”. A server marked for guests lets every guest use that server's tools on this PC, with this PC's rights: do not mark one that reaches your files or a shell.": "คีย์ของแขกใช้ได้เฉพาะเซิร์ฟเวอร์ที่ติ๊ก “แขกใช้ได้” ไว้ เซิร์ฟเวอร์ที่ติ๊กไว้จะให้แขกทุกคนใช้เครื่องมือของเซิร์ฟเวอร์นั้นบนเครื่องนี้ได้ ด้วยสิทธิ์ของเครื่องนี้ อย่าติ๊กเซิร์ฟเวอร์ที่เข้าถึงไฟล์ของคุณหรือเชลล์ได้",
   // the Monitor
   "In use by {names}": "กำลังใช้งานโดย {names}",
   "Waiting: {list}": "รอคิว: {list}",

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { getMcpConfig, saveMcpConfig } from "../lib/api"
 import { fmt } from "../lib/format"
 import { msg, t, tn } from "../lib/i18n"
-import { MASK, bodyFor, emptyDraft, entryFromRow, entryOf, limitsOf, parsePaste, stateOf, toDraft, type Change, type Draft, type McpConfigView, type McpLimits, type McpRow } from "../lib/mcpconfig"
+import { MASK, bodyFor, emptyDraft, entryFromRow, entryOf, guestsAfter, limitsOf, marksGuests, parsePaste, stateOf, toDraft, type Change, type Draft, type McpConfigView, type McpLimits, type McpRow } from "../lib/mcpconfig"
 import { cn } from "../lib/cn"
 import { Collapse, Reveal } from "./motion"
 import { StatusLabel } from "./orb"
@@ -45,6 +45,7 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
   const rows = view.servers
   const can = view.editable
   const taken = rows.filter((r) => r.source === "config").map((r) => r.name)
+  const guests = marksGuests(view)                                           // team mode, the owner: which servers guests may use (#310 R11)
 
   /** Save the list with `change` (and `settings`): null when it was saved, else why not. */
   const commit = async (change?: Change | Change[], settings?: Partial<McpLimits>): Promise<string | null> => {
@@ -84,6 +85,15 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
     const { disabled: _was, ...rest } = entryFromRow(r)
     const err = await commit({ name: r.name, entry: r.disabled ? rest : { ...rest, disabled: true } })
     if (err) setNotice(err)
+  }
+
+  const markGuest = async (r: McpRow, on: boolean) => {
+    setBusy(true)
+    setNotice(null)
+    const res = await saveMcpConfig({ ...bodyFor(rows), guest_mcp: guestsAfter(rows, r.name, on) })
+    setBusy(false)
+    if ("error" in res) setNotice(res.error)
+    else show(res.view)
   }
 
   const remove = async (r: McpRow) => {
@@ -146,6 +156,11 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
         {rows.length ? t("{n} tools; the model calls them when it decides to.", { n: fmt(nTools) }) : t("No server is set up yet. A server gives the model tools: files, a browser, a database.")}
       </p>
       {readOnly}
+      {guests && (
+        <p role="note" className="mt-2 rounded-md bg-fill px-3 py-2 text-[12px] text-ink-2">
+          {t("Guest keys get only the servers marked “Guests may use”. A server marked for guests lets every guest use that server's tools on this PC, with this PC's rights: do not mark one that reaches your files or a shell.")}
+        </p>
+      )}
 
       <ul className="m-0 mt-2 list-none p-0" aria-label={t("MCP servers")}>
         {rows.map((s) => {
@@ -168,6 +183,12 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
               {s.source === "file" && <div className="mt-0.5 text-[12px] text-ink-3">{t("From {file}: edit that file to change it.", { file: s.file || "--mcp-config" })}</div>}
               {s.overridden && <div className="mt-0.5 text-[12px] text-ink-3">{t("A server of the same name in --mcp-config is used instead.")}</div>}
               {s.error && <div className="mt-1 text-[12px] text-bad [overflow-wrap:anywhere]">{s.error}</div>}
+              {guests && !s.overridden && (
+                <label className="mt-1.5 flex w-fit items-center gap-2 text-[12px]">
+                  <input type="checkbox" checked={!!s.guest} disabled={busy} onChange={(e) => void markGuest(s, e.target.checked)} aria-label={`${t("Guests may use")} ${s.name}`} />
+                  <span>{t("Guests may use")}</span>
+                </label>
+              )}
               {mine && (
                 <div className="mt-1.5 flex flex-wrap gap-1.5">
                   <Button kind="quiet" disabled={busy} onClick={() => openForm("edit", toDraft(s))} label={`${t("Edit")} ${s.name}`}>{t("Edit")}</Button>

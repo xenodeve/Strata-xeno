@@ -12,6 +12,7 @@ export interface McpTool { tool: string; name?: string; description?: string }
 export interface McpRow extends McpEntry {
   name: string; kind: string; source: "config" | "file"; editable: boolean; disabled: boolean
   shadowed?: boolean; overridden?: boolean; file?: string
+  guest?: boolean                                                             // team mode, the owner's view only: guests may use it (#310 R11)
   status: string; error: string | null; tools: McpTool[]; info?: { name?: string; version?: string }
 }
 export interface McpLimits { timeout_s: number; max_result_chars: number; max_rounds: number }
@@ -88,6 +89,16 @@ export function bodyFor(rows: McpRow[], change?: Change | Change[], settings?: P
   return settings ? { servers, settings } : { servers }
 }
 export interface Change { name: string; entry: McpEntry | null }
+
+/** #310 R11: whether this view is the team owner's - then each server says whether guests may use it (`guest`). */
+export const marksGuests = (v: McpConfigView) => v.editable && v.servers.some((r) => r.guest !== undefined)
+
+/** The servers guests may use once `name` is switched `on` or off: the run config's "guest_mcp" as the POST body takes it. */
+export function guestsAfter(rows: McpRow[], name: string, on: boolean): string[] {
+  const names = new Set(rows.filter((r) => r.guest && r.name !== name).map((r) => r.name))
+  if (on) names.add(name)
+  return [...names]
+}
 
 /** A block of Claude Desktop's format ({"mcpServers": {...}}), or the same without the wrapper ({"name": {...}}). */
 export function parsePaste(text: string, taken: string[] = []): { entries: Record<string, McpEntry>; problem: string | null } {
