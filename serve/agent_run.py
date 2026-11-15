@@ -51,14 +51,16 @@ class Broker:
         return len(slots)
 
     def end_all(self, who: str) -> int:
-        """#310: a key that is revoked (or made a guest): every live run of `who` is cancelled and every prompt it holds
-        is closed as refused (a permission as "deny", a question as skipped).  How many prompts were closed."""
+        """#310: a key that is revoked (or made a guest): every live run of `who` is stopped for good (`stopped`, its
+        cancel set; a run not yet bound to its request's cancel carries it over in `AgentRun.bind`) and every prompt it
+        holds is closed as refused (a permission as "deny", a question as skipped).  How many prompts were closed."""
         with self.lock:
-            runs = [run for run in list(self.runs) if run.who == who]
+            for run in list(self.runs):
+                if run.who == who:
+                    run.stopped = True
+                    run.cancel.set()
             gone = [rid for rid, s in self.pending.items() if s.get("who") == who]
             slots = [self.pending.pop(rid) for rid in gone]
-        for run in runs:
-            run.cancel.set()
         for s in slots:
             s["answer"] = "deny" if s.get("kind") == "permission" else {"answers": None}
             s["event"].set()
@@ -114,6 +116,7 @@ class AgentRun:
         self.limit_hit = False                                 # the tool loop stopped at its limit of rounds
         self.steers: queue.Queue = queue.Queue()               # what the user sent while the agent worked: read by the model at the next step (serve/server.py run_with_mcp)
         self.ctx = agent.AgentContext(policy=policy, session=session, ask=self.ask, cancel=cancel, emit=self._emit, question=self.question)
+        self.stopped = False                                   # #310: Broker.end_all stopped it (its key was revoked or made a guest)
         broker.track(self)                                     # #310: a rename moves it, a revoke stops it
 
     def steer(self, text: str) -> None:
@@ -128,8 +131,14 @@ class AgentRun:
                 return out
 
     def bind(self, cancel: threading.Event) -> None:
-        """The request's own cancel event (made after the run, once the prompt is ready)."""
-        self.cancel = self.ctx.cancel = cancel
+        """The request's own cancel event (made after the run, once the prompt is ready).  A stop that came before it
+        (Broker.end_all while the request waited, for a model load) carries over: under the broker's lock, so a stop
+        cannot fall between the two events."""
+        with self.broker.lock:
+            old = self.cancel
+            self.cancel = self.ctx.cancel = cancel
+            if self.stopped or old.is_set():
+                cancel.set()
 
     def _emit(self, event: dict) -> None:
         self.events.put({"call_id": self.current, **event})                # an event that names its call (or none: a prompt or stop hook) keeps it

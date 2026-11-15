@@ -352,6 +352,24 @@ class KeysAndDevices(Base):
         self.assertEqual(self.req("GET", "/props")[0], 401)       # team mode: a key always
         self.assertEqual(self.req("GET", "/props", key="k")[0], 200)
 
+    def test_the_first_key_is_not_made_through_a_tunnel(self):
+        """#310 review: with no API key, the first create comes from this PC itself only - not from a tunnel that
+        connects from 127.0.0.1 and names localhost, which may_edit alone lets through."""
+        self.start(team=False)
+        for headers in ({"X-Forwarded-For": "203.0.113.6"}, {"Cf-Connecting-Ip": "203.0.113.5"},
+                        {"Forwarded": "for=203.0.113.7"}):
+            code, err = self.req("POST", "/keys", {"action": "create", "name": "boss", "role": "owner"}, headers=headers)
+            self.assertEqual((code, err["error"]["type"]), (403, "forbidden"), headers)
+            self.assertIn("this PC itself", err["error"]["message"])
+        self.assertFalse(self.keys_path.exists())
+        self.assertEqual(self.keys({"action": "create", "name": "boss", "role": "owner"}, key=None)[0], 200)
+
+    def test_with_the_api_key_the_first_key_may_come_from_anywhere(self):
+        self.start(api_key="k", team=False, peer_override=REMOTE)
+        code, got = self.req("POST", "/keys", {"action": "create", "name": "boss", "role": "owner"}, key="k",
+                             headers={"X-Forwarded-For": "203.0.113.6"})
+        self.assertEqual(code, 200, got)
+
     def test_without_any_key_only_this_pc_makes_the_first_one_and_it_is_an_owners(self):
         self.start(team=False)
         self.svc.peer_override = REMOTE                           # another PC: today's may_edit refusal
@@ -685,6 +703,42 @@ class RunsBelongToTheirIdentity(Base):
         self.svc.peer_override = None
         self.assertEqual(self.req("POST", "/keys", {"action": "role", "name": "ann", "role": "owner"}, key="k"),
                          (200, {"ok": True}))
+
+    def held_at_load(self):
+        """The request's model load waits until `release` (the window a revoke or demotion can fall into)."""
+        entered, release = threading.Event(), threading.Event()
+        real = self.svc.load
+
+        def load(*a, **k):
+            entered.set()
+            release.wait(20)
+            return real(*a, **k)
+        self.svc.load = load
+        self.addCleanup(release.set)
+        return entered, release
+
+    def test_a_revoke_or_demotion_while_the_request_waits_stops_the_run(self):
+        """#310 review: the run's key is checked again right before it starts; a revoke (401) or a demotion (403)
+        while the request waited for a model load means no run, no prompt, no tool."""
+        self.start_agent(tool_call("Read", file_path=str(self.outside / "b.txt")), "</think>\n\nDone.",
+                         api_key="k", peer_override=REMOTE)
+        keys = {"ann": (self.approved("ann", "owner"), DEV1), "bea": (self.approved("bea", "owner", device=DEV2), DEV2)}
+        for name, change, status in (("ann", {"action": "revoke", "name": "ann"}, 401),
+                                     ("bea", {"action": "role", "name": "bea", "role": "guest"}, 403)):
+            with self.subTest(name=name):
+                entered, release = self.held_at_load()
+                t, asked, events = self.launch(*keys[name])
+                self.assertTrue(entered.wait(20))
+                self.svc.peer_override = None
+                self.assertEqual(self.req("POST", "/keys", change, key="k")[0], 200)
+                self.svc.peer_override = REMOTE
+                release.set()
+                t.join(20)
+                self.assertFalse(t.is_alive())
+                self.assertEqual(events[0], status)
+                self.assertFalse(asked.is_set())
+                self.assertIsNone(self.svc.runs.get(self.RID))
+                self.assertEqual(self.svc.broker.pending, {})
 
     def test_rename_moves_the_run_and_its_prompts(self):
         """A renamed key keeps its run: the prompt open at the rename and the next one are the new name's to answer;

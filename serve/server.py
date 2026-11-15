@@ -5606,8 +5606,7 @@ def make_handler(svc: Service):
             (no keys file) it is as before: the api_key, when set, is the door and every holder is the owner; with no
             key the owner is a request from this PC that names this PC (mcp_admin.may_edit), anyone else a guest."""
             self.team = svc.keys.team_mode()
-            auth = self.headers.get("Authorization", "")
-            given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+            given = self._given_key()
             if not self.team:
                 if svc.api_key and not key_matches(given, svc.api_key):
                     self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
@@ -5641,6 +5640,27 @@ def make_handler(svc: Service):
                 self._json(403, {"error": {"type": "device_refused", "message":
                                  f"this device may not use the key {ident.name!r} (the owner refused it, or the key has "
                                  f"too many devices); the owner can clear it"}})
+            return False
+
+        def _given_key(self) -> str:
+            auth = self.headers.get("Authorization", "")
+            return auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+
+        def _still_may_run(self, arun) -> bool:
+            """#310: right before a coding run starts, after the request may have waited (a model load): its key is still
+            there and still an owner's, and no revoke or demotion stopped the run meanwhile.  Otherwise the run's cancel
+            is set and the request is refused (401 revoked, 403 no longer an owner)."""
+            if not self.team:
+                return True
+            ident = svc.keys.match(self._given_key())
+            if ident is not None and ident.is_owner and not arun.stopped:
+                return True
+            arun.cancel.set()
+            if ident is None:
+                self._json(401, {"error": {"type": "authentication_error", "message": "the key was revoked"}})
+            else:
+                self._json(403, {"error": {"type": "forbidden", "message": "The coding tools can be used only with an "
+                                                                          "owner key (this key was changed meanwhile)"}})
             return False
 
         def _peer(self) -> str:
@@ -6511,6 +6531,12 @@ def make_handler(svc: Service):
                                                              "there; it cannot be renamed, made a guest or revoked here"}})
             if action != "create" and not self.team:        # no keys file: no key to change, and nothing is written
                 return self._json(404, {"error": {"message": f"there is no key named {name!r}"}})
+            if not self.team and not svc.api_key and not self._loopback_local():
+                # the first key turns team mode on: with no API key it is made on this PC itself only, never through a
+                # tunnel that names this PC (may_edit does not look at the forwarding headers)
+                return self._json(403, {"error": {"type": "forbidden", "message": "the first key is made only on this PC "
+                                                  "itself (open the page as localhost, not through a tunnel or proxy), or "
+                                                  "with the API key"}})
             by, missing = self.identity, {"error": {"message": f"there is no key named {name!r}"}}
             try:
                 if action == "create":
@@ -6808,6 +6834,8 @@ def make_handler(svc: Service):
             detached = arun is not None and bool(req.get("stream")) and isinstance(rid, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,64}", rid) is not None
             if arun is not None:
                 arun.bind(cancel)
+                if not self._still_may_run(arun):            # #310: a revoke or demotion while this request waited
+                    return
             if not detached:
                 self._watch_client(cancel)                   # #430 #431 (a run that goes on when the page goes away is not cancelled by it: serve/runs.py)
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,

@@ -151,6 +151,28 @@ class Holder(unittest.TestCase):
         t.join(3)
         self.assertEqual((box["a"], box["b"]), ("allow", "deny"))
 
+    def test_a_stop_before_bind_carries_over_to_the_requests_cancel(self):
+        """#310 review: the request binds its own cancel event after it may have waited for a model load; a revoke in
+        that window must still stop the run."""
+        run, broker = make(who="ann")
+        self.assertEqual(broker.end_all("ann"), 0)
+        self.assertTrue(run.stopped)
+        later = threading.Event()
+        run.bind(later)
+        self.assertTrue(later.is_set())
+        self.assertIs(run.ctx.cancel, later)
+        other, _ = make(who="bob", broker=broker)
+        other.cancel.set()                                            # any cancel that came first carries over too
+        fresh = threading.Event()
+        other.bind(fresh)
+        self.assertTrue(fresh.is_set())
+        quiet, _ = make(who="cat", broker=broker)
+        calm = threading.Event()
+        quiet.bind(calm)
+        self.assertFalse(calm.is_set())
+        broker.end_all("cat")                                         # after bind: the bound event is the one set
+        self.assertTrue(calm.is_set())
+
     def test_end_all_stops_a_name_and_closes_what_it_was_asked(self):
         """#310: a revoked key: its runs are cancelled and every prompt it holds is closed as refused."""
         run, broker = make(who="ann")
