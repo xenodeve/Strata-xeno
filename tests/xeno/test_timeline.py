@@ -289,3 +289,37 @@ def test_split_copies_are_matched_to_the_split_issuer():
     assert r["issue_to_start_ms"]["n"] == 2 and r["issue_to_start_ms"]["max"] == pytest.approx(9.0), r["issue_to_start_ms"]
     assert r["layer_copy_ms"] == {0: pytest.approx(4.0)}   # both copies on layer 0, keyed by layer, not by expert
 
+
+
+def test_slot_switch_is_split_into_save_park_wait_load_and_the_offload_beside_the_next_read(tmp_path):
+    """#321: the engine's `slot a -> b restored N tokens in M ms` line times the whole switch.  The report splits it
+    into the outgoing save, the wait for the incoming slot's park write and the incoming load, and gives the next
+    prompt read with the time the background offload write ran beside it."""
+    ev = [{"ph": "M", "pid": PID, "tid": 9, "name": "thread_name", "args": {"name": "slot offload"}},
+          X(1, "slot switch", 0, 1000, 121000, 71000),
+          X(1, "slot save", 0, 300, 0, 121000),
+          X(1, "slot park wait", 300, 350, 1),
+          X(1, "slot load", 350, 1000, 1, 71000),
+          X(1, "slot load positional", 350, 600, 1),
+          X(1, "slot load checkpoints", 600, 900, 1),
+          X(1, "slot restore", 900, 950, 1),
+          X(1, "slot drop", 950, 1000, 1),
+          X(9, "slot offload", 300, 2000, 0, 790),
+          X(1, "prompt read (batched)", 1000, 4000, 0, 2200),
+          X(1, "prompt read (windows)", 4000, 5000, 2200, 2228),
+          X(1, "decode round", 5000, 5040),
+          X(1, "prompt read (batched)", 6000, 7000, 0, 100)]   # after the decode: not this switch's read
+    r = timeline.switch_report(timeline.load(write(tmp_path, ev)))
+    assert len(r) == 1
+    s = r[0]
+    assert (s["out_tokens"], s["in_tokens"]) == (121000, 71000)
+    assert s["switch_ms"] == pytest.approx(1000)
+    assert s["save_ms"] == pytest.approx(300)
+    assert s["park_wait_ms"] == pytest.approx(50)
+    assert s["load_ms"] == pytest.approx(650)
+    assert (s["load_positional_ms"], s["load_checkpoints_ms"], s["restore_ms"]) == (
+        pytest.approx(250), pytest.approx(300), pytest.approx(50))
+    assert s["drop_ms"] == pytest.approx(50)
+    assert s["other_ms"] == pytest.approx(0)
+    assert s["read_ms"] == pytest.approx(4000)          # 1000-5000, up to the first decode round
+    assert s["offload_in_read_ms"] == pytest.approx(1000)   # the offload 300-2000 beside the read 1000-5000

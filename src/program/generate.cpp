@@ -14547,6 +14547,7 @@ int main(int argc, char** argv) {
             }
             if (req_slot != active_slot) {
                 const auto switch_start = Clock::now();
+                int64_t tl_out = 0;   // #321: the outgoing conversation's tokens, for the "slot switch" span
                 // A cancelled request has usable checkpoints but no valid live state.
                 if (!live_ok && !checks.empty()) {
                     const auto& last = checks.back();
@@ -14556,6 +14557,8 @@ int main(int argc, char** argv) {
                 if (live_ok && !live.empty()) {
                     auto& saved = slots[active_slot];
                     if (!saved.written()) saved.drop();   // never runs: an active slot was waited for when it came in
+                    const auto t_save = Clock::now();   // #321: the outgoing save on this thread ("slot save")
+                    tl_out = (int64_t) live.size();
 #if defined(_WIN32)
                     wchar_t temp_dir[MAX_PATH], temp_file[MAX_PATH];
                     const DWORD count = GetTempPathW(MAX_PATH, temp_dir);
@@ -14574,6 +14577,7 @@ int main(int argc, char** argv) {
                         std::printf("ERR saving conversation cache slot failed\n"); return serve_fatal();
                     }
                     saved.checks = std::move(checks);
+                    strata::timeline::complete("slot save", t_save, Clock::now(), active_slot, tl_out);
                     // #145: the checkpoints - host vectors already, nothing the next request overwrites - go to the
                     // file on a thread: their write was 127-497 ms of every switch (swap-t40k-run.txt).  Their RAM is
                     // held until it ends, beside the incoming slot's.  STRATA_SLOT_SYNC=1: on this thread (the A/B).
@@ -14588,6 +14592,11 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr,"strata cache: slot %d offloaded %.1f MiB of checkpoint state in %.0f ms\n",
                             slot,saved.state_bytes/(1024.0*1024.0),
                             std::chrono::duration<double,std::milli>(Clock::now()-t0).count());
+                        if (strata::timeline::enabled()) {   // #321: beside the next prompt read (b: MiB)
+                            strata::timeline::name_thread("slot offload");
+                            strata::timeline::complete("slot offload", t0, Clock::now(), slot,
+                                                       (int64_t) (saved.state_bytes >> 20));
+                        }
                         return true;
                     };
                     static const bool sync_write = std::getenv("STRATA_SLOT_SYNC") != nullptr;
@@ -14596,18 +14605,37 @@ int main(int argc, char** argv) {
                 }
                 live_ok = false; live.clear(); live_imgs.clear(); checks.clear();
                 auto& incoming = slots[req_slot];
-                (void) incoming.written();   // #145: its park's write first (a failed one dropped the slot's state)
+                {
+                    strata::timeline::Span sp("slot park wait", req_slot);
+                    (void) incoming.written();   // #145: its park's write first (a failed one dropped the slot's state)
+                }
                 if (incoming.file) {
-                    if (!slot_positional(incoming,ss,g,mtp,true) || !slot_checkpoints(incoming,true)
-                        || !checkpoint_restore(incoming.running,ss,g)) {
+                    // #321: each step of the incoming load is a span of its own (the same calls and order as before)
+                    strata::timeline::Span load_sp("slot load", req_slot, incoming.cells);
+                    bool loaded;
+                    {
+                        strata::timeline::Span sp("slot load positional", req_slot);
+                        loaded = slot_positional(incoming,ss,g,mtp,true);
+                    }
+                    if (loaded) {
+                        strata::timeline::Span sp("slot load checkpoints", req_slot);
+                        loaded = slot_checkpoints(incoming,true);
+                    }
+                    if (loaded) {
+                        strata::timeline::Span sp("slot restore", req_slot);
+                        loaded = checkpoint_restore(incoming.running,ss,g);
+                    }
+                    if (!loaded) {
                         std::printf("ERR loading conversation cache slot failed\n"); return serve_fatal();
                     }
                     live = incoming.running.ids; live_imgs = incoming.running.imgs; live_ok = true;
                     checks = std::move(incoming.checks); cvec_cached = incoming.cvec;
+                    strata::timeline::Span drop_sp("slot drop", req_slot);   // its file closes (deleted) and RAM frees
                     incoming.drop();
                 }
                 std::fprintf(stderr,"strata cache: slot %d -> %d restored %lld tokens in %.0f ms\n",active_slot,req_slot,
                     (long long)live.size(),std::chrono::duration<double,std::milli>(Clock::now()-switch_start).count());
+                strata::timeline::complete("slot switch", switch_start, Clock::now(), tl_out, (int64_t) live.size());
                 active_slot = req_slot;
             }
             // the control vector: upstream 0.1.30 invalidates the session and the checkpoints for a switch below,
