@@ -80,6 +80,7 @@ CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 WIN = os.name == "nt"
 MODES = ("w1", "w2a", "w2b", "short", "w2s")
+TEMPERATURE = 1.0                  # --temperature: the agent's 1.0; 0 = greedy (parity runs)
 PIN_SLOTS = {"A": 0, "B": 1, "solo": 0}   # pin=1: the engine cache slot of each user's turns (#321)
 SHORT_BASE = "installer-fr.0"      # the short mode's long turn (~37K tokens)
 SHORT_FILE, SHORT_LINES, SHORT_N = "setup.py", 20, 4
@@ -100,6 +101,7 @@ class Arm:
     exe: str | None = None
     xargs: list = field(default_factory=list)
     env: dict = field(default_factory=dict)
+    setargs: dict = field(default_factory=dict)   # setarg=--flag:value;...: replace (or add) an engine flag's value
     pin: bool = False                # pin=1: user A's turns send strata_cache_slot 0, user B's 1 (side requests: none)
 
 
@@ -119,6 +121,10 @@ def parse_arm(spec: str) -> Arm:
                 arm.parallel = int(v)
         elif k == "exe":
             arm.exe = v
+        elif k == "setarg":
+            for x in (y for y in v.split(";") if y):
+                flag, _, val = x.partition(":")
+                arm.setargs[flag] = val
         elif k == "pin":
             arm.pin = v not in ("0", "", "false", "no")
         elif k == "xargs":
@@ -160,6 +166,9 @@ def derive_config(base: dict, arm: Arm, boot_dir: Path, port: int, profile_load:
             shutil.copyfile(src, dst)
     if "--dump-routing" in args:                    # never the served routing trace
         _redirect_arg(args, "--dump-routing", str(boot_dir / "routing.bin"))
+    for flag, val in arm.setargs.items():           # setarg: the flag's value replaced, or the flag added
+        if _redirect_arg(args, flag, sub(val)) is None:
+            args += [flag, sub(val)]
     if profile_load:                                # load the profile from a snapshot, not the base's file
         _redirect_arg(args, "--expert-profile", str(profile_load))
     cfg["args"] = args
@@ -315,7 +324,8 @@ def post_stream(port: int, messages: list[dict], *, max_new: int, seed: int, mar
     the empty role chunk, sent before the prompt is read; a ':' line is a keep-alive).  `extra`: body fields laid over
     the agent's (a value None removes the field), e.g. strata_cache_slot, or a side request's own settings."""
     body = {"messages": messages, "tools": atb.TOOLS if tools is None else tools, "max_tokens": max_new,
-            "temperature": 1.0, "top_p": 0.95, "top_k": 20, "seed": seed, "reasoning_effort": "high", "stream": True}
+            "temperature": TEMPERATURE, "top_p": 0.95, "top_k": 20, "seed": seed, "reasoning_effort": "high",
+            "stream": True}
     for k, v in (extra or {}).items():
         if v is None:
             body.pop(k, None)
@@ -900,6 +910,7 @@ def main(argv=None) -> int:
     ap.add_argument("--log", help="JSONL (default <work-dir>/workstation_bench.jsonl)")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--server-root", default=str(ROOT), help="the tree whose serve/server.py runs")
+    ap.add_argument("--temperature", type=float, default=1.0, help="the requests' temperature (0: greedy)")
     ap.add_argument("--fixed-mode-order", action="store_true", help="every boot runs --mode in the given order "
                     "(default: odd rounds reverse it)")
     ap.add_argument("--profile-load", help="the --expert-profile every arm loads (a snapshot), instead of the base's")
@@ -925,6 +936,8 @@ def main(argv=None) -> int:
     if not modes or any(m not in MODES for m in modes):
         ap.error(f"--mode: one or more of {', '.join(MODES)}")
     parse_split(a.split)
+    global TEMPERATURE
+    TEMPERATURE = a.temperature
     base_path = Path(a.config)
     base = json.loads(base_path.read_text(encoding="utf-8"))
     arms = [parse_arm(s) for s in a.arms]

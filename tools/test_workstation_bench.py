@@ -98,6 +98,14 @@ class ArmConfig(unittest.TestCase):
         self.assertNotIn("CUDA_DEVICE_ORDER", env)
         self.assertEqual(env["STRATA_TIMELINE"], f"{bd}/tl.json")
 
+    def test_setarg_replaces_or_adds_a_flag(self):
+        cfg = self.derive("N:setarg=--kv:q4;--adapt-swaps:0")
+        a = cfg["args"]
+        self.assertEqual(a[a.index("--kv") + 1], "q4")
+        self.assertEqual(a.count("--kv"), 1)
+        self.assertEqual(a[a.index("--adapt-swaps") + 1], "0")
+        self.assertEqual(self.base["args"][self.base["args"].index("--kv") + 1], "int8")   # the base untouched
+
     def test_dump_routing_never_the_served_trace(self):
         self.base["args"] += ["--dump-routing", "D:/real/routing/served.bin"]
         cfg = self.derive("P2:")
