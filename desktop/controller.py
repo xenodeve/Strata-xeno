@@ -16,11 +16,13 @@ first, and every later step of theirs checks that before it starts a runner or o
 asks the server for devices that wait for approval every 30 s while the runner is online.  Quit starts
 `desktop-quit-watchdog`, which ends the process after 10 s if a step hangs, and logs the step.
 
-The token in the web view's storage (ruling P3-R1): `servers.json` `injected` names the origin that may hold it.  It is
-written *before* the token is (a crash in between leaves a record, not a token nobody knows of), and cleared only when
-the clear script answered True: the clear runs on that server's own page, so it needs the server to answer, and a
-False keeps the record for the next try (the next switch, Quit, or the next start).  Origins this session could not
-clear are kept in memory and tried again at every clear; the file has one slot, which holds the newest.
+The token in the web view's storage (rulings P3-R1, P3-R3): `servers.json` `injected` lists every origin that may
+hold it - the one open, and each whose clear failed.  An origin is written there *before* the token is (a crash in
+between leaves a record, not a token nobody knows of), and leaves the list only when its clear script answered True:
+the clear runs on that server's own page, so it needs the server to answer, and a False keeps the origin for the next
+try (the next switch, Quit, or the next start, which clears every listed origin first).  The address each origin was
+opened at is remembered for the session, so a server behind a path prefix is cleared there even after its entry was
+renamed or removed.
 """
 from __future__ import annotations
 
@@ -220,8 +222,10 @@ class Controller:
         self._host = None
         self._ticket: object | None = None       # the current host's: its events carry it, a stale one is dropped
         self._watch: PendingWatch | None = None
-        left = store.injected                    # an earlier run's (a crash): known from the first moment, so a
-        self._dirty: list[str] = [left] if left else []     # Quit before start() still clears it, or keeps it
+        # An earlier run's (a crash): known from the first moment, so a Quit before start() still clears them or
+        # keeps them listed.
+        self._dirty: list[str] = list(store.injected)
+        self._bases: dict[str, str] = {}         # origin -> the address it was opened at (this session)
         self._front = "servers"                  # what Open shows: "servers", or "app" once the app was opened
         self._quitting = False
         self._quit_step = ""
@@ -285,7 +289,12 @@ class Controller:
 
     # ------------------------------------------------------------------ the token in the web view
     def _base_for(self, origin: str) -> str:
-        """The address to load for `origin`: a listed server's (its path prefix kept), else the origin itself."""
+        """The address to load for `origin`: the one it was opened at this session, else a listed server's (its path
+        prefix kept), else the origin itself."""
+        with self._mu:
+            known = self._bases.get(origin)
+        if known:
+            return known
         for e in self._store.entries():
             try:
                 if inject.origin(e.url) == origin:
@@ -294,17 +303,19 @@ class Controller:
                 continue
         return origin
 
-    def _mark(self, origin: str) -> None:
-        """`origin` may hold a token from now on: recorded before the token is written."""
+    def _mark(self, origin: str, base: str) -> None:
+        """`origin` may hold a token from now on: recorded, with every origin not cleared yet, before the token is
+        written."""
         with self._mu:
             if origin not in self._dirty:
                 self._dirty.append(origin)
-        self._store.set_injected(origin)
+            self._bases[origin] = base
+            listed = list(self._dirty)
+        self._store.set_injected(listed)
 
     def _clear(self) -> None:
-        """Removes the token from every origin that may hold one; the file then names the newest origin whose clear
-        failed (its server did not answer), or nothing.  Never between an inject's record and its end
-        (`_storage`)."""
+        """Removes the token from every origin that may hold one; the file then lists the origins whose clear failed
+        (their server did not answer).  Never between an inject's record and its end (`_storage`)."""
         with self._storage:
             self._clear_locked()
 
@@ -324,9 +335,9 @@ class Controller:
                             origin)
         with self._mu:
             self._dirty = [o for o in self._dirty if o not in tried or o in failed]
-            keep = self._dirty[-1] if self._dirty else None
+            listed = list(self._dirty)
         if tried:                                    # nothing tried: the record is left as it is
-            self._store.set_injected(keep)
+            self._store.set_injected(listed)
 
     # ------------------------------------------------------------------ the runner
     def _stop_runner(self) -> None:
@@ -425,7 +436,7 @@ class Controller:
             with self._mu:
                 if moved_on():
                     return False
-            self._mark(conn.origin)
+            self._mark(conn.origin, conn.base)
             ok = self._window.navigate_and_inject(conn.base, inject.inject_script(values, remove))
             with self._mu:
                 if moved_on():
@@ -489,7 +500,8 @@ class Controller:
             host = self._make_host(entry.url, token, self._device, self._label, self._runner_folder,
                                    self._on_state(ticket))
             self._host, self._ticket, self._open = host, ticket, conn
-        host.start()
+            host.start()                             # inside: a Quit cannot stop it before it started (it only
+                                                     # starts a thread), so no runner thread begins after Quit
 
     def open_without_runner(self) -> None:
         """The app without My PC (an older server, or the runner could not start): `strata.runner` removed."""
@@ -524,10 +536,30 @@ class Controller:
         code = code_text(self._state.code) if self._state.kind == "pending" else ""
         return bool(code) and bool(self._clipboard(code))
 
+    def saved(self, old_name: str | None, entry) -> None:
+        """The servers window saved `entry`, renamed from `old_name`: the open server keeps its connection (to the
+        address it was opened at) under its new name."""
+        if old_name is None or entry is None:
+            return
+        with self._mu:
+            if self._open is not None and self._open.name == old_name:
+                self._open.name = entry.name
+
+    def _is_open(self, name: str) -> bool:
+        """`name` is the server open now: by its name, or by the address the connection was made to (a rename the
+        controller was not told of)."""
+        with self._mu:
+            conn = self._open
+        if conn is None:
+            return False
+        if conn.name == name:
+            return True
+        entry = self._store.get(name)
+        return entry is not None and entry.url == conn.base
+
     def remove(self, name: str) -> None:
         with self._op:
-            with self._mu:
-                is_open = self._open is not None and self._open.name == name
+            is_open = self._is_open(name)
             if is_open:
                 with self._mu:
                     self._open = None
@@ -535,6 +567,14 @@ class Controller:
                 self._stop_runner()
                 self._window.hide_app()
                 self._clear()                            # before the entry goes: its address finds the origin
+            else:
+                entry = self._store.get(name)
+                try:
+                    dirty = entry is not None and inject.origin(entry.url) in self._dirty
+                except ValueError:
+                    dirty = False
+                if dirty:                                # a clear that failed before: try it while the address
+                    self._clear()                        # (and its path prefix) is still listed
             self._store.remove(name)
             if is_open:
                 self._set(TrayState("idle"), "")

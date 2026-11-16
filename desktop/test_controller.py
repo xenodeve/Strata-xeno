@@ -59,7 +59,7 @@ class FakeStore:
         self.log = log
         self.rows = rows if rows is not None else {"A": ServerEntry("A", URL_A, Secret(TOKEN_A)),
                                                    "B": ServerEntry("B", URL_B, Secret(TOKEN_B))}
-        self.last, self.injected = last, injected
+        self.last, self.injected = last, list(injected or [])
 
     def entries(self):
         return list(self.rows.values())
@@ -72,8 +72,12 @@ class FakeStore:
                 for e in self.rows.values()]
 
     def save(self, name, url, token, old_name=None):
-        e = ServerEntry(name, url, Secret(token or ""))
+        old = self.rows.pop(old_name, None) if old_name is not None else None
+        tok = Secret(token) if token else old.token if old else Secret("")
+        e = ServerEntry(name, url, tok)
         self.rows[name] = e
+        if old_name is not None and self.last == old_name:
+            self.last = name
         return e
 
     def remove(self, name):
@@ -88,9 +92,10 @@ class FakeStore:
         self.log.add("set_last", name)
         self.last = name
 
-    def set_injected(self, origin):
-        self.log.add("set_injected", origin)
-        self.injected = origin
+    def set_injected(self, origins):
+        assert isinstance(origins, list)                         # P3-R3: always the whole list
+        self.log.add("set_injected", list(origins))
+        self.injected = list(origins)
 
 
 class FakeWindow:
@@ -255,7 +260,7 @@ def test_connect_waits_for_hello_then_injects(rig):
     names = r.log.names("inject", "open_app", "hide_servers")
     assert names == ["inject", "open_app", "hide_servers"]
     assert r.log.of("open_app") == [("open_app", URL_A, "A")]
-    assert r.store.injected == ORIGIN_A
+    assert r.store.injected == [ORIGIN_A]
     assert r.store.last == "A"
     assert r.ctl.state.kind == "online" and r.ctl.state.runner_id == RID_1
     assert r.tray.states[-1].kind == "online"
@@ -312,7 +317,7 @@ def test_inject_false_keeps_servers_window(rig):
     assert r.ctl.notice == words.t("window_not_prepared")
     assert r.window.views[-1]["notice"] == words.t("window_not_prepared")
     assert r.store.last is None
-    assert r.store.injected == ORIGIN_A                  # the script may have written part of it: Quit clears it
+    assert r.store.injected == [ORIGIN_A]                # the script may have written part of it: Quit clears it
 
 
 def test_refused_key_does_not_open(rig):
@@ -374,7 +379,7 @@ def test_protocol_offers_open_without_runner(rig):
     assert "strata.runner" in d["remove"] and "strata.runner" not in d["set"]
     assert json.loads(d["set"]["strata.apikey"]) == TOKEN_A
     assert r.log.of("open_app") == [("open_app", URL_A, "A")]
-    assert r.store.injected == ORIGIN_A
+    assert r.store.injected == [ORIGIN_A]
 
 
 def test_error_offers_open_without_runner(rig):
@@ -429,7 +434,7 @@ def test_quit_during_an_inject_clears_after_it(rig):
     q.join(5)
     names = r.log.names("inject", "clear", "open_app")
     assert names == ["inject", "clear"]                           # cleared after, and the app never opened
-    assert r.store.injected is None
+    assert r.store.injected == []
 
 
 def test_late_event_of_an_old_runner_is_dropped(rig):
@@ -454,7 +459,7 @@ def test_switch_stops_old_runner_first(rig):
              if c[0] in ("host.stop", "host.stopped", "host.made", "clear", "inject")]
     assert names == [("host.made", URL_A), ("inject", URL_A), ("host.stop", URL_A), ("host.stopped", URL_A),
                      ("clear", URL_A), ("host.made", URL_B), ("inject", URL_B)]
-    assert r.hosts[0].stopped and r.store.injected == ORIGIN_B
+    assert r.hosts[0].stopped and r.store.injected == [ORIGIN_B]
     assert r.log.of("clear")[0][3] == controller.CLEAR_S
 
 
@@ -485,14 +490,30 @@ def test_clear_false_keeps_injected_and_is_tried_again(rig):
     r.ctl.connect("A")
     r.emit("online", {"id": RID_1, "who": "ann"})
     r.ctl.connect("B")                                          # A's clear fails
-    assert r.store.injected == ORIGIN_A
+    assert r.store.injected == [ORIGIN_A]
     r.emit("online", {"id": RID_2, "who": "ann"})
-    assert r.store.injected == ORIGIN_B                         # the file's one slot holds the newest
+    assert r.store.injected == [ORIGIN_A, ORIGIN_B]             # P3-R3: both listed
     r.window.clear_ok = True
     r.ctl.quit()
     cleared = [c[1] for c in r.log.of("clear")]
     assert cleared[-2:] == [URL_A, URL_B]                       # A tried again at Quit, then B
-    assert r.store.injected is None
+    assert r.store.injected == []
+
+
+def test_failed_clear_then_another_inject_then_a_crash(rig):
+    """I-1: server A is down, so the user switches to B; B is injected; the app crashes (no Quit).  The next start
+    must clear A as well as B."""
+    r = rig(window_kw={"clear_ok": False})
+    r.ctl.connect("A")
+    r.emit("online", {"id": RID_1, "who": "ann"})
+    r.ctl.connect("B")                                          # A's clear fails: A is down
+    r.emit("online", {"id": RID_2, "who": "ann"})               # B written
+    on_disk = list(r.store.injected)                            # a crash here: what the next start reads
+    assert on_disk == [ORIGIN_A, ORIGIN_B]
+    r2 = rig(store_kw={"injected": on_disk})
+    r2.ctl.start()
+    assert [c[1] for c in r2.log.of("clear")] == [URL_A, URL_B]
+    assert r2.store.injected == []
 
 
 def test_quit_with_clear_false_keeps_injected(rig):
@@ -500,8 +521,18 @@ def test_quit_with_clear_false_keeps_injected(rig):
     r.ctl.connect("A")
     r.emit("online", {"id": RID_1, "who": "ann"})
     r.ctl.quit()
-    assert r.store.injected == ORIGIN_A
-    assert r.log.of("set_injected")[-1] == ("set_injected", ORIGIN_A)
+    assert r.store.injected == [ORIGIN_A]
+    assert r.log.of("set_injected")[-1] == ("set_injected", [ORIGIN_A])
+
+
+def test_one_failed_clear_of_two_keeps_only_that_one(rig):
+    r = rig(store_kw={"injected": [ORIGIN_A, ORIGIN_B]})
+    r.window.clear_ok = True
+    real = r.window.navigate_and_inject
+    r.window.navigate_and_inject = lambda base, script, timeout=15.0: (real(base, script, timeout)
+                                                                       and base != URL_A)
+    r.ctl.start()
+    assert r.store.injected == [ORIGIN_A]
 
 
 def test_remove_open_server(rig):
@@ -511,8 +542,44 @@ def test_remove_open_server(rig):
     r.ctl.remove("A")
     names = r.log.names("host.stop", "clear", "set_injected", "store.remove", "show_servers")
     assert names[-5:] == ["host.stop", "clear", "set_injected", "store.remove", "show_servers"]
-    assert r.store.injected is None and "A" not in r.store.rows
+    assert r.store.injected == [] and "A" not in r.store.rows
     assert r.ctl.state.kind == "idle"
+
+
+@pytest.mark.parametrize("told", [True, False])
+def test_rename_then_remove_the_open_server(rig, told):
+    """I-2: the open server renamed in the list, then removed: its runner stops and its token is cleared at the
+    address it was opened at (path prefix kept) - whether or not the controller was told of the rename."""
+    r = rig()
+    r.ctl.connect("B")
+    r.emit("online", {"id": RID_1, "who": "ann"})
+    if told:
+        api = gui.ServersApi(r.store, DEVICE, LABEL, r.ctl, probe=ok_probe)
+        assert api.save("Lab", URL_B, None, "B") == {"ok": True}
+    else:
+        r.store.save("Lab", URL_B, None, "B")
+    r.ctl.remove("Lab")
+    assert r.hosts[0].stopped
+    assert r.log.of("clear")[-1][1] == URL_B
+    assert r.store.injected == [] and "Lab" not in r.store.rows
+    assert r.ctl.state.kind == "idle"
+
+
+def test_rename_follows_the_open_server(rig):
+    r = rig()
+    r.ctl.connect("B")
+    r.emit("online", {"id": RID_1, "who": "ann"})
+    r.ctl.saved("B", r.store.save("Lab", URL_B, None, "B"))
+    r.ctl.remove("B")                                            # the old name no longer names it
+    assert not r.hosts[0].stopped
+
+
+def test_remove_a_server_whose_clear_failed_clears_it_first(rig):
+    """M-3: its address (with its path prefix) is tried while the entry still gives it."""
+    r = rig(store_kw={"injected": [ORIGIN_B]})
+    r.ctl.remove("B")
+    assert r.log.names("clear", "store.remove") == ["clear", "store.remove"]
+    assert r.log.of("clear")[0][1] == URL_B and r.store.injected == []
 
 
 def test_remove_other_server_leaves_the_open_one(rig):
@@ -529,29 +596,30 @@ def test_remove_while_unreachable_then_restart_clears_from_the_origin(rig):
     r.ctl.connect("B")
     r.emit("online", {"id": RID_1, "who": "ann"})
     r.ctl.remove("B")
-    assert r.store.injected == ORIGIN_B and "B" not in r.store.rows
+    assert r.store.injected == [ORIGIN_B] and "B" not in r.store.rows
     r.ctl.quit()
+    assert r.log.of("clear")[-1][1] == URL_B                     # this session still knows its address
     r2 = rig(store_kw={"rows": dict(r.store.rows), "injected": r.store.injected})
     r2.ctl.start()
     assert r2.log.calls[0][:2] == ("clear", ORIGIN_B)            # no entry names it: the origin alone
-    assert r2.store.injected is None
+    assert r2.store.injected == []
 
 
 # ------------------------------------------------------------------------------------------------ start
 def test_crash_leftover_cleared_at_start(rig):
-    r = rig(store_kw={"injected": ORIGIN_B, "last": None})
+    r = rig(store_kw={"injected": [ORIGIN_B], "last": None})
     r.ctl.start()
     first = r.log.calls[0]
     assert first[0] == "clear" and first[1] == URL_B          # the entry with that origin: its path prefix kept
     assert first[2] == inject.clear_script()
-    assert r.store.injected is None
+    assert r.store.injected == []
     assert r.log.names().index("set_injected") < r.log.names().index("show_servers")
 
 
 def test_crash_leftover_kept_when_the_server_is_down(rig):
-    r = rig(store_kw={"injected": ORIGIN_A}, window_kw={"clear_ok": False})
+    r = rig(store_kw={"injected": [ORIGIN_A]}, window_kw={"clear_ok": False})
     r.ctl.start()
-    assert r.store.injected == ORIGIN_A
+    assert r.store.injected == [ORIGIN_A]
     assert "show_servers" in r.log.names()
 
 
@@ -578,7 +646,7 @@ def test_quit_order(rig):
     after = [c[0] for c in r.log.calls[n:]
              if c[0] in ("host.stopped", "clear", "set_injected", "tray.stop", "destroy", "release")]
     assert after == ["host.stopped", "clear", "set_injected", "tray.stop", "destroy", "release"]
-    assert r.log.of("set_injected")[-1] == ("set_injected", None)
+    assert r.log.of("set_injected")[-1] == ("set_injected", [])
     assert r.log.of("clear")[-1][3] == controller.CLEAR_S        # the 3 s cap
     assert r.ctl.wait_quit(1) and r.exits == []
     r.ctl.quit()                                                   # twice: nothing more
@@ -626,16 +694,42 @@ def test_watchdog_logs_the_hung_step(rig, caplog):
 
 def test_quit_before_start_keeps_the_crash_record(rig):
     """Quit before start() (the web view failed, a tray Quit during start-up) must not drop the leftover's record."""
-    r = rig(store_kw={"injected": ORIGIN_A}, window_kw={"clear_ok": False})
+    r = rig(store_kw={"injected": [ORIGIN_A]}, window_kw={"clear_ok": False})
     r.ctl.quit()
-    assert r.store.injected == ORIGIN_A
-    r2 = rig(store_kw={"injected": ORIGIN_A})
+    assert r.store.injected == [ORIGIN_A]
+    r2 = rig(store_kw={"injected": [ORIGIN_A]})
     r2.ctl.quit()
-    assert r2.log.of("clear")[0][1] == URL_A and r2.store.injected is None
+    assert r2.log.of("clear")[0][1] == URL_A and r2.store.injected == []
+
+
+def test_no_runner_starts_after_quit_during_a_connect(rig):
+    """M-1: a Quit landing between the host being made and its start never sees a host that starts after it."""
+    r = rig()
+    started = threading.Event()
+
+    def slow_start(host):
+        def start():
+            time.sleep(0.3)                                  # the gap a Quit could land in
+            host.log.add("host.start", host.url)
+            started.set()
+        return start
+
+    real_make = r.ctl._make_host
+
+    def make(*a):
+        h = real_make(*a)
+        h.start = slow_start(h)
+        threading.Thread(target=r.ctl.quit, daemon=True).start()     # Quit waits for the lock connect holds
+        return h
+    r.ctl._make_host = make
+    r.ctl.connect("A")
+    assert r.ctl.wait_quit(5)
+    names = r.log.names("host.start", "host.stop")
+    assert names == ["host.start", "host.stop"]                     # started before Quit stopped it, never after
 
 
 def test_start_after_quit_does_nothing(rig):
-    r = rig(store_kw={"injected": ORIGIN_A, "last": "A"})
+    r = rig(store_kw={"injected": [ORIGIN_A], "last": "A"})
     r.ctl.quit()
     n = len(r.log.calls)
     r.ctl.start()

@@ -110,12 +110,16 @@ class FakeController:
         self.calls = []
         self.state = state.TrayState("online", server="lab", who="ann", runner_id="r0123456789abcdef")
         self.notice = ""
+        self.renames = []
 
     def connect(self, name):
         self.calls.append(("connect", name))
 
     def remove(self, name):
         self.calls.append(("remove", name))
+
+    def saved(self, old_name, entry):
+        self.renames.append((old_name, entry.name))
 
     def open_without_runner(self):
         self.calls.append(("open_without_runner",))
@@ -191,6 +195,16 @@ def test_warning():
     assert api.warning("http://192.168.1.5:8091") == words.t("plain_http")
     assert api.warning("https://lab.example.com") is None
     assert api.warning(None) is None
+
+
+def test_save_tells_the_controller():
+    api, store, ctl, _ = _api()
+    api.save("lab2", "http://h:1", TOKEN, None)
+    api.save("lab3", "http://h:1", None, "lab2")
+    assert ctl.renames == [(None, "lab2"), ("lab2", "lab3")]
+    store.fail = ValueError("bad")
+    api.save("x", "y", None, "lab3")
+    assert len(ctl.renames) == 2                                                 # a refused save: nothing to follow
 
 
 def test_save_add_edit_and_keep_token():

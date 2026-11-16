@@ -1,9 +1,11 @@
 """Strata Desktop's server list (#310 part 3): `servers.json` in the data folder, each token kept with DPAPI.
 
-The file: `{"version": 1, "last": name | null, "injected": origin | null, "servers": [{"name", "url", "token_dpapi":
+The file: `{"version": 1, "last": name | null, "injected": [origin, ...], "servers": [{"name", "url", "token_dpapi":
 base64 of the DPAPI blob | null}]}`, written to `servers.json.tmp` and moved over the old one with `os.replace`, so a
-failed write leaves the old file whole.  `last` is the server opened last; `injected` names the web view origin whose
-localStorage holds a token right now (the next start removes it there first, so a crash leaves it only until then).
+failed write leaves the old file whole.  `last` is the server opened last; `injected` lists the web view origins whose
+localStorage may hold a token right now: the one open, and any whose clear failed because its server did not answer
+(ruling P3-R3).  The next start removes it there first, so a crash leaves it only until then.  An older file's
+`"injected": origin` (one string) reads as a one-item list, `null` as none.
 
 The token is never in the file, in an error message, in any `repr` / `str` (`Secret` shows `***`) or in `public()`.
 A blob that no longer decrypts (the profile moved to another Windows user) gives its entry `Secret("")` and
@@ -87,6 +89,17 @@ def _clean_url(url: str) -> str:
     return f"{p.scheme}://{p.netloc}{p.path.rstrip('/')}"
 
 
+def _origins(v) -> list[str]:
+    """`injected` as a list of distinct non-empty strings: a list as it is, one string (the file before P3-R3) as a
+    one-item list, anything else as none."""
+    items = [v] if isinstance(v, str) else v if isinstance(v, list) else []
+    out: list[str] = []
+    for o in items:
+        if isinstance(o, str) and o and o not in out:
+            out.append(o)
+    return out
+
+
 def _clean_name(name: str) -> str:
     n = name.strip() if isinstance(name, str) else ""
     if not 1 <= len(n) <= NAME_MAX:
@@ -104,7 +117,7 @@ class ServerStore:
 
     # ------------------------------------------------------------------ the file
     def _read(self) -> dict:
-        empty = {"version": VERSION, "last": None, "injected": None, "servers": []}
+        empty = {"version": VERSION, "last": None, "injected": [], "servers": []}
         try:
             raw = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -115,7 +128,7 @@ class ServerStore:
                      "token_dpapi": r.get("token_dpapi") if isinstance(r.get("token_dpapi"), str) else None}
                     for r in doc["servers"]]
             last = doc.get("last") if isinstance(doc.get("last"), str) else None
-            injected = doc.get("injected") if isinstance(doc.get("injected"), str) else None
+            injected = _origins(doc.get("injected"))
         except (ValueError, KeyError, TypeError, AttributeError):
             os.replace(self.path, self.path.with_name(self.path.name + ".broken"))      # kept, not overwritten
             return empty
@@ -176,8 +189,8 @@ class ServerStore:
         return self._doc["last"]
 
     @property
-    def injected(self) -> str | None:
-        return self._doc["injected"]
+    def injected(self) -> list[str]:
+        return list(self._doc["injected"])
 
     # ------------------------------------------------------------------ changing
     def save(self, name: str, url: str, token: str | None, old_name: str | None = None) -> ServerEntry:
@@ -230,8 +243,9 @@ class ServerStore:
             doc["last"] = name
             self._write(doc)
 
-    def set_injected(self, origin: str | None) -> None:
+    def set_injected(self, origins) -> None:
+        """The origins that may hold a token now (a list; one string or None are read as `_origins` reads them)."""
         with self._lock:
             doc = self._copy()
-            doc["injected"] = origin
+            doc["injected"] = _origins(origins)
             self._write(doc)

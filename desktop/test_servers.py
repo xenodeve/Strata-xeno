@@ -34,7 +34,7 @@ def test_file_format(path):
     s.save("Office", "http://26.1.2.3:8095", TOKEN)
     s.save("Home", "https://strata.example.ts.net", None)
     doc = json.loads(path.read_text(encoding="utf-8"))
-    assert doc["version"] == 1 and doc["last"] is None and doc["injected"] is None
+    assert doc["version"] == 1 and doc["last"] is None and doc["injected"] == []
     assert [set(x) for x in doc["servers"]] == [{"name", "url", "token_dpapi"}] * 2
     blob = base64.b64decode(doc["servers"][0]["token_dpapi"], validate=True)
     assert dpapi.unprotect(blob) == TOKEN.encode("ascii")
@@ -205,12 +205,25 @@ def test_public_has_no_token(path):
 
 
 def test_injected_round_trip(path):
+    """P3-R3: a list of origins."""
     s = ServerStore(path)
-    assert s.injected is None
-    s.set_injected("http://26.1.2.3:8095")
-    assert ServerStore(path).injected == "http://26.1.2.3:8095"
-    s.set_injected(None)
-    assert ServerStore(path).injected is None
+    assert s.injected == []
+    s.set_injected(["http://26.1.2.3:8095", "https://lab.example.ts.net"])
+    assert ServerStore(path).injected == ["http://26.1.2.3:8095", "https://lab.example.ts.net"]
+    got = s.injected
+    got.append("x")                                              # a copy: the store is not changed through it
+    assert s.injected == ["http://26.1.2.3:8095", "https://lab.example.ts.net"]
+    s.set_injected([])
+    assert ServerStore(path).injected == []
+
+
+@pytest.mark.parametrize("old, read", [("http://26.1.2.3:8095", ["http://26.1.2.3:8095"]), (None, []), (7, []),
+                                       (["a", 3, "", "a", "b"], ["a", "b"])])
+def test_injected_older_forms(path, old, read):
+    """The file before P3-R3 held one origin or null: read as a one-item list or none."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "last": None, "injected": old, "servers": []}), encoding="utf-8")
+    assert ServerStore(path).injected == read
 
 
 def test_atomic_write(path, monkeypatch):
@@ -231,7 +244,7 @@ def test_atomic_write(path, monkeypatch):
 
 def test_missing_file_is_empty(path):
     s = ServerStore(path)
-    assert s.entries() == [] and s.public() == [] and s.last is None and s.injected is None
+    assert s.entries() == [] and s.public() == [] and s.last is None and s.injected == []
     assert not path.exists()
 
 

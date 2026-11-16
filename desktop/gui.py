@@ -135,7 +135,7 @@ class ServersApi:
     public objects inside it, as callable from the page.
 
     `controller` gives `state` (the current TrayState), `notice` (words or "") and `connect(name)`, `remove(name)`,
-    `open_without_runner()`, `copy_code() -> bool` (desktop/controller.py `Controller`)."""
+    `saved(old_name, entry)`, `open_without_runner()`, `copy_code() -> bool` (desktop/controller.py `Controller`)."""
 
     def __init__(self, store, device: dict, label: str, controller, probe=probe.test_server):
         self._store, self._device, self._label = store, device, label
@@ -168,9 +168,10 @@ class ServersApi:
             if tok is not None:
                 applog.add_secret(tok)
             try:
-                self._store.save(name, url, tok, old_name)
+                entry = self._store.save(name, url, tok, old_name)
             except (ValueError, DpapiError) as e:     # their words name the field and never repeat the token
                 return {"error": str(e)}
+            self._ctl.saved(old_name, entry)          # a rename of the open server: the controller follows it
             return {"ok": True}
         return self._safe("save", do, self._fail())
 
