@@ -33,6 +33,10 @@ def test_exact_copy():
         "Use Tailscale, Radmin VPN or an https tunnel.")
     assert words.TABLE["pending"]["en"] == "Waiting for approval on {server}: code {code}"
     assert words.TABLE["pending"]["th"] == "รออนุมัติที่ {server}: รหัส {code}"
+    assert words.TABLE["plain_http"]["th"] == (
+        "ที่อยู่นี้เป็น http ธรรมดาไปยังเครือข่ายอื่น โทเค็นของคุณและไฟล์ที่เครื่องคุณส่งไปจะวิ่งแบบไม่เข้ารหัส "
+        "ใช้ Tailscale, Radmin VPN หรือ tunnel แบบ https แทน")
+    assert words.TABLE["update"]["th"] == "อัปเดต Strata Desktop: {server} ใช้โปรโตคอล runner รุ่น {n}"
     assert words.TABLE["update"]["en"] == "Update Strata Desktop: {server} speaks runner protocol {n}."
     assert words.TABLE["no_webview2"]["en"] == (
         "Strata Desktop needs the Microsoft Edge WebView2 Runtime, which this PC does not have. Install it from "

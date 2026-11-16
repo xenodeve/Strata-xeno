@@ -79,17 +79,22 @@ def test_server(url: str, token: str, device: dict, label: str, timeout: float =
         left = deadline - time.monotonic()
         if left <= 0:
             raise _Failed("timed_out")
-        if https:
-            conn = http.client.HTTPSConnection(host, port, timeout=left, context=ssl.create_default_context())
-        else:
-            conn = http.client.HTTPConnection(host, port, timeout=left)
         headers = dict(base_headers)
         if with_token:
             headers["Authorization"] = "Bearer " + token
         try:
+            if https:
+                conn = http.client.HTTPSConnection(host, port, timeout=left, context=ssl.create_default_context())
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=left)
+        except http.client.InvalidURL:           # "http://a b:1": a host http.client will not connect to
+            raise _Failed("bad_url") from None
+        try:
             conn.request("GET", prefix + path, headers=headers)
             r = conn.getresponse()
             raw = r.read(BODY_MOST)
+        except http.client.InvalidURL:           # a path with a space or a control character
+            raise _Failed("bad_url") from None
         except TimeoutError:                     # socket.timeout too
             raise _Failed("timed_out") from None
         except ssl.SSLError:

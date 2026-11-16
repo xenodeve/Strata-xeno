@@ -75,14 +75,18 @@ FORBIDDEN = (403, {"error": {"type": "forbidden", "message": "keys can be manage
 def run(answers: dict, *, url_suffix: str = "", hang: tuple = (), timeout: float = 10.0, token: str = TOKEN):
     s = Scripted(answers, hang)
     try:
-        return probe.test_server(s.url + url_suffix, token, DEVICE, LABEL, timeout=timeout), s
+        r = probe.test_server(s.url + url_suffix, token, DEVICE, LABEL, timeout=timeout)
     finally:
         s.close()
+    assert_no_token(r, token)                     # RF 1, on every scripted path
+    return r, s
 
 
-def assert_no_token(result):
-    assert TOKEN not in repr(result)
-    assert TOKEN not in json.dumps(dataclasses.asdict(result))
+def assert_no_token(result, token: str = TOKEN):
+    for secret in {token, TOKEN}:
+        assert secret not in repr(result)
+        assert secret not in str(result)
+        assert secret not in json.dumps(dataclasses.asdict(result), ensure_ascii=False)
 
 
 def test_device_headers():
@@ -217,8 +221,20 @@ def test_bad_token_text_does_not_leak():
     assert TOKEN not in repr(r)
 
 
+def test_api_never_returns_token():
+    # RF 1, the probe's share: what ServersApi.test (Task 4/5) returns is asdict(ProbeResult); the probe never puts
+    # the token in it, nor a server's error text that echoes it (a model name the server chooses is the server's own)
+    echo = (401, {"error": {"type": "authentication_error", "message": "wrong key " + TOKEN}})
+    for answers in ({"/health": HEALTH_OK, "/props": PROPS_OK, "/keys": KEYS_OK},
+                    {"/health": HEALTH_OK, "/props": echo},
+                    {"/health": HEALTH_OK, "/props": (500, {"error": {"message": TOKEN}})},
+                    {"/health": HEALTH_OK, "/props": (403, {"error": {"type": "device_refused", "message": TOKEN}})}):
+        r, _ = run(answers)
+        assert r.reachable                       # (run() asserts the token is absent)
+
+
 def test_bad_url():
-    for url in ("", "ftp://x", "http://", "nonsense"):
+    for url in ("", "ftp://x", "http://", "nonsense", "http://a b:1", "http://127.0.0.1:9/a b"):
         r = probe.test_server(url, TOKEN, DEVICE, LABEL)
         assert (r.reachable, r.error) == (False, words.t("bad_url"))
 
