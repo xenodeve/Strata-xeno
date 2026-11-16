@@ -43,16 +43,17 @@ export interface AgentControlsProps {
   permsHref?: string                    // the page of the rules that last (Settings > Permissions)
   // #310 part 2, only when this browser has a runner: where a project is (My PC or the Server PC, the latter only when the server's coding tools are this
   // page's), the runner's state, and why the tools cannot be used here (no runner known for a My PC project)
-  machine?: { value: Machine; server: boolean; onPick: (m: Machine) => void; state?: RunnerState }
+  machine?: { value: Machine; server: boolean; onPick: (m: Machine) => void; state?: RunnerState; locked?: boolean }      // locked: an answer is being written
   runner?: string                       // the folders are on the engineer's own PC: listed and checked by its runner
   blocked?: string                      // the words instead of the usual ones when the tools cannot be used
+  blockedRow?: string                   // the same, short, for the + menu's row
 }
 
 export function AgentControls(p: AgentControlsProps) {
   const one = p.folders[0] ?? ""
   const [draft, setDraft] = useState(one)
   useEffect(() => setDraft(one), [one])
-  const picker = p.machine && p.folderOf.kind === "project" ? <MachinePicker value={p.machine.value} server={p.machine.server} onPick={p.machine.onPick} state={p.machine.state} /> : null
+  const picker = p.machine && p.folderOf.kind === "project" ? <MachinePicker value={p.machine.value} server={p.machine.server} onPick={p.machine.onPick} state={p.machine.state} locked={p.machine.locked} /> : null
   if (!p.info.available) return <div className="space-y-3">{picker}<p className="text-[13px] text-ink-2">{t("The coding tools are switched off on this server (\"agent\": false in the run config).")}</p></div>
   if (!p.info.allowed) return <div className="space-y-3">{picker}<p role="note" className="text-[13px] text-ink-2">{p.blocked ?? t("The coding tools work only from the PC that runs Strata (or with the API key), because they change files and run commands there.")}</p></div>
   const changed = draft.trim() !== one

@@ -23,7 +23,7 @@ import { SkillText } from "../../components/SkillTip"
 import { CompactingStatus } from "../../components/CompactingStatus"
 import { skillCall, type SkillCall } from "../../lib/panel"
 import { AgentCall, HookNotes, MachineMark, TodoList } from "./AgentCall"
-import { isCodingServer } from "../../lib/runner"
+import { isCodingCall } from "../../lib/runner"
 import { msg, t, useLang } from "../../lib/i18n"
 
 /** How many times a message was drawn (a test reads it: a message that did not change is not drawn again when the page is drawn). */
@@ -116,7 +116,7 @@ function Answer({ m, streaming, show, phase }: { m: Message; streaming: boolean;
     }
     if (at > pos) parts.push(<Prose key={`p${k}`} text={m.text.slice(pos, at)} />)
     pos = at
-    parts.push(isCodingServer(tc.server) ? <AgentCall key={tc.id} call={tc} /> : <Tool key={tc.id} call={tc} />)         // the coding tools (of the server, or of My PC: #310 part 2) show as what they are
+    parts.push(isCodingCall(tc) ? <AgentCall key={tc.id} call={tc} /> : <Tool key={tc.id} call={tc} />)         // the coding tools (of the server, or of My PC: #310 part 2) show as what they are
   })
   const tail = rpos !== undefined ? reasoning.slice(rpos) : ""
   if (tail.trim()) {                                                                  // the thinking after the last tool: live while the model thinks again

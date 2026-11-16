@@ -9,7 +9,7 @@ const data = new Map<string, string>()
   removeItem: (k: string) => { data.delete(k) },
 }
 
-const { runnerId, setRunnerId, withRunner, machineOf, isCodingServer, chatMachine, closeReason, isSkillsServer } = await import("./runner")
+const { runnerId, setRunnerId, withRunner, machineOf, isCodingCall, chatMachine, closeReason, isSkillsCall, myPcCoding, blockText } = await import("./runner")
 const ID = "r0123456789abcdef"
 
 beforeEach(() => { data.clear() })
@@ -62,20 +62,46 @@ describe("machineOf", () => {
   })
 })
 
-describe("isCodingServer / isSkillsServer", () => {
-  test("the server's coding group and the runner's (also renamed on a clash)", () => {
-    expect(isCodingServer("agent")).toBe(true)
-    expect(isCodingServer("my_agent")).toBe(true)
-    expect(isCodingServer("my_agent_2")).toBe(true)
-    expect(isCodingServer("my_agentx")).toBe(false)
-    expect(isCodingServer("fs")).toBe(false)
-    expect(isCodingServer(undefined)).toBe(false)
+describe("isCodingCall / isSkillsCall: by the event's machine, not the name alone", () => {
+  test("the server's coding group, and the runner's only on a call that ran on My PC (also renamed on a clash)", () => {
+    expect(isCodingCall({ server: "agent" })).toBe(true)
+    expect(isCodingCall({ server: "my_agent", machine: "my" })).toBe(true)
+    expect(isCodingCall({ server: "my_agent_2", machine: "my" })).toBe(true)
+    expect(isCodingCall({ server: "my_agentx", machine: "my" })).toBe(false)
+    expect(isCodingCall({ server: "fs" })).toBe(false)
+    expect(isCodingCall({})).toBe(false)
+  })
+  test("a server MCP literally named my_agent / my_skills (no runner, no machine) stays an MCP call", () => {
+    expect(isCodingCall({ server: "my_agent" })).toBe(false)
+    expect(isSkillsCall({ server: "my_skills" })).toBe(false)
+    expect(isCodingCall({ server: "agent", machine: "my" })).toBe(false)         // a runner's call is never the server's group
   })
   test("skills of either machine", () => {
-    expect(isSkillsServer("skills")).toBe(true)
-    expect(isSkillsServer("my_skills")).toBe(true)
-    expect(isSkillsServer("my_skills_2")).toBe(true)
-    expect(isSkillsServer("fs")).toBe(false)
+    expect(isSkillsCall({ server: "skills" })).toBe(true)
+    expect(isSkillsCall({ server: "my_skills", machine: "my" })).toBe(true)
+    expect(isSkillsCall({ server: "my_skills_2", machine: "my" })).toBe(true)
+    expect(isSkillsCall({ server: "fs" })).toBe(false)
+  })
+})
+
+describe("myPcCoding: a My PC chat never sends a prompt that silently goes without tools", () => {
+  const ONLINE = { available: true, allowed: true, shell: "bash", tools: ["Read"], machine: "ann-pc", online: true }
+  test("no runner id, or a runner the server does not know for this key (404): blocked, with the reason", () => {
+    expect(myPcCoding("", undefined)).toMatchObject({ block: "no-runner", info: { allowed: false } })
+    expect(myPcCoding(ID, "unknown")).toMatchObject({ block: "unknown", info: { allowed: false } })
+  })
+  test("known (online or offline), not answered yet, or one failed ask: sent with the runner, so the server says what is wrong", () => {
+    expect(myPcCoding(ID, ONLINE)).toEqual({ info: ONLINE, block: null })
+    expect(myPcCoding(ID, { ...ONLINE, online: false, allowed: false })).toMatchObject({ info: { allowed: true, online: false }, block: null })
+    expect(myPcCoding(ID, undefined)).toMatchObject({ info: { available: true, allowed: true }, block: null })
+    expect(myPcCoding(ID, null)).toMatchObject({ info: { available: true, allowed: true }, block: null })
+  })
+  test("the words: what is wrong and what to do, long and short", () => {
+    expect(blockText("no-runner", "http://26.1.2.3:8091").full).toContain("Settings")
+    const u = blockText("unknown", "http://26.1.2.3:8091")
+    expect(u.full).toContain("python -m serve.runner --server http://26.1.2.3:8091 --key YOUR-KEY")
+    expect(u.short).toBe("My PC: the runner is not connected")
+    expect(blockText("no-runner", "x").short).toBe("My PC: this browser has no runner")
   })
 })
 
@@ -102,18 +128,20 @@ describe("chatMachine: where a chat's coding tools work", () => {
 })
 
 describe("closeReason: a card the server closed, in words", () => {
-  test("the reasons the server gives (runner_hub.py)", () => {
-    expect(closeReason("offline")).toBe("Your PC went offline, so this was closed.")
-    expect(closeReason("your PC's runner restarted")).toBe("Your PC's runner restarted, so this was closed.")
-    expect(closeReason("the key was revoked")).toBe("The key of this chat was revoked, so this was closed.")
-    expect(closeReason("the owner refused or cleared this PC's device")).toBe("The owner refused or cleared your PC as a device, so this was closed.")
-    expect(closeReason("the server is stopping")).toBe("The server is stopping, so this was closed.")
+  // The words the server really sends as `reason` (serve/runner_hub.py `_card`: abort.why = r.ended or "ended", "offline", "cancelled";
+  // Runner.ended from Runner.end(why): "replaced" :697 :724, "revoked" :738, "device" :742, "closed" :694 :757). The server's own stream test
+  // asserts `reason == "replaced"` (serve/test_runner_http.py :613, a second runner process on the same PC).
+  test("each word the server sends", () => {
+    expect(closeReason("replaced")).toBe("Your PC's runner restarted, so this was closed.")
+    expect(closeReason("revoked")).toBe("The key of this chat was revoked, so this was closed.")
+    expect(closeReason("device")).toBe("The owner refused or cleared your PC as a device, so this was closed.")
     expect(closeReason("closed")).toBe("The server is stopping, so this was closed.")
     expect(closeReason("ended")).toBe("Your PC's runner stopped, so this was closed.")
+    expect(closeReason("offline")).toBe("Your PC went offline, so this was closed.")
   })
-  test("cancelled is the answer that stopped; an unknown reason keeps the server's words; none is null", () => {
+  test("cancelled is the answer that stopped; an unknown word gets a sentence, never the bare word; none is null", () => {
     expect(closeReason("cancelled")).toBe("The answer stopped before you answered.")
-    expect(closeReason("something new")).toBe("This was closed: something new")
+    expect(closeReason("something new")).toBe("The server closed this before you answered.")
     expect(closeReason(null)).toBe(null)
     expect(closeReason(undefined)).toBe(null)
     expect(closeReason("")).toBe(null)

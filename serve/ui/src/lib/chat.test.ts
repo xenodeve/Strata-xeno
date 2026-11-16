@@ -2278,7 +2278,7 @@ describe("#310 part 2: the runner in the chat", () => {
       { strata_mcp: { event: "answered", id: "p1", call_id: "c1", answer: "deny", reason: "offline" } },
       { strata_mcp: { event: "start", id: "c2", name: "AskUserQuestion" } }, { strata_mcp: { event: "call", id: "c2", name: "AskUserQuestion", server: "my_agent", machine: "my", tool: "AskUserQuestion", arguments: { questions }, round: 1 } },
       { strata_mcp: { event: "question", id: "q1", call_id: "c2", questions } },
-      { strata_mcp: { event: "question_answered", id: "q1", call_id: "c2", answers: null, reason: "the key was revoked" } },
+      { strata_mcp: { event: "question_answered", id: "q1", call_id: "c2", answers: null, reason: "revoked" } },
       { strata_mcp: { event: "start", id: "c3", name: "Bash" } }, { strata_mcp: { event: "call", id: "c3", name: "Bash", server: "agent", tool: "Bash", arguments: { command: "ls" }, round: 1 } },
       { strata_mcp: { event: "permission", id: "p3", call_id: "c3", tool: "Bash", arguments: { command: "ls" }, why: "asks", danger: false, rule: null } },
       { strata_mcp: { event: "answered", id: "p3", call_id: "c3", answer: "deny" } },
@@ -2287,7 +2287,7 @@ describe("#310 part 2: the runner in the chat", () => {
     await c.send("go", [], ctx)
     const [bash, ask, plain] = c.messages[1].tools!
     expect(bash.ask).toMatchObject({ answer: "deny", closed: "offline" })
-    expect(ask.question).toMatchObject({ answers: null, closed: "the key was revoked" })
+    expect(ask.question).toMatchObject({ answers: null, closed: "revoked" })
     expect(plain.ask!.answer).toBe("deny")
     expect("closed" in plain.ask!).toBe(false)                    // a timeout or the user's deny has no reason: today's words
   })

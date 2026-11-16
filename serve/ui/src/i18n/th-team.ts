@@ -119,7 +119,6 @@ export const part: Record<string, string> = {
   "Where the project is": "โปรเจกต์อยู่ที่",
   "Its files are on your PC: the tools run there, through this browser's runner.": "ไฟล์อยู่บนเครื่องของคุณ เครื่องมือจะทำงานบนเครื่องนั้นผ่านตัวรันของเบราว์เซอร์นี้",
   "Its files are on the workstation that runs Strata: the tools run there.": "ไฟล์อยู่บนเครื่องที่รัน Strata เครื่องมือจะทำงานบนเครื่องนั้น",
-  "This project is on My PC, and this browser has no runner. Set it in Settings, under This browser's runner.": "โปรเจกต์นี้อยู่บนเครื่องของฉัน แต่เบราว์เซอร์นี้ยังไม่มีตัวรัน ตั้งได้ที่ การตั้งค่า > ตัวรันของเบราว์เซอร์นี้",
   // the My PC sections of Settings
   "MCP servers on My PC": "เซิร์ฟเวอร์ MCP บนเครื่องของฉัน",
   "MCP servers on the Server PC": "เซิร์ฟเวอร์ MCP บนเครื่องเซิร์ฟเวอร์",
@@ -141,5 +140,10 @@ export const part: Record<string, string> = {
   "The owner refused or cleared your PC as a device, so this was closed.": "เจ้าของเครื่องปฏิเสธหรือล้างเครื่องของคุณออกจากอุปกรณ์ รายการนี้จึงถูกปิด",
   "The server is stopping, so this was closed.": "เซิร์ฟเวอร์กำลังหยุดทำงาน รายการนี้จึงถูกปิด",
   "Your PC's runner stopped, so this was closed.": "ตัวรันบนเครื่องของคุณหยุดทำงาน รายการนี้จึงถูกปิด",
-  "This was closed: {reason}": "รายการนี้ถูกปิด: {reason}",
+  "This project is on My PC, and this browser has no runner. Set its id in Settings, under This browser's runner, then send again.": "โปรเจกต์นี้อยู่บนเครื่องของฉัน แต่เบราว์เซอร์นี้ยังไม่มีตัวรัน ใส่รหัสตัวรันได้ที่ การตั้งค่า > ตัวรันของเบราว์เซอร์นี้ แล้วส่งใหม่",
+  "My PC: this browser has no runner": "เครื่องของฉัน: เบราว์เซอร์นี้ยังไม่มีตัวรัน",
+  "Your PC's runner is not connected for your key. Start it on your PC with python -m serve.runner --server {server} --key YOUR-KEY, then send again.": "ตัวรันบนเครื่องของคุณยังไม่ได้เชื่อมต่อกับคีย์ของคุณ เปิดตัวรันบนเครื่องของคุณด้วยคำสั่ง python -m serve.runner --server {server} --key YOUR-KEY แล้วส่งใหม่",
+  "My PC: the runner is not connected": "เครื่องของฉัน: ตัวรันยังไม่ได้เชื่อมต่อ",
+  "Your PC cannot be reached": "ติดต่อเครื่องของคุณไม่ได้",
+  "The server closed this before you answered.": "เซิร์ฟเวอร์ปิดรายการนี้ก่อนที่คุณจะตอบ",
 }

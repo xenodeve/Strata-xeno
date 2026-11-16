@@ -15,12 +15,12 @@ import { WebSettings } from "../components/WebSettings"
 import { KeysSettings } from "../components/KeysSettings"
 import { HelpersSettings } from "../components/HelpersSettings"
 import { AgentControls } from "../components/AgentControls"
-import { getAgent } from "../lib/api"
+import { getAgent, root } from "../lib/api"
 import { refreshTeam } from "../lib/keys"
 import { chat } from "../lib/chat"
 import { NO_AGENT, type AgentInfo } from "../lib/agent"
 import { RunnerSettings, runnerLine, useRunnerAgent } from "../components/RunnerSettings"
-import { chatMachine, runnerId } from "../lib/runner"
+import { blockText, chatMachine, myPcCoding, runnerId } from "../lib/runner"
 
 // What can be set in the app, apart from what About tells. A menu of sections and topics; the address says which topic shows
 // (#/settings/mcp-servers), so a link can point at one. The status marks and the API key are kept in this browser; the MCP
@@ -66,13 +66,14 @@ function CodingTools() {
   const rid = runnerId()
   const [my] = useRunnerAgent(rid, 0)
   const onMy = chatMachine({ project: undefined, serverAllowed: known ? info.allowed : undefined, runner: rid }) === "my"
-  const shown: AgentInfo = !onMy ? info : typeof my === "object" && my !== null ? { ...my, allowed: true } : { ...NO_AGENT, available: true }
+  const mine = onMy ? myPcCoding(rid, my) : null
+  const shown: AgentInfo = mine ? mine.info : info
   return (
     <section>
       <h2 className="text-[15px] font-semibold">{t("Coding tools")}</h2>
       <p className="mt-1 mb-3 text-[13px] text-ink-2">{t("The chat can read, search and change files and run commands on this PC with Claude Code's own tools, and asks you before anything that is not plainly safe. Here are the defaults; a project has its own folders, chosen when it is made.")}</p>
       <AgentControls
-        info={shown} blocked={onMy ? runnerLine(my) : undefined} on={s.agent !== false} mode={s.agentMode === "plan" || s.agentMode === "auto" ? s.agentMode : "ask"} folders={s.agentFolder?.trim() ? [s.agentFolder.trim()] : []} folderOf={{ kind: "default" }} rules={0}
+        info={shown} blocked={mine?.block ? blockText(mine.block, location.origin + root().replace(/\/$/, "")).full : onMy ? runnerLine(my) : undefined} on={s.agent !== false} mode={s.agentMode === "plan" || s.agentMode === "auto" ? s.agentMode : "ask"} folders={s.agentFolder?.trim() ? [s.agentFolder.trim()] : []} folderOf={{ kind: "default" }} rules={0}
         onToggle={() => chat.setSettings({ ...s, agent: s.agent === false })} onMode={(m) => chat.setSettings({ ...s, agentMode: m })}
         onFolders={(list) => chat.setSettings({ ...s, agentFolder: list[0]?.trim() ?? "" })} onForget={() => {}}
       />

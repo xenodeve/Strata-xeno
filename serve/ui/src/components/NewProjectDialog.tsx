@@ -40,7 +40,8 @@ export function NewProjectDialog({ open, onCreate, onCancel }: { open: boolean; 
     if (!open) { setPicked(false); return }
     if (picked) return
     const online = typeof state === "object" && state !== null && !!state.online
-    setMachine(runner && (online || !serverOk) ? "my" : "server")
+    const next: Machine = runner && (online || !serverOk) ? "my" : "server"
+    setMachine((was) => { if (was !== next) { setFolders([]); setPending("") } return next })      // a folder added meanwhile was a path on the other machine
   }, [open, runner, state, serverOk, picked])
   const pick = (m: Machine) => { setPicked(true); if (m !== machine) { setMachine(m); setFolders([]); setPending("") } }      // the folders were paths on the other machine
 

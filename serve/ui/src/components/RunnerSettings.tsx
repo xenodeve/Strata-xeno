@@ -1,16 +1,15 @@
 import { useCallback, useEffect, useState } from "react"
 import { getMcp, getRunnerAgent, type McpInfo } from "../lib/api"
-import type { AgentInfo } from "../lib/agent"
 import { fmt } from "../lib/format"
 import { msg, t } from "../lib/i18n"
-import { MACHINE_LABEL, runnerId, setRunnerId, type Machine } from "../lib/runner"
+import { MACHINE_LABEL, runnerId, setRunnerId, type Machine, type RunnerState } from "../lib/runner"
 import { Button, Segmented, inputCls } from "./ui"
 
 // This browser's runner (#310 part 2). The runner is the part of Strata Desktop on the engineer's own PC: it runs the coding tools, the MCP servers
 // and the skills of a project on that PC for the server. The page knows it by its id (`strata.runner`): Strata Desktop sets it, and here it can be
 // pasted (the runner prints it when it connects). The server answers for a runner of this key only, so an id grants nothing by itself.
 
-export type RunnerState = AgentInfo | "unknown" | null | undefined          // the runner's GET /agent; "unknown": the server knows no such runner for this key; null: not asked; undefined: not yet
+export type { RunnerState }
 
 /** GET /agent?runner= for `runner`, asked again every `every` ms (it costs the server no job: the answer is from the runner's hello). */
 export function useRunnerAgent(runner: string, every = 15000): [RunnerState, () => void] {
@@ -34,9 +33,9 @@ export function runnerLine(state: RunnerState): string {
 }
 
 /** The machine a project works on: "My PC" (through this browser's runner) or "Server PC" (the workstation; offered only when its coding tools are this page's). */
-export function MachinePicker({ value, server, onPick, state }: { value: Machine; server: boolean; onPick: (m: Machine) => void; state?: RunnerState }) {
+export function MachinePicker({ value, server, onPick, state, locked }: { value: Machine; server: boolean; onPick: (m: Machine) => void; state?: RunnerState; locked?: boolean }) {
   return (
-    <div data-machine-picker={value}>
+    <div data-machine-picker={value} className={locked ? "pointer-events-none opacity-60" : undefined} aria-disabled={locked || undefined}>
       {server || value === "server"
         ? <Segmented label={t("Where the project is")} value={value} onChange={onPick} options={(["my", "server"] as Machine[]).map((m) => ({ value: m, label: t(MACHINE_LABEL[m]) }))} />
         : <div className="text-[13px]"><span className="text-ink-2">{t("Where the project is")}: </span><span className="font-medium">{t(MACHINE_LABEL.my)}</span></div>}

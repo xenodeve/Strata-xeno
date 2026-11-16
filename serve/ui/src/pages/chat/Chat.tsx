@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, Menu01Icon, SidebarLeftIcon } from "@hugeicons/core-free-icons"
-import { apiHeaders, getAgent, getHealth, getImport, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
+import { apiHeaders, getAgent, getHealth, getImport, getMcp, NO_HEALTH, root, url, type Health, type McpInfo } from "../../lib/api"
 import { chat, exportMarkdown, isPrompt, useChatVersion, type Attachment, type Message } from "../../lib/chat"
 import { readFiles } from "../../lib/files"
 import { cn } from "../../lib/cn"
@@ -34,7 +34,7 @@ import { SettingsSheet } from "./SettingsSheet"
 import { PanelDock } from "../../components/SidePanel"
 import { ProjectPicker } from "../../components/ProjectPicker"
 import { panelState, type PanelState, type PanelTab } from "../../lib/panel"
-import { runnerId } from "../../lib/runner"
+import { blockText, myPcCoding, runnerId } from "../../lib/runner"
 import { runnerLine, useRunnerAgent } from "../../components/RunnerSettings"
 
 const NO_MCP: McpInfo = { servers: [], tools: 0 }
@@ -128,13 +128,17 @@ export function Chat({ id }: { id?: string }) {
   const input = useRef<HTMLTextAreaElement>(null)
   const pinned = useRef(true)                                   // follow the answer while the reader is at the bottom
   const busy = chat.busy
-  // #310 part 2: the machine the open chat works on, and so which coding tools, which runner, which MCP servers. A My PC chat with a known runner
-  // sends its requests even while the runner is offline: the server answers with the words that say so (409 runner_offline). One with no runner
-  // known sends no coding tools, and the controls say why.
+  // #310 part 2: the machine the open chat works on, and so which coding tools, which runner, which MCP servers. A My PC chat whose runner this page
+  // has an id for sends with `runner` (online, offline, not answered yet, one failed ask): an offline PC is answered with the server's own words
+  // (409 runner_offline). With no runner id, or one the server does not know for this key, nothing can reach the PC: the words say so next to the
+  // prompt and a send with the coding tools on is refused - never a prompt that silently goes without tools (lib/runner.ts myPcCoding).
   const onMy = chat.machine() === "my"
   const onRunner = onMy && rid ? rid : undefined
-  const coding: AgentInfo = !onMy ? agentInfo : typeof myAgent === "object" && myAgent !== null ? { ...myAgent, allowed: true } : { ...NO_AGENT, available: true }
-  const blocked = !onMy ? undefined : !rid ? t("This project is on My PC, and this browser has no runner. Set it in Settings, under This browser's runner.") : myAgent === undefined ? t("Asking the server…") : runnerLine(myAgent)
+  const mine = onMy ? myPcCoding(rid, myAgent) : null
+  const coding: AgentInfo = mine ? mine.info : agentInfo
+  const stop = mine?.block ? blockText(mine.block, location.origin + root().replace(/\/$/, "")) : null
+  const blocking = !!stop && chat.settings.agent !== false
+  const blocked = stop ? stop.full : onMy && myAgent !== undefined ? runnerLine(myAgent) : undefined
   const chatMcp: McpInfo = onMy && myMcp ? { servers: [...mcp.servers, ...myMcp.servers], tools: mcp.tools + myMcp.tools } : mcp      // a My PC chat may use its PC's MCP servers too
   const { data: metrics, stale } = useMetrics()
   const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
@@ -272,6 +276,7 @@ export function Chat({ id }: { id?: string }) {
       else void chat.compact(ctx(), asked.focus)
       return
     }
+    if (blocking) { toast("warn", t("Your PC cannot be reached"), stop!.full, 8000); return }            // #310 part 2: never a silent tool-less answer; the prompt stays in the composer
     const typed = !files.length && isInitCommand(text) ? INIT_PROMPT : text, f = files                                    // "/init": the prompt that has the model write the project's CLAUDE.md
     const folders = chat.folders()
     const go = async () => {
@@ -381,6 +386,7 @@ export function Chat({ id }: { id?: string }) {
       </div>
 
       <div className="sticky bottom-3 z-10">
+        {blocking && <p role="note" data-runner-blocked={mine!.block!} className="mb-2 rounded-md border border-line bg-surface px-3 py-2 text-[12.5px] text-ink-2 shadow-[0_4px_16px_rgb(0_0_0/0.06)] [overflow-wrap:anywhere]">{stop!.full}</p>}
         <PromptBar
           value={text}
           onChange={setText}
@@ -407,8 +413,8 @@ export function Chat({ id }: { id?: string }) {
             onMode: (m) => chat.setSettings({ ...chat.settings, agentMode: m }),
             onFolders: (list) => (project ? chat.setProjectFolders(project.id, list) : chat.setSettings({ ...chat.settings, agentFolder: list[0]?.trim() ?? "" })),
             onForget: () => { forgetRules(store, chatKey); chat.notify() }, permsHref: href("settings", "permissions"),
-            ...(rid && project ? { machine: { value: onMy ? "my" as const : "server" as const, server: agentInfo.allowed, onPick: (m: "my" | "server") => chat.setProjectMachine(project.id, m), state: myAgent } } : {}),
-            runner: onRunner, blocked,
+            ...(rid && project ? { machine: { value: onMy ? "my" as const : "server" as const, server: agentInfo.allowed, onPick: (m: "my" | "server") => { if (!busy) chat.setProjectMachine(project.id, m) }, state: myAgent, locked: !!busy } } : {}),
+            runner: onRunner, blocked, blockedRow: stop?.short,
           }}
           mcp={{
             servers: chatMcp.servers, tools: chatMcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings", "mcp-servers"),
