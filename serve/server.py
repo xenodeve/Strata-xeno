@@ -6902,7 +6902,7 @@ def make_handler(svc: Service):
             with svc.runner_hub.names:                      # #315: wholly before or after a rename of the key
                 if self.team:                               # the key's name now, not as it was when the request came
                     who = svc.keys.match(self._given_key())
-                r = None if who is None else                     svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
+                r = None if who is None else svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
             if r is None:                                   # revoked meanwhile (answered after the lock)
                 return self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             poll = runner_hub.POLL_MAX_S
