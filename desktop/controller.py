@@ -220,7 +220,8 @@ class Controller:
         self._host = None
         self._ticket: object | None = None       # the current host's: its events carry it, a stale one is dropped
         self._watch: PendingWatch | None = None
-        self._dirty: list[str] = []              # origins whose storage may hold a token
+        left = store.injected                    # an earlier run's (a crash): known from the first moment, so a
+        self._dirty: list[str] = [left] if left else []     # Quit before start() still clears it, or keeps it
         self._front = "servers"                  # what Open shows: "servers", or "app" once the app was opened
         self._quitting = False
         self._quit_step = ""
@@ -272,11 +273,9 @@ class Controller:
     def start(self) -> None:
         """The crash leftover first (a token an earlier run left in the web view), then the servers window, then the
         server opened last."""
-        left = self._store.injected
-        if left:
-            with self._mu:
-                if left not in self._dirty:
-                    self._dirty.append(left)
+        if self._quitting:
+            return
+        if self._dirty:                              # the crash leftover (seeded from servers.json at __init__)
             self._clear()
         self._window.show_servers()
         self._show_state()
@@ -326,7 +325,7 @@ class Controller:
         with self._mu:
             self._dirty = [o for o in self._dirty if o not in tried or o in failed]
             keep = self._dirty[-1] if self._dirty else None
-        if tried or self._store.injected != keep:
+        if tried:                                    # nothing tried: the record is left as it is
             self._store.set_injected(keep)
 
     # ------------------------------------------------------------------ the runner
@@ -550,25 +549,16 @@ class Controller:
                 return
             self._quitting = True
         threading.Thread(target=self._watchdog, name="desktop-quit-watchdog", daemon=True).start()
+        steps = (("the runner", self._stop_runner), ("the app window", self._window.hide_app),
+                 ("the token's clear", self._clear), ("the tray", self._tray.stop),
+                 ("the windows", self._window.destroy), ("the mutex", self._release or (lambda: None)))
         try:
-            self._quit_step = "the runner"
-            self._stop_runner()
-            self._quit_step = "the token's clear"
-            try:
-                self._window.hide_app()
-            except Exception as e:  # noqa: BLE001
-                log.warning("hiding the app window raised %s", type(e).__name__)
-            self._clear()
-            self._quit_step = "the tray"
-            try:
-                self._tray.stop()
-            except Exception as e:  # noqa: BLE001
-                log.warning("stopping the tray raised %s", type(e).__name__)
-            self._quit_step = "the windows"
-            self._window.destroy()
-            self._quit_step = "the mutex"
-            if self._release is not None:
-                self._release()
+            for name, step in steps:                     # a step that raises never keeps the next from running
+                self._quit_step = name
+                try:
+                    step()
+                except Exception as e:  # noqa: BLE001
+                    log.error("Quit: %s raised %s", name, type(e).__name__, exc_info=True)
             self._quit_step = "done"
         finally:
             self._events.put(None)

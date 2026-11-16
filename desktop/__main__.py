@@ -54,7 +54,6 @@ def main(argv: list[str] | None = None) -> int:
         applog.add_secret(selftest_token)
     from serve import runner
     runner._say = applog.say
-    log.info("Strata Desktop starts (data folder %s)", data)
 
     if args.selftest:
         return _selftest(args, data, selftest_token)
@@ -65,13 +64,11 @@ def main(argv: list[str] | None = None) -> int:
 
     name = single.instance_name(data, bool(args.data_dir))
     instance = single.acquire(name)
-    if instance is None:
-        if single.signal_show(name):
-            log.info("another Strata Desktop runs for this folder: it was asked to show its window")
-        else:
-            log.info("another Strata Desktop runs for this folder and could not be reached")
+    if instance is None:                               # no log line: a second start never opens desktop.log
+        if not single.signal_show(name):
             webview2.message_box(words.t("already_running"))
         return EXIT_OK
+    log.info("Strata Desktop starts (data folder %s)", data)
     try:
         return _run(args, data, instance)
     finally:

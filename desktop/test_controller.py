@@ -624,6 +624,38 @@ def test_watchdog_logs_the_hung_step(rig, caplog):
     r.hosts[0].hang.set()
 
 
+def test_quit_before_start_keeps_the_crash_record(rig):
+    """Quit before start() (the web view failed, a tray Quit during start-up) must not drop the leftover's record."""
+    r = rig(store_kw={"injected": ORIGIN_A}, window_kw={"clear_ok": False})
+    r.ctl.quit()
+    assert r.store.injected == ORIGIN_A
+    r2 = rig(store_kw={"injected": ORIGIN_A})
+    r2.ctl.quit()
+    assert r2.log.of("clear")[0][1] == URL_A and r2.store.injected is None
+
+
+def test_start_after_quit_does_nothing(rig):
+    r = rig(store_kw={"injected": ORIGIN_A, "last": "A"})
+    r.ctl.quit()
+    n = len(r.log.calls)
+    r.ctl.start()
+    assert r.log.calls[n:] == [] and r.hosts == []
+
+
+def test_a_failing_quit_step_does_not_strand_the_rest(rig):
+    r = rig()
+    r.ctl.connect("A")
+    r.emit("online", {"id": RID_1, "who": "ann"})
+
+    def full_disk(origin):
+        raise OSError(28, "No space left on device")
+    r.store.set_injected = full_disk
+    r.hosts[0].stop = lambda timeout=5.0: (_ for _ in ()).throw(RuntimeError("stop broke"))
+    r.ctl.quit()
+    assert r.log.names("tray.stop", "destroy", "release") == ["tray.stop", "destroy", "release"]
+    assert r.ctl.wait_quit(1) and r.exits == []
+
+
 def test_nothing_starts_after_quit(rig):
     r = rig()
     r.ctl.quit()
