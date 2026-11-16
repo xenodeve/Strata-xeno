@@ -266,10 +266,16 @@ class Stub:
 
             def do_POST(self):
                 req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                t0 = time.time()
                 with stub.lock:
                     stub.active += 1
                     stub.max_active = max(stub.max_active, stub.active)
-                t0 = time.time()
+                    stub.records.append({"id": f"r{len(stub.records)}", "client": self.headers.get("User-Agent"),
+                                         "time": t0, "prompt_ms": 1.0, "reused": 3,
+                                         "body_slot": req.get("strata_cache_slot", "absent"),
+                                         "body_tools": "tools" in req, "body_effort": req.get("reasoning_effort"),
+                                         "body_max_tokens": req.get("max_tokens"),
+                                         "body_kwargs": req.get("chat_template_kwargs")})
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Connection", "close")
@@ -301,8 +307,6 @@ class Stub:
                 self.wfile.flush()
                 with stub.lock:
                     stub.active -= 1
-                    stub.records.append({"id": f"r{len(stub.records)}", "client": self.headers.get("User-Agent"),
-                                         "time": t0, "prompt_ms": 1.0, "reused": 3})
                 self.close_connection = True
 
         stub_read, stub_tokens, stub_tok = read_s, tokens, tok_s
@@ -351,6 +355,49 @@ class Schedulers(unittest.TestCase):
         self.assertEqual(self.stub.max_active, 1)
         WB.mark_overlap(rows)
         self.assertTrue(all(r["overlap_s"] == 0 for r in rows))
+
+    def test_pin_sends_each_users_slot(self):
+        rows = WB.run_sequential(self.stub.port, WB.send_order("w2a", tiny_users(), pin=True), self.mk, max_new=8,
+                                 seed=1)
+        by = {x["client"]: x for x in self.stub.records}
+        for r in rows:
+            self.assertEqual(by[r["marker"]]["body_slot"], {"A": 0, "B": 1}[r["user"]])
+            self.assertEqual(r["cache_slot"], {"A": 0, "B": 1}[r["user"]])
+        self.stub.records.clear()
+        WB.run_sequential(self.stub.port, WB.send_order("w2a", tiny_users(), pin=False), self.mk, max_new=8, seed=1)
+        self.assertTrue(all(x["body_slot"] == "absent" for x in self.stub.records))     # the server's rule decides
+        self.stub.records.clear()
+        WB.run_concurrent(self.stub.port, WB.pinned_users(tiny_users(), True), self.mk, max_new=8, seed=1)
+        self.assertEqual({x["body_slot"] for x in self.stub.records}, {0, 1})
+
+    def test_w2s_side_requests_between_turns(self):
+        order = WB.send_order("w2s", tiny_users(), pin=True)
+        self.assertEqual([u for u, _ in order][:6], ["A", "A~side", "B", "B~side", "A", "A~side"])
+        self.assertEqual(len(order), 14)
+        rows = WB.run_sequential(self.stub.port, order, self.mk, max_new=8, seed=1)
+        by = {x["client"]: x for x in self.stub.records}
+        for r in rows:
+            got = by[r["marker"]]
+            if r["user"].endswith("~side"):
+                self.assertEqual(got["body_slot"], "absent")               # side requests are never pinned
+                self.assertFalse(got["body_tools"])
+                self.assertIsNone(got["body_effort"])
+                self.assertEqual(got["body_max_tokens"], 32)
+                self.assertEqual(got["body_kwargs"], {"enable_thinking": False})
+                self.assertTrue(r["tag"].endswith(".side"))
+            else:
+                self.assertTrue(got["body_tools"])
+                self.assertEqual(got["body_effort"], "high")
+
+    def test_side_heads_differ_and_are_short(self):
+        users = WB.split_users(WB.workload(), "01/234")
+        sides = [WB.side_item(it) for it in users["A"] + users["B"]]
+        heads = [s[1][0]["content"][:1500] for s in sides]                  # ~ the first 512 tokens' text
+        self.assertEqual(len(set(heads)), len(heads))                        # a new prompt family every time
+        for _, msgs, _extra in sides:
+            n = len(msgs[0]["content"]) / 4                                   # characters / 4
+            self.assertTrue(250 <= n <= 650, n)
+            self.assertNotIn(WB.atb.SYSTEM[:200], msgs[0]["content"])        # not the agent's family
 
     def test_client_clock_not_timings(self):
         r = WB.post_stream(self.stub.port, tiny_users()["A"][0][1], max_new=8, seed=1, marker="m")

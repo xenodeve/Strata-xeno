@@ -27,6 +27,10 @@ two rounds each mode is first once per arm; `mode_pos` in each row):
   w2b  two users at once: each sends its next turn as soon as its previous answer arrived
   short one long turn (installer-fr.0, ~37K tokens), then 4 follow-ups that each add ~200-250 tokens (a tool call and
        20 lines of setup.py): short prompt reads on a long cached prefix
+  w2s  w2a, and after each user's turn one short side request of that user (user `A~side` / `B~side`): a classifier
+       prompt of its own (~300-600 tokens, thinking off, 32 tokens) whose first 512 tokens differ every time, as Claude
+       Code's auto-mode classifier and title requests do, so it is a new prompt family for the server's CacheSlots
+Arm key pin=1 (#321): user A's turns send "strata_cache_slot": 0, user B's 1 (side requests send none)
 Users (--split, default 01/234): user A has sessions 0-1 (server-option, expert-cache: 10 turns), user B sessions 2-4
 (installer-fr, cuda-kernel, tokenizer-fr: 13 turns); ~150K tokens of new prompt each (characters / 4), so neither
 user is idle for most of a w2b series.  Each session has its own task after the shared system prompt and tools, so the
@@ -75,7 +79,8 @@ import agent_turns_bench as atb  # noqa: E402
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 WIN = os.name == "nt"
-MODES = ("w1", "w2a", "w2b", "short")
+MODES = ("w1", "w2a", "w2b", "short", "w2s")
+PIN_SLOTS = {"A": 0, "B": 1, "solo": 0}   # pin=1: the engine cache slot of each user's turns (#321)
 SHORT_BASE = "installer-fr.0"      # the short mode's long turn (~37K tokens)
 SHORT_FILE, SHORT_LINES, SHORT_N = "setup.py", 20, 4
 GIB = 1024 ** 3
@@ -95,6 +100,7 @@ class Arm:
     exe: str | None = None
     xargs: list = field(default_factory=list)
     env: dict = field(default_factory=dict)
+    pin: bool = False                # pin=1: user A's turns send strata_cache_slot 0, user B's 1 (side requests: none)
 
 
 def parse_arm(spec: str) -> Arm:
@@ -113,6 +119,8 @@ def parse_arm(spec: str) -> Arm:
                 arm.parallel = int(v)
         elif k == "exe":
             arm.exe = v
+        elif k == "pin":
+            arm.pin = v not in ("0", "", "false", "no")
         elif k == "xargs":
             arm.xargs = [x for x in v.split(";") if x]
         else:
@@ -250,13 +258,69 @@ def alternate(users: dict[str, list]) -> list[tuple[str, tuple]]:
     return out
 
 
+SIDE_SYSTEM = (
+    "You are a safety classifier for an autonomous coding agent. You are shown the most recent output of a tool the "
+    "agent ran in the user's repository. Decide whether the agent's next step, judged only from that output, could "
+    "change files outside the repository, reach the network, delete data, expose credentials or run something the "
+    "user did not ask for. Most steps are harmless: reading files, searching the code and listing directories are "
+    "always allowed. Editing files inside the repository is allowed when the task asks for it. Running tests and "
+    "builds is allowed. Installing packages, pushing to a remote, changing system settings, reading files in the "
+    "user's home folder outside the repository, and anything that sends data to another machine need the user's "
+    "approval. When you are unsure, prefer asking. Answer with exactly one word: ALLOW or ASK. Do not explain.")
+SIDE_EXTRA = {"max_tokens": 32, "tools": None, "reasoning_effort": None,
+              "chat_template_kwargs": {"enable_thinking": False}}
+SIDE_TAIL_CHARS = 1200
+
+
+def side_item(item) -> tuple[str, list[dict], dict]:
+    """A side request after a turn (w2s): the classifier prompt with the turn's last tool output first in the user
+    message, so the prompt's first 512 tokens are new every time (a new CacheSlots family).  ~300-600 tokens."""
+    tag, msgs = item[0], item[1]
+    task = next((m["content"] for m in msgs if m.get("role") == "user"), "")
+    last = next((m["content"] for m in reversed(msgs) if m.get("role") == "tool"), "")
+    tail = last[-SIDE_TAIL_CHARS:]
+    text = f"Agent task: {task}\nTool output:\n{tail}\n\n{SIDE_SYSTEM}"
+    return (f"{tag}.side", [{"role": "user", "content": text}], dict(SIDE_EXTRA))
+
+
+def _pinned(user: str, item, pin: bool):
+    if not pin or user not in PIN_SLOTS:
+        return item
+    tag, msgs, extra = (tuple(item) + (None,))[:3]
+    return (tag, msgs, {**(extra or {}), "strata_cache_slot": PIN_SLOTS[user]})
+
+
+def send_order(mode: str, items: dict[str, list], pin: bool = False) -> list[tuple[str, tuple]]:
+    """The sequential modes' send order: w1 / short in order, w2a alternating, w2s alternating with each user's side
+    request after its turn.  pin: the users' own turns carry their cache slot (PIN_SLOTS); side requests none."""
+    if mode in ("w1", "short"):
+        order = [(u, it) for u, v in items.items() for it in v]
+    elif mode == "w2s":
+        order = []
+        for u, it in alternate(items):
+            order += [(u, it), (f"{u}~side", side_item(it))]
+    else:
+        order = alternate(items)
+    return [(u, _pinned(u, it, pin)) for u, it in order]
+
+
+def pinned_users(items: dict[str, list], pin: bool = False) -> dict[str, list]:
+    return {u: [_pinned(u, it, pin) for it in v] for u, v in items.items()}
+
+
 # ------------------------------------------------------------------------------------------------ the client
 def post_stream(port: int, messages: list[dict], *, max_new: int, seed: int, marker: str, api_key: str | None = None,
-                timeout: float = 3600, tools=None, host: str = "127.0.0.1") -> dict:
+                timeout: float = 3600, tools=None, host: str = "127.0.0.1", extra: dict | None = None) -> dict:
     """One streamed chat request.  t_first: the first delta that carries text, reasoning or a call (the first chunk is
-    the empty role chunk, sent before the prompt is read; a ':' line is a keep-alive)."""
+    the empty role chunk, sent before the prompt is read; a ':' line is a keep-alive).  `extra`: body fields laid over
+    the agent's (a value None removes the field), e.g. strata_cache_slot, or a side request's own settings."""
     body = {"messages": messages, "tools": atb.TOOLS if tools is None else tools, "max_tokens": max_new,
             "temperature": 1.0, "top_p": 0.95, "top_k": 20, "seed": seed, "reasoning_effort": "high", "stream": True}
+    for k, v in (extra or {}).items():
+        if v is None:
+            body.pop(k, None)
+        else:
+            body[k] = v
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream", "User-Agent": marker}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -316,10 +380,11 @@ def client_numbers(rec: dict) -> dict:
 # ------------------------------------------------------------------------------------------------ schedulers
 def run_sequential(port: int, items: list[tuple[str, tuple[str, list]]], make_marker, *, max_new: int, seed: int,
                    log_size=None, api_key=None, on_row=None) -> list[dict]:
-    """items: [(user, (tag, messages))] in send order; each waits for the previous answer."""
+    """items: [(user, (tag, messages[, extra body fields]))] in send order; each waits for the previous answer."""
     rows = []
-    for seq, (user, (tag, msgs)) in enumerate(items):
-        rows.append(_one(port, user, tag, msgs, seq, make_marker, max_new, seed, log_size, api_key, on_row))
+    for seq, (user, item) in enumerate(items):
+        tag, msgs, extra = (tuple(item) + (None,))[:3]
+        rows.append(_one(port, user, tag, msgs, seq, make_marker, max_new, seed, log_size, api_key, on_row, extra))
     return rows
 
 
@@ -333,10 +398,11 @@ def run_concurrent(port: int, users: dict[str, list[tuple[str, list]]], make_mar
 
     def worker(user, items):
         start.wait()
-        for tag, msgs in items:
+        for item in items:
+            tag, msgs, extra = (tuple(item) + (None,))[:3]
             with lock:
                 seq = next(seqs)
-            row = _one(port, user, tag, msgs, seq, make_marker, max_new, seed, log_size, api_key, None)
+            row = _one(port, user, tag, msgs, seq, make_marker, max_new, seed, log_size, api_key, None, extra)
             with lock:
                 rows.append(row)
                 if on_row:
@@ -351,11 +417,12 @@ def run_concurrent(port: int, users: dict[str, list[tuple[str, list]]], make_mar
     return rows
 
 
-def _one(port, user, tag, msgs, seq, make_marker, max_new, seed, log_size, api_key, on_row) -> dict:
+def _one(port, user, tag, msgs, seq, make_marker, max_new, seed, log_size, api_key, on_row, extra=None) -> dict:
     marker = make_marker(user, seq)
     off0 = log_size() if log_size else None
-    rec = post_stream(port, msgs, max_new=max_new, seed=seed, marker=marker, api_key=api_key)
+    rec = post_stream(port, msgs, max_new=max_new, seed=seed, marker=marker, api_key=api_key, extra=extra)
     row = {"user": user, "tag": tag, "seq": seq, "marker": marker, "msgs_sha": messages_hash(msgs), "log_off0": off0,
+           "cache_slot": (extra or {}).get("strata_cache_slot"),
            "log_off1": log_size() if log_size else None, **rec}
     if on_row:
         on_row(row)
@@ -936,12 +1003,11 @@ def main(argv=None) -> int:
                                                   + (f"  ERROR {r['error']}" if r['error'] else ""), flush=True))
                 t0 = time.time()
                 if mode == "w2b":
-                    rows = run_concurrent(a.port, items, mk, max_new=a.max_new, seed=a.seed, log_size=log_size,
-                                          on_row=on_row)
+                    rows = run_concurrent(a.port, pinned_users(items, arm.pin), mk, max_new=a.max_new, seed=a.seed,
+                                          log_size=log_size, on_row=on_row)
                 else:
-                    seq_items = [(u, it) for u, v in items.items() for it in v] if mode in ("w1", "short") else alternate(items)
-                    rows = run_sequential(a.port, seq_items, mk, max_new=a.max_new, seed=a.seed, log_size=log_size,
-                                          on_row=on_row)
+                    rows = run_sequential(a.port, send_order(mode, items, arm.pin), mk, max_new=a.max_new,
+                                          seed=a.seed, log_size=log_size, on_row=on_row)
                 mark_overlap(rows)
                 try:
                     match_records(rows, fetch_metrics(a.port))
