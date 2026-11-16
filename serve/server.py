@@ -3148,12 +3148,14 @@ class Service:
             on = []
         return memory_mod.collect(home, folders, on)
 
-    def start_agent_run(self, sa: dict, messages: list, who: str = "owner", runner=None):
+    def start_agent_run(self, sa: dict, messages: list, who: str = "owner", runner=None, guest: bool = False):
         """One request's use of the coding tools: the folder, mode, rules and chat the page named (anything odd is ignored), the rules for the
         AI as a prompt, and auto mode's judge (serve/agent_run.py).  `who`: the identity whose request it is; only it answers what the run asks (#310).
         `runner` (#310 part 2): the serve/runner_hub.py Runner of a project on the engineer's own PC.  Its `run.start` job (the facts job) gives
         the real folders, the shell, the platform, git and the notes, and the server touches none of its own disk, hooks or checkpoints for
-        the run; web access, helpers, vision and the judge stay the server's.  RunnerUnavailable when the job fails (before any run is made)."""
+        the run; web access, helpers, vision and the judge stay the server's.  RunnerUnavailable when the job fails (before any run is made).
+        `guest`: a team guest's run - its WebFetch (it runs here, for the run and its helpers) reaches only the public internet, never this
+        PC, a private network, Tailscale or Radmin's 26.0.0.0/8 (web.public_not_vpn, as #311's image URLs; final review I-1)."""
         mode = sa.get("mode") if sa.get("mode") in ("auto", "plan") else None
         rules = lambda v: [x for x in v if isinstance(x, str) and 0 < len(x) <= 500][:200] if isinstance(v, list) else []      # noqa: E731
         sid = sa.get("session") if isinstance(sa.get("session"), str) and 0 < len(sa["session"]) <= 80 else "default"
@@ -3197,8 +3199,8 @@ class Service:
             run.ctx.run_key, run.coding, run.runner, git = facts["run"], "my_agent", runner, facts["git"]
         web = web_mod.settings(conf)
         run.hidden = set() if web["on"] else set(getattr(self.agent, "web_tools", ()))          # web access is off until the user switches it on: the model is not even offered the tools
-        if web["on"]:
-            run.ctx.web = web_mod.Web(web)
+        if web["on"]:                                                   # a guest's fetches leave from this PC: not into the team's own network
+            run.ctx.web = web_mod.Web(web, fetcher=web_mod.Fetcher(guard=web_mod.public_not_vpn) if guest else None)
         helpers = getattr(self.agent, "helper_tools", ())
         if subagent_mod.settings(conf)["on"] and helpers:                                         # helpers are off until the user switches them on, for the same reason
             run.ctx.spawn = lambda kind, prompt, description: subagent_mod.execute(self, run, kind, prompt, description, run_with_mcp)
@@ -7085,11 +7087,12 @@ def make_handler(svc: Service):
                     return self._json(403, {"error": {"message": "The coding tools change files and run commands on this PC, so they work only from this PC itself (open the page as localhost) or with the API key. " + why}})
                 if runner is None and (svc.agent is None or svc.mcp is None):
                     return self._json(409, {"error": {"message": "the coding tools are switched off on this server (\"agent\": false in the run config)"}})
+                guest = self.team and not (self.identity is not None and self.identity.is_owner)     # its WebFetch: never the team's network (I-1)
                 if runner is None:
-                    arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name)     # #310: the run and what it asks are this identity's
+                    arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, guest=guest)     # #310: the run and what it asks are this identity's
                 else:
                     try:                                          # the facts job: up to REQUEST_TIMEOUT_S, on this request's own thread, no lock held
-                        arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, runner=runner)
+                        arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, runner=runner, guest=guest)
                     except runner_hub.RunnerUnavailable as e:
                         return self._json(409, {"error": {"type": "runner_offline", "message": e.message[:300]}})
                     base = svc.mcp if svc.mcp is not None else McpHub({})

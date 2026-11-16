@@ -12,11 +12,13 @@ import contextlib
 import http.client
 import io
 import json
+import socket
 import sys
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -423,6 +425,85 @@ class Routing(Fixture):
         code, body = self.req("GET", "/agent", key="k", device=DEV0)
         self.assertEqual(code, 200)
         self.assertEqual(set(body), {"available", "allowed", "reason", "shell", "tools"})
+
+    # #310 final review I-1: a team guest's WebFetch runs on the server, so it goes through #311's guard (web.public_not_vpn):
+    # never this PC, a private network, Tailscale or the Radmin network 26.0.0.0/8 - for her run and its helpers. The owner's
+    # and every run outside team mode keep web.public_ip. No test connects anywhere: serve/web.py's socket is a recorder.
+    def web_runs(self, *scripts, cfg=None):
+        self.start_routing(*scripts, cfg={"web": {"on": True}, "guest_mcp": [], **(cfg or {})})
+        runs, orig = [], self.svc.start_agent_run
+
+        def start(*a, **k):
+            runs.append(orig(*a, **k))
+            return runs[-1]
+        self.svc.start_agent_run = start
+        self.connects: list = []
+
+        def no_socket(*a, **k):
+            self.connects.append(a)
+            raise OSError("no network in this test")
+        p = mock.patch.object(web, "socket", SimpleNamespace(getaddrinfo=socket.getaddrinfo, SOCK_STREAM=socket.SOCK_STREAM,
+                                                             socket=no_socket))
+        p.start()
+        self.addCleanup(p.stop)
+        return runs
+
+    def web_results(self, events):
+        return [e for e in events if e["event"] == "result"]
+
+    def test_a_guests_webfetch_refuses_radmin_and_this_pc_without_connecting(self):
+        lst = socket.socket()
+        lst.bind(("127.0.0.1", 0))
+        lst.listen(1)
+        lst.setblocking(False)
+        self.addCleanup(lst.close)
+        port = lst.getsockname()[1]
+        runs = self.web_runs(tool_call("WebFetch", url="http://26.1.2.3/"), tool_call("WebFetch", url=f"http://127.0.0.1:{port}/"), DONE)
+        f = self.fake(self.ann)
+        code, events, _ = self.chat(self.ann, {"cwd": CWD, "runner": f.id, "allow": ["WebFetch"]})
+        self.assertEqual(code, 200, events)
+        self.assertEqual(self.server_calls, ["WebFetch", "WebFetch"])         # on the server, with no card (her allow rule)
+        got = self.web_results(events)
+        self.assertEqual([r["ok"] for r in got], [False, False], got)
+        for r in got:
+            self.assertIn("only addresses on the public internet can be fetched", r["text"])
+        self.assertEqual(self.connects, [])
+        with self.assertRaises(BlockingIOError):
+            lst.accept()                                                       # nothing reached this PC's port
+        self.assertIs(runs[0].ctx.web.fetcher.guard, web.public_not_vpn)
+
+    def test_a_guests_helper_fetches_through_the_same_guard(self):
+        runs = self.web_runs(tool_call("Task", description="look it up", prompt="fetch the page", subagent_type="general"),
+                             tool_call("WebFetch", url="http://26.1.2.3/"), "</think>\n\nReport: refused.", DONE,
+                             cfg={"agents": {"on": True}})
+        f = self.fake(self.ann)
+        code, events, _ = self.chat(self.ann, {"cwd": CWD, "session": "chat-1", "runner": f.id, "allow": ["WebFetch"]})
+        self.assertEqual(code, 200, events)
+        self.assertEqual(self.server_calls, ["Task", "WebFetch"])
+        fetch = [e for e in events if e["event"] == "step_result"]                  # the helper's own WebFetch
+        self.assertEqual(len(fetch), 1, events)
+        self.assertFalse(fetch[0]["ok"])
+        self.assertIn("only addresses on the public internet can be fetched", fetch[0]["text"])
+        self.assertEqual(self.connects, [])
+        self.assertIs(runs[0].ctx.web.fetcher.guard, web.public_not_vpn)
+
+    def test_the_owners_webfetch_is_unchanged(self):
+        runs = self.web_runs(tool_call("WebFetch", url="http://26.1.2.3/"), DONE)
+        f = self.fake("k", device=DEV0, machine="owner-pc")
+        code, events, _ = self.chat("k", {"cwd": CWD, "runner": f.id, "allow": ["WebFetch"]}, device=DEV0)
+        self.assertEqual(code, 200, events)
+        self.assertIs(runs[0].ctx.web.fetcher.guard, web.public_ip)
+        self.assertEqual(len(self.connects), 1)                                 # public_ip lets 26.x through, as before
+        self.assertIn("no network in this test", self.web_results(events)[0]["text"])     # it went as far as the socket
+
+    def test_outside_team_mode_webfetch_is_unchanged(self):
+        self.start_routing(DONE, cfg={"web": {"on": True}}, team=False)
+        f = self.fake(None, device=DEV1, machine="my-pc")
+        runs, orig = [], self.svc.start_agent_run
+        self.svc.start_agent_run = lambda *a, **k: runs.append(orig(*a, **k)) or runs[-1]
+        code, events, _ = self.chat(None, {"cwd": CWD, "runner": f.id})
+        self.assertEqual(code, 200, events)
+        self.assertIs(runs[0].ctx.web.fetcher.guard, web.public_ip)
 
     def test_get_agent_with_runner(self):
         self.start_routing()
