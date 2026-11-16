@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="__LANG__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'unsafe-eval'">
+<title>Strata Desktop</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9; --panel: #ffffff; --text: #16191d; --muted: #5d6670; --line: #dde1e6;
+    --accent: #2459c9; --accent-text: #ffffff; --warn-bg: #fff4d6; --warn-text: #6b4a00; --bad: #b3261e;
+    --good: #1f8a4c; --amber: #c27c0e; --grey: #8a929b; --sel: #e9effc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15171a; --panel: #1d2024; --text: #e8eaed; --muted: #9aa3ad; --line: #30353b;
+      --accent: #6d9bff; --accent-text: #0e1420; --warn-bg: #3a2f12; --warn-text: #f3d48a; --bad: #ff8a80;
+      --good: #5fd08f; --amber: #f0b44c; --grey: #7d858e; --sel: #24314a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 14px/1.45 "Segoe UI", "Leelawadee UI", system-ui, sans-serif;
+  }
+  h1 { font-size: 17px; margin: 0 0 10px; font-weight: 600; letter-spacing: -0.01em; }
+  h2 { font-size: 14px; margin: 0 0 10px; font-weight: 600; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+  .state { display: flex; gap: 8px; align-items: flex-start; }
+  .dot { flex: none; width: 10px; height: 10px; border-radius: 50%; margin-top: 5px; background: var(--grey); }
+  .dot.online { background: var(--good); } .dot.connecting, .dot.pending, .dot.offline { background: var(--amber); }
+  .dot.refused, .dot.error { background: var(--bad); }
+  .code { font: 600 34px/1.1 "Cascadia Mono", Consolas, monospace; letter-spacing: 0.12em; margin: 10px 0 6px; }
+  .row-actions, .form-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li.server { border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin-bottom: 8px; cursor: pointer; }
+  li.server.selected { background: var(--sel); border-color: var(--accent); }
+  .name { font-weight: 600; }
+  .muted { color: var(--muted); font-size: 12.5px; word-break: break-all; }
+  .result { font-size: 12.5px; margin-top: 4px; }
+  .result.bad { color: var(--bad); }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin: 8px 0 3px; }
+  input {
+    width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; font: inherit;
+    background: var(--bg); color: var(--text);
+  }
+  input:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button {
+    font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel);
+    color: var(--text); cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: 0.5; cursor: default; transform: none; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  .warn { background: var(--warn-bg); color: var(--warn-text); border-radius: 6px; padding: 6px 8px; font-size: 12.5px; margin-top: 6px; }
+  .error { color: var(--bad); font-size: 12.5px; margin-top: 6px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .note { font-size: 12px; color: var(--muted); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="panel" id="state-panel">
+  <h1 id="title"></h1>
+  <div class="state"><span class="dot" id="dot"></span><span id="state-text"></span></div>
+  <div id="pending" hidden>
+    <div class="code" id="code"></div>
+    <button id="copy" type="button"></button> <span class="muted" id="copied" hidden></span>
+  </div>
+  <div class="row-actions" id="without-row" hidden><button id="without" type="button"></button></div>
+</div>
+
+<div class="panel">
+  <ul id="servers"></ul>
+  <p class="muted" id="empty" hidden></p>
+</div>
+
+<div class="panel">
+  <h2 id="form-title"></h2>
+  <form id="form" autocomplete="off">
+    <label for="f-name" id="l-name"></label>
+    <input id="f-name" maxlength="64" spellcheck="false">
+    <label for="f-url" id="l-url"></label>
+    <input id="f-url" spellcheck="false" placeholder="https://">
+    <div class="warn" id="warning" hidden></div>
+    <label for="f-token" id="l-token"></label>
+    <input id="f-token" type="password" spellcheck="false">
+    <div class="hint" id="token-hint" hidden></div>
+    <div class="error" id="form-error" hidden></div>
+    <div class="form-actions">
+      <button class="primary" id="save" type="submit"></button>
+      <button id="remove" type="button" hidden></button>
+      <button id="new" type="button"></button>
+    </div>
+  </form>
+</div>
+<p class="note" id="kept"></p>
+
+<script>
+"use strict";
+const WORDS = /*WORDS*/{};
+function w(key, fields) {
+  let s = WORDS[key] || key;
+  for (const k in (fields || {})) s = s.split("{" + k + "}").join(String(fields[k]));
+  return s;
+}
+const $ = (id) => document.getElementById(id);
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = String(text);
+  return e;
+}
+
+let api = null;
+let editing = null;          // the name of the server in the form, or null for a new one
+let selected = null;
+const results = {};          // name -> the last test's result (this window only)
+
+function busy(on) {
+  for (const b of document.querySelectorAll("button")) b.disabled = on;
+}
+async function call(fn) {
+  busy(true);
+  try { return await fn(); } catch (e) { return { error: w("internal_error") }; } finally { busy(false); }
+}
+
+function resultLine(name, server) {
+  const r = results[name];
+  if (!r) return null;
+  if (r.error) return el("div", "result bad", r.error);
+  const parts = [];
+  if (r.pending_code) parts.push(w("pending", { server: server, code: r.pending_code }));
+  else if (r.reachable) parts.push(w("test_reachable"));
+  if (r.model) parts.push(w("label_model") + ": " + r.model);
+  if (r.role) parts.push(w(r.role === "owner" ? "role_owner" : "role_guest"));
+  if (r.reachable && !r.engine_running) parts.push(w("engine_down"));
+  return el("div", "result", parts.join(" · "));
+}
+
+function renderList(servers) {
+  const ul = $("servers");
+  ul.replaceChildren();
+  $("empty").hidden = servers.length > 0;
+  for (const s of servers) {
+    const li = el("li", "server" + (s.name === selected ? " selected" : ""));
+    li.append(el("div", "name", s.name), el("div", "muted", s.url),
+              el("div", "muted", w(s.token === "set" ? "token_set" : s.token === "unreadable" ? "token_unreadable" : "token_missing")));
+    const line = resultLine(s.name, s.name);
+    if (line) li.append(line);
+    const actions = el("div", "row-actions");
+    const test = el("button", "", w("button_test"));
+    test.type = "button";
+    test.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      results[s.name] = await call(() => api.test(s.name));
+      refresh();
+    });
+    const connect = el("button", "primary", w("button_connect"));
+    connect.type = "button";
+    connect.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const r = await call(() => api.connect(s.name));
+      if (r && r.error) results[s.name] = { error: r.error };
+      refresh();
+    });
+    actions.append(test, connect);
+    li.append(actions);
+    li.addEventListener("click", () => edit(s));
+    ul.append(li);
+  }
+}
+
+function edit(s) {
+  selected = s ? s.name : null;
+  editing = s ? s.name : null;
+  $("form-title").textContent = s ? s.name : w("button_new");
+  $("f-name").value = s ? s.name : "";
+  $("f-url").value = s ? s.url : "";
+  $("f-token").value = "";                       // the token is never put back into the form
+  $("token-hint").hidden = !s;
+  $("remove").hidden = !s;
+  $("form-error").hidden = true;
+  checkUrl();
+  for (const li of document.querySelectorAll("li.server")) li.classList.toggle("selected", !!s && li.firstChild.textContent === s.name);
+}
+
+let warnTimer = 0;
+function checkUrl() {
+  clearTimeout(warnTimer);
+  warnTimer = setTimeout(async () => {
+    if (!api) return;
+    let text = null;
+    try { text = await api.warning($("f-url").value); } catch (e) { text = null; }
+    $("warning").textContent = text || "";
+    $("warning").hidden = !text;
+  }, 150);
+}
+
+async function refresh() {
+  if (!api) return;
+  let r;
+  try { r = await api.list(); } catch (e) { r = { error: w("internal_error") }; }
+  if (!r || r.error) { $("form-error").textContent = (r && r.error) || w("internal_error"); $("form-error").hidden = false; return; }
+  if (selected === null && r.last) selected = r.last;
+  renderList(r.servers || []);
+  if (r.state) window.render(r.state);
+}
+
+window.render = function (st) {
+  if (!st) return;
+  $("dot").className = "dot " + (st.kind || "idle");
+  $("state-text").textContent = st.text || "";
+  const pending = st.kind === "pending" && !!st.code;
+  $("pending").hidden = !pending;
+  $("code").textContent = pending ? st.code : "";
+  $("without-row").hidden = !st.can_open_without_runner;
+};
+
+function init() {
+  if (api) return;
+  api = window.pywebview.api;
+  refresh();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  $("title").textContent = w("servers_title");
+  $("l-name").textContent = w("label_name");
+  $("l-url").textContent = w("label_url");
+  $("l-token").textContent = w("label_token");
+  $("token-hint").textContent = w("token_keep");
+  $("save").textContent = w("button_save");
+  $("remove").textContent = w("button_remove");
+  $("new").textContent = w("button_new");
+  $("copy").textContent = w("menu_copy_code");
+  $("copied").textContent = w("copied");
+  $("without").textContent = w("button_open_without_runner");
+  $("empty").textContent = w("servers_empty");
+  $("kept").textContent = w("token_kept");
+  edit(null);
+
+  $("f-url").addEventListener("input", checkUrl);
+  $("new").addEventListener("click", () => edit(null));
+  $("form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const name = $("f-name").value, url = $("f-url").value, token = $("f-token").value;
+    const r = await call(() => api.save(name, url, token || null, editing));
+    if (r && r.ok) {
+      $("f-token").value = "";
+      selected = editing = name.trim();
+      $("form-title").textContent = editing;
+      $("token-hint").hidden = false;
+      $("remove").hidden = false;
+      $("form-error").hidden = true;
+      refresh();
+    } else {
+      $("form-error").textContent = (r && r.error) || w("internal_error");
+      $("form-error").hidden = false;
+    }
+  });
+  $("remove").addEventListener("click", async () => {
+    if (!editing || !window.confirm(w("confirm_remove", { name: editing }))) return;
+    const r = await call(() => api.remove(editing));
+    if (r && r.error) { $("form-error").textContent = r.error; $("form-error").hidden = false; return; }
+    delete results[editing];
+    edit(null);
+    refresh();
+  });
+  $("copy").addEventListener("click", async () => {
+    const r = await call(() => api.copy_code());
+    $("copied").hidden = !(r && r.ok);
+    setTimeout(() => { $("copied").hidden = true; }, 2000);
+  });
+  $("without").addEventListener("click", () => call(() => api.open_without_runner()));
+
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.list) init();
+});
+window.addEventListener("pywebviewready", init);
+</script>
+</body>
+</html>

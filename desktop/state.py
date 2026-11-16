@@ -88,6 +88,11 @@ def _render(s: TrayState, server: str) -> str:
     return text
 
 
+def describe(s: TrayState) -> str:
+    """The state in words, uncut (the servers window's state line)."""
+    return _render(s, s.server)
+
+
 def tooltip(s: TrayState) -> str:
     """The tray icon's tooltip, at most TOOLTIP_MAX characters: the server's name is cut first, then the end."""
     text = _render(s, s.server)

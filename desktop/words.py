@@ -141,6 +141,29 @@ TABLE: dict[str, dict[str, str]] = {
         "en": "The window could not be prepared.",
         "th": "เตรียมหน้าต่างไม่สำเร็จ",
     },
+    "servers_title": {"en": "Strata Desktop", "th": "Strata Desktop - เซิร์ฟเวอร์"},
+    "servers_empty": {
+        "en": "No servers yet. Add one with its address and your token.",
+        "th": "ยังไม่มีเซิร์ฟเวอร์ เพิ่มได้ด้วยที่อยู่และโทเค็นของคุณ",
+    },
+    "button_new": {"en": "Add a server", "th": "เพิ่มเซิร์ฟเวอร์"},
+    "token_keep": {
+        "en": "Leave it empty to keep the saved token.",
+        "th": "เว้นว่างไว้เพื่อใช้โทเค็นที่บันทึกไว้เดิม",
+    },
+    "label_model": {"en": "Model", "th": "โมเดล"},
+    "test_reachable": {"en": "Reachable", "th": "เชื่อมต่อได้"},
+    "confirm_remove": {"en": "Remove {name} from the list?", "th": "ลบ {name} ออกจากรายการไหม"},
+    "copied": {"en": "Copied", "th": "คัดลอกแล้ว"},
+    "token_missing_test": {
+        "en": "This server has no token to test with: enter it and save.",
+        "th": "เซิร์ฟเวอร์นี้ยังไม่มีโทเค็นให้ทดสอบ ใส่โทเค็นแล้วบันทึกก่อน",
+    },
+    "no_such_server": {"en": "There is no server with that name.", "th": "ไม่มีเซิร์ฟเวอร์ชื่อนี้"},
+    "internal_error": {
+        "en": "Something went wrong; the details are in desktop.log.",
+        "th": "เกิดข้อผิดพลาด ดูรายละเอียดได้ใน desktop.log",
+    },
     # ---------------------------------------------------------------- notices (Task 5)
     "notice_device_title": {"en": "A device asks to be let in", "th": "มีอุปกรณ์ขอเข้าใช้"},
     "notice_device_text": {
@@ -153,6 +176,12 @@ TABLE: dict[str, dict[str, str]] = {
               "https://go.microsoft.com/fwlink/p/?LinkId=2124703 and start Strata Desktop again.",
         "th": "Strata Desktop ต้องใช้ Microsoft Edge WebView2 Runtime ซึ่งเครื่องนี้ยังไม่มี ติดตั้งได้จาก "
               "https://go.microsoft.com/fwlink/p/?LinkId=2124703 แล้วเปิด Strata Desktop ใหม่อีกครั้ง",
+    },
+    "no_dotnet": {
+        "en": "Strata Desktop needs .NET Framework 4.6.2 or later, which this PC does not have. Install it from "
+              "https://dotnet.microsoft.com/download/dotnet-framework and start Strata Desktop again.",
+        "th": "Strata Desktop ต้องใช้ .NET Framework 4.6.2 ขึ้นไป ซึ่งเครื่องนี้ยังไม่มี ติดตั้งได้จาก "
+              "https://dotnet.microsoft.com/download/dotnet-framework แล้วเปิด Strata Desktop ใหม่อีกครั้ง",
     },
 }
 
