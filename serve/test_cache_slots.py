@@ -159,6 +159,13 @@ class SlotRule(unittest.TestCase):
         self.assertEqual(slots.choose(turn(2, 0))[0], 1)
         self.assertEqual(slots.choose(turn(1, 1)), (0, 1800, "continues"))
 
+    def test_ids_of_any_sequence_type(self):
+        """_shared_len compares list slices, and a tuple slice never equals a list slice: ids are made a list first."""
+        slots = CacheSlots(4)
+        slots.record(0, tuple(turn(1, 3)))
+        self.assertEqual(slots.choose(tuple(turn(1, 4))), (0, len(turn(1, 3)), "continues"))
+        self.assertEqual(slots.shared(tuple(turn(1, 5))), len(turn(1, 4)))
+
     def test_shared_and_pick_answer_like_choose(self):
         slots = CacheSlots(4)
         head = list(range(600))

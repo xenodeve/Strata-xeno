@@ -650,6 +650,7 @@ class CacheSlots:
         """-> (slot, shared, how): how is "continues" (shared = the prefix shared with the slot's last prompt),
         "free" or "evicts" (shared None).  `nearest` (a dict) is filled with the slot sharing the most and its tail
         (its last prompt's tokens past the shared prefix), for the STRATA_DEBUG line."""
+        ids = ids if isinstance(ids, list) else list(ids)   # _shared_len compares list slices (never equal to tuples)
         with self.lock:
             best, best_sh, near, near_sh = self._scan(ids)
             if nearest is not None and near is not None:
@@ -674,6 +675,7 @@ class CacheSlots:
 
     def shared(self, ids):
         """How many leading tokens the prompt shares with the last prompt of the slot it continues; None if none."""
+        ids = ids if isinstance(ids, list) else list(ids)
         with self.lock:
             best, best_sh, _, _ = self._scan(ids)
         return best_sh if best is not None else None
