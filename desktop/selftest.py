@@ -22,7 +22,8 @@ window, then the app loaded), and the Controller's Quit.  Steps, each `{"step", 
     quit     Controller.quit(): every runner, job, pending-watch and event thread ended; every process the app had
              started before Quit (its descendants but the web view's: the runner's MCP servers from its runner.json,
              a shell) gone after it, by PID (null, "not exercised", when there was none); the clear's read-back on
-             the server's origin shows no strata.apikey and the device kept; servers.json `injected` empty.  The
+             the server's origin shows no strata.apikey and the device kept, read on the local clear page the app
+             window answers itself (`cleared_on_local_page`); servers.json `injected` empty.  The
              tray is not exercised (null): the selftest's tray is a recorder, a real icon would show on the display
 
 A check that is null is not a failure; its detail says why.  The step's `ok` is true only when no check is false.
@@ -186,6 +187,8 @@ class NoWindow:
     def render(self, view: dict) -> None: ...
     def navigate_and_inject(self, base: str, script: str, timeout: float = 15.0) -> bool:
         return False
+    def clear_storage(self, base: str, script: str, timeout: float = 15.0) -> bool:
+        return False
     def open_app(self, base: str, server: str | None = None) -> None: ...
     def show_app(self) -> None: ...
     def hide_app(self) -> None: ...
@@ -215,7 +218,12 @@ class Watched:
 
     def navigate_and_inject(self, base: str, script: str, timeout: float = 15.0) -> bool:
         ok = self.inner.navigate_and_inject(base, script, timeout=timeout)
-        (self.clears if script == inject.clear_script() else self.injects).append(ok is True)
+        self.injects.append(ok is True)
+        return ok
+
+    def clear_storage(self, base: str, script: str, timeout: float = 15.0) -> bool:
+        ok = self.inner.clear_storage(base, script, timeout=timeout)
+        self.clears.append(ok is True)
         return ok
 
     def open_app(self, base: str, server: str | None = None) -> None:
@@ -328,7 +336,8 @@ GATE_SCRIPT = ("(function(){var r=document.getElementById(\"root\");return JSON.
                "\"[data-device-gate]\")!==null,root:r?r.childElementCount:-1})})()")
 SERVERS_SCRIPT = ("(function(){try{var s=window.localStorage;return " + inject.js_literal(list(STORAGE_KEYS)) +
                   ".every(function(k){return s.getItem(k)===null})}catch(e){return \"no storage\"}})()")
-READ_BACK_SCRIPT = ("(function(){try{return JSON.stringify({origin:location.origin,apikey_absent:window.localStorage"
+READ_BACK_SCRIPT = ("(function(){try{return JSON.stringify({origin:location.origin,path:location.pathname,"
+                    "apikey_absent:window.localStorage"
                     ".getItem(\"strata.apikey\")===null,device_kept:window.localStorage.getItem(\"strata.device\")!==null})"
                     "}catch(e){return JSON.stringify({error:String(e&&e.name)})}})()")
 
@@ -584,6 +593,8 @@ def _quit_step(ctl, watched: Watched, tray: QuietTray, server: str, data_dir, wi
             and back.get("apikey_absent") is True and back.get("origin") == inject.origin(server) \
             and back.get("device_kept") is True
         checks["injected_empty"] = injected == []
+        # the clear ran on the page the app window answers itself (ruling P3-R5): no server needed for it
+        checks["cleared_on_local_page"] = back.get("path") == inject.CLEAR_PATH
         detail.update({"read_back": back, "clears": watched.clears})
     else:
         checks["token_cleared"] = None

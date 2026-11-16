@@ -1,18 +1,26 @@
 """Strata Desktop's two windows (#310 part 3).  The only module that imports `webview` (inside `Gui.run`); `pystray`
 and `PIL` stay in `desktop/tray.py`, also inside functions.
 
-- **servers** - the local page `desktop/ui/servers.html` (`html=`, its words filled in here), with the Python API
-  `ServersApi` (`js_api`).  Nothing but this page ever loads in it, and no method of the API returns a token.
+- **servers** - the local page `desktop/ui/servers.html` (`html=`, its words filled in here), and the calls it makes:
+  eight plain functions (`api_functions`, given to `window.expose`), never a `js_api` object - pywebview follows a
+  dotted name from the page into any attribute of that object, `_` ones included.  Its own page is its only page: its
+  first navigation (pywebview's NavigateToString of that page) is let through and every later one is cancelled
+  (`_on_servers_navigating`), and every call is refused until that check is on.  No method returns a token.
 - **app** - the server's web app, created hidden and with no `js_api`.  `navigate_and_inject` loads `<base>/health`,
   checks the page is on the server's origin, and runs the localStorage script there (desktop/inject.py);
-  `open_app` then loads `<base>/` and shows the window once it has loaded.
+  `open_app` then loads `<base>/` and shows the window once it has loaded.  `clear_storage` removes the token with no
+  server at all: the window loads `<origin>/.strata-desktop/clear?n=<nonce>` and answers that one request itself
+  (WebView2's WebResourceRequested, `_on_app_request`), so the page commits on the origin, with its localStorage.
 
-Nothing in the app window reaches Windows but a plain http(s) address: a new-window link goes through
-`install_link_guard` (pywebview hands it to `webbrowser.open`, which is `os.startfile`), and a top-level navigation
-of the app window off the open server's origin is cancelled (`_on_app_navigating`; a link the user clicked to another
-http(s) address opens in the system browser).
+Neither window takes a link or a file dropped from outside (`AllowExternalDrop` off, set in pywebview's `before_show`,
+on the UI thread before the first navigation).  Nothing in the app window reaches Windows but a plain http(s)
+address: a new-window link goes through `install_link_guard` (pywebview hands it to `webbrowser.open`, which is
+`os.startfile`), and a top-level navigation of the app window off the open server's origin is cancelled
+(`_on_app_navigating`; a link the user clicked to another http(s) address opens in the system browser).
 
-Closing either window hides it (the app stays in the tray) unless the controller is quitting.  `webview.start` runs
+Closing either window hides it (the app stays in the tray) unless the controller is quitting.  When Windows closes them
+(sign-out or shutdown, WM_QUERYENDSESSION; Task Manager), `_on_form_closing` runs Quit first (`on_session_end`, capped
+at SESSION_END_S) and lets them go.  `webview.start` runs
 with `gui="edgechromium"`, `private_mode=False` and `storage_path=<data>\\webview` (the WebView2 profile: chats survive a
 restart); downloads are allowed (the web app saves files).  pywebview falls back to MSHTML without saying so when
 Edge Chromium is missing: `desktop/webview2.py` checks before, and a fallback seen here gives the same box and exit 4.
@@ -22,6 +30,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -48,6 +57,12 @@ PAGE_WORDS = (
 
 WEB_SCHEMES = ("http", "https")
 URL_MOST = 8192
+
+API_NAMES = ("list", "warning", "save", "remove", "test", "connect", "open_without_runner", "copy_code")
+CLEAR_PATH = inject.CLEAR_PATH
+LOCAL_PAGE = b"<!doctype html><meta charset=utf-8><meta name=strata-desktop content=clear><title>Strata Desktop</title>"
+LOCAL_HEADERS = "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store"
+SESSION_END_S = 4.0     # Windows ends the session: Quit gets this long (it shows "an app is preventing" after ~5 s)
 
 
 def external_url_ok(url) -> bool:
@@ -119,6 +134,21 @@ def _open_nothing(url, new=0, autoraise=True) -> bool:
     return False
 
 
+def _do_events() -> None:
+    """One pass of the UI thread's message queue (WinForms, loaded by pywebview): what a call from another thread
+    (`Invoke`, a script's answer, a navigation's events) needs while the UI thread waits in a handler."""
+    import System.Windows.Forms as WinForms
+    WinForms.Application.DoEvents()
+
+
+def _no_drop(control, which: str) -> None:
+    """A link or a file dragged onto the window from outside does nothing (WebView2 would navigate to it)."""
+    try:
+        control.AllowExternalDrop = False
+    except Exception as e:
+        log.error("the %s window still takes drops from outside (%s)", which, type(e).__name__)
+
+
 def servers_html() -> str:
     """`ui/servers.html` with the words of the current language in place of `/*WORDS*/{}` and its `lang`."""
     text = SERVERS_HTML.read_text(encoding="utf-8")
@@ -137,8 +167,9 @@ def state_view(s: state.TrayState, notice: str = "") -> dict:
 class ServersApi:
     """What the servers page calls (`window.pywebview.api.<method>`).  Every value it returns is JSON with no token
     (RF 1); a failure is `{"error": words}`, never an exception (pywebview would hand its text and traceback to the
-    page).  Its state is kept in `_` attributes: pywebview lists every public attribute of a js_api object, and the
-    public objects inside it, as callable from the page.
+    page).  It is never given to pywebview as a `js_api`: pywebview 6.2.1 resolves a call's name with a dotted
+    `getattr` chain that does not stop at `_` (webview/util.py `js_bridge_call` -> `get_nested_attribute`), so a page
+    could reach `_store.save` or, through `_ctl`, the whole process.  The window gets `api_functions(api)` instead.
 
     `controller` gives `state` (the current TrayState), `notice` (words or "") and `connect(name)`, `remove(name)`,
     `saved(old_name, entry)`, `open_without_runner()`, `copy_code() -> bool` (desktop/controller.py `Controller`)."""
@@ -219,16 +250,37 @@ class ServersApi:
         return self._safe("copy_code", do, self._fail())
 
 
+def api_functions(api: ServersApi, allowed: Callable[[], bool] = lambda: True) -> tuple:
+    """`api`'s calls as plain functions named as the page calls them (API_NAMES), for `window.expose`: pywebview
+    looks an exposed function up by its exact name (`window._functions`) and leaves `_js_api` None, so a dotted name
+    from the page reaches nothing.  A call is refused - words, nothing done - while `allowed()` is False: the servers
+    window's navigation check is not on, so the page in it may not be this app's."""
+    def make(name: str):
+        method = getattr(api, name)
+
+        def call(*args):
+            if not allowed():
+                log.error("the servers window's %s was refused: its navigation check is not on", name)
+                return {"error": words.t("internal_error")}
+            return method(*args)
+        call.__name__ = call.__qualname__ = name
+        return call
+    return tuple(make(n) for n in API_NAMES)
+
+
 class Gui:
     """The two windows (desktop/controller.py's WindowPort).  `quitting()` tells the closing handlers whether the
     controller is quitting; `servers_hidden` keeps the servers window hidden at its creation (the hidden-window check);
     `headless` (the selftest) does that and more: no window is ever shown (every `show` is skipped, the app window's
-    too) and no message box is raised - a failure is only logged and returned."""
+    too) and no message box is raised - a failure is only logged and returned.  `on_session_end` runs Quit when Windows
+    closes the windows (the controller's `end_session`); `pump` is one pass of the UI thread's messages (tests)."""
 
     def __init__(self, data: Path | None, api: ServersApi | None, quitting: Callable[[], bool] = lambda: False, *,
-                 debug: bool = False, servers_hidden: bool = False, headless: bool = False):
+                 debug: bool = False, servers_hidden: bool = False, headless: bool = False,
+                 on_session_end: Callable[[], None] | None = None, pump: Callable[[], None] | None = None):
         self._data, self._api, self._quitting = data, api, quitting
         self._debug, self._servers_hidden, self._headless = debug, servers_hidden or headless, headless
+        self._on_session_end, self._pump = on_session_end, pump or _do_events
         self._servers = None
         self._app = None
         self._app_lock = threading.Lock()        # one navigation of the app window at a time
@@ -240,6 +292,13 @@ class Gui:
         self._loads = 0                          # navigate_and_inject's count: each load has its own URL
         self._app_origin: str | None = None      # the only origin the app window may navigate to
         self._nav_guarded = False                # _on_app_navigating is on the app window's control
+        self._servers_guarded = False            # _on_servers_navigating is on the servers window's control
+        self._servers_navigated = False          # its own page's navigation was seen: every later one is cancelled
+        self._local_ready = threading.Event()    # _on_app_request is on the app window's CoreWebView2
+        self._local_failed = False               # ... and it could not be put there: a clear needs the server
+        self._local_page: str | None = None      # the one address _on_app_request answers now (a clear's load)
+        self._session_thread: threading.Thread | None = None
+        self._session_deadline = 0.0
 
     def __repr__(self) -> str:
         return "Gui()"
@@ -265,13 +324,19 @@ class Gui:
         # pywebview platforms/edgechromium.py on_new_window_request), which on Windows is os.startfile: any scheme
         # would reach ShellExecute.  Only plain http(s) addresses get through; headless, none (a browser is a window).
         install_link_guard(_open_nothing if self._headless else None)
-        self._servers = webview.create_window(words.t("servers_title"), html=servers_html(), js_api=self._api,
+        self._servers = webview.create_window(words.t("servers_title"), html=servers_html(),
                                               width=SERVERS_SIZE[0], height=SERVERS_SIZE[1], min_size=SERVERS_MIN,
                                               hidden=self._servers_hidden)
+        if self._api is not None:                        # functions, never an object (see ServersApi)
+            self._servers.expose(*api_functions(self._api, lambda: self._servers_guarded))
         self._app = webview.create_window("Strata", hidden=True, width=APP_SIZE[0], height=APP_SIZE[1],
                                           min_size=APP_MIN)
         for w in (self._servers, self._app):
             w.events.closing += self._closing_handler(w)
+        # `before_show` runs on the UI thread right after the form is made, before WebView2 has started: before
+        # either window's first navigation.
+        self._servers.events.before_show += self._prepare_servers
+        self._app.events.before_show += self._prepare_app
         self._hook_app(self._app)
 
         def begin():
@@ -306,6 +371,141 @@ class Gui:
                 log.error("hiding a window raised %s", type(e).__name__)
             return False                              # cancels the close
         return on_closing
+
+    # ------------------------------------------------------------------ before the first navigation (UI thread)
+    def _prepare_servers(self, window) -> None:
+        """No drop from outside, the navigation check (its own page only) and the session-end hook.  Without the
+        check every call of the page is refused (`api_functions`): fail closed."""
+        native = getattr(window, "native", None)
+        control = getattr(native, "webview", None)
+        _no_drop(control, "servers")
+        try:
+            control.NavigationStarting += self._on_servers_navigating
+            self._servers_guarded = True
+        except Exception as e:
+            log.error("the servers window's navigation check could not be installed (%s): its calls are refused",
+                      type(e).__name__)
+        self._hook_closing(native)
+
+    def _on_servers_navigating(self, sender, args) -> None:
+        """The servers window shows its own page and nothing else: the first navigation is pywebview's
+        NavigateToString of it (a `data:` URI; the only one seen in the hidden run), every later one - a dropped link
+        or file, a script - is cancelled."""
+        try:
+            if not self._servers_navigated:
+                self._servers_navigated = True
+                return
+            args.Cancel = True
+            log.warning("the servers window was kept from going to a %s address", _scheme(str(args.Uri)))
+        except Exception as e:
+            try:
+                args.Cancel = True
+            except Exception:
+                pass
+            log.error("the servers window's navigation check raised %s; the navigation was cancelled",
+                      type(e).__name__)
+
+    def _prepare_app(self, window) -> None:
+        """No drop from outside, the session-end hook, and - once WebView2 has started - the local clear page."""
+        native = getattr(window, "native", None)
+        control = getattr(native, "webview", None)
+        _no_drop(control, "app")
+        try:
+            control.CoreWebView2InitializationCompleted += self._on_app_core_ready
+        except Exception as e:
+            self._local_failed = True
+            log.error("the app window's local page could not be hooked (%s): a clear needs the server",
+                      type(e).__name__)
+        self._hook_closing(native)
+
+    def _on_app_core_ready(self, sender, args) -> None:
+        """`_on_app_request` on the app window's CoreWebView2.  pywebview 6.2.1 has already asked for every request
+        (`AddWebResourceRequestedFilter('*', All)` in on_webview_ready), so no filter of our own is needed."""
+        try:
+            if not bool(args.IsSuccess):
+                raise RuntimeError("WebView2 did not start")
+            sender.CoreWebView2.WebResourceRequested += self._on_app_request
+        except Exception as e:
+            self._local_failed = True
+            log.error("the app window's local page could not be hooked (%s): a clear needs the server",
+                      type(e).__name__)
+            return
+        self._local_ready.set()
+
+    def _on_app_request(self, sender, args) -> None:
+        """Answers the one address `clear_storage` armed (its nonce is new for each clear) with LOCAL_PAGE; every
+        other request goes on to the network untouched."""
+        want = self._local_page
+        if want is None:
+            return
+        try:
+            if str(args.Request.Uri) != want:
+                return
+            args.Response = self._respond(sender)
+        except Exception as e:
+            log.error("answering the local clear page raised %s", type(e).__name__)
+
+    def _respond(self, core):
+        from System import Array, Byte
+        from System.IO import MemoryStream
+        return core.Environment.CreateWebResourceResponse(MemoryStream(Array[Byte](LOCAL_PAGE)), 200, "OK",
+                                                          LOCAL_HEADERS)
+
+    # ------------------------------------------------------------------ Windows ends the session
+    def _hook_closing(self, native) -> None:
+        try:
+            native.FormClosing += self._on_form_closing
+        except Exception as e:
+            log.error("a window's close hook could not be installed (%s): sign-out would not run Quit",
+                      type(e).__name__)
+
+    def _on_form_closing(self, sender, args) -> None:
+        """WinForms' FormClosing, after pywebview's own handler (which asked `_closing_handler`, so a close outside
+        Quit is cancelled by now).  The title bar's X and our own `destroy` (both UserClosing) are left as they are.
+        Any other close - Windows signing out or shutting down (WM_QUERYENDSESSION: WindowsShutDown; a cancel there
+        answers FALSE, "Strata Desktop is preventing sign-out"), Task Manager, Application.Exit - lets the window go
+        and runs Quit first, once."""
+        try:
+            if self._ending:
+                return
+            reason = str(args.CloseReason)
+            if reason == "UserClosing":
+                return
+            args.Cancel = False
+            self._end_session(reason)
+        except Exception as e:
+            log.error("Windows closing the app: the close handler raised %s", type(e).__name__)
+
+    def _end_session(self, reason: str) -> None:
+        """Quit (`on_session_end`) on its own thread while this - the UI thread - keeps pumping messages: Quit's clear
+        and its closing of the windows need this thread.  One Quit; every close waits on it (the other form's, a
+        re-entrant one under the pump), all within one deadline, SESSION_END_S from the first."""
+        if self._on_session_end is None:
+            return
+        with self._flag_lock:
+            first = self._session_thread is None
+            if first:
+                self._session_thread = threading.Thread(target=self._run_session_end, name="desktop-session-end",
+                                                        daemon=True)
+                self._session_deadline = time.monotonic() + SESSION_END_S
+            t = self._session_thread
+        if first:
+            log.warning("Windows closes the app (%s): Quit runs first", reason)
+            t.start()
+        while t.is_alive() and time.monotonic() < self._session_deadline:
+            try:
+                self._pump()
+            except Exception as e:
+                log.error("pumping the UI thread's messages raised %s", type(e).__name__)
+                t.join(max(0.0, self._session_deadline - time.monotonic()))
+                break
+            t.join(0.02)
+
+    def _run_session_end(self) -> None:
+        try:
+            self._on_session_end()
+        except Exception as e:
+            log.error("Quit at the session's end raised %s", type(e).__name__, exc_info=True)
 
     def _hook_app(self, window) -> None:
         window.events.loaded += self._on_app_loaded
@@ -387,23 +587,54 @@ class Gui:
             # URL it already shows, so a second inject in a row would wait out its timeout (seen in the hidden-window
             # check).  The server routes /health on the path alone.
             url = f"{inject.health_url(base)}?desktop={self._loads}"
+            return self._load_and_run(url, want, urlsplit(inject.health_url(base)).path, script, deadline, timeout)
+
+    def clear_storage(self, base: str, script: str, timeout: float = 15.0) -> bool:
+        """Runs `script` (the clear) on `base`'s origin with no server: the app window loads
+        `<origin>/.strata-desktop/clear?n=<nonce>`, and `_on_app_request` answers that request itself (LOCAL_PAGE), so
+        the page commits on that origin - its localStorage - without the network (hidden run: 32-63 ms on a closed
+        port, an unresolvable host and https).  The answer is armed for this load only, and its nonce is new each
+        time.  Before WebView2 has started it waits for the hook (within `timeout`); when the hook could not be put
+        on, the clear goes to the server's /health as `navigate_and_inject` does (the server must answer)."""
+        deadline = time.monotonic() + timeout
+        try:
+            want = inject.origin(base)
+        except ValueError:
+            return False
+        if not self._nav_guarded:
+            log.error("the app window has no navigation check: nothing cleared")
+            return False
+        if self._local_failed or not self._local_ready.wait(max(0.0, deadline - time.monotonic())):
+            log.warning("the app window has no local clear page: the clear goes to the server")
+            return self.navigate_and_inject(base, script, max(0.0, deadline - time.monotonic()))
+        url = f"{want}{CLEAR_PATH}?n={secrets.token_hex(16)}"
+        with self._app_lock:
+            self._app_origin = want
+            self._local_page = url
             try:
-                self._app.load_url(url)                        # clears `loaded` first (webview/window.py load_url)
-                if not self._app.events.loaded.wait(max(0.0, deadline - time.monotonic())):
-                    log.info("the app window did not load %s/health in %g s", want, timeout)
-                    return False
-                try:
-                    landed = inject.origin(self._app.get_current_url())
-                except ValueError:
-                    landed = None
-                if landed != want:
-                    log.info("the app window landed on another origin, not %s: nothing written", want)
-                    return False
-                path = urlsplit(inject.health_url(base)).path
-                return self._app.evaluate_js(inject.guarded(script, want, path)) is True
-            except Exception as e:
-                log.error("preparing the app window raised %s", type(e).__name__)
+                return self._load_and_run(url, want, CLEAR_PATH, script, deadline, timeout)
+            finally:
+                self._local_page = None
+
+    def _load_and_run(self, url: str, want: str, path: str, script: str, deadline: float, timeout: float) -> bool:
+        """Under `_app_lock`: loads `url`, and runs `script` only when the page landed on `want` (and, in the page,
+        on `path`); True only when it evaluated to `true`.  The script is never logged."""
+        try:
+            self._app.load_url(url)                            # clears `loaded` first (webview/window.py load_url)
+            if not self._app.events.loaded.wait(max(0.0, deadline - time.monotonic())):
+                log.info("the app window did not load %s%s in %g s", want, path, timeout)
                 return False
+            try:
+                landed = inject.origin(self._app.get_current_url())
+            except ValueError:
+                landed = None
+            if landed != want:
+                log.info("the app window landed on another origin, not %s: nothing written", want)
+                return False
+            return self._app.evaluate_js(inject.guarded(script, want, path)) is True
+        except Exception as e:
+            log.error("preparing the app window raised %s", type(e).__name__)
+            return False
 
     def open_app(self, base: str, server: str | None = None) -> None:
         """Loads `<base>/` in the app window, titled "Strata - <server>", and shows it when it has loaded."""

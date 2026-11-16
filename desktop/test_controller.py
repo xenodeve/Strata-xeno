@@ -116,11 +116,17 @@ class FakeWindow:
         self.log.add("render", view)
 
     def navigate_and_inject(self, base, script, timeout=15.0):
-        clear = script == inject.clear_script()
-        self.log.add("clear" if clear else "inject", base, script, timeout)
+        assert script != inject.clear_script(), "a clear goes through clear_storage (its local page, I-3)"
+        self.log.add("inject", base, script, timeout)
         if self.block is not None:
             self.block.wait(10)
-        return self.clear_ok if clear else self.inject_ok
+        return self.inject_ok
+
+    def clear_storage(self, base, script, timeout=15.0):
+        self.log.add("clear", base, script, timeout)
+        if self.block is not None:
+            self.block.wait(10)
+        return self.clear_ok
 
     def open_app(self, base, server=None):
         self.log.add("open_app", base, server)
@@ -528,9 +534,8 @@ def test_quit_with_clear_false_keeps_injected(rig):
 def test_one_failed_clear_of_two_keeps_only_that_one(rig):
     r = rig(store_kw={"injected": [ORIGIN_A, ORIGIN_B]})
     r.window.clear_ok = True
-    real = r.window.navigate_and_inject
-    r.window.navigate_and_inject = lambda base, script, timeout=15.0: (real(base, script, timeout)
-                                                                       and base != URL_A)
+    real = r.window.clear_storage
+    r.window.clear_storage = lambda base, script, timeout=15.0: real(base, script, timeout) and base != URL_A
     r.ctl.start()
     assert r.store.injected == [ORIGIN_A]
 
@@ -701,6 +706,37 @@ def test_quit_order(rig):
     assert r.ctl.wait_quit(1) and r.exits == []
     r.ctl.quit()                                                   # twice: nothing more
     assert r.log.names("tray.stop") == ["tray.stop"]
+
+
+def test_session_end_quits_in_order_with_short_caps(rig):
+    """I-2: Windows signs out or shuts down - the same Quit, with caps that fit in the few seconds Windows gives."""
+    r = rig()
+    r.ctl.connect("A")
+    r.emit("online", {"id": RID_1, "who": "ann"})
+    n = len(r.log.calls)
+    t0 = time.monotonic()
+    r.ctl.end_session()
+    assert time.monotonic() - t0 < 2 and r.ctl.quitting and r.ctl.wait_quit(0)
+    after = [c[0] for c in r.log.calls[n:]
+             if c[0] in ("host.stopped", "clear", "set_injected", "tray.stop", "destroy", "release")]
+    assert after == ["host.stopped", "clear", "set_injected", "tray.stop", "destroy", "release"]
+    assert r.log.of("host.stop")[-1][2] == controller.SESSION_STOP_S
+    assert r.log.of("clear")[-1][3] == controller.SESSION_CLEAR_S
+    assert controller.SESSION_STOP_S + controller.SESSION_CLEAR_S < 4.0
+    assert r.store.injected == [] and r.exits == []
+
+
+def test_session_end_during_a_quit_waits_for_it(rig):
+    r = rig()
+    r.ctl.connect("A")
+    r.hosts[0].hang = threading.Event()
+    threading.Thread(target=r.ctl.quit, name="test-quit", daemon=True).start()
+    while not r.ctl.quitting:
+        time.sleep(0.01)
+    threading.Timer(0.3, r.hosts[0].hang.set).start()
+    t0 = time.monotonic()
+    r.ctl.end_session()
+    assert r.ctl.wait_quit(0) and 0.2 <= time.monotonic() - t0 < 3
 
 
 def test_quit_ends_the_worker_and_the_watchdog(rig):
@@ -925,3 +961,21 @@ def test_fetch_pending_sends_token_and_device_headers():
     assert path == "/strata/devices/pending"
     assert headers["Authorization"] == "Bearer " + TOKEN_A
     assert headers["X-Strata-Device"] == DEVICE["id"] and headers["X-Strata-Device-Name"] == LABEL
+
+
+def test_clipboard_runs_clip_from_system32(monkeypatch):
+    """A bare "clip.exe" is searched in the app's folder and the current directory before System32."""
+    import os
+    import subprocess
+    seen = []
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.setattr(controller.os, "name", "nt")
+    monkeypatch.setenv("SystemRoot", r"C:\WinRoot")
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: seen.append((argv, kw)) or Done())
+    assert controller.copy_to_clipboard("K7QZ") is True
+    (argv, kw), = seen
+    assert argv == [os.path.join(r"C:\WinRoot", "System32", "clip.exe")]
+    assert kw["creationflags"] == controller.NO_WINDOW and kw["input"] == b"K7QZ"

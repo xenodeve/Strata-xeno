@@ -177,6 +177,12 @@ TABLE: dict[str, dict[str, str]] = {
         "th": "Strata Desktop เปิดอยู่แล้วด้วยสิทธิ์อื่น (เปิดแบบผู้ดูแลระบบไว้หรือเปล่า) ใช้ตัวนั้น "
               "หรือสั่งออกจากไอคอนในถาดก่อน",
     },
+    "cannot_start": {
+        "en": "Strata Desktop could not start: Windows refused the lock that keeps it to one copy. The details are in "
+              "desktop.log.",
+        "th": "Strata Desktop เปิดไม่ได้ เพราะ Windows ไม่ยอมให้สร้างตัวล็อกที่กันไม่ให้เปิดซ้ำ ดูรายละเอียดได้ใน "
+              "desktop.log",
+    },
     "no_webview2": {
         "en": "Strata Desktop needs the Microsoft Edge WebView2 Runtime, which this PC does not have. Install it from "
               "https://go.microsoft.com/fwlink/p/?LinkId=2124703 and start Strata Desktop again.",

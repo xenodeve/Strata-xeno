@@ -10,6 +10,7 @@ import inspect
 import json
 import re
 import threading
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -168,6 +169,120 @@ def test_api_exposes_only_its_methods():
     api, *_ = _api()
     assert _exposed(api) == {"list", "warning", "save", "remove", "test", "connect", "open_without_runner",
                              "copy_code"}
+
+
+def test_api_functions_are_plain_and_exact():
+    """What the servers window gets (`window.expose`): one plain function per call, named as the page calls it."""
+    api, store, ctl, _ = _api()
+    fns = gui.api_functions(api)
+    assert {f.__name__ for f in fns} == set(gui.API_NAMES) and len(fns) == len(gui.API_NAMES)
+    assert all(inspect.isfunction(f) for f in fns)
+    by = {f.__name__: f for f in fns}
+    assert by["list"]() == api.list()
+    assert by["connect"]("lab") == {"ok": True} and ctl.calls == [("connect", "lab")]
+
+
+def test_api_functions_refuse_until_the_window_is_guarded():
+    api, store, ctl, _ = _api()
+    allowed = [False]
+    by = {f.__name__: f for f in gui.api_functions(api, lambda: allowed[0])}
+    assert by["connect"]("lab") == {"error": words.t("internal_error")}
+    assert by["save"]("x", "https://evil.example", None, "lab") == {"error": words.t("internal_error")}
+    assert ctl.calls == [] and store.saved == []
+    allowed[0] = True
+    assert by["connect"]("lab") == {"ok": True}
+
+
+class FakeWebviewWindow:
+    """What `webview.create_window` returns, as the Gui's wiring uses it."""
+
+    def __init__(self, title, **kw):
+        self.title, self.kw = title, kw
+        self.exposed: list = []
+        self.events = type("E", (), {})()
+        for name in ("closing", "loaded", "before_show", "shown"):
+            setattr(self.events, name, FakeEvent())
+
+    def expose(self, *functions):
+        self.exposed.extend(functions)
+
+
+def _fake_webview(monkeypatch):
+    import sys
+    import types
+    made = []
+    fake = types.ModuleType("webview")
+    fake.settings = {}
+    fake.renderer = "edgechromium"
+
+    def create_window(title, **kw):
+        w = FakeWebviewWindow(title, **kw)
+        made.append(w)
+        return w
+    fake.create_window = create_window
+    fake.start = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "webview", fake)
+    monkeypatch.setattr(gui.webview2, "message_box", lambda text: pytest.fail("a message box"))
+    import webbrowser
+    monkeypatch.setattr(webbrowser, "open", webbrowser.open)        # run() wraps it: restored after the test
+    return made
+
+
+def test_servers_window_gets_functions_not_an_object(monkeypatch, tmp_path):
+    """I-1: no js_api object (pywebview follows dotted names into it, `_` attributes included); the exact calls through
+    `expose`; both windows prepared before they first load."""
+    made = _fake_webview(monkeypatch)
+    api, *_ = _api()
+    g = gui.Gui(data=tmp_path, api=api)
+    assert g.run(lambda: None) == 0
+    servers, app = made
+    assert servers.kw.get("js_api") is None and app.kw.get("js_api") is None
+    assert {f.__name__ for f in servers.exposed} == set(gui.API_NAMES)
+    assert all(inspect.isfunction(f) for f in servers.exposed)
+    assert servers.events.before_show.handlers and app.events.before_show.handlers
+
+
+def test_headless_servers_window_without_an_api_exposes_nothing(monkeypatch, tmp_path):
+    made = _fake_webview(monkeypatch)
+    g = gui.Gui(data=tmp_path, api=None, headless=True)
+    assert g.run(lambda: None) == 0
+    assert made[0].exposed == [] and made[0].kw.get("js_api") is None
+
+
+def test_pywebview_bridge_reaches_only_the_exposed_functions(monkeypatch, tmp_path):
+    """pywebview 6.2.1's own `js_bridge_call` against the window the Gui really wires (venv only): a dotted name into
+    a private attribute, a function's globals or its closure reaches nothing."""
+    webview = pytest.importorskip("webview")
+    from webview import util
+    monkeypatch.setattr(webview, "windows", [])
+    monkeypatch.setattr(webview, "start", lambda *a, **k: None)
+    import webbrowser
+    monkeypatch.setattr(webbrowser, "open", webbrowser.open)
+    monkeypatch.setattr(gui.webview2, "message_box", lambda text: pytest.fail("a message box"))
+    api, store, ctl, _ = _api()
+    g = gui.Gui(data=tmp_path, api=api)
+    g._servers_guarded = True
+    assert g.run(lambda: None) == 0
+    win = g._servers
+    answers = []
+    win.evaluate_js = lambda script, *a, **k: answers.append(script)
+
+    def call(name, params):
+        before = threading.active_count()
+        util.js_bridge_call(win, name, params, "v1")
+        deadline = time.monotonic() + 5
+        while threading.active_count() > before and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    call("connect", ["lab"])
+    assert ctl.calls == [("connect", "lab")] and len(answers) == 1
+    for name, params in [("_ctl.connect", ["lab"]), ("_store.save", ["lab", "https://evil.example", None, "lab"]),
+                         ("_api._ctl.connect", ["lab"]), ("list.__globals__.get", ["WEB_SCHEMES"]),
+                         ("connect.__globals__.__setitem__", ["WEB_SCHEMES", ["ms-msdt"]]),
+                         ("save.__closure__", []), ("_ctl._exit", [0]), ("_window._app.gui.os.system", ["x"])]:
+        call(name, params)
+    assert ctl.calls == [("connect", "lab")] and store.saved == [] and len(answers) == 1
+    assert gui.WEB_SCHEMES == ("http", "https")
 
 
 def test_api_never_returns_token():
@@ -642,3 +757,237 @@ def test_navigation_check_fails_closed():
     w.native = None
     assert g._guard_navigation(w) is False
     assert g._nav_guarded is False
+
+
+# ------------------------------------------------------------------------------------------------ before the first load
+class PrepControl:
+    """The WinForms WebView2 control as `before_show` finds it: no CoreWebView2 yet, drops allowed by default."""
+
+    def __init__(self):
+        self.NavigationStarting = FakeEvent()
+        self.CoreWebView2InitializationCompleted = FakeEvent()
+        self.AllowExternalDrop = True
+
+
+class PrepForm:
+    def __init__(self):
+        self.webview = PrepControl()
+        self.FormClosing = FakeEvent()
+
+
+def _prep_window():
+    w = FakeWindow()
+    w.native = PrepForm()
+    return w
+
+
+def test_servers_window_allows_its_own_page_and_nothing_after():
+    """I-1: the `html=` page is the servers window's first navigation (seen in the hidden run: one `data:` URI); a
+    dragged link or file, or any script, would be a later one: cancelled."""
+    g = gui.Gui(data=None, api=None)
+    w = _prep_window()
+    g._prepare_servers(w)
+    assert g._servers_guarded is True
+    assert w.native.webview.AllowExternalDrop is False
+    handler, = w.native.webview.NavigationStarting.handlers
+    first = NavArgs("data:text/html;charset=utf-8;base64,PCFkb2N0eXBl")
+    handler(None, first)
+    assert first.Cancel is False
+    for uri in ("file:///C:/Users/x/Downloads/evil.html", "https://evil.example/", "data:text/html;base64,PCFk",
+                "about:blank"):
+        a = NavArgs(uri, user=True)
+        handler(None, a)
+        assert a.Cancel is True, uri
+    assert len(w.native.FormClosing.handlers) == 1
+
+
+def test_servers_window_without_its_check_refuses_every_call():
+    api, store, ctl, _ = _api()
+    g = gui.Gui(data=None, api=api)
+    w = FakeWindow()
+    w.native = None                                       # the control could not be reached
+    g._prepare_servers(w)
+    assert g._servers_guarded is False
+    by = {f.__name__: f for f in gui.api_functions(api, lambda: g._servers_guarded)}
+    assert by["connect"]("lab") == {"error": words.t("internal_error")} and ctl.calls == []
+
+
+def test_servers_navigation_check_fails_closed():
+    g = gui.Gui(data=None, api=None)
+    g._servers_navigated = True
+
+    class Broken:
+        @property
+        def Uri(self):
+            raise RuntimeError("x")
+        Cancel = False
+
+    a = Broken()
+    g._on_servers_navigating(None, a)
+    assert a.Cancel is True
+
+
+def test_app_window_takes_no_drop_and_hooks_its_local_page():
+    g = gui.Gui(data=None, api=None)
+    w = _prep_window()
+    g._prepare_app(w)
+    assert w.native.webview.AllowExternalDrop is False
+    assert len(w.native.FormClosing.handlers) == 1
+    ready, = w.native.webview.CoreWebView2InitializationCompleted.handlers
+    assert not g._local_ready.is_set()
+
+    class Core:
+        def __init__(self):
+            self.WebResourceRequested = FakeEvent()
+
+    sender = type("Sender", (), {})()
+    sender.CoreWebView2 = Core()
+    ready(sender, type("Args", (), {"IsSuccess": True})())
+    assert g._local_ready.is_set() and sender.CoreWebView2.WebResourceRequested.handlers == [g._on_app_request]
+
+
+def test_pywebview_asks_for_every_request_of_the_app_window():
+    """The local page relies on pywebview 6.2.1's own filter: every request of every context reaches
+    WebResourceRequested (venv only, where pywebview is installed)."""
+    import importlib.util
+    spec = importlib.util.find_spec("webview")
+    if spec is None or not spec.submodule_search_locations:
+        pytest.skip("pywebview is not installed in this python")
+    from pathlib import Path
+    src = (Path(list(spec.submodule_search_locations)[0]) / "platforms" / "edgechromium.py").read_text(encoding="utf-8")
+    body = src[src.index("def on_webview_ready"):]
+    body = body[:body.index("\n    def ", 10)]
+    assert "AddWebResourceRequestedFilter('*', CoreWebView2WebResourceContext.All)" in body
+
+
+def test_app_window_without_its_core_has_no_local_page():
+    g = gui.Gui(data=None, api=None)
+    g._on_app_core_ready(None, type("Args", (), {"IsSuccess": False})())
+    assert not g._local_ready.is_set() and g._local_failed is True
+
+
+class ReqArgs:
+    def __init__(self, uri):
+        self.Request = type("Req", (), {"Uri": uri})()
+        self.Response = None
+
+
+def test_local_page_answers_only_the_armed_address():
+    g = gui.Gui(data=None, api=None)
+    answered = []
+    g._respond = lambda core: answered.append(core) or "RESPONSE"
+    url = "http://h:1" + gui.CLEAR_PATH + "?n=abc"
+    a = ReqArgs(url)
+    g._on_app_request("core", a)
+    assert a.Response is None                                         # not armed: the network answers
+    g._local_page = url
+    for other in ("http://h:1" + gui.CLEAR_PATH + "?n=abd", "http://h:1/health", "http://evil:1" + gui.CLEAR_PATH +
+                  "?n=abc"):
+        b = ReqArgs(other)
+        g._on_app_request("core", b)
+        assert b.Response is None, other
+    c = ReqArgs(url)
+    g._on_app_request("core", c)
+    assert c.Response == "RESPONSE" and answered == ["core"]
+
+
+def test_clear_storage_loads_the_local_page_on_the_origin():
+    """I-3: the clear needs no server - the app window loads `<origin>/.strata-desktop/clear?n=<nonce>`, which
+    `_on_app_request` answers while it is armed; the script runs there (origin and path checked)."""
+    armed = []
+    w = FakeWindow()
+    g = _gui(w)
+    real = w.load_url
+    w.load_url = lambda url: (armed.append(g._local_page == url), real(url))
+    g._local_ready.set()
+    assert g.clear_storage("http://Lab:8099/p", inject.clear_script(), timeout=2) is True
+    url = w.calls[0][1]
+    assert url.startswith("http://lab:8099" + gui.CLEAR_PATH + "?n=") and len(url.split("?n=")[1]) >= 16
+    assert armed == [True] and g._local_page is None                    # armed for its own load only
+    assert 'location.pathname!=="' + gui.CLEAR_PATH + '"' in w.scripts[0] and '"http://lab:8099"' in w.scripts[0]
+    assert g.clear_storage("http://lab:8099/p", inject.clear_script(), timeout=2) is True
+    assert w.calls[2][1] != url                                         # a new nonce each time
+
+
+def test_clear_storage_without_the_local_page_uses_the_server():
+    w = FakeWindow()
+    g = _gui(w)
+    g._local_failed = True
+    assert g.clear_storage("http://h:1/p", inject.clear_script(), timeout=2) is True
+    assert w.calls[0][1].startswith("http://h:1/p/health?")
+
+
+def test_clear_storage_without_the_navigation_check_writes_nothing():
+    w = FakeWindow()
+    g = gui.Gui(data=None, api=None)
+    g._app = w
+    g._local_ready.set()
+    assert g.clear_storage("http://h:1", inject.clear_script(), timeout=1) is False and w.calls == []
+
+
+# ------------------------------------------------------------------------------------------------ Windows ends the session
+class CloseArgs:
+    def __init__(self, reason, cancel=True):
+        self.CloseReason, self.Cancel = reason, cancel          # pywebview's handler ran first: it cancelled
+
+
+def test_the_title_bar_close_still_hides():
+    ended = []
+    g = gui.Gui(data=None, api=None, on_session_end=lambda: ended.append(1), pump=lambda: None)
+    a = CloseArgs("UserClosing")
+    g._on_form_closing(None, a)
+    assert a.Cancel is True and ended == []
+
+
+def test_session_end_runs_quit_once_and_lets_the_windows_close():
+    """I-2: sign-out or shutdown (WM_QUERYENDSESSION: CloseReason WindowsShutDown) runs Quit while the UI thread keeps
+    pumping, then lets the close go; the other form's close (and a re-entrant one) only waits for that one Quit."""
+    done = threading.Event()
+    ended, pumped = [], []
+
+    def end():
+        ended.append(threading.current_thread().name)
+        time.sleep(0.2)
+        done.set()
+    g = gui.Gui(data=None, api=None, on_session_end=end, pump=lambda: pumped.append(1))
+    a = CloseArgs("WindowsShutDown")
+    t0 = time.monotonic()
+    g._on_form_closing(None, a)
+    assert a.Cancel is False and done.is_set() and ended == ["desktop-session-end"]
+    assert pumped and time.monotonic() - t0 < 2
+    for reason in ("WindowsShutDown", "TaskManagerClosing", "None"):
+        b = CloseArgs(reason)
+        g._on_form_closing(None, b)
+        assert b.Cancel is False
+    assert len(ended) == 1
+
+
+def test_session_end_is_capped(monkeypatch):
+    monkeypatch.setattr(gui, "SESSION_END_S", 0.3)
+    hang = threading.Event()
+    g = gui.Gui(data=None, api=None, on_session_end=lambda: hang.wait(10), pump=lambda: None)
+    a = CloseArgs("WindowsShutDown")
+    t0 = time.monotonic()
+    g._on_form_closing(None, a)
+    assert a.Cancel is False and time.monotonic() - t0 < 1.5
+    b = CloseArgs("WindowsShutDown")                     # a later form: the same deadline, already past
+    t1 = time.monotonic()
+    g._on_form_closing(None, b)
+    assert time.monotonic() - t1 < 0.2
+    hang.set()
+
+
+def test_closing_after_destroy_is_left_alone():
+    ended = []
+    g = gui.Gui(data=None, api=None, on_session_end=lambda: ended.append(1), pump=lambda: None)
+    g._ending = True
+    a = CloseArgs("ApplicationExitCall", cancel=False)
+    g._on_form_closing(None, a)
+    assert a.Cancel is False and ended == []
+
+
+def test_session_end_without_a_controller_only_lets_go():
+    g = gui.Gui(data=None, api=None, pump=lambda: pytest.fail("pumped"))
+    a = CloseArgs("WindowsShutDown")
+    g._on_form_closing(None, a)
+    assert a.Cancel is False

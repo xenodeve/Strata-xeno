@@ -32,6 +32,26 @@ def english(monkeypatch):
     applog.forget_secrets()
 
 
+# ------------------------------------------------------------------------------------------------ the window port
+def test_watched_records_clears_from_clear_storage():
+    """I-3: a clear goes through the WindowPort's `clear_storage` (its local page); the selftest records its answer,
+    and the read-back says on which page it read."""
+    class Inner:
+        def navigate_and_inject(self, base, script, timeout=15.0):
+            return True
+
+        def clear_storage(self, base, script, timeout=15.0):
+            return base == "http://h:1"
+
+    w = selftest.Watched(Inner())
+    assert w.navigate_and_inject("http://h:1", "x") is True
+    assert w.clear_storage("http://h:1", inject.clear_script(), timeout=1) is True
+    assert w.clear_storage("http://h:2", inject.clear_script(), timeout=1) is False
+    assert w.injects == [True] and w.clears == [True, False]
+    assert selftest.NoWindow().clear_storage("http://h:1", inject.clear_script()) is False
+    assert "location.pathname" in selftest.READ_BACK_SCRIPT
+
+
 # ------------------------------------------------------------------------------------------------ the result file
 def test_result_records_each_step_and_never_the_token(tmp_path):
     path = tmp_path / "selftest.json"

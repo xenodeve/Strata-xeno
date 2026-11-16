@@ -9,7 +9,8 @@ id) - each JSON-encoded as `serve/ui/src/lib/store.ts` writes them.  Never on th
 its own device id.
 
 The token sits in the WebView2 profile while its server is open (ruling P3-R1): `clear_script()` removes it on Switch
-server, Quit and Remove, and on the next start after a crash.
+server, Quit and Remove, and on the next start after a crash.  It runs on `<origin>CLEAR_PATH?n=<nonce>`, a page the
+app window answers itself (desktop/gui.py `Gui.clear_storage`, ruling P3-R5), so a clear needs no server.
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{22}")      # serve/ui/src/lib/device.ts I
 RUNNER_ID = re.compile(r"r[0-9a-f]{16}")          # serve/ui/src/lib/runner.ts RUNNER_RE: any other the page ignores
 LABEL_MOST = 80                                   # device.ts headerSafe and the server (identity.MAX_TEXT) cut here
 DEFAULT_PORTS = {"http": 80, "https": 443}
+CLEAR_PATH = "/.strata-desktop/clear"             # the local page a clear runs on (never sent to the server)
 
 
 def page_label(label: str) -> str:

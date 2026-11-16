@@ -18,11 +18,15 @@ asks the server for devices that wait for approval every 30 s while the runner i
 
 The token in the web view's storage (rulings P3-R1, P3-R3): `servers.json` `injected` lists every origin that may
 hold it - the one open, and each whose clear failed.  An origin is written there *before* the token is (a crash in
-between leaves a record, not a token nobody knows of), and leaves the list only when its clear script answered True:
-the clear runs on that server's own page, so it needs the server to answer, and a False keeps the origin for the next
-try (the next switch, Quit, or the next start, which clears every listed origin first).  The address each origin was
-opened at is remembered for the session, so a server behind a path prefix is cleared there even after its entry was
-renamed or removed.
+between leaves a record, not a token nobody knows of), and leaves the list only when its clear script answered True.
+The clear runs on a page the app window answers itself on that origin (`clear_storage`, ruling P3-R5), so it needs no
+server; only when that page could not be hooked does it go to the server's /health, and then a False keeps the origin
+for the next try (the next switch, Quit, or the next start, which clears every listed origin first).  The address each
+origin was opened at is remembered for the session, so that fallback finds a server behind a path prefix even after its
+entry was renamed or removed.
+
+When Windows signs out or shuts down, `end_session` (desktop/gui.py `_on_form_closing`) is the same Quit with caps that
+fit in the few seconds Windows gives: SESSION_STOP_S for the runner, SESSION_CLEAR_S per origin.
 """
 from __future__ import annotations
 
@@ -48,6 +52,9 @@ log = logging.getLogger("strata.desktop.controller")
 STOP_S = 5.0                    # a runner's stop: its jobs, their processes, its thread, its executor
 CLEAR_S = 3.0                   # one clear of the token on one origin (Quit's cap, and every other clear's)
 QUIT_WATCHDOG_S = 10.0          # Quit ends the process after this, whatever hangs
+SESSION_STOP_S = 1.5            # Windows ends the session: the runner's stop (measured 0.03-0.08 s, task 3)
+SESSION_CLEAR_S = 1.0           # ... and one clear on its local page (32-63 ms in the hidden run)
+SESSION_WAIT_S = 4.0            # ... and the whole Quit (desktop/gui.py SESSION_END_S)
 PENDING_EVERY_S = 30.0          # the devices that wait for approval: asked this often while online
 PENDING_TIMEOUT_S = 10.0
 PENDING_BODY_MOST = 1 << 20
@@ -63,6 +70,7 @@ class WindowPort(Protocol):
     def hide_servers(self) -> None: ...
     def render(self, view: dict) -> None: ...
     def navigate_and_inject(self, base: str, script: str, timeout: float = 15.0) -> bool: ...
+    def clear_storage(self, base: str, script: str, timeout: float = 15.0) -> bool: ...
     def open_app(self, base: str, server: str | None = None) -> None: ...
     def show_app(self) -> None: ...
     def hide_app(self) -> None: ...
@@ -102,11 +110,13 @@ def code_text(v) -> str:
 
 
 def copy_to_clipboard(text: str) -> bool:
-    """`text` (a pending code: ASCII) onto the Windows clipboard through `clip.exe`, with no window."""
+    """`text` (a pending code: ASCII) onto the Windows clipboard through System32's `clip.exe`, with no window (a bare
+    name would be searched in the app's folder and the current directory first)."""
     if os.name != "nt" or not text:
         return False
+    clip = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "clip.exe")
     try:
-        r = subprocess.run(["clip.exe"], input=text.encode("ascii", "replace"), timeout=5,
+        r = subprocess.run([clip], input=text.encode("ascii", "replace"), timeout=5,
                            creationflags=NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return r.returncode == 0
     except (OSError, subprocess.SubprocessError) as e:
@@ -313,26 +323,25 @@ class Controller:
             listed = list(self._dirty)
         self._store.set_injected(listed)
 
-    def _clear(self, only: list[str] | None = None) -> None:
+    def _clear(self, only: list[str] | None = None, timeout: float = CLEAR_S) -> None:
         """Removes the token from every origin that may hold one (or from those of `only` that are listed); the file
-        then lists the origins whose clear failed (their server did not answer).  Never between an inject's record
-        and its end (`_storage`)."""
+        then lists the origins whose clear failed.  Never between an inject's record and its end (`_storage`)."""
         with self._storage:
-            self._clear_locked(only)
+            self._clear_locked(only, timeout)
 
-    def _clear_locked(self, only: list[str] | None = None) -> None:
+    def _clear_locked(self, only: list[str] | None = None, timeout: float = CLEAR_S) -> None:
         with self._mu:
             tried = [o for o in self._dirty if only is None or o in only]
         failed = []
         for origin in tried:
             ok = False
             try:
-                ok = self._window.navigate_and_inject(self._base_for(origin), inject.clear_script(), timeout=CLEAR_S)
+                ok = self._window.clear_storage(self._base_for(origin), inject.clear_script(), timeout=timeout)
             except Exception as e:  # noqa: BLE001
                 log.warning("clearing the token raised %s", type(e).__name__)
             if not ok:
                 failed.append(origin)
-                log.warning("the token could not be removed from %s (its server did not answer); tried again later",
+                log.warning("the token could not be removed from %s (its page did not load); tried again later",
                             origin)
         with self._mu:
             self._dirty = [o for o in self._dirty if o not in tried or o in failed]
@@ -341,7 +350,7 @@ class Controller:
             self._store.set_injected(listed)
 
     # ------------------------------------------------------------------ the runner
-    def _stop_runner(self) -> None:
+    def _stop_runner(self, stop_s: float = STOP_S) -> None:
         """Ends the current runner and the pending watch; later events of that host are dropped."""
         with self._mu:
             host, self._host, self._ticket = self._host, None, None
@@ -349,8 +358,8 @@ class Controller:
         if watch is not None:
             watch.stop()
         if host is not None:
-            if not host.stop(STOP_S):
-                log.warning("the runner did not end within %g s", STOP_S)
+            if not host.stop(stop_s):
+                log.warning("the runner did not end within %g s", stop_s)
 
     def _on_state(self, ticket: object) -> Callable[[str, dict], None]:
         def on_state(event: str, data: dict) -> None:
@@ -601,16 +610,18 @@ class Controller:
                 self._window.show_servers()
 
     # ------------------------------------------------------------------ quit
-    def quit(self) -> None:
+    def quit(self, session_end: bool = False) -> None:
         """In this order (RF 3): the runner (its jobs and processes), the token out of the web view, the tray, the
-        windows, the single-instance mutex.  A watchdog ends the process after `watchdog_s` if a step hangs."""
+        windows, the single-instance mutex.  A watchdog ends the process after `watchdog_s` if a step hangs.
+        `session_end`: Windows signs out or shuts down - the runner and each clear get the short caps."""
         with self._mu:
             if self._quitting:
                 return
             self._quitting = True
+        stop_s, clear_s = (SESSION_STOP_S, SESSION_CLEAR_S) if session_end else (STOP_S, CLEAR_S)
         threading.Thread(target=self._watchdog, name="desktop-quit-watchdog", daemon=True).start()
-        steps = (("the runner", self._stop_runner), ("the app window", self._window.hide_app),
-                 ("the token's clear", self._clear), ("the tray", self._tray.stop),
+        steps = (("the runner", lambda: self._stop_runner(stop_s)), ("the app window", self._window.hide_app),
+                 ("the token's clear", lambda: self._clear(timeout=clear_s)), ("the tray", self._tray.stop),
                  ("the windows", self._window.destroy), ("the mutex", self._release or (lambda: None)))
         try:
             for name, step in steps:                     # a step that raises never keeps the next from running
@@ -626,6 +637,13 @@ class Controller:
 
     def wait_quit(self, timeout: float | None = None) -> bool:
         return self._quit_done.wait(timeout)
+
+    def end_session(self) -> None:
+        """Windows signs out or shuts down (desktop/gui.py `_on_form_closing`, on its own thread while the UI thread
+        pumps): Quit with the short caps, back when it - or a Quit already under way - is done, at most
+        SESSION_WAIT_S."""
+        self.quit(session_end=True)
+        self.wait_quit(SESSION_WAIT_S)
 
     def _watchdog(self) -> None:
         if self._quit_done.wait(self._watchdog_s):

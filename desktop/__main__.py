@@ -4,8 +4,8 @@
     python -m desktop --selftest --server URL --data-dir PATH        (the token in STRATA_DESKTOP_SELFTEST_TOKEN;
                                                                       the result in PATH\\selftest.json)
 
-Exit codes: 0 normal (a second start that handed over to the first included), 4 no WebView2 Runtime or .NET 4.6.2
-(after a message box), 5 the selftest failed.
+Exit codes: 0 normal (a second start that handed over to the first included), 1 Windows refused the single-instance
+lock (after a message box), 4 no WebView2 Runtime or .NET 4.6.2 (after a message box), 5 the selftest failed.
 
 Order: the log (`applog.setup`, the exception hooks, stdout/stderr into it, `serve.runner._say` into it) -> the
 WebView2 check -> one instance per data folder (a second start asks the first to show its window and exits 0; when it
@@ -24,6 +24,7 @@ from desktop import applog, inject, paths, single, webview2, words
 log = logging.getLogger("strata.desktop")
 
 EXIT_OK = 0
+EXIT_START_FAILED = 1
 EXIT_SELFTEST_FAILED = 5
 SELFTEST_ENV = "STRATA_DESKTOP_SELFTEST_TOKEN"
 APP_NAME = paths.APP_NAME
@@ -91,7 +92,12 @@ def main(argv: list[str] | None = None) -> int:
         return code
 
     name = single.instance_name(data, bool(args.data_dir))
-    instance = single.acquire(name)
+    try:
+        instance = single.acquire(name)
+    except OSError as e:                               # words, never PyInstaller's error box
+        log.error("the single-instance lock could not be made: %s %s", type(e).__name__, e.errno)
+        webview2.message_box(words.t("cannot_start"))
+        return EXIT_START_FAILED
     if instance is None:                               # no log line: a second start never opens desktop.log
         if not single.signal_show(name):
             webview2.message_box(words.t("already_running"))
@@ -120,7 +126,8 @@ def _run(args: argparse.Namespace, data, instance) -> int:
     ctl: Controller | None = None
     tray = Tray(on_open=lambda: ctl.open(), on_switch=lambda: ctl.switch(), on_copy_code=lambda: ctl.copy_code(),
                 on_quit=lambda: ctl.quit())
-    gui = Gui(data, None, quitting=lambda: ctl is not None and ctl.quitting, debug=args.debug)
+    gui = Gui(data, None, quitting=lambda: ctl is not None and ctl.quitting, debug=args.debug,
+              on_session_end=lambda: ctl.end_session())
     ctl = Controller(store, device, label, runner_folder, gui, tray, release=instance.release)
     gui.attach(ServersApi(store, device, label, ctl))
     instance.listen(ctl.open)
@@ -143,10 +150,11 @@ def _selftest(args: argparse.Namespace, data, token: str | None) -> int:
     that folder."""
     from desktop import selftest
     result = data / selftest.RESULT_FILE
-    instance = single.acquire(single.instance_name(data, True))
-    if instance is None:
-        return selftest.fail(result, "start", "another Strata Desktop (or selftest) is using this data folder")
+    instance = None
     try:
+        instance = single.acquire(single.instance_name(data, True))
+        if instance is None:
+            return selftest.fail(result, "start", "another Strata Desktop (or selftest) is using this data folder")
         if not args.server:
             return selftest.fail(result, "start", "--selftest needs --server URL")
         if not token:
@@ -161,7 +169,8 @@ def _selftest(args: argparse.Namespace, data, token: str | None) -> int:
         log.error("the selftest raised %s", type(e).__name__, exc_info=True)
         return selftest.fail(result, "crash", type(e).__name__, keep=True)
     finally:
-        instance.release()
+        if instance is not None:
+            instance.release()
 
 
 if __name__ == "__main__":

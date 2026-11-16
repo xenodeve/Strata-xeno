@@ -198,6 +198,24 @@ def test_second_start_that_cannot_reach_the_first_says_so(tmp_path, monkeypatch,
     assert quiet == [words.t("already_running")]
 
 
+def _refused(name):
+    raise OSError(5, "CreateEventW failed")
+
+
+def test_a_refused_mutex_is_words_not_an_error_box(tmp_path, monkeypatch, quiet):
+    """A windowed exe would end in PyInstaller's error box: the OSError is a box with words and exit 1."""
+    monkeypatch.setattr(single, "acquire", _refused)
+    assert app.main(["--data-dir", str(tmp_path)]) == app.EXIT_START_FAILED
+    assert quiet == [words.t("cannot_start")]
+
+
+def test_selftest_with_a_refused_mutex_is_exit_5(tmp_path, monkeypatch, hidden_run, quiet):
+    monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+    monkeypatch.setattr(single, "acquire", _refused)
+    assert app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)]) == 5
+    assert _result(tmp_path)["steps"][-1]["step"] == "crash" and hidden_run == [] and quiet == []
+
+
 class FakeInstance:
     def __init__(self):
         self.released = 0
@@ -213,8 +231,9 @@ class FakeInstance:
 class FakeGui:
     made: list["FakeGui"] = []
 
-    def __init__(self, data, api, quitting=lambda: False, *, debug=False, servers_hidden=False):
+    def __init__(self, data, api, quitting=lambda: False, *, debug=False, servers_hidden=False, on_session_end=None):
         self.data, self.api, self.quitting, self.debug = data, api, quitting, debug
+        self.on_session_end = on_session_end
         self.calls = []
         FakeGui.made.append(self)
 
@@ -280,3 +299,33 @@ def test_wiring(tmp_path, monkeypatch):
     assert inst.listening == c.open and inst.released >= 1
     assert FakeTray.made[0].calls[:2] == ["start", "stop"]
     assert "show_servers" in g.calls and "destroy" in g.calls
+    assert g.on_session_end is not None
+    g.on_session_end()                                       # after Quit: returns at once, nothing more
+    assert c.wait_quit(0) and exits == []
+
+
+def test_session_end_is_the_controllers(tmp_path, monkeypatch):
+    """Windows ends the session while the loop runs: the Gui's hook is the controller's `end_session`."""
+    inst = FakeInstance()
+    monkeypatch.setattr(single, "acquire", lambda name: inst)
+    monkeypatch.setattr(tray, "Tray", FakeTray)
+    ended = []
+
+    class EndingGui(FakeGui):
+        def run(self, start):
+            self.on_session_end()
+            ended.append(self.quitting())
+            return 0
+    monkeypatch.setattr(gui, "Gui", EndingGui)
+    real = controller.Controller
+    made = []
+
+    def ctl(*a, **k):
+        c = real(*a, **k, exit_process=lambda code: None)
+        made.append(c)
+        return c
+    monkeypatch.setattr(controller, "Controller", ctl)
+    calls = []
+    monkeypatch.setattr(real, "end_session", lambda self: calls.append(self) or self.quit(session_end=True))
+    assert app.main(["--data-dir", str(tmp_path)]) == 0
+    assert calls == made and ended == [True]
