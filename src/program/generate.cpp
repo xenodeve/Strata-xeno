@@ -2451,6 +2451,10 @@ struct CacheSlot {
     std::vector<ConvCheckpoint> checks;
     bool cvec = true;
     int64_t cells = 0;
+    // #321: what a prompt could resume from this slot - the running state's and each checkpoint's tokens and pictures -
+    // kept in RAM when the payloads go to the file, so a switch can tell before loading that none of them is the start
+    // of the incoming prompt (the load is then skipped: that prompt is read from token 0 either way)
+    std::vector<std::pair<std::vector<int32_t>, std::vector<ImgKey>>> heads;
     // Shapes stay in memory; all vector payloads are appended after positional KV.
     // xeno #56: dead and block_pos joined the checkpoint in upstream 0.1.30 (the QSA indexer's spare row and block
     // position); a slot that did not carry them came back unrestorable ("loading conversation cache slot failed")
@@ -2467,6 +2471,7 @@ struct CacheSlot {
         shapes.clear();
         running = ConvCheckpoint{};
         std::vector<ConvCheckpoint>().swap(checks);
+        heads.clear();
     }
 };
 
@@ -14617,6 +14622,9 @@ int main(int argc, char** argv) {
                         std::printf("ERR saving conversation cache slot failed\n"); return serve_fatal();
                     }
                     saved.checks = std::move(checks);
+                    saved.heads.clear();   // #321: the resume points' tokens stay in RAM (the payloads go to the file)
+                    saved.heads.emplace_back(saved.running.ids, saved.running.imgs);
+                    for (const ConvCheckpoint& c : saved.checks) saved.heads.emplace_back(c.ids, c.imgs);
                     strata::timeline::complete("slot save", t_save, Clock::now(), active_slot, tl_out);
                     // #145: the checkpoints - host vectors already, nothing the next request overwrites - go to the
                     // file on a thread: their write was 127-497 ms of every switch (swap-t40k-run.txt).  Their RAM is
@@ -14648,6 +14656,25 @@ int main(int argc, char** argv) {
                 {
                     strata::timeline::Span sp("slot park wait", req_slot);
                     (void) incoming.written();   // #145: its park's write first (a failed one dropped the slot's state)
+                }
+                // #321: a slot none of whose resume points (its running state, its checkpoints) is the start of this
+                // prompt is not loaded: the prompt would be read from token 0 anyway, and the load took 0.6-1.8 s for
+                // 46-121K tokens (#318 Phase F).  The slot is this prompt's now, so its old conversation goes either way.
+                // Not with STRATA_SLOT_CKPT_MOVE (a batch slot's checkpoint can resume through the live state's cells);
+                // STRATA_SLOT_LOAD_ALL=1 loads every slot as before (the A/B).
+                static const bool load_all = std::getenv("STRATA_SLOT_LOAD_ALL") != nullptr;
+                if (incoming.file && !load_all && !slot_ckpt_move_env() && !incoming.heads.empty()) {
+                    bool usable = false;
+                    if (o.prompt_cache > 0)
+                        for (const auto& h : incoming.heads)
+                            if (starts_with(h.first, h.second)) { usable = true; break; }
+                    if (!usable) {
+                        std::fprintf(stderr, "strata cache: slot %d holds no start of this prompt (%lld tokens, %zu resume "
+                                             "points): not loaded\n", req_slot, (long long) incoming.cells,
+                                     incoming.heads.size());
+                        strata::timeline::Span drop_sp("slot drop", req_slot);
+                        incoming.drop();
+                    }
                 }
                 if (incoming.file) {
                     // #321: each step of the incoming load is a span of its own (the same calls and order as before)
