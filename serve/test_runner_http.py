@@ -244,6 +244,71 @@ class Channel(RunnerBase):
         self.assertEqual((body["runner"], body["who"]), (runner_hub.runner_id("anna", DEV1), "anna"))
         self.assertEqual(len(self.runners(self.ann)), 1)
 
+    def test_rename_answers_a_held_poll_404_at_once(self):
+        """#315: a poll held under the old id ends with 404 at the rename, not after its whole wait."""
+        self.team()
+        rid = self.hello(self.ann)[1]["runner"]
+        r = self.svc.runner_hub.get_for(rid, SimpleNamespace(name="ann"))
+        held = []
+        with mock.patch.object(runner_hub, "POLL_MAX_S", 10.0):
+            t = threading.Thread(target=lambda: held.append((self.poll(self.ann, rid, wait=10), time.monotonic())))
+            t.start()
+            end = time.monotonic() + 5
+            while r._held == 0 and time.monotonic() < end:
+                time.sleep(0.005)
+            t0 = time.monotonic()
+            code, body = self.req("POST", "/keys", {"action": "rename", "name": "ann", "to": "anna"}, key="k", device=DEV0)
+            self.assertEqual(code, 200, body)
+            t.join(10)
+        self.assertEqual(held[0][0][0], 404, held)
+        self.assertLess(held[0][1] - t0, 1.0)
+
+    def test_a_request_checked_across_a_rename_is_the_new_names(self):
+        """#315: the key matched as "ann", and the rename to "anna" came before its device check.  The key is still
+        good and its devices went with it: the request is anna's, not 403 device_refused (which stopped the runner
+        for good: a runner takes device_refused as the owner's decision)."""
+        self.team()
+        keys, real_match, once = self.svc.keys, self.svc.keys.match, []
+
+        def match(given):
+            ident = real_match(given)
+            if ident is not None and ident.name == "ann" and not once:
+                once.append(1)
+                keys.rename("ann", "anna", by=OWNER)            # between match() and the device check
+            return ident
+        with mock.patch.object(keys, "match", match):
+            code, body = self.hello(self.ann)
+        self.assertEqual(once, [1])
+        self.assertEqual(code, 200, body)
+        self.assertEqual((body["who"], body["runner"]), ("anna", runner_hub.runner_id("anna", DEV1)))
+
+    def test_a_hello_inside_a_rename_finds_the_moved_runner(self):
+        """#315: a runner that says hello under the new name while the rename is still moving things (its poll met
+        the 404 between the key's rename and the runners' move) gets its own runner, moved - not a second one that
+        the move then ends as replaced (409 runner_replaced stopped the runner for good)."""
+        self.team()
+        code, first = self.hello(self.ann)
+        r = self.svc.runner_hub.get_for(first["runner"], SimpleNamespace(name="ann"))
+        real_move, got = self.svc.broker.move, []
+
+        def move(old, new):                                     # after keys.rename, before runner_hub.move
+            t = threading.Thread(target=lambda: got.append(self.hello(self.ann)))
+            t.start()
+            t.join(1.0)                                         # it may wait for the rename to finish
+            return real_move(old, new)
+        with mock.patch.object(self.svc.broker, "move", move):
+            code, body = self.req("POST", "/keys", {"action": "rename", "name": "ann", "to": "anna"}, key="k", device=DEV0)
+        self.assertEqual(code, 200, body)
+        end = time.monotonic() + 5
+        while not got and time.monotonic() < end:
+            time.sleep(0.01)
+        code, body = got[0]
+        self.assertEqual(code, 200, body)
+        self.assertEqual((body["runner"], body["who"], body["channel"]),
+                         (runner_hub.runner_id("anna", DEV1), "anna", first["channel"]))     # the same registration
+        self.assertIsNone(r.ended)
+        self.assertEqual(self.poll(self.ann, body["runner"])[0], 200)
+
     def test_refused_or_cleared_device_ends_runner(self):
         self.team()
         rid = self.hello(self.ann)[1]["runner"]

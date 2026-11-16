@@ -5694,6 +5694,11 @@ def make_handler(svc: Service):
                 return True
             # every key's first use from a new device waits for the owner, the owner's own key too (spec decision 1)
             state = svc.keys.device(ident, self.device_id, label, addr, time.time())
+            if state == "refused":                           # #315: the key renamed between match() and the check -
+                again = svc.keys.match(given)                # its devices went with it, so its new name decides (a
+                if again is not None and again.name != ident.name:     # runner took the old name's "refused" as the
+                    ident = self.identity = again                       # owner's word and stopped for good)
+                    state = svc.keys.device(ident, self.device_id, label, addr, time.time())
             if state == "approved":
                 return True
             if state == "pending":
@@ -6686,12 +6691,13 @@ def make_handler(svc: Service):
                     key = svc.keys.create(name, role, by=by, owner_first=True)
                     return self._json(200, {"key": key, "name": name.strip(), "role": role})
                 if action == "rename":
-                    if not svc.keys.rename(name, body.get("to"), by=by):
-                        return self._json(404, missing)
-                    new = body["to"].strip()
-                    svc.runs.move(name, new)                # the holder keeps her runs and prompts; a later key named
-                    svc.broker.move(name, new)              # `name` inherits none of them
-                    svc.runner_hub.move(name, new)          # and her runners (their ids follow the name)
+                    with svc.runner_hub.names:              # #315: no runner's hello between the key's rename and
+                        if not svc.keys.rename(name, body.get("to"), by=by):        # its runners' move
+                            return self._json(404, missing)
+                        new = body["to"].strip()
+                        svc.runs.move(name, new)            # the holder keeps her runs and prompts; a later key named
+                        svc.broker.move(name, new)          # `name` inherits none of them
+                        svc.runner_hub.move(name, new)      # and her runners (their ids follow the name)
                     return self._json(200, {"ok": True, "name": new})
                 if action == "role":
                     role = body.get("role")
@@ -6827,7 +6833,13 @@ def make_handler(svc: Service):
             if isinstance(got, str):
                 return self._json(400, {"error": {"message": got}})
             info, groups, skills = got
-            r = svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
+            with svc.runner_hub.names:                      # #315: wholly before or after a rename of the key
+                if self.team:                               # the key's name now, not as it was when the request came
+                    who = svc.keys.match(self._given_key())
+                    if who is None:                         # revoked meanwhile
+                        return self._json(401, {"error": {"type": "authentication_error",
+                                                          "message": "missing or wrong API key"}})
+                r = svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
             poll = runner_hub.POLL_MAX_S
             return self._json(200, {"runner": r.id, "who": r.who, "protocol": runner_hub.RUNNER_PROTOCOL,
                                     "poll_s": int(poll) if float(poll).is_integer() else poll, "channel": r.channel})
@@ -6838,7 +6850,8 @@ def make_handler(svc: Service):
             (an ack that names another channel than the runner's is ignored).  A runner that ended while the poll was held is told why: replaced 409, revoked 401, its
             device refused or cleared 404 (a new hello meets the device gate), the server stopping 503."""
             q = parse_qs(urlsplit(self.path).query)
-            r = svc.runner_hub.get_for(q.get("id", [""])[0], self._acting())
+            asked = q.get("id", [""])[0]
+            r = svc.runner_hub.get_for(asked, self._acting())
             if r is None:
                 return self._json(404, {"error": {"message": NO_RUNNER}})
             if r.instance != q.get("instance", [""])[0]:
@@ -6856,11 +6869,13 @@ def make_handler(svc: Service):
             self._watch_client(gone)
             try:
                 messages = r.take(min(max(wait, 0.0), runner_hub.POLL_MAX_S), gone=gone, ack=int(ack),
-                                  channel=q.get("channel", [None])[0])
+                                  channel=q.get("channel", [None])[0], as_id=asked)
             finally:
                 self.watch_done.set()
             if gone.is_set():
                 return                                       # nobody to answer: the messages stay for the next poll
+            if r.ended is None and r.id != asked:            # #315: the key was renamed meanwhile - the runner says
+                return self._json(404, {"error": {"message": NO_RUNNER}})      # hello again now and learns its new id
             if r.ended == "replaced":
                 return self._json(409, RUNNER_REPLACED)
             if r.ended == "revoked":

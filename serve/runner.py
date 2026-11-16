@@ -645,6 +645,8 @@ class RunnerLoop:
         self.connected = threading.Event()              # a hello was answered, and no poll said 404 since
         self._threads: set[threading.Thread] = set()    # the job threads still running
         self._printed: str | None = None
+        self._said_hello = threading.Condition()        # notified after each answered hello: a reply that met 404
+                                                        # goes again at once under the new id (#315)
 
     # -------------------------------------------------------------------------------------------- hello
     def _info(self) -> tuple[dict, str]:
@@ -657,8 +659,10 @@ class RunnerLoop:
         body = self.client.hello(info)
         if self.client.on_hello(body):
             self._channel_changed()
-        self.id, self.who, self._sent_groups = body["runner"], body.get("who"), sig
-        self.connected.set()
+        with self._said_hello:
+            self.id, self.who, self._sent_groups = body["runner"], body.get("who"), sig
+            self.connected.set()
+            self._said_hello.notify_all()
         p = body.get("poll_s")
         self.poll_s = float(p) if isinstance(p, (int, float)) and not isinstance(p, bool) and p > 0 else runner_hub.POLL_MAX_S
         if self._printed != self.id:
@@ -856,9 +860,12 @@ class RunnerLoop:
                 return False
             except Gone:
                 wait_end = time.monotonic() + self.poll_s + 5
-                while not (self.connected.is_set() and self.id != used):
-                    if time.monotonic() > wait_end or self.stop.wait(0.1):
-                        return False
+                with self._said_hello:                  # woken by the hello itself, not a 0.1 s look (#315)
+                    while not (self.connected.is_set() and self.id != used):
+                        left = wait_end - time.monotonic()
+                        if left <= 0 or self.stop.is_set():
+                            return False
+                        self._said_hello.wait(min(left, 0.1))   # the 0.1 s: how soon a stop is seen
             except NetworkError:
                 if time.monotonic() > end or self.stop.is_set():
                     return False

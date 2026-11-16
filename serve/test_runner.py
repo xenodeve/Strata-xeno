@@ -224,10 +224,13 @@ class Connection(Base):
         self.assertTrue(any(new in line for line in self.said), self.said)          # the new id is printed
 
     def test_reply_after_a_rename_reaches_the_job(self):
-        """A job running when the key is renamed: its reply under the old id gets 404, and goes again under the new."""
+        """A job running when the key is renamed: the poll held under the old id ends at the rename (#315: not after
+        its whole wait), the runner says hello again, and the job's result reaches the page."""
         self.start_routing()
         loop = self.runner(self.ann)
         old, go, inside = loop.id, threading.Event(), threading.Event()
+        new = runner_hub.runner_id("anna", DEV1)
+        r = self.svc.runner_hub.get_for(old, SimpleNamespace(name="ann"))
         real = runner_mod.page_routes.answer
 
         def answer(*a, **kw):
@@ -240,15 +243,53 @@ class Connection(Base):
                 "GET", f"/agent/folders?runner={old}&path={self.dir}", key=self.ann, device=DEV1)))
             t.start()
             self.assertTrue(inside.wait(10))
+            self.assertTrue(wait_for(lambda: r._held, 5, 0.005))  # the runner's next poll is held on the server
+            t0 = time.monotonic()
             code, body = self.req("POST", "/keys", {"action": "rename", "name": "ann", "to": "anna"}, key="k",
                                   device=DEV0)
             self.assertEqual(code, 200, body)
-            self.assertEqual(loop.id, old)                       # the runner has not met the 404 yet
-            go.set()
+            self.assertTrue(wait_for(lambda: loop.id == new, 5, 0.005), self.said)
+            self.assertLess(time.monotonic() - t0, 1.0)         # the held poll's wait (POLL_MAX_S, 2 s here) is not
+            go.set()                                            # waited out
             t.join(20)
         self.assertEqual(got[0][0], 200, got)
         self.assertIn("proj", [d["name"] for d in got[0][1]["dirs"]])
-        self.assertEqual(loop.id, runner_hub.runner_id("anna", DEV1))
+        self.assertEqual(loop.codes, [])                        # the runner goes on
+
+    def test_a_reply_met_by_404_goes_again_once_the_hello_is_answered(self):
+        """A reply sent under the old id meets 404; it goes again under the new id as soon as the poll thread's hello
+        is answered (#315: it looked every 0.1 s, so up to 100 ms late)."""
+        calls = []
+
+        class Fake:
+            channel, url = "c1", "http://server"
+
+            def reply(self, rid, instance, msg):
+                calls.append((rid, time.monotonic()))
+                if rid == "r-old":
+                    raise runner_mod.Gone("there is no such runner")
+
+            def hello(self, info):
+                return {"runner": "r-new", "who": "anna", "channel": "c1", "poll_s": 2}
+
+            def on_hello(self, body):
+                return False
+        ex = SimpleNamespace(groups=lambda: [], skills=lambda: [], info=lambda: {}, starting=lambda: False)
+        loop = runner_mod.RunnerLoop(Fake(), ex)
+        loop.id, loop.poll_s = "r-old", 2.0
+        loop.connected.set()
+        answered = []
+
+        def hello_later():
+            wait_for(lambda: calls, 2, 0.001)
+            time.sleep(0.02)
+            loop._hello()
+            answered.append(time.monotonic())
+        threading.Thread(target=hello_later, daemon=True).start()
+        self.assertIs(loop._post({"job": "j1", "rid": 1, "result": {}}), True)
+        self.assertEqual([c[0] for c in calls], ["r-old", "r-new"])
+        wait_for(lambda: answered, 2, 0.001)
+        self.assertLess(calls[1][1] - answered[0], 0.04)
 
     def test_replies_number_rid_and_answers_match_to(self):
         target = self.dir / "outside.txt"
