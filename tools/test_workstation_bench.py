@@ -426,9 +426,7 @@ class Schedulers(unittest.TestCase):
                      "function": {"name": "read_file", "arguments": "{}"}}]}, "finish_reason": None}]},
                     {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                      "usage": {"prompt_tokens": 3, "completion_tokens": 2}}]
-            lines = [f"data: {json.dumps(c)}
-".encode() for c in body] + [b"data: [DONE]
-"]
+            lines = [f"data: {json.dumps(c)}\n".encode() for c in body] + [b"data: [DONE]\n"]
             class R:
                 def __enter__(s): return iter(lines)
                 def __exit__(s, *a): pass
