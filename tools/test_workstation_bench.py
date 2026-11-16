@@ -69,6 +69,14 @@ class ArmConfig(unittest.TestCase):
         self.assertEqual(p.parent, self.dir / "work" / "b0")
         self.assertEqual(self.base_path.read_bytes(), raw_before)
 
+    def test_profile_load_from_a_snapshot(self):
+        snap = self.dir / "snap.bin"
+        snap.write_bytes(b"SNAP")
+        cfg = WB.derive_config(self.base, WB.parse_arm("P2:"), self.dir / "work" / "b1", 8090, str(snap))
+        a = cfg["args"]
+        self.assertEqual(a[a.index("--expert-profile") + 1], str(snap))
+        self.assertEqual(Path(a[a.index("--expert-profile-save") + 1]).read_bytes(), self.profile.read_bytes())
+
     def test_log_history_host_key_port(self):
         cfg = self.derive("P2:parallel=2")
         bd = self.dir / "work" / "b0"

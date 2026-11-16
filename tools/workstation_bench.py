@@ -18,9 +18,10 @@ files it points at are never written:
 Every arm config also gets: "port" --port, "host" 127.0.0.1 and no "api_key" (the bench server is local only),
 "log" <boot>/engine.log, "history" {"dir": <boot>/history} (not the live server's request history), the
 `--expert-profile-save` path redirected to a copy of that profile inside the boot directory (the `--expert-profile` it
-loads is unchanged, so every boot starts from the same profile) and any `--dump-routing` path redirected there too.
+loads is unchanged, or --profile-load's snapshot, so every boot starts from the same profile) and any `--dump-routing` path redirected there too.
 
-Modes (--mode, a comma list runs each in turn on the same boot):
+Modes (--mode, a comma list runs each in turn on the same boot; odd rounds run them in reverse order, so over
+two rounds each mode is first once per arm; `mode_pos` in each row):
   w1   one user: the 23 turns in agent_turns_bench's order
   w2a  two users alternating turn by turn: A, B, A, B, ... (the longer series ends alone)
   w2b  two users at once: each sends its next turn as soon as its previous answer arrived
@@ -125,7 +126,7 @@ def _redirect_arg(args: list, flag: str, new: str) -> str | None:
     return None
 
 
-def derive_config(base: dict, arm: Arm, boot_dir: Path, port: int) -> dict:
+def derive_config(base: dict, arm: Arm, boot_dir: Path, port: int, profile_load: str | None = None) -> dict:
     """The arm's config for one boot, written nowhere (write_arm_config does that).  `base` is not changed; the files
     it names are only read (the profile copy)."""
     boot_dir = Path(boot_dir)
@@ -147,6 +148,8 @@ def derive_config(base: dict, arm: Arm, boot_dir: Path, port: int) -> dict:
             shutil.copyfile(src, dst)
     if "--dump-routing" in args:                    # never the served routing trace
         _redirect_arg(args, "--dump-routing", str(boot_dir / "routing.bin"))
+    if profile_load:                                # load the profile from a snapshot, not the base's file
+        _redirect_arg(args, "--expert-profile", str(profile_load))
     cfg["args"] = args
     cfg["port"] = int(port)
     cfg["host"] = "127.0.0.1"
@@ -797,6 +800,7 @@ def main(argv=None) -> int:
     ap.add_argument("--log", help="JSONL (default <work-dir>/workstation_bench.jsonl)")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--server-root", default=str(ROOT), help="the tree whose serve/server.py runs")
+    ap.add_argument("--profile-load", help="the --expert-profile every arm loads (a snapshot), instead of the base's")
     ap.add_argument("--workload-root", help="the tree the turns' tool results are read from (default: this one; its "
                     "files and tracked files decide the grep results, so another branch sends other prompts)")
     ap.add_argument("--cuda-visible", default="1,0")
@@ -844,7 +848,7 @@ def main(argv=None) -> int:
     if a.dry_run:
         for rnd, arm in boots:
             bd = work_dir / f"{run_id}-r{rnd}-{arm.name}"
-            cfg = derive_config(base, arm, bd, a.port)
+            cfg = derive_config(base, arm, bd, a.port, a.profile_load)
             p = write_arm_config(cfg, bd)
             print(f"[wsb] dry run: r{rnd} {arm.name}: {p} parallel={cfg.get('parallel')} env+={arm.env} "
                   f"exe sha256 {(sha256_file(cfg['exe']) or 'missing')[:12]}", flush=True)
@@ -871,10 +875,12 @@ def main(argv=None) -> int:
     all_rows = []
     for rnd, arm in boots:
         bd = work_dir / f"{run_id}-r{rnd}-{arm.name}"
-        cfg = derive_config(base, arm, bd, a.port)
+        cfg = derive_config(base, arm, bd, a.port, a.profile_load)
+        boot_modes = modes if rnd % 2 == 0 else modes[::-1]     # each mode first once per arm over two rounds
         cfg_path = write_arm_config(cfg, bd)
         env = server_env(arm, bd, a.cuda_visible)
-        boot = {"kind": "boot", "run": run_id, "arm": arm.name, "round": rnd, "modes": modes, "exe": cfg["exe"],
+        boot = {"kind": "boot", "run": run_id, "arm": arm.name, "round": rnd, "modes": boot_modes, "exe": cfg["exe"],
+                "profile_load": a.profile_load, "profile_load_sha256": sha256_file(a.profile_load) if a.profile_load else None,
                 "exe_sha256": sha256_file(cfg["exe"]), "server_root": str(server_root),
                 "server_git": git_head(server_root), "config": str(cfg_path), "boot_dir": str(bd),
                 "parallel": cfg.get("parallel"), "arm_env": arm.env, "xargs": arm.xargs, "workload": wl_hash, "workload_root": str(workload_root),
@@ -896,7 +902,7 @@ def main(argv=None) -> int:
                   f"parallel {cfg.get('parallel')})", flush=True)
             elog = Path(cfg["log"])
             log_size = lambda: elog.stat().st_size if elog.exists() else 0   # noqa: E731
-            for mode in modes:
+            for mode_pos, mode in enumerate(boot_modes):
                 items = series_items(mode, tags[mode], a.split, a.max_turns, base_work)
                 mk = lambda user, seq, m=mode: f"wsb/{run_id}/{arm.name}/r{rnd}/{m}/{user}/{seq:03d}"   # noqa: E731
                 on_row = lambda r, m=mode: (write(raw, {"run": run_id, "arm": arm.name, "round": rnd, "mode": m, **r}),   # noqa: E731
@@ -921,7 +927,7 @@ def main(argv=None) -> int:
                         r.setdefault("server", None)
                 for r in rows:
                     r.update({"kind": "request", "run": run_id, "arm": arm.name, "round": rnd, "mode": mode,
-                              "system_tag": tags[mode], "exe_sha256": boot["exe_sha256"],
+                              "system_tag": tags[mode], "mode_pos": mode_pos, "exe_sha256": boot["exe_sha256"],
                               "parallel": cfg.get("parallel")})
                 print(f"[wsb] r{rnd} {arm.name} {mode}: {len(rows)} requests in {time.time() - t0:.0f} s", flush=True)
                 series_rows += rows
