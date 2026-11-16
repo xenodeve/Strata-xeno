@@ -541,6 +541,7 @@ class RunnerLoop:
         self._lock = threading.Lock()
         self._sent_groups: str | None = None
         self.connected = threading.Event()              # a hello was answered, and no poll said 404 since
+        self._threads: set[threading.Thread] = set()    # the job threads still running
         self._printed: str | None = None
 
     # -------------------------------------------------------------------------------------------- hello
@@ -623,6 +624,17 @@ class RunnerLoop:
         for link in links:
             link.cancel.set()
 
+    def finish(self, timeout: float) -> None:
+        """The runner stops: every job is cancelled (a command's process tree is ended), and its thread gets up to
+        `timeout` seconds to end before the executor closes - so nothing started here keeps running on the PC."""
+        self.stop.set()
+        self._end()
+        end = time.monotonic() + timeout
+        with self._lock:
+            threads = list(self._threads)
+        for t in threads:
+            t.join(max(0.0, end - time.monotonic()))
+
     def _dispatch(self, msgs: list[dict]) -> None:
         """Hand the poll's messages out: a job starts, an answer reaches its job's link, a cancel sets it.  A seq
         already handled is ignored (delivery is at least once); the ack is the highest seq received."""
@@ -658,7 +670,10 @@ class RunnerLoop:
         link = JobLink(msg["job"], self._post)
         with self._lock:
             self.links[msg["job"]] = link
-        threading.Thread(target=self._job, args=(msg, link), daemon=True, name="runner-job").start()
+        t = threading.Thread(target=self._job, args=(msg, link), daemon=True, name="runner-job")
+        with self._lock:
+            self._threads.add(t)
+        t.start()
 
     def _job(self, msg: dict, link: JobLink) -> None:
         with self.slots:
@@ -678,7 +693,11 @@ class RunnerLoop:
                 with self._lock:
                     self.links.pop(msg["job"], None)
             ms = int((time.perf_counter() - t0) * 1000)
-        link.send({"result": res, "exec_ms": ms})       # outside the slot: a reply that waits holds no job's turn
+        try:
+            link.send({"result": res, "exec_ms": ms})   # outside the slot: a reply that waits holds no job's turn
+        finally:
+            with self._lock:
+                self._threads.discard(threading.current_thread())
 
     def _post(self, msg: dict) -> bool:
         """POST a reply; network errors are tried again (the same rid: the server applies it once) for up to
@@ -745,9 +764,9 @@ def main(argv: list[str] | None = None, stop: threading.Event | None = None) -> 
     except KeyboardInterrupt:
         stop.set()
         _say("[runner] stopping")
-        t.join(5)
         codes = [0]
     finally:
+        loop.finish(5.0)                                # its jobs end (a running command is stopped) first
         executor.close()
     return codes[0] if codes else 0
 

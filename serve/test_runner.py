@@ -351,6 +351,25 @@ class Hello(unittest.TestCase):
                 ex.close()
 
 
+class Device(unittest.TestCase):
+    def test_load_device_is_made_once(self):
+        with tempfile_dir() as d:
+            dev = runner_mod.load_device(d)
+            self.assertRegex(dev["id"], r"^[A-Za-z0-9_-]{22}$")
+            self.assertTrue(dev["name"])
+            self.assertEqual(runner_mod.load_device(d), dev)
+            (d / "device.json").write_text("{broken", encoding="utf-8")
+            again = runner_mod.load_device(d)
+            self.assertRegex(again["id"], r"^[A-Za-z0-9_-]{22}$")
+            self.assertEqual(runner_mod.load_device(d), again)
+
+    def test_runner_dir(self):
+        local = r"C:\Users\x\AppData\Local"
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": local}):
+            want = Path(local) / "StrataRunner" if os.name == "nt" else Path.home() / ".strata-runner"
+            self.assertEqual(runner_mod.runner_dir(), want)
+
+
 class SessionState(unittest.TestCase):
     """Todos, file reads and background shells are the chat's (`session`), not the request's run key."""
 
@@ -508,7 +527,8 @@ class Main(Base):
             self.assertTrue(wait_for(lambda: any(code in s for s in self.said)), self.said)
             time.sleep(1.2)
             self.assertEqual(sum(code in s for s in self.said), 1, self.said)      # the code is printed once
-            self.assertLessEqual(len(hellos), 1.2 / 0.3 + 3, hellos)                 # it waits between tries: no spin
+            gaps = [b - a for a, b in zip(hellos, hellos[1:])]
+            self.assertTrue(gaps and min(gaps) >= 0.25, gaps)                        # it waits between tries: no spin
             self.assertTrue(self.svc.keys.decide_device("cat", DEV3, True, OWNER))
             rid = runner_hub.runner_id("cat", DEV3)
             self.assertTrue(wait_for(lambda: self.svc.runner_hub.get_for(rid, SimpleNamespace(name="cat"))), self.said)
@@ -527,6 +547,36 @@ class Main(Base):
             t.join(10)
         self.assertEqual(codes, [3], self.said)
         self.assertIn("refused", self.said[-1])
+
+    def test_exit_with_a_command_running_stops_it(self):
+        """Revoked while a Bash command runs on the PC: main exits 3, and the command does not finish."""
+        self.start_routing(tool_call("Bash", command="echo s > started.txt; sleep 4; echo x > finished.txt"), DONE)
+        if runner_mod.shell_mod.find_shell() is None:
+            self.skipTest("no shell on this PC")
+        t, codes, _ = self.main(env={"STRATA_RUNNER_KEY": self.ann})
+        rid = runner_hub.runner_id("ann", DEV1)
+        self.assertTrue(wait_for(lambda: self.svc.runner_hub.get_for(rid, SimpleNamespace(name="ann"))), self.said)
+
+        def allow(ev):
+            self.req("POST", "/agent/permission", {"id": ev["id"], "decision": "allow"}, key=self.ann, device=DEV1)
+        chat, _events = self.stream(self.ann, {"cwd": str(self.proj), "session": "chat-1", "runner": rid}, answer=allow)
+        self.assertTrue(wait_for(lambda: (self.proj / "started.txt").exists(), 20), self.said)
+        code, body = self.req("POST", "/keys", {"action": "revoke", "name": "ann"}, key="k", device=DEV0)
+        self.assertEqual(code, 200, body)
+        t.join(2 * runner_hub.POLL_MAX_S + 6)
+        self.assertEqual(codes, [3], self.said)
+        time.sleep(5)
+        self.assertFalse((self.proj / "finished.txt").exists())        # the command was stopped, not left running
+        chat.join(30)
+
+    def test_second_runner_on_the_pc_replaces_the_first(self):
+        self.start_routing()
+        first = self.runner(self.ann, name="r1")
+        second = self.runner(self.ann, name="r2")
+        self.assertEqual(second.id, first.id)
+        self.assertTrue(wait_for(lambda: first.codes == [3], 2 * runner_hub.POLL_MAX_S + 3), self.said)
+        self.assertTrue(any("newer runner" in s for s in self.said), self.said)
+        self.assertEqual(second.codes, [])                       # the newer one goes on
 
     def test_no_key_is_an_error(self):
         self.start_routing()
