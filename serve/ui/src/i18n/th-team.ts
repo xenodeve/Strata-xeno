@@ -99,6 +99,9 @@ export const part: Record<string, string> = {
   // the Monitor
   "In use by {names}": "กำลังใช้งานโดย {names}",
   "Waiting: {list}": "รอคิว: {list}",
+  "Runners: {list}": "เครื่องที่เชื่อมต่อ: {list}",                  // #310 part 2: each runner as "name (machine) online"
+  "online": "ออนไลน์",
+  "offline": "ออฟไลน์",
   "sent by {name}": "ส่งโดย {name}",
 
   // this browser's runner and the two machines (#310 part 2)

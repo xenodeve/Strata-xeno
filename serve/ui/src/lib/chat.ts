@@ -42,6 +42,7 @@ export interface ToolCall {
   steps?: Step[]                                                                     // and what that helper did, step by step
   server?: string; tool?: string; arguments?: unknown; round?: number
   machine?: "my"                                                                     // #310 part 2: the call ran on the engineer's own PC (the event's machine)
+  remote?: "sending" | "running" | "offline"                                         // and its travel there, as the server's last `remote` event said
   result?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number | null; open?: boolean
 }
 export interface Attachment { kind: "image" | "file"; name: string; url?: string; text?: string }
@@ -152,7 +153,7 @@ interface ToolEvent {
   state?: string; kind?: string; description?: string; steps?: number; answer?: string; answers?: unknown
   on?: string; hook?: string; command?: string; code?: number | null; blocked?: boolean; timeout?: boolean; error?: string | null
   call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string; questions?: AskedQuestion["questions"]      // the coding tools
-  machine?: string; reason?: string | null                                           // #310 part 2: a call on My PC; why the server closed a card
+  machine?: string; reason?: string | null                                           // #310 part 2: a call on My PC; why the server closed a card (`state` also carries a `remote` event's step)
 }
 const REMOTE = ["sending", "running", "offline"] as const
 
@@ -209,6 +210,12 @@ function onTool(m: Message, x: ToolEvent, at = Date.now()) {
     else c.judging = false
     if (x.event === "permission") { c.ask = { id: x.id, tool: String(x.tool ?? c.name), why: x.why ?? "", danger: !!x.danger, rule: x.rule ?? null, arguments: x.arguments }; c.state = "asking" }
     else if (x.event === "judged" && (x.verdict === "allow" || x.verdict === "block" || x.verdict === "ask")) c.judge = { verdict: x.verdict, severity: x.severity ?? null }
+    return
+  }
+  if (x.event === "remote") {                                                                // #310 part 2: a call on My PC on its way there (sending, running there, the PC offline): about a call already shown
+    const c = (m.tools || []).find((y) => y.id === x.id)
+    const st = REMOTE.find((r) => r === x.state)
+    if (c && st) c.remote = st
     return
   }
   if (x.event !== "start" && x.event !== "call" && x.event !== "result") return                // a kind of event this page does not know

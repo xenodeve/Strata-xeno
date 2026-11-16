@@ -53,6 +53,13 @@ export function MachineMark({ call }: { call: { server?: string; machine?: strin
   return <span data-machine={m} className="shrink-0 rounded-sm bg-fill px-1.5 text-[11px] text-ink-2">{t(MACHINE_LABEL[m])}</span>
 }
 
+/** #310 part 2: a call whose PC went offline while it was on its way there or running (the server's `remote` event "offline"). It stays after the
+ *  result, which says what became of the call. */
+export function OfflineMark({ call }: { call: { remote?: string } }) {
+  if (call.remote !== "offline") return null
+  return <span data-offline className="shrink-0 rounded-sm bg-bad/10 px-1.5 text-[11px] text-bad">{t("offline")}</span>
+}
+
 /** #310 part 2: a helper's step on My PC while it travels there or runs (the words Task 8's status uses). */
 function stepTravel(s: Step): string | null {
   if (s.state !== "running") return null                                         // once its result is in, the result says what happened
@@ -247,7 +254,7 @@ export function AgentCall({ call }: { call: ToolCall }) {
   const busy = call.state === "running" || call.state === "writing"
   const summary = toolSummary(name, call.arguments)
   return (
-    <div className="my-2 rounded-md border border-line" data-state={call.state} data-agent-call={name}>
+    <div className="my-2 rounded-md border border-line" data-state={call.state} data-agent-call={name} data-remote={call.remote}>
       <button
         type="button"
         aria-expanded={open}
@@ -258,6 +265,7 @@ export function AgentCall({ call }: { call: ToolCall }) {
         <span className={cn("font-medium", busy && "t-shimmer")}>{name}</span>
         <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink-3">{summary}</span>
         <MachineMark call={call} />
+        <OfflineMark call={call} />
         <span className={cn("shrink-0", call.state === "error" ? "text-bad" : call.state === "asking" ? "font-medium text-ink" : "text-ink-2")}>{t(STATE[call.state])}</span>
         {call.ms != null && call.state !== "skipped" && <span className="num shrink-0 text-ink-3">{fmt(call.ms / 1000, 1)} s</span>}
         <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("shrink-0 text-ink-3 transition-transform duration-200", open && "rotate-180")} />

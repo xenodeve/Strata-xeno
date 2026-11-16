@@ -22,7 +22,7 @@ import { Spin } from "../../components/spin"
 import { SkillText } from "../../components/SkillTip"
 import { CompactingStatus } from "../../components/CompactingStatus"
 import { skillCall, type SkillCall } from "../../lib/panel"
-import { AgentCall, HookNotes, MachineMark, TodoList } from "./AgentCall"
+import { AgentCall, HookNotes, MachineMark, OfflineMark, TodoList } from "./AgentCall"
 import { isCodingCall } from "../../lib/runner"
 import { msg, t, useLang } from "../../lib/i18n"
 
@@ -75,6 +75,7 @@ function Tool({ call }: { call: ToolCall }) {
         <span className={cn("font-medium", (call.state === "running" || call.state === "writing") && "t-shimmer")} title={call.name} data-skill-call={sk ? sk.kind : undefined}>{sk ? skillTitle(sk) : call.tool || call.name || t("tool")}</span>
         {call.server && !sk && <span className="text-ink-2">{call.server}</span>}
         <MachineMark call={call} />
+        <OfflineMark call={call} />
         <span className="min-w-0 flex-1 truncate text-ink-3">{preview.slice(0, 200)}</span>
         <span className={cn("shrink-0", call.state === "error" ? "text-bad" : "text-ink-2")}>{t(TOOL_STATE[call.state])}</span>
         {call.ms != null && call.state !== "skipped" && <span className="num shrink-0 text-ink-3">{fmt(call.ms / 1000, 1)} s</span>}

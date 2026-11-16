@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { browserKeyAfterCreate, createKey, dismissFreshKey, getFreshKey, holdersOf, keysAnswer, logKind, showFreshKey, subscribeFreshKey, teamOf, waitingText, type KeysAction } from "./keys"
+import { browserKeyAfterCreate, createKey, dismissFreshKey, getFreshKey, getRunners, holdersOf, keysAnswer, logKind, runnersText, showFreshKey, subscribeFreshKey, teamOf, waitingText, type KeysAction } from "./keys"
 
 // The page's reading of the #310 routes: GET /keys (who is asking and whether the server is in team mode) and /metrics live (who holds
 // the engine and who waits).
@@ -40,6 +40,43 @@ describe("who holds the engine and who waits", () => {
     expect(waitingText({ waiting_who: [{ who: "bob", since: 2 }, { who: "cat", since: 3 }] })).toBe("bob (1), cat (2)")
     expect(waitingText({ waiting_who: [] })).toBe("")
     expect(waitingText({})).toBe("")
+  })
+})
+
+// #310 part 2: the runners in Monitor, from GET /runners. A guest gets another identity's runner as {who, online} only: it is shown as the name and
+// online / offline, never a machine it was not given.
+describe("the runners line", () => {
+  test("each runner as name (machine) online / offline, in the server's order", () => {
+    expect(runnersText([
+      { id: "r0123456789abcdef", who: "ann", device: "d1", online: true, machine: "ANN-LAPTOP", home: "C:/Users/ann", shell: "bash" },
+      { who: "bob", online: false },
+    ])).toBe("ann (ANN-LAPTOP) online, bob offline")
+  })
+  test("a full row without a machine name is the name alone; nothing is never a line", () => {
+    expect(runnersText([{ who: "owner", online: true, machine: null }, { who: "owner", online: false, machine: "" }])).toBe("owner online, owner offline")
+    expect(runnersText([])).toBe("")
+  })
+  test("getRunners: the list, or null when the server cannot be asked (no route, not the owner, an error)", async () => {
+    ;(globalThis as Record<string, unknown>).localStorage ??= { getItem: () => null, setItem: () => {}, removeItem: () => {} }
+    ;(globalThis as Record<string, unknown>).location ??= { pathname: "/next/", search: "" }
+    const real = globalThis.fetch
+    const urls: string[] = []
+    const answer = (status: number, body: unknown) => {
+      globalThis.fetch = (async (u: string) => { urls.push(String(u)); return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } }) }) as typeof fetch
+    }
+    try {
+      answer(200, { runners: [{ who: "bob", online: true }] })
+      expect(await getRunners()).toEqual([{ who: "bob", online: true }])
+      expect(urls[0].endsWith("runners")).toBe(true)
+      answer(404, { error: { message: "not found" } })
+      expect(await getRunners()).toBeNull()
+      answer(403, { error: { message: "a runner can connect only from this PC" } })
+      expect(await getRunners()).toBeNull()
+      answer(200, { nothing: true })
+      expect(await getRunners()).toBeNull()
+      globalThis.fetch = (async () => { throw new Error("down") }) as unknown as typeof fetch
+      expect(await getRunners()).toBeNull()
+    } finally { globalThis.fetch = real }
   })
 })
 

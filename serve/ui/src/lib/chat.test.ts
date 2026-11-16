@@ -2249,6 +2249,29 @@ describe("#310 part 2: the runner in the chat", () => {
     expect("machine" in theirs).toBe(false)
   })
 
+  test("a call on My PC: the call event sets machine, each remote event its travel; a remote for no call, or with a bad state, changes nothing", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(
+      { strata_mcp: { event: "start", id: "c1", name: "Bash" } },
+      { strata_mcp: { event: "call", id: "c1", name: "Bash", server: "my_agent", machine: "my", tool: "Bash", arguments: { command: "make" }, round: 1 } },
+      { strata_mcp: { event: "remote", id: "c1", state: "sending" } },
+      { strata_mcp: { event: "remote", id: "c1", state: "running" } },
+      { strata_mcp: { event: "remote", id: "c1", state: "nonsense" } },
+      { strata_mcp: { event: "remote", id: "nobody", state: "offline" } },
+      { strata_mcp: { event: "start", id: "c2", name: "Read" } },
+      { strata_mcp: { event: "call", id: "c2", name: "Read", server: "my_agent", machine: "my", tool: "Read", arguments: { file_path: "a" }, round: 1 } },
+      { strata_mcp: { event: "remote", id: "c2", state: "sending" } },
+      { strata_mcp: { event: "remote", id: "c2", state: "offline" } },
+      { strata_mcp: { event: "start", id: "c3", name: "Grep" } },
+      { strata_mcp: { event: "call", id: "c3", name: "Grep", server: "my_agent", machine: "my", tool: "Grep", arguments: { pattern: "x" }, round: 1 } },
+      { strata_mcp: { event: "remote", id: "c3", state: "sending" } },
+      ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("make", [], ctx)
+    const tools = c.messages[1].tools!
+    expect(tools.map((x) => [x.id, x.machine, x.remote])).toEqual([["c1", "my", "running"], ["c2", "my", "offline"], ["c3", "my", "sending"]])
+  })
+
   test("a helper's step on My PC is marked, and its travel (step_remote) is kept on it", async () => {
     keep()
     ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(

@@ -4,6 +4,7 @@
 import { useEffect, useSyncExternalStore } from "react"
 import { apiHeaders, errorMessage, url } from "./api"
 import { noteGate } from "./device"
+import { t } from "./i18n"
 
 export type Role = "owner" | "guest"
 export interface DeviceRow {
@@ -113,6 +114,29 @@ export function holdersOf(l: LiveWho): string[] {
  *  (live.waiting is #465's count of requests waiting for a slot, with no names). */
 export function waitingText(l: LiveWho): string {
   return (l.waiting_who ?? []).map((w, i) => `${w.who} (${i + 1})`).join(", ")
+}
+
+// The runners connected to this server (GET /runners, #310 part 2). The caller's own runners come in full, and every runner for the owner;
+// a guest gets another identity's runner as `who` and `online` only, so the page has nothing more of it to show.
+export interface RunnerRow {
+  who: string; online: boolean
+  id?: string; device?: string; machine?: string | null; platform?: string | null; shell?: string | null; home?: string | null; since?: number
+}
+
+/** The runners this caller may see; null when the server cannot be asked (no such route, a caller who may not, an error). */
+export async function getRunners(): Promise<RunnerRow[] | null> {
+  try {
+    const r = await fetch(url("runners"), { headers: apiHeaders() })
+    if (!r.ok) { await noteGate(r); return null }
+    const body = (await r.json()) as { runners?: RunnerRow[] }
+    return Array.isArray(body.runners) ? body.runners : null
+  } catch { return null }
+}
+
+/** The runners as one line: "ann (ANN-LAPTOP) online, bob offline". Only the name, the machine's name when the row has one, and whether
+ *  it is online: never the id, the home folder or the shell, which the owner's full rows also carry. */
+export function runnersText(rows: RunnerRow[]): string {
+  return rows.map((r) => `${r.who}${r.machine ? ` (${r.machine})` : ""} ${r.online ? t("online") : t("offline")}`).join(", ")
 }
 
 /** A log entry's action, as the server writes it ("created", "renamed from ann", "role:guest", ...): the kind, and the name or role it carries. */
