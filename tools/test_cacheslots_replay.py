@@ -78,6 +78,18 @@ class Replay(unittest.TestCase):
             self.assertIn("family", out)
             self.assertIn("owner|addr:10.0.0.2", out)
 
+    def test_the_review_sequences_replay_under_every_rule(self):
+        import cacheslots_sequences as seq
+        for name, make in seq.SEQUENCES.items():
+            records = make()
+            self.assertTrue(all(r["role"] in ("main", "subagent", "classifier", "side") for r in records), name)
+            got = {rule: cr.replay(records, rule) for rule in cr.RULES}
+            for res in got.values():
+                self.assertEqual(sum(res["by_role"].values()), res["read"], name)
+        i1 = seq.SEQUENCES["I1-idle-main-side"]()
+        self.assertEqual(cr.replay(i1, "hybrid")["regrets"], 0)             # main is not evicted for a side request
+        self.assertEqual(cr.replay(i1, "family")["regrets"], 1)
+
     def test_main_needs_a_trace_or_bench(self):
         with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
             cr.main([])

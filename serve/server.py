@@ -750,6 +750,90 @@ class ContinuationCacheSlots:
         return self.choose(ids)[0]
 
 
+class HybridCacheSlots:
+    """#321 round 4, STRATA_CACHE_SLOT_RULE=hybrid (opt-in; the default is the family rule, CacheSlots).  Built from
+    what a placement costs: a prompt placed in a slot reuses H, the prefix it shares with the slot's last prompt, now,
+    and destroys that prompt's part past H (loss = len(last) - H), which its owner re-reads only if it comes back.
+    The table keeps each slot's last prompt, when it was used, and whether a client pinned it; senders play no part.
+
+    1. Join: the slot with the longest H among those with H >= PREFIX and H >= JOIN * len(last), i.e. a certain
+       saving at least the possible loss (JOIN = 1/2, the break-even).  A continuation is the case loss ~ 0 ("continues";
+       a shared head otherwise, "joins").  So another agent's auto-mode classifier request (28-31K of shared
+       instructions, a few thousand tokens of its own transcript, in the #321 trace) shares one slot across agents and
+       senders, while a long conversation (its own part past the shared head larger than the head: two users' mains
+       on a 9-10K head, a general-purpose subagent sharing 5-7K with main) is never joined by another.  Two
+       conversations both under twice their shared head may share a slot; each re-reads less than the head it reuses.
+    2. Else the lowest never-used slot.
+    3. Else evict: the least recently used slot whose loss is at most EVICT (1) times this prompt's own length - a
+       request evicts only what costs no more to read again than itself (a 400-token side request takes another short
+       slot, never an idle 100K main conversation); if no slot is that small, the least recently used slot (a finished
+       session's, by age, rather than a live short one's).
+    A slot a client pinned (strata_cache_slot, recorded) is joined only by an exact continuation of its prompt and
+    evicted only when every slot is pinned.
+
+    PREFIX (512, the family rule's head) only keeps a few template tokens from counting as a shared head.  The
+    constants are ratios, not sizes, so they hold for other heads and other Claude Code versions; their sensitivity
+    (x0.5 / x2) is in the #321 round 4 report.  Known cost: a new conversation after a compaction, or a new session,
+    takes a free slot while one exists and reads its head again there (the family rule overwrote the old one, which
+    was dead or another user's; it cannot tell which), at most once per never-used slot."""
+    PREFIX = 512
+    JOIN = 0.5
+    EVICT = 1.0
+
+    def __init__(self, n: int):
+        self.n = n
+        self.lock = threading.Lock()
+        self.table: list = [None] * n           # slot -> {"ids", "used": tick, "pinned": bool}, or None
+        self.tick = 0
+
+    def _put(self, slot, ids, pinned=False):
+        self.tick += 1
+        self.table[slot] = {"ids": ids if isinstance(ids, list) else list(ids), "used": self.tick, "pinned": pinned}
+
+    def _place(self, ids):
+        """-> (slot, H with its last prompt, how, len of its last prompt); the table is not changed."""
+        sh = [_shared_len(e["ids"], ids) if e else 0 for e in self.table]
+        join = [s for s, e in enumerate(self.table) if e and sh[s] >= self.PREFIX and sh[s] >= self.JOIN * len(e["ids"])
+                and (not e["pinned"] or sh[s] >= len(e["ids"]))]
+        if join:
+            slot = max(join, key=lambda s: (sh[s], -s))
+            how = "continues" if sh[slot] >= len(self.table[slot]["ids"]) else "joins"
+        elif None in self.table:
+            slot, how = self.table.index(None), "free"
+        else:
+            pool = [s for s in range(self.n) if not self.table[s]["pinned"]] or list(range(self.n))
+            small = [s for s in pool if len(self.table[s]["ids"]) - sh[s] <= self.EVICT * len(ids)]
+            slot, how = min(small or pool, key=lambda s: self.table[s]["used"]), "evicts"
+        last = len(self.table[slot]["ids"]) if self.table[slot] else 0
+        return slot, sh[slot], how, last
+
+    def choose(self, ids, nearest=None, who=None):
+        """-> (slot, shared, how): how is "continues", "joins", "free" or "evicts"; shared is the prefix shared with
+        the slot's last prompt when at least PREFIX (the engine's ckpt_at), else None.  `nearest` (a dict) gets the
+        length of the slot's last prompt, for the STRATA_DEBUG line."""
+        ids = ids if isinstance(ids, list) else list(ids)
+        with self.lock:
+            slot, h, how, last = self._place(ids)
+            self._put(slot, ids)
+        if nearest is not None:
+            nearest["last"] = last
+        return slot, (h if h >= self.PREFIX else None), how
+
+    def record(self, slot, ids):
+        """A request whose client chose its slot: its prompt is that slot's last one, and the slot is pinned."""
+        with self.lock:
+            self._put(slot, ids, pinned=True)
+
+    def shared(self, ids, who=None):
+        ids = ids if isinstance(ids, list) else list(ids)
+        with self.lock:
+            _, h, how, _ = self._place(ids)
+        return h if how in ("continues", "joins") else None
+
+    def pick(self, ids, who=None) -> int:
+        return self.choose(ids)[0]
+
+
 def without_secondary(args: list[str]) -> list[str]:
     """#59: the engine's arguments with the secondary (4070) expert tier off - its size 0, no exclusive placement and
     no adaptive swaps there - so it serves on the primary GPU alone while the display needs that card's VRAM."""
@@ -3833,7 +3917,8 @@ class Service:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
 
-    SLOT_RULES = {"family": CacheSlots, "identity": IdentityCacheSlots, "continuation": ContinuationCacheSlots}
+    SLOT_RULES = {"family": CacheSlots, "identity": IdentityCacheSlots, "continuation": ContinuationCacheSlots,
+                  "hybrid": HybridCacheSlots}
 
     def with_slot(self, req: dict, ids, who: dict | None = None, route: str = "") -> dict:
         """The request with the cache slot of its prompt (xeno #49 S7), when the engine has several slots (INFO
@@ -3853,7 +3938,7 @@ class Service:
             return req
         name = os.environ.get("STRATA_CACHE_SLOT_RULE", "").strip().lower()
         kind = self.SLOT_RULES.get(name, CacheSlots)
-        family = kind is not ContinuationCacheSlots
+        family = kind in (CacheSlots, IdentityCacheSlots)
         if getattr(self, "slots", None) is None or self.slots.n != n or type(self.slots) is not kind:
             self.slots = kind(n)
         if "strata_cache_slot" in req:
@@ -3871,6 +3956,8 @@ class Service:
                 said = f"slot {slot}: {len(ids)} tokens, shares {shared} with the family's last"
                 if kind is IdentityCacheSlots:
                     said += f" (sender {key})"
+            elif kind is HybridCacheSlots:              # what it reuses of the slot's last prompt, and that prompt
+                said = f"slot {slot} ({how}): {len(ids)} tokens, shares {shared} of its last {nearest.get('last', 0)}"
             else:                                       # the nearest slot's tail: what TAIL would have to cover
                 near = (f"; nearest: slot {nearest['slot']} shares {nearest['shared']}, tail {nearest['tail']}"
                         if nearest and how != "continues" else "")

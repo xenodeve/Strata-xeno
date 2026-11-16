@@ -2,14 +2,19 @@
 
     python tools/cacheslots_replay.py TRACE.jsonl[.gz] [--slots 4] [--rows]
     python tools/cacheslots_replay.py --bench w1,w2a,w2s [--workload-root DIR] [--rows]
+    python tools/cacheslots_replay.py --sequences [--rows]
 
 TRACE is what the server wrote with STRATA_SLOT_TRACE=<file> (serve/server.py slot_trace: one JSON line per request -
 the route, who sent it, the prompt's token ids, a client's own strata_cache_slot).  --bench builds the stream from
 tools/workstation_bench.py's own request order instead (user A / B and their side requests; the prompt rendered by the
 server's template, its bytes cut into 4-byte pieces as a stand-in for tokens).
 
+--sequences replays the review's Claude-Code-shaped single-user sequences (tools/cacheslots_sequences.py).  A record's
+"role" (main, subagent, classifier, side), when present, splits the tokens read.
+
 Every rule of Service.with_slot is replayed on the same stream with the engine's slots (--slots, default 4):
-family (CacheSlots, the default), identity (IdentityCacheSlots), continuation (ContinuationCacheSlots).  A request whose
+family (CacheSlots, the default), identity (IdentityCacheSlots), continuation (ContinuationCacheSlots), hybrid
+(HybridCacheSlots).  A request whose
 client chose its slot goes there, as the server sends it.  The engine side is modelled as each slot holding the last
 prompt sent to it; "reused" is the prefix a prompt shares with its slot's last prompt.  That is an upper bound: the
 engine resumes from its last checkpoint at or before that point (turn starts, the root, ckpt_at).
@@ -34,10 +39,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from serve.server import (CacheSlots, ContinuationCacheSlots, IdentityCacheSlots,  # noqa: E402
+from serve.server import (CacheSlots, ContinuationCacheSlots, HybridCacheSlots, IdentityCacheSlots,  # noqa: E402
                           _shared_len)
 
-RULES = {"family": CacheSlots, "identity": IdentityCacheSlots, "continuation": ContinuationCacheSlots}
+RULES = {"family": CacheSlots, "identity": IdentityCacheSlots, "continuation": ContinuationCacheSlots,
+         "hybrid": HybridCacheSlots}
 PREFIX, TAIL = ContinuationCacheSlots.PREFIX, ContinuationCacheSlots.TAIL
 
 
@@ -69,12 +75,15 @@ def read_trace(path) -> list[dict]:
     return out
 
 
-def replay(records: list[dict], rule: str, slots: int = 4) -> dict:
-    table = RULES[rule](slots)
+def replay(records: list[dict], rule, slots: int = 4) -> dict:
+    """`rule`: a name of RULES, or a class with the CacheSlots interface (a variant under test)."""
+    cls = RULES[rule] if isinstance(rule, str) else rule
+    table = cls(slots)
+    rule = rule if isinstance(rule, str) else getattr(cls, "__name__", str(cls))
     content: list = [None] * slots
     evicted: dict = {}                                  # hash of the first PREFIX tokens -> [evicted prompts]
     res = {"rule": rule, "tokens": 0, "read": 0, "reused": 0, "switches": 0, "evictions": 0, "regrets": 0,
-           "regret_tokens": 0, "rows": []}
+           "regret_tokens": 0, "rows": [], "by_role": {}}
     prev_slot = None
     for i, rec in enumerate(records):
         ids, who = rec["ids"], sender(rec)
@@ -103,7 +112,9 @@ def replay(records: list[dict], rule: str, slots: int = 4) -> dict:
         res["tokens"] += len(ids)
         res["reused"] += reused
         res["read"] += len(ids) - reused
-        res["rows"].append({"i": i, "route": rec.get("route"), "who": label(who), "tag": rec.get("tag"),
+        role = rec.get("role") or "-"
+        res["by_role"][role] = res["by_role"].get(role, 0) + len(ids) - reused
+        res["rows"].append({"i": i, "route": rec.get("route"), "who": label(who), "tag": rec.get("tag"), "role": role,
                             "n": len(ids), "slot": slot, "how": how, "reused": reused, "read": len(ids) - reused})
     return res
 
@@ -156,7 +167,7 @@ def bench_records(mode: str, root: Path | None = None) -> list[dict]:
         messages, tools, kw = openai_to_messages(body)
         b = svc.render_prompt(messages, tools, kw).encode("utf-8")
         name = user.split("~")[0]
-        out.append({"route": "bench", "tag": tag, "who": {"key": "owner", "device": f"addr:{name}", "addr": name},
+        out.append({"route": "bench", "tag": tag, "role": "side" if "~" in user else "main", "who": {"key": "owner", "device": f"addr:{name}", "addr": name},
                     "ids": [hash(b[i:i + 4]) for i in range(0, len(b), 4)], "pinned": None})
     return out
 
@@ -168,7 +179,8 @@ def report(records: list[dict], slots: int = 4, rows: bool = False, title: str =
     results = [replay(records, r, slots) for r in RULES]
     for res in results:
         lines.append(f"{res['rule']:13s} {res['read']:>11,} {res['reused']:>11,} {res['switches']:>8} "
-                     f"{res['evictions']:>9} {res['regrets']:>7} {res['regret_tokens']:>11,}")
+                     f"{res['evictions']:>9} {res['regrets']:>7} {res['regret_tokens']:>11,}  read by role: "
+                     + ", ".join(f"{k} {v:,}" for k, v in sorted(res["by_role"].items())))
     lines.append("live conversations per sender (rule-independent): conversations, live max, live median")
     for who, v in sorted(live_conversations(records).items()):
         lines.append(f"  {who}: {v['conversations']}, {v['live_max']}, {v['live_median']}")
@@ -185,13 +197,19 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("trace", nargs="?", help="a STRATA_SLOT_TRACE file (.jsonl or .jsonl.gz)")
     ap.add_argument("--bench", help="replay workstation_bench's order instead: a comma list of w1, w2a, w2s")
+    ap.add_argument("--sequences", action="store_true",
+                    help="replay the review's Claude-Code-shaped sequences instead (tools/cacheslots_sequences.py)")
     ap.add_argument("--workload-root", help="the tree the bench turns' tool results are read from (default: this one)")
     ap.add_argument("--slots", type=int, default=4)
     ap.add_argument("--rows", action="store_true", help="every request's slot, how, reused and read, per rule")
     a = ap.parse_args(argv)
-    if bool(a.trace) == bool(a.bench):
-        ap.error("a trace file or --bench, one of them")
-    if a.trace:
+    if sum(map(bool, (a.trace, a.bench, a.sequences))) != 1:
+        ap.error("a trace file, --bench or --sequences, one of them")
+    if a.sequences:
+        import cacheslots_sequences as seq
+        for name, make in seq.SEQUENCES.items():
+            print(report(make(), a.slots, a.rows, f"sequence {name}: "))
+    elif a.trace:
         print(report(read_trace(a.trace), a.slots, a.rows, f"{a.trace}: "))
     else:
         for mode in a.bench.split(","):
