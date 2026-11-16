@@ -305,7 +305,17 @@ class FakeWindow:
 def _gui(window) -> gui.Gui:
     g = gui.Gui(data=None, api=None)
     g._app = window
+    g._nav_guarded = True
     return g
+
+
+def test_without_the_navigation_check_nothing_is_written_or_opened():
+    w = FakeWindow()
+    g = gui.Gui(data=None, api=None)
+    g._app = w
+    assert g.navigate_and_inject("http://h:1", "true", timeout=1) is False
+    g.open_app("http://h:1")
+    assert w.calls == []
 
 
 def test_navigate_and_inject_true():
@@ -315,6 +325,7 @@ def test_navigate_and_inject_true():
     assert w.calls[0][0] == "load_url" and w.calls[0][1].startswith("http://Lab:8099/p/health?")
     assert w.calls[1] == ("evaluate_js",)
     assert 'location.origin' in w.scripts[0] and '"http://lab:8099"' in w.scripts[0]
+    assert 'location.pathname!=="/p/health"' in w.scripts[0]
 
 
 def test_inject_twice_in_a_row_navigates_twice():
@@ -397,3 +408,179 @@ def test_closing_hides_unless_quitting():
     assert ("hide",) in w.calls
     quitting[0] = True
     assert handler() is not False
+
+
+# ------------------------------------------------------------------------------------------------ links and navigation
+REFUSED = [
+    "file:///C:/Windows/System32/calc.exe",
+    "FILE://host/share/x.exe",
+    "\\\\host\\share\\x.exe",
+    "//host/share/x.exe",
+    "http:\\\\host\\share\\x.exe",
+    "https://host\\..\\x",
+    "ms-msdt:/id PCWDiagnostic /skip force",
+    "search-ms:query=x&crumb=location:\\\\host\\share",
+    "ms-settings:privacy",
+    "javascript:alert(1)",
+    "data:text/html,<b>x</b>",
+    "vbscript:x",
+    "mailto:a@b.c",
+    "steam://run/1",
+    "C:\\Windows\\System32\\calc.exe",
+    "calc.exe",
+    "https://user:pass@example.com/",
+    "https://evil.com@example.com/",
+    "http:example.com",
+    "https:/example.com",
+    "https://",
+    "https://exa mple.com/",
+    "https://example.com/\nx",
+    "https://example.com:99999/",
+    "",
+    None,
+    5,
+    "https://example.com/" + "a" * 9000,
+]
+ALLOWED = ["https://example.com/", "http://127.0.0.1:8099/x?y=1#z", "HTTPS://Example.COM/a%20b", "http://[::1]:1/"]
+
+
+@pytest.mark.parametrize("url", REFUSED)
+def test_link_refused(url):
+    assert gui.external_url_ok(url) is False
+
+
+@pytest.mark.parametrize("url", ALLOWED)
+def test_link_allowed(url):
+    assert gui.external_url_ok(url) is True
+
+
+def test_guard_passes_only_web_links_and_logs_no_url(caplog):
+    opened = []
+    open_link = gui.guard_links(lambda url, new=0, autoraise=True: opened.append(url) or True)
+    for url in REFUSED:
+        assert open_link(url) is False
+    assert opened == []
+    assert open_link("https://example.com/?q=secret-query") is True
+    assert opened == ["https://example.com/?q=secret-query"]
+    open_link("ms-msdt:/id PCWDiagnostic /param secret-query")
+    assert "secret-query" not in caplog.text and "PCWDiagnostic" not in caplog.text
+    assert "'ms-msdt'" in caplog.text
+
+
+def test_install_link_guard_wraps_webbrowser_open(monkeypatch):
+    """The wiring: pywebview's new-window handler calls `webbrowser.open`; after the guard, that refuses file: and
+    passes https to what was there before."""
+    import webbrowser
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, new=0, autoraise=True: opened.append(url) or True)
+    gui.install_link_guard()
+    gui.install_link_guard()                                    # once: not wrapped twice
+    assert webbrowser.open("file:///C:/Windows/System32/calc.exe") is False
+    assert webbrowser.open("\\\\host\\share\\x.exe") is False
+    assert webbrowser.open_new_tab("ms-msdt:/id x") is False   # the module's other entry points go through it too
+    assert webbrowser.open("https://example.com/") is True
+    assert opened == ["https://example.com/"]
+
+
+def test_pywebview_new_windows_go_through_webbrowser_open():
+    """The guard sits where pywebview 6.2.1 sends a new-window request (only where pywebview is installed: the venv)."""
+    import importlib.util
+    spec = importlib.util.find_spec("webview")
+    if spec is None or not spec.submodule_search_locations:
+        pytest.skip("pywebview is not installed in this python")
+    from pathlib import Path
+    src = (Path(list(spec.submodule_search_locations)[0]) / "platforms" / "edgechromium.py").read_text(encoding="utf-8")
+    body = src[src.index("def on_new_window_request"):]
+    body = body[:body.index("\n    def ", 10)]
+    assert "webbrowser.open(" in body
+    assert "import webbrowser" in src
+
+
+@pytest.mark.parametrize("uri, ok", [
+    ("http://h:1/health?desktop=1", True),
+    ("http://H:1/#/chat", True),
+    ("blob:http://h:1/0f0e", True),
+    ("about:blank", True),
+    ("http://h:2/", False),
+    ("https://h:1/", False),
+    ("http://evil:1/", False),
+    ("file:///C:/x", False),
+    ("ms-msdt:/id x", False),
+    ("javascript:alert(1)", False),
+    ("data:text/html,x", False),
+    ("blob:http://evil:1/0f0e", False),
+    ("http://user@h:1/", False),
+    ("about:srcdoc", False),
+])
+def test_navigation_ok(uri, ok):
+    assert gui.navigation_ok(uri, "http://h:1") is ok
+
+
+def test_navigation_without_a_server_goes_nowhere():
+    assert gui.navigation_ok("http://h:1/", None) is False
+    assert gui.navigation_ok("about:blank", None) is True
+
+
+class NavArgs:
+    def __init__(self, uri, user=False, redirected=False):
+        self.Uri, self.IsUserInitiated, self.IsRedirected, self.Cancel = uri, user, redirected, False
+
+
+class FakeControl:
+    def __init__(self):
+        self.NavigationStarting = FakeEvent()
+
+
+class FakeNative:
+    def __init__(self):
+        self.webview = FakeControl()
+
+
+def test_app_navigation_is_checked(monkeypatch):
+    import webbrowser
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, new=0, autoraise=True: opened.append(url) or True)
+    gui.install_link_guard()
+    w = FakeWindow()
+    w.native = FakeNative()
+    g = gui.Gui(data=None, api=None)
+    g._app = w
+    assert g._guard_navigation(w) is True
+    handler, = w.native.webview.NavigationStarting.handlers
+    assert g.navigate_and_inject("http://h:1", "true", timeout=1) is True        # sets the allowed origin
+
+    same = NavArgs("http://h:1/#/chat")
+    handler(None, same)
+    assert same.Cancel is False
+    for uri in ("ms-msdt:/id x", "file:///C:/Windows/win.ini", "\\\\host\\share\\x"):
+        a = NavArgs(uri, user=True)
+        handler(None, a)
+        assert a.Cancel is True
+    scripted = NavArgs("https://elsewhere.example/")
+    handler(None, scripted)
+    assert scripted.Cancel is True
+    redirected = NavArgs("https://elsewhere.example/", user=True, redirected=True)
+    handler(None, redirected)
+    assert redirected.Cancel is True
+    clicked = NavArgs("https://elsewhere.example/doc", user=True)
+    handler(None, clicked)
+    assert clicked.Cancel is True
+    assert opened == ["https://elsewhere.example/doc"]                          # only the clicked web link
+
+
+def test_navigation_check_fails_closed():
+    g = gui.Gui(data=None, api=None)
+
+    class Broken:
+        @property
+        def Uri(self):
+            raise RuntimeError("x")
+        Cancel = False
+
+    a = Broken()
+    g._on_app_navigating(None, a)
+    assert a.Cancel is True
+    w = FakeWindow()
+    w.native = None
+    assert g._guard_navigation(w) is False
+    assert g._nav_guarded is False

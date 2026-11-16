@@ -121,12 +121,13 @@ def test_script_is_one_safe_literal():
     assert script.isascii()
 
 
-def _node(script: str, store: dict[str, str], *, drop: str | None = None, origin: str = "http://h:1") -> dict:
-    """Runs `script` in node against a Map-backed localStorage stub (a `setItem` that drops `drop`), returns
-    {"result", "store"}."""
+def _node(script: str, store: dict[str, str], *, drop: str | None = None, origin: str = "http://h:1",
+          path: str = "/health") -> dict:
+    """Runs `script` in node against a Map-backed localStorage stub (a `setItem` that drops `drop`) on a page at
+    `origin` + `path`, returns {"result", "store"}."""
     harness = """
 const fs = require("fs");
-const [scriptPath, storePath, drop, origin] = process.argv.slice(2);
+const [scriptPath, storePath, drop, origin, pathname] = process.argv.slice(2);
 const m = new Map(Object.entries(JSON.parse(fs.readFileSync(storePath, "utf8"))));
 globalThis.localStorage = {
   getItem: (k) => (m.has(k) ? m.get(k) : null),
@@ -134,7 +135,7 @@ globalThis.localStorage = {
   removeItem: (k) => { m.delete(k) },
 };
 globalThis.window = globalThis;
-globalThis.location = { origin };
+globalThis.location = { origin, pathname };
 const result = (0, eval)(fs.readFileSync(scriptPath, "utf8"));
 process.stdout.write(JSON.stringify({ result, store: Object.fromEntries(m) }));
 """
@@ -143,7 +144,7 @@ process.stdout.write(JSON.stringify({ result, store: Object.fromEntries(m) }));
         h.write_text(harness, encoding="utf-8")
         s.write_text(script, encoding="utf-8")
         st.write_text(json.dumps(store), encoding="utf-8")
-        out = subprocess.run([NODE, str(h), str(s), str(st), drop or "", origin], capture_output=True, text=True,
+        out = subprocess.run([NODE, str(h), str(s), str(st), drop or "", origin, path], capture_output=True, text=True,
                              encoding="utf-8", timeout=30, creationflags=NO_WINDOW)
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
@@ -189,6 +190,17 @@ def test_guarded_script_runs_only_on_its_origin():
     other = _node(script, {}, origin="http://evil:1")
     assert other == {"result": False, "store": {}}
     assert _node(script, {}, origin="null")["store"] == {}          # a browser error page
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_guarded_script_runs_only_on_its_path():
+    """A /health load that was cancelled (a redirect off the origin) leaves the app page current: same origin, other
+    path; the values must not land there (seen in the hidden-window check)."""
+    values, remove = inject.storage_values(TOKEN, RUNNER, DEVICE, LABEL)
+    script = inject.guarded(inject.inject_script(values, remove), "http://h:1", "/p/health")
+    assert _node(script, {}, path="/p/health")["result"] is True
+    assert _node(script, {}, path="/p/") == {"result": False, "store": {}}
+    assert _node(script, {}, path="/") == {"result": False, "store": {}}
 
 
 def test_script_refuses_what_is_not_text():

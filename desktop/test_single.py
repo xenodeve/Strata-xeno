@@ -109,3 +109,29 @@ def test_instance_name(tmp_path: Path):
     assert single.instance_name(Path(str(tmp_path).upper()), True) == a        # one folder, however it is written
     assert single.instance_name(tmp_path / "sub" / "..", True) == a
     assert single.instance_name(tmp_path / "other", True) != a
+
+
+def test_instance_name_resolves_a_junction(tmp_path: Path):
+    """Two spellings of one folder through a junction are one instance (else two runners on one device)."""
+    import _winapi
+    target, link = tmp_path / "data", tmp_path / "link"
+    target.mkdir()
+    _winapi.CreateJunction(str(target), str(link))
+    assert single.instance_name(link, True) == single.instance_name(target, True)
+
+
+def test_mutex_of_an_elevated_first_is_refused_not_raised(monkeypatch):
+    """A medium-integrity second start gets NULL + ERROR_ACCESS_DENIED for a name an elevated first made."""
+    class K32:
+        def CreateMutexW(self, *a):
+            return 0
+
+        def CloseHandle(self, h):
+            raise AssertionError("nothing to close")
+
+    monkeypatch.setattr(single, "_k32", K32())
+    monkeypatch.setattr(single.ctypes, "get_last_error", lambda: single.ERROR_ACCESS_DENIED)
+    assert single.acquire(_name()) is None
+    monkeypatch.setattr(single.ctypes, "get_last_error", lambda: 87)               # anything else still raises
+    with pytest.raises(OSError):
+        single.acquire(_name())

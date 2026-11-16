@@ -7,6 +7,11 @@ and `PIL` stay in `desktop/tray.py`, also inside functions.
   checks the page is on the server's origin, and runs the localStorage script there (desktop/inject.py);
   `open_app` then loads `<base>/` and shows the window once it has loaded.
 
+Nothing in the app window reaches Windows but a plain http(s) address: a new-window link goes through
+`install_link_guard` (pywebview hands it to `webbrowser.open`, which is `os.startfile`), and a top-level navigation
+of the app window off the open server's origin is cancelled (`_on_app_navigating`; a link the user clicked to another
+http(s) address opens in the system browser).
+
 Closing either window hides it (the app stays in the tray) unless the controller is quitting.  `webview.start` runs
 with `gui="edgechromium"`, `private_mode=False` and `storage_path=<data>\\webview` (the WebView2 profile: chats survive a
 restart); downloads are allowed (the web app saves files).  pywebview falls back to MSHTML without saying so when
@@ -21,6 +26,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 from desktop import applog, inject, paths, probe, state, urlcheck, webview2, words
 from desktop.dpapi import DpapiError
@@ -38,6 +44,73 @@ PAGE_WORDS = (
     "button_remove", "button_new", "button_open_without_runner", "menu_copy_code", "copied", "confirm_remove",
     "test_reachable", "role_owner", "role_guest", "engine_down", "pending", "internal_error",
 )
+
+
+WEB_SCHEMES = ("http", "https")
+URL_MOST = 8192
+
+
+def external_url_ok(url) -> bool:
+    """True for a plain http(s) address that may go to the system browser: a host, no user name or password in it,
+    no backslash (`http:\\\\host\\share` is a UNC path to ShellExecute), no space or control character, at most
+    8192 characters.  Everything else - file:, a UNC path, ms-msdt:, search-ms:, javascript:, any other protocol
+    handler - is refused."""
+    if not isinstance(url, str) or not url or len(url) > URL_MOST:
+        return False
+    if "\\" in url or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in url):
+        return False
+    try:
+        u = urlsplit(url)
+        host = u.hostname
+        u.port
+    except ValueError:
+        return False
+    return u.scheme.lower() in WEB_SCHEMES and bool(host) and "@" not in u.netloc and url[len(u.scheme):].startswith("://")
+
+
+def navigation_ok(uri, allowed_origin: str | None) -> bool:
+    """May the app window go to `uri`: about:blank, or a plain http(s) address (or a blob: of one) on
+    `allowed_origin`, the open server's origin."""
+    if uri == "about:blank":
+        return True
+    if not allowed_origin or not isinstance(uri, str):
+        return False
+    if uri[:5].lower() == "blob:":
+        uri = uri[5:]
+    if not external_url_ok(uri):
+        return False
+    try:
+        return inject.origin(uri) == allowed_origin
+    except ValueError:
+        return False
+
+
+def _scheme(url) -> str:
+    """A URL's scheme for the log (never the URL: its query may hold anything)."""
+    s = url.split(":", 1)[0] if isinstance(url, str) and ":" in url else ""
+    s = "".join(c for c in s[:24] if c.isascii() and (c.isalnum() or c in "+-."))
+    return repr(s or "(none)")
+
+
+def guard_links(opener: Callable[..., bool]) -> Callable[..., bool]:
+    """`opener` (webbrowser.open's signature) for addresses `external_url_ok` takes; anything else is dropped and
+    logged by its scheme only."""
+    def open_link(url, new=0, autoraise=True):
+        if not external_url_ok(url):
+            log.warning("a link with the scheme %s was not handed to Windows", _scheme(url))
+            return False
+        return opener(url, new, autoraise)
+    open_link.strata_link_guard = True
+    return open_link
+
+
+def install_link_guard(opener: Callable[..., bool] | None = None) -> None:
+    """Replaces `webbrowser.open` (the function pywebview's new-window handler calls) with `guard_links` of it, once.
+    `opener` replaces the real opener under the guard (the hidden-window check records instead of opening)."""
+    import webbrowser
+    if getattr(webbrowser.open, "strata_link_guard", False) and opener is None:
+        return
+    webbrowser.open = guard_links(opener or webbrowser.open)
 
 
 def servers_html() -> str:
@@ -155,6 +228,8 @@ class Gui:
         self._ending = False                     # destroy(): the closing handlers let the windows go
         self._failed = False
         self._loads = 0                          # navigate_and_inject's count: each load has its own URL
+        self._app_origin: str | None = None      # the only origin the app window may navigate to
+        self._nav_guarded = False                # _on_app_navigating is on the app window's control
 
     def __repr__(self) -> str:
         return "Gui()"
@@ -171,6 +246,10 @@ class Gui:
             h.setFormatter(applog.ScrubFormatter("[pywebview] %(message)s"))
         webview.settings["ALLOW_DOWNLOADS"] = True
         webview.settings["IGNORE_SSL_ERRORS"] = False    # with it, pywebview accepts any certificate: never
+        # A window.open / target=_blank link goes to `webbrowser.open` (OPEN_EXTERNAL_LINKS_IN_BROWSER, on by default;
+        # pywebview platforms/edgechromium.py on_new_window_request), which on Windows is os.startfile: any scheme
+        # would reach ShellExecute.  Only plain http(s) addresses get through.
+        install_link_guard()
         self._servers = webview.create_window(words.t("servers_title"), html=servers_html(), js_api=self._api,
                                               width=SERVERS_SIZE[0], height=SERVERS_SIZE[1], min_size=SERVERS_MIN,
                                               hidden=self._servers_hidden)
@@ -187,6 +266,8 @@ class Gui:
                 webview2.message_box(webview2.missing_message())
                 self.destroy()
                 return
+            self._app.events.shown.wait(20)
+            self._guard_navigation(self._app)
             start()
 
         try:
@@ -211,6 +292,39 @@ class Gui:
 
     def _hook_app(self, window) -> None:
         window.events.loaded += self._on_app_loaded
+
+    def _guard_navigation(self, window) -> bool:
+        """Puts `_on_app_navigating` on the app window's WebView2 control (NavigationStarting).  Without it the app
+        window is never used (`navigate_and_inject` is False, `open_app` does nothing): fail closed."""
+        control = getattr(getattr(window, "native", None), "webview", None)
+        try:
+            control.NavigationStarting += self._on_app_navigating
+        except Exception as e:
+            log.error("the app window's navigation check could not be installed (%s): it stays unused",
+                      type(e).__name__)
+            return False
+        self._nav_guarded = True
+        return True
+
+    def _on_app_navigating(self, sender, args) -> None:
+        """The app window goes only to the open server's origin (and about:blank).  Anything else is cancelled; a
+        link the user clicked to another http(s) address opens in the system browser (through the link guard)."""
+        try:
+            uri = str(args.Uri)
+            if navigation_ok(uri, self._app_origin):
+                return
+            args.Cancel = True
+            by_user = bool(args.IsUserInitiated) and not bool(args.IsRedirected)
+            log.warning("the app window was kept from going to a %s address", _scheme(uri))
+            if by_user and external_url_ok(uri):
+                import webbrowser
+                webbrowser.open(uri)
+        except Exception as e:
+            try:
+                args.Cancel = True
+            except Exception:
+                pass
+            log.error("the app window's navigation check raised %s; the navigation was cancelled", type(e).__name__)
 
     def _on_app_loaded(self) -> None:
         with self._flag_lock:
@@ -245,7 +359,11 @@ class Gui:
             want = inject.origin(base)
         except ValueError:
             return False
+        if not self._nav_guarded:
+            log.error("the app window has no navigation check: nothing written")
+            return False
         with self._app_lock:
+            self._app_origin = want
             self._loads += 1
             # A query that changes every time: the WebView2 control does not navigate when its Source is set to the
             # URL it already shows, so a second inject in a row would wait out its timeout (seen in the hidden-window
@@ -263,15 +381,20 @@ class Gui:
                 if landed != want:
                     log.info("the app window landed on another origin, not %s: nothing written", want)
                     return False
-                return self._app.evaluate_js(inject.guarded(script, want)) is True
+                path = urlsplit(inject.health_url(base)).path
+                return self._app.evaluate_js(inject.guarded(script, want, path)) is True
             except Exception as e:
                 log.error("preparing the app window raised %s", type(e).__name__)
                 return False
 
     def open_app(self, base: str, server: str | None = None) -> None:
         """Loads `<base>/` in the app window, titled "Strata - <server>", and shows it when it has loaded."""
+        if not self._nav_guarded:
+            log.error("the app window has no navigation check: not opened")
+            return
         with self._app_lock:
-            self._app.set_title(f"Strata - {server or inject.origin(base)}")
+            self._app_origin = inject.origin(base)
+            self._app.set_title(f"Strata - {server or self._app_origin}")
             with self._flag_lock:
                 self._show_pending = True
             self._app.load_url(inject.app_url(base))

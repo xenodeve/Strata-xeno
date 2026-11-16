@@ -66,6 +66,19 @@ class Scrub(LogBase):
         self.assertNotIn(json.dumps(json.dumps(token))[1:-1], text)
         self.assertNotIn(repr(token)[1:-1], text)
 
+    def test_the_inject_script_form_is_scrubbed(self):
+        from desktop import inject
+        token = 'sk-<b>&"q\\x'
+        applog.add_secret(token)
+        values, remove = inject.storage_values(token, None, {"id": "AbCdEfGhIjKlMnOpQrStUv"}, "Strata Desktop on x")
+        script = inject.inject_script(values, remove)
+        self.assertIn(inject.js_literal(json.dumps(token))[1:-1], script)      # the form the script carries
+        self.log.info("script %s literal %s", script, inject.js_literal(token))
+        text = self.text()
+        for form in (token, inject.js_literal(token)[1:-1], inject.js_literal(json.dumps(token))[1:-1], "<b>", "u003cb"):
+            self.assertNotIn(form, text)
+        self.assertIn("strata.device", text)                                    # the rest of the line is kept
+
     def test_empty_and_odd_secrets_are_ignored(self):
         applog.add_secret("")
         applog.add_secret(None)

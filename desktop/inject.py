@@ -84,11 +84,15 @@ def clear_script() -> str:
             'return s.getItem("strata.apikey")===null}catch(e){return false}})()')
 
 
-def guarded(script: str, want_origin: str) -> str:
-    """`script`, run only when the page's `location.origin` is `want_origin` (else `false`): a page that navigated
-    away, or the browser's error page (origin "null"), never gets the values."""
-    return ("(function(){try{if(window.location.origin!==" + js_literal(want_origin) + ")return false}"
-            "catch(e){return false}return(" + script + ")})()")
+def guarded(script: str, want_origin: str, want_path: str | None = None) -> str:
+    """`script`, run only when the page's `location.origin` is `want_origin` and, when given, its `location.pathname`
+    is `want_path` (else `false`): a page that navigated away, the browser's error page (origin "null"), and the
+    document still current when the load was cancelled (the app page itself: by then it has sent its own device id)
+    never get the values."""
+    cond = "window.location.origin!==" + js_literal(want_origin)
+    if want_path is not None:
+        cond += "||window.location.pathname!==" + js_literal(want_path)
+    return "(function(){try{if(" + cond + ")return false}catch(e){return false}return(" + script + ")})()"
 
 
 def origin(url: str) -> str:

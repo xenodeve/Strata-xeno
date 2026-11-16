@@ -171,6 +171,12 @@ TABLE: dict[str, dict[str, str]] = {
         "th": "{key} บน {label} ({addr}) รหัส {code} เปิด Strata Desktop ที่ Settings > Keys เพื่อตัดสิน",
     },
     # ---------------------------------------------------------------- start-up
+    "already_running": {
+        "en": "Strata Desktop is already running, started with other rights (as administrator?). Use that one, or "
+              "quit it from its tray icon first.",
+        "th": "Strata Desktop เปิดอยู่แล้วด้วยสิทธิ์อื่น (เปิดแบบผู้ดูแลระบบไว้หรือเปล่า) ใช้ตัวนั้น "
+              "หรือสั่งออกจากไอคอนในถาดก่อน",
+    },
     "no_webview2": {
         "en": "Strata Desktop needs the Microsoft Edge WebView2 Runtime, which this PC does not have. Install it from "
               "https://go.microsoft.com/fwlink/p/?LinkId=2124703 and start Strata Desktop again.",

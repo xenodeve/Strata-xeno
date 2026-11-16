@@ -26,10 +26,14 @@ _handler: logging.Handler | None = None
 
 def add_secret(s: str) -> None:
     """Blank `s` from now on: as it is, and as JSON writes it once and twice (a token with `"` or `\\` inside a script
-    or a JSON body), and as `repr` writes it.  An empty value (an unreadable token reads as "") is ignored."""
+    or a JSON body), as `repr` writes it, and as `inject.js_literal` writes it once and inside a JSON value (the form
+    the localStorage script carries: `<` `>` `&` as `\\u003c` ...).  An empty value (an unreadable token reads as "")
+    is ignored."""
     if not isinstance(s, str) or not s:
         return
-    forms = {s, json.dumps(s)[1:-1], json.dumps(json.dumps(s))[1:-1], repr(s)[1:-1]}
+    from desktop.inject import js_literal
+    forms = {s, json.dumps(s)[1:-1], json.dumps(json.dumps(s))[1:-1], repr(s)[1:-1],
+             js_literal(s)[1:-1], js_literal(json.dumps(s))[1:-1]}
     with _lock:
         _secrets.extend(f for f in forms if f and f not in _secrets)
         _secrets.sort(key=len, reverse=True)

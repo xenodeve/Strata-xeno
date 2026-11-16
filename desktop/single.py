@@ -20,6 +20,7 @@ log = logging.getLogger("strata.desktop.single")
 
 BASE = "Local\\StrataDesktop"
 ERROR_ALREADY_EXISTS = 183
+ERROR_ACCESS_DENIED = 5         # the name is held by a process with more rights (an elevated first instance)
 WAIT_OBJECT_0 = 0
 INFINITE = 0xFFFFFFFF
 EVENT_MODIFY_STATE = 0x0002
@@ -46,10 +47,11 @@ if os.name == "nt":
 
 def instance_name(data_dir: Path, overridden: bool) -> str:
     """`Local\\StrataDesktop`, or with `--data-dir` `Local\\StrataDesktop-` + the first 8 hex digits of the sha256 of
-    the folder's full path (case-folded: one folder however it is written)."""
+    the folder's real path (links, junctions, subst drives and 8.3 names resolved, case-folded: one folder however it
+    is written)."""
     if not overridden:
         return BASE
-    full = os.path.normcase(os.path.abspath(os.fspath(data_dir)))
+    full = os.path.normcase(os.path.realpath(os.fspath(data_dir)))
     return BASE + "-" + hashlib.sha256(full.encode("utf-8")).hexdigest()[:8]
 
 
@@ -111,12 +113,17 @@ class Instance:
 
 
 def acquire(name: str) -> Instance | None:
-    """This process's instance, or None when another process holds `name`."""
+    """This process's instance, or None when another process holds `name` - also one this process may not open (an
+    elevated first instance: ERROR_ACCESS_DENIED).  Then `signal_show` cannot reach it either; the caller shows
+    `words.t("already_running")` when `signal_show` is False."""
     if os.name != "nt":
         return Instance(name, None, None)
     mutex = _k32.CreateMutexW(None, False, name)
     err = ctypes.get_last_error()
     if not mutex:
+        if err == ERROR_ACCESS_DENIED:
+            log.info("another Strata Desktop with more rights holds %s", name)
+            return None
         raise OSError(err, "CreateMutexW failed")
     if err == ERROR_ALREADY_EXISTS:
         _k32.CloseHandle(mutex)
