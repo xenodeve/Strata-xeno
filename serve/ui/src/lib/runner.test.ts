@@ -142,6 +142,8 @@ describe("closeReason: a card the server closed, in words", () => {
   test("cancelled is the answer that stopped; an unknown word gets a sentence, never the bare word; none is null", () => {
     expect(closeReason("cancelled")).toBe("The answer stopped before you answered.")
     expect(closeReason("something new")).toBe("The server closed this before you answered.")
+    expect(closeReason("constructor")).toBe("The server closed this before you answered.")
+    expect(closeReason("toString")).toBe("The server closed this before you answered.")
     expect(closeReason(null)).toBe(null)
     expect(closeReason(undefined)).toBe(null)
     expect(closeReason("")).toBe(null)

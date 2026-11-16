@@ -94,5 +94,5 @@ const CLOSED: Record<string, string> = {
  *  sentence of its own, never the server's bare word. */
 export function closeReason(reason: string | null | undefined): string | null {
   if (!reason) return null
-  return t(CLOSED[reason] ?? msg("The server closed this before you answered."))
+  return t(Object.prototype.hasOwnProperty.call(CLOSED, reason) ? CLOSED[reason] : msg("The server closed this before you answered."))      // own keys only: "constructor" is no reason
 }

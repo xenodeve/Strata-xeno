@@ -276,13 +276,13 @@ export function Chat({ id }: { id?: string }) {
       else void chat.compact(ctx(), asked.focus)
       return
     }
-    if (blocking) { toast("warn", t("Your PC cannot be reached"), stop!.full, 8000); return }            // #310 part 2: never a silent tool-less answer; the prompt stays in the composer
+    if (chat.refuses(ctx())) return                                                                   // #310 part 2: never a silent tool-less answer; the prompt stays in the composer
     const typed = !files.length && isInitCommand(text) ? INIT_PROMPT : text, f = files                                    // "/init": the prompt that has the model write the project's CLAUDE.md
     const folders = chat.folders()
     const go = async () => {
       const found = coding.allowed ? await resolveMentions(folders, typed, onRunner) : []                                    // the files the prompt mentions with @ go with it
       const all = [...f, ...found.filter((x) => !f.some((y) => y.name === x.name))]
-      const context = { health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: folders, ...(onRunner ? { runner: onRunner } : {}) }
+      const context = { health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: folders, ...(onRunner ? { runner: onRunner } : {}), ...(stop ? { blocked: stop.full } : {}) }
       if (!busy) void chat.send(typed, all, context)
       else void chat.steer(typed, all, context).then((taken) => { if (!taken && !chat.queue(typed, all, context)) void chat.send(typed, all, context) })        // an agent is working: it reads this at its next step; else it waits in line and goes when the answer ends
     }
@@ -292,7 +292,7 @@ export function Chat({ id }: { id?: string }) {
     setAway(false)
     void go()
   }
-  const ctx = () => ({ health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: chat.folders(), ...(onRunner ? { runner: onRunner } : {}) })
+  const ctx = () => ({ health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: chat.folders(), ...(onRunner ? { runner: onRunner } : {}), ...(stop ? { blocked: stop.full } : {}) })
   const project = chat.index.projects.find((p) => p.id === chat.currentProject())       // the open conversation's project (or the one a new conversation was started in): its folders are where the coding tools work
   const chatKey = chat.index.active ?? "new"
   const editPrompt = (i: number, t: string) => { pinned.current = true; setAway(false); void chat.edit(i, t, ctx()) }

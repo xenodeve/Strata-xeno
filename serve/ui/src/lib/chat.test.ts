@@ -2269,6 +2269,31 @@ describe("#310 part 2: the runner in the chat", () => {
     expect(call.steps!.map((s) => [s.id, s.machine, s.remote])).toEqual([["s1", "my", "running"], ["s2", "my", "offline"]])
   })
 
+  test("a My PC chat that cannot reach its PC (ctx.blocked): send and edit refuse before anything is cut or sent, and say why", async () => {
+    keep()
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(...finish)], seen)
+    const c = new ChatController()
+    const said: string[] = []
+    c.onError = (title, text) => { said.push(`${title}: ${text}`) }
+    await c.send("one", [], { ...ctx, agent: ON, folder: ["C:/w"], runner: RID })             // a prompt that went out while the runner was known
+    expect(seen.length).toBe(1)
+    const before = c.messages.length
+    const blocked = { ...ctx, agent: { ...ON, allowed: false }, folder: ["C:/w"], blocked: "This project is on My PC, and this browser has no runner." }
+    expect(await c.edit(0, "one, again", blocked)).toBe(false)
+    expect(c.messages.length).toBe(before)                                                   // not cut
+    expect(c.messages[0].text).toBe("one")
+    await c.send("two", [], blocked)
+    expect(seen.length).toBe(1)                                                              // nothing more was sent
+    expect(c.messages.length).toBe(before)
+    expect(said).toEqual(["Your PC cannot be reached: This project is on My PC, and this browser has no runner.", "Your PC cannot be reached: This project is on My PC, and this browser has no runner."])
+    c.setSettings({ ...c.settings, agent: false })                                           // the coding tools switched off: a plain chat goes
+    mockFetch([sse(...finish)], seen)
+    await c.send("three", [], blocked)
+    expect(seen.length).toBe(2)
+    expect("strata_agent" in seen[1]).toBe(false)
+  })
+
   test("a card the server closed keeps the reason: not 'you did not allow it', not 'you skipped'", async () => {
     keep()
     const questions = [{ question: "Which?", header: "Library", multiSelect: false, options: [{ label: "a", description: "x" }, { label: "b", description: "y" }] }]

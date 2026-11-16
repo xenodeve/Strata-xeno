@@ -272,7 +272,7 @@ function restore(msgs: Message[]): Message[] {
   return msgs.map((m) => (m.prefill?.state === "reading" ? { ...m, prefill: { ...m.prefill, state: "done" as const, rate: null } } : m))
 }
 
-export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | string[] | null; runner?: string }      // skills: the names of the skills in use, for "/name"; runner (#310 part 2): the chat is on the engineer's own PC, through this runner
+export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | string[] | null; runner?: string; blocked?: string }      // skills: the names of the skills in use, for "/name"; runner (#310 part 2): the chat is on the engineer's own PC, through this runner
 
 /** An answer that is being written (or a conversation that is being summarised) for one conversation. Several can run at once, each for its own conversation: the page shows one,
  *  and the others go on in the background (the server takes their requests one after the other). `messages` is the live list of that conversation. */
@@ -727,9 +727,19 @@ export class ChatController {
   /** Rewrites the prompt at `index`: it and everything after it are replaced by the new prompt (with its own attachments
    *  that are still held) and a new answer. False when it cannot be done: an answer is being written, the message is not a
    *  prompt, or nothing would be sent. */
+  /** #310 part 2: a chat on My PC that cannot reach it (no runner id, or one the server does not know: `ctx.blocked`, its words) is refused while
+   *  the coding tools are on - before anything is changed or sent - and says why. Every way a prompt goes out (send, edit, a queued one) passes
+   *  here, so no prompt silently goes without its tools. True when refused. */
+  refuses(ctx: SendContext): boolean {
+    if (!ctx.blocked || this.settings.agent === false) return false
+    this.onError(t("Your PC cannot be reached"), ctx.blocked)
+    return true
+  }
+
   async edit(index: number, text: string, ctx: SendContext): Promise<boolean> {
     const m = this.messages[index]
     if (this.busy || !m || !isPrompt(m)) return false
+    if (this.refuses(ctx)) return false                     // before the conversation is cut
     const { kept, lost } = attachmentsOf(m)
     if (!text.trim() && !kept.length) return false
     this.messages = this.messages.slice(0, index)
@@ -742,6 +752,7 @@ export class ChatController {
   async send(text: string, attachments: Attachment[], ctx: SendContext) {
     text = text.trim()
     if ((!text && !attachments.length) || this.busy) return
+    if (this.refuses(ctx)) return
     const compactFirst = this.shouldAutoCompact(ctx, text, attachments)       // measured on the conversation so far, before this prompt is part of it
     const before = compactFirst ? this.contextUsed() : 0
     this.messages.push({
