@@ -58,7 +58,7 @@ def _text(v, most: int) -> str | None:
 
 
 def _code(v) -> str:
-    s = "".join(c for c in str(v) if c.isascii() and (c.isalnum() or c == "-"))[:CODE_MOST]
+    s = "".join(c for c in str(v) if c.isascii() and (c.isalnum() or c == "-"))[:CODE_MOST] if v is not None else ""
     return s or "----"
 
 
@@ -135,8 +135,11 @@ def test_server(url: str, token: str, device: dict, label: str, timeout: float =
             return result
         if code == 503:
             result.engine_running = False
-        elif code == 200:
+        elif code == 200 and isinstance(body, dict):
             result.model = _text(body.get("model_alias"), MODEL_MOST) or result.model
+        elif code == 200:                        # not a JSON object (or cut at BODY_MOST): no Strata /props answer
+            result.error = words.t("not_strata")
+            return result
         else:
             result.error = words.t("server_answered", code=code)
             return result
@@ -146,3 +149,6 @@ def test_server(url: str, token: str, device: dict, label: str, timeout: float =
     except _Failed as f:
         result.error = words.t(f.key)
     return result
+
+
+test_server.__test__ = False                     # a "test_" name pytest must not collect where it is imported

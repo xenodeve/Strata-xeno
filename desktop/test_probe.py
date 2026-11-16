@@ -143,6 +143,25 @@ def test_pending_code_is_bounded():
     assert isinstance(r.pending_code, str) and len(r.pending_code) <= 16
 
 
+def test_props_200_not_an_object():
+    # a /props 200 that is not a JSON object (no JSON, a list, or a body cut at BODY_MOST) is words, not a traceback
+    for props in ((200, b"<html>proxy page</html>"), (200, [1, 2]), (200, b'{"model_alias": "cut')):
+        r, s = run({"/health": HEALTH_OK, "/props": props, "/keys": KEYS_OK})
+        assert (r.reachable, r.role, r.error) == (True, None, words.t("not_strata")), props
+        assert "/keys" not in s.paths()
+
+
+def test_pending_without_code():
+    r, _ = run({"/health": HEALTH_OK, "/props": (403, {"error": {"type": "device_pending"}})})
+    assert r.pending_code == "----"
+    r, _ = run({"/health": HEALTH_OK, "/props": (403, {"error": {"type": "device_pending", "code": None}})})
+    assert r.pending_code == "----"
+
+
+def test_test_server_is_not_collected():
+    assert probe.test_server.__test__ is False
+
+
 def test_engine_down_still_reports_role():
     r, s = run({"/health": (503, {"status": "engine_exited", "model": "m"}),
                 "/props": (503, {"error": {"message": "the engine is not running"}}), "/keys": KEYS_OK})
