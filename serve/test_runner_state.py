@@ -6,7 +6,9 @@
 """
 from __future__ import annotations
 
+import shutil
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -112,6 +114,18 @@ class States(unittest.TestCase):
         self.assertEqual(seen[-1], ("refused", {"kind": "device_refused", "message": "no ***"}))
         self.assertEqual(sum("K7QZ" in s for s in self.said), 1, self.said)
 
+    def test_offline_after_a_hello_that_ended_a_failure_run(self):
+        """hello fails, hello works ("online"), then the poll fails: "offline" again, though the run of failures did
+        not end (no poll worked), and the line is printed once."""
+        seen = []
+        hellos = [runner_mod.NetworkError("down"), ONLINE]
+        code = self.run_loop(hellos, [runner_mod.NetworkError("down again"), runner_mod.Refused("key", "")],
+                             on_state=lambda ev, data: seen.append((ev, data)))
+        self.assertEqual(code, runner_mod.EXIT_REFUSED)
+        self.assertEqual([ev for ev, _ in seen], ["offline", "online", "offline", "refused"])
+        self.assertEqual(seen[2], ("offline", {"message": "down again"}))
+        self.assertEqual(sum("cannot be reached" in s for s in self.said), 1, self.said)
+
     def test_stop_reports_stopped(self):
         seen = []
         code = self.run_loop([ONLINE], [[]], on_state=lambda ev, data: seen.append((ev, data)))
@@ -149,10 +163,40 @@ class States(unittest.TestCase):
         self.assertEqual(self.said, before)
 
 
-class HeldPoll:
-    """A socket server on 127.0.0.1:0 that reads a request and never answers: a held GET /runner/next."""
+def self_signed() -> tuple[str, str]:
+    """A certificate and key for 127.0.0.1 in a temp folder (needs `cryptography`; skipped without it)."""
+    import datetime
+    import tempfile
+    import ipaddress
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        raise unittest.SkipTest("the https test needs the cryptography package")
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(minutes=5))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(key, hashes.SHA256()))
+    d = Path(tempfile.mkdtemp())
+    (d / "cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    (d / "key.pem").write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                  serialization.NoEncryption()))
+    return str(d / "cert.pem"), str(d / "key.pem")
 
-    def __init__(self):
+
+class HeldPoll:
+    """A socket server on 127.0.0.1:0 that reads a request and never answers: a held GET /runner/next.  `tls`: a
+    server-side ssl context (https)."""
+
+    def __init__(self, tls=None):
+        self.tls = tls
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen()
@@ -165,6 +209,8 @@ class HeldPoll:
         while True:
             try:
                 c, _ = self.sock.accept()
+                if self.tls is not None:
+                    c = self.tls.wrap_socket(c, server_side=True)
                 self.conns.append(c)
                 if c.recv(65536):
                     self.got.set()
@@ -212,6 +258,30 @@ class AbortPoll(unittest.TestCase):
         with mock.patch.object(runner_mod.Client, "_request", return_value=(200, {"ok": True})) as req:
             self.client.reply("r1", "inst-aaaa", {"job": "j", "rid": 1, "result": {}})
         self.assertEqual(req.call_count, 1)
+
+    def test_abort_ends_a_held_https_poll(self):
+        """The same over https (an SSLSocket, whose shutdown and detach are its own): a self-signed certificate for
+        127.0.0.1, trusted by the client's context for this test only."""
+        cert, key = self_signed()
+        self.addCleanup(shutil.rmtree, str(Path(cert).parent), True)
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(cert, key)
+        srv = HeldPoll(tls=server_ctx)
+        self.addCleanup(srv.close)
+        client_ctx = ssl.create_default_context(cafile=cert)
+        with mock.patch.object(runner_mod.ssl, "create_default_context", lambda: client_ctx):
+            client = runner_mod.Client(f"https://127.0.0.1:{srv.port}", KEY, DEV)
+            got = []
+            t = threading.Thread(target=lambda: got.append(client.next("r1", "inst-aaaa", 25.0)), daemon=True)
+            t.start()
+            self.assertTrue(srv.got.wait(5))                    # the request arrived over TLS and is held
+            time.sleep(0.2)
+            t0 = time.monotonic()
+            client.abort_poll()
+            t.join(3)
+        self.assertFalse(t.is_alive())
+        self.assertLess(time.monotonic() - t0, 1)
+        self.assertEqual(got, [[]])
 
     def test_abort_while_connecting(self):
         """An abort that lands after the poll was registered but before its socket connected: the poll still ends."""

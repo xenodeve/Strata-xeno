@@ -716,9 +716,10 @@ class RunnerLoop:
                 return EXIT_REFUSED
             except NetworkError as e:
                 delay = min(RETRY_MAX_S, 2.0 ** failures)
+                message = self.client.scrub(str(e))
                 if failures == 0:
-                    message = self.client.scrub(str(e))
                     _say(f"[runner] the server cannot be reached ({message}); trying again")
+                if failures == 0 or said_hello:         # a hello in this round said "online" while failures went on
                     self._state("offline", {"message": message})
                 failures += 1
                 self.stop.wait(delay)
