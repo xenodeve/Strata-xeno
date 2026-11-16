@@ -234,7 +234,8 @@ class Client:
     def abort_poll(self) -> None:
         """End the poll in flight now, and every later poll at once, each as an empty poll (Strata Desktop's stop, #310
         part 3: its thread must not wait out a poll the server holds for up to POLL_MAX_S).  Replies are left alone,
-        so cancelled jobs still send their results.  `python -m serve.runner` never calls it."""
+        so cancelled jobs still send their results.  The loop then ends as on stop (`polls_ended`); the caller sets
+        stop first.  `python -m serve.runner` never calls it."""
         with self._poll_lock:
             self._polls_ended = True
             conn = self._poll_conn
@@ -249,6 +250,11 @@ class Client:
             socket.close(sock.detach())                         # wait for the response's file to let go of it, so
         except OSError:                                         # the handle is taken from the object and closed:
             pass                                                # the read fails at once (WinError 10038)
+
+    @property
+    def polls_ended(self) -> bool:
+        """abort_poll was called: RunnerLoop.run ends (it would otherwise go round with nothing to wait on)."""
+        return self._polls_ended
 
     def _track_poll(self, conn: http.client.HTTPConnection) -> None:
         """Register the poll's connection, connect it, and check once more: an abort_poll that came in between (when
@@ -678,7 +684,7 @@ class RunnerLoop:
     def run(self) -> int:
         """Until `stop`: 0; EXIT_REFUSED when the server refuses this runner."""
         failures, gones, pending = 0, 0, None
-        while not self.stop.is_set():
+        while not self.stop.is_set() and not getattr(self.client, "polls_ended", False):    # abort_poll: no spin
             said_hello = False
             try:
                 if not self.connected.is_set() or self._groups_changed():
@@ -739,9 +745,10 @@ class RunnerLoop:
         for link in links:
             link.cancel.set()
 
-    def finish(self, timeout: float) -> None:
+    def finish(self, timeout: float) -> bool:
         """The runner stops: every job is cancelled (a command's process tree is ended), and its thread gets up to
-        `timeout` seconds to end before the executor closes - so nothing started here keeps running on the PC."""
+        `timeout` seconds to end before the executor closes - so nothing started here keeps running on the PC.
+        True when every job thread ended (`main` does not need the answer; Strata Desktop's stop reports it)."""
         self.stop.set()
         self._end()
         end = time.monotonic() + timeout
@@ -749,6 +756,8 @@ class RunnerLoop:
             threads = list(self._threads)
         for t in threads:
             t.join(max(0.0, end - time.monotonic()))
+        with self._lock:
+            return not any(t.is_alive() for t in self._threads)
 
     def _dispatch(self, msgs: list[dict]) -> None:
         """Hand the poll's messages out: a job starts, an answer reaches its job's link, a cancel sets it.  A seq

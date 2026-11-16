@@ -100,6 +100,31 @@ class FakeExecutor:
         self.closed += 1
 
 
+class SlowJobExecutor(FakeExecutor):
+    """A job that goes on 0.3 s after its cancel; `close` records which job threads were still alive."""
+
+    def __init__(self):
+        super().__init__()
+        self.handled = threading.Event()
+        self.in_handle = False
+        self.closed_during_handle = False
+        self.jobs_at_close: list[str] | None = None
+
+    def handle(self, msg, link):
+        self.in_handle = True
+        self.handling.set()
+        link.cancel.wait(30)
+        time.sleep(0.3)                                         # ignores the cancel for a while
+        self.in_handle = False
+        self.handled.set()
+        return runner_mod._err("cancelled")
+
+    def close(self):
+        self.closed_during_handle = self.closed_during_handle or self.in_handle
+        self.jobs_at_close = [t.name for t in threading.enumerate() if t.name == "runner-job" and t.is_alive()]
+        super().close()
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -218,6 +243,53 @@ class Stop(Base):
         self.assertEqual(len(h.events), n)                      # no event after stop returned
         self.assertNotIn("stopped", self.kinds(h))
         self.assertFalse(any("cannot be reached" in s for s in self.said), self.said)
+
+    def test_close_waits_for_a_job_that_ignores_cancel(self):
+        """A job that goes on 0.3 s after its cancel: the executor closes only after it ended (finish, then close)."""
+        self.server()
+        ex = SlowJobExecutor()
+        h = self.host(factory=lambda: ex)
+        h.start()
+        self.assertTrue(wait_for(lambda: "online" in self.kinds(h), 10), (h.events, self.said))
+        h._loop._dispatch([{"job": "j1", "kind": "tool", "group": "agent", "tool": "Bash", "arguments": {}}])
+        self.assertTrue(ex.handling.wait(5))
+        time.sleep(0.3)                                         # the poll is held by the server now
+        self.assertTrue(h.stop(5.0))
+        self.assertTrue(ex.handled.is_set())
+        self.assertEqual(ex.closed, 1)
+        self.assertEqual(ex.jobs_at_close, [])                  # no job thread was alive when the executor closed
+        self.assertFalse(ex.closed_during_handle)
+
+    def test_job_of_a_poll_answered_just_before_abort_is_waited_for(self):
+        """A poll that brought a job just as stop cut the polls: that job is handed out after stop began, and stop
+        still waits for its thread before the executor closes."""
+        self.server()
+        ex = SlowJobExecutor()
+        h = self.host(factory=lambda: ex)
+        real_next, started = runner_mod.Client.next, []
+
+        def next_(client, rid, instance, wait):
+            if not started:                                     # the first poll: answered as the abort comes
+                started.append(rid)
+                while not client.polls_ended:
+                    time.sleep(0.01)
+                return [{"job": "j-late", "kind": "tool", "group": "agent", "tool": "Bash", "arguments": {}}]
+            return real_next(client, rid, instance, wait)
+        real_start, handed_out = runner_mod.RunnerLoop._start, []
+
+        def start_(loop, msg):
+            handed_out.append(msg["job"])
+            real_start(loop, msg)
+        with mock.patch.object(runner_mod.Client, "next", next_), \
+                mock.patch.object(runner_mod.RunnerLoop, "_start", start_):
+            h.start()
+            self.assertTrue(wait_for(lambda: started, 10), (h.events, self.said))
+            self.assertTrue(h.stop(5.0))
+        self.assertEqual(handed_out, ["j-late"])
+        self.assertEqual(ex.closed, 1)
+        self.assertEqual(ex.jobs_at_close, [])
+        self.assertFalse(ex.closed_during_handle)
+        self.assertEqual(runner_threads(), [])
 
     def test_stop_while_executor_still_building(self):
         """RF 3: the executor is still being built when stop comes: it is closed once the build ends, and no loop

@@ -11,12 +11,12 @@ it.  A build that fails (a SystemExit for a bad runner.json, or any exception) i
 ends.  When the server refuses the runner, the thread lets its jobs end and closes the executor, as
 `python -m serve.runner` does.
 
-`stop`: sets the stop event, cuts the poll the server holds (`Client.abort_poll`), lets the jobs end
-(`RunnerLoop.finish`: cancelled, their process trees ended by #314's job objects), joins the thread, then closes the
-executor (background commands and MCP servers end) - all within one deadline.  The executor is closed exactly once,
-by whichever of `stop` and the thread comes last to it; a stop that comes while the executor is still being built
-leaves the closing to the thread, once the build ends.  No event is delivered once `stop` has begun, so a late event
-of an old host never overwrites the state of the next one.
+`stop`: sets the stop event, cuts the poll the server holds (`Client.abort_poll`), joins the thread (so a job a
+last poll brought is already handed out), lets every job end (`RunnerLoop.finish`: cancelled, their process trees
+ended by #314's job objects), then closes the executor (background commands and MCP servers end) - all within one
+deadline.  The executor is closed exactly once: by `stop`, or by the thread when the runner ended without a stop (a
+refusal, an error) or when a stop came while the executor was still being built (once the build ends).  No event is
+delivered once `stop` has begun, so a late event of an old host never overwrites the state of the next one.
 
 This class never prints (serve.runner's `_say` lines go where Task 4 routes them) and holds the token only inside
 serve.runner.Client; its repr shows the server's address only.
@@ -119,9 +119,10 @@ class RunnerHost:
         except Exception as e:  # noqa: BLE001 - e.g. a bad address: words for the tray, never a traceback
             self._emit("error", {"message": self._scrub(f"{type(e).__name__}: {e}")})
         finally:
-            if loop is not None and not self._stop.is_set():
-                loop.finish(FINISH_S)                   # refused: the jobs end before the executor closes
-            self._close_executor()
+            if not self._stop.is_set():                 # refused, or an error: the jobs end, then the executor closes
+                if loop is not None:                    # (on stop, `stop` does both, in that order, after this
+                    loop.finish(FINISH_S)               # thread ended: no job dispatched late is missed)
+                self._close_executor()
 
     def _close_executor(self) -> None:
         with self._lock:
@@ -137,29 +138,28 @@ class RunnerHost:
     # -------------------------------------------------------------------------------------------- stop
     def stop(self, timeout: float = 5.0) -> bool:
         """Stop the runner: its poll, its jobs (and their processes), its thread and its executor, within `timeout`
-        seconds.  True when the thread and every job thread ended.  Safe before start, during the build, and twice."""
+        seconds.  True when the thread and every job thread ended.  Safe before start, during the build, and twice.
+
+        Order: cut the poll; join this host's thread (it ends within milliseconds once its poll is cut, after it
+        handed out whatever that poll had just brought); then `finish` - every job is cancelled and joined, a late one
+        too; then close the executor.  So no job runs on a closed executor, as in `python -m serve.runner`."""
         end = time.monotonic() + timeout
-        got = self._emit_lock.acquire(timeout=max(0.0, timeout))      # an event being delivered ends first (bounded:
-        self._stopping = True                                          # a callback that blocks cannot hold stop)
+        got = self._emit_lock.acquire(timeout=min(1.0, max(0.0, timeout) / 4))     # an event being delivered ends
+        self._stopping = True                                   # first; a callback that blocks gets a small share only
         if got:
             self._emit_lock.release()
         self._stop.set()
         with self._lock:
-            client, loop = self._client, self._loop
+            client = self._client
         if client is not None:
             client.abort_poll()
-        if loop is not None:
-            loop.finish(max(0.0, end - time.monotonic()))
         t = self._thread
         if t is not None and t is not threading.current_thread():
             t.join(max(0.0, end - time.monotonic()))
         with self._lock:
+            loop = self._loop                                   # read after the join: a loop made meanwhile is seen
             building = self._executor is None and t is not None and t.is_alive()
-        if not building:                                # else the thread closes it once the build ends
+        jobs_ended = loop.finish(max(0.0, end - time.monotonic())) if loop is not None else True
+        if not building:                                        # else the thread closes it once the build ends
             self._close_executor()
-        thread_ended = t is None or not t.is_alive()
-        if loop is None:
-            return thread_ended
-        with loop._lock:
-            jobs = list(loop._threads)
-        return thread_ended and not any(j.is_alive() for j in jobs)
+        return (t is None or not t.is_alive()) and jobs_ended

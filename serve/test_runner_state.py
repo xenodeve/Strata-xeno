@@ -283,6 +283,30 @@ class AbortPoll(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 1)
         self.assertEqual(got, [[]])
 
+    def test_abort_without_stop_ends_the_loop(self):
+        """abort_poll with the stop event not set: the loop ends (returns 0) instead of going round on empty polls."""
+        calls = []
+        real_next = self.client.next
+
+        def next_(rid, instance, wait):
+            calls.append(rid)
+            return real_next(rid, instance, wait)
+        self.client.hello = lambda info: dict(ONLINE)
+        self.client.next = next_
+        stop = threading.Event()
+        loop = runner_mod.RunnerLoop(self.client, FakeExecutor(), stop=stop)
+        codes = []
+        with mock.patch.object(runner_mod, "_say", lambda s: None):
+            t = threading.Thread(target=lambda: codes.append(loop.run()), daemon=True)
+            t.start()
+            self.assertTrue(self.srv.got.wait(5))
+            self.client.abort_poll()
+            t.join(2)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(codes, [0])
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(stop.is_set())
+
     def test_abort_while_connecting(self):
         """An abort that lands after the poll was registered but before its socket connected: the poll still ends."""
         real = runner_mod.http.client.HTTPConnection.connect
