@@ -53,10 +53,13 @@ RETRY_MAX_S = 30.0              # the longest wait between tries after a network
 PENDING_RETRY_S = 10.0          # how often a runner whose device waits for the owner's approval says hello again
 MAX_JOBS = 16                   # jobs run at once; the others wait their turn
 RUNS_KEPT = 50                  # run keys (one per message of a chat) whose policy and checkpoint are kept
+REPLY_MAX = 32 << 20            # the largest reply the server takes (serve/server.py RUNNER_REPLY_MAX): a larger one is
+                                # not sent (a 413 from the server may come as a reset while it is still being sent)
 REPLY_RETRY_S = 60.0            # how long a reply is tried again after network errors before it is given up
 STARTING_POLL_S = 1.0           # the poll's wait while an MCP server still starts, so its tools are announced soon
 CODING = "agent"                # the coding group's name on the runner (the server calls it my_agent)
 DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
+KEY = re.compile(r"[!-~]{1,4096}")              # printable ASCII, no whitespace: what a header can carry
 EXIT_REFUSED = 3
 
 
@@ -174,9 +177,9 @@ class Refused(Exception):
     """The server will not have this runner: `kind` is "key" (401: a wrong or revoked key), "device_refused",
     "runner_replaced", "runner_protocol" or "refused" (another answer that trying again does not change)."""
 
-    def __init__(self, kind: str, message: str):
+    def __init__(self, kind: str, message: str, status: int = 0):
         super().__init__(message)
-        self.kind, self.message = kind, message
+        self.kind, self.message, self.status = kind, message, status
 
 
 class Pending(Exception):
@@ -218,22 +221,29 @@ class Client:
         self.ack = 0
         self.handled: set[int] = set()
 
-    def _request(self, method: str, path: str, body: dict | None = None, timeout: float = 60.0) -> tuple[int, object]:
+    def _request(self, method: str, path: str, body: dict | None = None, timeout: float = 60.0,
+                 most: int | None = None) -> tuple[int, object]:
+        """(status, JSON body).  A body over `most` bytes is not sent: it is answered 413 here, as the server would."""
+        data = None
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            if most is not None and len(data) > most:
+                return 413, {"error": {"message": f"send a body of up to {most >> 20} MB"}}
         if self._https:
             conn = http.client.HTTPSConnection(self._host, self._port, timeout=timeout, context=ssl.create_default_context())
         else:
             conn = http.client.HTTPConnection(self._host, self._port, timeout=timeout)
         headers = dict(self._headers)
-        data = None
-        if body is not None:
-            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        if data is not None:
             headers["Content-Type"] = "application/json"
         try:
             conn.request(method, self._prefix + path, body=data, headers=headers)
             r = conn.getresponse()
             raw = r.read()
         except (OSError, http.client.HTTPException) as e:
-            raise NetworkError(f"{type(e).__name__}: {e}") from None
+            raise NetworkError(self.scrub(f"{type(e).__name__}: {e}")) from None
+        except ValueError as e:                         # e.g. a header value http.client refuses: its text holds the
+            raise NetworkError(f"{type(e).__name__} while sending the request") from None     # value, so not shown
         finally:
             conn.close()
         try:
@@ -259,9 +269,14 @@ class Client:
             raise Refused(kind, message)
         if code == 404:
             raise Gone(message)
-        if code >= 500:
+        if code >= 500 or code in (408, 429):           # 408 / 429 (a proxy's timeout, a rate limit): try again
             raise NetworkError(f"the server answered {code}: {message}")
-        raise Refused("refused", f"the server answered {code}: {message}")
+        raise Refused("refused", f"the server answered {code}: {message}", code)
+
+    def scrub(self, text: str) -> str:
+        """`text` with the key blanked out, for anything the runner prints."""
+        key = self._headers["Authorization"][7:]
+        return text.replace(key, "***") if key else text
 
     def on_hello(self, body: dict) -> bool:
         """A hello's answer: another channel than before starts the ack and the handled seqs again.  True then."""
@@ -288,7 +303,7 @@ class Client:
 
     def reply(self, rid: str, instance: str, msg: dict) -> None:
         """POST /runner/reply {"id", "instance", **msg} (msg has "job" and "rid")."""
-        code, body = self._request("POST", "/runner/reply", {"id": rid, "instance": instance, **msg})
+        code, body = self._request("POST", "/runner/reply", {"id": rid, "instance": instance, **msg}, most=REPLY_MAX)
         self._check(code, body)
 
 
@@ -352,6 +367,19 @@ class JobLink:
 
 def _err(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": True}
+
+
+def _unsent(result, status: int):
+    """What is sent instead of a job's result the server refused (413: over its size limit; 400), in the result's own
+    shape, so the call on the server ends with text instead of waiting."""
+    why = ("the result was too large to send to the server" if status == 413
+           else f"the server refused the result ({status or 'refused'})")
+    text = f"{why}; nothing of it reached the model. Try a smaller request (a part of the file, fewer lines)."
+    if isinstance(result, dict) and "content" in result:
+        return _err(text)
+    if isinstance(result, dict) and "status" in result:
+        return {"status": 400, "body": {"error": {"message": text}}}
+    return {"error": "failed", "message": text}
 
 
 def _rules(v) -> list[str]:
@@ -495,7 +523,8 @@ class Executor:
             if helper:                                  # a helper: its own mode, and nobody to answer it questions
                 policy = copy.copy(policy)
                 policy.mode = msg.get("mode") if msg.get("mode") in ("auto", "plan") else None
-                policy.allow, policy.deny = list(policy.allow), list(policy.deny)
+                # allow / deny stay the run's lists: "allow for this chat" holds for the helper's next calls too,
+                # as on the server (serve/subagent.py)
                 policy.dirs, policy.protected = list(policy.dirs), list(policy.protected)
                 question = lambda qs: {"answers": None}          # noqa: E731
             ctx = agent_mod.AgentContext(policy=policy, session=_session(msg.get("session")), ask=link.ask,
@@ -612,8 +641,14 @@ class RunnerLoop:
             except NetworkError as e:
                 delay = min(RETRY_MAX_S, 2.0 ** failures)
                 if failures == 0:
-                    _say(f"[runner] the server cannot be reached ({e}); trying again")
+                    _say(f"[runner] the server cannot be reached ({self.client.scrub(str(e))}); trying again")
                 failures += 1
+                self.stop.wait(delay)
+            except Exception as e:  # noqa: BLE001 - a bug here must not end the runner silently, nor print the key
+                delay = min(RETRY_MAX_S, 2.0 ** failures)
+                _say(f"[runner] an unexpected {type(e).__name__} in the poll thread; trying again in {delay:g} s")
+                failures += 1
+                self.connected.clear()
                 self.stop.wait(delay)
         self._end()
         return 0
@@ -701,17 +736,25 @@ class RunnerLoop:
 
     def _post(self, msg: dict) -> bool:
         """POST a reply; network errors are tried again (the same rid: the server applies it once) for up to
-        REPLY_RETRY_S.  A refusal ends it (the poll thread handles it), and so does 404 - the job finished on the
+        REPLY_RETRY_S.  A result the server refuses (413, 400) is replaced once by a short error in its own shape
+        (`_unsent`), so the call there ends with text.  Any other refusal ends it (the poll thread handles it), and so does 404 - the job finished on the
         server - unless the runner's id changed meanwhile (a key rename: the job goes on under the new id), when the
         reply is sent again under the new one once the poll thread said hello (its next poll meets the 404: within a
         poll's wait).  True when the server took it."""
         end, delay = time.monotonic() + REPLY_RETRY_S, 0.5
+        fell_back = False
         while True:
             used = self.id
             try:
                 self.client.reply(used or "", self.instance, msg)
                 return True
-            except (Refused, Pending):
+            except Refused as e:
+                if e.kind == "refused" and "result" in msg and not fell_back:
+                    fell_back = True                    # the server took nothing, so the same rid is free
+                    msg = {"job": msg["job"], "rid": msg["rid"], "result": _unsent(msg["result"], e.status)}
+                    continue
+                return False
+            except Pending:
                 return False
             except Gone:
                 wait_end = time.monotonic() + self.poll_s + 5
@@ -735,10 +778,13 @@ def main(argv: list[str] | None = None, stop: threading.Event | None = None) -> 
     ap.add_argument("--device-id", help="this PC's device id (default: the one made once in device.json)")
     ap.add_argument("--config", help="the runner's run config (default: runner.json in the runner's folder)")
     a = ap.parse_args(argv)
-    key = a.key or os.environ.get("STRATA_RUNNER_KEY")
+    key = (a.key or os.environ.get("STRATA_RUNNER_KEY") or "").strip()     # a key pasted with its line end works
     os.environ.pop("STRATA_RUNNER_KEY", None)           # no command or MCP server this runner starts inherits it
     if not key:
         _say("[runner] give your key with --key or the environment variable STRATA_RUNNER_KEY")
+        return 2
+    if not KEY.fullmatch(key):                          # the key itself is never shown
+        _say("[runner] the key must be printable characters with no spaces or line breaks inside it")
         return 2
     if a.device_id is not None and not DEVICE_ID.fullmatch(a.device_id):
         _say("[runner] --device-id must be 8 to 64 of A-Z, a-z, 0-9, _ and -")
@@ -768,7 +814,7 @@ def main(argv: list[str] | None = None, stop: threading.Event | None = None) -> 
     finally:
         loop.finish(5.0)                                # its jobs end (a running command is stopped) first
         executor.close()
-    return codes[0] if codes else 0
+    return codes[0] if codes else 1                     # the poll thread ended without saying why
 
 
 if __name__ == "__main__":

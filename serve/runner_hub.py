@@ -554,6 +554,7 @@ class RunnerGroup:
                                 "timeout_s": timeout})
         end = None if self.group_kind == "coding" else time.perf_counter() + timeout + 30
         running, answered, cancelled_at = False, False, None
+        allowed = False                                 # an ask of this job was allowed on the server (the plan, for ExitPlanMode)
         exec_ms, result = -1, None
         try:
             say("sending")
@@ -578,6 +579,7 @@ class RunnerGroup:
                         card = msg["ask"]
                         ok = isinstance(card, dict) and ctx is not None
                         answer = self._card(ctx.ask, card, job, cancel) if ok else "deny"
+                        allowed = allowed or answer in ("allow", "allow_chat")
                         r.push({"job": job.id, "answer": answer, "to": msg.get("rid")})
                     elif "question" in msg:     # AskUserQuestion
                         qs = msg["question"]
@@ -586,7 +588,13 @@ class RunnerGroup:
                         r.push({"job": job.id, "answer": answer, "to": msg.get("rid")})
                     elif "emit" in msg:         # tool activity for the page (todos, a shell's output)
                         if ctx is not None and isinstance(msg["emit"], dict):
-                            ctx.emit(msg["emit"])
+                            ev = msg["emit"]
+                            if (ev.get("event") == "mode" and ev.get("mode") == "ask" and tool == "ExitPlanMode"
+                                    and self.group_kind == "coding" and allowed
+                                    and getattr(getattr(ctx, "policy", None), "mode", None) == "plan"):
+                                ctx.policy.mode = None  # the plan approved on the PC: the server's run leaves plan mode
+                                                        # too (its next jobs and helpers carry it), as ExitPlanMode does there
+                            ctx.emit(ev)
                     if result is not None:
                         break
                 now = time.perf_counter()               # a busy inbox does not put off the cancel or the presence

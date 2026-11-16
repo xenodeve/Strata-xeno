@@ -6,7 +6,9 @@ part on the engineer's own PC.  A real server (serve(svc, port=0), team mode, a 
 """
 from __future__ import annotations
 
+import contextlib
 import http.client
+import io
 import json
 import os
 import subprocess
@@ -25,7 +27,9 @@ from serve.server import serve  # noqa: E402
 from serve.test_harness import tool_call  # noqa: E402
 from serve.test_identity_http import DEV1, ROOT  # noqa: E402
 from serve.test_runner_http import DEV0, DEV3  # noqa: E402
-from serve.test_runner_routing import DONE, Fixture  # noqa: E402
+from serve import server as server_mod  # noqa: E402
+from serve.runner_fake import FakeRunner  # noqa: E402
+from serve.test_runner_routing import DONE, Fixture, coding  # noqa: E402
 
 FAKE_MCP = str(ROOT / "serve" / "mcp_fake_server.py")
 
@@ -313,6 +317,109 @@ class Connection(Base):
         self.assertEqual(got, ["allow", "cancelled"])
 
 
+class ReviewFixes(Base):
+    """Task 6 review: a key never leaks, a poll-thread bug is no exit, the plan's approval reaches the server's run, and a
+    result the server refuses still ends the call."""
+
+    def test_unexpected_error_in_a_poll_backs_off_without_the_key(self):
+        self.start_routing()
+        loop = self.runner(self.ann)
+        real, calls = loop.client.next, []
+
+        def boom(*a):
+            calls.append(time.monotonic())
+            if len(calls) <= 2:
+                raise RuntimeError(f"broken while sending Bearer {self.ann}")
+            return real(*a)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop.client.next = boom
+            self.assertTrue(wait_for(lambda: len(calls) >= 4, 15), self.said)
+        self.assertTrue(loop.thread.is_alive())                  # the runner goes on
+        self.assertEqual(loop.codes, [])
+        self.assertGreaterEqual(calls[1] - calls[0], 0.9)        # backed off: 1 s, then 2 s
+        self.assertTrue(any("unexpected RuntimeError" in s for s in self.said), self.said)
+        self.assertFalse(any(self.ann in s for s in self.said), self.said)
+        self.assertNotIn(self.ann, err.getvalue())
+        code, body = self.req("GET", f"/agent/folders?runner={loop.id}&path={self.dir}", key=self.ann, device=DEV1)
+        self.assertEqual(code, 200, body)
+
+    def test_a_header_error_never_shows_the_key(self):
+        client = runner_mod.Client("http://127.0.0.1:9", "secret-key\n", {"id": DEV1, "name": "pc"})
+        with self.assertRaises(runner_mod.NetworkError) as got:
+            client.hello({})
+        self.assertNotIn("secret-key", str(got.exception))
+
+    def jobs_of(self, loop):
+        """The tool jobs the runner receives, as they come."""
+        seen = []
+        real = loop._dispatch
+
+        def dispatch(msgs):
+            seen.extend(m for m in msgs if m.get("kind") == "tool")
+            return real(msgs)
+        loop._dispatch = dispatch
+        return seen
+
+    def plan_then_read(self, decision):
+        a = self.proj / "a.txt"
+        a.write_text("x\n", encoding="utf-8")
+        self.start_routing(tool_call("ExitPlanMode", plan="read a.txt"), tool_call("Read", file_path=str(a)), DONE)
+        loop = self.runner(self.ann)
+        seen = self.jobs_of(loop)
+
+        def answer(ev):
+            self.req("POST", "/agent/permission", {"id": ev["id"], "decision": decision}, key=self.ann, device=DEV1)
+        events = self.run_chat(self.ann, {"cwd": str(self.proj), "session": "chat-1", "mode": "plan", "runner": loop.id},
+                               answer=answer)
+        return [(m["tool"], m["mode"]) for m in seen], events
+
+    def test_approved_plan_reaches_the_servers_run(self):
+        jobs, events = self.plan_then_read("allow")
+        self.assertEqual(jobs, [("ExitPlanMode", "plan"), ("Read", None)], events)     # the next job leaves plan mode
+        self.assertTrue(any(e.get("event") == "mode" and e.get("mode") == "ask" for e in events), events)
+
+    def test_denied_plan_keeps_plan_mode(self):
+        jobs, events = self.plan_then_read("deny")
+        self.assertEqual(jobs, [("ExitPlanMode", "plan"), ("Read", "plan")], events)
+
+    def test_a_mode_emit_without_an_approval_changes_nothing(self):
+        self.start_routing(tool_call("ExitPlanMode", plan="p"), tool_call("Read", file_path="a.txt"), DONE)
+        seen = []
+
+        def on_job(msg, reply):
+            if msg.get("kind") == "run.start":
+                reply({"result": {"run": "run-x", "cwd": msg.get("cwd"), "dirs": [], "shell": None, "platform": "win32",
+                                  "git": False, "memory": [], "tools": ["Read", "ExitPlanMode"]}})
+            elif msg.get("kind") == "tool":
+                seen.append((msg["tool"], msg["mode"]))
+                if msg["tool"] == "ExitPlanMode":               # a runner that skips the card
+                    reply({"emit": {"event": "mode", "mode": "ask"}})
+                reply({"result": {"content": [{"type": "text", "text": "ok"}]}})
+        f = FakeRunner(self.port, self.ann, DEV1, [coding(["Read", "ExitPlanMode"])], on_job, machine="ann-pc")
+        self.fakes.append(f)
+        self.run_chat(self.ann, {"cwd": str(self.proj), "session": "chat-1", "mode": "plan", "runner": f.id})
+        self.assertEqual(seen, [("ExitPlanMode", "plan"), ("Read", "plan")])
+
+    def refused_result(self, patch):
+        big = self.proj / "big.txt"
+        big.write_text(("y" * 100 + "\n") * 60, encoding="utf-8")       # Read cuts a single line at 2000
+        self.start_routing(tool_call("Read", file_path=str(big)), DONE)
+        loop = self.runner(self.ann)
+        with patch:
+            t0 = time.monotonic()
+            events = self.run_chat(self.ann, {"cwd": str(self.proj), "session": "chat-1", "runner": loop.id})
+        result = next(e for e in events if e["event"] == "result")
+        self.assertIn("too large to send", result["text"])     # the call ended with text, not a silent wait
+        self.assertLess(time.monotonic() - t0, 20)
+
+    def test_a_result_the_server_refuses_ends_the_call(self):
+        self.refused_result(mock.patch.object(server_mod, "RUNNER_REPLY_MAX", 3000))     # the server's 413
+
+    def test_a_result_over_the_limit_is_not_sent(self):
+        self.refused_result(mock.patch.object(runner_mod, "REPLY_MAX", 3000))            # checked before sending
+
+
 class Hello(unittest.TestCase):
     def test_hello_meets_server_limits(self):
         groups = [{"name": "agent", "kind": "coding", "status": "ready", "error": None,
@@ -577,6 +684,26 @@ class Main(Base):
         self.assertTrue(wait_for(lambda: first.codes == [3], 2 * runner_hub.POLL_MAX_S + 3), self.said)
         self.assertTrue(any("newer runner" in s for s in self.said), self.said)
         self.assertEqual(second.codes, [])                       # the newer one goes on
+
+    def test_key_with_a_line_end_works(self):
+        self.start_routing()
+        t, codes, stop = self.main(env={"STRATA_RUNNER_KEY": self.ann + "\r\n"})
+        rid = runner_hub.runner_id("ann", DEV1)
+        self.assertTrue(wait_for(lambda: self.svc.runner_hub.get_for(rid, SimpleNamespace(name="ann"))), self.said)
+        stop.set()
+        t.join(10)
+        self.assertEqual(codes, [0])
+        self.assertFalse(any(self.ann in s for s in self.said), self.said)
+
+    def test_bad_key_exits_2_without_showing_it(self):
+        self.start_routing()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            t, codes, _ = self.main("--key", "abc\ndef-secret")
+            t.join(10)
+        self.assertEqual(codes, [2])
+        self.assertFalse(any("secret" in s for s in self.said), self.said)
+        self.assertNotIn("secret", err.getvalue())
 
     def test_no_key_is_an_error(self):
         self.start_routing()
