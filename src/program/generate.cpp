@@ -2513,7 +2513,8 @@ bool slot_checkpoints(CacheSlot& slot, bool reading) {
 
 // #321: with STRATA_TIMELINE, slot_positional's time split into the copy (to or from the K/V) and the file's read or
 // write, summed over its chunks (microseconds; reset and reported by slot_positional).
-double g_slot_copy_us = 0.0, g_slot_file_us = 0.0;
+double g_slot_copy_us = 0.0, g_slot_file_us = 0.0, g_slot_file_max_us = 0.0;   // max: the slowest chunk's file time
+int64_t g_slot_chunks = 0;
 
 bool slot_region(FILE* file, void* pointer, uint64_t bytes, bool host, bool reading,
                  std::vector<uint8_t>& buffer) {
@@ -2529,13 +2530,20 @@ bool slot_region(FILE* file, void* pointer, uint64_t bytes, bool host, bool read
             if (tl) t1 = strata::timeline::now_us();
             if (host) std::memcpy(p + offset, buffer.data(), n);
             else if (cudaMemcpy(p + offset, buffer.data(), n, cudaMemcpyHostToDevice) != cudaSuccess) return false;
-            if (tl) { g_slot_file_us += t1 - t0; g_slot_copy_us += strata::timeline::now_us() - t1; }
+            if (tl) {
+                g_slot_file_us += t1 - t0; g_slot_copy_us += strata::timeline::now_us() - t1;
+                g_slot_file_max_us = std::max(g_slot_file_max_us, t1 - t0); ++g_slot_chunks;
+            }
         } else {
             if (host) std::memcpy(buffer.data(), p + offset, n);
             else if (cudaMemcpy(buffer.data(), p + offset, n, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
             if (tl) t1 = strata::timeline::now_us();
             if (std::fwrite(buffer.data(), 1, n, file) != n) return false;
-            if (tl) { g_slot_copy_us += t1 - t0; g_slot_file_us += strata::timeline::now_us() - t1; }
+            if (tl) {
+                const double tw = strata::timeline::now_us() - t1;
+                g_slot_copy_us += t1 - t0; g_slot_file_us += tw;
+                g_slot_file_max_us = std::max(g_slot_file_max_us, tw); ++g_slot_chunks;
+            }
         }
         offset += n;
     }
@@ -2573,7 +2581,8 @@ bool slot_positional(CacheSlot& slot, strata::core::SessionState& ss, const stra
     if (cudaDeviceSynchronize() != cudaSuccess) return false;
     std::rewind(slot.file.get());
     std::vector<uint8_t> buffer(16 * 1024 * 1024);
-    g_slot_copy_us = g_slot_file_us = 0.0;
+    g_slot_copy_us = g_slot_file_us = g_slot_file_max_us = 0.0;
+    g_slot_chunks = 0;
     for (int64_t l=0;l<g.n_qsa_layers();++l)
         if (!slot_qsa(slot.file.get(),ss.qsa_states[l],g,slot.cells,reading,buffer)) return false;
     if (!slot_qsa(slot.file.get(),mtp.kv_state(),g,slot.cells,reading,buffer)) return false;
@@ -2583,6 +2592,9 @@ bool slot_positional(CacheSlot& slot, strata::core::SessionState& ss, const stra
         g_slot_file_us += strata::timeline::now_us() - t_end;
         strata::timeline::instant(reading ? "slot load kv io" : "slot save kv io", (int64_t) g_slot_copy_us,
                                   (int64_t) g_slot_file_us);
+        // the slowest 16 MiB chunk's file time (us) and the chunk count: a few long stalls or an even slowdown
+        strata::timeline::instant(reading ? "slot load kv chunks" : "slot save kv chunks", (int64_t) g_slot_file_max_us,
+                                  g_slot_chunks);
     }
     return ok;
 }

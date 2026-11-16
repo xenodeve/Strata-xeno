@@ -450,7 +450,7 @@ def switch_report(tl: Timeline) -> list[dict]:
     checkpoints, restore, then the old slot's drop: its file closed and deleted, its RAM freed); then the prompt read that follows it (up to the first decode round) and how much of that
     read the background "slot offload" writes overlapped."""
     rounds = [s.t0 for s in tl.find("decode round")]
-    instants = [e for e in tl.instants if e.name in ("slot save kv io", "slot load kv io")]
+    instants = [e for e in tl.instants if e.name in ("slot save kv io", "slot load kv io", "slot save kv chunks")]
     offloads = tl.find("slot offload")   # by name: before the #321 fix a pooled writer's lane kept another job's name
     out = []
     for sw in tl.find("slot switch"):
@@ -466,13 +466,17 @@ def switch_report(tl: Timeline) -> list[dict]:
                 r[kids[s.name]] += s.dur
         r["other_ms"] = sw.dur - r["save_ms"] - r["park_wait_ms"] - r["load_ms"]
         # the K/V's copy and file time, summed by the engine over its chunks (a, b in microseconds)
-        for k in ("save_copy_ms", "save_file_ms", "load_copy_ms", "load_file_ms"):
+        for k in ("save_copy_ms", "save_file_ms", "load_copy_ms", "load_file_ms", "save_chunk_max_ms"):
             r[k] = 0.0
+        r["save_chunks"] = 0
         for e in instants:
             if sw.t0 - EPS <= e.t0 <= sw.t1 + EPS and e.lane == sw.lane:
                 if e.name == "slot save kv io":
                     r["save_copy_ms"] += e.a / 1000.0
                     r["save_file_ms"] += e.b / 1000.0
+                elif e.name == "slot save kv chunks":   # the slowest chunk's write (us) and the chunk count
+                    r["save_chunk_max_ms"] = max(r["save_chunk_max_ms"], e.a / 1000.0)
+                    r["save_chunks"] += e.b
                 elif e.name == "slot load kv io":
                     r["load_copy_ms"] += e.a / 1000.0
                     r["load_file_ms"] += e.b / 1000.0
