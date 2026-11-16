@@ -227,10 +227,45 @@ class Client:
         self.channel: str | None = None
         self.ack = 0
         self.handled: set[int] = set()
+        self._poll_lock = threading.Lock()
+        self._poll_conn: http.client.HTTPConnection | None = None      # the GET /runner/next in flight
+        self._polls_ended = False
+
+    def abort_poll(self) -> None:
+        """End the poll in flight now, and every later poll at once, each as an empty poll (Strata Desktop's stop, #310
+        part 3: its thread must not wait out a poll the server holds for up to POLL_MAX_S).  Replies are left alone,
+        so cancelled jobs still send their results.  `python -m serve.runner` never calls it."""
+        with self._poll_lock:
+            self._polls_ended = True
+            conn = self._poll_conn
+        sock = getattr(conn, "sock", None)
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)                     # enough elsewhere; on Windows a blocked read stays...
+        except OSError:
+            pass
+        try:                                                    # ...until its handle is closed.  sock.close() would
+            socket.close(sock.detach())                         # wait for the response's file to let go of it, so
+        except OSError:                                         # the handle is taken from the object and closed:
+            pass                                                # the read fails at once (WinError 10038)
+
+    def _track_poll(self, conn: http.client.HTTPConnection) -> None:
+        """Register the poll's connection, connect it, and check once more: an abort_poll that came in between (when
+        the socket did not exist yet to be shut down) ends the poll here.  NetworkError when the polls ended."""
+        with self._poll_lock:
+            if self._polls_ended:
+                raise NetworkError("the runner stopped")
+            self._poll_conn = conn
+        conn.connect()
+        with self._poll_lock:
+            if self._polls_ended:
+                raise NetworkError("the runner stopped")
 
     def _request(self, method: str, path: str, body: dict | None = None, timeout: float = 60.0,
-                 most: int | None = None) -> tuple[int, object]:
-        """(status, JSON body).  A body over `most` bytes is not sent: it is answered 413 here, as the server would."""
+                 most: int | None = None, poll: bool = False) -> tuple[int, object]:
+        """(status, JSON body).  A body over `most` bytes is not sent: it is answered 413 here, as the server would.
+        `poll`: the connection can be cut by `abort_poll`."""
         data = None
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -244,6 +279,8 @@ class Client:
         if data is not None:
             headers["Content-Type"] = "application/json"
         try:
+            if poll:
+                self._track_poll(conn)
             conn.request(method, self._prefix + path, body=data, headers=headers)
             r = conn.getresponse()
             raw = r.read()
@@ -252,6 +289,10 @@ class Client:
         except ValueError as e:                         # e.g. a header value http.client refuses: its text holds the
             raise NetworkError(f"{type(e).__name__} while sending the request") from None     # value, so not shown
         finally:
+            if poll:
+                with self._poll_lock:
+                    if self._poll_conn is conn:
+                        self._poll_conn = None
             conn.close()
         try:
             got = json.loads(raw) if raw else None
@@ -304,7 +345,14 @@ class Client:
     def next(self, rid: str, instance: str, wait: float) -> list[dict]:
         """GET /runner/next: the messages for this runner (held at most `wait` seconds), with this channel's ack."""
         q = f"id={quote(rid)}&instance={quote(instance)}&wait={wait:g}&channel={quote(self.channel or '')}&ack={self.ack}"
-        code, body = self._request("GET", "/runner/next?" + q, timeout=wait + 30)
+        if self._polls_ended:
+            return []
+        try:
+            code, body = self._request("GET", "/runner/next?" + q, timeout=wait + 30, poll=True)
+        except NetworkError:
+            if self._polls_ended:                       # cut by abort_poll: an empty poll, not a failure
+                return []
+            raise
         msgs = self._check(code, body).get("messages")
         return [m for m in msgs if isinstance(m, dict)] if isinstance(msgs, list) else []
 
@@ -565,8 +613,15 @@ class Executor:
 class RunnerLoop:
     """One poll thread (hello, poll, hand out), one thread per job (at most MAX_JOBS at once, the others wait)."""
 
-    def __init__(self, client: Client, executor, *, stop: threading.Event | None = None):
+    def __init__(self, client: Client, executor, *, stop: threading.Event | None = None,
+                 on_state: Callable[[str, dict], None] | None = None):
+        """`on_state(event, data)` (Strata Desktop's tray, #310 part 3; None for `python -m serve.runner`): "online"
+        {"id", "who"} after each hello that succeeds and when a poll works again after network errors; "pending"
+        {"code"} on each Pending; "offline" {"message"} (scrubbed) on the first network error of a run of them;
+        "refused" {"kind", "message"} before run returns EXIT_REFUSED; "stopped" {} when run returns 0.  It is called
+        on the poll thread; an exception from it is logged and ignored."""
         self.client, self.executor = client, executor
+        self.on_state = on_state
         self.stop = stop or threading.Event()
         self.instance = new_instance()
         self.id: str | None = None
@@ -599,6 +654,15 @@ class RunnerLoop:
             self._printed = self.id
             _say(f"[runner] connected to {self.client.url} as {self.who}; this PC's runner id is {self.id} - paste it "
                  f"in the web app under Settings > This browser's runner")
+        self._state("online", {"id": self.id, "who": self.who})
+
+    def _state(self, event: str, data: dict) -> None:
+        if self.on_state is None:
+            return
+        try:
+            self.on_state(event, data)
+        except Exception as e:  # noqa: BLE001 - the app's view of the runner must never stop the runner
+            _say(f"[runner] the state callback raised {type(e).__name__} on {event!r}; the runner goes on")
 
     def _channel_changed(self) -> None:
         """A new registration on the server: the jobs of the old one ended there, so their links are cancelled."""
@@ -615,14 +679,17 @@ class RunnerLoop:
         """Until `stop`: 0; EXIT_REFUSED when the server refuses this runner."""
         failures, gones, pending = 0, 0, None
         while not self.stop.is_set():
+            said_hello = False
             try:
                 if not self.connected.is_set() or self._groups_changed():
                     self._hello()
-                    pending = None
+                    pending, said_hello = None, True
                 wait = min(self.poll_s, STARTING_POLL_S) if self.executor.starting() else self.poll_s
                 msgs = self.client.next(self.id, self.instance, wait)
                 if failures:
                     _say("[runner] the server answers again")
+                    if not said_hello:                  # the hello just said "online"
+                        self._state("online", {"id": self.id, "who": self.who})
                 failures = gones = 0
                 self._dispatch(msgs)
             except Gone:                                # the server restarted, or the key was renamed: hello again
@@ -636,6 +703,7 @@ class RunnerLoop:
                     pending = e.code
                     _say(f"[runner] this PC waits for the owner's approval: the owner sees it with the code {e.code}. "
                          f"Trying again every {PENDING_RETRY_S:g} s.")
+                self._state("pending", {"code": e.code})      # each time: a network error may have come in between
                 self.stop.wait(PENDING_RETRY_S)
             except Refused as e:
                 why = {"key": "the key was refused (wrong or revoked)",
@@ -644,11 +712,14 @@ class RunnerLoop:
                        "runner_protocol": "this runner and the server speak different versions"}.get(e.kind, "the server refused the runner")
                 _say(f"[runner] stopped: {why}" + (f" ({e.message})" if e.message else ""))
                 self._end()
+                self._state("refused", {"kind": e.kind, "message": self.client.scrub(e.message)})
                 return EXIT_REFUSED
             except NetworkError as e:
                 delay = min(RETRY_MAX_S, 2.0 ** failures)
                 if failures == 0:
-                    _say(f"[runner] the server cannot be reached ({self.client.scrub(str(e))}); trying again")
+                    message = self.client.scrub(str(e))
+                    _say(f"[runner] the server cannot be reached ({message}); trying again")
+                    self._state("offline", {"message": message})
                 failures += 1
                 self.stop.wait(delay)
             except Exception as e:  # noqa: BLE001 - a bug here must not end the runner silently, nor print the key
@@ -658,6 +729,7 @@ class RunnerLoop:
                 self.connected.clear()
                 self.stop.wait(delay)
         self._end()
+        self._state("stopped", {})
         return 0
 
     def _end(self) -> None:
