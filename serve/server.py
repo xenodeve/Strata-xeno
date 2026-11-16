@@ -3924,7 +3924,8 @@ class Service:
         """The request with the cache slot of its prompt (xeno #49 S7), when the engine has several slots (INFO
         cache_slots) and the client chose none.  The rule is STRATA_CACHE_SLOT_RULE (#321): unset or "family" the
         prompt-family rule (CacheSlots), "identity" the family per sender (IdentityCacheSlots), "continuation" the
-        slot the prompt continues (ContinuationCacheSlots; it also records a client's own strata_cache_slot).  `who`
+        slot the prompt continues (ContinuationCacheSlots), "hybrid" by what a placement saves and destroys
+        (HybridCacheSlots); those two also record a client's own strata_cache_slot.  `who`
         ({"key", "device", "addr"}, the HTTP handler's _slot_who; None for the server's own requests) and `route`
         ("openai", "anthropic", "judge") go to STRATA_SLOT_TRACE as well."""
         trace = os.environ.get("STRATA_SLOT_TRACE")
