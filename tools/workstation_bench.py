@@ -326,6 +326,7 @@ def post_stream(port: int, messages: list[dict], *, max_new: int, seed: int, mar
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(f"http://{host}:{port}/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers=headers)
+    text: list[str] = []
     rec = {"t_send": time.time(), "t_first": None, "t_end": None, "first_kind": None, "usage": None, "finish": None,
            "timings_untrusted": None, "error": None, "chunks": 0}
     try:
@@ -346,6 +347,11 @@ def post_stream(port: int, messages: list[dict], *, max_new: int, seed: int, mar
                     rec["error"] = c["error"]
                 ch = (c.get("choices") or [{}])[0]
                 d = ch.get("delta") or {}
+                for key in ("reasoning_content", "content"):
+                    if d.get(key):
+                        text.append(d[key])
+                for tc in d.get("tool_calls") or []:
+                    text.append(json.dumps(tc, sort_keys=True))
                 if rec["t_first"] is None:
                     kind = "content" if d.get("content") else "reasoning" if d.get("reasoning_content") else \
                         "tool_calls" if d.get("tool_calls") else None
@@ -360,6 +366,9 @@ def post_stream(port: int, messages: list[dict], *, max_new: int, seed: int, mar
     except Exception as e:                                       # noqa: BLE001 - recorded, the series goes on
         rec["error"] = f"{type(e).__name__}: {e}"
     rec["t_end"] = time.time()
+    joined = "".join(text)                                       # the reply (reasoning, text, calls) as streamed
+    rec["reply_sha"] = hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+    rec["reply_chars"] = len(joined)
     return client_numbers(rec)
 
 
@@ -891,6 +900,8 @@ def main(argv=None) -> int:
     ap.add_argument("--log", help="JSONL (default <work-dir>/workstation_bench.jsonl)")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--server-root", default=str(ROOT), help="the tree whose serve/server.py runs")
+    ap.add_argument("--fixed-mode-order", action="store_true", help="every boot runs --mode in the given order "
+                    "(default: odd rounds reverse it)")
     ap.add_argument("--profile-load", help="the --expert-profile every arm loads (a snapshot), instead of the base's")
     ap.add_argument("--workload-root", help="the tree the turns' tool results are read from (default: this one; its "
                     "files and tracked files decide the grep results, so another branch sends other prompts)")
@@ -967,7 +978,7 @@ def main(argv=None) -> int:
     for rnd, arm in boots:
         bd = work_dir / f"{run_id}-r{rnd}-{arm.name}"
         cfg = derive_config(base, arm, bd, a.port, a.profile_load)
-        boot_modes = modes if rnd % 2 == 0 else modes[::-1]     # each mode first once per arm over two rounds
+        boot_modes = modes if (rnd % 2 == 0 or a.fixed_mode_order) else modes[::-1]   # each mode first once per arm
         cfg_path = write_arm_config(cfg, bd)
         env = server_env(arm, bd, a.cuda_visible)
         boot = {"kind": "boot", "run": run_id, "arm": arm.name, "round": rnd, "modes": boot_modes, "exe": cfg["exe"],

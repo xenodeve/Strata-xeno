@@ -408,6 +408,8 @@ class Schedulers(unittest.TestCase):
         self.assertEqual(r["cached_tokens"], 3)
         self.assertLess(r["client_decode_tok_s"], 100)      # ~4 tokens in ~0.2 s, not the stub's 9999 timings
         self.assertEqual(r["timings_untrusted"]["predicted_per_second"], 9999)
+        self.assertEqual(r["reply_chars"], len("think") + 4)                 # reasoning + 4 content chunks of "x"
+        self.assertEqual(len(r["reply_sha"]), 16)
 
     def test_summary_prints(self):
         rows = WB.run_concurrent(self.stub.port, tiny_users(), self.mk, max_new=8, seed=1)
