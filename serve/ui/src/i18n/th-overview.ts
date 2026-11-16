@@ -123,6 +123,7 @@ export const part: Record<string, string> = {
   "Stopped": "หยุดแล้ว",
   "Waiting": "รอ",
   "Strata runs a large mixture-of-experts model on this PC. Nothing leaves it.": "Strata รันโมเดล mixture-of-experts ขนาดใหญ่บนพีซีเครื่องนี้ ไม่มีข้อมูลใดออกจากเครื่อง",
+  "Strata runs a large mixture-of-experts model on the server PC ({host}). Your prompts, and what the tools read for them, go there.": "Strata รันโมเดล mixture-of-experts ขนาดใหญ่บนเครื่องเซิร์ฟเวอร์ ({host}) ข้อความที่คุณส่งและสิ่งที่เครื่องมืออ่านมาใช้ตอบจะถูกส่งไปที่เครื่องนั้น",
   "The model": "โมเดล",
   "Pictures": "รูปภาพ",
   "on": "เปิด",

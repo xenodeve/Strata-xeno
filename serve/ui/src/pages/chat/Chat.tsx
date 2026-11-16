@@ -12,6 +12,7 @@ import { Sidebar } from "../../components/Sidebar"
 import { ConfirmDialog } from "../../components/ConfirmDialog"
 import { useMetrics } from "../../lib/metrics"
 import { readProgress } from "../../lib/status"
+import { chatWhere } from "../../lib/where"
 import { href } from "../../lib/router"
 import { effortChoices, settleEffort } from "../../lib/effort"
 import { noteSend } from "../../lib/sendfx"
@@ -368,7 +369,7 @@ export function Chat({ id }: { id?: string }) {
             <StatusOrb live={live} stale={stale} size={64} scale={2.5} override={typing ? { design: "listening", label: t(ORB_NAMES.listening) } : ambient ? { design: ambient, label: t(ORB_NAMES[ambient]) } : undefined} />
             <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>{t("What can I help with?")}</h1>
             <div className="mt-3"><ProjectPicker projects={chat.index.projects} value={project?.id ?? null} onPick={(id) => { chat.setPendingProject(id) }} /></div>
-            <p className="lede mt-3">{t("{name} runs on this PC. Nothing leaves it.", { name: metrics?.model_info?.name ? [metrics.model_info.name, metrics.model_info.variant].filter(Boolean).join(" · ") : health.model })}</p>
+            <p className="lede mt-3">{chatWhere(metrics?.model_info?.name ? [metrics.model_info.name, metrics.model_info.variant].filter(Boolean).join(" · ") : health.model, location.hostname, onMy ? "my" : "server")}</p>
           </div>
         </Collapse>
         {chat.messages.map((m, i) => (
