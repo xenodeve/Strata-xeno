@@ -419,6 +419,30 @@ class Schedulers(unittest.TestCase):
         self.assertEqual(r["reply_chars"], len("think") + 4)                 # reasoning + 4 content chunks of "x"
         self.assertEqual(len(r["reply_sha"]), 16)
 
+    def test_reply_hash_ignores_the_servers_tool_call_id(self):
+        import urllib.request
+        def stream(call_id):
+            body = [{"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": call_id, "type": "function",
+                     "function": {"name": "read_file", "arguments": "{}"}}]}, "finish_reason": None}]},
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                     "usage": {"prompt_tokens": 3, "completion_tokens": 2}}]
+            lines = [f"data: {json.dumps(c)}
+".encode() for c in body] + [b"data: [DONE]
+"]
+            class R:
+                def __enter__(s): return iter(lines)
+                def __exit__(s, *a): pass
+            return lambda req, timeout=0: R()
+        real = urllib.request.urlopen
+        try:
+            urllib.request.urlopen = stream("call_aaaa")
+            a = WB.post_stream(1, [{"role": "user", "content": "x"}], max_new=4, seed=1, marker="m")
+            urllib.request.urlopen = stream("call_bbbb")
+            b = WB.post_stream(1, [{"role": "user", "content": "x"}], max_new=4, seed=1, marker="m")
+        finally:
+            urllib.request.urlopen = real
+        self.assertEqual(a["reply_sha"], b["reply_sha"])
+
     def test_summary_prints(self):
         rows = WB.run_concurrent(self.stub.port, tiny_users(), self.mk, max_new=8, seed=1)
         WB.mark_overlap(rows)

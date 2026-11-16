@@ -360,8 +360,8 @@ def post_stream(port: int, messages: list[dict], *, max_new: int, seed: int, mar
                 for key in ("reasoning_content", "content"):
                     if d.get(key):
                         text.append(d[key])
-                for tc in d.get("tool_calls") or []:
-                    text.append(json.dumps(tc, sort_keys=True))
+                for tc in d.get("tool_calls") or []:          # the server's call id is random: not the reply
+                    text.append(json.dumps({k: v for k, v in tc.items() if k != "id"}, sort_keys=True))
                 if rec["t_first"] is None:
                     kind = "content" if d.get("content") else "reasoning" if d.get("reasoning_content") else \
                         "tool_calls" if d.get("tool_calls") else None
