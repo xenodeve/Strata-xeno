@@ -183,9 +183,27 @@ def session_names() -> list[str]:
     return [s[0] for s in atb.SESSIONS]
 
 
-def workload(system_tag: str | None = None) -> list[tuple[str, list[dict]]]:
-    """agent_turns_bench's turns; with a tag, the system prompt ends with one line naming it."""
-    work = atb.turns()
+def build_turns(root: Path | None = None) -> list[tuple[str, list[dict]]]:
+    """agent_turns_bench's turns with the tool results read from `root` (its files and `git grep` over its tracked
+    files; default: this tree).  A tree with other files gives other grep results, so a run builds them once and
+    every request row carries the hash of what it sent."""
+    if root is None:
+        return atb.turns()
+    saved = atb.ROOT
+    atb.ROOT = Path(root)
+    try:
+        return atb.turns()
+    finally:
+        atb.ROOT = saved
+
+
+def messages_hash(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def workload(system_tag: str | None = None, base=None) -> list[tuple[str, list[dict]]]:
+    """agent_turns_bench's turns (`base`, else built now); with a tag, the system prompt ends with one line naming it."""
+    work = build_turns() if base is None else base
     if not system_tag:
         return work
     out = []
@@ -330,7 +348,7 @@ def _one(port, user, tag, msgs, seq, make_marker, max_new, seed, log_size, api_k
     marker = make_marker(user, seq)
     off0 = log_size() if log_size else None
     rec = post_stream(port, msgs, max_new=max_new, seed=seed, marker=marker, api_key=api_key)
-    row = {"user": user, "tag": tag, "seq": seq, "marker": marker, "log_off0": off0,
+    row = {"user": user, "tag": tag, "seq": seq, "marker": marker, "msgs_sha": messages_hash(msgs), "log_off0": off0,
            "log_off1": log_size() if log_size else None, **rec}
     if on_row:
         on_row(row)
@@ -384,14 +402,18 @@ METRICS_LINE = re.compile(
 SLOT_LINE = re.compile(r"strata batch: slot (?P<slot>\d+) takes (?P<n>\d+) tokens")
 
 
-def parse_legs(text: str, base_offset: int = 0) -> list[dict]:
+def parse_legs(data, base_offset: int = 0) -> list[dict]:
     """The engine's per-call lines in log order: one leg per `strata serve: prompt ...` line (a request moved between
     the solo path and a batch slot has several), with the `request metrics` line after it and the `slot S takes`
-    line before it (an admission into a batch slot).  `pos`: the line's byte offset in the log."""
+    line before it (an admission into a batch slot).  `data`: the log's bytes (str is encoded); `pos`: the line's byte
+    offset in the log, the same count as the file sizes taken at each send."""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
     legs, slot, pos = [], None, base_offset
-    for line in text.splitlines(keepends=True):
+    for raw in data.splitlines(keepends=True):
         here = pos
-        pos += len(line.encode("utf-8"))
+        pos += len(raw)
+        line = raw.decode("utf-8", "replace")
         m = SLOT_LINE.search(line)
         if m:
             slot = int(m["slot"])
@@ -412,19 +434,21 @@ def parse_legs(text: str, base_offset: int = 0) -> list[dict]:
     return legs
 
 
-def read_log(path, start: int = 0) -> str:
+def read_log(path, start: int = 0) -> bytes:
     try:
         with open(path, "rb") as f:
             f.seek(start)
-            return f.read().decode("utf-8", "replace")
+            return f.read()
     except OSError:
-        return ""
+        return b""
 
 
 def assign_legs(rows: list[dict], legs: list[dict]) -> None:
     """Give each row its legs.  The first leg's prompt is the request's own (usage.prompt_tokens), written after the
     row's send; a later leg (continued after a move between the solo path and a slot) has prompt + the tokens made so
-    far, and comes before the same user's next send.  A leg two rows could claim is marked ambiguous on both."""
+    far, and comes before the same user's next send.  A read that gave way to a shorter waiting prompt (BYIELD) goes
+    on in a slot with the same prompt: its later legs have prompt == the request's, and the read is their sum.  A leg
+    two rows could claim is marked ambiguous on both."""
     by_user: dict[str, list[dict]] = {}
     for r in sorted(rows, key=lambda r: r["t_send"]):
         by_user.setdefault(r["user"], []).append(r)
@@ -443,16 +467,18 @@ def assign_legs(rows: list[dict], legs: list[dict]) -> None:
         if first is None:
             continue
         mine = [first] + [lg for lg in legs if lg["pos"] > first["pos"] and (hi is None or lg["pos"] < hi)
-                          and p < lg["prompt"] <= p + c]
+                          and p <= lg["prompt"] <= p + c]
         r["legs"] = mine
         for lg in mine:
             claims.setdefault(id(lg), []).append(r)
     for r in rows:
         r["legs_ambiguous"] = any(len(claims.get(id(lg), [])) > 1 for lg in r["legs"])
         first = r["legs"][0] if r["legs"] else None
-        r["engine_read_ms"] = first["read_ms"] if first else None
+        reads = [lg for lg in r["legs"] if lg["prompt"] == r.get("prompt_tokens")]
+        r["engine_read_ms"] = round(sum(lg["read_ms"] for lg in reads), 1) if first else None
+        r["engine_read"] = sum(lg["read"] for lg in reads) if first else None
+        r["engine_read_legs"] = len(reads)
         r["engine_reused"] = first["reused"] if first else None
-        r["engine_read"] = first["read"] if first else None
         if r["legs"] and any("entries" in lg for lg in r["legs"]):
             tiers = {k: sum(lg.get(k, 0) for lg in r["legs"]) for k in ("entries", "primary", "secondary", "pcie", "cpu")}
             tiers["cpu_ms"] = round(sum(lg.get("cpu_ms", 0.0) for lg in r["legs"]), 1)
@@ -513,12 +539,26 @@ def _alive(pid: int, created: float) -> bool:
         return False
 
 
-def kill_tree(pid: int, timeout: float = 60.0, since: float | None = None,
+def _ours(pid: int, tree_pids: set, scope_dir) -> bool:
+    """Is this process the boot's: started by a process of its tree (Windows keeps the parent's pid after the parent
+    ended), or with the boot directory on its command line (the arm's --expert-profile-save copy is there)."""
+    import psutil
+    try:
+        p = psutil.Process(pid)
+        if p.ppid() in tree_pids:
+            return True
+        return bool(scope_dir) and str(scope_dir).lower() in " ".join(p.cmdline()).lower()
+    except psutil.Error:
+        return False
+
+
+def kill_tree(pid: int, timeout: float = 60.0, since: float | None = None, scope_dir=None,
               names=("strata.exe", "strata-vision.exe")) -> dict:
     """End `pid` and every process under it (taskkill /T /F on Windows), then check each one the snapshot saw is gone
-    (pid + creation time, so a reused pid is not mistaken for it).  `since`: also end any process named in `names`
-    started at or after that time (an engine the snapshot missed); never one older, such as another server's engine.
-    -> {"snapshot": [...], "leftover": [...]} (leftover: still alive after the timeout and a direct kill)."""
+    (pid + creation time, so a reused pid is not mistaken for it).  `since`: also end a process named in `names` that
+    the snapshot missed, but only one of this boot's (_ours: started at or after `since` by a process of the tree, or
+    with `scope_dir` on its command line) - never another server's engine, whenever it started.
+    -> {"snapshot": [...], "late": [...], "leftover": [...]} (leftover: alive after the timeout and a direct kill)."""
     import psutil
     snap = tree_snapshot(pid)
     if WIN:
@@ -534,7 +574,7 @@ def kill_tree(pid: int, timeout: float = 60.0, since: float | None = None,
     late = []
     if since is not None:
         for e in running_engines(names):
-            if e["create_time"] >= since - 1.0 and not any(e["pid"] == s[0] for s in snap):
+            if e["create_time"] >= since - 1.0 and not any(e["pid"] == s[0] for s in snap)                     and _ours(e["pid"], {s[0] for s in snap}, scope_dir):
                 late.append((e["pid"], e["create_time"], e["name"]))
     every = snap + late
 
@@ -659,7 +699,7 @@ def summarize(rows: list[dict]) -> str:
     for (mode, arm), rs in sorted(groups.items()):
         rounds = sorted({r["round"] for r in rs})
         out.append(f"\n== {mode} arm {arm} ({len(rs)} requests, rounds {rounds}) ==")
-        out.append("  user  n   wall med/p90 s    wait(ttft) med/p90 s  read ms med/p90 (src)    reused med  "
+        out.append("  user  n   wall med/p90 s    wait(ttft) med/p90 s  read ms med/p90 (src)    reused med/p90  "
                    "decode tok/s med  sum wall s")
         users = sorted({r["user"] for r in rs})
         for user in users + (["both"] if len(users) > 1 else []):
@@ -674,7 +714,7 @@ def summarize(rows: list[dict]) -> str:
             out.append(f"  {user:4s} {len(ur):3d} {_f(_q([r['wall_s'] for r in ok], .5)):>7s} / "
                        f"{_f(_q([r['wall_s'] for r in ok], .9)):<7s} {_f(_q([r['ttft_s'] for r in ok], .5)):>7s} / "
                        f"{_f(_q([r['ttft_s'] for r in ok], .9)):<9s} {_f(_q(reads, .5), 0):>7s} / "
-                       f"{_f(_q(reads, .9), 0):<7s} ({src:7s}) {_f(_q(frac, .5), 3):>8s}  "
+                       f"{_f(_q(reads, .9), 0):<7s} ({src:7s}) {_f(_q(frac, .5), 3):>6s} / {_f(_q(frac, .9), 3):<6s} "
                        f"{_f(_q([r.get('client_decode_tok_s') for r in ok], .5), 1):>10s}       "
                        f"{_f(sum(r['wall_s'] for r in ok) / n_rounds, 1):>8s}"
                        + (f"   ({len(ur) - len(ok)} errors)" if len(ok) < len(ur) else ""))
@@ -736,8 +776,8 @@ def plan(arms: list[Arm], rounds: int) -> list[tuple[int, Arm]]:
     return out
 
 
-def series_items(mode: str, tag: str | None, split: str, max_turns: int):
-    work = workload(tag)
+def series_items(mode: str, tag: str | None, split: str, max_turns: int, base=None):
+    work = workload(tag, base)
     users = {"solo": work} if mode == "w1" else split_users(work, split)
     return {u: v[:max_turns] for u, v in users.items()} if max_turns else users
 
@@ -757,6 +797,8 @@ def main(argv=None) -> int:
     ap.add_argument("--log", help="JSONL (default <work-dir>/workstation_bench.jsonl)")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--server-root", default=str(ROOT), help="the tree whose serve/server.py runs")
+    ap.add_argument("--workload-root", help="the tree the turns' tool results are read from (default: this one; its "
+                    "files and tracked files decide the grep results, so another branch sends other prompts)")
     ap.add_argument("--cuda-visible", default="1,0")
     ap.add_argument("--ready-timeout", type=float, default=1800)
     ap.add_argument("--ram-margin-gib", type=float, default=2.0,
@@ -787,14 +829,16 @@ def main(argv=None) -> int:
     log_path = Path(a.log) if a.log else work_dir / "workstation_bench.jsonl"
     run_id = time.strftime("%m%d%H%M%S")
     server_root = Path(a.server_root).resolve()
-    wl_hash = hashlib.sha256(json.dumps(atb.turns(), sort_keys=True).encode()).hexdigest()[:16]
+    workload_root = Path(a.workload_root).resolve() if a.workload_root else ROOT
+    base_work = build_turns(workload_root)
+    wl_hash = messages_hash(base_work)
     tags = {m: (m if len(modes) > 1 else None) for m in modes}
 
     boots = plan(arms, a.rounds)
     print(f"[wsb] run {run_id}: {len(boots)} boots, modes {modes}, arms {[x.name for x in arms]}, rounds {a.rounds}, "
-          f"port {a.port}, work dir {work_dir}, workload {wl_hash}", flush=True)
+          f"port {a.port}, work dir {work_dir}, workload {wl_hash} from {workload_root}", flush=True)
     for m in modes:
-        items = series_items(m, tags[m], a.split, a.max_turns)
+        items = series_items(m, tags[m], a.split, a.max_turns, base_work)
         print(f"[wsb]   {m}: " + ", ".join(f"user {u} {len(v)} turns ({v[0][0]} .. {v[-1][0]})" for u, v in items.items()),
               flush=True)
     if a.dry_run:
@@ -833,11 +877,12 @@ def main(argv=None) -> int:
         boot = {"kind": "boot", "run": run_id, "arm": arm.name, "round": rnd, "modes": modes, "exe": cfg["exe"],
                 "exe_sha256": sha256_file(cfg["exe"]), "server_root": str(server_root),
                 "server_git": git_head(server_root), "config": str(cfg_path), "boot_dir": str(bd),
-                "parallel": cfg.get("parallel"), "arm_env": arm.env, "xargs": arm.xargs, "workload": wl_hash,
+                "parallel": cfg.get("parallel"), "arm_env": arm.env, "xargs": arm.xargs, "workload": wl_hash, "workload_root": str(workload_root),
                 "split": a.split, "max_new": a.max_new, "seed": a.seed, "ram_avail_gib_before_run": round(ram0 / GIB, 2),
                 "ram_avail_gib_at_boot": round(ram_available() / GIB, 2)}
-        if port_in_use(a.port):
-            boot["error"] = f"port {a.port} still answers"
+        others = [] if a.allow_running_engine else running_engines()
+        if port_in_use(a.port) or others:
+            boot["error"] = f"port {a.port} still answers" if port_in_use(a.port) else                 f"another strata.exe runs ({[o['pid'] for o in others]})"
             write(out, boot)
             print(f"[wsb] {boot['error']}: stopping", flush=True)
             return 3
@@ -852,7 +897,7 @@ def main(argv=None) -> int:
             elog = Path(cfg["log"])
             log_size = lambda: elog.stat().st_size if elog.exists() else 0   # noqa: E731
             for mode in modes:
-                items = series_items(mode, tags[mode], a.split, a.max_turns)
+                items = series_items(mode, tags[mode], a.split, a.max_turns, base_work)
                 mk = lambda user, seq, m=mode: f"wsb/{run_id}/{arm.name}/r{rnd}/{m}/{user}/{seq:03d}"   # noqa: E731
                 on_row = lambda r, m=mode: (write(raw, {"run": run_id, "arm": arm.name, "round": rnd, "mode": m, **r}),   # noqa: E731
                                             print(f"  {m} {r['user']} {r['tag']:16s} wall {r['wall_s']:7.2f} s  "
@@ -884,7 +929,7 @@ def main(argv=None) -> int:
             boot["error"] = f"{type(e).__name__}: {e}"
             print(f"[wsb] r{rnd} {arm.name}: {boot['error']}", flush=True)
         finally:
-            stop = kill_tree(proc.pid, since=t_boot)
+            stop = kill_tree(proc.pid, since=t_boot, scope_dir=bd)
             boot["stop"] = stop
             if stop["leftover"]:
                 print(f"[wsb] processes left after the stop: {stop['leftover']}: stopping the run", flush=True)

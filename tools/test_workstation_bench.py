@@ -130,6 +130,11 @@ class Users(unittest.TestCase):
         tagged = WB.workload("w2b")
         self.assertTrue(tagged[0][1][0]["content"].endswith("Session group: w2b."))
         self.assertEqual(WB.workload()[0][1][0]["content"], WB.atb.SYSTEM)     # agent_turns_bench's own, untagged
+        saved = WB.atb.ROOT
+        built = WB.build_turns(ROOT)
+        self.assertIs(WB.atb.ROOT, saved)                                       # the module's root is put back
+        self.assertEqual(WB.messages_hash(built), WB.messages_hash(WB.atb.turns()))
+        self.assertEqual(WB.workload(None, built), built)
         order = WB.alternate({"A": [1, 2], "B": [10, 20, 30]})
         self.assertEqual(order, [("A", 1), ("B", 10), ("A", 2), ("B", 20), ("B", 30)])
         with self.assertRaises(ValueError):
@@ -189,6 +194,33 @@ class Matching(unittest.TestCase):
         self.assertFalse(any(r["legs_ambiguous"] for r in rows))
         self.assertAlmostEqual(WB.reused_fraction(rows[1])[0], 40000 / 41000)
         self.assertEqual(WB.reused_fraction(rows[1])[1], "engine")
+
+    def test_a_read_that_gave_way_is_summed(self):
+        # A's 60000-token read gives way (BYIELD) after 12288 tokens to B's short prompt, then goes on in slot 1
+        log = (
+            b"\xff\xfe not utf-8 \x80\n"
+            b"strata serve: prompt 60000 tokens = 1000 reused + 12288 of 59000 read in 4000 ms (3072.0 tok/s), "
+            b"0 generated in 0 ms (0.0 tok/s), drafts accepted 0 of 0, 1 checkpoints (cancelled)\n"
+            b"strata batch: slot 0 takes 2001 tokens\n"
+            b"strata serve: prompt 2000 tokens = 1000 reused + 1000 read in 500 ms (2000.0 tok/s), 1 generated in "
+            b"0 ms (0.0 tok/s), drafts accepted 0 of 0, 1 checkpoints\n"
+            b"strata batch: slot 1 takes 60001 tokens\n"
+            b"strata serve: prompt 60000 tokens = 13288 reused + 46712 read in 15000 ms (3114.1 tok/s), 1 generated "
+            b"in 0 ms (0.0 tok/s), drafts accepted 0 of 0, 2 checkpoints\n")
+        legs = WB.parse_legs(log)
+        self.assertEqual(legs[0]["pos"], log.index(b"strata serve: prompt 60000"))    # byte offsets, bad bytes too
+        self.assertEqual(legs[2]["pos"], log.index(b"strata serve: prompt 60000 tokens = 13288"))
+        rows = [{"user": "A", "t_send": 1.0, "prompt_tokens": 60000, "completion_tokens": 256, "log_off0": 0},
+                {"user": "B", "t_send": 2.0, "prompt_tokens": 2000, "completion_tokens": 256, "log_off0": 0}]
+        WB.assign_legs(rows, legs)
+        a, b = rows
+        self.assertEqual([lg["prompt"] for lg in a["legs"]], [60000, 60000])
+        self.assertEqual(a["engine_read_ms"], 19000.0)
+        self.assertEqual(a["engine_read"], 12288 + 46712)
+        self.assertEqual(a["engine_read_legs"], 2)
+        self.assertEqual(a["engine_reused"], 1000)                    # what the cache held when it arrived
+        self.assertEqual([lg["prompt"] for lg in b["legs"]], [2000])
+        self.assertFalse(a["legs_ambiguous"] or b["legs_ambiguous"])
 
 
 class Stub:
@@ -358,6 +390,32 @@ class TreeKill(unittest.TestCase):
             self.assertLessEqual({x["name"].lower() for x in res["snapshot"]}, {"python.exe", "conhost.exe", "python"})
             self.assertFalse(child.is_running())
             self.assertEqual(res["late"], [])               # no strata.exe started by this test
+
+    def test_late_kill_only_this_boots(self):
+        """A process the snapshot missed is ended only when it is this boot's (its command line names the boot dir),
+        never an unrelated one started after the boot.  python.exe stands in for strata.exe."""
+        import psutil
+        with tempfile.TemporaryDirectory() as d:
+            boot = Path(d) / "boot-dir"
+            boot.mkdir()
+            flags = (WB.CREATE_NO_WINDOW | WB.CREATE_NEW_PROCESS_GROUP) if WB.WIN else 0
+            sleeper = [sys.executable, "-c", "import time, sys; time.sleep(120)"]
+            t0 = time.time()
+            root = subprocess.Popen(sleeper, creationflags=flags)
+            mine = subprocess.Popen(sleeper + [str(boot / "x.bin")], creationflags=flags)     # not in root's tree
+            other = subprocess.Popen(sleeper + ["unrelated"], creationflags=flags)
+            try:
+                time.sleep(0.5)
+                res = WB.kill_tree(root.pid, timeout=10, since=t0, scope_dir=boot, names=("python.exe", "python"))
+                self.assertEqual([x["pid"] for x in res["late"]], [mine.pid])
+                self.assertEqual(res["leftover"], [])
+                mine.wait(10)
+                self.assertTrue(psutil.Process(other.pid).is_running())
+            finally:
+                for p in (root, mine, other):
+                    if p.poll() is None:
+                        p.kill()
+                        p.wait(10)
 
     def test_ram_wait_returns_at_once_when_reached(self):
         ok, avail, waited = WB.wait_ram(0, timeout=1)
