@@ -683,7 +683,9 @@ class RunnerHub:
         self._closed = False
         # #315: a key's rename (the keys file, then `move`) and a hello (the key's name, then `hello`) each hold this,
         # so a hello is wholly before a rename or wholly after it.  A hello in between registered a second runner under
-        # the new name, which `move` then ended as replaced: the runner on the PC stopped for good (409).
+        # the new name, which `move` then ended as replaced: the runner on the PC stopped for good (409).  Only a
+        # rename takes it: a revoke or a role change does not, so a hello that matched just before a revoke may still
+        # register a runner under the retired name after `end_all` (unusable: no key carries that name again).
         self.names = threading.Lock()
 
     def hello(self, who: str, device: str, instance: str, info: dict, groups: list, skills: list) -> Runner:

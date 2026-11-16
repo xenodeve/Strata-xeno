@@ -385,6 +385,19 @@ class Connection(Base):
         self.assertLess(got[0][1] - t0, 1.0)
         self.assertEqual(c.next(rid, "inst-keep-0001", 5), [])     # and every later poll at once
 
+    def test_a_poll_stopped_before_it_was_sent_closes_its_kept_connection(self):
+        self.start_routing()
+        c = runner_mod.Client(f"http://127.0.0.1:{self.port}", self.ann, {"id": DEV1, "name": "ann-pc"})
+        self.addCleanup(c.close)
+        body = c.hello(self.hello_info())
+        c.on_hello(body)
+        self.assertEqual(c.next(body["runner"], "inst-keep-0001", 0), [])
+        conn = c._poll_kept[0]
+        c.abort_poll()                                          # no poll in flight: the next one stops before sending
+        with self.assertRaises(runner_mod.NetworkError):
+            c._request("GET", f"/runner/next?id={body['runner']}&instance=inst-keep-0001&wait=0", poll=True)
+        self.assertIsNone(conn.sock)                            # closed, not left to the garbage collector
+
     def test_replies_number_rid_and_answers_match_to(self):
         target = self.dir / "outside.txt"
         self.start_routing(tool_call("Write", file_path=str(target), content="x"), DONE)
@@ -553,6 +566,96 @@ class ReviewFixes(Base):
 
     def test_a_result_over_the_limit_is_not_sent(self):
         self.refused_result(mock.patch.object(runner_mod, "REPLY_MAX", 3000))            # checked before sending
+
+
+class KeptConnections(unittest.TestCase):
+    """#313 fix round 1: kept connections the server dropped - a whole pool (a server restart closes every one), and
+    a TLS one closed without close_notify - cost one fresh connection, never a NetworkError."""
+
+    def stub(self, tls=False):
+        """A stdlib HTTP/1.1 server answering every POST with a hello's answer (after `self.delay` s); its accepted
+        sockets in `self.conns`."""
+        import socketserver  # noqa: F401
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        conns, lock, case = [], threading.Lock(), self
+        self.conns, self.delay = conns, 0.0
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def setup(self):
+                super().setup()
+                with lock:
+                    conns.append(self.connection)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                time.sleep(case.delay)
+                b = json.dumps({"runner": "r1", "who": "ann", "channel": "c", "poll_s": 2}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        scheme, ctx = "http", None
+        if tls:
+            from serve.test_runner_state import self_signed
+            import ssl
+            cert, key = self_signed()
+            sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            sctx.load_cert_chain(cert, key)
+            srv.socket = sctx.wrap_socket(srv.socket, server_side=True)
+            scheme, ctx = "https", ssl.create_default_context(cafile=cert)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        c = runner_mod.Client(f"{scheme}://127.0.0.1:{srv.server_address[1]}", "k" * 20, {"id": "dev12345678"})
+        if ctx is not None:
+            c._ssl = ctx
+        self.addCleanup(c.close)
+        return c, lock
+
+    def drop_all(self, lock):
+        """The server ends every connection it has, as server_close does (FIN, no TLS close_notify)."""
+        import socket
+        with lock:
+            for s in self.conns:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                s.close()
+        time.sleep(0.2)
+
+    def test_a_pool_the_server_dropped_goes_on_a_fresh_connection(self):
+        c, lock = self.stub()
+        self.delay = 0.3                                        # three hellos at once: three kept connections
+        ts = [threading.Thread(target=c.hello, args=({},)) for _ in range(3)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertEqual(len(c._kept), 3)
+        self.delay = 0.0
+        self.drop_all(lock)
+        n = len(self.conns)
+        self.assertEqual(c.hello({})["runner"], "r1")         # no NetworkError
+        self.assertEqual(len(self.conns), n + 1)                # one new connection, not another dead one
+        self.assertEqual(len(c._kept), 1)                       # the dead ones went with the first that failed
+
+    def test_a_kept_tls_connection_closed_without_close_notify_is_tried_again(self):
+        c, lock = self.stub(tls=True)
+        self.assertEqual(c.hello({})["runner"], "r1")
+        self.assertEqual(len(c._kept), 1)
+        self.drop_all(lock)                                     # SSLEOFError on the kept connection's next use
+        self.assertEqual(c.hello({})["runner"], "r1")
+        self.assertEqual(len(self.conns), 2)
 
 
 class Hello(unittest.TestCase):

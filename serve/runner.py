@@ -220,6 +220,12 @@ def device_label(device: dict, app: str = "Strata runner") -> str:
     return _header(f"{app} on {device.get('name') or machine_name()}")
 
 
+# #313: what a request on a kept connection meets when the server or a proxy closed it while it was kept: a reset or
+# an abort, a FIN where the answer should be, and over TLS a FIN without close_notify (SSLEOFError) or a close_notify
+# (SSLZeroReturnError).  A timeout is not one of them: a request that waited that long is not repeated.
+STALE = (ConnectionError, http.client.RemoteDisconnected, ssl.SSLEOFError, ssl.SSLZeroReturnError)
+
+
 class Client:
     """The runner's side of the channel.  Holds the delivery state of the current registration: `channel`, `ack`
     (the highest seq received on it) and `handled` (the seqs handled on it).  `label`: the device's name for the
@@ -258,12 +264,23 @@ class Client:
         for c in conns:
             c.close()
 
-    def _take(self, poll: bool, timeout: float) -> http.client.HTTPConnection:
-        """A kept connection used within KEEP_IDLE_S (the poll's own for a poll), else a new one: its socket is opened
-        by the request."""
+    def _drop_kept(self) -> None:
+        """A kept connection was found closed by the server: so were the other idle ones, most likely (they all go to
+        the same server, and one that stops closes every connection it kept), so none of them is tried."""
+        with self._keep_lock:
+            conns = [c for c, _ in self._kept] + ([self._poll_kept[0]] if self._poll_kept else [])
+            self._kept, self._poll_kept = [], None
+        for c in conns:
+            c.close()
+
+    def _take(self, poll: bool, timeout: float, fresh: bool = False) -> http.client.HTTPConnection:
+        """A kept connection used within KEEP_IDLE_S (the poll's own for a poll), else - or with `fresh` - a new one:
+        its socket is opened by the request."""
         now, conn, stale = time.monotonic(), None, []
         with self._keep_lock:
-            if poll:
+            if fresh:
+                pass
+            elif poll:
                 if self._poll_kept is not None:
                     (conn, used), self._poll_kept = self._poll_kept, None
                     if now - used >= KEEP_IDLE_S:
@@ -339,8 +356,9 @@ class Client:
                  most: int | None = None, poll: bool = False) -> tuple[int, object]:
         """(status, JSON body).  A body over `most` bytes is not sent: it is answered 413 here, as the server would.
         `poll`: the connection can be cut by `abort_poll`.  The connection is kept for the next request (#313); one
-        that the server or a proxy closed while it was kept fails at once, and the request goes once more on a new
-        one (safe for every request here: a reply's `rid`, the poll's ack and the hello make a repeat harmless)."""
+        that the server or a proxy closed while it was kept fails at once (STALE), the other kept ones are dropped
+        with it, and the request goes once more on a new connection (safe for every request here: a reply's `rid`,
+        the poll's ack and the hello make a repeat harmless)."""
         data = None
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -350,7 +368,7 @@ class Client:
         if data is not None:
             headers["Content-Type"] = "application/json"
         for again in (False, True):
-            conn = self._take(poll, timeout)
+            conn = self._take(poll, timeout, fresh=again)
             kept = conn.sock is not None
             try:
                 if poll:
@@ -358,10 +376,13 @@ class Client:
                 conn.request(method, self._prefix + path, body=data, headers=headers)
                 r = conn.getresponse()
                 raw = r.read()
+            except NetworkError:                        # abort_poll came first: the connection is not used again
+                conn.close()
+                raise
             except (OSError, http.client.HTTPException) as e:
                 conn.close()
-                if kept and not again and isinstance(e, (ConnectionError, http.client.RemoteDisconnected)) \
-                        and not (poll and self._polls_ended):
+                if kept and not again and isinstance(e, STALE) and not (poll and self._polls_ended):
+                    self._drop_kept()
                     continue                            # closed while kept: once more, on a new connection
                 raise NetworkError(self.scrub(f"{type(e).__name__}: {e}")) from None
             except ValueError as e:                     # e.g. a header value http.client refuses: its text holds the

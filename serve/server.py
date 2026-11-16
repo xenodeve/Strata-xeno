@@ -5421,6 +5421,15 @@ RUNNER_REPLACED = {"error": {"type": "runner_replaced", "message": "a newer Stra
 # per reply cost 10-14 ms median on this PC (bimodal 0.2-0.5 or 10-25 ms), and 1 RTT more (plus 1-2 for TLS) on a
 # real link.  Every other route stays HTTP/1.0 with Connection: close (end_headers).
 RUNNER_KEEP = {("POST", "/runner/hello"), ("GET", "/runner/next"), ("POST", "/runner/reply")}
+
+
+def route_path(target: str) -> str:
+    """The path do_GET / do_POST route a request target on: the classic app's /classic prefix taken off once, the
+    query cut, trailing slashes dropped.  The keep-alive decision (#313) uses it too, so it keeps exactly the
+    requests the runner's routes answer; a fragment or an absolute-form target ends in the generic 404 and closes."""
+    if target.startswith("/classic/"):
+        target = target[len("/classic"):]
+    return target.split("?")[0].rstrip("/")
 RUNNER_IDLE_S = 90.0            # a kept connection with no next request for this long is closed (the runner's own limit
                                 # is shorter, serve/runner.py KEEP_IDLE_S, so it rarely sends on one the server closed)
 
@@ -5595,7 +5604,7 @@ def make_handler(svc: Service):
             host = self.headers.get("Host")
             # svc.allowed_hosts again: a name the config adds after serve() worked out host_names (xeno #71)
             if svc.key_required() or host_allowed(host, svc.host_names | set(svc.allowed_hosts), "*" in svc.allowed_hosts):
-                if self.request_version == "HTTP/1.1" and (self.command, urlsplit(self.path).path) in RUNNER_KEEP:
+                if self.request_version == "HTTP/1.1" and (self.command, route_path(self.path)) in RUNNER_KEEP:
                     self.protocol_version = "HTTP/1.1"       # #313: the runner's routes may keep the connection
                     self.close_connection = (self.headers.get("Connection") or "").strip().lower() == "close"
                 return True
@@ -5963,9 +5972,10 @@ def make_handler(svc: Service):
             return True
 
         def do_GET(self):
+            target = self.path                               # as it came: _ui_prefix may take /classic off
             if self._ui_prefix():
                 return
-            path = self.path.split("?")[0].rstrip("/")
+            path = route_path(target)
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
@@ -6266,11 +6276,12 @@ def make_handler(svc: Service):
                     self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _do_post(self):
+            target = self.path
             if self.path.startswith("/classic/"):             # the classic app under its prefix (xeno UI S1)
                 self.path = self.path[len("/classic"):]
             if not self._authorized():
                 return
-            path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            path = route_path(target)                    # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
             # #310: what changes the shared engine, every client's settings or what is recorded is an owner key's in
@@ -6742,12 +6753,14 @@ def make_handler(svc: Service):
                     return self._json(200, {"key": key, "name": name.strip(), "role": role})
                 if action == "rename":
                     with svc.runner_hub.names:              # #315: no runner's hello between the key's rename and
-                        if not svc.keys.rename(name, body.get("to"), by=by):        # its runners' move
-                            return self._json(404, missing)
-                        new = body["to"].strip()
-                        svc.runs.move(name, new)            # the holder keeps her runs and prompts; a later key named
-                        svc.broker.move(name, new)          # `name` inherits none of them
-                        svc.runner_hub.move(name, new)      # and her runners (their ids follow the name)
+                        renamed = svc.keys.rename(name, body.get("to"), by=by)      # its runners' move
+                        if renamed:
+                            new = body["to"].strip()
+                            svc.runs.move(name, new)        # the holder keeps her runs and prompts; a later key named
+                            svc.broker.move(name, new)      # `name` inherits none of them
+                            svc.runner_hub.move(name, new)  # and her runners (their ids follow the name)
+                    if not renamed:                         # answered after the lock: a slow client holds no hello
+                        return self._json(404, missing)
                     return self._json(200, {"ok": True, "name": new})
                 if action == "role":
                     role = body.get("role")
@@ -6889,10 +6902,9 @@ def make_handler(svc: Service):
             with svc.runner_hub.names:                      # #315: wholly before or after a rename of the key
                 if self.team:                               # the key's name now, not as it was when the request came
                     who = svc.keys.match(self._given_key())
-                    if who is None:                         # revoked meanwhile
-                        return self._json(401, {"error": {"type": "authentication_error",
-                                                          "message": "missing or wrong API key"}})
-                r = svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
+                r = None if who is None else                     svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
+            if r is None:                                   # revoked meanwhile (answered after the lock)
+                return self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             poll = runner_hub.POLL_MAX_S
             return self._json(200, {"runner": r.id, "who": r.who, "protocol": runner_hub.RUNNER_PROTOCOL,
                                     "poll_s": int(poll) if float(poll).is_integer() else poll, "channel": r.channel})
@@ -7542,8 +7554,10 @@ class Server(ThreadingHTTPServer):
         super().__init__(*args, **kwargs)
 
     def keep(self, sock, kept: bool) -> None:
-        """#313: `sock` waits for its next request (True) or is done (False).  server_close ends the waiting ones, so a
-        stopped server answers no more requests on them."""
+        """#313: `sock` is a kept connection (True: from the end of its first kept answer) or is done (False).
+        server_close shuts every one, whether it waits for its next request or is serving one (a stop ends that
+        request too: the runner sees the connection end and connects again), so a stopped server answers no more
+        requests on them."""
         with self._kept_lock:
             (self._kept.add if kept else self._kept.discard)(sock)
 

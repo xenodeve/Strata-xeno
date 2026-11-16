@@ -284,6 +284,34 @@ class Channel(RunnerBase):
         self.assertEqual(code, 200, body)
         self.assertEqual((body["who"], body["runner"]), ("anna", runner_hub.runner_id("anna", DEV1)))
 
+    def across_a_rename(self, action):
+        """A hello whose key matched as "ann" with `action(keys)` done before its device check."""
+        keys, real_match, once = self.svc.keys, self.svc.keys.match, []
+
+        def match(given):
+            ident = real_match(given)
+            if ident is not None and ident.name == "ann" and not once:
+                once.append(1)
+                action(keys)
+            return ident
+        with mock.patch.object(keys, "match", match):
+            got = self.hello(self.ann)
+        self.assertEqual(once, [1])
+        return got
+
+    def test_a_key_revoked_between_match_and_the_device_check_stays_refused(self):
+        """#315's re-match never lets in what was refused: a revoked key matches nothing again."""
+        self.team()
+        code, body = self.across_a_rename(lambda k: k.revoke("ann", by=OWNER))
+        self.assertEqual((code, body["error"]["type"]), (403, "device_refused"), body)
+
+    def test_a_refused_device_stays_refused_under_the_new_name(self):
+        """The device record moves with the key: a device the owner refused is refused under the new name too."""
+        self.team()
+        self.assertTrue(self.svc.keys.decide_device("ann", DEV1, False, OWNER))
+        code, body = self.across_a_rename(lambda k: k.rename("ann", "anna", by=OWNER))
+        self.assertEqual((code, body["error"]["type"]), (403, "device_refused"), body)
+
     def test_a_hello_inside_a_rename_finds_the_moved_runner(self):
         """#315: a runner that says hello under the new name while the rename is still moving things (its poll met
         the 404 between the key's rename and the runners' move) gets its own runner, moved - not a second one that
@@ -989,6 +1017,20 @@ class KeepAlive(RunnerBase):
         r, body = self.ask(c, "GET", "/v1/models")
         self.assertEqual((r.status, r.version, r.will_close), (200, 10, True), body)
         self.assertEqual(r.getheader("Connection"), "close")
+
+    def test_a_target_the_runner_routes_do_not_answer_closes(self):
+        """Keep-alive is decided on the routers' own path: a fragment or an absolute-form target of a runner path
+        ends in the generic 404, which is HTTP/1.0 with Connection: close like every other route."""
+        self.team()
+        for method, target, body in (("GET", "/runner/next#x", None), ("POST", "/runner/hello#x", hello_body()),
+                                     ("GET", f"http://127.0.0.1:{self.port}/runner/next", None)):
+            c = self.kept()
+            r, got = self.ask(c, method, target, body)
+            self.assertEqual((r.status, r.version, r.will_close, r.getheader("Connection")), (404, 10, True, "close"),
+                             (target, got))
+        c = self.kept()                                         # a target the router does take as the runner's: kept
+        r, got = self.ask(c, "POST", "/runner/hello/", hello_body())
+        self.assertEqual((r.status, r.version, r.will_close), (200, 11, False), got)
 
     def test_the_idle_limit_does_not_bound_the_next_request(self):
         """The idle limit is for the wait between requests: a poll held longer than it is not cut."""
