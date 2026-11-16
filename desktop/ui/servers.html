@@ -65,6 +65,7 @@
 <div class="panel" id="state-panel">
   <h1 id="title"></h1>
   <div class="state"><span class="dot" id="dot"></span><span id="state-text"></span></div>
+  <div class="error" id="notice" role="status" hidden></div>
   <div id="pending" hidden>
     <div class="code" id="code"></div>
     <button id="copy" type="button"></button> <span class="muted" id="copied" hidden></span>
@@ -213,6 +214,8 @@ window.render = function (st) {
   if (!st) return;
   $("dot").className = "dot " + (st.kind || "idle");
   $("state-text").textContent = st.text || "";
+  $("notice").textContent = st.notice || "";
+  $("notice").hidden = !st.notice;
   const pending = st.kind === "pending" && !!st.code;
   $("pending").hidden = !pending;
   $("code").textContent = pending ? st.code : "";

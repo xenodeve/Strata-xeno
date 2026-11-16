@@ -74,7 +74,14 @@ def test_state_view():
                                           message="protocol 3"))["can_open_without_runner"] is True
     assert gui.state_view(state.TrayState("error", message="x"))["can_open_without_runner"] is True
     assert gui.state_view(state.TrayState("refused", refused="key"))["can_open_without_runner"] is False
+    assert v["notice"] == ""
+    assert gui.state_view(s, words.t("window_not_prepared"))["notice"] == words.t("window_not_prepared")
     json.dumps(v)
+
+
+def test_servers_page_shows_the_notice():
+    html = gui.servers_html()
+    assert 'id="notice"' in html and "st.notice" in html
 
 
 # ------------------------------------------------------------------------------------------------ the API
@@ -102,6 +109,7 @@ class FakeController:
     def __init__(self):
         self.calls = []
         self.state = state.TrayState("online", server="lab", who="ann", runner_id="r0123456789abcdef")
+        self.notice = ""
 
     def connect(self, name):
         self.calls.append(("connect", name))
@@ -114,6 +122,7 @@ class FakeController:
 
     def copy_code(self):
         self.calls.append(("copy_code",))
+        return self.state.kind == "pending"
 
 
 def _api(probe_fn=None):
@@ -227,7 +236,10 @@ def test_controller_calls():
     assert api.connect("lab") == {"ok": True}
     assert api.remove("lab") == {"ok": True}
     assert api.open_without_runner() == {"ok": True}
+    assert api.copy_code() == {"ok": False}                  # not pending: nothing copied, the page says nothing
+    ctl.state = state.TrayState("pending", server="lab", code="K7QZ")
     assert api.copy_code() == {"ok": True}
+    ctl.calls.pop()
     assert ctl.calls == [("connect", "lab"), ("remove", "lab"), ("open_without_runner",), ("copy_code",)]
 
 

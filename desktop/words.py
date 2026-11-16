@@ -213,8 +213,9 @@ def _windows_ui_langid() -> int | None:
 LANG: str = pick_lang(_windows_ui_langid())
 
 
-def t(key: str, **kw) -> str:
-    """The words of `key` in the current language, with `kw` filled in.  An unknown key raises KeyError."""
+def t(key: str, /, **kw) -> str:
+    """The words of `key` in the current language, with `kw` filled in (a field may itself be called `key`, as
+    `notice_device_text`'s is).  An unknown key raises KeyError."""
     row = TABLE[key]
     text = row.get(LANG) or row["en"]
     return text.format(**kw) if kw else text

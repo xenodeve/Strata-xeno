@@ -120,10 +120,11 @@ def servers_html() -> str:
     return text.replace("/*WORDS*/{}", inject.js_literal(table)).replace("__LANG__", words.LANG)
 
 
-def state_view(s: state.TrayState) -> dict:
-    """The runner's state as the servers page shows it: the TrayState's fields, the words for it, and whether the
-    page offers "Open without My PC" (an old server, or the runner could not start)."""
-    return {**dataclasses.asdict(s), "text": state.describe(s),
+def state_view(s: state.TrayState, notice: str = "") -> dict:
+    """The runner's state as the servers page shows it: the TrayState's fields, the words for it, whether the page
+    offers "Open without My PC" (an old server, or the runner could not start), and `notice`: what the last step
+    could not do (the server test's words, "the window could not be prepared"), or ""."""
+    return {**dataclasses.asdict(s), "text": state.describe(s), "notice": notice or "",
             "can_open_without_runner": s.kind == "error" or (s.kind == "refused" and s.refused == "runner_protocol")}
 
 
@@ -133,8 +134,8 @@ class ServersApi:
     page).  Its state is kept in `_` attributes: pywebview lists every public attribute of a js_api object, and the
     public objects inside it, as callable from the page.
 
-    `controller` gives `state` (the current TrayState) and `connect(name)`, `remove(name)`, `open_without_runner()`,
-    `copy_code()` (desktop/controller.py, Task 5)."""
+    `controller` gives `state` (the current TrayState), `notice` (words or "") and `connect(name)`, `remove(name)`,
+    `open_without_runner()`, `copy_code() -> bool` (desktop/controller.py `Controller`)."""
 
     def __init__(self, store, device: dict, label: str, controller, probe=probe.test_server):
         self._store, self._device, self._label = store, device, label
@@ -155,7 +156,7 @@ class ServersApi:
 
     def list(self) -> dict:
         return self._safe("list", lambda: {"servers": self._store.public(), "last": self._store.last,
-                                           "state": state_view(self._ctl.state)}, self._fail())
+                                           "state": state_view(self._ctl.state, self._ctl.notice)}, self._fail())
 
     def warning(self, url) -> str | None:
         return self._safe("warning", lambda: urlcheck.plain_http_warning(url), None)
@@ -207,13 +208,12 @@ class ServersApi:
 
     def copy_code(self) -> dict:
         def do():
-            self._ctl.copy_code()
-            return {"ok": True}
+            return {"ok": bool(self._ctl.copy_code())}
         return self._safe("copy_code", do, self._fail())
 
 
 class Gui:
-    """The two windows (the controller's WindowPort, Task 5).  `quitting()` tells the closing handlers whether the
+    """The two windows (desktop/controller.py's WindowPort).  `quitting()` tells the closing handlers whether the
     controller is quitting; `servers_hidden` keeps the servers window hidden too (the selftest)."""
 
     def __init__(self, data: Path | None, api: ServersApi | None, quitting: Callable[[], bool] = lambda: False, *,
@@ -233,6 +233,11 @@ class Gui:
 
     def __repr__(self) -> str:
         return "Gui()"
+
+    def attach(self, api: ServersApi) -> None:
+        """The servers window's API, given before `run` (desktop/__main__.py: the controller needs this Gui, and the
+        API needs the controller)."""
+        self._api = api
 
     # ------------------------------------------------------------------ the loop
     def run(self, start: Callable[[], None]) -> int:
@@ -398,6 +403,10 @@ class Gui:
             with self._flag_lock:
                 self._show_pending = True
             self._app.load_url(inject.app_url(base))
+
+    def show_app(self) -> None:
+        """The app window as it is (the tray's Open): no reload, so an answer being written goes on."""
+        self._app.show()
 
     def hide_app(self) -> None:
         with self._flag_lock:
