@@ -134,6 +134,15 @@ class Users(unittest.TestCase):
                 if t1.split(".")[0] == t2.split(".")[0]:
                     self.assertEqual(m2[:len(m1)], m1)
 
+    def test_short_mode_extends_one_long_turn(self):
+        items = WB.series_items("short", None, "01/234", 0, WB.workload())["solo"]
+        self.assertEqual([t for t, _ in items], [f"short.{k}" for k in range(WB.SHORT_N + 1)])
+        self.assertEqual(items[0][1], dict(WB.workload())[WB.SHORT_BASE])
+        for (_, a), (_, b) in zip(items, items[1:]):
+            self.assertEqual(b[:len(a)], a)
+            self.assertEqual(len(b), len(a) + 2)
+            self.assertLess(len(b[-1]["content"]), 2000)       # a short read: ~20 lines
+
     def test_system_tag_and_alternation(self):
         tagged = WB.workload("w2b")
         self.assertTrue(tagged[0][1][0]["content"].endswith("Session group: w2b."))

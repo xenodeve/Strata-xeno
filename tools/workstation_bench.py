@@ -25,6 +25,8 @@ two rounds each mode is first once per arm; `mode_pos` in each row):
   w1   one user: the 23 turns in agent_turns_bench's order
   w2a  two users alternating turn by turn: A, B, A, B, ... (the longer series ends alone)
   w2b  two users at once: each sends its next turn as soon as its previous answer arrived
+  short one long turn (installer-fr.0, ~37K tokens), then 4 follow-ups that each add ~200-250 tokens (a tool call and
+       20 lines of setup.py): short prompt reads on a long cached prefix
 Users (--split, default 01/234): user A has sessions 0-1 (server-option, expert-cache: 10 turns), user B sessions 2-4
 (installer-fr, cuda-kernel, tokenizer-fr: 13 turns); ~150K tokens of new prompt each (characters / 4), so neither
 user is idle for most of a w2b series.  Each session has its own task after the shared system prompt and tools, so the
@@ -73,7 +75,9 @@ import agent_turns_bench as atb  # noqa: E402
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 WIN = os.name == "nt"
-MODES = ("w1", "w2a", "w2b")
+MODES = ("w1", "w2a", "w2b", "short")
+SHORT_BASE = "installer-fr.0"      # the short mode's long turn (~37K tokens)
+SHORT_FILE, SHORT_LINES, SHORT_N = "setup.py", 20, 4
 GIB = 1024 ** 3
 
 # the server record's fields kept per request (serve/server.py, Service.run's history record)
@@ -779,8 +783,28 @@ def plan(arms: list[Arm], rounds: int) -> list[tuple[int, Arm]]:
     return out
 
 
-def series_items(mode: str, tag: str | None, split: str, max_turns: int, base=None):
+def short_items(work, root: Path | None = None, n: int = SHORT_N) -> list[tuple[str, list[dict]]]:
+    """The live shape of a short prompt read on a long cached prefix (#318: 205-220 new tokens at 35-46K cached took
+    3.4-3.7 s): one long turn (SHORT_BASE), then n follow-ups that each add one tool call and a SHORT_LINES-line result
+    (setup.py, read from `root`), so each reads only those ~200-250 tokens after the turn before it."""
+    msgs = dict(work)[SHORT_BASE]
+    lines = ((root or atb.ROOT) / SHORT_FILE).read_text(encoding="utf-8", errors="replace").splitlines()
+    out = [("short.0", msgs)]
+    for k in range(1, n + 1):
+        cid = f"call_short_{k}"
+        part = "\n".join(lines[(k - 1) * SHORT_LINES:k * SHORT_LINES])
+        msgs = msgs + [{"role": "assistant", "content": f"Reading the next part of {SHORT_FILE}.",
+                        "tool_calls": [{"id": cid, "type": "function", "function": {
+                            "name": "read_file", "arguments": json.dumps({"path": SHORT_FILE})}}]},
+                       {"role": "tool", "tool_call_id": cid, "content": part}]
+        out.append((f"short.{k}", msgs))
+    return out
+
+
+def series_items(mode: str, tag: str | None, split: str, max_turns: int, base=None, root: Path | None = None):
     work = workload(tag, base)
+    if mode == "short":
+        return {"solo": short_items(work, root)}
     users = {"solo": work} if mode == "w1" else split_users(work, split)
     return {u: v[:max_turns] for u, v in users.items()} if max_turns else users
 
@@ -842,7 +866,7 @@ def main(argv=None) -> int:
     print(f"[wsb] run {run_id}: {len(boots)} boots, modes {modes}, arms {[x.name for x in arms]}, rounds {a.rounds}, "
           f"port {a.port}, work dir {work_dir}, workload {wl_hash} from {workload_root}", flush=True)
     for m in modes:
-        items = series_items(m, tags[m], a.split, a.max_turns, base_work)
+        items = series_items(m, tags[m], a.split, a.max_turns, base_work, workload_root)
         print(f"[wsb]   {m}: " + ", ".join(f"user {u} {len(v)} turns ({v[0][0]} .. {v[-1][0]})" for u, v in items.items()),
               flush=True)
     if a.dry_run:
@@ -903,7 +927,7 @@ def main(argv=None) -> int:
             elog = Path(cfg["log"])
             log_size = lambda: elog.stat().st_size if elog.exists() else 0   # noqa: E731
             for mode_pos, mode in enumerate(boot_modes):
-                items = series_items(mode, tags[mode], a.split, a.max_turns, base_work)
+                items = series_items(mode, tags[mode], a.split, a.max_turns, base_work, workload_root)
                 mk = lambda user, seq, m=mode: f"wsb/{run_id}/{arm.name}/r{rnd}/{m}/{user}/{seq:03d}"   # noqa: E731
                 on_row = lambda r, m=mode: (write(raw, {"run": run_id, "arm": arm.name, "round": rnd, "mode": m, **r}),   # noqa: E731
                                             print(f"  {m} {r['user']} {r['tag']:16s} wall {r['wall_s']:7.2f} s  "
@@ -915,7 +939,7 @@ def main(argv=None) -> int:
                     rows = run_concurrent(a.port, items, mk, max_new=a.max_new, seed=a.seed, log_size=log_size,
                                           on_row=on_row)
                 else:
-                    seq_items = [(u, it) for u, v in items.items() for it in v] if mode == "w1" else alternate(items)
+                    seq_items = [(u, it) for u, v in items.items() for it in v] if mode in ("w1", "short") else alternate(items)
                     rows = run_sequential(a.port, seq_items, mk, max_new=a.max_new, seed=a.seed, log_size=log_size,
                                           on_row=on_row)
                 mark_overlap(rows)
