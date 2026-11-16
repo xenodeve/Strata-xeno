@@ -146,10 +146,11 @@ class States(unittest.TestCase):
 
     def test_no_callback_unchanged(self):
         """The lines of this script as `python -m serve.runner` printed them before on_state existed (recorded from
-        the code at 9e2a8104)."""
+        the code at 9e2a8104), but the pending line's retry words: since #310 part 3 task 6 the pending runner says
+        hello every PENDING_RETRY_S for PENDING_FAST_S, then every PENDING_SLOW_S, and says so."""
         before = [
             "[runner] this PC waits for the owner's approval: the owner sees it with the code K7QZ. Trying again every "
-            "0.01 s.",
+            "0.01 s (every 10 s after 2 min).",
             "[runner] connected to http://srv.example as owner; this PC's runner id is r1 - paste it in the web app "
             "under Settings > This browser's runner",
             "[runner] the server cannot be reached (down ***); trying again",

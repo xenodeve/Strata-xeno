@@ -76,6 +76,8 @@ def test_child_processes_sees_a_child():
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], creationflags=0x08000000)
     try:
         assert child.pid in [c["pid"] for c in selftest.child_processes(os.getpid())]
+        assert child.pid in [c["pid"] for c in selftest.descendants(os.getpid())]
+        assert child.pid not in [c["pid"] for c in selftest.descendants(os.getpid(), skip=("python.exe",))]
         assert (os.getpid(), os.getppid()) in [(p, parent) for p, parent, _ in selftest.processes()]
     finally:
         child.kill()
@@ -107,6 +109,33 @@ def test_run_hidden_waits_for_the_selftest_after_the_loop_ends(tmp_path, monkeyp
     monkeypatch.setattr(gui, "Gui", LoopGui)
     monkeypatch.setattr(selftest, "run", selftest_run)
     assert selftest.run_hidden("http://h:1", tmp_path, TOKEN, tmp_path / "selftest.json") == 0
+
+
+def test_run_hidden_loop_failure_is_in_the_file(tmp_path, monkeypatch):
+    """The selftest passed but the web view's loop ended with 4: exit 5, and the file says so (not "exit 0")."""
+    from desktop import gui
+
+    class FailingGui:
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self, start):
+            start()
+            return 4
+
+        def destroy(self):
+            pass
+
+    def selftest_run(server, data, token, result, window):
+        r = selftest.Result(result, token)
+        r.add("store", True, "ok", 0)
+        return r.finish(0)
+    monkeypatch.setattr(gui, "Gui", FailingGui)
+    monkeypatch.setattr(selftest, "run", selftest_run)
+    path = tmp_path / "selftest.json"
+    assert selftest.run_hidden("http://h:1", tmp_path, TOKEN, path) == 5
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert (doc["exit"], doc["steps"][-1]["step"], doc["steps"][-1]["ok"]) == (5, "webview2", False)
 
 
 def test_no_token_fails_before_anything(tmp_path):
@@ -211,6 +240,11 @@ def test_selftest_passes_in_process(team, tmp_path):
     from serve import runner
     data = tmp_path / "d"
     result = data / "selftest.json"
+    # a process the runner owns, so the quit step sees Quit end one: an MCP server from the runner's runner.json
+    root = Path(__file__).resolve().parents[1]
+    (data / "runner").mkdir(parents=True)
+    (data / "runner" / "runner.json").write_text(json.dumps({"mcp_servers": {"probe": {
+        "command": sys.executable, "args": [str(root / "serve" / "mcp_fake_server.py")]}}}), encoding="utf-8")
     seen: dict = {}
     stop = threading.Event()
     approver = threading.Thread(target=_approve_when_pending, args=(team, result, seen, stop), daemon=True)
@@ -243,6 +277,10 @@ def test_selftest_passes_in_process(team, tmp_path):
     assert label.startswith("Strata Desktop on ")
     assert steps["runner"]["detail"]["who"] == "ann" and steps["runner"]["detail"]["device"] == device["id"]
     assert steps["runners"]["detail"]["device"] == device["id"]
+    quit_detail = steps["quit"]["detail"]
+    assert "python.exe" in [c["name"].lower() for c in quit_detail["children_before"]], quit_detail   # the MCP server
+    assert quit_detail["checks"]["runner_children_ended"] is True and quit_detail["children_left"] == []
+    assert quit_detail["checks"]["tray_icon_removed"] is None and "not exercised" in quit_detail["tray"]
     # after Quit no poll of ann's runner stays held on the server (it still lists the runner as online for OFFLINE_S
     # after its last poll: runner_hub.Runner.online).  The server learns of a poll the runner cut only when that poll
     # ends (POLL_MAX_S, 2 s here), so it is given that long.
@@ -253,6 +291,16 @@ def test_selftest_passes_in_process(team, tmp_path):
             break
         time.sleep(0.05)
     assert held and not any(held)
+
+
+def test_a_runner_that_never_gets_in_still_quits_before_done(team, tmp_path):
+    """Nobody approves: the runner step fails after runner_wait, then Quit runs and is recorded, and only then is the
+    file `done` (a reader trusting `done` never misses the quit step)."""
+    result = tmp_path / "d" / "selftest.json"
+    assert selftest.run(team.url, tmp_path / "d", team.ann, result, None, runner_wait=1.5) == 5
+    doc = json.loads(result.read_text(encoding="utf-8"))
+    assert [(s["step"], s["ok"]) for s in doc["steps"]][-2:] == [("runner", False), ("quit", True)]
+    assert (doc["done"], doc["exit"]) == (True, 5)
 
 
 def test_selftest_fails_on_wrong_token(team, tmp_path):

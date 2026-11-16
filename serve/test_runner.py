@@ -644,6 +644,33 @@ class Main(Base):
         self.assertEqual(codes, [0])
         self.assertFalse(any(cat in s for s in self.said))
 
+    def test_pending_runner_says_hello_less_often_after_a_while(self):
+        """PENDING_RETRY_S for the first PENDING_FAST_S of waiting, then PENDING_SLOW_S (#310 part 3 task 6: a short
+        first interval, so the runner is online soon after the owner approves, without a hello every 2 s for ever)."""
+        self.start_routing()
+        cat = self.svc.keys.create("cat", "guest")
+        hellos = []
+        real = runner_mod.Client.hello
+
+        def hello(client, info):
+            hellos.append(time.monotonic())
+            return real(client, info)
+        with mock.patch.object(runner_mod, "PENDING_RETRY_S", 0.1), \
+                mock.patch.object(runner_mod, "PENDING_FAST_S", 0.5), \
+                mock.patch.object(runner_mod, "PENDING_SLOW_S", 0.6), \
+                mock.patch.object(runner_mod.Client, "hello", hello):
+            t, codes, stop = self.main("--key", cat, device=DEV3)
+            self.assertTrue(wait_for(lambda: len(hellos) >= 9, timeout=10), hellos)
+            stop.set()
+            t.join(10)
+        gaps = [b - a for a, b in zip(hellos, hellos[1:])]
+        start = hellos[0]
+        fast = [g for a, g in zip(hellos, gaps) if a - start < 0.3]
+        slow = [g for a, g in zip(hellos, gaps) if a - start > 0.7]
+        self.assertTrue(fast and max(fast) < 0.4, gaps)                  # every 0.1 s at first
+        self.assertTrue(slow and min(slow) >= 0.55, gaps)                # then every 0.6 s
+        self.assertTrue(any("Trying again every 0.1 s (every 0.6 s after" in s for s in self.said), self.said)
+
     def test_runner_exits_on_refused_device(self):
         self.start_routing()
         cat = self.svc.keys.create("cat", "guest")

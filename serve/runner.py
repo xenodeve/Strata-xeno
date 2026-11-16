@@ -50,7 +50,12 @@ from serve import memory as memory_mod, page_routes, permissions, runner_hub, sh
 from serve.mcp import McpCancelled, McpError, hub_from_config
 
 RETRY_MAX_S = 30.0              # the longest wait between tries after a network error (1, 2, 4 ... 30 s)
-PENDING_RETRY_S = 10.0          # how often a runner whose device waits for the owner's approval says hello again
+PENDING_RETRY_S = 2.0           # how often a runner whose device waits for the owner's approval says hello again: it
+                                # is online only at its next hello after the approval, so this is the most the user
+                                # waits after approving (#310 part 3 task 6, approval right after a pending hello:
+                                # 9.78 / 9.98 / 10.0 s at 10 s, 1.91 / 1.88 / 2.03 s at 2 s)
+PENDING_FAST_S = 120.0          # ... for this long; after it, every PENDING_SLOW_S (an approval nobody gives soon)
+PENDING_SLOW_S = 10.0
 MAX_JOBS = 16                   # jobs run at once; the others wait their turn
 RUNS_KEPT = 50                  # run keys (one per message of a chat) whose policy and checkpoint are kept
 REPLY_MAX = 32 << 20            # the largest reply the server takes (serve/server.py RUNNER_REPLY_MAX): a larger one is
@@ -683,13 +688,13 @@ class RunnerLoop:
     # -------------------------------------------------------------------------------------------- polling
     def run(self) -> int:
         """Until `stop`: 0; EXIT_REFUSED when the server refuses this runner."""
-        failures, gones, pending = 0, 0, None
+        failures, gones, pending, pending_since = 0, 0, None, None
         while not self.stop.is_set() and not getattr(self.client, "polls_ended", False):    # abort_poll: no spin
             said_hello = False
             try:
                 if not self.connected.is_set() or self._groups_changed():
                     self._hello()
-                    pending, said_hello = None, True
+                    pending, pending_since, said_hello = None, None, True
                 wait = min(self.poll_s, STARTING_POLL_S) if self.executor.starting() else self.poll_s
                 msgs = self.client.next(self.id, self.instance, wait)
                 if failures:
@@ -705,12 +710,16 @@ class RunnerLoop:
                     self.stop.wait(min(RETRY_MAX_S, 2.0 ** (gones - 2)))
             except Pending as e:
                 self.connected.clear()
+                now = time.monotonic()
+                if pending_since is None:
+                    pending_since = now
                 if pending != e.code:
                     pending = e.code
                     _say(f"[runner] this PC waits for the owner's approval: the owner sees it with the code {e.code}. "
-                         f"Trying again every {PENDING_RETRY_S:g} s.")
+                         f"Trying again every {PENDING_RETRY_S:g} s (every {PENDING_SLOW_S:g} s after "
+                         f"{PENDING_FAST_S / 60:g} min).")
                 self._state("pending", {"code": e.code})      # each time: a network error may have come in between
-                self.stop.wait(PENDING_RETRY_S)
+                self.stop.wait(PENDING_RETRY_S if now - pending_since < PENDING_FAST_S else PENDING_SLOW_S)
             except Refused as e:
                 why = {"key": "the key was refused (wrong or revoked)",
                        "device_refused": "the owner refused this PC as a device",

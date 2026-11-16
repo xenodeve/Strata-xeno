@@ -13,16 +13,21 @@ window, then the app loaded), and the Controller's Quit.  Steps, each `{"step", 
     pending  only when this PC waits for the owner: written at once, with "code", so a harness can approve it
     runner   the runner said hello (online) within 120 s: who, its runner id, this PC's device and label
     window   the app window: the inject answered true and the app was opened; on the page, the four values (the token
-             compared inside the page, never read back), the origin, #root mounted, and 5 s after the load no
-             [data-device-gate] (the waiting screen); the servers window holds none of the values.  "not checked"
-             (ok null) with no window (the in-process test)
+             compared inside the page, never read back), the origin, #root mounted, 5 s after the load no
+             [data-device-gate] (the waiting screen), and the page let in: a GET /props fetched from inside the page
+             with its own key and device answers 200; the servers window holds none of the values (null when its
+             page has no storage at all).  "not checked" (ok null) with no window (the in-process test)
     runners  GET /runners with the token and this PC's device: its own runner is online, on this device, and its id is
              the one the page was given
-    quit     Controller.quit(): every runner, job, pending-watch and event thread ended, no child process left (but
-             the web view's own), the clear's read-back shows no strata.apikey on the server's origin, servers.json
-             `injected` empty, and no tray icon (the selftest's tray is a recorder; pystray is never loaded)
+    quit     Controller.quit(): every runner, job, pending-watch and event thread ended; every process the app had
+             started before Quit (its descendants but the web view's: the runner's MCP servers from its runner.json,
+             a shell) gone after it, by PID (null, "not exercised", when there was none); the clear's read-back on
+             the server's origin shows no strata.apikey and the device kept; servers.json `injected` empty.  The
+             tray is not exercised (null): the selftest's tray is a recorder, a real icon would show on the display
 
-`selftest.json` never holds the token: every value is scrubbed before it is written.
+A check that is null is not a failure; its detail says why.  The step's `ok` is true only when no check is false.
+`selftest.json` never holds the token: every value is scrubbed before it is written.  `done` is written last, after
+the quit step.  Each run with a fresh --data-dir is a new device on the server's key (a pending row there).
 """
 from __future__ import annotations
 
@@ -31,7 +36,6 @@ import json
 import logging
 import os
 import ssl
-import sys
 import threading
 import time
 from pathlib import Path
@@ -50,6 +54,7 @@ RUNNER_WAIT_S = 120.0                   # for the runner's hello (the owner appr
 OPEN_WAIT_S = 30.0                      # from online to the app window opened
 LOAD_WAIT_S = 30.0                      # for the app's page to load, and again for #root to mount
 GATE_WAIT_S = 5.0                       # after the load: the waiting screen would be up by then
+ADMIT_WAIT_S = 10.0                     # for the page's own GET /props to answer
 QUIT_WAIT_S = 15.0
 SETTLE_S = 5.0                          # for threads and child processes to end after Quit
 WORKER_THREADS = ("desktop-runner", "runner-job", "runner-poll", "desktop-pending", "desktop-events", "desktop-tray")
@@ -328,6 +333,17 @@ READ_BACK_SCRIPT = ("(function(){try{return JSON.stringify({origin:location.orig
                     "}catch(e){return JSON.stringify({error:String(e&&e.name)})}})()")
 
 
+def _admit_script(prefix: str) -> str:
+    """Starts a fetch of `<origin><prefix>/props` from inside the page with the page's own key, device and name (read
+    from its storage there: the token never comes back), and puts its status (or -1) in `window.__strataSelftest`."""
+    return ("(function(){try{var s=window.localStorage,v=function(k){return JSON.parse(s.getItem(k))};"
+            "window.__strataSelftest=null;fetch(location.origin+" + inject.js_literal(prefix + "/props") + ",{cache:"
+            "\"no-store\",credentials:\"omit\",headers:{\"Authorization\":\"Bearer \"+v(\"strata.apikey\"),"
+            "\"X-Strata-Device\":v(\"strata.device\"),\"X-Strata-Device-Name\":v(\"strata.deviceName\")}}).then("
+            "function(r){window.__strataSelftest=r.status},function(){window.__strataSelftest=-1});return true}"
+            "catch(e){return false}})()")
+
+
 def _json(v) -> dict:
     try:
         out = json.loads(v) if isinstance(v, str) else None
@@ -376,7 +392,7 @@ def run(server: str, data_dir: Path, token: str, result_path: Path, window=None,
         ok, detail, ms = _timed(do_store)
         res.add("store", ok, detail, ms)
         if not ok:
-            return res.finish(EXIT_FAILED)
+            raise _Stop
         store = store_box[0]
 
         # probe -------------------------------------------------------------------------------------------------
@@ -389,7 +405,7 @@ def run(server: str, data_dir: Path, token: str, result_path: Path, window=None,
         ok, detail, ms = _timed(do_probe)
         res.add("probe", ok, detail, ms)
         if not ok:
-            return res.finish(EXIT_FAILED)
+            raise _Stop
 
         # runner ------------------------------------------------------------------------------------------------
         from desktop.controller import Controller
@@ -404,7 +420,7 @@ def run(server: str, data_dir: Path, token: str, result_path: Path, window=None,
         s = ctl.state
         if s.kind == "idle":                                   # the connect stopped before a runner started
             res.add("runner", False, ctl.notice or "no runner was started", (time.monotonic() - t0) * 1000)
-            return res.finish(EXIT_FAILED)
+            raise _Stop
         end, pending_told = t0 + runner_wait, False
         while True:
             s = tray.wait(lambda x: x.kind in ("online", "refused", "error") or (x.kind == "pending" and not
@@ -422,7 +438,7 @@ def run(server: str, data_dir: Path, token: str, result_path: Path, window=None,
                                    "label": label, "no_shell": s.no_shell, "message": s.message or None},
                 (time.monotonic() - t0) * 1000)
         if not online:
-            return res.finish(EXIT_FAILED)
+            raise _Stop
 
         # window ------------------------------------------------------------------------------------------------
         page: dict = {}
@@ -449,14 +465,39 @@ def run(server: str, data_dir: Path, token: str, result_path: Path, window=None,
                           "page_runner": page.get("runner") if window is not None else "not checked"}
         ok, detail, ms = _timed(do_runners)
         res.add("runners", ok, detail, ms)
+    except _Stop:                                               # a failed step is already recorded
+        pass
     except Exception as e:  # noqa: BLE001 - the selftest reports, it never crashes
         log.error("the selftest raised %s", type(e).__name__, exc_info=True)
         res.add("crash", False, f"{type(e).__name__}: {e}", 0)
     finally:
         if ctl is not None:
-            ok, detail, ms = _timed(lambda: _quit_step(ctl, watched, tray, data_dir, window is not None))
+            ok, detail, ms = _timed(lambda: _quit_step(ctl, watched, tray, server, data_dir, window is not None))
             res.add("quit", ok, detail, ms)
-    return res.finish(exit_code(res.steps))
+    return res.finish(exit_code(res.steps))                     # `done` only once the quit step is in the file
+
+
+class _Stop(Exception):
+    """A step failed: the selftest goes on to Quit (when a runner was started) and its end."""
+
+
+def _verdict(checks: dict) -> bool:
+    """Every check True, or None ("not applicable" / "not exercised", said in its detail); False fails."""
+    return all(v is True or v is None for v in checks.values())
+
+
+def descendants(pid: int, skip: tuple[str, ...] = (WEBVIEW_PROCESS,)) -> list[dict]:
+    """`pid`'s descendants as {"pid", "name"}, the subtrees of the processes named in `skip` left out (the web view's
+    own processes end with its windows, not with Quit)."""
+    procs, out, seen, todo = processes(), [], {pid}, [pid]
+    while todo:
+        p = todo.pop()
+        for child, parent, name in procs:
+            if parent == p and child not in seen and name.lower() not in skip:
+                seen.add(child)
+                out.append({"pid": child, "name": name})
+                todo.append(child)
+    return out
 
 
 def _watchdog_exit(code: int) -> None:
@@ -478,6 +519,17 @@ def _window_step(window, watched: Watched, ctl, server: str, token: str, device:
     time.sleep(max(0.0, gate_wait - (time.monotonic() - t_loaded)))
     gate = _json(window.evaluate("app", GATE_SCRIPT))
     servers_clean = window.evaluate("servers", SERVERS_SCRIPT)
+    # The page let in, positively: from inside the page, a fetch of the gated GET /props with the headers built from
+    # the page's own storage (as lib/device.ts apiHeaders sends them).  Only its status comes back.
+    admitted = None
+    if window.evaluate("app", _admit_script(urlsplit(server).path.rstrip("/"))) is True:
+        end = time.monotonic() + ADMIT_WAIT_S
+        while time.monotonic() < end:
+            admitted = window.evaluate("app", "window.__strataSelftest")
+            if admitted is not None:
+                break
+            time.sleep(0.1)
+    hidden = window.evaluate("app", "document.hidden")
 
     def decoded(key):
         try:
@@ -495,33 +547,49 @@ def _window_step(window, watched: Watched, ctl, server: str, token: str, device:
         "runner": decoded("strata.runner") == s.runner_id,
         "root_mounted": isinstance(read.get("root"), int) and read["root"] > 0,
         "no_device_gate": gate.get("gate") is False,
-        "servers_window_has_none": servers_clean in (True, "no storage"),
+        "page_admitted": admitted == 200,
+        # the servers window's html= page has no localStorage at all: nothing to hold the values, so not applicable
+        "servers_window_has_none": None if servers_clean == "no storage" else servers_clean is True,
     }
-    return all(checks.values()), {"checks": checks, "origin": read.get("origin"), "root": read.get("root"),
-                                  "servers_window": servers_clean, "error": read.get("error")}
+    return _verdict(checks), {"checks": checks, "origin": read.get("origin"), "root": read.get("root"),
+                              "props_from_page": admitted, "document_hidden": hidden,
+                              "servers_window": servers_clean, "error": read.get("error")}
 
 
-def _quit_step(ctl, watched: Watched, tray: QuietTray, data_dir, with_window: bool) -> tuple:
+def _quit_step(ctl, watched: Watched, tray: QuietTray, server: str, data_dir, with_window: bool) -> tuple:
     from desktop.servers import ServerStore
+    me = os.getpid()
+    before = descendants(me)                    # the runner's processes (its MCP servers, a shell): Quit must end them
     ctl.quit()
     done = ctl.wait_quit(QUIT_WAIT_S)
     threads = _settle(_worker_threads, SETTLE_S)
-    me = os.getpid()
-    children = _settle(lambda: [c for c in child_processes(me) if c["name"].lower() != WEBVIEW_PROCESS], SETTLE_S)
+    pids = {c["pid"] for c in before}
+    left = _settle(lambda: [{"pid": p, "name": n} for p, _, n in processes() if p in pids], SETTLE_S)
+    later = [c for c in descendants(me) if c["pid"] not in pids]
     injected = ServerStore(paths.servers_file(Path(data_dir))).injected
-    checks = {"quit_finished": done, "no_worker_thread": threads == [], "no_child_process": children == [],
-              "no_tray_icon": "pystray" not in sys.modules and tray.stopped}
-    detail = {"threads": threads, "children": children, "injected": injected, "tray_notices": tray.notices}
+    checks = {"quit_finished": done, "no_worker_thread": threads == [],
+              # by PID: every process the app had started before Quit (but the web view's) is gone after it.  With
+              # none started (no MCP server in runner.json, no job) there is nothing to see end: not exercised.
+              "runner_children_ended": (left == [] and later == []) if before else None,
+              # the selftest's tray is a recorder: a real icon would show on the developer's display
+              "tray_icon_removed": None}
+    detail = {"threads": threads, "children_before": before, "children_left": left, "children_new": later,
+              "injected": injected, "tray": "not exercised: the selftest's tray is a recorder (no icon is made)",
+              "tray_notices": tray.notices}
+    if not before:
+        detail["runner_children"] = "not exercised: the runner had started no process"
     if with_window:
         back = watched.read_back if isinstance(watched.read_back, dict) else {}
         checks["token_cleared"] = bool(watched.clears) and watched.clears[-1] is True \
-            and back.get("apikey_absent") is True
+            and back.get("apikey_absent") is True and back.get("origin") == inject.origin(server) \
+            and back.get("device_kept") is True
         checks["injected_empty"] = injected == []
         detail.update({"read_back": back, "clears": watched.clears})
     else:
+        checks["token_cleared"] = None
         detail["token_cleared"] = "not checked: no window"
     detail["checks"] = checks
-    return all(checks.values()), detail
+    return _verdict(checks), detail
 
 
 # ------------------------------------------------------------------------------------------------ the hidden window
@@ -550,4 +618,6 @@ def run_hidden(server: str, data: Path, token: str, result: Path) -> int:
         return fail(result, "quit", "the selftest did not end after the windows closed", keep=True)
     if "code" not in out:
         return fail(result, "webview2", f"the hidden web view did not start (exit {rc})", keep=True)
-    return out["code"] if rc == 0 else EXIT_FAILED
+    if rc != 0:                                                 # the file must say what the exit code says
+        return fail(result, "webview2", f"the web view's loop ended with {rc}", keep=True)
+    return out["code"]

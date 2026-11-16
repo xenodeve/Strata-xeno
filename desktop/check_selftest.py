@@ -9,10 +9,13 @@
    exe talks to this PC's own non-loopback address (`--address`, by default the first one found) and is a device that
    waits for the owner, as over the VPN.  The owner's calls stay on 127.0.0.1.
 3. POST /keys: the first named key (owner) and a guest `ann`.
-4. The exe: `--selftest --server http://ADDRESS:PORT --data-dir <temp>\\d`, with ann's key in
+4. `<temp>\\d\\runner\\runner.json` with one MCP server (serve/mcp_fake_server.py on that python): a process the
+   runner owns, which the selftest's quit step must see end with Quit (by PID).
+   The exe: `--selftest --server http://ADDRESS:PORT --data-dir <temp>\\d`, with ann's key in
    STRATA_DESKTOP_SELFTEST_TOKEN and STRATA_HOME / APPDATA in the temp folder, in its environment only.
 5. When selftest.json shows `pending`, the owner approves the device with that code (GET /devices/pending, POST
-   /devices).  While the exe runs, its process tree and ann's runner (GET /runners) are watched.
+   /devices).  While the exe runs, its process tree and ann's runner (GET /runners) are watched; the time from the
+   approval to the runner first listed online (asked every 50 ms meanwhile) is `approval_to_runner_online_s`.
 6. The exe's exit (cap 180 s); then before anything is ended: the processes of the exe's tree or with the temp folder
    in their command line that are still there; the owner's view of ann's devices and runners; whether the token's
    bytes are still in the web view's profile files (LevelDB may keep a removed value until compaction: counted, not
@@ -230,6 +233,12 @@ def main(argv: list[str] | None = None) -> int:
         ann = body["key"]
         keys.append(ann)
 
+        # A child the runner owns: an MCP server (serve/mcp_fake_server.py, on the server's python) in the runner's
+        # own runner.json, so the selftest's quit step sees a real process of the runner end with Quit.
+        (data / "runner").mkdir(parents=True)
+        (data / "runner" / "runner.json").write_text(json.dumps({"mcp_servers": {"probe": {
+            "command": str(server_python()), "args": [str(ROOT / "serve" / "mcp_fake_server.py")]}}}),
+            encoding="utf-8")
         env = {k: v for k, v in os.environ.items() if k != TOKEN_ENV}
         env.update({TOKEN_ENV: ann, "STRATA_HOME": str(tmp / "home"), "APPDATA": str(tmp / "appdata")})
         t0 = time.monotonic()
@@ -238,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
                                stderr=subprocess.DEVNULL, creationflags=NO_WINDOW | NEW_GROUP)
         summary["exe_pid"] = app.pid
         result_path = data / "selftest.json"
-        approved, runner_seen = None, None
+        approved, runner_seen, t_approved, t_online = None, None, None, None
         while app.poll() is None and time.monotonic() - t0 < EXE_CAP_S:
             for pid, name in tree(app.pid):
                 seen_tree.setdefault(pid, name)
@@ -251,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                 if row is not None:
                     code, _ = req(a.port, "POST", "/devices", owner, {"key": "ann", "device": row["device"],
                                                                       "approve": True})
+                    t_approved = time.monotonic()
                     approved = {"code": codes[0], "device": row["device"], "label": row.get("label"),
                                 "addr": row.get("addr"), "answer": code,
                                 "after_s": round(time.monotonic() - t0, 1)}
@@ -258,7 +268,13 @@ def main(argv: list[str] | None = None) -> int:
             for r in (body or {}).get("runners", []):
                 if r.get("who") == "ann" and r.get("online"):
                     runner_seen = {k: r.get(k) for k in ("id", "who", "device", "online", "machine", "shell")}
-            time.sleep(0.25)
+                    if t_online is None:
+                        t_online = time.monotonic()
+            # between the approval and the runner's first hello that got in: asked every 50 ms, so the wait the
+            # user sees after approving is measured to that resolution
+            time.sleep(0.05 if t_approved is not None and t_online is None else 0.25)
+        if t_approved is not None and t_online is not None:
+            summary["approval_to_runner_online_s"] = round(t_online - t_approved, 2)
         summary["exe_seconds"] = round(time.monotonic() - t0, 1)
         summary["exe_exit"] = app.poll()
         summary["approved"] = approved
@@ -287,7 +303,8 @@ def main(argv: list[str] | None = None) -> int:
                                     for r in (body or {}).get("runners", [])]
         summary["token_bytes_in_profile_files"] = token_in_files(data / "webview", ann)
         log = data / "desktop.log"
-        summary["token_in_desktop_log"] = log.is_file() and ann in log.read_text(encoding="utf-8", errors="replace")
+        summary["token_in_desktop_log"] = any(ann in f.read_text(encoding="utf-8", errors="replace")
+                                              for f in data.glob("desktop.log*"))
         summary["token_in_selftest_json"] = result_path.is_file() and ann in result_path.read_text(encoding="utf-8")
         if a.out:
             out = Path(a.out)
@@ -312,10 +329,15 @@ def main(argv: list[str] | None = None) -> int:
     s = summary.get("selftest") or {}
     steps = {x.get("step"): x for x in s.get("steps", [])}
     devices = summary.get("ann_devices") or []
+    want = {"store", "probe", "runner", "window", "runners", "quit"} | ({"pending"} if summary.get("approved") else set())
+    quit_detail = (steps.get("quit") or {}).get("detail") or {}
     checks = {
         "exe_exit_0": summary.get("exe_exit") == 0,
         "selftest_ok": s.get("ok") is True and s.get("exit") == 0,
-        "every_step_ok": bool(steps) and all(x.get("ok") is True for x in steps.values()),
+        "every_step_ok": want <= set(steps) and all(x.get("ok") is True for x in steps.values()),
+        # the runner's MCP server was running before Quit and gone after it (the selftest's own check, by PID)
+        "runner_child_ended_by_quit": bool(quit_detail.get("children_before"))
+                                      and (quit_detail.get("checks") or {}).get("runner_children_ended") is True,
         "pending_then_approved": bool(summary.get("approved")) and summary["approved"]["answer"] == 200,
         "runner_hello_as_ann": (summary.get("runner_seen") or {}).get("who") == "ann"
                                and (summary.get("runner_seen") or {}).get("device") == summary.get("device_json_id"),

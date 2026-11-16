@@ -34,29 +34,54 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
                                 "with this PC's tools (My PC) running beside them.")
     p.add_argument("--data-dir", metavar="PATH", help="keep servers.json, the web view's profile and desktop.log here "
                    "(default %%LOCALAPPDATA%%\\StrataDesktop); the runner's device then lives in PATH\\runner")
-    p.add_argument("--selftest", action="store_true", help="check the program against --server without a window; "
-                   "the token comes from " + SELFTEST_ENV)
+    p.add_argument("--selftest", action="store_true", help="check the program against --server without a window, "
+                   "in an empty --data-dir of its own; the token comes from " + SELFTEST_ENV + ". Each run in a new "
+                   "folder is a new device on that key: the server's owner sees one more device row for it")
     p.add_argument("--server", metavar="URL", help="the server --selftest checks")
     p.add_argument("--debug", action="store_true", help="pywebview's debug mode (the web inspector)")
     a = p.parse_args(argv)
     if a.server and not a.selftest:
         p.error("--server is for --selftest only")
-    if a.selftest and not a.data_dir:              # its own folder: never the real server list, profile or device
-        p.error("--selftest needs --data-dir PATH")
+    if a.selftest:                                 # its own folder: never the real server list, profile or device
+        why = selftest_folder_refused(a.data_dir)
+        if why:
+            p.error(why)
     return a
+
+
+def selftest_folder_refused(folder: str | None) -> str | None:
+    """Why `--selftest` may not use `folder`, or None.  Its folder is its own: not the app's (the selftest replaces the
+    server named "selftest" there and writes `last` and `injected` beside a live app), and not one holding a server
+    list that an earlier selftest did not make."""
+    if not folder:
+        return "--selftest needs --data-dir PATH (an empty folder of its own)"
+
+    def real(p) -> str:
+        return os.path.normcase(os.path.realpath(os.fspath(p)))
+    if real(folder) == real(paths.data_dir(None)):
+        return "--selftest may not use Strata Desktop's own folder: give it an empty --data-dir"
+    d = paths.data_dir(folder)
+    if paths.servers_file(d).exists() and not (d / "selftest.json").exists():
+        return "--data-dir holds a server list the selftest did not make: give it an empty folder"
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
     selftest_token = os.environ.pop(SELFTEST_ENV, None)     # at once: nothing the app starts inherits it
     args = parse(argv)
     data = paths.data_dir(args.data_dir)
-    applog.setup(paths.log_file(data))
-    applog.install_hooks()
-    applog.capture_stdio()
-    if selftest_token:
-        applog.add_secret(selftest_token)
-    from serve import runner
-    runner._say = applog.say
+    try:
+        applog.setup(paths.log_file(data))
+        applog.install_hooks()
+        applog.capture_stdio()
+        if selftest_token:
+            applog.add_secret(selftest_token)
+        from serve import runner
+        runner._say = applog.say
+    except Exception:  # noqa: BLE001
+        if args.selftest:                          # an unwritable folder: exit 5, never PyInstaller's error box
+            return EXIT_SELFTEST_FAILED
+        raise
 
     if args.selftest:
         return _selftest(args, data, selftest_token)
@@ -114,9 +139,13 @@ def _run(args: argparse.Namespace, data, instance) -> int:
 def _selftest(args: argparse.Namespace, data, token: str | None) -> int:
     """`--selftest` (desktop/selftest.py): no window, no tray icon, no message box; the result in
     `<data>\\selftest.json`.  Whatever it raises is exit 5 (a windowed exe would otherwise end in PyInstaller's error
-    box).  No single-instance mutex: the data folder is the selftest's own."""
+    box).  It takes the data folder's single-instance mutex, so it never runs beside an app (or another selftest) on
+    that folder."""
     from desktop import selftest
     result = data / selftest.RESULT_FILE
+    instance = single.acquire(single.instance_name(data, True))
+    if instance is None:
+        return selftest.fail(result, "start", "another Strata Desktop (or selftest) is using this data folder")
     try:
         if not args.server:
             return selftest.fail(result, "start", "--selftest needs --server URL")
@@ -131,6 +160,8 @@ def _selftest(args: argparse.Namespace, data, token: str | None) -> int:
     except Exception as e:  # noqa: BLE001
         log.error("the selftest raised %s", type(e).__name__, exc_info=True)
         return selftest.fail(result, "crash", type(e).__name__, keep=True)
+    finally:
+        instance.release()
 
 
 if __name__ == "__main__":

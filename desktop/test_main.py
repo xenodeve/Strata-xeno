@@ -109,6 +109,58 @@ def test_selftest_needs_its_own_data_dir(hidden_run, monkeypatch):
     assert e.value.code == 2 and hidden_run == []
 
 
+def test_selftest_refuses_the_apps_own_folder(tmp_path, monkeypatch, hidden_run):
+    """--data-dir naming %LOCALAPPDATA%\\StrataDesktop itself (written another way too) is refused before anything."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    own = tmp_path / "StrataDesktop"
+    own.mkdir()
+    for given in (own, tmp_path / "x" / ".." / "StrataDesktop", str(own).upper()):
+        monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+        with pytest.raises(SystemExit) as e:
+            app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(given)])
+        assert e.value.code == 2
+    assert hidden_run == [] and list(own.iterdir()) == []
+
+
+def test_selftest_refuses_a_folder_with_a_server_list_it_did_not_make(tmp_path, monkeypatch, hidden_run):
+    monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+    (tmp_path / "servers.json").write_text('{"version": 1, "servers": []}', encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)])
+    assert e.value.code == 2 and hidden_run == []
+    (tmp_path / "selftest.json").write_text("{}", encoding="utf-8")          # an earlier selftest's folder: fine
+    monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+    assert app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)]) == 0
+    assert len(hidden_run) == 1
+
+
+def test_selftest_never_runs_beside_an_app_on_its_folder(tmp_path, monkeypatch, hidden_run):
+    monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+    names = []
+    monkeypatch.setattr(single, "acquire", lambda name: names.append(name))   # None: someone holds it
+    assert app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)]) == 5
+    assert names == [single.instance_name(tmp_path, True)] and hidden_run == []
+    assert "another Strata Desktop" in _result(tmp_path)["steps"][0]["detail"]
+
+
+def test_selftest_holds_the_folders_mutex_and_lets_it_go(tmp_path, monkeypatch, hidden_run):
+    monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+    inst = FakeInstance()
+    monkeypatch.setattr(single, "acquire", lambda name: inst)
+    assert app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)]) == 0
+    assert len(hidden_run) == 1 and inst.released == 1
+
+
+def test_selftest_with_an_unwritable_folder_is_exit_5(tmp_path, monkeypatch):
+    """A failure in the log's setup is exit 5 for --selftest (a windowed exe would show PyInstaller's error box)."""
+    monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+
+    def boom(path):
+        raise PermissionError("denied")
+    monkeypatch.setattr(applog, "setup", boom)
+    assert app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)]) == 5
+
+
 def test_a_windowed_exe_without_stderr_still_parses(tmp_path, monkeypatch):
     """PyInstaller's windowed exe has sys.stderr None: a usage error must exit 2, not raise inside argparse."""
     import sys
