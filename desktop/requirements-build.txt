@@ -1,0 +1,4 @@
+# Strata Desktop's build and test tools (#310 part 3), installed only into desktop\.venv.
+# The versions installed and checked on 2026-11-16 (Windows 11, Python 3.11.9).
+pyinstaller==6.22.3
+pytest==9.2.0

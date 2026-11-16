@@ -1,0 +1,7 @@
+# Strata Desktop's GUI libraries (#310 part 3), installed only into desktop\.venv, never the global Python:
+#   python -m venv desktop\.venv
+#   desktop\.venv\Scripts\python -m pip install -r desktop\requirements.txt -r desktop\requirements-build.txt
+# The versions installed and checked on 2026-11-16 (Windows 11, Python 3.11.9).
+pywebview==6.2.1
+pystray==0.19.5
+Pillow==13.0.0
