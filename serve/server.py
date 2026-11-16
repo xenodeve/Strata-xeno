@@ -5417,6 +5417,12 @@ RUNNER_HELLO_MAX, RUNNER_REPLY_MAX = 4 << 20, 32 << 20
 NO_RUNNER = "there is no such runner (say hello again)"
 RUNNER_REPLACED = {"error": {"type": "runner_replaced", "message": "a newer Strata Desktop runner on this PC took this "
                                                                    "runner's place; this one stops"}}
+# #313: the runner's own requests keep their connection (HTTP/1.1, Content-Length): a new TCP connection per poll and
+# per reply cost 10-14 ms median on this PC (bimodal 0.2-0.5 or 10-25 ms), and 1 RTT more (plus 1-2 for TLS) on a
+# real link.  Every other route stays HTTP/1.0 with Connection: close (end_headers).
+RUNNER_KEEP = {("POST", "/runner/hello"), ("GET", "/runner/next"), ("POST", "/runner/reply")}
+RUNNER_IDLE_S = 90.0            # a kept connection with no next request for this long is closed (the runner's own limit
+                                # is shorter, serve/runner.py KEEP_IDLE_S, so it rarely sends on one the server closed)
 
 
 def make_handler(svc: Service):
@@ -5435,13 +5441,46 @@ def make_handler(svc: Service):
             pass
 
         def handle_one_request(self):
-            self.answer_started = False
+            # #313: a runner's kept connection brings every one of its requests to this one object: each starts clean
+            self.answer_started = self.body_read = self.team = self.length_sent = False
+            self.record = self.watch_done = self.identity = None
+            self.device_id, self.status_sent = "", 0
+            self.protocol_version = "HTTP/1.0"
             super().handle_one_request()
             self._drain_body()
+            if not self.close_connection:                    # kept (only the runner's routes are): until its next
+                try:                                         # request, or RUNNER_IDLE_S without one
+                    self.connection.settimeout(RUNNER_IDLE_S)
+                    self.server.keep(self.connection, True)
+                except (OSError, AttributeError):
+                    self.close_connection = True
+
+        def finish(self):
+            keep = getattr(self.server, "keep", None)
+            if keep is not None:
+                keep(self.connection, False)
+            super().finish()
 
         def send_response(self, code, message=None):
             self.answer_started = True                 # a malformed-request answer can only replace one not yet begun
+            self.status_sent = code
             super().send_response(code, message)
+
+        def send_header(self, keyword, value):
+            if keyword.lower() == "content-length":
+                self.length_sent = True
+            super().send_header(keyword, value)
+
+        def _keeps(self) -> bool:
+            """#313: this answer leaves the connection open - a runner route asked over HTTP/1.1 (not `Connection:
+            close`), its body read to the end (or it had none), a Content-Length, and no 5xx."""
+            if self.protocol_version != "HTTP/1.1" or self.close_connection or not self.length_sent:
+                return False
+            if self.status_sent >= 500:
+                return False
+            headers = getattr(self, "headers", None)
+            no_body = headers is not None and not self._chunked() and headers.get("Content-Length", "0").strip() == "0"
+            return self.body_read or no_body
 
         def _chunked(self) -> bool:
             """#893: a body sent as Transfer-Encoding: chunked (a relay or proxy that does not buffer it).  By RFC 9112
@@ -5551,6 +5590,9 @@ def make_handler(svc: Service):
             host = self.headers.get("Host")
             # svc.allowed_hosts again: a name the config adds after serve() worked out host_names (xeno #71)
             if svc.key_required() or host_allowed(host, svc.host_names | set(svc.allowed_hosts), "*" in svc.allowed_hosts):
+                if self.request_version == "HTTP/1.1" and (self.command, urlsplit(self.path).path) in RUNNER_KEEP:
+                    self.protocol_version = "HTTP/1.1"       # #313: the runner's routes may keep the connection
+                    self.close_connection = (self.headers.get("Connection") or "").strip().lower() == "close"
                 return True
             print(f"[strata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
                   f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
@@ -5588,7 +5630,9 @@ def make_handler(svc: Service):
             # client that pools connections (.NET's SocketsHttpHandler) can put its next request on this socket
             # before the close reaches it, and that request fails with "response ended prematurely" without the
             # server ever reading it (a .NET agent app, 2026-10-03: 25 of ~1000 requests, 1-24 ms after the previous answer).
-            self.send_header("Connection", "close")
+            # The one exception is the runner's own routes over HTTP/1.1 (#313, `_keeps`).
+            if not self._keeps():
+                self.send_header("Connection", "close")
             super().end_headers()
 
         def _watch_client(self, cancel: threading.Event) -> None:
@@ -5596,7 +5640,8 @@ def make_handler(svc: Service):
             until it ends, and a streamed one only a keep-alive per prompt chunk (and the first write after a hang-up
             usually still succeeds), so a dropped request kept the engine busy until its answer or the whole prompt
             was done.  Every 0.5 s: the socket readable with nothing to read (EOF) means the client closed it.  A
-            request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
+            request is fully read here, and no client sends its next request before this one's answer (a runner's kept
+            connection, #313, neither), so no later bytes are expected - data is not a hang-up."""
             done = self.watch_done = threading.Event()
             sock = self.connection
 
@@ -7483,11 +7528,29 @@ class Server(ThreadingHTTPServer):
     # (STRATA_HTTP_BACKLOG overrides it)
     request_queue_size = max(5, int(os.environ.get("STRATA_HTTP_BACKLOG") or 256))
 
+    def __init__(self, *args, **kwargs):
+        self._kept: set = set()                     # #313: the runner connections open between two requests
+        self._kept_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def keep(self, sock, kept: bool) -> None:
+        """#313: `sock` waits for its next request (True) or is done (False).  server_close ends the waiting ones, so a
+        stopped server answers no more requests on them."""
+        with self._kept_lock:
+            (self._kept.add if kept else self._kept.discard)(sock)
+
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
 
     def server_close(self):
+        with self._kept_lock:
+            kept, self._kept = list(self._kept), set()
+        for sock in kept:                           # the runner sees the end at once and connects again
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         # the hardware sampler serve() started for this server stops with it (test isolation: every Service a test
         # started used to leave its sampler running, 21 of them after test_responses, which slowed test_parallel's timing)
         tel = getattr(getattr(self, "svc", None), "telemetry", None)

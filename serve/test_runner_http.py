@@ -6,6 +6,7 @@ mock engine in team mode and outside it; and (task 5) the page routes and GET /m
 """
 from __future__ import annotations
 
+import http.client
 import json
 import queue
 import socket
@@ -20,6 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import agent_run, folders, runner_hub  # noqa: E402
+from serve import server as server_mod  # noqa: E402
 from serve.identity import OWNER  # noqa: E402
 from serve.mcp import McpHub  # noqa: E402
 from serve.permissions import Policy  # noqa: E402
@@ -906,6 +908,99 @@ class PageRoutes(RunnerBase):
             code, body = self.req("GET", f"/agent/mention?path=X&rel=a&runner={fake.id}", key=self.ann, device=DEV1)
             self.assertEqual((code, body["error"]["type"]), (502, "runner_answer"), answer)
             fake.stop()
+
+
+class KeepAlive(RunnerBase):
+    """#313: the runner's routes answer HTTP/1.1 and keep the connection for its next request; every other route still
+    answers HTTP/1.0 and closes (a .NET client put its next request on a socket the server was closing)."""
+
+    def kept(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        self.addCleanup(c.close)
+        return c
+
+    def ask(self, c, method, path, body=None, key=None, ctype="application/json"):
+        h = {"Authorization": "Bearer " + (key or self.ann), "X-Strata-Device": DEV1}
+        data = None
+        if body is not None:
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            h["Content-Type"] = ctype
+        c.request(method, path, body=data, headers=h)
+        r = c.getresponse()
+        raw = r.read()
+        return r, (json.loads(raw) if raw[:1] == b"{" else raw)
+
+    def test_runner_routes_keep_the_connection(self):
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+        self.assertEqual((r.status, r.version, r.will_close), (200, 11, False), body)
+        self.assertIsNotNone(r.getheader("Content-Length"))
+        sock = c.sock
+        r, body = self.ask(c, "GET", f"/runner/next?id={body['runner']}&instance=inst-aaaa&wait=0")
+        self.assertEqual((r.status, r.version, r.will_close), (200, 11, False), body)
+        r, body = self.ask(c, "POST", "/runner/reply", {"id": "nope", "instance": "inst-aaaa", "job": "j", "rid": 1})
+        self.assertEqual((r.status, r.will_close), (404, False), body)
+        self.assertIs(c.sock, sock)                                  # one TCP connection for all three
+
+    def test_other_routes_still_close(self):
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "GET", "/v1/models")
+        self.assertEqual((r.status, r.version, r.will_close), (200, 10, True), body)
+        self.assertEqual(r.getheader("Connection"), "close")
+
+    def test_an_unread_body_or_a_closing_request_ends_the_connection(self):
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+        self.assertFalse(r.will_close)
+        r, body = self.ask(c, "POST", "/runner/reply", b"not json", ctype="text/plain")     # 415: the body not read
+        self.assertEqual((r.status, r.will_close, r.getheader("Connection")), (415, True, "close"), body)
+        c2 = self.kept()
+        c2.request("GET", "/runner/next?id=x&instance=inst-aaaa&wait=0", headers={
+            "Authorization": "Bearer " + self.ann, "X-Strata-Device": DEV1, "Connection": "close"})
+        r = c2.getresponse()
+        r.read()
+        self.assertTrue(r.will_close)
+
+    def test_each_request_on_a_kept_connection_is_its_own(self):
+        """The handler object serves every request of a kept connection: who sent it is decided again each time."""
+        self.team()
+        c = self.kept()
+        r, ann = self.ask(c, "POST", "/runner/hello", hello_body())
+        r, bob = self.ask(c, "POST", "/runner/hello", hello_body(instance="inst-bbbb"), key=self.bob)
+        self.assertEqual((r.status, bob["who"]), (200, "bob"), bob)
+        r, body = self.ask(c, "GET", f"/runner/next?id={ann['runner']}&instance=inst-aaaa&wait=0", key=self.bob)
+        self.assertEqual(r.status, 404, body)                        # ann's runner is not bob's
+
+    def test_an_idle_kept_connection_is_closed(self):
+        self.team()
+        c = self.kept()
+        with mock.patch.object(server_mod, "RUNNER_IDLE_S", 0.3):
+            r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+            self.assertFalse(r.will_close)
+            c.sock.settimeout(5)
+            t0 = time.monotonic()
+            self.assertEqual(c.sock.recv(1), b"")                   # the server closed it
+        self.assertLess(time.monotonic() - t0, 3)
+
+    def test_stopping_the_server_ends_its_kept_connections(self):
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+        self.assertFalse(r.will_close)
+        self.svc.runner_hub.close()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd = None
+        c.sock.settimeout(5)
+        t0 = time.monotonic()
+        try:
+            self.assertEqual(c.sock.recv(1), b"")
+        except ConnectionError:
+            pass
+        self.assertLess(time.monotonic() - t0, 3)
 
 
 class OutsideTeamMode(RunnerBase):

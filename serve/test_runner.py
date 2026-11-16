@@ -291,6 +291,78 @@ class Connection(Base):
         wait_for(lambda: answered, 2, 0.001)
         self.assertLess(calls[1][1] - answered[0], 0.04)
 
+    # ---------------------------------------------------------------------------------------- #313: kept connections
+    def hello_info(self, instance="inst-keep-0001"):
+        return {"instance": instance, "machine": "ann-pc", "platform": "win32", "shell": None, "home": "C:\\Users\\ann",
+                "groups": [], "skills": []}
+
+    def count_connects(self):
+        """TCP connects made by the runner's threads (its poll thread and its job threads), from now on."""
+        made, real = [], http.client.HTTPConnection.connect
+
+        def connect(conn):
+            if threading.current_thread().name in ("test-runner", "runner-job", "keep-test"):
+                made.append(threading.current_thread().name)
+            return real(conn)
+        p = mock.patch.object(http.client.HTTPConnection, "connect", connect)
+        p.start()
+        self.addCleanup(p.stop)
+        return made
+
+    def test_polls_and_replies_keep_their_connections(self):
+        """Five page jobs: their polls and replies go over the connections the runner already has - no new TCP
+        connection per message (it was two per job: the reply's and the next poll's)."""
+        self.start_routing()
+        (self.proj / "hello.txt").write_text("hi\n", encoding="utf-8")
+        loop = self.runner(self.ann)
+        code, body = self.req("GET", f"/agent/folders?runner={loop.id}&path={self.dir}", key=self.ann, device=DEV1)
+        self.assertEqual(code, 200, body)                       # the first reply opened the reply connection
+        made = self.count_connects()
+        for _ in range(5):
+            code, body = self.req("GET", f"/agent/folders?runner={loop.id}&path={self.dir}", key=self.ann, device=DEV1)
+            self.assertEqual(code, 200, body)
+        self.assertEqual(made, [])
+
+    def test_a_kept_connection_the_server_closed_is_tried_again_once(self):
+        self.start_routing()
+        made = self.count_connects()
+        c = runner_mod.Client(f"http://127.0.0.1:{self.port}", self.ann, {"id": DEV1, "name": "ann-pc"})
+        self.addCleanup(c.close)
+        got = []
+
+        def go():
+            got.append(c.hello(self.hello_info())["runner"])
+            time.sleep(0.6)                                     # the server closes the idle connection meanwhile
+            got.append(c.hello(self.hello_info())["runner"])
+        with mock.patch.object(server_mod, "RUNNER_IDLE_S", 0.2):
+            t = threading.Thread(target=go, name="keep-test")
+            t.start()
+            t.join(10)
+        self.assertEqual(len(got), 2, self.said)
+        self.assertEqual(got[0], got[1])
+        self.assertEqual(len(made), 2)                          # the first, then one again after the server's close
+
+    def test_abort_poll_cuts_a_held_poll_on_a_kept_connection(self):
+        self.start_routing()
+        c = runner_mod.Client(f"http://127.0.0.1:{self.port}", self.ann, {"id": DEV1, "name": "ann-pc"})
+        self.addCleanup(c.close)
+        body = c.hello(self.hello_info())
+        c.on_hello(body)
+        rid = body["runner"]
+        self.assertEqual(c.next(rid, "inst-keep-0001", 0), [])     # the poll's connection is kept from here
+        r = self.svc.runner_hub.get_for(rid, SimpleNamespace(name="ann"))
+        got = []
+        with mock.patch.object(runner_hub, "POLL_MAX_S", 20.0):
+            t = threading.Thread(target=lambda: got.append((c.next(rid, "inst-keep-0001", 20), time.monotonic())))
+            t.start()
+            self.assertTrue(wait_for(lambda: r._held, 5, 0.005))
+            t0 = time.monotonic()
+            c.abort_poll()
+            t.join(10)
+        self.assertEqual(got[0][0], [])
+        self.assertLess(got[0][1] - t0, 1.0)
+        self.assertEqual(c.next(rid, "inst-keep-0001", 5), [])     # and every later poll at once
+
     def test_replies_number_rid_and_answers_match_to(self):
         target = self.dir / "outside.txt"
         self.start_routing(tool_call("Write", file_path=str(target), content="x"), DONE)
