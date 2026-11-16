@@ -203,11 +203,18 @@ def _header(text: str) -> str:
     return "".join(c if 32 <= ord(c) < 127 else "?" for c in text)
 
 
+def device_label(device: dict, app: str = "Strata runner") -> str:
+    """The X-Strata-Device-Name the owner sees for this PC: "<app> on <machine>".  Strata Desktop passes its own app
+    name (#310 part 3), so its page, its server test and its runner name one device the same way."""
+    return _header(f"{app} on {device.get('name') or machine_name()}")
+
+
 class Client:
     """The runner's side of the channel.  Holds the delivery state of the current registration: `channel`, `ack`
-    (the highest seq received on it) and `handled` (the seqs handled on it)."""
+    (the highest seq received on it) and `handled` (the seqs handled on it).  `label`: the device's name for the
+    server (default `device_label(device)`, "Strata runner on <machine>")."""
 
-    def __init__(self, server: str, key: str, device: dict):
+    def __init__(self, server: str, key: str, device: dict, label: str | None = None):
         u = urlsplit(server.strip())
         if u.scheme not in ("http", "https") or not u.hostname:
             raise ValueError(f"--server must be an http:// or https:// address, not {server!r}")
@@ -215,7 +222,7 @@ class Client:
         self._https, self._host, self._port = u.scheme == "https", u.hostname, u.port
         self._prefix = u.path.rstrip("/")
         self._headers = {"Authorization": "Bearer " + key, "X-Strata-Device": device["id"],
-                         "X-Strata-Device-Name": _header(f"Strata runner on {device.get('name') or machine_name()}"),
+                         "X-Strata-Device-Name": device_label(device) if label is None else _header(label),
                          "User-Agent": "strata-runner/1"}
         self.channel: str | None = None
         self.ack = 0
