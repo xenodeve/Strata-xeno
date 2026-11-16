@@ -521,8 +521,9 @@ def cache_slot(request: dict) -> int:
     return slot
 
 
-class CacheSlots:
-    """The server's choice of the engine's cache slot (xeno #49 S7, on upstream PR #175): Claude Code cannot send
+class FamilyCacheSlots:
+    """The rule before #321, kept for the A/B (STRATA_CACHE_SLOT_RULE=family).  The server's choice of the engine's
+    cache slot (xeno #49 S7, on upstream PR #175): Claude Code cannot send
     strata_cache_slot, and its side requests (the auto-mode classifier, titles) start from their own prompt, so on
     one slot each of them wiped the main session's cache (#50). A prompt family is its first PREFIX tokens; a family
     keeps its slot, and a new family takes a free slot or the least recently used one."""
@@ -558,6 +559,127 @@ class CacheSlots:
                 slot = free[0]
             self.families[family] = slot
             return slot
+
+    def choose(self, ids):
+        """-> (slot, shared, "family"): shared() and then pick(), as Service.with_slot called them before #321."""
+        shared = self.shared(ids)
+        return self.pick(ids), shared, "family"
+
+    def record(self, slot, ids):
+        """A client's own strata_cache_slot: this rule never saw it."""
+
+
+def _shared_len(a, b, step=4096) -> int:
+    """How many leading tokens two id lists share: compared a block at a time (list slices compare in C), then one
+    by one inside the first block that differs."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i:i + step] == b[i:i + step]:
+        i += step
+    if i >= n:
+        return n
+    end = min(i + step, n)
+    while i < end and a[i] == b[i]:
+        i += 1
+    return i
+
+
+class CacheSlots:
+    """The server's choice of the engine's cache slot (#321; the family rule before it: FamilyCacheSlots, xeno #49
+    S7).  Each request goes to the engine as cache_slot=N; the slot holds the KV of its last prompt, and a prompt that
+    lands in a slot reuses what it shares with that slot's last prompt.  The table keeps each slot's last prompt ids
+    and when it was last used, nothing per conversation:
+
+    1. Continuation: the slot whose last prompt this one continues - they share at least PREFIX tokens and all of the
+       last one but at most its last TAIL tokens; several such slots: the longest shared prefix.
+    2. Else a slot never used yet, the lowest first.
+    3. Else evict the slot whose last prompt holds the fewest tokens, the least recently used among equals: a short
+       side request (the auto-mode classifier's fast stage, a title) evicts another short one, not a long
+       conversation, while a short one exists.
+
+    A shared head alone is no continuation: two users of one harness share its system prompt and tools (the first
+    512 tokens and far more), and under the family rule they shared one slot and re-read each other's conversation
+    on every alternated turn (#321, w2a: 452/419 s against 270/283 s with a slot per user).
+
+    TAIL: the server renders the previous turns as they were (the template keeps every assistant turn's thinking -
+    serve/ never sets preserve_thinking false - and a reasoning carry adds the cut reply after the cut prompt), so a
+    conversation's next prompt repeats its last one up to the generation prompt's few tokens
+    (test_consecutive_turns_through_the_template_part_within_TAIL).  What does not repeat is a transcript that grows
+    inside one message, the classifier's (the _ckpt_at comment in Service.with_slot): its last prompt's text after
+    the transcript (the closing instructions).  Its size was not measured; 1,024 tokens is the allowance, and the
+    STRATA_DEBUG line names the nearest slot's tail for every prompt that is not a continuation, so one live session
+    measures it.  TAIL is also the window of a false continuation: two conversations whose own parts are both under
+    TAIL tokens past a shared head (two users' first short turns) share a slot, re-reading at most TAIL tokens a
+    turn, until one grows past it.  A prompt under PREFIX tokens is never a continuation, not even an exact repeat.
+
+    The trade-off accepted: a rewind or a compaction - a prompt that parts from its own conversation mid-way, well
+    before its last TAIL tokens - is not a continuation.  It takes a free slot or evicts per 3, and is read from 0
+    there (or from what it shares with the evicted slot's prompt) instead of from the point where it parted; the
+    conversation it left keeps its slot until evicted.
+
+    A client's own strata_cache_slot is used as sent (Service.with_slot) and recorded here (record): its prompt
+    becomes that slot's last one, so the rule knows the slot is taken."""
+    PREFIX = 512
+    TAIL = 1024
+
+    def __init__(self, n: int):
+        self.n = n
+        self.lock = threading.Lock()
+        self.table: list = [None] * n                    # slot -> {"ids": its last prompt, "used": tick}, or None
+        self.tick = 0
+
+    def _scan(self, ids):
+        """-> (continued slot or None, its shared length, nearest slot, its shared length): one pass over the table."""
+        best = best_sh = near = near_sh = None
+        for s, e in enumerate(self.table):
+            if e is None:
+                continue
+            last = e["ids"]
+            sh = _shared_len(last, ids)
+            if near is None or sh > near_sh:
+                near, near_sh = s, sh
+            if sh >= self.PREFIX and sh >= len(last) - self.TAIL and (best is None or sh > best_sh):
+                best, best_sh = s, sh
+        return best, best_sh, near, near_sh
+
+    def _put(self, slot, ids):
+        self.tick += 1
+        self.table[slot] = {"ids": list(ids), "used": self.tick}
+
+    def choose(self, ids, nearest=None):
+        """-> (slot, shared, how): how is "continues" (shared = the prefix shared with the slot's last prompt),
+        "free" or "evicts" (shared None).  `nearest` (a dict) is filled with the slot sharing the most and its tail
+        (its last prompt's tokens past the shared prefix), for the STRATA_DEBUG line."""
+        with self.lock:
+            best, best_sh, near, near_sh = self._scan(ids)
+            if nearest is not None and near is not None:
+                nearest.update(slot=near, shared=near_sh, tail=len(self.table[near]["ids"]) - near_sh)
+            if best is not None:
+                slot, shared, how = best, best_sh, "continues"
+            else:
+                shared = None
+                free = [s for s in range(self.n) if self.table[s] is None]
+                if free:
+                    slot, how = free[0], "free"
+                else:
+                    slot = min(range(self.n), key=lambda s: (len(self.table[s]["ids"]), self.table[s]["used"]))
+                    how = "evicts"
+            self._put(slot, ids)
+            return slot, shared, how
+
+    def record(self, slot, ids):
+        """A request whose client chose its slot: that slot's last prompt is now this one."""
+        with self.lock:
+            self._put(slot, ids)
+
+    def shared(self, ids):
+        """How many leading tokens the prompt shares with the last prompt of the slot it continues; None if none."""
+        with self.lock:
+            best, best_sh, _, _ = self._scan(ids)
+        return best_sh if best is not None else None
+
+    def pick(self, ids) -> int:
+        return self.choose(ids)[0]
 
 
 def without_secondary(args: list[str]) -> list[str]:
@@ -3644,29 +3766,41 @@ class Service:
         return self.shared
 
     def with_slot(self, req: dict, ids) -> dict:
-        """The request with the cache slot of its prompt family (xeno #49 S7), when the engine has several slots
-        (INFO cache_slots) and the client chose none."""
-        if "strata_cache_slot" in req:
-            return req
+        """The request with the cache slot CacheSlots picks for its prompt (#321; xeno #49 S7), when the engine has
+        several slots (INFO cache_slots) and the client chose none.  A client's own strata_cache_slot is left as sent
+        and recorded, so the rule knows that slot is taken.  STRATA_CACHE_SLOT_RULE=family: the prompt-family rule
+        before #321 (FamilyCacheSlots), which ignores a client's slot."""
         try:
             n = int((getattr(self.engine, "info", {}) or {}).get("cache_slots", 1))
         except (TypeError, ValueError):
             n = 1
         if n <= 1:
             return req
-        if getattr(self, "slots", None) is None or self.slots.n != n:
-            self.slots = CacheSlots(n)
-        shared = self.slots.shared(ids)
-        slot = self.slots.pick(ids)
-        if os.environ.get("STRATA_DEBUG"):              # where the prompt leaves its family's last one, and its turns
+        family = os.environ.get("STRATA_CACHE_SLOT_RULE", "").strip().lower() == "family"
+        kind = FamilyCacheSlots if family else CacheSlots
+        if getattr(self, "slots", None) is None or self.slots.n != n or type(self.slots) is not kind:
+            self.slots = kind(n)
+        if "strata_cache_slot" in req:
+            pinned = req["strata_cache_slot"]           # a bad one is the request's 400 (cache_slot), not ours
+            if isinstance(pinned, int) and not isinstance(pinned, bool) and 0 <= pinned < n:
+                self.slots.record(pinned, ids)
+            return req
+        nearest = {}
+        slot, shared, how = self.slots.choose(ids) if family else self.slots.choose(ids, nearest)
+        if os.environ.get("STRATA_DEBUG"):              # where the prompt leaves its slot's last one, and its turns
             start = self.tok.encode("<|im_start|>", parse_special=True)
             turns = [i for i, t in enumerate(ids) if len(start) == 1 and t == start[0]]
-            print(f"[strata] slot {slot}: {len(ids)} tokens, shares {shared} with the family's last, "
-                  f"turns at {turns[:3]}{'...' if len(turns) > 6 else ''}{turns[-3:] if len(turns) > 3 else ''}",
-                  flush=True)
+            if family:
+                said = f"slot {slot}: {len(ids)} tokens, shares {shared} with the family's last"
+            else:                                       # the nearest slot's tail: what TAIL would have to cover
+                near = (f"; nearest: slot {nearest['slot']} shares {nearest['shared']}, tail {nearest['tail']}"
+                        if nearest and how != "continues" else "")
+                said = f"slot {slot} ({how}): {len(ids)} tokens, shares {shared} with its last{near}"
+            print(f"[strata] {said}, turns at {turns[:3]}{'...' if len(turns) > 6 else ''}"
+                  f"{turns[-3:] if len(turns) > 3 else ''}", flush=True)
         req = {**req, "strata_cache_slot": slot}
         if shared:                                      # the engine keeps a checkpoint there (GEN key ckpt_at): the
-            req["_ckpt_at"] = shared                    # family's next prompt shares it (a transcript that grows
+            req["_ckpt_at"] = shared                    # slot's next prompt shares it (a transcript that grows
         return req                                      # inside one message has no turn start to resume from)
 
     def cjk(self, req: dict, messages) -> dict:
