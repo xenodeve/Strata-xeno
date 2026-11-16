@@ -19,6 +19,7 @@ breaking.
 from __future__ import annotations
 
 import collections
+import copy
 import json
 import os
 import re
@@ -233,7 +234,8 @@ class StdioTransport:
         try:
             if os.name == "nt":                          # npx.cmd -> node: end the whole tree
                 subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=10)
+                               stderr=subprocess.DEVNULL, timeout=10,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))     # no console window flashes
             else:
                 os.killpg(p.pid, signal.SIGTERM)
                 try:
@@ -517,9 +519,46 @@ class McpHub:
         for t in self.threads:
             t.join(None if end is None else max(0.0, end - time.monotonic()))
 
+    def with_servers(self, extra: dict, replace: dict | None = None) -> McpHub:
+        """#310 part 2: one request's own view of the hub - the same settings and start threads, `servers` = this
+        hub's in their order with the ones named in `replace` swapped in place (a name the hub does not have is
+        ignored), then `extra` (a runner's groups, serve/runner_hub.py).  An `extra` name the view has already gets
+        `_2`, `_3`, ... on a shallow copy, so a server of the hub is never swapped out and the group's object is not
+        renamed.  Its own `_routes`; this hub is not changed.  Never start(), status() or close() a view: the
+        servers are this hub's (and the runner's)."""
+        view = McpHub.__new__(McpHub)
+        view.settings, view.threads, view._routes = self.settings, self.threads, {}
+        view.servers = {n: (replace[n] if replace and n in replace else s) for n, s in self.servers.items()}
+        for name, s in extra.items():
+            key, n = name, 2
+            while key in view.servers:
+                key, n = f"{name}_{n}", n + 1
+            if key != name:
+                s = copy.copy(s)
+                s.name = key
+            view.servers[key] = s
+        return view
+
+    _pinned: dict | None = None             # a pinned view's route table (pin)
+    _refused: frozenset = frozenset()       # ... and the servers it never calls
+
+    def pin(self, skip_servers=()) -> dict:
+        """#310 part 2, on a request's view only: build the route table once, without the servers in `skip_servers`,
+        and keep it for the rest of the request - routes(), template_tools() and call() (the request's and its
+        helpers') use it from now on, and a call never reaches a server in `skip_servers`.  So a server that becomes
+        ready later (an MCP server still starting when the list was made) cannot take a name the model was offered for
+        another group.  The table."""
+        self._pinned = None
+        self._refused = frozenset(skip_servers)
+        self._pinned = {n: r for n, r in self.routes().items() if r[0].name not in self._refused}
+        self._routes = self._pinned
+        return self._pinned
+
     def routes(self) -> dict[str, tuple[McpServer, str]]:
         """tool name the model sees -> (server, the tool's own name).  A server that stopped after it was ready keeps
-        its tools here: a call starts it again."""
+        its tools here: a call starts it again.  A pinned view (pin) answers its table."""
+        if self._pinned is not None:
+            return self._pinned
         out = {}
         for s in self.servers.values():
             if s.status not in ("ready", "stopped"):
@@ -541,7 +580,9 @@ class McpHub:
         for name, (s, tool) in self.routes().items():
             if name in exclude or s.name in skip_servers:
                 continue
-            t = next(x for x in s.tools if x["name"] == tool)
+            t = next((x for x in s.tools if x["name"] == tool), None)
+            if t is None:                                # a pinned table outlived the tool (its server listed again)
+                continue
             schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
             out.append({"name": name, "description": str(t.get("description") or t.get("title") or ""),
                         "parameters": schema or {"type": "object", "properties": {}}})
@@ -550,22 +591,27 @@ class McpHub:
     def openai_tools(self) -> list[dict]:
         return [{"type": "function", "function": t} for t in self.template_tools()]
 
-    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None, ctx=None) -> dict:
+    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None, ctx=None,
+             progress=None) -> dict:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
         "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised.
-        `ctx`: the request's AgentContext, handed to a built-in server that asks for it (the coding tools)."""
+        `ctx`: the request's AgentContext, handed to a built-in server that asks for it (the coding tools).
+        `progress(word)`: handed only to a server with `wants_progress` (a runner's group, serve/runner_hub.py)."""
         t0 = time.monotonic()
         server, tool = self._routes.get(name) or self.routes().get(name, (None, name))
+        if server is not None and server.name in self._refused:   # a pinned view: never a server the request skipped
+            server = None
         out = {"server": server.name if server else None, "tool": tool}
         if server is None:
             text, ok = f"error: there is no tool named {name!r}", False
         else:
             try:
+                more = {"progress": progress} if getattr(server, "wants_progress", False) else {}
                 if getattr(server, "wants_context", False):
-                    res = server.call(tool, arguments if isinstance(arguments, dict) else {}, 0, cancel, ctx)       # a command's own timeout is its own parameter
+                    res = server.call(tool, arguments if isinstance(arguments, dict) else {}, 0, cancel, ctx, **more)       # a command's own timeout is its own parameter
                 else:
                     res = server.call(tool, arguments if isinstance(arguments, dict) else {},
-                                      float(self.settings["timeout_s"]), cancel)
+                                      float(self.settings["timeout_s"]), cancel, **more)
                 if getattr(server, "wants_context", False):               # the coding tools may give the model an image (Read): it goes with the result, not as text
                     for b in res.get("content") or []:
                         if isinstance(b, dict) and b.get("type") == "image" and isinstance(b.get("data"), str) and isinstance(b.get("mimeType"), str):

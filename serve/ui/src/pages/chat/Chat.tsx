@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, Menu01Icon, SidebarLeftIcon } from "@hugeicons/core-free-icons"
-import { apiHeaders, getAgent, getHealth, getImport, getMcp, NO_HEALTH, url, type Health, type McpInfo } from "../../lib/api"
+import { apiHeaders, getAgent, getHealth, getImport, getMcp, NO_HEALTH, root, url, type Health, type McpInfo } from "../../lib/api"
 import { chat, exportMarkdown, isPrompt, useChatVersion, type Attachment, type Message } from "../../lib/chat"
 import { readFiles } from "../../lib/files"
 import { cn } from "../../lib/cn"
@@ -12,6 +12,7 @@ import { Sidebar } from "../../components/Sidebar"
 import { ConfirmDialog } from "../../components/ConfirmDialog"
 import { useMetrics } from "../../lib/metrics"
 import { readProgress } from "../../lib/status"
+import { chatWhere } from "../../lib/where"
 import { href } from "../../lib/router"
 import { effortChoices, settleEffort } from "../../lib/effort"
 import { noteSend } from "../../lib/sendfx"
@@ -34,6 +35,8 @@ import { SettingsSheet } from "./SettingsSheet"
 import { PanelDock } from "../../components/SidePanel"
 import { ProjectPicker } from "../../components/ProjectPicker"
 import { panelState, type PanelState, type PanelTab } from "../../lib/panel"
+import { blockText, myPcCoding, runnerId } from "../../lib/runner"
+import { runnerLine, useRunnerAgent } from "../../components/RunnerSettings"
 
 const NO_MCP: McpInfo = { servers: [], tools: 0 }
 
@@ -94,9 +97,21 @@ export function Chat({ id }: { id?: string }) {
   const [agentInfo, setAgentInfo] = useState<AgentInfo>(NO_AGENT)  // the coding tools: does the server have them, and may this page use them
   useEffect(() => {
     let gone = false
-    void getAgent().then((v) => { if (!gone && v) setAgentInfo(v) })
+    void getAgent().then((v) => { if (!gone && v) { setAgentInfo(v); chat.serverAllowed = !!v.allowed; chat.notify() } })      // #310 part 2: a chat in no project runs on the Server PC for an owner
     return () => { gone = true }
   }, [])
+  // #310 part 2: this browser's runner (the engineer's own PC). Its coding tools and its MCP servers, asked again now and then (no job on the PC: the
+  // answer is from its hello), so a runner that comes online is used without a reload. Nothing of this happens without a runner id.
+  const rid = runnerId()
+  const [myAgent] = useRunnerAgent(rid)
+  const myOnline = typeof myAgent === "object" && myAgent !== null && !!myAgent.online
+  const [myMcp, setMyMcp] = useState<McpInfo | null>(null)
+  useEffect(() => {
+    if (!rid) { setMyMcp(null); return }
+    let gone = false
+    void getMcp(rid).then((v) => { if (!gone) setMyMcp(v) })
+    return () => { gone = true }
+  }, [rid, myOnline])
   useEffect(() => {
     let gone = false
     void getImport().then((v) => { if (!gone && v?.available && v.skills?.settings.enabled) setSkills(commandsOf(v.skills.items, Object.fromEntries((v.harnesses ?? []).map((h) => [h.id, h.label])))) })
@@ -114,6 +129,18 @@ export function Chat({ id }: { id?: string }) {
   const input = useRef<HTMLTextAreaElement>(null)
   const pinned = useRef(true)                                   // follow the answer while the reader is at the bottom
   const busy = chat.busy
+  // #310 part 2: the machine the open chat works on, and so which coding tools, which runner, which MCP servers. A My PC chat whose runner this page
+  // has an id for sends with `runner` (online, offline, not answered yet, one failed ask): an offline PC is answered with the server's own words
+  // (409 runner_offline). With no runner id, or one the server does not know for this key, nothing can reach the PC: the words say so next to the
+  // prompt and a send with the coding tools on is refused - never a prompt that silently goes without tools (lib/runner.ts myPcCoding).
+  const onMy = chat.machine() === "my"
+  const onRunner = onMy && rid ? rid : undefined
+  const mine = onMy ? myPcCoding(rid, myAgent) : null
+  const coding: AgentInfo = mine ? mine.info : agentInfo
+  const stop = mine?.block ? blockText(mine.block, location.origin + root().replace(/\/$/, "")) : null
+  const blocking = !!stop && chat.settings.agent !== false
+  const blocked = stop ? stop.full : onMy && myAgent !== undefined ? runnerLine(myAgent) : undefined
+  const chatMcp: McpInfo = onMy && myMcp ? { servers: [...mcp.servers, ...myMcp.servers], tools: mcp.tools + myMcp.tools } : mcp      // a My PC chat may use its PC's MCP servers too
   const { data: metrics, stale } = useMetrics()
   const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
   useEffect(() => { void chat.resumeRuns() }, [])                // an answer that was being written when the page was refreshed went on in the server: it is read again
@@ -250,12 +277,13 @@ export function Chat({ id }: { id?: string }) {
       else void chat.compact(ctx(), asked.focus)
       return
     }
+    if (chat.refuses(ctx())) return                                                                   // #310 part 2: never a silent tool-less answer; the prompt stays in the composer
     const typed = !files.length && isInitCommand(text) ? INIT_PROMPT : text, f = files                                    // "/init": the prompt that has the model write the project's CLAUDE.md
     const folders = chat.folders()
     const go = async () => {
-      const found = agentInfo.allowed ? await resolveMentions(folders, typed) : []                                    // the files the prompt mentions with @ go with it
+      const found = coding.allowed ? await resolveMentions(folders, typed, onRunner) : []                                    // the files the prompt mentions with @ go with it
       const all = [...f, ...found.filter((x) => !f.some((y) => y.name === x.name))]
-      const context = { health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: folders }
+      const context = { health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: folders, ...(onRunner ? { runner: onRunner } : {}), ...(stop ? { blocked: stop.full } : {}) }
       if (!busy) void chat.send(typed, all, context)
       else void chat.steer(typed, all, context).then((taken) => { if (!taken && !chat.queue(typed, all, context)) void chat.send(typed, all, context) })        // an agent is working: it reads this at its next step; else it waits in line and goes when the answer ends
     }
@@ -265,7 +293,7 @@ export function Chat({ id }: { id?: string }) {
     setAway(false)
     void go()
   }
-  const ctx = () => ({ health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folders() })
+  const ctx = () => ({ health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: chat.folders(), ...(onRunner ? { runner: onRunner } : {}), ...(stop ? { blocked: stop.full } : {}) })
   const project = chat.index.projects.find((p) => p.id === chat.currentProject())       // the open conversation's project (or the one a new conversation was started in): its folders are where the coding tools work
   const chatKey = chat.index.active ?? "new"
   const editPrompt = (i: number, t: string) => { pinned.current = true; setAway(false); void chat.edit(i, t, ctx()) }
@@ -341,7 +369,7 @@ export function Chat({ id }: { id?: string }) {
             <StatusOrb live={live} stale={stale} size={64} scale={2.5} override={typing ? { design: "listening", label: t(ORB_NAMES.listening) } : ambient ? { design: ambient, label: t(ORB_NAMES[ambient]) } : undefined} />
             <h1 className="display mt-6" style={{ fontSize: "clamp(28px, 4vw, 40px)" }}>{t("What can I help with?")}</h1>
             <div className="mt-3"><ProjectPicker projects={chat.index.projects} value={project?.id ?? null} onPick={(id) => { chat.setPendingProject(id) }} /></div>
-            <p className="lede mt-3">{t("{name} runs on this PC. Nothing leaves it.", { name: metrics?.model_info?.name ? [metrics.model_info.name, metrics.model_info.variant].filter(Boolean).join(" · ") : health.model })}</p>
+            <p className="lede mt-3">{chatWhere(metrics?.model_info?.name ? [metrics.model_info.name, metrics.model_info.variant].filter(Boolean).join(" · ") : health.model, location.hostname, onMy ? "my" : "server")}</p>
           </div>
         </Collapse>
         {chat.messages.map((m, i) => (
@@ -359,6 +387,7 @@ export function Chat({ id }: { id?: string }) {
       </div>
 
       <div className="sticky bottom-3 z-10">
+        {blocking && <p role="note" data-runner-blocked={mine!.block!} className="mb-2 rounded-md border border-line bg-surface px-3 py-2 text-[12.5px] text-ink-2 shadow-[0_4px_16px_rgb(0_0_0/0.06)] [overflow-wrap:anywhere]">{stop!.full}</p>}
         <PromptBar
           value={text}
           onChange={setText}
@@ -376,18 +405,20 @@ export function Chat({ id }: { id?: string }) {
           onNewChat={newChat}
           onSave={download}
           context={{ view: contextView(chat.messages, chat.contextReported(), health.max_context, chat.settings.autoCompact !== false), canCompact: chat.canCompact(), onCompact: () => { void chat.compact(ctx()) }, open: ctxOpen }}
-          mention={{ folders: chat.folders(), enabled: agentInfo.allowed }}
+          mention={{ folders: chat.folders(), enabled: coding.allowed, runner: onRunner }}
           skills={commands}
           agent={{
-            info: agentInfo, on: chat.settings.agent !== false, mode: (chat.settings.agentMode === "plan" || chat.settings.agentMode === "auto" ? chat.settings.agentMode : "ask") as AgentMode,
+            info: coding, on: chat.settings.agent !== false, mode: (chat.settings.agentMode === "plan" || chat.settings.agentMode === "auto" ? chat.settings.agentMode : "ask") as AgentMode,
             folders: project ? project.folders ?? [] : chat.folders(), folderOf: project ? { kind: "project", name: project.name } : { kind: "default" }, rules: rulesOf(store, chatKey).length,
             onToggle: () => chat.setSettings({ ...chat.settings, agent: chat.settings.agent === false }),
             onMode: (m) => chat.setSettings({ ...chat.settings, agentMode: m }),
             onFolders: (list) => (project ? chat.setProjectFolders(project.id, list) : chat.setSettings({ ...chat.settings, agentFolder: list[0]?.trim() ?? "" })),
             onForget: () => { forgetRules(store, chatKey); chat.notify() }, permsHref: href("settings", "permissions"),
+            ...(rid && project ? { machine: { value: onMy ? "my" as const : "server" as const, server: agentInfo.allowed, onPick: (m: "my" | "server") => { if (!busy) chat.setProjectMachine(project.id, m) }, state: myAgent, locked: !!busy } } : {}),
+            runner: onRunner, blocked, blockedRow: stop?.short,
           }}
           mcp={{
-            servers: mcp.servers, tools: mcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings", "mcp-servers"),
+            servers: chatMcp.servers, tools: chatMcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings", "mcp-servers"),
             onToggleAll: () => chat.setSettings({ ...chat.settings, mcp: chat.settings.mcp === false }),
             onToggleServer: (name) => { const off = Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : []; chat.setSettings({ ...chat.settings, mcpOff: off.includes(name) ? off.filter((n) => n !== name) : [...off, name] }) },
           }}
@@ -422,7 +453,7 @@ export function Chat({ id }: { id?: string }) {
       <SettingsSheet open={sheet} onClose={closeSheet} efforts={choices} mcp={mcp} projectionLoaded={projection} />
     </section>
     <RewindDialog
-      open={rewindAt !== null} prompts={rewindPrompts()} start={rewindAt ?? 0} session={chat.index.active}
+      open={rewindAt !== null} prompts={rewindPrompts()} start={rewindAt ?? 0} session={chat.index.active} runner={onRunner}
       onCancel={() => setRewindAt(null)}
       onDone={(cut) => {
         setRewindAt(null)
@@ -438,7 +469,7 @@ export function Chat({ id }: { id?: string }) {
     <PanelDock
       open={panel.open} tab={panel.tab} onTab={(tab: PanelTab) => keepPanel({ ...panel, tab })} onClose={() => keepPanel({ ...panel, open: false })}
       data={{
-        folders: chat.folders(), allowed: agentInfo.allowed, busy: !!busy, messages: chat.messages, commands, onAsk: (text) => { setText(text); input.current?.focus() },
+        folders: chat.folders(), allowed: coding.allowed, runner: onRunner, busy: !!busy, messages: chat.messages, commands, onAsk: (text) => { setText(text); input.current?.focus() },
         context: contextView(chat.messages, chat.contextReported(), health.max_context, chat.settings.autoCompact !== false), canCompact: chat.canCompact(), onCompact: () => { void chat.compact(ctx()) },
       }}
     />

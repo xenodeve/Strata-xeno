@@ -4,11 +4,13 @@ They run real commands through Git Bash (or bash) when there is one; without a s
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -180,6 +182,125 @@ class Finding(unittest.TestCase):
     def test_the_description_names_the_shell(self):
         if SHELL:
             self.assertIn(SHELL.kind, shell.describe(SHELL).lower())
+
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _sleeps(token: str) -> list[int]:
+    """The pids of the sleep.exe processes whose command line holds `token` (each test's own unique duration, so another
+    session's sleep is never counted or killed)."""
+    q = (f"Get-CimInstance Win32_Process -Filter \"Name='sleep.exe'\" | Where-Object {{ $_.CommandLine -like '*{token}*' }} "
+         "| ForEach-Object { $_.ProcessId }")
+    out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", q], capture_output=True, text=True,
+                         timeout=60, creationflags=NO_WINDOW).stdout
+    return [int(x) for x in out.split() if x.isdigit()]
+
+
+def _alive(pid: int) -> bool:
+    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, creationflags=NO_WINDOW).stdout
+    return str(pid) in out
+
+
+@unittest.skipUnless(os.name == "nt" and SHELL and SHELL.kind == "bash", "Git Bash on Windows (#314)")
+class StopReachesEveryProcess(unittest.TestCase):
+    """#314: stopping a Git Bash command ends the MSYS programs it started too.  bash forks them through an intermediary
+    that exits at once, so `taskkill /T` cannot find them by parent; each Running is a kill-on-close job of its own."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp.cleanup)
+        self.proj = Path(self._tmp.name).resolve()
+
+    def token(self) -> str:
+        t = f"30.{uuid.uuid4().int % 10**6:06d}1"                    # sleep 30.xxxxxx1: a duration no other process has
+        self.addCleanup(self._sweep, t)                               # before any assertion: a failing run leaves none behind
+        return t
+
+    @staticmethod
+    def _sweep(token: str) -> None:
+        for pid in _sleeps(token):
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, creationflags=NO_WINDOW)
+
+    def started(self, token: str) -> list[int]:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            pids = _sleeps(token)
+            if pids:
+                return pids
+            time.sleep(0.2)
+        self.fail(f"sleep {token} never started")
+
+    def gone(self, pids: list[int]) -> list[int]:
+        deadline = time.monotonic() + 10
+        left = pids
+        while left and time.monotonic() < deadline:
+            time.sleep(0.2)
+            left = [p for p in pids if _alive(p)]
+        return left
+
+    def test_kill_ends_the_msys_child_of_every_shape(self):
+        for shape in ("sleep {t}; echo x", "sleep {t} && echo x", "sleep {t} | cat"):
+            with self.subTest(shape=shape):
+                t = self.token()
+                run = shell.Running(shape.format(t=t), SHELL, str(self.proj))
+                pids = self.started(t)
+                run.kill()
+                run.proc.wait(timeout=10)
+                self.assertEqual(self.gone(pids), [], f"{shape}: sleep.exe outlived kill()")
+                run.kill()                                            # a second stop is harmless
+
+    def srv_ctx(self, cancel=None):
+        srv = agent.AgentServer()
+        shell.install(srv, SHELL)
+        self.addCleanup(srv.close)
+        ctx = agent.AgentContext(policy=Policy(cwd=str(self.proj), allow=["Bash"]), session="s1", ask=lambda req: "allow",
+                                 cancel=cancel or threading.Event())
+        return srv, ctx
+
+    def test_a_bash_timeout_ends_the_msys_child(self):
+        srv, ctx = self.srv_ctx()
+        t = self.token()
+        holder: dict = {}
+        th = threading.Thread(target=lambda: holder.update(r=srv.call("Bash", {"command": f"sleep {t}; echo x", "timeout": 3000}, 0, None, ctx)))
+        th.start()
+        pids = self.started(t)
+        th.join(30)
+        self.assertIn("timed out", text(holder["r"]))
+        self.assertEqual(self.gone(pids), [], "sleep.exe outlived the Bash timeout")
+
+    def test_killshell_ends_the_msys_child(self):
+        srv, ctx = self.srv_ctx()
+        t = self.token()
+        r = srv.call("Bash", {"command": f"sleep {t} && echo x", "run_in_background": True}, 0, None, ctx)
+        bid = text(r).split("ID:")[1].split()[0].strip(".")
+        pids = self.started(t)
+        self.assertFalse(srv.call("KillShell", {"shell_id": bid}, 0, None, ctx)["isError"])
+        self.assertEqual(self.gone(pids), [], "sleep.exe outlived KillShell")
+
+    def test_a_command_that_ends_by_itself_leaves_what_it_started_on_purpose(self):
+        """As before #314: a foreground command that returns normally lets go of its job, so a program it started in the
+        background on purpose (a dev server, an editor) keeps running."""
+        srv, ctx = self.srv_ctx()
+        pidfile = (self.proj / "pid.txt").as_posix()
+        code = f"import os, time; open(r'{pidfile}', 'w').write(str(os.getpid())); time.sleep(30)"
+        r = srv.call("Bash", {"command": f'"{PY}" -c "{code}" > /dev/null 2>&1 &'}, 0, None, ctx)
+        self.assertFalse(r["isError"], text(r))
+        deadline = time.monotonic() + 15
+        while not os.path.exists(pidfile) or not open(pidfile).read().strip():
+            self.assertLess(time.monotonic(), deadline, "the background program never started")
+            time.sleep(0.1)
+        pid = int(open(pidfile).read())
+        self.addCleanup(lambda: subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, creationflags=NO_WINDOW))
+        time.sleep(1.0)
+        self.assertTrue(_alive(pid), "a normally ended command's background program was killed")
+
+    def test_a_running_lets_go_of_its_job_when_it_ends(self):
+        run = shell.Running("echo hi", SHELL, str(self.proj))
+        run.proc.wait(timeout=10)
+        run.reader.join(timeout=10)
+        self.assertIsNone(run._job)                                   # no handle is kept for a finished command
+        self.assertEqual(run.text().strip(), "hi")
 
 
 if __name__ == "__main__":

@@ -67,11 +67,14 @@ from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
 from serve import harness, mcp_admin  # noqa: E402
+from serve import identity as identity_mod  # noqa: E402  (#310: named keys, roles, the approval of devices)
 from serve import skills as skills_mod  # noqa: E402
 from serve import agent as agent_mod, agent_prompt, agent_run, hooks as hooks_mod, permissions, runs as runs_mod, shell as shell_mod, subagent as subagent_mod, web as web_mod  # noqa: E402
-from serve import checkpoints as checkpoints_mod, files as files_mod, folders as folders_mod, gitview, memory as memory_mod  # noqa: E402
-from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve import checkpoints as checkpoints_mod, folders as folders_mod, memory as memory_mod  # noqa: E402
+from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import runner_hub  # noqa: E402  (#310 part 2: the runner channel)
+from serve import page_routes  # noqa: E402  (#310 part 2: the page routes that act on a project's machine)
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -1540,7 +1543,8 @@ class StrataEngine:
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
-                            "started": time.time(), "first_token": None}
+                            "started": time.time(), "first_token": None,
+                            "who": ((sampling or {}).get("_meta") or {}).get("who") or "owner"}   # #310
                     self.slot_live[slot] = live
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
@@ -1717,7 +1721,8 @@ class StrataEngine:
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
+                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None,
+                         "who": r.get("who")})                  # #310: whose request the slot runs
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -2062,6 +2067,7 @@ class StrataEngine:
 
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
+GUEST_IMAGE_URLS = 16           # #311: the image URLs one request of a team guest may name (each is held in memory)
 
 
 def network_path(path: str) -> bool:
@@ -2230,10 +2236,28 @@ class Vision:
         raise ValueError("an image must be a data: URL, an http(s) URL or a local file path")
 
     @staticmethod
-    def download(url: str) -> bytes:
+    def download(url: str, guard=None) -> bytes:
         """An image URL's bytes, at most IMAGE_URL_MAX of them: the whole response was read, so a huge or endless one
-        filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection."""
+        filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection.
+        `guard(ip, port)` (#311: a team guest's URL, web.public_not_vpn): fetched by web.Fetcher, which checks every
+        address it connects to - after the name is looked up, and again on every redirect - and the refusal says only
+        that the address is not public, before anything is sent to it."""
         too_big = f"the image URL's file is over {IMAGE_URL_MAX >> 20} MiB"
+        if guard is not None:
+            try:
+                page = web_mod.Fetcher(guard=guard, timeout=60).get(url, headers={"Accept": "image/*,*/*;q=0.5", "Accept-Encoding": "identity"},
+                                                                    limit=IMAGE_URL_MAX)
+            except web_mod.NotPublic:
+                raise ValueError("an image URL must be an address on the public internet: send the image as a data: "
+                                 "URL") from None
+            except web_mod.Refused as e:
+                raise ValueError(f"the image URL could not be read: {e}") from None
+            if page.cut:
+                raise ValueError(too_big if len(page.body) >= IMAGE_URL_MAX else "the image URL could not be read whole (too slow, or the "
+                                 "connection ended)")
+            if not 200 <= page.status < 300:
+                raise ValueError(f"the image URL could not be read: HTTP {page.status}")
+            return page.body
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
                 size = r.headers.get("Content-Length") or ""
@@ -3019,6 +3043,12 @@ class Service:
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        # #310: named keys with the roles owner and guest, and the approval of new devices (serve/identity.py); main()
+        # gives it the keys file beside the run config.  Team mode is that file existing; without it every gate below
+        # behaves as before (the one api_key is the owner's)
+        self.keys = identity_mod.KeyStore(None)
+        self.trust_loopback = True                     # #310: a request from this PC to this PC needs no device approval
+        self.peer_override = None                      # #310 tests: the client address the handler sees instead of the socket's
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
@@ -3037,6 +3067,9 @@ class Service:
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0, "loops_stopped": 0, "thinking_cycles_closed": 0}  # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
+        # #310: who waits for the engine, in arrival order ({"who", "since"}), one entry per status["queued"] count
+        # (_queue_enter / _queue_leave change both together)
+        self.queue_who: list[dict] = []
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
@@ -3069,6 +3102,7 @@ class Service:
         self.agent = None                                # serve/agent.py's AgentServer: the chat's coding tools (Read, Write, Edit, Bash, ...); None: switched off
         self.broker = agent_run.Broker()                 # the questions the coding tools have asked the page and not had answered yet
         self.runs = runs_mod.RunStore()                  # the answers that use the coding tools: they go on when the page that asked is refreshed or closed (serve/runs.py)
+        self.runner_hub = runner_hub.RunnerHub()         # #310 part 2: the runners on the engineers' own PCs (serve/runner_hub.py)
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
@@ -3114,18 +3148,14 @@ class Service:
             on = []
         return memory_mod.collect(home, folders, on)
 
-    def start_agent_run(self, sa: dict, messages: list):
+    def start_agent_run(self, sa: dict, messages: list, who: str = "owner", runner=None, guest: bool = False):
         """One request's use of the coding tools: the folder, mode, rules and chat the page named (anything odd is ignored), the rules for the
-        AI as a prompt, and auto mode's judge (serve/agent_run.py)."""
-        raw = sa.get("cwd")
-        folder = os.path.realpath(raw) if isinstance(raw, str) and raw.strip() and "\0" not in raw and os.path.isdir(raw) else None
-        dirs: list[str] = []                                            # the project's other folders: the real ones, once each, not the main one; none without a main one
-        for d in sa.get("dirs") if folder and isinstance(sa.get("dirs"), list) else []:
-            if isinstance(d, str) and d.strip() and "\0" not in d and os.path.isdir(d):
-                r = os.path.realpath(d)
-                if os.path.normcase(r) != os.path.normcase(folder) and os.path.normcase(r) not in [os.path.normcase(x) for x in dirs]:
-                    dirs.append(r)
-        dirs = dirs[:agent_mod.MAX_DIRS]
+        AI as a prompt, and auto mode's judge (serve/agent_run.py).  `who`: the identity whose request it is; only it answers what the run asks (#310).
+        `runner` (#310 part 2): the serve/runner_hub.py Runner of a project on the engineer's own PC.  Its `run.start` job (the facts job) gives
+        the real folders, the shell, the platform, git and the notes, and the server touches none of its own disk, hooks or checkpoints for
+        the run; web access, helpers, vision and the judge stay the server's.  RunnerUnavailable when the job fails (before any run is made).
+        `guest`: a team guest's run - its WebFetch (it runs here, for the run and its helpers) reaches only the public internet, never this
+        PC, a private network, Tailscale or Radmin's 26.0.0.0/8 (web.public_not_vpn, as #311's image URLs; final review I-1)."""
         mode = sa.get("mode") if sa.get("mode") in ("auto", "plan") else None
         rules = lambda v: [x for x in v if isinstance(x, str) and 0 < len(x) <= 500][:200] if isinstance(v, list) else []      # noqa: E731
         sid = sa.get("session") if isinstance(sa.get("session"), str) and 0 < len(sa["session"]) <= 80 else "default"
@@ -3135,43 +3165,63 @@ class Service:
                 c = m.get("content")
                 goal = c if isinstance(c, str) else "".join(p.get("text", "") for p in c if isinstance(p, dict)) if isinstance(c, list) else ""
                 break
+
+        def read_conf() -> dict:
+            try:
+                return harness._cfg(self)
+            except Exception:  # noqa: BLE001 - a config that cannot be read means the defaults: no web access, no hooks
+                return {}
         sh = getattr(self.agent, "shell", None)
-        policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs,
-                                    protected=[p for p in (self.config_path, self.mcp_config_path) if p])   # hooks, web access and keys live there: never changed unasked
-        run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell_mod.describe(sh) if sh else None)
         cp = sa.get("checkpoint")
-        if isinstance(cp, str) and sid != "default":
-            run.ctx.checkpoint = self.checkpoints.scope(sid, cp)                  # this prompt's checkpoint: the files the tools change are kept as they were
-        git, d = False, folder
-        for _ in range(6):                                              # the folder or one of the folders above it holds .git
-            if not d:
-                break
-            if os.path.exists(os.path.join(d, ".git")):
-                git = True
-                break
-            parent = os.path.dirname(d)
-            d = parent if parent != d else None
-        try:
-            conf = harness._cfg(self)
-        except Exception:  # noqa: BLE001 - a config that cannot be read means the defaults: no web access, no hooks
-            conf = {}
+        if runner is None:
+            folder, dirs = folders_mod.resolve(sa.get("cwd"), sa.get("dirs"), agent_mod.MAX_DIRS)     # the real ones, once each, not the main one; none without a main one
+            shell, facts, conf = shell_mod.describe(sh) if sh else None, None, None
+            protected = [p for p in (self.config_path, self.mcp_config_path) if p]                 # hooks, web access and keys live there: never changed unasked
+        else:
+            conf = read_conf()
+            path = lambda v: isinstance(v, str) and bool(v.strip()) and "\0" not in v and len(v) <= 4096    # noqa: E731 - the runner finds the real ones
+            raw_dirs = sa.get("dirs") if isinstance(sa.get("dirs"), list) else []
+            facts = runner_hub.run_facts(runner.request("run.start", {
+                "cwd": sa.get("cwd") if path(sa.get("cwd")) else None, "dirs": [d for d in raw_dirs[:200] if path(d)], "mode": mode,
+                "allow": rules(sa.get("allow")), "deny": rules(sa.get("deny")), "session": sid,
+                "checkpoint": cp if isinstance(cp, str) and len(cp) <= 200 and sid != "default" else None,
+                "memory_on": memory_mod.settings(conf)["on"]}), runner.info.get("machine") or "?", agent_mod.MAX_DIRS, memory_mod.MAX_TOTAL)
+            folder, dirs, shell = facts["cwd"], facts["dirs"], facts["shell"]
+            protected = []                                              # the runner keeps its own files from the tools; the server's are not there
+        policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs, protected=protected)
+        run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell, who=who)
+        if facts is None:
+            if isinstance(cp, str) and sid != "default":
+                run.ctx.checkpoint = self.checkpoints.scope(sid, cp)              # this prompt's checkpoint: the files the tools change are kept as they were
+            git = folders_mod.in_git(folder)                            # the folder or one of the folders above it holds .git
+            conf = read_conf()
+        else:                                                           # the runner keeps the checkpoint and found .git
+            run.ctx.run_key, run.coding, run.runner, git = facts["run"], "my_agent", runner, facts["git"]
         web = web_mod.settings(conf)
         run.hidden = set() if web["on"] else set(getattr(self.agent, "web_tools", ()))          # web access is off until the user switches it on: the model is not even offered the tools
-        if web["on"]:
-            run.ctx.web = web_mod.Web(web)
+        if web["on"]:                                                   # a guest's fetches leave from this PC: not into the team's own network
+            run.ctx.web = web_mod.Web(web, fetcher=web_mod.Fetcher(guard=web_mod.public_not_vpn) if guest else None)
         helpers = getattr(self.agent, "helper_tools", ())
         if subagent_mod.settings(conf)["on"] and helpers:                                         # helpers are off until the user switches them on, for the same reason
             run.ctx.spawn = lambda kind, prompt, description: subagent_mod.execute(self, run, kind, prompt, description, run_with_mcp)
         else:
             run.hidden |= set(helpers)
-        tools = [t["name"] for t in self.agent.tools if (t["name"] != "ExitPlanMode" or mode == "plan") and t["name"] not in run.hidden]
-        run.prompt = agent_prompt.build(folder, shell_mod.describe(sh) if sh else None, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
-        defined, _problems = hooks_mod.load(conf)
+        if facts is None:
+            tools = [t["name"] for t in self.agent.tools if (t["name"] != "ExitPlanMode" or mode == "plan") and t["name"] not in run.hidden]
+            run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
+        else:                                                           # the runner's coding tools, then the server's own that run here
+            ours = {t["name"] for t in getattr(self.agent, "tools", None) or []}
+            names = [n for n in facts["tools"] if n not in runner_hub.SERVER_TOOLS and runner_hub.plain_name_ok(n)] + [n for n in runner_hub.SERVER_TOOLS if n in ours]
+            tools = [n for n in names if (n != "ExitPlanMode" or mode == "plan") and n not in run.hidden]
+            run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), facts["platform"], git, None, tools, dirs, facts["memory"])
         run.ctx.vision = self.vision is not None and not self._vision_down()          # Read can give an image to the model only when the vision encoder is there
-        runner = hooks_mod.Runner(defined, sh, folder, sid, run._emit, lambda: run.cancel.is_set(), begin=run._emit)
-        if runner:
-            run.ctx.hooks = run.hooks = runner
-            said = runner.prompt(goal)                                   # the user's own prompt hooks: what they print goes to the model with the rules
+        if facts is not None:                                           # no hooks for a project on the engineer's PC (v1): the server's run on the server
+            return run
+        defined, _problems = hooks_mod.load(conf)
+        hooks = hooks_mod.Runner(defined, sh, folder, sid, run._emit, lambda: run.cancel.is_set(), begin=run._emit)
+        if hooks:
+            run.ctx.hooks = run.hooks = hooks
+            said = hooks.prompt(goal)                                    # the user's own prompt hooks: what they print goes to the model with the rules
             if said:
                 run.prompt += "\n\n" + said
         return run
@@ -3201,7 +3251,12 @@ class Service:
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
-    def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
+    def key_required(self) -> bool:
+        """Does a request need a key: the api_key is set, or the server is in team mode (#310: a keys file, even an
+        empty or broken one - it must not turn into an open server)."""
+        return bool(self.api_key) or self.keys.team_mode()
+
+    def slot_action(self, slot: str, action: str, filename, who: str = "owner") -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
         to or from a file in slot_save_path.  -> (HTTP status, body)."""
         def error(code, message):
@@ -3228,19 +3283,19 @@ class Service:
                 return error(404, f"no saved session named {filename}")
         self.last_request_at = time.time()                  # the idle unload counts this as activity
         with self.status_lock:
-            self.status["queued"] += 1
+            place = self._queue_enter(who)
         waiting = True
         try:
             with self.fifo:
                 with self.status_lock:
-                    self.status["queued"] -= 1
+                    self._queue_leave(place)
                 waiting = False
                 if not self.loaded():
                     return error(503, "the model is not loaded")
                 with self.status_lock:
                     self.status.update(busy=True, phase="saving the session" if action == "save"
                                        else "restoring a session", started=time.time(), first_token=None,
-                                       prompt_tokens=None, generated=None, max_tokens=None)
+                                       prompt_tokens=None, generated=None, max_tokens=None, who=who)
                 try:
                     if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
                         from serve.session_save_retry import session_file
@@ -3262,7 +3317,7 @@ class Service:
         finally:
             if waiting:                                     # never reached the FIFO (an exception while waiting)
                 with self.status_lock:
-                    self.status["queued"] -= 1
+                    self._queue_leave(place)
         if action == "save":
             return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
@@ -3430,7 +3485,7 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self, wait_for_restart: bool = False):
+    def load(self, wait_for_restart: bool = False, who: str = "owner"):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy).  While
         another request (re)loads it: EngineDied at once (xeno #49 S2, the Anthropic API's retryable 529), or, with
         `wait_for_restart` (the OpenAI API), a turn in the queue until it is loaded (#208, #332).  That wait is this
@@ -3445,12 +3500,12 @@ class Service:
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
         with self.status_lock:                          # #1603: waiting for the fifo to start the engine is queued, not nothing
-            self.status["queued"] += 1
+            place = self._queue_enter(who)
         counted = True
         try:
             with self.fifo:
                 with self.status_lock:
-                    self.status["queued"] -= 1
+                    self._queue_leave(place)
                 counted = False
                 loading = time.perf_counter()
                 if trace is not None:
@@ -3467,7 +3522,23 @@ class Service:
         finally:
             if counted:
                 with self.status_lock:
-                    self.status["queued"] -= 1
+                    self._queue_leave(place)
+
+    def _queue_enter(self, who: str) -> dict:
+        """#310: one more request waits for the engine (the caller holds status_lock): status["queued"] counts it and
+        queue_who names it, in arrival order.  Returns its place, for _queue_leave."""
+        self.status["queued"] += 1
+        place = {"who": who, "since": time.time()}
+        self.queue_who.append(place)
+        return place
+
+    def _queue_leave(self, place: dict) -> None:
+        """It waits no more (the caller holds status_lock): its turn came, it was cancelled or it failed."""
+        self.status["queued"] -= 1
+        for i, x in enumerate(self.queue_who):
+            if x is place:
+                del self.queue_who[i]
+                break
 
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
@@ -3624,10 +3695,11 @@ class Service:
                     req["output_config"] = {"effort": effort}
         return req
 
-    def meta_for(self, dialect, messages, tools, user_agent) -> dict:
+    def meta_for(self, dialect, messages, tools, user_agent, who: str = "owner") -> dict:
         """The request's history meta; while "keep the next N prompts" is on it also carries the full prompt (`_prompt`,
-        which run() moves to the detail file and never into the summary row)."""
-        meta = request_meta(dialect, messages, tools, user_agent)
+        which run() moves to the detail file and never into the summary row).  `who`: the identity that sent it (#310),
+        which run() also shows as the engine's holder or a waiting request."""
+        meta = request_meta(dialect, messages, tools, user_agent, who)
         with self.keep_lock:
             if self.keep_prompts > 0:
                 self.keep_prompts -= 1
@@ -3690,8 +3762,9 @@ class Service:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
-    def begin_request(self, path, req):
-        """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
+    def begin_request(self, path, req, who: str = "owner"):
+        """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then).  `who`: the
+        identity that sent it (#310)."""
         if not self.api_monitor:
             return None
         raw = json.dumps(req, ensure_ascii=False, indent=2)
@@ -3701,35 +3774,45 @@ class Service:
                   if isinstance(req.get("response_format"), dict) else None,
                   "input": raw[:262144], "input_truncated": len(raw) > 262144,
                   "output": "", "reasoning": "", "output_truncated": False, "reasoning_truncated": False,
-                  "queue_s": 0.0, "load_s": 0.0, "first_token_s": None,
+                  "queue_s": 0.0, "load_s": 0.0, "first_token_s": None, "who": who,
                   "_clock": time.perf_counter()}
         with self.status_lock:
             self.api_requests.append(record)
         self.request_trace.record = record
         return record
 
-    def request_records(self, request_id=None):
+    def request_records(self, request_id=None, viewer: identity_mod.Identity = identity_mod.OWNER):
+        """#332's records as `viewer` may see them (#310): another person's request is not found by id, and in the
+        list it shows who, state, queue place and timings only (identity.visible_record)."""
         with self.status_lock:
             records = list(self.api_requests)
             if request_id:
                 record = next((r for r in records if r["id"] == request_id), None)
-                if record is None:
+                if record is None or not self.may_read(record, viewer):
                     return None
                 return {k: v for k, v in record.items() if not k.startswith("_")}
-            return [{k: v for k, v in r.items()
+            return [identity_mod.visible_record(
+                    {k: v for k, v in r.items()
                      if k not in ("input", "output", "reasoning", "response") and not k.startswith("_")}
-                    | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
+                    | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}, viewer)
                     for r in reversed(records)]
 
-    def metrics(self, all_requests=False) -> dict:
+    @staticmethod
+    def may_read(record: dict, viewer: identity_mod.Identity) -> bool:
+        """#310: may `viewer` read what a request asked and answered - the owner, or the identity that sent it."""
+        return viewer.is_owner or record.get("who") == viewer.name
+
+    def metrics(self, all_requests=False, viewer: identity_mod.Identity = identity_mod.OWNER) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
-        the hardware (with a minute of history per series)."""
+        the hardware (with a minute of history per series).  #310: the requests as `viewer` may see them; who holds
+        the engine and who waits for it, by name."""
         with self.status_lock:
             s = dict(self.status)
             if self.live_reqs:                          # parallel requests: the newest one's status
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
             hist = list(self.history)
             totals = dict(self.totals)
+            waiting = [dict(x) for x in self.queue_who]
         now = time.time()
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and s.get("first_token") is None:
@@ -3748,7 +3831,10 @@ class Service:
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
-                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
+                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None,
+                # #310: the identity whose request has the engine (with "parallel": each busy slot's "who"), and the
+                # ones waiting for it, in arrival order (in both modes; "waiting" is #465's count, with "parallel" only)
+                "holder": s.get("who") if s.get("busy") else None, "waiting_who": waiting}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         par = int(getattr(self.engine, "batch", 0) or 0)
@@ -3758,9 +3844,10 @@ class Service:
             slots = self.engine.slots_view() if hasattr(self.engine, "slots_view") else []
             # the requests in flight that are not in a slot: the one alone on the solo path, or waiting their turn
             in_slots = sum(1 for x in slots if x["state"] != "idle")
+            # "holder" is each busy slot's "who" here (#310)
             live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
-                        admitting=int(getattr(self.engine, "admitting", 0) or 0))
+                        admitting=int(getattr(self.engine, "admitting", 0) or 0), holder=None)
             if running and state == "idle":
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
@@ -3771,7 +3858,8 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        return {"engine": engine, "live": live,
+                "requests": [identity_mod.visible_record(r, viewer) for r in hist[::-1][:None if all_requests else 12]],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -4372,6 +4460,8 @@ class Service:
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
         trace = getattr(self.request_trace, "record", None)
+        # #310: the identity whose request this is (its history meta's "who"): the engine's holder while it runs
+        who = ((sampling or {}).get("_meta") or {}).get("who") or "owner"
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
@@ -4379,7 +4469,7 @@ class Service:
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
-            self.status["queued"] += 1
+            place = self._queue_enter(who)
         t_queue = timeline.now_us()
         priority = 0 if (sampling or {}).get("stream") else 1   # xeno #49 S6: main turn first
         try:
@@ -4401,11 +4491,11 @@ class Service:
                             yield "ping", None
                 except BaseException:                    # the consumer closed us at a ping: no longer queued
                     with self.status_lock:
-                        self.status["queued"] -= 1
+                        self._queue_leave(place)
                     raise
                 if not got:                              # cancelled while queued
                     with self.status_lock:
-                        self.status["queued"] -= 1
+                        self._queue_leave(place)
                     yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
                                    "reasoning_tokens": 0, "reasoning_recoveries": 0}
                     return
@@ -4417,7 +4507,7 @@ class Service:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
                             trace["state"] = "generating"
                         if not par:
-                            self.status["queued"] -= 1
+                            self._queue_leave(place)
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that).
                     # #1603: a parallel request stays counted as queued until it is registered as running below -
@@ -4432,14 +4522,14 @@ class Service:
                     except BaseException:
                         if par:
                             with self.status_lock:
-                                self.status["queued"] -= 1
+                                self._queue_leave(place)
                         raise
                     with self.status_lock:
                         if par:
-                            self.status["queued"] -= 1
+                            self._queue_leave(place)
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
+                                  max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget, who=who)
                         if par:
                             self.live_reqs[id(st)] = (st, rate)
                             self.status.update(st)
@@ -4637,7 +4727,7 @@ class Service:
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
-                            meta = dict((sampling or {}).get("_meta") or request_meta("", [], None, None))
+                            meta = dict((sampling or {}).get("_meta") or request_meta("", [], None, None, who))
                             # one request can call run() several times (an MCP tool round, the thinking budget's second call):
                             # the first keeps the request's id, the later ones get -2, -3 ... so no row or detail overwrites another
                             shared = (sampling or {}).get("_meta")
@@ -4678,7 +4768,8 @@ class Service:
                             hw, hw_series = tel.request_hw(started, time.time()) if tel is not None else (None, [])
                             rec["hw"] = hw
                             self.history.append(rec)
-                            to_disk = (rec, {"prefill_chunks": chunks["items"] if chunks else [],
+                            to_disk = (rec, {"who": rec.get("who"),     # #310: whose request (the route checks its summary's)
+                                             "prefill_chunks": chunks["items"] if chunks else [],
                                              "decode_series": decode["series"] if decode else [],
                                              "stats": last.get("stats"),
                                              "hw_series": hw_series,
@@ -4894,19 +4985,35 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         results = []
         for c in calls:
             s, tool = hub.routes().get(c.name, (None, c.name))
+            remote = s is not None and getattr(s, "machine", None) == "my"      # #310 part 2: a group of the engineer's own PC
             yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
-                          "tool": tool, "arguments": c.arguments, "round": rounds}
+                          "tool": tool, "arguments": c.arguments, "round": rounds, **({"machine": "my"} if remote else {})}
+            states: queue.SimpleQueue = queue.SimpleQueue()      # the runner group's progress words, from the worker thread
+            said = "sending"
+            if remote:
+                yield "mcp", {"event": "remote", "id": c.id, "state": said}
             # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
             # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
             box = {}
             if agent_run is not None:
                 agent_run.current = c.id
 
-            def work(c=c, box=box):
+            def work(c=c, box=box, remote=remote, states=states):
                 try:
-                    box["r"] = hub.call(c.name, c.arguments, cancel, agent_run.ctx if agent_run is not None else None)
+                    ctx = agent_run.ctx if agent_run is not None else None
+                    box["r"] = hub.call(c.name, c.arguments, cancel, ctx, progress=states.put) if remote \
+                        else hub.call(c.name, c.arguments, cancel, ctx)
                 except McpCancelled:
                     box["cancelled"] = True
+
+            def progress(c=c, states=states):
+                """The runner's `running` / `offline` as `remote` events, each once in a row (`sending` was said)."""
+                nonlocal said
+                while not states.empty():
+                    word = states.get()
+                    if word in ("running", "offline") and word != said:
+                        said = word
+                        yield "mcp", {"event": "remote", "id": c.id, "state": word}
             worker = threading.Thread(target=work, daemon=True)
             worker.start()
             try:
@@ -4916,12 +5023,14 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                     if agent_run is not None:
                         for e in agent_run.drain():      # a question for the user, a todo list, ...: to the page at once
                             yield "mcp", e
+                    yield from progress()
                     beat += 1
                     if worker.is_alive() and beat % 5 == 0:
                         yield "ping", None
                 if agent_run is not None:
                     for e in agent_run.drain():
                         yield "mcp", e
+                yield from progress()
             except GeneratorExit:
                 cancel.set()                             # the client is gone: stop the tool too (a question that is open ends too)
                 raise
@@ -5290,6 +5399,26 @@ class BadBody(Exception):
         self.status = status
 
 
+# #310: POST routes that only an owner key may use in team mode (with /slots/*), and what each one does
+OWNER_POSTS = {"/settings": "settings can be changed", "/config": "the run config can be changed",
+               "/unload": "the model can be loaded or unloaded", "/load": "the model can be loaded or unloaded",
+               "/v1/unload": "the model can be loaded or unloaded", "/v1/load": "the model can be loaded or unloaded",
+               "/v1/vram": "the VRAM reserve can be changed", "/metrics/keep": "prompts can be kept"}
+NO_RUN = "there is no such run (it ended long ago, or the server was restarted)"
+# the owner gate's words of the page routes on the workstation (serve/page_routes.py; with `runner=` they act on the
+# caller's own PC instead, #310 part 2)
+PAGE_GATES = {"/agent/folders": "this PC's folders can be listed", "/agent/git": "a folder's Git state can be read",
+              "/agent/git/diff": "a folder's Git state can be read", "/agent/files": "the project's files can be read",
+              "/agent/mention": "the project's files can be read", "/agent/memory": "the project's notes can be read",
+              "/agent/memory/file": "the project's notes can be read", "/agent/rewind": "files can be put back",
+              "/agent/checkpoints/forget": "files can be put back"}
+# #310 part 2: the runner channel's bodies (a reply carries a tool's result: a Read image fits) and answers
+RUNNER_HELLO_MAX, RUNNER_REPLY_MAX = 4 << 20, 32 << 20
+NO_RUNNER = "there is no such runner (say hello again)"
+RUNNER_REPLACED = {"error": {"type": "runner_replaced", "message": "a newer Strata Desktop runner on this PC took this "
+                                                                   "runner's place; this one stops"}}
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -5297,6 +5426,9 @@ def make_handler(svc: Service):
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
         body_read = False                                   # whether a handler took this request's body
+        identity = None                                     # #310: who sent this request (_authorized sets it)
+        device_id = ""                                      # #310: the device it came from, in team mode
+        team = False                                        # #310: the server was in team mode when _authorized ran
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
 
         def log_message(self, fmt, *args):
@@ -5412,13 +5544,13 @@ def make_handler(svc: Service):
 
         def parse_request(self):
             """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
-            (host_allowed).  With a key a rebinding page cannot authenticate, so the check is skipped: tunnels and
-            proxies that pass their own name on keep working."""
+            (host_allowed).  With a key (the api_key, or team mode's named keys, #310) a rebinding page cannot
+            authenticate, so the check is skipped: tunnels and proxies that pass their own name on keep working."""
             if not super().parse_request():
                 return False
             host = self.headers.get("Host")
             # svc.allowed_hosts again: a name the config adds after serve() worked out host_names (xeno #71)
-            if svc.api_key or host_allowed(host, svc.host_names | set(svc.allowed_hosts), "*" in svc.allowed_hosts):
+            if svc.key_required() or host_allowed(host, svc.host_names | set(svc.allowed_hosts), "*" in svc.allowed_hosts):
                 return True
             print(f"[strata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
                   f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
@@ -5435,7 +5567,7 @@ def make_handler(svc: Service):
             there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
             then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
             origin = self.headers.get("Origin")
-            if svc.api_key or not origin:
+            if svc.key_required() or not origin:
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
@@ -5537,14 +5669,195 @@ def make_handler(svc: Service):
             self.wfile.write(body)
 
         def _authorized(self) -> bool:
-            if not svc.api_key:
+            """Who sent this request (self.identity) and, in team mode, from which device (#310).  Outside team mode
+            (no keys file) it is as before: the api_key, when set, is the door and every holder is the owner; with no
+            key the owner is a request from this PC that names this PC (mcp_admin.may_edit), anyone else a guest."""
+            self.team = svc.keys.team_mode()
+            given = self._given_key()
+            if not self.team:
+                if svc.api_key and not key_matches(given, svc.api_key):
+                    self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+                    return False
+                self.identity = identity_mod.OWNER if self._edit_answer()[0] else identity_mod.LOCAL_GUEST
                 return True
-            auth = self.headers.get("Authorization", "")
-            given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if key_matches(given, svc.api_key):
+            ident = svc.keys.match(given)                    # team mode: a key always, even with no api_key set
+            if ident is None:
+                self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+                return False
+            self.identity = ident
+            peer, h = self._peer(), self.headers
+            addr = identity_mod.device_addr(peer, mcp_admin.is_loopback(peer), h.get("Cf-Connecting-Ip"),
+                                            self._all_lines("X-Forwarded-For"), self._all_lines("Forwarded"))
+            self.device_id, label = identity_mod.device_of(h.get("X-Strata-Device"), h.get("X-Strata-Device-Name"),
+                                                           h.get("User-Agent"), addr)
+            if self._loopback_local():                       # the workstation itself: approved without asking
                 return True
-            self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+            # every key's first use from a new device waits for the owner, the owner's own key too (spec decision 1)
+            state = svc.keys.device(ident, self.device_id, label, addr, time.time())
+            if state == "approved":
+                return True
+            if state == "pending":
+                code = svc.keys.device_code(ident.name, self.device_id)
+                self._json(403, {"error": {"type": "device_pending", "code": code or "----", "message":
+                                 f"this device waits for the owner's approval to use the key {ident.name!r}; the owner "
+                                 f"sees it with the code {code}" if code else
+                                 "this device waits for the owner's approval, but the keys file on the server cannot be "
+                                 "read or written, so the device is not recorded: the owner must fix the keys file"}})
+            else:
+                self._json(403, {"error": {"type": "device_refused", "message":
+                                 f"this device may not use the key {ident.name!r} (the owner refused it, or the key has "
+                                 f"too many devices); the owner can clear it"}})
             return False
+
+        def _all_lines(self, name: str) -> str | None:
+            """A list header as one value: every line it came on, in order, joined by commas (as RFC 9110 reads it), so
+            the last entry is the nearest proxy's even when that proxy added a line of its own (final review M2)."""
+            lines = self.headers.get_all(name)
+            return ", ".join(lines) if lines else None
+
+        def _given_key(self) -> str:
+            auth = self.headers.get("Authorization", "")
+            return auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+
+        def _still_may_run(self, arun) -> bool:
+            """#310: right before a coding run starts, after the request may have waited (a model load): its key is still
+            there and still an owner's, and no revoke or demotion stopped the run meanwhile.  Otherwise the run's cancel
+            is set and the request is refused (401 revoked, 403 no longer an owner).  A run on My PC (#310 part 2) needs no
+            owner key: its key must still match, the run not be stopped, and its runner still be the caller's and online
+            (else 409 runner_offline)."""
+            if arun.runner is not None:                      # #310 part 2: a run on My PC - any identity whose key still
+                ident = svc.keys.match(self._given_key()) if self.team else identity_mod.OWNER     # matches, while its runner is still there
+                if ident is not None and not arun.stopped \
+                        and svc.runner_hub.get_for(arun.runner.id, ident) is arun.runner and arun.runner.online():
+                    return True
+                arun.cancel.set()
+                if ident is None:
+                    self._json(401, {"error": {"type": "authentication_error", "message": "the key was revoked"}})
+                elif arun.stopped:
+                    self._json(403, {"error": {"type": "forbidden", "message": "the run was stopped (this key was changed meanwhile)"}})
+                else:
+                    self._json(409, self._runner_offline(arun.runner))
+                return False
+            if not self.team:
+                return True
+            ident = svc.keys.match(self._given_key())
+            if ident is not None and ident.is_owner and not arun.stopped:
+                return True
+            arun.cancel.set()
+            if ident is None:
+                self._json(401, {"error": {"type": "authentication_error", "message": "the key was revoked"}})
+            else:
+                self._json(403, {"error": {"type": "forbidden", "message": "The coding tools can be used only with an "
+                                                                          "owner key (this key was changed meanwhile)"}})
+            return False
+
+        def _runner_offline(self, runner) -> dict:
+            """#310 part 2: the 409 of a chat whose runner is offline (or gone)."""
+            m = runner.info.get("machine") or "?"
+            return {"error": {"type": "runner_offline", "message": f"your PC ({m}) is offline: start the runner on it and send again"}}
+
+        def _runner_param(self, q: dict, body, online: bool = True):
+            """#310 part 2, task 5: the runner a page route names - `runner` in the query (`q`: parse_qs with blank values
+            kept) or in the JSON body.  None: it names none (no key, or the body's "runner" is null), the route acts on
+            the workstation.  The Runner when it is the caller's own (RunnerHub.get_for: the same identity exactly, the
+            owner role too) and, with `online`, online.  False after answering: 404 runner_not_found for another
+            identity's id, an unknown, blank or non-string one (the same answer, so ids cannot be probed); 409
+            runner_offline.  Outside team mode a runner is the owner's: the owner gate comes first."""
+            if "runner" in q:
+                rid = q["runner"][0]
+            elif isinstance(body, dict) and body.get("runner") is not None:
+                rid = body["runner"]
+            else:
+                return None
+            if not self.team and not self._owner_only("a runner can be used"):
+                return False
+            r = svc.runner_hub.get_for(rid, self._acting()) if isinstance(rid, str) and rid else None
+            if r is None:
+                self._json(404, {"error": {"type": "runner_not_found", "message": "there is no runner with that id for this key"}})
+                return False
+            if online and not r.online():
+                self._json(409, self._runner_offline(r))
+                return False
+            return r
+
+        def _page_job(self, runner, path: str, query: dict, body) -> None:
+            """#310 part 2, task 5: a page route on the caller's own PC - one `page` job (Runner.request, at most
+            REQUEST_TIMEOUT_S), its answer checked by page_routes.relay (409 offline, 504 no answer in time, 502 a
+            status or body the page must not get).  The notes' "apps switched on" come from the server's run config,
+            for the notes' routes only."""
+            on = memory_mod.settings(harness._cfg(svc))["on"] if path in page_routes.MEMORY_PATHS else []
+            res = runner.request("page", {"path": path, "query": query, "body": body, "memory_on": on})
+            self._json(*page_routes.relay(res, runner.info.get("machine") or "?"))
+
+        def _page_here(self, path: str, q: dict, body) -> tuple[int, dict]:
+            """A page route on the workstation itself (page_routes.answer): its home and run config for the notes, the
+            server's checkpoints for the way back."""
+            home, on = "", []
+            if path in page_routes.MEMORY_PATHS:
+                imp = getattr(svc, "importer", None)
+                home = str(imp.home) if imp is not None else str(harness.home_dir())
+                on = memory_mod.settings(harness._cfg(svc))["on"]
+            return page_routes.answer(path, q, body, home=home, memory_on=on, checkpoints=svc.checkpoints)
+
+        def _peer(self) -> str:
+            """The client's address as the socket has it (#310 tests put another one in svc.peer_override)."""
+            return svc.peer_override or self.client_address[0]
+
+        def _loopback_local(self) -> bool:
+            """#310: a request from this PC that names this PC and that no proxy relayed - the only kind whose device is
+            approved without asking.  A tunnel (cloudflared, tailscale serve) connects from 127.0.0.1 too, but names
+            its public Host or adds a forwarding header."""
+            return bool(svc.trust_loopback) and mcp_admin.is_loopback(self._peer()) \
+                and mcp_admin.host_is_loopback(self.headers.get("Host", "")) \
+                and not any(name in self.headers for name in identity_mod.FORWARDING)
+
+        def _edit_answer(self) -> tuple[bool, str]:
+            """(may this request change what runs on this PC, why not).  In team mode: an owner key (#310).  Outside
+            it, as before: mcp_admin.may_edit."""
+            if self.team:
+                ok = self.identity is not None and self.identity.is_owner
+                return ok, "" if ok else "only with an owner key"
+            return mcp_admin.may_edit(bool(svc.api_key), self._peer(), self.headers.get("Host", ""))
+
+        def _owner_only(self, what: str) -> bool:
+            """True for an owner.  Otherwise a 403: in team mode `forbidden` ("<what> only with an owner key", #310);
+            outside it the answer the route gave before, word for word."""
+            ok, why = self._edit_answer()
+            if ok:
+                return True
+            if self.team:
+                self._json(403, {"error": {"type": "forbidden", "message": f"{what} only with an owner key"}})
+            else:
+                self._json(403, {"error": {"message": why}})
+            return False
+
+        def _mcp_allowed(self) -> set[str] | None:
+            """#310 ruling R11: the server MCP servers this request may use - None for all of them (the owner, and every
+            caller outside team mode, as before: the run config is not read).  A team guest gets the servers the owner
+            marked for guests (the run config's "guest_mcp", read on each request like the other tool settings) and the
+            skills, never the coding tools: an MCP server runs on this PC with its owner's rights."""
+            if not self.team or (self.identity is not None and self.identity.is_owner):
+                return None
+            return mcp_admin.guest_allowed(harness._cfg(svc), svc.mcp)
+
+        def _mcp_view(self) -> dict:
+            """GET /mcp/config's answer for this caller (#79): a team guest's lists only her servers (R11), the team owner's
+            says which servers guests may use."""
+            may = self._edit_answer()
+            marks = mcp_admin.guest_servers(harness._cfg(svc)) if self.team and may[0] else None
+            return mcp_admin.view(svc, self._peer(), self.headers.get("Host", ""), may=may, allowed=self._mcp_allowed(),
+                                  guests=marks)
+
+        def _runs_gate(self, what: str) -> bool:
+            """#310: the gate of a run's routes and of the answers to its prompts.  In team mode every key passes it: a
+            run and a prompt belong to the identity that launched it, and the run store and the broker answer 404 for
+            another's id, as for one that is not there, so ids cannot be probed.  Outside team mode `_owner_only`, as
+            before."""
+            return True if self.team else self._owner_only(what)
+
+        def _acting(self) -> identity_mod.Identity:
+            """Who a run route acts as: the request's identity in team mode; outside it OWNER, whose every run is."""
+            return self.identity if self.team else identity_mod.OWNER
 
         def _ui_prefix(self) -> bool:
             """xeno UI S1: /classic/... is the classic web app under a prefix (its relative URLs then land on the
@@ -5639,10 +5952,13 @@ def make_handler(svc: Service):
                             page, size = int(q.get("page", ["0"])[0]), int(q.get("size", ["50"])[0])
                         except ValueError:
                             return self._json(400, {"error": {"message": "page and size are numbers"}})
-                        return self._json(200, svc.hstore.page(page, size))
+                        viewer = self._acting()              # #310: another's rows show no prompt or answer
+                        got = svc.hstore.page(page, size)
+                        got["items"] = [identity_mod.visible_record(r, viewer) for r in got["items"]]
+                        return self._json(200, got)
                     rid = path[len("/metrics/requests/"):]
                     summary = svc.hstore.summary(rid)
-                    if summary is None:
+                    if summary is None or not svc.may_read(summary, self._acting()):   # #310: another's, as one not there
                         return self._json(404, {"error": {"message": "no such request"}})
                     detail = svc.hstore.detail(rid)
                     return self._json(200, {"summary": summary, "detail": detail,
@@ -5670,12 +5986,12 @@ def make_handler(svc: Service):
                     return
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
-                    self._json(200, svc.metrics(all_requests="requests=all" in self.path))
+                    self._json(200, svc.metrics(all_requests="requests=all" in self.path, viewer=self._acting()))
                 return
             if path == "/api/requests" and svc.api_monitor:
                 if self._authorized():
                     request_id = parse_qs(urlsplit(self.path).query).get("id", [None])[0]
-                    records = svc.request_records(request_id)
+                    records = svc.request_records(request_id, viewer=self._acting())
                     self._json(404 if records is None else 200,
                                {"error": {"message": "request no longer retained"}} if records is None else
                                records if request_id else {"requests": records, "retention": 100, "persistent": False,
@@ -5685,19 +6001,57 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared})
                 return
+            if path == "/keys":                              # #310: the named keys and what was done to them, for the owner's Settings
+                if self._authorized() and self._owner_only("keys can be managed"):
+                    self._json(200, {"keys": svc.keys.view(), "log": svc.keys.log(100), "retired": svc.keys.retired(),
+                                     "team": self.team,
+                                     "keys_file": os.path.basename(svc.keys.path) if svc.keys.path else None})
+                return
+            if path == "/devices/pending":                   # #310: the devices waiting for approval that this caller may decide
+                if self._authorized():                       # (a caller on a device that waits never gets here: the gate answers 403)
+                    rows = svc.keys.pending() if self.team else []
+                    self._json(200, {"devices": [r for r in rows if svc.keys.may_approve(self.identity, r["key"], self.device_id or None)]})
+                return
             if path == "/config":                            # #564: the Settings view's keys of the run config
                 if self._authorized():
                     self._config_get()
                 return
+            if path in ("/runner/next", "/runners"):         # #310 part 2: a runner's long poll, and who has one
+                if self._authorized() and self._runner_gate():
+                    if path == "/runners":
+                        return self._json(200, {"runners": svc.runner_hub.view(self._acting())})
+                    self._runner_next()
+                return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
-                if self._authorized():
-                    self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
+                if self._authorized():                       # #310 R11: a team guest sees only the servers she may use
+                    q = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    if "runner" in q:                        # #310 part 2: the caller's own PC's groups, from its hello (no job)
+                        r = self._runner_param(q, None, online=False)
+                        if r is not False:
+                            st = McpHub({}, builtins=r.servers()).status()   # its own routes: names as my_<x>__<tool>
+                            self._json(200, {"servers": st["servers"], "tools": st["tools"], "skills": [dict(s) for s in r.skills],
+                                             "machine": r.info.get("machine"), "online": r.online()})
+                        return
+                    self._json(200, mcp_admin.status_for(svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0},
+                                                         self._mcp_allowed()))
                 return
             if path == "/agent":
                 # the chat's coding tools: whether they are on, which shell commands run in, and whether this caller may use them (only from this PC, or with the key)
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
+                    ok, why = self._edit_answer()
+                    q = parse_qs(urlsplit(self.path).query)
+                    if "runner" in q:                        # #310 part 2: the coding tools of the caller's own PC, from its hello
+                        if not self.team and not self._owner_only("the coding tools of a runner can be read"):
+                            return
+                        r = svc.runner_hub.get_for(q["runner"][0], self._acting())
+                        if r is None:
+                            return self._json(404, {"error": {"type": "runner_not_found", "message": "there is no runner with that id for this key"}})
+                        online = r.online()
+                        coding = r.servers().get("my_agent")             # the first coding group, without the tools the server runs
+                        return self._json(200, {"available": True, "allowed": online, "reason": "" if online else "your PC is offline",
+                                                "shell": r.info.get("shell"), "tools": [t["name"] for t in coding.tools] if coding else [],
+                                                "machine": r.info.get("machine"), "online": online})
                     sh = getattr(svc.agent, "shell", None)
                     self._json(200, {"available": svc.agent is not None, "allowed": ok, "reason": "" if ok else why, "shell": shell_mod.describe(sh) if sh else None,
                                      "tools": [t["name"] for t in svc.agent.tools] if svc.agent else []})
@@ -5705,34 +6059,31 @@ def make_handler(svc: Service):
             if path == "/agent/hooks":
                 # the user's hooks (serve/hooks.py), read only: they are written in the run config; only who may use the coding tools sees the commands
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("the hooks can be read"):
+                        return
                     self._json(200, {**hooks_mod.view(harness._cfg(svc)), "config_file": os.path.basename(svc.config_path) if svc.config_path else None,
                                      "shell": bool(getattr(svc.agent, "shell", None)), "editable": bool(svc.config_path)})
                 return
             if path == "/agent/helpers":
                 # sub-agents (serve/subagent.py): off by default; only who may use the coding tools sees the setting
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("the sub-agent settings can be read"):
+                        return
                     self._json(200, {**subagent_mod.settings(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "helper_tools", ())), "editable": bool(svc.config_path),
                                      "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
                 return
             if path == "/agent/run":
                 # a run that went on while the page was away (serve/runs.py): its events from number `from` on, as they come; only for who may use the coding tools
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._runs_gate("a run can be read"):
+                        return
                     origin = self.headers.get("Origin")
                     if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
                         return self._json(403, {"error": {"message": "a run can be read only from Strata's own page"}})
                     q = parse_qs(urlsplit(self.path).query)
-                    run = svc.runs.get(q.get("id", [""])[0])
+                    run = svc.runs.get_for(q.get("id", [""])[0], self._acting())          # #310: another identity's run is not there
                     if run is None:
-                        return self._json(404, {"error": {"message": "there is no such run (it ended long ago, or the server was restarted)"}})
+                        return self._json(404, {"error": {"message": NO_RUN}})
                     try:
                         start = int(q.get("from", ["0"])[0])
                     except ValueError:
@@ -5743,81 +6094,38 @@ def make_handler(svc: Service):
             if path == "/agent/web":
                 # web access (serve/web.py): off by default; only who may use the coding tools sees the settings
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
+                    if not self._owner_only("the web access settings can be read"):
+                        return
                     self._json(200, {**web_mod.public_view(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "web_tools", ())), "editable": bool(svc.config_path),
                                      "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
                 return
-            if path == "/agent/folders":
-                # the folders of this PC, to choose a project's folder from (only the names of folders, and only for who may use the coding tools)
+            if path in page_routes.GET_PATHS:
+                # the folders of this PC (the project picker), a folder's Git state (the Chat's right panel), `@file`, and
+                # the notes the chat reads for a project (serve/page_routes.py): on the workstation for who may use the
+                # coding tools; with `runner=<id>` on the caller's own PC, through its runner (#310 part 2)
                 if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
-                    seen = folders_mod.look(parse_qs(urlsplit(self.path).query).get("path", [""])[0])
-                    # a path that is no folder is an answer, not an error (a 404 would be logged as one in the browser's console)
-                    self._json(200, seen if seen is not None else {"ok": False, "error": "That is not a folder on this PC"})
-                return
-            if path in ("/agent/git", "/agent/git/diff"):
-                # the Git state of a folder, read only, for the Chat's right panel (serve/gitview.py); for who may use the coding tools
-                if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
-                    q = parse_qs(urlsplit(self.path).query)
-                    folder = q.get("path", [""])[0]
-                    if path == "/agent/git":
-                        return self._json(200, gitview.info(folder))
-                    return self._json(200, gitview.diff(folder, q.get("file", [""])[0], q.get("staged", ["0"])[0] == "1", q.get("untracked", ["0"])[0] == "1"))
-                return
-            if path in ("/agent/files", "/agent/mention"):
-                # `@file` in the prompt: the files of the project's folders that go with typed letters, and the text of one that was mentioned (serve/files.py); for who may use the coding tools
-                if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
-                    q = parse_qs(urlsplit(self.path).query)
-                    folders = [f for f in [q.get("path", [""])[0], *q.get("dirs", [])] if f.strip() and "\0" not in f][:agent_mod.MAX_DIRS + 1]
-                    if path == "/agent/files":
-                        return self._json(200, {"files": files_mod.find(folders, q.get("q", [""])[0])})
-                    return self._json(200, files_mod.read(folders, q.get("rel", [""])[0]))
-                return
-            if path in ("/agent/memory", "/agent/memory/file"):
-                # the notes the chat reads for a project: the project's own files and what the user's other apps wrote down (serve/memory.py); for who may use the coding tools
-                if self._authorized():
-                    ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                    if not ok:
-                        return self._json(403, {"error": {"message": why}})
-                    q = parse_qs(urlsplit(self.path).query)
-                    folders = [f for f in [q.get("path", [""])[0], *q.get("dirs", [])] if f.strip() and "\0" not in f][:agent_mod.MAX_DIRS + 1]
-                    imp = getattr(svc, "importer", None)
-                    home = str(imp.home) if imp is not None else str(harness.home_dir())
-                    on = memory_mod.settings(harness._cfg(svc))["on"]
-                    sources = memory_mod.discover(home, folders, on)
-                    if path == "/agent/memory":
-                        return self._json(200, {"max": memory_mod.MAX_TOTAL, "sources": [{k: s[k] for k in ("id", "app", "label", "kind", "shown", "bytes", "on")} for s in sources]})
-                    src = next((s for s in sources if s["id"] == q.get("id", [""])[0]), None)
-                    try:
-                        n = int(q.get("n", ["0"])[0])
-                    except ValueError:
-                        n = -1
-                    if src is None or not 0 <= n < len(src["files"]):
-                        return self._json(404, {"ok": False, "error": "no such file"})
-                    got = memory_mod._read(src["files"][n], 200_000)
-                    if got is None:
-                        return self._json(200, {"ok": False, "error": "cannot be read"})
-                    return self._json(200, {"ok": True, "name": os.path.basename(src["files"][n]), "text": got[0], "cut": got[1]})
+                    query = urlsplit(self.path).query
+                    runner = self._runner_param(parse_qs(query, keep_blank_values=True), None)
+                    if runner is False:
+                        return
+                    q = parse_qs(query)
+                    if runner is not None:
+                        return self._page_job(runner, path, {k: v for k, v in q.items() if k != "runner"}, None)
+                    if not self._owner_only(PAGE_GATES[path]):
+                        return
+                    self._json(*self._page_here(path, q, None))
                 return
             if path == "/mcp/config":
                 # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)
                 if self._authorized():
-                    self._json(200, mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
+                    self._json(200, self._mcp_view())
                 return
             if path == "/import":
                 # the skills and the MCP servers of the other coding apps on this PC, with what may be changed (#94)
                 if self._authorized():
-                    self._json(200, harness.view(svc, self.client_address[0], self.headers.get("Host", ""), rescan="rescan=1" in self.path))
+                    may = self._edit_answer()                     # #310: in team mode only an owner makes the server rescan this PC's apps
+                    self._json(200, harness.view(svc, self._peer(), self.headers.get("Host", ""),
+                                                 rescan="rescan=1" in self.path and (not self.team or may[0]), may=may))
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
@@ -5832,7 +6140,7 @@ def make_handler(svc: Service):
                 alive = proc is None or proc.poll() is None or bool(getattr(svc.engine, "unloaded", False))
                 self._json(200 if alive else 503, {"status": "ok" if alive else "engine_exited",
                                      "max_context": svc.reported_ctx(), "model": svc.model,
-                                     "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                     "images": svc.vision is not None, "api_key": svc.key_required(),
                                      "loops_stopped": svc.status["loops_stopped"],
                                      "thinking_cycles_closed": svc.status["thinking_cycles_closed"],   # #199
                                      "loaded": svc.loaded(),
@@ -5850,6 +6158,8 @@ def make_handler(svc: Service):
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
                 for k in ("started", "first_token"):
                     s.pop(k, None)
+                if "tail" in s and not svc.may_read(s, self._acting()):   # #310: the answer is its sender's and the owner's
+                    s["tail"] = ""
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
@@ -5908,17 +6218,37 @@ def make_handler(svc: Service):
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
+            # #310: what changes the shared engine, every client's settings or what is recorded is an owner key's in
+            # team mode; outside it these stay open to every key holder, as before
+            if self.team and (path in OWNER_POSTS or path.startswith("/slots/")) and \
+                    not self._owner_only(OWNER_POSTS.get(path, "conversations can be saved or restored")):
+                return
             if path == "/settings":
                 self._settings()
                 return
+            if path in ("/runner/hello", "/runner/reply"):   # #310 part 2: a runner says hello, or answers a job
+                if self._runner_gate():
+                    self._runner_post(path)
+                return
+            if path in ("/keys", "/devices"):                # #310: named keys and device approval, managed live
+                n = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
+                if not self._own_page("keys and devices can be managed"):
+                    return
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict):
+                    return self._json(400, {"error": {"message": "send a JSON object"}})
+                return self._keys_post(body) if path == "/keys" else self._devices_post(body)
             if path == "/mcp/config":                        # set up the MCP servers: a write that decides which programs Strata starts (#79)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
                 if not self._own_page("MCP servers can be changed"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("MCP servers can be changed"):
+                    return
                 if not svc.config_path:
                     return self._json(409, {"error": {"message": "this server was started without a run config file (--config), so there is nowhere to save the servers"}})
                 if not 0 < n <= 1_000_000:
@@ -5928,67 +6258,63 @@ def make_handler(svc: Service):
                 except ValueError:
                     return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
                 code, out = mcp_admin.apply(svc, body)
-                return self._json(code, out if code != 200 else mcp_admin.view(svc, self.client_address[0], self.headers.get("Host", "")))
-            if path in ("/agent/rewind", "/agent/checkpoints/forget"):         # the way back for the files the tools changed (serve/checkpoints.py)
+                return self._json(code, out if code != 200 else self._mcp_view())
+            if path in page_routes.POST_PATHS:               # the way back for the files the tools changed (serve/checkpoints.py, serve/page_routes.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("files can be put back"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
                 try:
                     body = json.loads(raw)
                 except ValueError:
                     body = None
-                if not isinstance(body, dict) or not isinstance(body.get("session"), str):
-                    return self._json(400, {"error": {"message": "send {\"session\": the chat's id, \"checkpoint\": the prompt's id}"}})
-                if path == "/agent/checkpoints/forget":
-                    svc.checkpoints.forget(body["session"])
-                    return self._json(200, {"ok": True})
-                if not isinstance(body.get("checkpoint"), str):
-                    return self._json(400, {"error": {"message": "send the checkpoint, the prompt's id"}})
-                if body.get("apply") is True:
-                    return self._json(200, svc.checkpoints.apply(body["session"], body["checkpoint"], body.get("include_changed") is True))
-                return self._json(200, svc.checkpoints.preview(body["session"], body["checkpoint"]))
+                runner = self._runner_param({}, body)          # #310 part 2: the body's "runner" - the files on the caller's own PC
+                if runner is False:
+                    return
+                if runner is not None:
+                    return self._page_job(runner, path, {}, {k: v for k, v in body.items() if k != "runner"})
+                if not self._owner_only(PAGE_GATES[path]):
+                    return
+                return self._json(*self._page_here(path, {}, body))
             if path == "/agent/steer":                       # what the user sends while the agent works: the agent reads it at its next step (serve/runs.py, run_with_mcp)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
                 if not self._own_page("A message can be sent to a run"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._runs_gate("A message can be sent to a run"):
+                    return
                 try:
                     body = json.loads(raw)
                 except ValueError:
                     body = None
                 if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not isinstance(body.get("text"), str) or not 0 < len(body["text"].strip()) <= 20_000:
                     return self._json(400, {"error": {"message": "send {\"id\": the run's id, \"text\": the message (1 to 20,000 characters)}"}})
-                return self._json(200, {"ok": True, "found": svc.runs.steer(body["id"], body["text"].strip())})
+                if self.team and svc.runs.get_for(body["id"], self.identity) is None:
+                    return self._json(404, {"error": {"message": NO_RUN}})          # #310: another identity's run is not there
+                return self._json(200, {"ok": True, "found": svc.runs.steer(body["id"], body["text"].strip(), self._acting())})
             if path == "/agent/cancel":                      # the user's Stop for an answer that runs on its own (serve/runs.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("A run can be stopped"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._runs_gate("A run can be stopped"):
+                    return
                 try:
                     body = json.loads(raw)
                 except ValueError:
                     body = None
                 if not isinstance(body, dict) or not isinstance(body.get("id"), str):
                     return self._json(400, {"error": {"message": "send {\"id\": the run's id}"}})
-                return self._json(200, {"ok": True, "found": svc.runs.cancel(body["id"])})
+                if self.team and svc.runs.get_for(body["id"], self.identity) is None:
+                    return self._json(404, {"error": {"message": NO_RUN}})          # #310: another identity's run is not there
+                return self._json(200, {"ok": True, "found": svc.runs.cancel(body["id"], self._acting())})
             if path == "/agent/question":                    # the page's answer to a question the model asked with AskUserQuestion (serve/agent_run.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 50_000 else b""
                 if not self._own_page("A question can be answered"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._runs_gate("A question can be answered"):
+                    return
                 try:
                     body = json.loads(raw)
                 except ValueError:
@@ -5997,7 +6323,7 @@ def make_handler(svc: Service):
                 if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not (ans is None or (isinstance(ans, dict) and len(ans) <= 4 and all(
                         isinstance(k, str) and len(k) <= 400 and isinstance(v, list) and 0 < len(v) <= 8 and all(isinstance(x, str) and len(x) <= 500 for x in v) for k, v in ans.items()))):
                     return self._json(400, {"error": {"message": "send {\"id\": the question's id, \"answers\": {question: [choices]} or null to skip}"}})
-                if not svc.broker.respond(body["id"], ans):
+                if not svc.broker.respond(body["id"], ans, self._acting()):          # #310: only the run's holder answers it
                     return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
                 return self._json(200, {"ok": True})
             if path == "/agent/permission":                  # the page's answer to a question of the coding tools (serve/agent_run.py)
@@ -6005,16 +6331,15 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("A question can be answered"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._runs_gate("A question can be answered"):
+                    return
                 try:
                     body = json.loads(raw)
                 except ValueError:
                     body = None
                 if not isinstance(body, dict) or not isinstance(body.get("id"), str) or body.get("decision") not in agent_run.ANSWERS:
                     return self._json(400, {"error": {"message": "send {\"id\": the question's id, \"decision\": \"allow\" | \"allow_chat\" | \"deny\"}"}})
-                if not svc.broker.answer(body["id"], body["decision"]):
+                if not svc.broker.answer(body["id"], body["decision"], self._acting()):     # #310: only the run's holder answers it
                     return self._json(404, {"error": {"message": "no question with that id is waiting (it was answered, or the request ended)"}})
                 return self._json(200, {"ok": True})
             if path == "/agent/helpers":                     # sub-agents on or off (serve/subagent.py)
@@ -6022,9 +6347,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 10_000 else b""
                 if not self._own_page("sub-agents can be switched"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("sub-agents can be switched"):
+                    return
                 if not svc.config_path:
                     return self._json(409, {"error": {"message": harness.NO_FILE}})
                 if not 0 < n <= 10_000:
@@ -6047,9 +6371,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
                 if not self._own_page("web access can be changed"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("web access can be changed"):
+                    return
                 if not svc.config_path:
                     return self._json(409, {"error": {"message": harness.NO_FILE}})
                 if not 0 < n <= 100_000:
@@ -6072,9 +6395,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
                 if not self._own_page("the hooks can be switched"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("the hooks can be switched"):
+                    return
                 if not svc.config_path:
                     return self._json(409, {"error": {"message": harness.NO_FILE}})
                 if not 0 < n <= 100_000:
@@ -6098,9 +6420,8 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
                 if not self._own_page("the import can be changed"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
-                    return self._json(403, {"error": {"message": why}})
+                if not self._owner_only("the import can be changed"):
+                    return
                 if not svc.config_path:
                     return self._json(409, {"error": {"message": harness.NO_FILE}})
                 if not 0 < n <= 1_000_000:
@@ -6110,7 +6431,7 @@ def make_handler(svc: Service):
                 except ValueError:
                     return self._json(400, {"error": {"message": "the body is not JSON", "fields": []}})
                 code, out = harness.apply(svc, body)
-                return self._json(code, out if code != 200 else harness.view(svc, self.client_address[0], self.headers.get("Host", "")))
+                return self._json(code, out if code != 200 else harness.view(svc, self._peer(), self.headers.get("Host", ""), may=self._edit_answer()))
             if path == "/metrics/keep":                      # keep the full prompt of the next N requests (0: off)
                 raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 if not self._own_page("prompts can be kept"):      # xeno #71: a "simple" cross-site POST must not switch this on
@@ -6148,7 +6469,7 @@ def make_handler(svc: Service):
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
-                    svc.load()
+                    svc.load(who=self._acting().name)
                     self._json(200, {"status": "loaded"})
                 except GpuBusy as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
@@ -6203,14 +6524,14 @@ def make_handler(svc: Service):
                     if slot and int(getattr(svc.engine, "info", {}).get("cache_slots", 4)) == 1:
                         raise ValueError("cache slots require a single-GPU session")
                     # unloaded: _openai / _anthropic load first (or 503 while the GPU is busy)
-                    self.record = svc.begin_request(path, req)
+                    self.record = svc.begin_request(path, req, who=self._acting().name)
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
                     query = parse_qs(self.path.partition("?")[2])
                     try:
                         code, body = svc.slot_action(path[len("/slots/"):], (query.get("action") or [""])[0],
-                                                     req.get("filename"))
+                                                     req.get("filename"), who=self._acting().name)
                     except EngineDied as e:                  # EngineSilent included: the engine was ended
                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
                                                      "the engine again", "type": "server_error"}}
@@ -6333,6 +6654,223 @@ def make_handler(svc: Service):
                 self._json(400, {"error": {"message": "incomplete control request body"}})
             return complete
 
+        def _keys_post(self, body: dict):
+            """#310: POST /keys - create, rename, change the role of or revoke a named key (an owner's).  The plain key of a
+            new one is in this answer only: it is not printed, logged or kept (only its sha256 is).  Outside team mode
+            the first create makes the keys file and so turns team mode on; nothing else writes it there."""
+            if not self._owner_only("keys can be managed"):
+                return
+            action, name = body.get("action"), body.get("name")
+            if action not in ("create", "rename", "role", "revoke") or not isinstance(name, str):
+                return self._json(400, {"error": {"message": 'send {"action": "create", "name", "role"}, {"action": "rename", '
+                                                             '"name", "to"}, {"action": "role", "name", "role"} or {"action": '
+                                                             '"revoke", "name"}'}})
+            if not svc.keys.path:
+                return self._json(409, {"error": {"message": "this server was started without a run config (--config), so "
+                                                             "there is no keys file to keep keys in"}})
+            if action != "create" and name.strip().casefold() == "owner":
+                return self._json(400, {"error": {"message": "the owner key is the run config's api_key: change or remove it "
+                                                             "there; it cannot be renamed, made a guest or revoked here"}})
+            if action != "create" and not self.team:        # no keys file: no key to change, and nothing is written
+                return self._json(404, {"error": {"message": f"there is no key named {name!r}"}})
+            if not self.team and not svc.api_key and not self._loopback_local():
+                # the first key turns team mode on: with no API key it is made on this PC itself only, never through a
+                # tunnel that names this PC (may_edit does not look at the forwarding headers)
+                return self._json(403, {"error": {"type": "forbidden", "message": "the first key is made only on this PC "
+                                                  "itself (open the page as localhost, not through a tunnel or proxy), or "
+                                                  "with the API key"}})
+            by, missing = self.identity, {"error": {"message": f"there is no key named {name!r}"}}
+            try:
+                if action == "create":
+                    role = body.get("role")
+                    key = svc.keys.create(name, role, by=by, owner_first=True)
+                    return self._json(200, {"key": key, "name": name.strip(), "role": role})
+                if action == "rename":
+                    if not svc.keys.rename(name, body.get("to"), by=by):
+                        return self._json(404, missing)
+                    new = body["to"].strip()
+                    svc.runs.move(name, new)                # the holder keeps her runs and prompts; a later key named
+                    svc.broker.move(name, new)              # `name` inherits none of them
+                    svc.runner_hub.move(name, new)          # and her runners (their ids follow the name)
+                    return self._json(200, {"ok": True, "name": new})
+                if action == "role":
+                    role = body.get("role")
+                    if not svc.keys.set_role(name, role, by=by):
+                        return self._json(404, missing)
+                    # the coding tools are an owner's (part 1): a key made a guest keeps no run going on this PC
+                    return self._json(200, {"ok": True, **(self._stop_identity(name) if role != "owner" else {})})
+                if not svc.keys.revoke(name, by=by):
+                    return self._json(404, missing)
+                stopped = self._stop_identity(name)
+                svc.runner_hub.end_all(name)                # her runners end (a demotion keeps them: not in _stop_identity)
+                svc.runs.move(name, identity_mod.REVOKED)   # a later key with this name inherits nothing
+                svc.broker.move(name, identity_mod.REVOKED)
+                return self._json(200, {"ok": True, **stopped})
+            except identity_mod.KeysFileBad as e:
+                return self._json(409, {"error": {"message": str(e)}})
+            except ValueError as e:
+                return self._json(400, {"error": {"message": str(e)}})
+            except OSError as e:
+                return self._json(500, {"error": {"message": f"the keys file could not be written: {e}"}})
+
+        def _stop_identity(self, name: str) -> dict:
+            """#310: every run of `name` that is going is cancelled, and every prompt it holds is closed as refused."""
+            return {"runs_stopped": svc.runs.cancel_all(name), "prompts_closed": svc.broker.end_all(name)}
+
+        def _devices_post(self, body: dict):
+            """#310: POST /devices - approve, refuse or clear a device of a key.  `may_approve` decides (the owner; a
+            key's holder from an approved device of that key), before anything is looked up, so the answer to anyone else
+            is the same whether the key or device exists."""
+            key, device, clear = body.get("key"), body.get("device"), body.get("action") == "clear"
+            if not isinstance(key, str) or not isinstance(device, str) or not (
+                    clear and "approve" not in body or "action" not in body and isinstance(body.get("approve"), bool)):
+                return self._json(400, {"error": {"message": 'send {"key", "device", "approve": true | false} or {"key", '
+                                                             '"device", "action": "clear"}'}})
+            if not svc.keys.may_approve(self.identity, key, self.device_id or None):
+                return self._json(403, {"error": {"type": "forbidden", "message": "a device is decided only by an owner key, "
+                                                  "or by its own key from a device of that key that is already approved"}})
+            missing = {"error": {"message": "that key has no such device"}}
+            if not self.team:                                # no keys file: no devices are recorded, and nothing is written
+                return self._json(404, missing)
+            try:
+                ok = svc.keys.clear_device(key, device, by=self.identity) if clear else \
+                    svc.keys.decide_device(key, device, body["approve"], self.identity)
+            except identity_mod.KeysFileBad as e:            # where the file lives is the owner's to know
+                return self._json(409, {"error": {"message": str(e) if self.identity.is_owner else
+                                                  "the keys file on the server does not parse, so nothing can be "
+                                                  "changed now: tell the owner"}})
+            except OSError as e:
+                return self._json(500, {"error": {"message": f"the keys file could not be written: {e}"
+                                                  if self.identity.is_owner else
+                                                  "the keys file on the server could not be written: tell the owner"}})
+            if ok:
+                if clear or not body["approve"]:             # #310 part 2: a refused or cleared device keeps no runner
+                    svc.runner_hub.end_device(key, device)
+                return self._json(200, {"ok": True})
+            status = next((d["status"] for r in svc.keys.view() if r["name"] == key for d in r["devices"]
+                           if d["device"] == device), None)
+            if status == "refused" and not self.identity.is_owner:
+                return self._json(403, {"error": {"type": "forbidden", "message": "a refused device is let in again only "
+                                                  "by an owner key"}})
+            return self._json(404, missing)
+
+        def _runner_gate(self) -> bool:
+            """#310 part 2: the runner routes, after `_authorized`.  In team mode every key (the device gate has run);
+            outside it the owner, as `may_edit` decides - a runner runs its holder's tools on her own PC.  No
+            `_own_page`: a runner is no page."""
+            return True if self.team else self._owner_only("a runner can connect")
+
+        def _runner_device(self) -> str:
+            """The device a runner's hello comes from: the gate's in team mode; outside it `_authorized` records none,
+            so it is read here the same way (two PCs on a single-user server get two runners)."""
+            if self.team:
+                return self.device_id
+            h = self.headers
+            return identity_mod.device_of(h.get("X-Strata-Device"), h.get("X-Strata-Device-Name"), h.get("User-Agent"),
+                                          self._peer())[0]
+
+        def _runner_body(self, limit: int) -> dict | None:
+            """A runner's POST body: JSON only, at most `limit` bytes, an object.  None after an answer (415, 413, 400)."""
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                self._json(415, {"error": {"message": "send application/json"}})
+                return None
+            if self._chunked():
+                self.body_read = True
+                raw = self._read_chunked(limit)              # BadBody 413 / 400: do_POST answers it
+            else:
+                try:
+                    n = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    n = -1
+                if n > limit:
+                    self._json(413, {"error": {"message": f"send a body of up to {limit >> 20} MB"}})
+                    return None
+                if n < 0:
+                    self._json(400, {"error": {"message": "invalid Content-Length"}})
+                    return None
+                self.body_read = True
+                raw = self.rfile.read(n)
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                self._json(400, {"error": {"message": "send a JSON object"}})
+                return None
+            return body
+
+        def _runner_post(self, path: str):
+            """#310 part 2: POST /runner/hello and /runner/reply (serve/runner_hub.py)."""
+            body = self._runner_body(RUNNER_HELLO_MAX if path == "/runner/hello" else RUNNER_REPLY_MAX)
+            if body is None:
+                return
+            who = self._acting()
+            if path == "/runner/reply":
+                if not all(isinstance(body.get(k), str) for k in ("id", "instance", "job")):
+                    return self._json(400, {"error": {"message": 'send {"id", "instance", "job", "rid", ...}'}})
+                if type(body.get("rid")) is not int or body["rid"] < 1:     # the reply's id in its job: a retry is applied once
+                    return self._json(400, {"error": {"message": "rid numbers the job's replies: a whole number from 1"}})
+                r = svc.runner_hub.get_for(body["id"], who)         # another identity's runner: as one not there
+                if r is None:
+                    return self._json(404, {"error": {"message": NO_RUNNER}})
+                if r.instance != body["instance"]:
+                    return self._json(409, RUNNER_REPLACED)
+                if not r.deliver(body):
+                    return self._json(404, {"error": {"message": "there is no such job (it finished, or was never sent)"}})
+                return self._json(200, {"ok": True})
+            protocol = body.get("protocol")                          # first: a runner of another version may send another shape
+            if type(protocol) is not int or protocol != runner_hub.RUNNER_PROTOCOL:
+                return self._json(409, {"error": {"type": "runner_protocol", "server_protocol": runner_hub.RUNNER_PROTOCOL,
+                                                  "message": f"update Strata Desktop (the server speaks runner protocol "
+                                                             f"{runner_hub.RUNNER_PROTOCOL})"}})
+            got = runner_hub.check_hello(body)
+            if isinstance(got, str):
+                return self._json(400, {"error": {"message": got}})
+            info, groups, skills = got
+            r = svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
+            poll = runner_hub.POLL_MAX_S
+            return self._json(200, {"runner": r.id, "who": r.who, "protocol": runner_hub.RUNNER_PROTOCOL,
+                                    "poll_s": int(poll) if float(poll).is_integer() else poll, "channel": r.channel})
+
+        def _runner_next(self):
+            """#310 part 2: GET /runner/next?id=&instance=&wait=&channel=&ack= - the messages for the runner, held at
+            most POLL_MAX_S; `ack` (the highest `seq` received on `channel`, default 0) lets the acknowledged ones go
+            (an ack that names another channel than the runner's is ignored).  A runner that ended while the poll was held is told why: replaced 409, revoked 401, its
+            device refused or cleared 404 (a new hello meets the device gate), the server stopping 503."""
+            q = parse_qs(urlsplit(self.path).query)
+            r = svc.runner_hub.get_for(q.get("id", [""])[0], self._acting())
+            if r is None:
+                return self._json(404, {"error": {"message": NO_RUNNER}})
+            if r.instance != q.get("instance", [""])[0]:
+                return self._json(409, RUNNER_REPLACED)
+            try:
+                wait = float(q.get("wait", [str(runner_hub.POLL_MAX_S)])[0])
+            except ValueError:
+                wait = math.nan
+            if not math.isfinite(wait):
+                return self._json(400, {"error": {"message": "wait is a number of seconds"}})
+            ack = q.get("ack", ["0"])[0]
+            if not (ack.isascii() and ack.isdigit() and len(ack) <= 18):
+                return self._json(400, {"error": {"message": "ack is the highest seq received, a whole number"}})
+            gone = threading.Event()                 # the runner hung up: the held poll ends and takes nothing
+            self._watch_client(gone)
+            try:
+                messages = r.take(min(max(wait, 0.0), runner_hub.POLL_MAX_S), gone=gone, ack=int(ack),
+                                  channel=q.get("channel", [None])[0])
+            finally:
+                self.watch_done.set()
+            if gone.is_set():
+                return                                       # nobody to answer: the messages stay for the next poll
+            if r.ended == "replaced":
+                return self._json(409, RUNNER_REPLACED)
+            if r.ended == "revoked":
+                return self._json(401, {"error": {"type": "authentication_error", "message": "the key was revoked"}})
+            if r.ended == "closed":
+                return self._json(503, {"error": {"message": "the server is stopping"}})
+            if r.ended is not None:
+                return self._json(404, {"error": {"message": NO_RUNNER}})
+            return self._json(200, {"messages": messages})
+
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
             server never grants) and no foreign Origin: a web page elsewhere must not change settings or run tools."""
@@ -6391,17 +6929,53 @@ def make_handler(svc: Service):
             return bool(origin) and origin.split("://", 1)[-1] != self.headers.get("Host", "") and \
                 origin not in svc.trusted_origins
 
-        def _no_local_images(self, messages):
+        def _no_local_images(self, messages, foreign: bool = True):
             """A web page of another origin must not have a file on this computer read as an image.  Without an
             api_key, _foreign_page refuses such a page unless cors_origins lets it in - and a page cors_origins lets
             in (["*"]: every page) could name any file and, CORS allowing, read what the model says about it.  data:
             and http(s) images are the page's own to send; files come from Strata's own page, a trusted origin or a
-            client that is no browser.  ValueError (a 400)."""
-            if self._foreign_origin() and any(not src.startswith(("data:", "http://", "https://"))
-                                              for src in images_of(messages)):
-                raise ValueError("a web page of another origin cannot have a file on this computer read as an "
-                                 "image: send it as a data: URL (or add the page's origin to the config's "
-                                 "trusted_origins)")
+            client that is no browser.  #310: in team mode only an owner key may name a file on this PC - a guest's
+            files are on the guest's own PC, and the refusal comes before anything looks at the path, so it does not
+            tell whether the path exists.  `foreign`: False checks only the team rule.  A guest's http(s) images go
+            through _guest_image_urls (#311).  ValueError (a 400)."""
+            guest = self.team and not (self.identity is not None and self.identity.is_owner)
+            if any(not src.startswith(("data:", "http://", "https://")) for src in images_of(messages)):
+                if foreign and self._foreign_origin():
+                    raise ValueError("a web page of another origin cannot have a file on this computer read as an "
+                                     "image: send it as a data: URL (or add the page's origin to the config's "
+                                     "trusted_origins)")
+                if guest:
+                    raise ValueError("a file on the server's computer can be read as an image only with an owner key: "
+                                     "send the image as a data: URL")
+            if guest:
+                self._guest_image_urls(messages)
+
+        def _guest_image_urls(self, messages):
+            """#311: a team guest's http(s) image is fetched here, only from an address on the public internet - not
+            this PC, a private or link-local network, CGNAT 100.64/10 (Tailscale) or 26.0.0.0/8 (Radmin VPN) - checked
+            on the address connected to and on every redirect (Vision.download with web.public_not_vpn).  Its item then
+            carries the bytes as a data: URL, so nothing later (prepare, a tool round) holds the URL to fetch it again
+            without the check.  Every role's images, as images_of reads them.  With no vision encoder nothing is
+            fetched (prepare refuses the image, or notes a tool's, as for anyone), and a request names at most
+            GUEST_IMAGE_URLS of them: each is held in memory (final review T5b-m5, m7).  ValueError (a 400)."""
+            if svc.vision is None:
+                return
+            urls = [src for src in images_of(messages) if src.startswith(("http://", "https://"))]
+            if len(urls) > GUEST_IMAGE_URLS:
+                raise ValueError(f"a request with a guest key may name at most {GUEST_IMAGE_URLS} image URLs (this one "
+                                 f"names {len(urls)}): send the others as data: URLs, or in another request")
+            fetched: dict[str, str] = {}
+            for m in messages:
+                content = m.get("content")
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    src = item.get("source") if isinstance(item, dict) and item.get("type") == "image" else None
+                    if isinstance(src, str) and src.startswith(("http://", "https://")):
+                        if src not in fetched:
+                            data = Vision.download(src, guard=web_mod.public_not_vpn)
+                            fetched[src] = "data:;base64," + base64.b64encode(data).decode("ascii")
+                        item["source"] = fetched[src]
 
         def _settings(self):
             # They change what every client gets, so only the app's own page may set them
@@ -6498,12 +7072,35 @@ def make_handler(svc: Service):
             if isinstance(sa, dict):
                 if not self._own_page("The coding tools can be used"):
                     return
-                ok, why = mcp_admin.may_edit(bool(svc.api_key), self.client_address[0], self.headers.get("Host", ""))
-                if not ok:
+                runner = None
+                ok, why = self._edit_answer()
+                if isinstance(sa.get("runner"), str) and (self.team or ok):      # #310 part 2: the project is on the caller's own PC
+                    runner = svc.runner_hub.get_for(sa["runner"], self._acting())     # only her own runner, the owner role too
+                    if runner is None:
+                        return self._json(404, {"error": {"type": "runner_not_found", "message": "there is no runner with that id for this key"}})
+                    if not runner.online():
+                        return self._json(409, self._runner_offline(runner))
+                elif not ok:
+                    if self.team:                                 # #310: the coding tools run on this PC: an owner's
+                        self._owner_only("The coding tools can be used")
+                        return
                     return self._json(403, {"error": {"message": "The coding tools change files and run commands on this PC, so they work only from this PC itself (open the page as localhost) or with the API key. " + why}})
-                if svc.agent is None or svc.mcp is None:
+                if runner is None and (svc.agent is None or svc.mcp is None):
                     return self._json(409, {"error": {"message": "the coding tools are switched off on this server (\"agent\": false in the run config)"}})
-                arun = svc.start_agent_run(sa, req.get("messages") or [])
+                guest = self.team and not (self.identity is not None and self.identity.is_owner)     # its WebFetch: never the team's network (I-1)
+                if runner is None:
+                    arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, guest=guest)     # #310: the run and what it asks are this identity's
+                else:
+                    try:                                          # the facts job: up to REQUEST_TIMEOUT_S, on this request's own thread, no lock held
+                        arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, runner=runner, guest=guest)
+                    except runner_hub.RunnerUnavailable as e:
+                        return self._json(409, {"error": {"type": "runner_offline", "message": e.message[:300]}})
+                    base = svc.mcp if svc.mcp is not None else McpHub({})
+                    mine = runner.servers()               # my_agent, my_skills, my_<name>: after the server's groups
+                    arun.hub = base.with_servers(mine, replace={"agent": runner_hub.agent_subset(svc.agent, runner_hub.SERVER_TOOLS)}
+                                                 if svc.agent is not None else None)        # never two coding groups: the server's keeps WebFetch, WebSearch, Task
+                    arun.coding = next((k for k, s in arun.hub.servers.items() if getattr(s, "runner", None) is runner      # the name its coding
+                                        and getattr(s, "group_kind", "") == "coding"), "my_agent")             # group landed under in the view
                 req = {**req, "messages": agent_prompt.with_system(req.get("messages") or [], arun.prompt)}
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
@@ -6520,22 +7117,30 @@ def make_handler(svc: Service):
             # an OpenAI request waits in the queue while another one loads the model (#208, #332) - in load() only, see
             # there; the Anthropic API answers 529 at once instead (xeno #49 S2: Claude Code retries it, rather than
             # wait minutes)
-            svc.load(wait_for_restart=True)
+            svc.load(wait_for_restart=True, who=self._acting().name)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
-            use_mcp = (req.get("strata_mcp") is True or arun is not None) and svc.mcp is not None      # the web app's opt-in (serve/mcp.py), or the coding tools
+            hub = arun.hub if arun is not None and arun.hub is not None else svc.mcp      # #310 part 2: a run on My PC has its own view
+            use_mcp = (req.get("strata_mcp") is True or arun is not None) and hub is not None      # the web app's opt-in (serve/mcp.py), or the coding tools
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
-                svc.mcp.wait(10)                                  # servers still starting (only right after start)
+                hub.wait(10)                                      # servers still starting (only right after start)
                 off = req.get("strata_mcp_off")                   # servers the page's list switched off for this chat; anything but a list of names is ignored
                 skip = {x for x in off if isinstance(x, str)} if isinstance(off, list) and all(isinstance(x, str) for x in off) else set()
-                if req.get("strata_mcp") is not True:
-                    skip |= {n for n in svc.mcp.servers if n != "agent"}      # the coding tools alone: no MCP server
+                subset = arun is not None and arun.runner is not None and svc.agent is not None    # #310 part 2: the view's "agent" is the server's WebFetch / WebSearch / Task
+                if req.get("strata_mcp") is not True:             # (without server coding tools a config server may be called "agent": it is an MCP server then)
+                    keep = {arun.coding} | ({"agent"} if arun.runner is None or subset else set())
+                    skip |= {n for n in hub.servers if n not in keep}      # the coding tools alone: no MCP server
                 if arun is None:
                     skip.add("agent")                             # and the coding tools only when the request asks for them
-                extra = svc.mcp.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
+                allowed = self._mcp_allowed()                     # #310 R11: a team guest, only the servers marked for guests
+                if allowed is not None:                           # (the server's WebFetch / WebSearch / Task of a run on My PC stay)
+                    skip |= {n for n in (svc.mcp.servers if svc.mcp is not None else ()) if n not in allowed and not (subset and n == "agent")}
+                if hub is not svc.mcp:                            # #310 part 2: a run on My PC keeps the names it is offered now, for every
+                    hub.pin(skip)                                 # call of this request and its helpers; a skipped server is never called
+                extra = hub.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             if force and use_mcp:
@@ -6546,16 +7151,19 @@ def make_handler(svc: Service):
             messages, req, ids, thinking, max_new = svc.prepare_carried(          # #200
                 req, messages, tools, kw, max_new, 0 if req.get("stream") else 1, force=force)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
-            req = {**req, "_meta": svc.meta_for("openai", messages, tools, self.headers.get("User-Agent"))}
+            req = {**req, "_meta": svc.meta_for("openai", messages, tools, self.headers.get("User-Agent"),
+                                               who=self._acting().name)}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             rid = sa.get("run") if isinstance(sa, dict) else None
             detached = arun is not None and bool(req.get("stream")) and isinstance(rid, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,64}", rid) is not None
             if arun is not None:
                 arun.bind(cancel)
+                if not self._still_may_run(arun):            # #310: a revoke or demotion while this request waited
+                    return
             if not detached:
                 self._watch_client(cancel)                   # #430 #431 (a run that goes on when the page goes away is not cancelled by it: serve/runs.py)
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+            run = run_with_mcp(svc, hub, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}, arun) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
@@ -6566,7 +7174,7 @@ def make_handler(svc: Service):
                     if isinstance(e, EngineDied):
                         return {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                     return {"error": {"type": "server_error", "message": str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"}}
-                buf = svc.runs.launch(rid, chunks, cancel, describe, owner=arun)             # the answer is written on its own thread: a refresh of the page does not stop it
+                buf = svc.runs.launch(rid, chunks, cancel, describe, owner=arun, who=arun.who)             # the answer is written on its own thread: a refresh of the page does not stop it
                 if buf is None:
                     return self._json(409, {"error": {"message": "there is a run with that id already"}})
                 self._sse()
@@ -6734,7 +7342,7 @@ def make_handler(svc: Service):
                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
-            svc.load()
+            svc.load(who=self._acting().name)
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
@@ -6757,7 +7365,9 @@ def make_handler(svc: Service):
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
-            # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
+            # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...); its
+            # history meta is the empty one run() makes, but with the identity that sent it (#310)
+            req = {**req, "_meta": request_meta("", [], None, None, self._acting().name)}
             return ids, thinking, tools, max_new, asm, validator, req
 
         def _count_tokens(self, req):
@@ -6767,6 +7377,7 @@ def make_handler(svc: Service):
             gets (xeno #49 S3, think_budget.side_effort) is not applied - this is the main turn's prompt."""
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, vision=svc.vision is not None)
+            self._no_local_images(messages, foreign=False)    # #310: counting reads the image too (team mode only)
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             try:
@@ -6779,7 +7390,7 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(ids)})
 
         def _anthropic(self, req):
-            svc.load()
+            svc.load(who=self._acting().name)
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, vision=svc.vision is not None)
             req = svc.cjk(req, messages)                                # xeno #49 S4
@@ -6795,7 +7406,8 @@ def make_handler(svc: Service):
             messages, req, ids, thinking, max_new = svc.prepare_carried(          # #200
                 req, messages, tools, kw, max_new, 0 if req.get("stream") else 1, force=force)
             req = svc.with_slot(req, ids)                               # xeno #49 S7
-            req = {**req, "_meta": svc.meta_for("anthropic", messages, tools, self.headers.get("User-Agent"))}
+            req = {**req, "_meta": svc.meta_for("anthropic", messages, tools, self.headers.get("User-Agent"),
+                                               who=self._acting().name)}
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
             if budget and thinking:
                 req = {**req, "_think_budget": budget}
@@ -7105,6 +7717,36 @@ def api_key_of(value):
     if key and not key_list(key):
         raise ValueError("an API key was given but it is empty")
     return key.strip()
+
+
+def start_lines(svc, host: str, port: int, max_context: int, vision: bool, ips: list[str]) -> list[str]:
+    """What main() prints once it serves: where, and whether a request needs a key - `key_required()`, so a team-mode
+    server with no api_key does not say it is open (#310, final review M3).  `ips`: this PC's LAN addresses, asked only
+    when `host` is not a loopback name (issue #26: reachable from other devices - say at which address)."""
+    here = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+    keyed = svc.key_required()
+    lines = [f"ready: http://{here}:{port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
+             f"context {max_context} tokens{', images on' if vision else ''}{', API key required' if keyed else ''})",
+             f"       open http://{here}:{port}/ in a browser to chat; close this window to stop the model"]
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        lines += [f"       from other devices: http://{ip}:{port}/   (API: http://{ip}:{port}/v1)" for ip in ips]
+        if not ips:
+            lines.append("       from other devices: http://<this PC's IP address>:" + str(port) + "/")
+        if not keyed:
+            lines.append("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": "
+                         "\"...\" to the config (clients send it as their API key; the web page asks for it)")
+    return lines
+
+
+def keys_file_of(cfg: dict, config_path) -> str | None:
+    """#310: where the named keys are kept: the run config's "keys_file" (a path relative to the config's folder), by
+    default strata-keys.json beside the run config.  No run config, no keys file (and no team mode)."""
+    if not config_path:
+        return None
+    name = cfg.get("keys_file", "strata-keys.json")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("keys_file: the path of the keys file, e.g. \"strata-keys.json\"")
+    return os.path.join(os.path.dirname(os.path.abspath(config_path)), os.path.expanduser(name.strip()))
 
 
 def key_matches(given: str, key) -> bool:
@@ -7618,6 +8260,13 @@ def main() -> int:
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    try:                                                 # #310: the named keys; the file existing is team mode
+        svc.keys = identity_mod.KeyStore(keys_file_of(cfg, a.config), svc.api_key)
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    if svc.keys.team_mode():
+        print(f"[strata] team keys: {svc.keys.path} ({len(svc.keys.view())} named); a key used from a new device waits "
+              "for the owner's approval", flush=True)
     svc.cjk_ban = a.engine == "strata" and bool(cfg.get("cjk_guard"))   # xeno #49 S4: --ban-ids was passed
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
@@ -7629,13 +8278,13 @@ def main() -> int:
         print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
-    if svc.api_monitor:
+    if svc.api_monitor:                                  # #310: a team-mode server needs a key even with no api_key
         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
-              "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
+              "memory" + ("" if svc.key_required() else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
     if svc.cors_origins:
         print(f"[strata] CORS on /v1/* for {', '.join(svc.cors_origins)}"
-              + ("" if svc.api_key or "*" not in svc.cors_origins else
+              + ("" if svc.key_required() or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
@@ -7737,21 +8386,10 @@ def main() -> int:
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     svc.start_engine_watch()                            # #59: a dead engine comes back without waiting for a request
-    here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
-    print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
-          f"context {engine.max_context} tokens{', images on' if vision else ''}"
-          f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
-    if a.host not in ("127.0.0.1", "localhost", "::1"):
-        # issue #26: reachable from other devices - say at which address, and what can still block it
-        ips = lan_addresses()
-        for ip in ips:
-            print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
-        if not ips:
-            print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
-        if not svc.api_key:
-            print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
-                  "to the config (clients send it as their API key; the web page asks for it)", flush=True)
+    lan = a.host not in ("127.0.0.1", "localhost", "::1")
+    for line in start_lines(svc, a.host, a.port, engine.max_context, bool(vision), lan_addresses() if lan else []):
+        print(line, flush=True)
+    if lan:
         if os.name == "nt":
             print("       nothing arrives? Windows Firewall blocks it until allowed: accept its prompt for Python, or run "
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Strata " + str(a.port) + "\" "
@@ -7774,7 +8412,7 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        closers = [svc.runner_hub.close, httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:

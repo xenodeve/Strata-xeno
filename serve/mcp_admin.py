@@ -181,10 +181,12 @@ def _servers_in(cfg: dict) -> dict:
     return out
 
 
-def write_config(path, servers: dict, settings: dict) -> None:
+def write_config(path, servers: dict, settings: dict, guest_mcp: list[str] | None = None, known=None) -> None:
     """Write `servers` (and the limits in `settings`) into the run config at `path`, keeping every other key.  The key is the
     one the file already uses (`mcpServers` if that is the only one, else `mcp_servers`).  The original is copied once to
-    `<path>.bak-mcp`; the new file is written beside it and moved over, so a failed write leaves the file as it was."""
+    `<path>.bak-mcp`; the new file is written beside it and moved over, so a failed write leaves the file as it was.
+    `guest_mcp`: the servers team guests may use, to store (#310 R11); None keeps the stored list, and with `known` (every
+    server name there is now) drops from it a server that is gone, so a later server of that name is not open to guests."""
     path = Path(path)
     cfg = _read_json(path)
     key = "mcpServers" if "mcpServers" in cfg and "mcp_servers" not in cfg else "mcp_servers"
@@ -192,7 +194,39 @@ def write_config(path, servers: dict, settings: dict) -> None:
     cfg[key] = servers
     if settings:
         cfg["mcp"] = {**(cfg["mcp"] if isinstance(cfg.get("mcp"), dict) else {}), **settings}
+    if guest_mcp is not None:
+        cfg[GUEST_KEY] = list(guest_mcp)
+    elif known is not None and isinstance(cfg.get(GUEST_KEY), list):
+        cfg[GUEST_KEY] = [x for x in cfg[GUEST_KEY] if x in known]
     _save(path, cfg)
+
+
+# ------------------------------------------------------------------------------------------------ team guests (#310 R11)
+GUEST_KEY = "guest_mcp"
+
+
+def guest_servers(cfg) -> set[str]:
+    """The server MCP servers the owner let team guests use: the run config's `"guest_mcp"`, a list of server names
+    (default none; anything but a list of names is none).  Never the coding tools (`agent`).  The skills are not in it:
+    they are open to guests anyway (read-only, inside the skill folders)."""
+    value = cfg.get(GUEST_KEY) if isinstance(cfg, dict) else None
+    if not isinstance(value, list):
+        return set()
+    return {x for x in value if isinstance(x, str) and x != "agent"}
+
+
+def guest_allowed(cfg, hub) -> set[str]:
+    """The hub servers a team guest may use: those marked in `"guest_mcp"`, and the built-in skills."""
+    skills = {n for n, s in (hub.servers.items() if hub is not None else ()) if n == "skills" and getattr(s, "kind", "") == "builtin"}
+    return guest_servers(cfg) | skills
+
+
+def status_for(status: dict, allowed: set[str] | None) -> dict:
+    """GET /mcp's answer with only the servers in `allowed` (None: all, as it is) and their tools counted."""
+    if allowed is None:
+        return status
+    servers = [s for s in status["servers"] if s["name"] in allowed]
+    return {**status, "servers": servers, "tools": sum(len(s["tools"]) for s in servers)}
 
 
 def update_config(path, mutate) -> None:
@@ -259,11 +293,19 @@ def read_view(config_path: str | None, mcp_config_path: str | None) -> dict:
     return {"servers": servers}
 
 
-def view(svc, client_ip: str, host: str) -> dict:
+def view(svc, client_ip: str, host: str, may: tuple[bool, str] | None = None, allowed: set[str] | None = None,
+         guests: set[str] | None = None) -> dict:
     """The answer of GET /mcp/config: the servers with their state and tools, the limits, and whether (and, if not, why)
-    this caller may change them."""
+    this caller may change them.  `may`: that answer as the server decided it (#310: an owner key in team mode);
+    None asks may_edit.  #310 R11, team mode only: `allowed` (a guest) lists only those servers and counts their tools;
+    `guests` (the owner) marks each server with `"guest"`: whether guests may use it."""
     v = read_view(svc.config_path, svc.mcp_config_path)
-    status = svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0}
+    status = status_for(svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0}, allowed)
+    if allowed is not None:
+        v["servers"] = [s for s in v["servers"] if s["name"] in allowed]
+    if guests is not None:
+        for s in v["servers"]:
+            s["guest"] = s["name"] in guests
     live = {s["name"]: s for s in status["servers"]}
     for s in v["servers"]:
         r = live.get(s["name"])
@@ -271,7 +313,7 @@ def view(svc, client_ip: str, host: str) -> dict:
         s["error"] = r["error"] if r else None
         s["tools"] = r["tools"] if r else []
         s["info"] = r["info"] if r else {}
-    ok, why = may_edit(bool(svc.api_key), client_ip, host)
+    ok, why = may if may is not None else may_edit(bool(svc.api_key), client_ip, host)
     if not ok:                                               # how a server is started (a token can sit in an argument or a URL) is for those who may change it
         for s in v["servers"]:
             for k in ("command", "args", "cwd", "url", "env", "headers"):
@@ -307,7 +349,8 @@ def reload_hub(svc) -> None:
 
 def apply(svc, body) -> tuple[int, dict]:
     """POST /mcp/config (who may ask has been decided): validate, write the run config, restart the hub.
-    Returns (status, what to send).  `body`: {"servers": {name: entry}, "settings": {...}}; a server not listed is deleted."""
+    Returns (status, what to send).  `body`: {"servers": {name: entry}, "settings": {...}, "guest_mcp": [names]}; a server
+    not listed is deleted (and unmarked for guests); without "guest_mcp" the stored marks are kept."""
     if not isinstance(body, dict) or not isinstance(body.get("servers"), dict):
         return 400, {"error": {"message": "send {\"servers\": {name: {...}}}", "fields": []}}
     if len(body["servers"]) > MAX_SERVERS:
@@ -326,11 +369,18 @@ def apply(svc, body) -> tuple[int, dict]:
             servers[name] = entry
         settings, errs = validate_settings(body.get("settings", {}))
         errors += [{"server": None, **e} for e in errs]
+        known = set(servers) | {s["name"] for s in read_view(None, svc.mcp_config_path)["servers"]}
+        guest = body.get(GUEST_KEY)
+        if GUEST_KEY in body and not (isinstance(guest, list) and len(guest) <= MAX_SERVERS and all(
+                isinstance(x, str) and x in known and x != "agent" for x in guest)):
+            errors.append({"server": None, **_err(GUEST_KEY, "guest_mcp lists the servers guests may use: names of "
+                                                             "servers set up here (not the coding tools)")})
         if errors:
             return 400, {"error": {"message": f"{errors[0]['message']} ({errors[0]['server'] or 'settings'}: {errors[0]['field']})",
                                    "fields": errors}}
         try:
-            write_config(svc.config_path, servers, settings)
+            write_config(svc.config_path, servers, settings,
+                         list(dict.fromkeys(guest)) if GUEST_KEY in body else None, known)
             reload_hub(svc)
         except (OSError, ValueError, TypeError) as e:
             return 500, {"error": {"message": f"the servers could not be saved: {e}"}}

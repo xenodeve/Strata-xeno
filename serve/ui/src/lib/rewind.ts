@@ -13,14 +13,17 @@ const post = async <T,>(path: string, body: unknown): Promise<T | { error: strin
   } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
 }
 
+// `runner` (#310 part 2): the chat's project is on the engineer's own PC: its runner keeps the checkpoints
+const mine = (runner?: string) => (runner ? { runner } : {})
+
 /** What putting the files back to before this prompt would do. */
-export const previewRewind = (session: string, checkpoint: string) => post<RewindPreview>("agent/rewind", { session, checkpoint })
+export const previewRewind = (session: string, checkpoint: string, runner?: string) => post<RewindPreview>("agent/rewind", { session, checkpoint, ...mine(runner) })
 
 /** Puts them back. A file that was changed since by someone else is left, unless `includeChanged`. */
-export const applyRewind = (session: string, checkpoint: string, includeChanged: boolean) => post<RewindResult>("agent/rewind", { session, checkpoint, apply: true, include_changed: includeChanged })
+export const applyRewind = (session: string, checkpoint: string, includeChanged: boolean, runner?: string) => post<RewindResult>("agent/rewind", { session, checkpoint, apply: true, include_changed: includeChanged, ...mine(runner) })
 
 /** A chat is gone: its checkpoints go too (not waited for, not reported). */
-export function forgetCheckpoints(session: string): void { void post("agent/checkpoints/forget", { session }) }
+export function forgetCheckpoints(session: string, runner?: string): void { void post("agent/checkpoints/forget", { session, ...mine(runner) }) }
 
 export type RewindWhat = "both" | "files" | "conversation"
 

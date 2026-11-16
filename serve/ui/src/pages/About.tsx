@@ -3,6 +3,7 @@ import { apiHeaders, getHealth, NO_HEALTH, root, url, type Health } from "../lib
 import { parseArch } from "../lib/arch"
 import { fmt } from "../lib/format"
 import { t } from "../lib/i18n"
+import { aboutWhere } from "../lib/where"
 import { ModelFacts } from "../components/ModelBlock"
 import { SLOT, Sentence } from "../components/bits"
 import type { ModelInfo } from "../lib/metrics"
@@ -35,7 +36,7 @@ export function About() {
     <div className="max-w-[65ch] space-y-8">
       <section>
         <h1 className="page-title">{t("About")}</h1>
-        <p className="page-sub">{t("Strata runs a large mixture-of-experts model on this PC. Nothing leaves it.")}</p>
+        <p className="page-sub">{aboutWhere(location.hostname)}</p>
       </section>
 
       <section>

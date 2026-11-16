@@ -2,6 +2,7 @@
 // the text of each file that is mentioned goes with it, as an attachment (cut to a size; only inside the project's folders). The server does the looking (serve/files.py).
 import { apiHeaders, url } from "./api"
 import type { Attachment } from "./chat"
+import { withRunner } from "./runner"
 
 export interface AtQuery { start: number; query: string }          // start: where the `@` is
 
@@ -36,18 +37,18 @@ const query = (folders: string[]) => `path=${encodeURIComponent(folders[0] ?? ""
 
 export interface FoundFile { path: string; folder: number }
 
-/** The files that go with `q`; null when the server cannot be asked. */
-export async function getFiles(folders: string[], q: string): Promise<FoundFile[] | null> {
+/** The files that go with `q`; null when the server cannot be asked. `runner` (#310 part 2): the project is on the engineer's own PC. */
+export async function getFiles(folders: string[], q: string, runner?: string): Promise<FoundFile[] | null> {
   if (!folders.length) return []
   try {
-    const r = await fetch(url(`agent/files?${query(folders)}&q=${encodeURIComponent(q)}`), { headers: apiHeaders() })
+    const r = await fetch(url(withRunner(`agent/files?${query(folders)}&q=${encodeURIComponent(q)}`, runner)), { headers: apiHeaders() })
     return r.ok ? (((await r.json()) as { files?: FoundFile[] }).files ?? []) : null
   } catch { return null }
 }
 
-export async function getMention(folders: string[], rel: string): Promise<{ name: string; text: string; cut: boolean } | null> {
+export async function getMention(folders: string[], rel: string, runner?: string): Promise<{ name: string; text: string; cut: boolean } | null> {
   try {
-    const r = await fetch(url(`agent/mention?${query(folders)}&rel=${encodeURIComponent(rel)}`), { headers: apiHeaders() })
+    const r = await fetch(url(withRunner(`agent/mention?${query(folders)}&rel=${encodeURIComponent(rel)}`, runner)), { headers: apiHeaders() })
     if (!r.ok) return null
     const j = await r.json()
     return j?.ok === true ? { name: String(j.name), text: String(j.text), cut: !!j.cut } : null
@@ -55,10 +56,10 @@ export async function getMention(folders: string[], rel: string): Promise<{ name
 }
 
 /** The files a prompt mentions, as attachments (the ones that are there; a name that is no file of the project is left as the words it is). */
-export async function resolveMentions(folders: string[], text: string): Promise<Attachment[]> {
+export async function resolveMentions(folders: string[], text: string, runner?: string): Promise<Attachment[]> {
   if (!folders.length) return []
   const names = mentionsOf(text)
   if (!names.length) return []
-  const got = await Promise.all(names.map((n) => getMention(folders, n)))
+  const got = await Promise.all(names.map((n) => getMention(folders, n, runner)))
   return got.flatMap((g): Attachment[] => (g ? [{ kind: "file", name: g.name, text: g.cut ? g.text + "\n[cut here: the file is longer than is sent]" : g.text }] : []))
 }

@@ -9,7 +9,11 @@ import { t } from "./i18n"
 // the next step being planned, the thinking, the writing. A change from one to the next is a change of words, not a gap.
 
 /** What the status needs of a tool call. `at` and `rat` are the lengths of the text and of the thinking when the call began. */
-export interface StatusTool { name: string; state: string; at?: number; rat?: number; judging?: boolean; hookRunning?: string | null }
+export interface StatusTool {
+  name: string; state: string; at?: number; rat?: number; judging?: boolean; hookRunning?: string | null
+  machine?: "my"                                         // #310 part 2: the call runs on the engineer's own PC (the runner)
+  remote?: "sending" | "running" | "offline"             // and where it is on its way there (the server's `remote` events)
+}
 export interface StatusInput {
   streaming: boolean
   reasoning?: string
@@ -20,7 +24,7 @@ export interface StatusInput {
   /** A hook of the user's that belongs to the answer and not to a call (a prompt or an end hook) is running. */
   hookRunning?: string | null
 }
-export type StatusKind = "asking" | "hook" | "judging" | "writing" | "running" | "reading" | "planning" | "thinking" | "composing"
+export type StatusKind = "asking" | "hook" | "judging" | "writing" | "sending" | "offline" | "running" | "reading" | "planning" | "thinking" | "composing"
 export interface AgentStatus { kind: StatusKind; design: OrbDesign; label: string }
 
 const status = (kind: StatusKind, design: OrbDesign, label: string): AgentStatus => ({ kind, design, label })
@@ -47,6 +51,10 @@ export function agentStatus(i: StatusInput): AgentStatus | null {
   if (doing) {
     const design = toolDesign(doing.name)
     if (doing.state === "writing") return status("writing", design, t("Writing the call to {tool}…", { tool: doing.name }))
+    // #310 part 2: a call on My PC, from the server's `remote` events, which it sends as each step begins (sending at once, running when the runner took it)
+    if (doing.remote === "offline") return status("offline", "breathing", t("Your PC is offline…"))
+    if (doing.remote === "sending") return status("sending", "connecting", t("Sending the call to your PC…"))
+    if (doing.machine === "my") return status("running", design, t("Running {tool} on your PC…", { tool: doing.name }))
     return status("running", design, doing.name === "Task" ? t("A helper is working…") : t("Running {tool}…", { tool: doing.name }))
   }
   const text = i.text ?? "", reasoning = i.reasoning ?? ""

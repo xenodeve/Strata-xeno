@@ -2210,3 +2210,133 @@ describe("a message sent while the agent works", () => {
   })
 })
 
+
+// #310 part 2: a chat whose project is on the engineer's own PC (the runner): the request names the runner, a call says which machine ran it,
+// a helper's steps on that PC carry the travel of each step, and a card the server closed says why.
+describe("#310 part 2: the runner in the chat", () => {
+  const ON = { available: true, allowed: true, shell: "bash", tools: ["Read"] }
+  const RID = "r0123456789abcdef"
+  const finish = [delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 } }, "data: [DONE]" + String.fromCharCode(10) + String.fromCharCode(10)]
+  function keep() {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+  }
+
+  test("the request carries the runner of the chat's context; without one it is today's", async () => {
+    keep()
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(...finish), sse(...finish)], seen)
+    const c = new ChatController()
+    await c.send("one", [], { ...ctx, agent: ON, folder: ["C:/w"], runner: RID })
+    await c.send("two", [], { ...ctx, agent: ON, folder: ["C:/w"] })
+    expect((seen[0].strata_agent as { runner?: string }).runner).toBe(RID)
+    expect("runner" in (seen[1].strata_agent as object)).toBe(false)
+  })
+
+  test("a call on My PC is marked so; a call of the server is not", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(
+      { strata_mcp: { event: "start", id: "c1", name: "Read" } }, { strata_mcp: { event: "call", id: "c1", name: "Read", server: "my_agent", machine: "my", tool: "Read", arguments: { file_path: "a" }, round: 1 } },
+      { strata_mcp: { event: "start", id: "c2", name: "Read" } }, { strata_mcp: { event: "call", id: "c2", name: "Read", server: "agent", tool: "Read", arguments: { file_path: "a" }, round: 1 } },
+      ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("look", [], ctx)
+    const [mine, theirs] = c.messages[1].tools!
+    expect(mine.machine).toBe("my")
+    expect(mine.server).toBe("my_agent")
+    expect("machine" in theirs).toBe(false)
+  })
+
+  test("a call on My PC: the call event sets machine, each remote event its travel; a remote for no call, or with a bad state, changes nothing", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(
+      { strata_mcp: { event: "start", id: "c1", name: "Bash" } },
+      { strata_mcp: { event: "call", id: "c1", name: "Bash", server: "my_agent", machine: "my", tool: "Bash", arguments: { command: "make" }, round: 1 } },
+      { strata_mcp: { event: "remote", id: "c1", state: "sending" } },
+      { strata_mcp: { event: "remote", id: "c1", state: "running" } },
+      { strata_mcp: { event: "remote", id: "c1", state: "nonsense" } },
+      { strata_mcp: { event: "remote", id: "nobody", state: "offline" } },
+      { strata_mcp: { event: "start", id: "c2", name: "Read" } },
+      { strata_mcp: { event: "call", id: "c2", name: "Read", server: "my_agent", machine: "my", tool: "Read", arguments: { file_path: "a" }, round: 1 } },
+      { strata_mcp: { event: "remote", id: "c2", state: "sending" } },
+      { strata_mcp: { event: "remote", id: "c2", state: "offline" } },
+      { strata_mcp: { event: "start", id: "c3", name: "Grep" } },
+      { strata_mcp: { event: "call", id: "c3", name: "Grep", server: "my_agent", machine: "my", tool: "Grep", arguments: { pattern: "x" }, round: 1 } },
+      { strata_mcp: { event: "remote", id: "c3", state: "sending" } },
+      ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("make", [], ctx)
+    const tools = c.messages[1].tools!
+    expect(tools.map((x) => [x.id, x.machine, x.remote])).toEqual([["c1", "my", "running"], ["c2", "my", "offline"], ["c3", "my", "sending"]])
+  })
+
+  test("a helper's step on My PC is marked, and its travel (step_remote) is kept on it", async () => {
+    keep()
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(
+      { strata_mcp: { event: "start", id: "t1", name: "Task" } },
+      { strata_mcp: { event: "call", id: "t1", name: "Task", server: "agent", tool: "Task", arguments: { description: "d", prompt: "p" }, round: 1 } },
+      { strata_mcp: { event: "helper", state: "start", kind: "explore", description: "d", call_id: "t1" } },
+      { strata_mcp: { event: "step", id: "s1", name: "Read", machine: "my", arguments: { file_path: "a" }, call_id: "t1" } },
+      { strata_mcp: { event: "step_remote", id: "s1", state: "sending", call_id: "t1" } },
+      { strata_mcp: { event: "step_remote", id: "s1", state: "running", call_id: "t1" } },
+      { strata_mcp: { event: "step", id: "s2", name: "Read", machine: "my", arguments: { file_path: "b" }, call_id: "t1" } },
+      { strata_mcp: { event: "step_remote", id: "s2", state: "offline", call_id: "t1" } },
+      { strata_mcp: { event: "step_remote", id: "s2", state: "nonsense", call_id: "t1" } },
+      { strata_mcp: { event: "step_remote", id: "nobody", state: "running", call_id: "t1" } },
+      ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("look", [], ctx)
+    const call = c.messages[1].tools![0]
+    expect(call.steps!.map((s) => [s.id, s.machine, s.remote])).toEqual([["s1", "my", "running"], ["s2", "my", "offline"]])
+  })
+
+  test("a My PC chat that cannot reach its PC (ctx.blocked): send and edit refuse before anything is cut or sent, and say why", async () => {
+    keep()
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(...finish)], seen)
+    const c = new ChatController()
+    const said: string[] = []
+    c.onError = (title, text) => { said.push(`${title}: ${text}`) }
+    await c.send("one", [], { ...ctx, agent: ON, folder: ["C:/w"], runner: RID })             // a prompt that went out while the runner was known
+    expect(seen.length).toBe(1)
+    const before = c.messages.length
+    const blocked = { ...ctx, agent: { ...ON, allowed: false }, folder: ["C:/w"], blocked: "This project is on My PC, and this browser has no runner." }
+    expect(await c.edit(0, "one, again", blocked)).toBe(false)
+    expect(c.messages.length).toBe(before)                                                   // not cut
+    expect(c.messages[0].text).toBe("one")
+    await c.send("two", [], blocked)
+    expect(seen.length).toBe(1)                                                              // nothing more was sent
+    expect(c.messages.length).toBe(before)
+    expect(said).toEqual(["Your PC cannot be reached: This project is on My PC, and this browser has no runner.", "Your PC cannot be reached: This project is on My PC, and this browser has no runner."])
+    c.setSettings({ ...c.settings, agent: false })                                           // the coding tools switched off: a plain chat goes
+    mockFetch([sse(...finish)], seen)
+    await c.send("three", [], blocked)
+    expect(seen.length).toBe(2)
+    expect("strata_agent" in seen[1]).toBe(false)
+  })
+
+  test("a card the server closed keeps the reason: not 'you did not allow it', not 'you skipped'", async () => {
+    keep()
+    const questions = [{ question: "Which?", header: "Library", multiSelect: false, options: [{ label: "a", description: "x" }, { label: "b", description: "y" }] }]
+    ;(globalThis as Record<string, unknown>).fetch = async () => new Response(sse(
+      { strata_mcp: { event: "start", id: "c1", name: "Bash" } }, { strata_mcp: { event: "call", id: "c1", name: "Bash", server: "my_agent", machine: "my", tool: "Bash", arguments: { command: "make" }, round: 1 } },
+      { strata_mcp: { event: "permission", id: "p1", call_id: "c1", tool: "Bash", arguments: { command: "make" }, why: "asks", danger: false, rule: null } },
+      { strata_mcp: { event: "answered", id: "p1", call_id: "c1", answer: "deny", reason: "offline" } },
+      { strata_mcp: { event: "start", id: "c2", name: "AskUserQuestion" } }, { strata_mcp: { event: "call", id: "c2", name: "AskUserQuestion", server: "my_agent", machine: "my", tool: "AskUserQuestion", arguments: { questions }, round: 1 } },
+      { strata_mcp: { event: "question", id: "q1", call_id: "c2", questions } },
+      { strata_mcp: { event: "question_answered", id: "q1", call_id: "c2", answers: null, reason: "revoked" } },
+      { strata_mcp: { event: "start", id: "c3", name: "Bash" } }, { strata_mcp: { event: "call", id: "c3", name: "Bash", server: "agent", tool: "Bash", arguments: { command: "ls" }, round: 1 } },
+      { strata_mcp: { event: "permission", id: "p3", call_id: "c3", tool: "Bash", arguments: { command: "ls" }, why: "asks", danger: false, rule: null } },
+      { strata_mcp: { event: "answered", id: "p3", call_id: "c3", answer: "deny" } },
+      ...finish), { status: 200 })
+    const c = new ChatController()
+    await c.send("go", [], ctx)
+    const [bash, ask, plain] = c.messages[1].tools!
+    expect(bash.ask).toMatchObject({ answer: "deny", closed: "offline" })
+    expect(ask.question).toMatchObject({ answers: null, closed: "revoked" })
+    expect(plain.ask!.answer).toBe("deny")
+    expect("closed" in plain.ask!).toBe(false)                    // a timeout or the user's deny has no reason: today's words
+  })
+})

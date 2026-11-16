@@ -68,6 +68,7 @@ class AgentContext:
     web: object | None = None                              # serve/web.py Web: set only when the user switched web access on (WebFetch and WebSearch run only with it)
     spawn: Callable | None = None                          # serve/subagent.py: runs a helper (kind, prompt, description) -> (ok, report); set only when the user switched helpers on
     in_helper: bool = False                                # this call is a helper's: it cannot start a helper
+    run_key: str = ""                                      # #310: the run on the engineer's PC (its runner's `run.start` answer) these calls belong to: it keeps a chat's session, todos, reads and background shells apart there; "" on the server
 
 
 class Session:

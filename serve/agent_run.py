@@ -4,6 +4,10 @@ The tool runs on a worker thread (serve/server.py run_with_mcp) and calls `ctx.a
 `permission` event on a queue - the request's stream sends it to the page - and waits until the page answers (POST /agent/permission, which
 reaches `Broker.answer`), the request is cancelled, or the time is up (a refusal).  In mode "auto" a call that may be judged goes to the
 judge first (serve/judge.py); a clear verdict settles it, an unclear one asks the user.
+
+#310: a question belongs to the identity whose run asked it (`AgentRun.who`, kept in the slot) and only that identity answers it.  The owner role
+does not answer for another - an approval is the run holder's.  An answer from anyone else is refused as for an id that was not asked, and the
+question stays open for its holder.
 """
 from __future__ import annotations
 
@@ -11,7 +15,11 @@ import queue
 import threading
 import time
 import uuid
-from typing import Callable
+import weakref
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from serve.identity import Identity
 
 from serve import agent, judge, permissions
 
@@ -24,9 +32,42 @@ class Broker:
     def __init__(self):
         self.lock = threading.Lock()
         self.pending: dict[str, dict] = {}
+        self.runs: weakref.WeakSet = weakref.WeakSet()      # the AgentRuns that ask through this broker (helpers too), while alive
 
-    def open(self, rid: str, kind: str = "permission") -> dict:
-        slot = {"event": threading.Event(), "answer": None, "kind": kind}
+    def track(self, run: AgentRun) -> None:
+        with self.lock:
+            self.runs.add(run)
+
+    def move(self, old: str, new: str) -> int:
+        """#310: a key renamed from `old` to `new`: every open prompt and every live run of `old` (so what it asks next
+        too) is `new`'s.  A later key named `old` inherits nothing.  How many open prompts moved."""
+        with self.lock:
+            for run in list(self.runs):
+                if run.who == old:
+                    run.who = new
+            slots = [s for s in self.pending.values() if s.get("who") == old]
+            for s in slots:
+                s["who"] = new
+        return len(slots)
+
+    def end_all(self, who: str) -> int:
+        """#310: a key that is revoked (or made a guest): every live run of `who` is stopped for good (`stopped`, its
+        cancel set; a run not yet bound to its request's cancel carries it over in `AgentRun.bind`) and every prompt it
+        holds is closed as refused (a permission as "deny", a question as skipped).  How many prompts were closed."""
+        with self.lock:
+            for run in list(self.runs):
+                if run.who == who:
+                    run.stopped = True
+                    run.cancel.set()
+            gone = [rid for rid, s in self.pending.items() if s.get("who") == who]
+            slots = [self.pending.pop(rid) for rid in gone]
+        for s in slots:
+            s["answer"] = "deny" if s.get("kind") == "permission" else {"answers": None}
+            s["event"].set()
+        return len(slots)
+
+    def open(self, rid: str, kind: str = "permission", who: str = "owner") -> dict:
+        slot = {"event": threading.Event(), "answer": None, "kind": kind, "who": who}
         with self.lock:
             self.pending[rid] = slot
         return slot
@@ -35,25 +76,25 @@ class Broker:
         with self.lock:
             self.pending.pop(rid, None)
 
-    def answer(self, rid, decision) -> bool:
-        """The page's answer; False for an id that was not asked (or is answered already) or an answer that is not one."""
+    def answer(self, rid, decision, by: Identity) -> bool:
+        """The page's answer; False for an id that was not asked (or is answered already), one that `by` did not ask, or an answer that is not one."""
         if decision not in ANSWERS:
             return False
         with self.lock:
             slot = self.pending.get(rid) if isinstance(rid, str) else None
-            if slot is None or slot.get("kind") != "permission":
+            if slot is None or slot.get("kind") != "permission" or slot.get("who") != by.name:
                 return False
             self.pending.pop(rid, None)
         slot["answer"] = decision
         slot["event"].set()
         return True
 
-    def respond(self, rid, answers) -> bool:
+    def respond(self, rid, answers, by: Identity) -> bool:
         """The page's answer to a question the model asked (AskUserQuestion): {question: [labels or the user's own words]}, or None when the user skipped it. False for an id that
-        was not asked, is answered already, or is a permission question."""
+        was not asked, is answered already, is a permission question, or that `by` did not ask."""
         with self.lock:
             slot = self.pending.get(rid) if isinstance(rid, str) else None
-            if slot is None or slot.get("kind") != "question":
+            if slot is None or slot.get("kind") != "question" or slot.get("who") != by.name:
                 return False
             self.pending.pop(rid, None)
         slot["answer"] = {"answers": answers}
@@ -63,17 +104,23 @@ class Broker:
 
 class AgentRun:
     def __init__(self, policy: permissions.Policy, session: str, broker: Broker, goal: str, side: Callable[[str, str], str] | None,
-                 cancel: threading.Event, timeout: float = 600.0, shell: str | None = None):
+                 cancel: threading.Event, timeout: float = 600.0, shell: str | None = None, who: str = "owner"):
         self.policy, self.broker, self.goal, self.side, self.cancel, self.timeout, self.shell = policy, broker, goal, side, cancel, timeout, shell
+        self.who = who                                         # #310: the identity whose request this is: only it answers what the run asks
         self.events: queue.Queue = queue.Queue()
         self.current: str | None = None                      # the id of the model's call that is running (for the page to tie a card to it)
         self.prompt = ""                                       # the rules for the AI (serve/agent_prompt.py), set by the server
         self.hidden: set = set()                               # coding tools that are not offered to the model in this request (web access, until it is switched on)
         self.hooks = None                                      # serve/hooks.py Runner, when the user has hooks
+        self.hub = None                                        # #310 part 2: the request's own view of the tool groups (task 4); None: the server's hub
+        self.coding = "agent"                                  # #310 part 2: the coding group the run's calls go to: "my_agent" for a project on the engineer's PC
+        self.runner = None                                     # #310 part 2: the serve/runner_hub.py Runner of a project on the engineer's PC, else None
         self.kw, self.sampling = {}, {}                        # the request's template settings and sampling: a helper (serve/subagent.py) runs with the same
         self.limit_hit = False                                 # the tool loop stopped at its limit of rounds
         self.steers: queue.Queue = queue.Queue()               # what the user sent while the agent worked: read by the model at the next step (serve/server.py run_with_mcp)
         self.ctx = agent.AgentContext(policy=policy, session=session, ask=self.ask, cancel=cancel, emit=self._emit, question=self.question)
+        self.stopped = False                                   # #310: Broker.end_all stopped it (its key was revoked or made a guest)
+        broker.track(self)                                     # #310: a rename moves it, a revoke stops it
 
     def steer(self, text: str) -> None:
         self.steers.put(text)
@@ -87,8 +134,14 @@ class AgentRun:
                 return out
 
     def bind(self, cancel: threading.Event) -> None:
-        """The request's own cancel event (made after the run, once the prompt is ready)."""
-        self.cancel = self.ctx.cancel = cancel
+        """The request's own cancel event (made after the run, once the prompt is ready).  A stop that came before it
+        (Broker.end_all while the request waited, for a model load) carries over: under the broker's lock, so a stop
+        cannot fall between the two events."""
+        with self.broker.lock:
+            old = self.cancel
+            self.cancel = self.ctx.cancel = cancel
+            if self.stopped or old.is_set():
+                cancel.set()
 
     def _emit(self, event: dict) -> None:
         self.events.put({"call_id": self.current, **event})                # an event that names its call (or none: a prompt or stop hook) keeps it
@@ -117,16 +170,21 @@ class AgentRun:
             return f"blocked: auto mode judged this call too risky (severity {severity} of 5)"
         return None
 
-    def question(self, questions: list) -> dict | str:
-        """The model's questions to the user: a `question` event, and the answer ({"answers": {...} or None}), or "cancelled", or {"answers": None} when nobody answered in time."""
+    def question(self, questions: list, abort: threading.Event | None = None) -> dict | str:
+        """The model's questions to the user: a `question` event, and the answer ({"answers": {...} or None}), or "cancelled", or {"answers": None} when nobody answered in time.
+        `abort` (#310 part 2, a call on the user's own PC): set when that PC went offline, its runner was replaced or its device cleared - the card closes at once
+        with {"answers": None} and a `question_answered` event whose `reason` is `abort.why`."""
         rid = uuid.uuid4().hex[:16]
-        slot = self.broker.open(rid, "question")
+        slot = self.broker.open(rid, "question", self.who)
         self._emit({"event": "question", "id": rid, "questions": questions})
         end = time.monotonic() + self.timeout
         try:
             while not slot["event"].wait(0.25):
                 if self.cancel.is_set():
                     return "cancelled"
+                if abort is not None and abort.is_set():
+                    self._emit({"event": "question_answered", "id": rid, "answers": None, "reason": getattr(abort, "why", None)})
+                    return {"answers": None}
                 if time.monotonic() > end:
                     self._emit({"event": "question_answered", "id": rid, "answers": None})
                     return {"answers": None}
@@ -135,19 +193,24 @@ class AgentRun:
         finally:
             self.broker.close(rid)
 
-    def ask(self, req: dict) -> str:
+    def ask(self, req: dict, abort: threading.Event | None = None) -> str:
+        """A permission card: "allow" | "allow_chat" | "deny" | "cancelled" | a "blocked:..." verdict.  `abort` (#310 part 2): as for `question` - the card
+        closes at once as "deny", with an `answered` event whose `reason` is `abort.why`."""
         rid = uuid.uuid4().hex[:16]
         if self.policy.mode == "auto" and req.get("judgeable") and not req.get("danger") and self.side is not None:
             settled = self._judge(req, rid)
             if settled:
                 return settled
-        slot = self.broker.open(rid)
+        slot = self.broker.open(rid, "permission", self.who)
         self._emit({"event": "permission", "id": rid, **{k: req.get(k) for k in ("tool", "arguments", "why", "danger", "rule")}})
         end = time.monotonic() + self.timeout
         try:
             while not slot["event"].wait(0.25):
                 if self.cancel.is_set():
                     return "cancelled"
+                if abort is not None and abort.is_set():
+                    self._emit({"event": "answered", "id": rid, "answer": "deny", "reason": getattr(abort, "why", None)})
+                    return "deny"
                 if time.monotonic() > end:
                     self._emit({"event": "answered", "id": rid, "answer": "deny"})
                     return "deny"

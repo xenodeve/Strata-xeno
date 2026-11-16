@@ -19,11 +19,12 @@ const WHAT: { value: RewindWhat; label: () => string; hint: () => string }[] = [
   { value: "conversation", label: () => t("Only the conversation"), hint: () => t("The files stay as they are.") },
 ]
 
-export function RewindDialog({ open, prompts, start, session, onCancel, onDone }: {
+export function RewindDialog({ open, prompts, start, session, runner, onCancel, onDone }: {
   open: boolean
   prompts: RewindPrompt[]                        // the prompts of the chat, oldest first
   start: number                                  // which of them it opens on (an index into `prompts`)
   session: string | null
+  runner?: string                                                // #310 part 2: the chat is on the engineer's own PC, whose runner keeps the checkpoints
   onCancel: () => void
   onDone: (conversation: { index: number } | null) => void       // the conversation is to be cut at this prompt, or not
 }) {
@@ -64,9 +65,9 @@ export function RewindDialog({ open, prompts, start, session, onCancel, onDone }
     if (!open || !prompt || !session) { setFiles(null); return }
     let stale = false
     setFiles("loading")
-    void previewRewind(session, prompt.checkpoint).then((r) => { if (!stale) setFiles("error" in r ? "error" : r.files) })
+    void previewRewind(session, prompt.checkpoint, runner).then((r) => { if (!stale) setFiles("error" in r ? "error" : r.files) })
     return () => { stale = true }
-  }, [open, at, session, prompt?.checkpoint]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, at, session, prompt?.checkpoint, runner]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const list = Array.isArray(files) ? files : []
   const touches = list.filter((f) => f.action !== "skip")
@@ -77,7 +78,7 @@ export function RewindDialog({ open, prompts, start, session, onCancel, onDone }
     setBusy(true)
     setProblem(null)
     if (filesApply && session && touches.length) {
-      const r = await applyRewind(session, prompt.checkpoint, more)
+      const r = await applyRewind(session, prompt.checkpoint, more, runner)
       if ("error" in r) { setBusy(false); setProblem(r.error); return }
       const s = rewindSummary(r)
       const parts = [s.restored ? t("{n} files put back", { n: s.restored }) : "", s.deleted ? t("{n} files deleted", { n: s.deleted }) : "", s.kept ? t("{n} left as you changed them", { n: s.kept }) : "", s.failed ? t("{n} could not be changed", { n: s.failed }) : ""].filter(Boolean)

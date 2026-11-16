@@ -1,0 +1,993 @@
+"""desktop/test_gui.py - the parts of the windows that are not visual (#310 part 3 task 4): the servers page's text,
+the Python API the servers page calls (no method returns a token, RF 1; nothing but its methods is exposed), and the
+app window's prepare-then-open steps against a fake window (the origin check, `True` only).  No window is opened.
+
+    python -m pytest desktop/test_gui.py -q
+"""
+from __future__ import annotations
+
+import inspect
+import json
+import re
+import threading
+import time
+from dataclasses import dataclass
+
+import pytest
+
+from desktop import applog, gui, inject, probe, state, words
+from desktop.dpapi import DpapiError
+from desktop.servers import Secret, ServerEntry
+
+TOKEN = "sk-strata-gui-SECRET-0123456789"
+DEVICE = {"id": "AbCdEfGhIjKlMnOpQrStUv", "name": "ann-pc"}
+LABEL = "Strata Desktop on ann-pc"
+
+
+@pytest.fixture(autouse=True)
+def english(monkeypatch):
+    monkeypatch.setattr(words, "LANG", "en")
+    yield
+    applog.forget_secrets()
+
+
+# ------------------------------------------------------------------------------------------------ the page
+def test_servers_html_carries_the_words():
+    html = gui.servers_html()
+    m = re.search(r"const WORDS = (\{.*?\});", html, re.S)
+    assert m, "the words were not filled in"
+    table = json.loads(m.group(1))
+    for key in gui.PAGE_WORDS:
+        assert table[key] == words.t(key), key
+    assert "/*WORDS*/" not in html
+    assert "</script" not in m.group(1)
+
+
+def test_servers_html_in_thai(monkeypatch):
+    monkeypatch.setattr(words, "LANG", "th")
+    html = gui.servers_html()
+    table = json.loads(re.search(r"const WORDS = (\{.*?\});", html, re.S).group(1))
+    assert table["button_connect"] == words.TABLE["button_connect"]["th"]
+    assert 'lang="th"' in html
+
+
+def test_servers_html_is_self_contained():
+    html = gui.servers_html()
+    assert not re.search(r"""<(script|link|img|iframe)[^>]+(src|href)\s*=\s*["']?(https?:)?//""", html, re.I)
+    assert "@import" not in html
+    assert "innerHTML" not in html                                  # server text goes in as textContent only
+    assert "prefers-color-scheme: dark" in html
+    assert "window.render" in html and "pywebviewready" in html
+
+
+def test_page_words_exist():
+    for key in gui.PAGE_WORDS:
+        assert key in words.TABLE, key
+
+
+def test_state_view():
+    s = state.TrayState("pending", server="lab", code="K7QZ")
+    v = gui.state_view(s)
+    assert v["kind"] == "pending" and v["code"] == "K7QZ" and v["server"] == "lab"
+    assert v["text"] == words.t("pending", server="lab", code="K7QZ")
+    assert v["can_open_without_runner"] is False
+    assert gui.state_view(state.TrayState("refused", server="lab", refused="runner_protocol",
+                                          message="protocol 3"))["can_open_without_runner"] is True
+    assert gui.state_view(state.TrayState("error", message="x"))["can_open_without_runner"] is True
+    assert gui.state_view(state.TrayState("refused", refused="key"))["can_open_without_runner"] is False
+    assert v["notice"] == ""
+    assert gui.state_view(s, words.t("window_not_prepared"))["notice"] == words.t("window_not_prepared")
+    json.dumps(v)
+
+
+def test_servers_page_shows_the_notice():
+    html = gui.servers_html()
+    assert 'id="notice"' in html and "st.notice" in html
+
+
+# ------------------------------------------------------------------------------------------------ the API
+class FakeStore:
+    def __init__(self):
+        self.rows = {"lab": ServerEntry("lab", "http://127.0.0.1:8099", Secret(TOKEN))}
+        self.saved = []
+        self.fail: Exception | None = None
+        self.last = "lab"
+
+    def public(self):
+        return [{"name": e.name, "url": e.url, "token": "set"} for e in self.rows.values()]
+
+    def get(self, name):
+        return self.rows.get(name)
+
+    def save(self, name, url, token, old_name=None):
+        if self.fail:
+            raise self.fail
+        self.saved.append((name, url, token, old_name))
+        return ServerEntry(name, url, Secret(token or ""))
+
+
+class FakeController:
+    def __init__(self):
+        self.calls = []
+        self.state = state.TrayState("online", server="lab", who="ann", runner_id="r0123456789abcdef")
+        self.notice = ""
+        self.renames = []
+
+    def connect(self, name):
+        self.calls.append(("connect", name))
+
+    def remove(self, name):
+        self.calls.append(("remove", name))
+
+    def saved(self, old_name, entry):
+        self.renames.append((old_name, entry.name))
+
+    def open_without_runner(self):
+        self.calls.append(("open_without_runner",))
+
+    def copy_code(self):
+        self.calls.append(("copy_code",))
+        return self.state.kind == "pending"
+
+
+def _api(probe_fn=None):
+    store, ctl = FakeStore(), FakeController()
+    seen = []
+
+    def fake_probe(url, token, device, label, timeout=10.0):
+        seen.append((url, token, device, label))
+        return probe.ProbeResult(True, model="gyro", role="owner", engine_running=True)
+
+    api = gui.ServersApi(store, DEVICE, LABEL, ctl, probe=probe_fn or fake_probe)
+    return api, store, ctl, seen
+
+
+def _exposed(obj) -> set[str]:
+    """What pywebview's inject_pywebview lists for a js_api object (webview/util.py get_functions): public methods,
+    and the public attributes of public objects, recursively."""
+    found, seen = set(), set()
+
+    def walk(o, base):
+        if id(o) in seen:
+            return
+        seen.add(id(o))
+        for name in dir(o):
+            if name.startswith("_"):
+                continue
+            attr = getattr(o, name)
+            full = f"{base}.{name}" if base else name
+            if inspect.ismethod(attr) or inspect.isfunction(attr):
+                found.add(full)
+            elif inspect.isclass(attr) or (not callable(attr) and hasattr(attr, "__module__")):
+                walk(attr, full)
+
+    walk(obj, "")
+    return found
+
+
+def test_api_exposes_only_its_methods():
+    api, *_ = _api()
+    assert _exposed(api) == {"list", "warning", "save", "remove", "test", "connect", "open_without_runner",
+                             "copy_code"}
+
+
+def test_api_functions_are_plain_and_exact():
+    """What the servers window gets (`window.expose`): one plain function per call, named as the page calls it."""
+    api, store, ctl, _ = _api()
+    fns = gui.api_functions(api)
+    assert {f.__name__ for f in fns} == set(gui.API_NAMES) and len(fns) == len(gui.API_NAMES)
+    assert all(inspect.isfunction(f) for f in fns)
+    by = {f.__name__: f for f in fns}
+    assert by["list"]() == api.list()
+    assert by["connect"]("lab") == {"ok": True} and ctl.calls == [("connect", "lab")]
+
+
+def test_api_functions_refuse_until_the_window_is_guarded():
+    api, store, ctl, _ = _api()
+    allowed = [False]
+    by = {f.__name__: f for f in gui.api_functions(api, lambda: allowed[0])}
+    assert by["connect"]("lab") == {"error": words.t("internal_error")}
+    assert by["save"]("x", "https://evil.example", None, "lab") == {"error": words.t("internal_error")}
+    assert ctl.calls == [] and store.saved == []
+    allowed[0] = True
+    assert by["connect"]("lab") == {"ok": True}
+
+
+class FakeWebviewWindow:
+    """What `webview.create_window` returns, as the Gui's wiring uses it."""
+
+    def __init__(self, title, **kw):
+        self.title, self.kw = title, kw
+        self.exposed: list = []
+        self.events = type("E", (), {})()
+        for name in ("closing", "loaded", "before_show", "shown"):
+            setattr(self.events, name, FakeEvent())
+
+    def expose(self, *functions):
+        self.exposed.extend(functions)
+
+
+def _fake_webview(monkeypatch):
+    import sys
+    import types
+    made = []
+    fake = types.ModuleType("webview")
+    fake.settings = {}
+    fake.renderer = "edgechromium"
+
+    def create_window(title, **kw):
+        w = FakeWebviewWindow(title, **kw)
+        made.append(w)
+        return w
+    fake.create_window = create_window
+    fake.start = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "webview", fake)
+    monkeypatch.setattr(gui.webview2, "message_box", lambda text: pytest.fail("a message box"))
+    import webbrowser
+    monkeypatch.setattr(webbrowser, "open", webbrowser.open)        # run() wraps it: restored after the test
+    return made
+
+
+def test_servers_window_gets_functions_not_an_object(monkeypatch, tmp_path):
+    """I-1: no js_api object (pywebview follows dotted names into it, `_` attributes included); the exact calls through
+    `expose`; both windows prepared before they first load."""
+    made = _fake_webview(monkeypatch)
+    api, *_ = _api()
+    g = gui.Gui(data=tmp_path, api=api)
+    assert g.run(lambda: None) == 0
+    servers, app = made
+    assert servers.kw.get("js_api") is None and app.kw.get("js_api") is None
+    assert {f.__name__ for f in servers.exposed} == set(gui.API_NAMES)
+    assert all(inspect.isfunction(f) for f in servers.exposed)
+    assert servers.events.before_show.handlers and app.events.before_show.handlers
+
+
+def test_headless_servers_window_without_an_api_exposes_nothing(monkeypatch, tmp_path):
+    made = _fake_webview(monkeypatch)
+    g = gui.Gui(data=tmp_path, api=None, headless=True)
+    assert g.run(lambda: None) == 0
+    assert made[0].exposed == [] and made[0].kw.get("js_api") is None
+
+
+def test_pywebview_bridge_reaches_only_the_exposed_functions(monkeypatch, tmp_path):
+    """pywebview 6.2.1's own `js_bridge_call` against the window the Gui really wires (venv only): a dotted name into
+    a private attribute, a function's globals or its closure reaches nothing."""
+    webview = pytest.importorskip("webview")
+    from webview import util
+    monkeypatch.setattr(webview, "windows", [])
+    monkeypatch.setattr(webview, "start", lambda *a, **k: None)
+    import webbrowser
+    monkeypatch.setattr(webbrowser, "open", webbrowser.open)
+    monkeypatch.setattr(gui.webview2, "message_box", lambda text: pytest.fail("a message box"))
+    api, store, ctl, _ = _api()
+    g = gui.Gui(data=tmp_path, api=api)
+    g._servers_guarded = True
+    assert g.run(lambda: None) == 0
+    win = g._servers
+    answers = []
+    win.evaluate_js = lambda script, *a, **k: answers.append(script)
+
+    def call(name, params):
+        before = threading.active_count()
+        util.js_bridge_call(win, name, params, "v1")
+        deadline = time.monotonic() + 5
+        while threading.active_count() > before and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    call("connect", ["lab"])
+    assert ctl.calls == [("connect", "lab")] and len(answers) == 1
+    for name, params in [("_ctl.connect", ["lab"]), ("_store.save", ["lab", "https://evil.example", None, "lab"]),
+                         ("_api._ctl.connect", ["lab"]), ("list.__globals__.get", ["WEB_SCHEMES"]),
+                         ("connect.__globals__.__setitem__", ["WEB_SCHEMES", ["ms-msdt"]]),
+                         ("save.__closure__", []), ("_ctl._exit", [0]), ("_window._app.gui.os.system", ["x"])]:
+        call(name, params)
+    assert ctl.calls == [("connect", "lab")] and store.saved == [] and len(answers) == 1
+    assert gui.WEB_SCHEMES == ("http", "https")
+
+
+def test_api_never_returns_token():
+    api, store, ctl, seen = _api()
+    out = [api.list(), api.warning("http://192.168.1.5:8091"), api.save("lab2", "http://h:1", TOKEN, None),
+           api.test("lab"), api.connect("lab"), api.remove("lab"), api.open_without_runner(), api.copy_code(),
+           api.test("nope")]
+    store.fail = ValueError("bad")
+    out.append(api.save("x", "y", TOKEN, None))
+    for v in out:
+        assert TOKEN not in json.dumps(v)
+    assert seen and seen[0][1] == TOKEN                       # the probe got the token; the page did not
+
+
+def test_list():
+    api, store, ctl, _ = _api()
+    got = api.list()
+    assert got["servers"] == store.public()
+    assert got["last"] == "lab"
+    assert got["state"] == gui.state_view(ctl.state)
+
+
+def test_warning():
+    api, *_ = _api()
+    assert api.warning("http://192.168.1.5:8091") == words.t("plain_http")
+    assert api.warning("https://lab.example.com") is None
+    assert api.warning(None) is None
+
+
+def test_save_tells_the_controller():
+    api, store, ctl, _ = _api()
+    api.save("lab2", "http://h:1", TOKEN, None)
+    api.save("lab3", "http://h:1", None, "lab2")
+    assert ctl.renames == [(None, "lab2"), ("lab2", "lab3")]
+    store.fail = ValueError("bad")
+    api.save("x", "y", None, "lab3")
+    assert len(ctl.renames) == 2                                                 # a refused save: nothing to follow
+
+
+def test_save_add_edit_and_keep_token():
+    api, store, *_ = _api()
+    assert api.save("lab2", "http://h:1", TOKEN, None) == {"ok": True}
+    assert api.save("lab3", "http://h:1", "lab2", "lab2") == {"ok": True}         # a rename with a new token
+    assert api.save("lab3", "http://h:2", None, "lab3") == {"ok": True}           # keep the stored token
+    assert api.save("lab4", "http://h:2", "", "lab3") == {"ok": True}             # an empty field keeps it too
+    assert store.saved == [("lab2", "http://h:1", TOKEN, None), ("lab3", "http://h:1", "lab2", "lab2"),
+                           ("lab3", "http://h:2", None, "lab3"), ("lab4", "http://h:2", None, "lab3")]
+    assert applog.scrub("x " + TOKEN) == "x ***"                                  # a saved token is blanked in the log
+
+
+def test_save_errors_are_words():
+    api, store, *_ = _api()
+    store.fail = ValueError("A server with this name is already in the list.")
+    assert api.save("lab", "http://h:1", None, None) == {"error": "A server with this name is already in the list."}
+    store.fail = DpapiError("the token store needs Windows")
+    assert api.save("lab", "http://h:1", TOKEN, None) == {"error": "the token store needs Windows"}
+    store.fail = RuntimeError("boom " + TOKEN)
+    assert api.save("lab", "http://h:1", TOKEN, None) == {"error": words.t("internal_error")}
+
+
+def test_test_sends_the_device_and_label():
+    api, store, ctl, seen = _api()
+    got = api.test("lab")
+    assert seen == [("http://127.0.0.1:8099", TOKEN, DEVICE, LABEL)]
+    assert got["reachable"] is True and got["role"] == "owner" and got["model"] == "gyro"
+    assert set(got) == {"reachable", "model", "role", "pending_code", "engine_running", "error"}
+
+
+def test_test_without_token():
+    api, store, ctl, seen = _api()
+    store.rows["empty"] = ServerEntry("empty", "http://h:1", Secret(""))
+    got = api.test("empty")
+    assert got["reachable"] is False and got["error"] == words.t("token_missing_test")
+    assert seen == []
+    assert api.test("nope")["error"] == words.t("no_such_server")
+
+
+def test_controller_calls():
+    api, store, ctl, _ = _api()
+    assert api.connect("lab") == {"ok": True}
+    assert api.remove("lab") == {"ok": True}
+    assert api.open_without_runner() == {"ok": True}
+    assert api.copy_code() == {"ok": False}                  # not pending: nothing copied, the page says nothing
+    ctl.state = state.TrayState("pending", server="lab", code="K7QZ")
+    assert api.copy_code() == {"ok": True}
+    ctl.calls.pop()
+    assert ctl.calls == [("connect", "lab"), ("remove", "lab"), ("open_without_runner",), ("copy_code",)]
+
+
+def test_controller_error_is_words():
+    api, store, ctl, _ = _api()
+
+    def boom(name):
+        raise RuntimeError("x " + TOKEN)
+
+    ctl.connect = boom
+    assert api.connect("lab") == {"error": words.t("internal_error")}
+
+
+# ------------------------------------------------------------------------------------------------ the app window
+class FakeEvent:
+    def __init__(self):
+        self._e = threading.Event()
+        self.handlers = []
+
+    def wait(self, timeout=None):
+        return self._e.wait(timeout)
+
+    def set(self):
+        self._e.set()
+
+    def clear(self):
+        self._e.clear()
+
+    def __iadd__(self, fn):
+        self.handlers.append(fn)
+        return self
+
+
+@dataclass
+class FakeEvents:
+    loaded: FakeEvent
+    closing: FakeEvent
+
+
+class FakeWindow:
+    """pywebview's Window as the Gui uses it: load_url clears `loaded`, then the page "loads" at `lands_on(url)`."""
+
+    def __init__(self, lands_on=lambda url: url, result=True, loads=True):
+        self.events = FakeEvents(FakeEvent(), FakeEvent())
+        self.lands_on, self.result, self.loads = lands_on, result, loads
+        self.url, self.calls, self.scripts = None, [], []
+
+    def load_url(self, url):
+        self.calls.append(("load_url", url))
+        self.events.loaded.clear()
+        if url == self.url:                     # the WebView2 control: the same Source again does not navigate
+            return
+        self.url = self.lands_on(url)
+        if self.loads:
+            self.events.loaded.set()
+
+    def get_current_url(self):
+        return self.url
+
+    def evaluate_js(self, script):
+        self.calls.append(("evaluate_js",))
+        self.scripts.append(script)
+        return self.result
+
+    def set_title(self, title):
+        self.calls.append(("set_title", title))
+
+    def show(self):
+        self.calls.append(("show",))
+
+    def hide(self):
+        self.calls.append(("hide",))
+
+
+def _gui(window) -> gui.Gui:
+    g = gui.Gui(data=None, api=None)
+    g._app = window
+    g._nav_guarded = True
+    return g
+
+
+def test_without_the_navigation_check_nothing_is_written_or_opened():
+    w = FakeWindow()
+    g = gui.Gui(data=None, api=None)
+    g._app = w
+    assert g.navigate_and_inject("http://h:1", "true", timeout=1) is False
+    g.open_app("http://h:1")
+    assert w.calls == []
+
+
+def test_navigate_and_inject_true():
+    w = FakeWindow()
+    g = _gui(w)
+    assert g.navigate_and_inject("http://Lab:8099/p", "true", timeout=2) is True
+    assert w.calls[0][0] == "load_url" and w.calls[0][1].startswith("http://Lab:8099/p/health?")
+    assert w.calls[1] == ("evaluate_js",)
+    assert 'location.origin' in w.scripts[0] and '"http://lab:8099"' in w.scripts[0]
+    assert 'location.pathname!=="/p/health"' in w.scripts[0]
+
+
+def test_inject_twice_in_a_row_navigates_twice():
+    """The control ignores a Source equal to the current one; each inject must still load (seen in the hidden-window
+    check: the second inject at the same /health waited out its timeout)."""
+    w = FakeWindow()
+    g = _gui(w)
+    assert g.navigate_and_inject("http://h:1", "true", timeout=1) is True
+    assert g.navigate_and_inject("http://h:1", "true", timeout=1) is True
+    urls = [c[1] for c in w.calls if c[0] == "load_url"]
+    assert len(urls) == 2 and urls[0] != urls[1]
+
+
+@pytest.mark.parametrize("result", [False, None, "true", 1, {"x": 1}])
+def test_navigate_and_inject_only_true(result):
+    assert _gui(FakeWindow(result=result)).navigate_and_inject("http://h:1", "x", timeout=2) is False
+
+
+def test_no_inject_on_another_origin():
+    w = FakeWindow(lands_on=lambda url: "https://login.example.com/")
+    assert _gui(w).navigate_and_inject("http://h:1", "x", timeout=2) is False
+    assert ("evaluate_js",) not in w.calls
+
+
+def test_no_inject_on_an_error_page():
+    w = FakeWindow(lands_on=lambda url: "chrome-error://chromewebdata/")
+    assert _gui(w).navigate_and_inject("http://h:1", "x", timeout=2) is False
+    assert ("evaluate_js",) not in w.calls
+
+
+def test_no_inject_when_never_loaded():
+    w = FakeWindow(loads=False)
+    assert _gui(w).navigate_and_inject("http://h:1", "x", timeout=0.2) is False
+    assert ("evaluate_js",) not in w.calls
+
+
+def test_inject_error_is_false():
+    w = FakeWindow()
+
+    def boom(script):
+        raise RuntimeError("js failed")
+
+    w.evaluate_js = boom
+    assert _gui(w).navigate_and_inject("http://h:1", "x", timeout=2) is False
+
+
+def test_open_app_shows_on_loaded():
+    w = FakeWindow(loads=False)
+    g = _gui(w)
+    g._hook_app(w)
+    g.open_app("http://h:1/p", server="lab")
+    assert ("set_title", "Strata - lab") in w.calls
+    assert ("load_url", "http://h:1/p/") in w.calls
+    assert ("show",) not in w.calls
+    for fn in w.events.loaded.handlers:
+        fn()
+    assert w.calls[-1] == ("show",)
+    for fn in w.events.loaded.handlers:                            # a later load (the page's own reload) shows nothing
+        fn()
+    assert w.calls.count(("show",)) == 1
+
+
+def test_hide_app_cancels_a_pending_show():
+    w = FakeWindow(loads=False)
+    g = _gui(w)
+    g._hook_app(w)
+    g.open_app("http://h:1")
+    g.hide_app()
+    for fn in w.events.loaded.handlers:
+        fn()
+    assert ("show",) not in w.calls
+
+
+def test_headless_never_shows_a_window():
+    """The selftest's Gui: open_app loads the page, but no show() reaches either window, ever."""
+    app_w, servers_w = FakeWindow(loads=False), FakeWindow()
+    g = gui.Gui(data=None, api=None, headless=True)
+    g._app, g._servers, g._nav_guarded = app_w, servers_w, True
+    g._hook_app(app_w)
+    g.show_servers()
+    g.open_app("http://h:1", server="lab")
+    for fn in app_w.events.loaded.handlers:
+        fn()
+    g.show_app()
+    assert ("load_url", "http://h:1/") in app_w.calls
+    assert ("show",) not in app_w.calls and ("show",) not in servers_w.calls
+    assert gui._open_nothing("https://example.com/") is False      # headless: no link reaches a browser window
+
+
+def test_evaluate_and_wait_loaded():
+    app_w, servers_w = FakeWindow(result="A"), FakeWindow(result="S")
+    g = _gui(app_w)
+    g._servers = servers_w
+    assert g.evaluate("app", "1") == "A" and g.evaluate("servers", "2") == "S"
+    assert app_w.scripts == ["1"] and servers_w.scripts == ["2"]
+
+    def boom(script):
+        raise RuntimeError("gone")
+    app_w.evaluate_js = boom
+    assert g.evaluate("app", "1") is None
+    assert g.wait_app_loaded(0.05) is False
+    app_w.events.loaded.set()
+    assert g.wait_app_loaded(0.05) is True
+
+
+def test_closing_hides_unless_quitting():
+    quitting = [False]
+    g = gui.Gui(data=None, api=None, quitting=lambda: quitting[0])
+    w = FakeWindow()
+    handler = g._closing_handler(w)
+    assert handler() is False
+    assert ("hide",) in w.calls
+    quitting[0] = True
+    assert handler() is not False
+
+
+# ------------------------------------------------------------------------------------------------ links and navigation
+REFUSED = [
+    "file:///C:/Windows/System32/calc.exe",
+    "FILE://host/share/x.exe",
+    "\\\\host\\share\\x.exe",
+    "//host/share/x.exe",
+    "http:\\\\host\\share\\x.exe",
+    "https://host\\..\\x",
+    "ms-msdt:/id PCWDiagnostic /skip force",
+    "search-ms:query=x&crumb=location:\\\\host\\share",
+    "ms-settings:privacy",
+    "javascript:alert(1)",
+    "data:text/html,<b>x</b>",
+    "vbscript:x",
+    "mailto:a@b.c",
+    "steam://run/1",
+    "C:\\Windows\\System32\\calc.exe",
+    "calc.exe",
+    "https://user:pass@example.com/",
+    "https://evil.com@example.com/",
+    "http:example.com",
+    "https:/example.com",
+    "https://",
+    "https://exa mple.com/",
+    "https://example.com/\nx",
+    "https://example.com:99999/",
+    "",
+    None,
+    5,
+    "https://example.com/" + "a" * 9000,
+]
+ALLOWED = ["https://example.com/", "http://127.0.0.1:8099/x?y=1#z", "HTTPS://Example.COM/a%20b", "http://[::1]:1/"]
+
+
+@pytest.mark.parametrize("url", REFUSED)
+def test_link_refused(url):
+    assert gui.external_url_ok(url) is False
+
+
+@pytest.mark.parametrize("url", ALLOWED)
+def test_link_allowed(url):
+    assert gui.external_url_ok(url) is True
+
+
+def test_guard_passes_only_web_links_and_logs_no_url(caplog):
+    opened = []
+    open_link = gui.guard_links(lambda url, new=0, autoraise=True: opened.append(url) or True)
+    for url in REFUSED:
+        assert open_link(url) is False
+    assert opened == []
+    assert open_link("https://example.com/?q=secret-query") is True
+    assert opened == ["https://example.com/?q=secret-query"]
+    open_link("ms-msdt:/id PCWDiagnostic /param secret-query")
+    assert "secret-query" not in caplog.text and "PCWDiagnostic" not in caplog.text
+    assert "'ms-msdt'" in caplog.text
+
+
+def test_install_link_guard_wraps_webbrowser_open(monkeypatch):
+    """The wiring: pywebview's new-window handler calls `webbrowser.open`; after the guard, that refuses file: and
+    passes https to what was there before."""
+    import webbrowser
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, new=0, autoraise=True: opened.append(url) or True)
+    gui.install_link_guard()
+    gui.install_link_guard()                                    # once: not wrapped twice
+    assert webbrowser.open("file:///C:/Windows/System32/calc.exe") is False
+    assert webbrowser.open("\\\\host\\share\\x.exe") is False
+    assert webbrowser.open_new_tab("ms-msdt:/id x") is False   # the module's other entry points go through it too
+    assert webbrowser.open("https://example.com/") is True
+    assert opened == ["https://example.com/"]
+
+
+def test_pywebview_new_windows_go_through_webbrowser_open():
+    """The guard sits where pywebview 6.2.1 sends a new-window request (only where pywebview is installed: the venv)."""
+    import importlib.util
+    spec = importlib.util.find_spec("webview")
+    if spec is None or not spec.submodule_search_locations:
+        pytest.skip("pywebview is not installed in this python")
+    from pathlib import Path
+    src = (Path(list(spec.submodule_search_locations)[0]) / "platforms" / "edgechromium.py").read_text(encoding="utf-8")
+    body = src[src.index("def on_new_window_request"):]
+    body = body[:body.index("\n    def ", 10)]
+    assert "webbrowser.open(" in body
+    assert "import webbrowser" in src
+
+
+@pytest.mark.parametrize("uri, ok", [
+    ("http://h:1/health?desktop=1", True),
+    ("http://H:1/#/chat", True),
+    ("blob:http://h:1/0f0e", True),
+    ("about:blank", True),
+    ("http://h:2/", False),
+    ("https://h:1/", False),
+    ("http://evil:1/", False),
+    ("file:///C:/x", False),
+    ("ms-msdt:/id x", False),
+    ("javascript:alert(1)", False),
+    ("data:text/html,x", False),
+    ("blob:http://evil:1/0f0e", False),
+    ("http://user@h:1/", False),
+    ("about:srcdoc", False),
+])
+def test_navigation_ok(uri, ok):
+    assert gui.navigation_ok(uri, "http://h:1") is ok
+
+
+def test_navigation_without_a_server_goes_nowhere():
+    assert gui.navigation_ok("http://h:1/", None) is False
+    assert gui.navigation_ok("about:blank", None) is True
+
+
+class NavArgs:
+    def __init__(self, uri, user=False, redirected=False):
+        self.Uri, self.IsUserInitiated, self.IsRedirected, self.Cancel = uri, user, redirected, False
+
+
+class FakeControl:
+    def __init__(self):
+        self.NavigationStarting = FakeEvent()
+
+
+class FakeNative:
+    def __init__(self):
+        self.webview = FakeControl()
+
+
+def test_app_navigation_is_checked(monkeypatch):
+    import webbrowser
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, new=0, autoraise=True: opened.append(url) or True)
+    gui.install_link_guard()
+    w = FakeWindow()
+    w.native = FakeNative()
+    g = gui.Gui(data=None, api=None)
+    g._app = w
+    assert g._guard_navigation(w) is True
+    handler, = w.native.webview.NavigationStarting.handlers
+    assert g.navigate_and_inject("http://h:1", "true", timeout=1) is True        # sets the allowed origin
+
+    same = NavArgs("http://h:1/#/chat")
+    handler(None, same)
+    assert same.Cancel is False
+    for uri in ("ms-msdt:/id x", "file:///C:/Windows/win.ini", "\\\\host\\share\\x"):
+        a = NavArgs(uri, user=True)
+        handler(None, a)
+        assert a.Cancel is True
+    scripted = NavArgs("https://elsewhere.example/")
+    handler(None, scripted)
+    assert scripted.Cancel is True
+    redirected = NavArgs("https://elsewhere.example/", user=True, redirected=True)
+    handler(None, redirected)
+    assert redirected.Cancel is True
+    clicked = NavArgs("https://elsewhere.example/doc", user=True)
+    handler(None, clicked)
+    assert clicked.Cancel is True
+    assert opened == ["https://elsewhere.example/doc"]                          # only the clicked web link
+
+
+def test_navigation_check_fails_closed():
+    g = gui.Gui(data=None, api=None)
+
+    class Broken:
+        @property
+        def Uri(self):
+            raise RuntimeError("x")
+        Cancel = False
+
+    a = Broken()
+    g._on_app_navigating(None, a)
+    assert a.Cancel is True
+    w = FakeWindow()
+    w.native = None
+    assert g._guard_navigation(w) is False
+    assert g._nav_guarded is False
+
+
+# ------------------------------------------------------------------------------------------------ before the first load
+class PrepControl:
+    """The WinForms WebView2 control as `before_show` finds it: no CoreWebView2 yet, drops allowed by default."""
+
+    def __init__(self):
+        self.NavigationStarting = FakeEvent()
+        self.CoreWebView2InitializationCompleted = FakeEvent()
+        self.AllowExternalDrop = True
+
+
+class PrepForm:
+    def __init__(self):
+        self.webview = PrepControl()
+        self.FormClosing = FakeEvent()
+
+
+def _prep_window():
+    w = FakeWindow()
+    w.native = PrepForm()
+    return w
+
+
+def test_servers_window_allows_its_own_page_and_nothing_after():
+    """I-1: the `html=` page is the servers window's first navigation (seen in the hidden run: one `data:` URI); a
+    dragged link or file, or any script, would be a later one: cancelled."""
+    g = gui.Gui(data=None, api=None)
+    w = _prep_window()
+    g._prepare_servers(w)
+    assert g._servers_guarded is True
+    assert w.native.webview.AllowExternalDrop is False
+    handler, = w.native.webview.NavigationStarting.handlers
+    first = NavArgs("data:text/html;charset=utf-8;base64,PCFkb2N0eXBl")
+    handler(None, first)
+    assert first.Cancel is False
+    for uri in ("file:///C:/Users/x/Downloads/evil.html", "https://evil.example/", "data:text/html;base64,PCFk",
+                "about:blank"):
+        a = NavArgs(uri, user=True)
+        handler(None, a)
+        assert a.Cancel is True, uri
+    assert len(w.native.FormClosing.handlers) == 1
+
+
+def test_servers_window_without_its_check_refuses_every_call():
+    api, store, ctl, _ = _api()
+    g = gui.Gui(data=None, api=api)
+    w = FakeWindow()
+    w.native = None                                       # the control could not be reached
+    g._prepare_servers(w)
+    assert g._servers_guarded is False
+    by = {f.__name__: f for f in gui.api_functions(api, lambda: g._servers_guarded)}
+    assert by["connect"]("lab") == {"error": words.t("internal_error")} and ctl.calls == []
+
+
+def test_servers_navigation_check_fails_closed():
+    g = gui.Gui(data=None, api=None)
+    g._servers_navigated = True
+
+    class Broken:
+        @property
+        def Uri(self):
+            raise RuntimeError("x")
+        Cancel = False
+
+    a = Broken()
+    g._on_servers_navigating(None, a)
+    assert a.Cancel is True
+
+
+def test_app_window_takes_no_drop_and_hooks_its_local_page():
+    g = gui.Gui(data=None, api=None)
+    w = _prep_window()
+    g._prepare_app(w)
+    assert w.native.webview.AllowExternalDrop is False
+    assert len(w.native.FormClosing.handlers) == 1
+    ready, = w.native.webview.CoreWebView2InitializationCompleted.handlers
+    assert not g._local_ready.is_set()
+
+    class Core:
+        def __init__(self):
+            self.WebResourceRequested = FakeEvent()
+
+    sender = type("Sender", (), {})()
+    sender.CoreWebView2 = Core()
+    ready(sender, type("Args", (), {"IsSuccess": True})())
+    assert g._local_ready.is_set() and sender.CoreWebView2.WebResourceRequested.handlers == [g._on_app_request]
+
+
+def test_pywebview_asks_for_every_request_of_the_app_window():
+    """The local page relies on pywebview 6.2.1's own filter: every request of every context reaches
+    WebResourceRequested (venv only, where pywebview is installed)."""
+    import importlib.util
+    spec = importlib.util.find_spec("webview")
+    if spec is None or not spec.submodule_search_locations:
+        pytest.skip("pywebview is not installed in this python")
+    from pathlib import Path
+    src = (Path(list(spec.submodule_search_locations)[0]) / "platforms" / "edgechromium.py").read_text(encoding="utf-8")
+    body = src[src.index("def on_webview_ready"):]
+    body = body[:body.index("\n    def ", 10)]
+    assert "AddWebResourceRequestedFilter('*', CoreWebView2WebResourceContext.All)" in body
+
+
+def test_app_window_without_its_core_has_no_local_page():
+    g = gui.Gui(data=None, api=None)
+    g._on_app_core_ready(None, type("Args", (), {"IsSuccess": False})())
+    assert not g._local_ready.is_set() and g._local_failed is True
+
+
+class ReqArgs:
+    def __init__(self, uri):
+        self.Request = type("Req", (), {"Uri": uri})()
+        self.Response = None
+
+
+def test_local_page_answers_only_the_armed_address():
+    g = gui.Gui(data=None, api=None)
+    answered = []
+    g._respond = lambda core: answered.append(core) or "RESPONSE"
+    url = "http://h:1" + gui.CLEAR_PATH + "?n=abc"
+    a = ReqArgs(url)
+    g._on_app_request("core", a)
+    assert a.Response is None                                         # not armed: the network answers
+    g._local_page = url
+    for other in ("http://h:1" + gui.CLEAR_PATH + "?n=abd", "http://h:1/health", "http://evil:1" + gui.CLEAR_PATH +
+                  "?n=abc"):
+        b = ReqArgs(other)
+        g._on_app_request("core", b)
+        assert b.Response is None, other
+    c = ReqArgs(url)
+    g._on_app_request("core", c)
+    assert c.Response == "RESPONSE" and answered == ["core"]
+
+
+def test_clear_storage_loads_the_local_page_on_the_origin():
+    """I-3: the clear needs no server - the app window loads `<origin>/.strata-desktop/clear?n=<nonce>`, which
+    `_on_app_request` answers while it is armed; the script runs there (origin and path checked)."""
+    armed = []
+    w = FakeWindow()
+    g = _gui(w)
+    real = w.load_url
+    w.load_url = lambda url: (armed.append(g._local_page == url), real(url))
+    g._local_ready.set()
+    assert g.clear_storage("http://Lab:8099/p", inject.clear_script(), timeout=2) is True
+    url = w.calls[0][1]
+    assert url.startswith("http://lab:8099" + gui.CLEAR_PATH + "?n=") and len(url.split("?n=")[1]) >= 16
+    assert armed == [True] and g._local_page is None                    # armed for its own load only
+    assert 'location.pathname!=="' + gui.CLEAR_PATH + '"' in w.scripts[0] and '"http://lab:8099"' in w.scripts[0]
+    assert g.clear_storage("http://lab:8099/p", inject.clear_script(), timeout=2) is True
+    assert w.calls[2][1] != url                                         # a new nonce each time
+
+
+def test_clear_storage_without_the_local_page_uses_the_server():
+    w = FakeWindow()
+    g = _gui(w)
+    g._local_failed = True
+    assert g.clear_storage("http://h:1/p", inject.clear_script(), timeout=2) is True
+    assert w.calls[0][1].startswith("http://h:1/p/health?")
+
+
+def test_clear_storage_without_the_navigation_check_writes_nothing():
+    w = FakeWindow()
+    g = gui.Gui(data=None, api=None)
+    g._app = w
+    g._local_ready.set()
+    assert g.clear_storage("http://h:1", inject.clear_script(), timeout=1) is False and w.calls == []
+
+
+# ------------------------------------------------------------------------------------------------ Windows ends the session
+class CloseArgs:
+    def __init__(self, reason, cancel=True):
+        self.CloseReason, self.Cancel = reason, cancel          # pywebview's handler ran first: it cancelled
+
+
+def test_the_title_bar_close_still_hides():
+    ended = []
+    g = gui.Gui(data=None, api=None, on_session_end=lambda: ended.append(1), pump=lambda: None)
+    a = CloseArgs("UserClosing")
+    g._on_form_closing(None, a)
+    assert a.Cancel is True and ended == []
+
+
+def test_session_end_runs_quit_once_and_lets_the_windows_close():
+    """I-2: sign-out or shutdown (WM_QUERYENDSESSION: CloseReason WindowsShutDown) runs Quit while the UI thread keeps
+    pumping, then lets the close go; the other form's close (and a re-entrant one) only waits for that one Quit."""
+    done = threading.Event()
+    ended, pumped = [], []
+
+    def end():
+        ended.append(threading.current_thread().name)
+        time.sleep(0.2)
+        done.set()
+    g = gui.Gui(data=None, api=None, on_session_end=end, pump=lambda: pumped.append(1))
+    a = CloseArgs("WindowsShutDown")
+    t0 = time.monotonic()
+    g._on_form_closing(None, a)
+    assert a.Cancel is False and done.is_set() and ended == ["desktop-session-end"]
+    assert pumped and time.monotonic() - t0 < 2
+    for reason in ("WindowsShutDown", "TaskManagerClosing", "None"):
+        b = CloseArgs(reason)
+        g._on_form_closing(None, b)
+        assert b.Cancel is False
+    assert len(ended) == 1
+
+
+def test_session_end_is_capped(monkeypatch):
+    monkeypatch.setattr(gui, "SESSION_END_S", 0.3)
+    hang = threading.Event()
+    g = gui.Gui(data=None, api=None, on_session_end=lambda: hang.wait(10), pump=lambda: None)
+    a = CloseArgs("WindowsShutDown")
+    t0 = time.monotonic()
+    g._on_form_closing(None, a)
+    assert a.Cancel is False and time.monotonic() - t0 < 1.5
+    b = CloseArgs("WindowsShutDown")                     # a later form: the same deadline, already past
+    t1 = time.monotonic()
+    g._on_form_closing(None, b)
+    assert time.monotonic() - t1 < 0.2
+    hang.set()
+
+
+def test_closing_after_destroy_is_left_alone():
+    ended = []
+    g = gui.Gui(data=None, api=None, on_session_end=lambda: ended.append(1), pump=lambda: None)
+    g._ending = True
+    a = CloseArgs("ApplicationExitCall", cancel=False)
+    g._on_form_closing(None, a)
+    assert a.Cancel is False and ended == []
+
+
+def test_session_end_without_a_controller_only_lets_go():
+    g = gui.Gui(data=None, api=None, pump=lambda: pytest.fail("pumped"))
+    a = CloseArgs("WindowsShutDown")
+    g._on_form_closing(None, a)
+    assert a.Cancel is False

@@ -84,8 +84,30 @@ describe("the status of an answer being written", () => {
     for (const i of run) expect(agentStatus(i)).not.toBeNull()
   })
 
+  // #310 part 2: a call that runs on the engineer's own PC (the runner) has words for each step of its travel, from the server's `remote` events
+  test("a call on My PC: sending it, running it there, or the PC is offline - each has its words", () => {
+    expect(kind({ tools: [tool("Bash", "running", { remote: "sending", machine: "my" })] })).toBe("sending")
+    expect(label({ tools: [tool("Bash", "running", { remote: "sending", machine: "my" })] })).toBe("Sending the call to your PC…")
+    expect(kind({ tools: [tool("Bash", "running", { remote: "running", machine: "my" })] })).toBe("running")
+    expect(label({ tools: [tool("Bash", "running", { remote: "running", machine: "my" })] })).toBe("Running Bash on your PC…")
+    expect(label({ tools: [tool("Bash", "running", { machine: "my" })] })).toBe("Running Bash on your PC…")              // before its first remote event
+    expect(kind({ tools: [tool("Bash", "running", { remote: "offline", machine: "my" })] })).toBe("offline")
+    expect(label({ tools: [tool("Bash", "running", { remote: "offline", machine: "my" })] })).toBe("Your PC is offline…")
+  })
+
+  test("a question, a hook or auto mode still come first; a call without a machine says what it says today", () => {
+    expect(kind({ tools: [tool("Bash", "asking", { remote: "sending", machine: "my" })] })).toBe("asking")
+    expect(kind({ tools: [tool("Read", "done"), tool("Bash", "asking", { machine: "my" }), tool("Grep", "running", { remote: "sending", machine: "my" })] })).toBe("asking")
+    expect(kind({ tools: [tool("Bash", "running", { remote: "sending", machine: "my", hookRunning: "./check.sh" })] })).toBe("hook")
+    expect(kind({ tools: [tool("Bash", "running", { remote: "sending", machine: "my", judging: true })] })).toBe("judging")
+    expect(label({ tools: [tool("Bash", "running")] })).toBe("Running Bash…")
+    expect(label({ tools: [tool("Task", "running")] })).toBe("A helper is working…")
+    expect(label({ tools: [tool("Bash", "writing", { machine: "my" })] })).toBe("Writing the call to Bash…")             // the call is still being written: not on its way yet
+    expect(kind({ tools: [tool("Bash", "done", { remote: "running", machine: "my" })], serverState: "reading" })).toBe("reading")   // its result is in: the travel is over
+  })
+
   test("each status has an orb form and words", () => {
-    for (const i of [{ tools: [tool("Bash", "running")] }, { tools: [tool("Bash", "asking")] }, { tools: [tool("Read", "done")], serverState: "reading" }, { text: "x" }]) {
+    for (const i of [{ tools: [tool("Bash", "running")] }, { tools: [tool("Bash", "asking")] }, { tools: [tool("Bash", "running", { remote: "sending" })] }, { tools: [tool("Bash", "running", { remote: "offline" })] }, { tools: [tool("Read", "done")], serverState: "reading" }, { text: "x" }]) {
       const s = agentStatus({ ...base, ...i })!
       expect(s.label.length).toBeGreaterThan(3)
       expect(typeof s.design).toBe("string")

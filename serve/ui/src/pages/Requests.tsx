@@ -9,6 +9,7 @@ import { getKeepLeft, getRequest, getRequestPage, promptSplit, setKeep, type Req
 import { href } from "../lib/router"
 import { msg, t } from "../lib/i18n"
 import { appendPage, mergeNewest } from "../lib/requestlist"
+import { useTeam } from "../lib/keys"
 
 /** Puts elements (a bold figure, a link) into a translated sentence at its {name} places, so the sentence stays one piece for the translator. */
 function rich(text: string, parts: Record<string, ReactNode>): ReactNode {
@@ -49,6 +50,7 @@ function prefillCell(r: RequestRow): ReactNode {
 }
 
 export function RequestList({ rows, empty }: { rows: RequestRow[]; empty: ReactNode }) {
+  const team = useTeam()                                         // #310: whose request it was, in team mode only (outside it every one is the owner's)
   if (!rows.length) return typeof empty === "string" ? <p><Empty>{empty}</Empty></p> : <>{empty}</>
   return (
     <ul className="m-0 list-none p-0">
@@ -58,7 +60,7 @@ export function RequestList({ rows, empty }: { rows: RequestRow[]; empty: ReactN
             <a href={href("requests", r.id)} className="min-w-0 flex-1 basis-56 no-underline">
               <div className="truncate">{r.preview || <span className="text-ink-3">{t("(no text)")}</span>}</div>
               <div className="mt-0.5 truncate text-[12px] text-ink-2">
-                <span className="num">{when(r.time)}</span> · {r.dialect === "anthropic" ? "Anthropic" : r.dialect === "openai" ? "OpenAI" : t("unknown API")}
+                <span className="num">{when(r.time)}</span>{team && r.who && <> · <span data-who>{r.who}</span></>} · {r.dialect === "anthropic" ? "Anthropic" : r.dialect === "openai" ? "OpenAI" : t("unknown API")}
                 {r.client && ` · ${clientName(r.client)}`}{r.tools.length > 0 && ` · ${t("{n} tools", { n: r.tools.length })}`}
                 {r.finish !== "stop" && r.finish !== "length" && ` · ${r.finish}`}
               </div>
@@ -156,6 +158,7 @@ const STAGES: [string, string, string?][] = [
 ]
 
 export function RequestDetailPage({ id }: { id: string }) {
+  const team = useTeam()
   const [d, setD] = useState<RequestDetail | null | undefined>(undefined)
   const [error, setError] = useState<string | null>(null)
   useEffect(() => { getRequest(id).then(setD).catch((e: Error) => setError(e.message)) }, [id])
@@ -166,6 +169,7 @@ export function RequestDetailPage({ id }: { id: string }) {
 
   const r = d.summary
   const det = d.detail
+  const who = team ? r.who : undefined
   const stats = det?.stats ?? r.stats
   const split = promptSplit(r.prompt_tokens, r.reused)
   const tierTotal = stats ? TIERS.reduce((a, [k]) => a + (stats[k] ?? 0), 0) : 0
@@ -174,7 +178,7 @@ export function RequestDetailPage({ id }: { id: string }) {
     <div>
       <p className="mb-3 text-[13px]"><a href={href("requests")}>← {t("Requests")}</a></p>
       <h1 className="page-title line-clamp-2 !text-[clamp(22px,2.8vw,30px)] [overflow-wrap:anywhere]">{r.preview || t("(no text)")}</h1>
-      <p className="page-sub"><span className="num">{when(r.time)}</span> · {r.dialect}{r.client && ` · ${clientName(r.client)}`}</p>
+      <p className="page-sub"><span className="num">{when(r.time)}</span>{who && <> · {t("sent by {name}", { name: who })}</>} · {r.dialect}{r.client && ` · ${clientName(r.client)}`}</p>
 
       <Section title={t("Overview")}>
         <Facts items={[

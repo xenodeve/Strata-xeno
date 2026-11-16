@@ -61,3 +61,8 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# Strata Desktop (#310 part 3): its own venv and the PyInstaller build output
+/desktop/.venv/
+/desktop/build/
+/desktop/dist/

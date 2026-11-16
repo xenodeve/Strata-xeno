@@ -192,6 +192,22 @@ class Meta(unittest.TestCase):
         m = request_meta("openai", [], None, None)
         self.assertEqual((m["preview"], m["tools"], m["client"]), ("", [], ""))
 
+    def test_history_keeps_who(self):
+        """#310: every summary says whose request it was; a row written before the field is the owner's."""
+        from serve.history import request_meta, summary_record
+        self.assertEqual(request_meta("openai", [], None, None)["who"], "owner")
+        self.assertEqual(request_meta("openai", [], None, None, who="ann")["who"], "ann")
+        self.assertEqual(summary_record({"id": "r1", "who": "ann"})["who"], "ann")
+        with tempfile.TemporaryDirectory() as d:
+            h = HistoryStore(d)
+            h.append(rec(1, who="ann"))
+            h.append(rec(2))                                     # an old row, from before #310
+            h.write_detail("r0001", {"who": "ann", "decode_series": [1.0]})
+            self.assertEqual([(r["id"], r["who"]) for r in h.page(0, 10)["items"]], [("r0002", "owner"), ("r0001", "ann")])
+            self.assertEqual(h.summary("r0001")["who"], "ann")
+            self.assertEqual(h.summary("r0002")["who"], "owner")
+            self.assertEqual(h.detail("r0001")["who"], "ann")
+
     def test_summary_adds_prefill_speed_from_what_was_read(self):
         from serve.history import summary_record
         s = summary_record({"id": "r1", "prompt_tokens": 1100, "reused": 100, "prompt_ms": 500.0})

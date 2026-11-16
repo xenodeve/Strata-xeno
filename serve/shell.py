@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from serve import agent, permissions
+from serve import agent, permissions, winjob
 
 DEFAULT_TIMEOUT_MS = 120_000
 MAX_TIMEOUT_MS = 600_000
@@ -92,7 +92,8 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         return
     try:
         if WIN:
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=10)
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=10,
+                           creationflags=subprocess.CREATE_NO_WINDOW)          # no console window flashes
         else:
             import signal
             os.killpg(proc.pid, signal.SIGKILL)
@@ -104,7 +105,12 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 
 class Running:
-    """One command that is running (or has run): its process and what it has written."""
+    """One command that is running (or has run): its process and what it has written.
+
+    On Windows the command is in a kill-on-close job of its own (#314): `kill()` ends the job, which reaches what Git Bash
+    forks through an intermediary that has already exited (`taskkill /T` cannot find those by parent), and a hard end of
+    this process (Task Manager, a crash) ends the command too.  A command that ends by itself lets go of its job, so what
+    it started on purpose and left running keeps running, as before.  Without a job, `taskkill /T` as before."""
 
     def __init__(self, command: str, sh: Shell, cwd: str):
         self.command = command
@@ -113,12 +119,14 @@ class Running:
         self.lock = threading.Lock()
         self.pos = 0                                                  # how much BashOutput has given out
         self.killed = False
+        self._job_lock = threading.Lock()
         flags = {}
         if WIN:
             flags["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         else:
             flags["start_new_session"] = True
         self.proc = subprocess.Popen([*sh.argv, command], cwd=cwd, env=_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **flags)
+        self._job = winjob.own_job(self.proc)                         # at once: bash takes tens of ms before it forks
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
 
@@ -131,10 +139,26 @@ class Running:
             with self.lock:
                 if len(self.buf) < MAX_KEPT:
                     self.buf += chunk
+        try:
+            self.proc.wait()
+        except OSError:
+            pass
+        self.let_go()                                                 # the shell has ended and nothing holds its output
+
+    def let_go(self) -> None:
+        """The command ended by itself: close its job without stopping what it left running (after a kill, nothing)."""
+        with self._job_lock:
+            if self.killed:
+                return
+            job, self._job = self._job, None
+        winjob.let_go(job)
 
     def kill(self) -> None:
-        self.killed = True
-        _kill_tree(self.proc)
+        with self._job_lock:
+            self.killed = True
+            job, self._job = self._job, None                          # taken once: a second kill never closes a handle twice
+        if not winjob.end_job(job):
+            _kill_tree(self.proc)
 
     def text(self, start: int = 0) -> str:
         with self.lock:
@@ -225,6 +249,8 @@ def _bash(server: agent.AgentServer, sh: Shell, a: dict, ctx: agent.AgentContext
         run.proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
+    if not why:
+        run.let_go()                                                  # a program it left running in the background keeps running, as before
     run.reader.join(timeout=2)
     out = _cap(run.text()).rstrip()
     moved = _ended(s, ctx.policy, mark, start)

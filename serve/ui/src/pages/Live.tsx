@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react"
 import { Loading } from "../components/orb"
 import { Chart } from "../components/Chart"
 import { Swap } from "../components/motion"
@@ -11,6 +12,7 @@ import { useMetrics, type Live as LiveT } from "../lib/metrics"
 import { RequestList } from "./Requests"
 import { modelLine } from "../components/ModelBlock"
 import { phaseKind } from "../lib/orbs"
+import { getRunners, holdersOf, runnersText, useTeam, waitingText, type RunnerRow } from "../lib/keys"
 
 function headline(l: LiveT): { tone: "ok" | "busy" | "idle"; text: string } {
   switch (l.state) {
@@ -26,8 +28,44 @@ function headline(l: LiveT): { tone: "ok" | "busy" | "idle"; text: string } {
   }
 }
 
+/** Who holds the engine and who waits for it, by name (#310): "In use by ann · Waiting: bob (1), cat (2)". */
+function WhoLine({ l }: { l: LiveT }) {
+  const holders = holdersOf(l), waiting = waitingText(l)
+  if (!holders.length && !waiting) return null
+  return (
+    <p className="mt-0.5 text-[13px] text-ink-2" data-live-who>
+      {holders.length > 0 && t("In use by {names}", { names: holders.join(", ") })}
+      {holders.length > 0 && waiting && " · "}
+      {waiting && t("Waiting: {list}", { list: waiting })}
+    </p>
+  )
+}
+
+/** The runners connected to this server (GET /runners, #310 part 2), asked again at each of the Monitor's own reads of /metrics (`tick`),
+ *  one ask at a time. Null until answered, or when the server cannot be asked. */
+function useRunners(tick: number | undefined): RunnerRow[] | null {
+  const [rows, setRows] = useState<RunnerRow[] | null>(null)
+  const asking = useRef(false)
+  const alive = useRef(true)
+  useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
+  useEffect(() => {
+    if (tick === undefined || asking.current) return
+    asking.current = true
+    void getRunners().then((r) => { asking.current = false; if (alive.current) setRows(r) })
+  }, [tick])
+  return rows
+}
+
+/** "Runners: ann (ANN-LAPTOP) online, bob offline" - only when the server has any (#310 part 2). */
+function RunnersLine({ rows }: { rows: RunnerRow[] | null }) {
+  if (!rows?.length) return null
+  return <p className="mt-0.5 text-[13px] text-ink-2" data-live-runners>{t("Runners: {list}", { list: runnersText(rows) })}</p>
+}
+
 export function Live() {
   const { data: m, error, stale } = useMetrics()
+  const team = useTeam()                                                   // outside team mode every request is the owner's: no names
+  const runners = useRunners(m?.time)
   if (!m) return <Loading error={error} />
   const l = m.live
   const running = l.state === "reading" || l.state === "generating"       // no request: idle, which is not the same as not measured
@@ -46,6 +84,8 @@ export function Live() {
           <p className="page-sub !mt-1">
             {stale ? t("The server is not answering. Showing the last numbers it gave.") : l.queued ? t("{n} waiting in the queue", { n: l.queued }) : modelLine(m)}
           </p>
+          {team && !stale && <WhoLine l={l} />}
+          {!stale && <RunnersLine rows={runners} />}
         </div>
       </header>
 

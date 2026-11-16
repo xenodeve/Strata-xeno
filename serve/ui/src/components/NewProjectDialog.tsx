@@ -3,6 +3,9 @@ import { createPortal } from "react-dom"
 import { cn } from "../lib/cn"
 import { t } from "../lib/i18n"
 import { FoldersEditor, type FoldersApi } from "./FoldersEditor"
+import { MachinePicker, useRunnerAgent } from "./RunnerSettings"
+import { getAgent } from "../lib/api"
+import { runnerId, type Machine } from "../lib/runner"
 import { GlidePanel, useMounted } from "./motion"
 import { Button, inputCls } from "./ui"
 
@@ -11,7 +14,7 @@ import { Button, inputCls } from "./ui"
 // (components/FoldersEditor.tsx). The dialog stretches where its content grows (a folder added, the list of folders, what is offered while a path is typed) and closes
 // up where it shrinks: the part that changed glides and the rest follows (GlidePanel), the dialog stays centered.
 
-export function NewProjectDialog({ open, onCreate, onCancel }: { open: boolean; onCreate: (name: string, folders: string[]) => void; onCancel: () => void }) {
+export function NewProjectDialog({ open, onCreate, onCancel }: { open: boolean; onCreate: (name: string, folders: string[], machine: Machine) => void; onCancel: () => void }) {
   const mounted = useMounted(open, 220)
   const [shown, setShown] = useState(false)
   const [name, setName] = useState("")
@@ -25,6 +28,22 @@ export function NewProjectDialog({ open, onCreate, onCancel }: { open: boolean; 
   const head = useId()
   const cancelRef = useRef(onCancel)                                          // the page gives a new function at each render; the dialog must not start over for that
   cancelRef.current = onCancel
+  // #310 part 2: with a runner in this browser the project is on My PC (its folders are listed there) or on the Server PC (only when the server's own
+  // coding tools are this page's); a new one is on My PC when the runner is online. Without a runner the dialog is as it always was.
+  const runner = open ? runnerId() : ""
+  const [state] = useRunnerAgent(runner, 0)
+  const [serverOk, setServerOk] = useState(false)
+  const [machine, setMachine] = useState<Machine>("server")
+  const [picked, setPicked] = useState(false)
+  useEffect(() => { if (!open || !runner) return; let gone = false; void getAgent().then((v) => { if (!gone) setServerOk(!!v?.allowed) }); return () => { gone = true } }, [open, runner])
+  useEffect(() => {
+    if (!open) { setPicked(false); return }
+    if (picked) return
+    const online = typeof state === "object" && state !== null && !!state.online
+    const next: Machine = runner && (online || !serverOk) ? "my" : "server"
+    setMachine((was) => { if (was !== next) { setFolders([]); setPending("") } return next })      // a folder added meanwhile was a path on the other machine
+  }, [open, runner, state, serverOk, picked])
+  const pick = (m: Machine) => { setPicked(true); if (m !== machine) { setMachine(m); setFolders([]); setPending("") } }      // the folders were paths on the other machine
 
   useEffect(() => {
     if (!open) { setShown(false); return }
@@ -51,7 +70,7 @@ export function NewProjectDialog({ open, onCreate, onCancel }: { open: boolean; 
     const list = await editor.current?.commit()                              // what is typed counts too, once it is checked
     setBusy(false)
     if (!list || list.length === 0) return
-    onCreate(name.trim(), list)
+    onCreate(name.trim(), list, runner ? machine : "server")
   }
 
   if (!mounted) return null
@@ -84,9 +103,11 @@ export function NewProjectDialog({ open, onCreate, onCancel }: { open: boolean; 
             />
           </label>
 
+          {runner && <div className="mt-3"><MachinePicker value={machine} server={serverOk} onPick={pick} state={state} /></div>}
+
           <div className="mt-3">
             <span className="mb-1.5 block text-[13px]">{t("Folders")}</span>
-            <FoldersEditor folders={folders} onChange={setFolders} onDraft={setPending} onSubmit={() => void create()} api={editor} />
+            <FoldersEditor key={runner ? machine : "server"} folders={folders} onChange={setFolders} onDraft={setPending} onSubmit={() => void create()} api={editor} runner={runner && machine === "my" ? runner : undefined} />
           </div>
 
           <div className="mt-5 flex justify-end gap-2">

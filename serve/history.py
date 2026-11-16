@@ -26,9 +26,10 @@ def default_dir() -> Path:
     return Path(base) / "Strata" / "history"
 
 
-def request_meta(dialect: str, messages, tools, user_agent) -> dict:
-    """What is kept of a request besides its numbers: an id, the endpoint's dialect, the client, the tool names and
-    the first 200 characters of the last user message. Never the whole prompt (that is an opt-in, "keep for replay")."""
+def request_meta(dialect: str, messages, tools, user_agent, who: str = "owner") -> dict:
+    """What is kept of a request besides its numbers: an id, the endpoint's dialect, the client, the tool names, the
+    identity that sent it (#310: "owner" outside team mode) and the first 200 characters of the last user message.
+    Never the whole prompt (that is an opt-in, "keep for replay")."""
     preview = ""
     for m in reversed(messages or []):
         if isinstance(m, dict) and m.get("role") == "user":
@@ -44,7 +45,7 @@ def request_meta(dialect: str, messages, tools, user_agent) -> dict:
         if n:
             names.append(str(n))
     return {"id": f"r{int(time.time() * 1000):x}{os.urandom(2).hex()}", "dialect": dialect,
-            "client": str(user_agent or "")[:120], "tools": names, "preview": preview}
+            "client": str(user_agent or "")[:120], "tools": names, "preview": preview, "who": who}
 
 
 def prompt_for_keep(messages) -> list:
@@ -170,6 +171,7 @@ class HistoryStore:
 
     @staticmethod
     def _read(path: Path):
+        """The rows of a month file; a row written before #310 has no `who` and is the owner's (one identity then)."""
         out = []
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -177,9 +179,12 @@ class HistoryStore:
             return out
         for line in text.splitlines():
             try:
-                out.append(json.loads(line))
+                row = json.loads(line)
             except ValueError:                      # a torn last line after a crash
                 continue
+            if isinstance(row, dict):
+                row.setdefault("who", "owner")
+            out.append(row)
         return out
 
     def _count(self, path: Path) -> int:

@@ -86,12 +86,17 @@ def execute(svc, parent, kind: str, prompt: str, description: str, run_loop) -> 
     policy.allow, policy.deny = parent.policy.allow, parent.policy.deny
     if kind == "explore":
         policy.mode = "plan"                                  # nothing is changed, whatever the tools say
-    helper = agent_run_mod.AgentRun(policy, parent.ctx.session, parent.broker, parent.goal, parent.side, cancel, parent.timeout, shell=parent.shell)
+    helper = agent_run_mod.AgentRun(policy, parent.ctx.session, parent.broker, parent.goal, parent.side, cancel, parent.timeout, shell=parent.shell, who=parent.who)
     helper.ctx.checkpoint, helper.ctx.hooks, helper.ctx.vision, helper.ctx.web = parent.ctx.checkpoint, parent.ctx.hooks, parent.ctx.vision, parent.ctx.web
     helper.ctx.in_helper = True
     helper.ctx.question = lambda questions: {"answers": None}                  # a helper cannot ask the user
-    allowed = [n for n in TOOLS[kind] if n in {t["name"] for t in svc.agent.tools} and n not in parent.hidden]
-    template = [t for t in svc.mcp.template_tools(skip_servers={n for n in svc.mcp.servers if n != "agent"}) if t["name"] in allowed]
+    # #310 part 2: the helper works where its run works - the run's own view of the tool groups and its coding group (a project on the
+    # engineer's PC: that PC's runner, never the server's own tools), and the same run key on that PC
+    hub = parent.hub if parent.hub is not None else svc.mcp
+    helper.hub, helper.coding, helper.runner, helper.ctx.run_key = parent.hub, parent.coding, parent.runner, parent.ctx.run_key
+    have = {t["name"] for name in dict.fromkeys((parent.coding, "agent")) if hub.servers.get(name) is not None for t in hub.servers[name].tools}
+    allowed = [n for n in TOOLS[kind] if n in have and n not in parent.hidden]
+    template = [t for t in hub.template_tools(skip_servers={n for n in hub.servers if n not in (parent.coding, "agent")}) if t["name"] in allowed]
     names = {t["name"] for t in template}
     system = agent_prompt.helper(kind, parent.policy.cwd, parent.shell, time.strftime("%Y-%m-%d"), sorted(names))
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
@@ -105,7 +110,7 @@ def execute(svc, parent, kind: str, prompt: str, description: str, run_loop) -> 
     text: list[str] = []
     done, steps = None, 0
     try:
-        for kind_, x in run_loop(svc, svc.mcp, messages, template, kw, ids, thinking, max_new, 0, sampling, cancel, names, helper, rounds_limit=HELPER_ROUNDS):
+        for kind_, x in run_loop(svc, hub, messages, template, kw, ids, thinking, max_new, 0, sampling, cancel, names, helper, rounds_limit=HELPER_ROUNDS):
             if kind_ == "event":
                 if x.kind == "content":
                     text.append(x.text)
@@ -140,8 +145,12 @@ def _forward(parent, e: dict) -> int:
     """A helper's tool activity to the page, on the Task call: its calls and results as steps, its questions as they are; 1 for a step that started."""
     ev = e.get("event")
     if ev == "call":
-        parent._emit({"event": "step", "id": e.get("id"), "name": e.get("tool") or e.get("name"), "arguments": e.get("arguments")})
+        parent._emit({"event": "step", "id": e.get("id"), "name": e.get("tool") or e.get("name"), "arguments": e.get("arguments"),
+                      **({"machine": "my"} if e.get("machine") == "my" else {})})          # #310 part 2: a step on the engineer's own PC
         return 1
+    if ev == "remote":                                                           # #310 part 2: its travel to that PC, under the step (not a call of the run)
+        parent._emit({"event": "step_remote", "id": e.get("id"), "state": e.get("state")})
+        return 0
     if ev == "result":
         parent._emit({"event": "step_result", "id": e.get("id"), "ok": bool(e.get("ok")), "chars": e.get("chars"), "text": str(e.get("text") or "")[:300]})
         return 0

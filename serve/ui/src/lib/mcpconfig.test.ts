@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { MASK, bodyFor, emptyDraft, entryOf, entryFromRow, limitsOf, parseKv, parsePaste, toDraft, type McpRow } from "./mcpconfig"
+import { MASK, bodyFor, emptyDraft, entryOf, entryFromRow, guestsAfter, limitsOf, marksGuests, parseKv, parsePaste, toDraft, type McpConfigView, type McpRow } from "./mcpconfig"
 
 const row = (over: Partial<McpRow>): McpRow => ({ name: "fs", kind: "program", command: "npx", disabled: false, source: "config", editable: true, status: "ready", error: null, tools: [], ...over })
 
@@ -77,5 +77,21 @@ describe("the limits", () => {
     expect(limitsOf({ timeout_s: "30", max_result_chars: "5000", max_rounds: "4" })).toEqual({ limits: { timeout_s: 30, max_result_chars: 5000, max_rounds: 4 }, bad: null })
     expect(limitsOf({ timeout_s: "30", max_result_chars: "", max_rounds: "4" })).toEqual({ limits: null, bad: "max_result_chars" })
     expect(limitsOf({ timeout_s: "x", max_result_chars: "1", max_rounds: "1" }).bad).toBe("timeout_s")
+  })
+})
+
+describe("servers for guests (#310 R11)", () => {
+  const row = (name: string, guest?: boolean): McpRow => ({ name, kind: "program", source: "config", editable: true, disabled: false, status: "ready", error: null, tools: [], ...(guest === undefined ? {} : { guest }) })
+  const view = (servers: McpRow[], editable = true): McpConfigView => ({ servers, editable, reason: "", settings: { timeout_s: 60, max_result_chars: 20000, max_rounds: 8 }, config_file: "x.json", tools: 0 })
+  test("only the team owner's view marks servers: outside team mode no row says guest", () => {
+    expect(marksGuests(view([row("a", false)]))).toBe(true)
+    expect(marksGuests(view([row("a")]))).toBe(false)
+    expect(marksGuests(view([row("a", true)], false))).toBe(false)
+  })
+  test("switching one server on or off keeps the others' marks", () => {
+    const rows = [row("files", false), row("notes", true), { ...row("notes", true), source: "file" as const }]
+    expect(guestsAfter(rows, "files", true).sort()).toEqual(["files", "notes"])
+    expect(guestsAfter(rows, "notes", false)).toEqual([])
+    expect(guestsAfter(rows, "notes", true)).toEqual(["notes"])
   })
 })

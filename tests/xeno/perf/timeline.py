@@ -26,6 +26,7 @@ import bisect
 import heapq
 import json
 import os
+import statistics
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -166,8 +167,9 @@ class Timeline:
 
 
 def load(path: str) -> Timeline:
-    """The engine's file, and serve/server.py's <file>.server.json beside it when there is one (same clock)."""
-    events = read_events(path)
+    """The engine's file, and serve/server.py's <file>.server.json beside it when there is one (same clock).  Either may
+    be missing: a mock-engine server writes only the server's file."""
+    events = read_events(path) if os.path.exists(path) else []
     server = path + ".server.json"
     if os.path.exists(server):
         events += read_events(server)
@@ -444,6 +446,30 @@ def server_report(tl: Timeline) -> list[dict]:
     return out
 
 
+def runner_report(tl: Timeline) -> dict:
+    """#310 part 2: the calls the server sent to an engineer's PC (serve/runner_hub.py `_end_job`: a tool call, a run's
+    facts job or a page route).  Each job writes, on the thread that waited for it, `runner.call` (queued -> the end;
+    a = the runner's own exec_ms, b = the result's characters) and `runner.call wait` (queued -> a poll handed it out)
+    from the same start.  Split per call: wait (the pick-up), exec (the runner's handling, as it measured it) and
+    network = total - wait - exec (the poll's answer travelling to the PC, the result's POST back, both sides' HTTP).
+    A call the runner never answered (a = -1: offline, a timeout) counts in total and wait, not in exec and network."""
+    waits = {(s.lane, round(s.t0, 6)): s.dur for s in tl.find("runner.call wait")}
+    total, wait, exe, net = [], [], [], []
+    for s in tl.find("runner.call"):
+        w = waits.get((s.lane, round(s.t0, 6)), 0.0)
+        total.append(s.dur)
+        wait.append(w)
+        if s.a >= 0:
+            exe.append(float(s.a))
+            net.append(s.dur - w - s.a)
+
+    def stats(xs: list[float]) -> dict:
+        return {"min": min(xs, default=0.0), "median": statistics.median(xs) if xs else 0.0, "p90": pct(xs, 0.9),
+                "max": max(xs, default=0.0)}
+    return {"calls": len(total), "answered": len(exe), "total_ms": stats(total), "wait_ms": stats(wait),
+            "exec_ms": stats(exe), "network_ms": stats(net)}
+
+
 def startup_report(tl: Timeline) -> list[tuple[str, float]]:
     firsts = [s.t0 for n in ("prefill run", "decode round", "request") for s in tl.find(n)[:1]]
     end = min(firsts) if firsts else float("inf")
@@ -478,6 +504,13 @@ def render(tl: Timeline, top: int) -> str:
     for r in server_report(tl):
         out.append("== server request at {:.1f} s: ".format(r["t0_ms"] / 1000) + ", ".join(
             f"{k[:-3] if k.endswith('_ms') else k} {v:.0f} ms" for k, v in r.items() if k != "t0_ms") + " ==")
+    rr = runner_report(tl)
+    if rr["calls"]:
+        out.append(f"== runner calls: {rr['calls']} ({rr['answered']} answered by the runner) ==")
+        out.append(table([(name, *(f"{rr[k][q]:.2f}" for q in ("min", "median", "p90", "max")))
+                          for name, k in (("total (queued -> result)", "total_ms"), ("wait (queued -> picked up)", "wait_ms"),
+                                          ("exec (on the runner)", "exec_ms"), ("network (the rest)", "network_ms"))],
+                         ("ms per call", "min", "median", "p90", "max")))
     for req in tl.find("request"):
         out.append(f"== request at {req.t0 / 1000:.1f} s: {req.a} prompt tokens, {req.b} generated, {req.dur:.0f} ms ==")
     for i, r in enumerate(prefill_report(tl, top)):
@@ -573,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"prefill": prefill_report(tl, a.top), "decode": decode_report(tl), "lanes": utilisation(tl),
-                       "threads": thread_report(tl), "server": server_report(tl)},
+                       "threads": thread_report(tl), "server": server_report(tl), "runner": runner_report(tl)},
                       f, indent=1, default=str)
     if a.perfetto:
         export_perfetto(a.trace, a.perfetto)

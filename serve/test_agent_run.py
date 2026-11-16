@@ -6,20 +6,24 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from serve import agent_run, judge  # noqa: E402
+from serve.identity import OWNER, Identity  # noqa: E402
 from serve.permissions import Policy  # noqa: E402
 
 REQ = {"tool": "Bash", "arguments": {"command": "python build.py"}, "why": "a command asks every time", "danger": False, "judgeable": True, "rule": "Bash(python build.py:*)"}
 
 
-def make(mode=None, side=None, timeout=5.0, broker=None, **kw):
+def make(mode=None, side=None, timeout=5.0, broker=None, who="owner", **kw):
     broker = broker or agent_run.Broker()
-    run = agent_run.AgentRun(Policy(cwd="C:/proj", mode=mode, **kw), session="s1", broker=broker, goal="build the project", side=side, cancel=threading.Event(), timeout=timeout)
+    run = agent_run.AgentRun(Policy(cwd="C:/proj", mode=mode, **kw), session="s1", broker=broker, goal="build the project", side=side, cancel=threading.Event(), timeout=timeout,
+                             who=who)
     return run, broker
 
 
@@ -40,7 +44,7 @@ class Asking(unittest.TestCase):
         self.assertEqual(ev["event"], "permission")
         self.assertEqual((ev["tool"], ev["call_id"], ev["why"], ev["rule"]), ("Bash", "call-1", REQ["why"], REQ["rule"]))
         self.assertTrue(ev["id"])
-        self.assertTrue(broker.answer(ev["id"], "allow"))
+        self.assertTrue(broker.answer(ev["id"], "allow", OWNER))
         t.join(3)
         self.assertEqual(box["a"], "allow")
 
@@ -50,11 +54,11 @@ class Asking(unittest.TestCase):
         t.start()
         time.sleep(0.1)
         rid = run.drain()[0]["id"]
-        self.assertFalse(broker.answer(rid, "yes please"))
-        self.assertFalse(broker.answer("nope", "allow"))
-        self.assertTrue(broker.answer(rid, "deny"))
+        self.assertFalse(broker.answer(rid, "yes please", OWNER))
+        self.assertFalse(broker.answer("nope", "allow", OWNER))
+        self.assertTrue(broker.answer(rid, "deny", OWNER))
         t.join(3)
-        self.assertFalse(broker.answer(rid, "allow"))
+        self.assertFalse(broker.answer(rid, "allow", OWNER))
 
     def test_no_answer_in_time_is_a_refusal(self):
         run, _ = make(timeout=0.3)
@@ -74,13 +78,193 @@ class Asking(unittest.TestCase):
         t = threading.Thread(target=lambda: box.update(a=run.ctx.ask(dict(REQ))))
         t.start()
         time.sleep(0.1)
-        broker.answer(run.drain()[0]["id"], "allow_chat")
+        broker.answer(run.drain()[0]["id"], "allow_chat", OWNER)
         t.join(3)
         self.assertEqual(box["a"], "allow_chat")
 
     def test_a_page_may_answer_only_what_this_server_asked(self):
         _, broker = make()
-        self.assertFalse(broker.answer("not-asked", "allow"))
+        self.assertFalse(broker.answer("not-asked", "allow", OWNER))
+
+
+def wait_event(run, n=1):
+    got = []
+    for _ in range(200):
+        got += run.drain()
+        if len(got) >= n:
+            return got
+        time.sleep(0.02)
+    return got
+
+
+class Holder(unittest.TestCase):
+    """#310: a permission or question prompt is answered only by the identity whose run asked it - the owner role does not answer for another."""
+    ANN, BOB, BOSS = Identity("ann", "guest"), Identity("bob", "guest"), Identity("boss", "owner")
+
+    def test_only_the_holder_may_answer_a_permission(self):
+        run, broker = make(who="ann")
+        box = {}
+        t = threading.Thread(target=lambda: box.update(a=run.ctx.ask(dict(REQ))))
+        t.start()
+        rid = wait_event(run)[0]["id"]
+        self.assertEqual(broker.pending[rid]["who"], "ann")
+        self.assertFalse(broker.answer(rid, "allow", self.BOB))
+        self.assertFalse(broker.answer(rid, "allow", self.BOSS))                 # an approval is the run holder's, not the owner's
+        self.assertFalse(broker.answer(rid, "allow", OWNER))
+        self.assertTrue(broker.answer(rid, "deny", self.ANN))                    # the refused tries did not use the slot up
+        t.join(3)
+        self.assertEqual(box["a"], "deny")
+
+    def test_only_the_holder_may_answer_a_question(self):
+        run, broker = make(who="ann")
+        box = {}
+        t = threading.Thread(target=lambda: box.update(a=run.ctx.question([{"question": "Which?", "options": [{"label": "A"}]}])))
+        t.start()
+        rid = wait_event(run)[0]["id"]
+        self.assertEqual(broker.pending[rid]["who"], "ann")
+        self.assertFalse(broker.respond(rid, {"Which?": ["A"]}, self.BOB))
+        self.assertFalse(broker.respond(rid, {"Which?": ["A"]}, self.BOSS))
+        self.assertTrue(broker.respond(rid, {"Which?": ["A"]}, self.ANN))
+        t.join(3)
+        self.assertEqual(box["a"], {"answers": {"Which?": ["A"]}})
+
+    def test_move_hands_the_open_prompts_and_the_next_ones_to_the_new_name(self):
+        """#310: a renamed key answers what its runs asked before and after the rename; the old name answers nothing."""
+        run, broker = make(who="ann")
+        other, _ = make(who="bob", broker=broker)
+        box = {}
+        t = threading.Thread(target=lambda: box.update(a=run.ctx.ask(dict(REQ)), b=run.ctx.ask(dict(REQ))))
+        t.start()
+        first = wait_event(run)[0]["id"]
+        self.assertEqual(broker.move("ann", "anna"), 1)
+        self.assertEqual((run.who, other.who), ("anna", "bob"))
+        self.assertFalse(broker.answer(first, "allow", self.ANN))
+        self.assertTrue(broker.answer(first, "allow", Identity("anna", "guest")))
+        second = None
+        for _ in range(200):
+            second = next((e["id"] for e in run.drain() if e.get("event") == "permission"), None)
+            if second:
+                break
+            time.sleep(0.02)
+        self.assertEqual(broker.pending[second]["who"], "anna")
+        self.assertTrue(broker.answer(second, "deny", Identity("anna", "guest")))
+        t.join(3)
+        self.assertEqual((box["a"], box["b"]), ("allow", "deny"))
+
+    def test_a_stop_before_bind_carries_over_to_the_requests_cancel(self):
+        """#310 review: the request binds its own cancel event after it may have waited for a model load; a revoke in
+        that window must still stop the run."""
+        run, broker = make(who="ann")
+        self.assertEqual(broker.end_all("ann"), 0)
+        self.assertTrue(run.stopped)
+        later = threading.Event()
+        run.bind(later)
+        self.assertTrue(later.is_set())
+        self.assertIs(run.ctx.cancel, later)
+        other, _ = make(who="bob", broker=broker)
+        other.cancel.set()                                            # any cancel that came first carries over too
+        fresh = threading.Event()
+        other.bind(fresh)
+        self.assertTrue(fresh.is_set())
+        quiet, _ = make(who="cat", broker=broker)
+        calm = threading.Event()
+        quiet.bind(calm)
+        self.assertFalse(calm.is_set())
+        broker.end_all("cat")                                         # after bind: the bound event is the one set
+        self.assertTrue(calm.is_set())
+
+    def test_end_all_stops_a_name_and_closes_what_it_was_asked(self):
+        """#310: a revoked key: its runs are cancelled and every prompt it holds is closed as refused."""
+        run, broker = make(who="ann")
+        bobs, _ = make(who="bob", broker=broker)
+        box = {}
+        t1 = threading.Thread(target=lambda: box.update(a=run.ctx.ask(dict(REQ))))
+        t2 = threading.Thread(target=lambda: box.update(q=run.ctx.question([{"question": "Which?", "options": [{"label": "A"}]}])))
+        t3 = threading.Thread(target=lambda: box.update(b=bobs.ctx.ask(dict(REQ))))
+        for t in (t1, t2, t3):
+            t.start()
+        deadline = time.time() + 5
+        while len(broker.pending) < 3 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(broker.end_all("ann"), 2)
+        t1.join(3)
+        t2.join(3)
+        self.assertTrue(run.cancel.is_set())
+        self.assertFalse(bobs.cancel.is_set())
+        self.assertIn(box["a"], ("deny", "cancelled"))
+        self.assertIn(box["q"], ({"answers": None}, "cancelled"))
+        self.assertEqual([s["who"] for s in broker.pending.values()], ["bob"])
+        bob_id = next(iter(broker.pending))
+        self.assertTrue(broker.answer(bob_id, "deny", self.BOB))
+        t3.join(3)
+        self.assertEqual(broker.end_all("nobody"), 0)
+
+    def test_a_run_with_no_who_is_the_owners(self):
+        run, broker = make()
+        self.assertEqual(run.who, "owner")
+        self.assertEqual(broker.open("x" * 16)["who"], "owner")
+        self.assertEqual(broker.open("y" * 16, "question", who="ann")["who"], "ann")
+
+    def test_a_helper_asks_as_its_parents_holder(self):
+        from serve import subagent
+        parent, _ = make(who="ann")
+        made = []
+        real = agent_run.AgentRun.__init__
+
+        def spy(self, *a, **k):
+            real(self, *a, **k)
+            made.append(self.who)
+
+        def prepare(*a, **k):
+            raise ValueError("only the helper's making is looked at")
+        svc = SimpleNamespace(agent=SimpleNamespace(tools=[]), prepare=prepare,
+                              mcp=SimpleNamespace(servers={}, template_tools=lambda skip_servers=(): []))
+        with mock.patch.object(agent_run.AgentRun, "__init__", spy):
+            ok, _ = subagent.execute(svc, parent, "explore", "look", "look around", None)
+        self.assertFalse(ok)
+        self.assertEqual(made, ["ann"])
+
+
+class Abort(unittest.TestCase):
+    """#310 part 2: a card for a call on the user's own PC closes at once when that PC goes offline, its runner is
+    replaced or its device cleared (the runner's call sets `abort`, with `why`): a refusal, and an event the page
+    reads to drop the card."""
+
+    def aborter(self, run, why):
+        abort = threading.Event()
+        seen = []
+
+        def fire():
+            seen.extend(wait_event(run))                        # the card is open
+            abort.why = why
+            abort.set()
+        threading.Thread(target=fire, daemon=True).start()
+        return abort, seen
+
+    def test_abort_closes_a_permission_card(self):
+        run, broker = make()
+        abort, seen = self.aborter(run, "offline")
+        t0 = time.monotonic()
+        self.assertEqual(run.ctx.ask(dict(REQ), abort=abort), "deny")
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertEqual(broker.pending, {})
+        ev = run.drain()[-1]
+        self.assertEqual((ev["event"], ev["id"], ev["answer"], ev["reason"]), ("answered", seen[0]["id"], "deny", "offline"))
+
+    def test_abort_closes_a_question_card(self):
+        run, broker = make()
+        abort, seen = self.aborter(run, "replaced")
+        self.assertEqual(run.ctx.question([{"question": "Which?", "options": [{"label": "A"}]}], abort=abort),
+                         {"answers": None})
+        self.assertEqual(broker.pending, {})
+        ev = run.drain()[-1]
+        self.assertEqual((ev["event"], ev["id"], ev["answers"], ev["reason"]),
+                         ("question_answered", seen[0]["id"], None, "replaced"))
+
+    def test_without_abort_nothing_changes(self):
+        run, broker = make(timeout=0.3)
+        self.assertEqual(run.ctx.ask(dict(REQ)), "deny")                 # nobody answered: as before
+        self.assertNotIn("reason", run.drain()[-1])
 
 
 class AutoMode(unittest.TestCase):

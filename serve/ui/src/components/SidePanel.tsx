@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import { ArrowDown01Icon, ArrowReloadHorizontalIcon, BookOpenTextIcon, CheckmarkCircle01Icon, GitBranchIcon, GitCommitIcon, Layers01Icon, Cancel01Icon } from "@hugeicons/core-free-icons"
 import type { Message } from "../lib/chat"
@@ -40,7 +40,9 @@ export interface PanelData {
   context: ContextView
   canCompact: boolean
   onCompact: () => void
+  runner?: string                    // #310 part 2: the project is on the engineer's own PC: Git and notes are read there, through its runner
 }
+const PanelRunner = createContext<string | undefined>(undefined)
 
 const STATUS_COLOR: Record<string, string> = { M: "text-[#b7791f]", A: "text-[#2f9e6b]", D: "text-bad", R: "text-accent", C: "text-accent", T: "text-ink-2", U: "text-bad", "?": "text-ink-3" }
 
@@ -70,6 +72,7 @@ function DiffView({ lines }: { lines: DiffLine[] }) {
 
 /** One changed file: its status and path, and the diff that opens under it. */
 function FileRow({ folder, file, staged, untracked }: { folder: string; file: GitFile; staged: boolean; untracked: boolean }) {
+  const runner = useContext(PanelRunner)
   const [open, setOpen] = useState(false)
   const [diff, setDiff] = useState<{ lines: DiffLine[]; binary: boolean; truncated: boolean } | "loading" | "error" | null>(null)
   const toggle = () => {
@@ -77,7 +80,7 @@ function FileRow({ folder, file, staged, untracked }: { folder: string; file: Gi
     setOpen(next)
     if (next && diff === null) {
       setDiff("loading")
-      void getGitDiff(folder, file.path, staged, untracked).then((r) => setDiff(r === "unavailable" || !r.ok ? "error" : { lines: parseDiff(r.diff), binary: r.binary, truncated: r.truncated }))
+      void getGitDiff(folder, file.path, staged, untracked, runner).then((r) => setDiff(r === "unavailable" || !r.ok ? "error" : { lines: parseDiff(r.diff), binary: r.binary, truncated: r.truncated }))
     }
   }
   return (
@@ -197,10 +200,12 @@ function GitTab({ folders, allowed, busy }: Pick<PanelData, "folders" | "allowed
   const [at, setAt] = useState(0)
   const [seen, setSeen] = useState<Record<string, GitResult | "loading">>({})
   const folder = folders[Math.min(at, folders.length - 1)] ?? null
+  const runner = useContext(PanelRunner)
+  useEffect(() => setSeen({}), [runner])                                             // the other machine: what was read is not its
   const load = useCallback((f: string) => {
     setSeen((s) => ({ ...s, [f]: s[f] && s[f] !== "loading" ? s[f] : "loading" }))        // what was shown stays while it is read again
-    void getGit(f).then((r) => setSeen((s) => ({ ...s, [f]: r })))
-  }, [])
+    void getGit(f, runner).then((r) => setSeen((s) => ({ ...s, [f]: r })))
+  }, [runner])
   useEffect(() => { if (folder && allowed) load(folder) }, [folder, allowed, load])
   const was = useRef(busy)
   useEffect(() => { if (was.current && !busy && folder && allowed) load(folder); was.current = busy }, [busy, folder, allowed, load])      // an answer ended: the files may have changed
@@ -280,12 +285,13 @@ function MemoryFile({ folders, source, n, onAsk }: { folders: string[]; source: 
   const [open, setOpen] = useState(false)
   const [got, setGot] = useState<{ name: string; text: string; cut: boolean } | "loading" | "error" | null>(null)
   const name = source.shown[n]
+  const runner = useContext(PanelRunner)
   const toggle = () => {
     const next = !open
     setOpen(next)
     if (next && got === null) {
       setGot("loading")
-      void getMemoryFile(folders, source.id, n).then((r) => setGot(r ?? "error"))
+      void getMemoryFile(folders, source.id, n, runner).then((r) => setGot(r ?? "error"))
     }
   }
   return (
@@ -311,8 +317,9 @@ function MemoryFile({ folders, source, n, onAsk }: { folders: string[]; source: 
 
 function MemoryTab({ folders, allowed, onAsk }: { folders: string[]; allowed: boolean; onAsk: (text: string) => void }) {
   const [list, setList] = useState<MemoryList | null | "loading">("loading")
+  const runner = useContext(PanelRunner)
   const key = folders.join("|")
-  const load = useCallback(() => { void getMemory(folders).then(setList) }, [key])       // eslint-disable-line react-hooks/exhaustive-deps
+  const load = useCallback(() => { void getMemory(folders, runner).then(setList) }, [key, runner])       // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (allowed) load() }, [allowed, load])
   if (!allowed) return <p className="text-[13px] text-ink-2">{t("Notes are read from this PC's files, so they are shown only on the PC that runs Strata (or with the API key).")}</p>
   if (list === "loading") return <Loading>{t("Looking for notes…")}</Loading>
@@ -413,6 +420,7 @@ export function PanelBody({ tab, onTab, onClose, data }: { tab: PanelTab; onTab:
         </div>
         {onClose && <button type="button" aria-label={t("Close the panel")} onClick={onClose} className="flex size-8 shrink-0 items-center justify-center rounded-sm text-ink-2 transition-colors hover:bg-hover hover:text-ink"><HugeiconsIcon icon={Cancel01Icon} size={15} aria-hidden /></button>}
       </div>
+      <PanelRunner.Provider value={data.runner}>
       <GlidePanel role="tabpanel" aria-label={TAB_META[shown].label()} cap={() => Math.max(240, innerHeight - 190)} inner="pb-2" className="-mx-1 px-1">
         {shown === "git" && <GitTab folders={data.folders} allowed={data.allowed} busy={data.busy} />}
         {shown === "plan" && <PlanTab messages={data.messages} />}
@@ -420,6 +428,7 @@ export function PanelBody({ tab, onTab, onClose, data }: { tab: PanelTab; onTab:
         {shown === "memory" && <MemoryTab folders={data.folders} allowed={data.allowed} onAsk={data.onAsk} />}
         {shown === "context" && <ContextPanel view={data.context} canCompact={data.canCompact} onCompact={data.onCompact} />}
       </GlidePanel>
+      </PanelRunner.Provider>
     </div>
   )
 }

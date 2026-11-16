@@ -4,9 +4,13 @@ import type { McpConfigView } from "./mcpconfig"
 import type { ImportView } from "./importer"
 import type { HooksView } from "./hooks"
 import type { AgentInfo } from "./agent"
+import { deviceHeaders } from "./device"
+import { withRunner } from "./runner"
 
+/** Every request's headers: the API key (when one is entered), and this browser's device id and name (#310; a server outside team
+ *  mode does not look at them). */
 export const apiHeaders = (json = false): Record<string, string> => {
-  const h: Record<string, string> = {}
+  const h: Record<string, string> = deviceHeaders()
   const key = store.get("apikey", "")
   if (key) h.Authorization = "Bearer " + key
   if (json) h["Content-Type"] = "application/json"
@@ -19,7 +23,7 @@ export const rootOf = (pathname: string) => pathname.replace(/next\/$/, "").repl
 export const root = () => rootOf(location.pathname)
 export const url = (path: string) => root() + path
 
-export interface Health { model: string; images: boolean; max_context: number }
+export interface Health { model: string; images: boolean; max_context: number; api_key?: boolean }
 export const NO_HEALTH: Health = { model: "strata", images: false, max_context: 0 }
 
 export async function getHealth(): Promise<Health> {
@@ -27,23 +31,38 @@ export async function getHealth(): Promise<Health> {
   return (await r.json()) as Health
 }
 
+/** Whether the server was started with an API key (/health "api_key"); null when it cannot be asked. */
+export async function serverHasKey(): Promise<boolean | null> {
+  try { const h = await getHealth(); return typeof h.api_key === "boolean" ? h.api_key : null } catch { return null }
+}
+
 export interface McpTool { tool: string; description?: string }
 export interface McpServer {
   name: string; transport: string; status: string; tools: McpTool[]; error?: string; info?: { name?: string; version?: string }
 }
-export interface McpInfo { servers: McpServer[]; tools: number }
+/** GET /mcp; with `runner=` (#310 part 2) the MCP servers and skills of the engineer's own PC, from its runner's hello, and whether it is online. */
+export interface McpInfo { servers: McpServer[]; tools: number; skills?: { name: string; description?: string; app?: string }[]; machine?: string; online?: boolean }
 
-export async function getMcp(): Promise<McpInfo | null> {
+export async function getMcp(runner?: string): Promise<McpInfo | null> {
   try {
-    const r = await fetch(url("mcp"), { headers: apiHeaders() })
+    const r = await fetch(url(withRunner("mcp", runner)), { headers: apiHeaders() })
     return r.ok ? ((await r.json()) as McpInfo) : null
   } catch { return null }
 }
 
-/** The chat's coding tools (serve/agent.py): whether the server has them, and whether this caller may use them (only from this PC, or with the key). */
-export async function getAgent(): Promise<AgentInfo | null> {
+/** The chat's coding tools (serve/agent.py): whether the server has them, and whether this caller may use them (only from this PC, or with the key).
+ *  With `runner` (#310 part 2): the coding tools of the engineer's own PC, its name and whether it is online (null too when the server knows no such
+ *  runner for this key: see `getRunnerAgent`). */
+export async function getAgent(runner?: string): Promise<AgentInfo | null> {
+  const r = await getRunnerAgent(runner)
+  return typeof r === "object" ? r : null
+}
+
+/** GET /agent?runner=: the runner's answer, "unknown" when the server knows no runner with that id for this key (404), null when it cannot be asked. */
+export async function getRunnerAgent(runner?: string): Promise<AgentInfo | "unknown" | null> {
   try {
-    const r = await fetch(url("agent"), { headers: apiHeaders() })
+    const r = await fetch(url(withRunner("agent", runner)), { headers: apiHeaders() })
+    if (runner && r.status === 404) return "unknown"
     return r.ok ? ((await r.json()) as AgentInfo) : null
   } catch { return null }
 }
@@ -103,9 +122,9 @@ export interface FolderView { path: string; parent: string | null; dirs: { name:
 
 /** The folders of this PC (serve/folders.py), to choose a project's folder from: where `path` is and the folders in it; blank is the home folder, "@drives" the drives
  *  (Windows). `unknown` when the server cannot be asked (another PC, no such route): then the path cannot be checked, only used as typed. */
-export async function getFolders(path: string): Promise<FolderView | { error: string } | "unknown"> {
+export async function getFolders(path: string, runner?: string): Promise<FolderView | { error: string } | "unknown"> {
   try {
-    const r = await fetch(url("agent/folders?path=" + encodeURIComponent(path)), { headers: apiHeaders() })
+    const r = await fetch(url(withRunner("agent/folders?path=" + encodeURIComponent(path), runner)), { headers: apiHeaders() })
     if (!r.ok) return "unknown"
     const body = await r.json()
     if (body?.ok === true) return body as FolderView

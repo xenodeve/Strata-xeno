@@ -13,10 +13,11 @@ import { addPerm, forgetPerms, permsFor, type Effect, type Scope } from "./perms
 import { forgetCheckpoints } from "./rewind"
 import { noteFrom, type HookNote } from "./hooks"
 import { LiveTokens, type LiveReading } from "./livetokens"
-import { slotKey, addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, saveBackground, foldersOf, setProjectFolders, type SessionIndex, type StoredMessage } from "./sessions"
+import { slotKey, addProject, loadIndex, moveSession, newSession, openSession, persistIndex, removeProject, removeSession, renameProject, renameSession, saveActive, saveBackground, foldersOf, setProjectFolders, setProjectMachine, projectMachine, type SessionIndex, type StoredMessage } from "./sessions"
+import { chatMachine, runnerId, type Machine } from "./runner"
 
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
-export interface Ask { stopped?: boolean; id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny"; kept?: { scope: "project" | "everywhere"; effect: Effect } }
+export interface Ask { stopped?: boolean; id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny"; kept?: { scope: "project" | "everywhere"; effect: Effect }; closed?: string }      // closed (#310 part 2): the server closed the card (My PC went offline, ...), its reason
 export interface Todo { content: string; status: "pending" | "in_progress" | "completed"; activeForm: string }
 /** What the model asked the user (AskUserQuestion): one to four questions with two to four choices each; `answers` once the user answered (null: skipped). */
 export interface AskedQuestion {
@@ -24,9 +25,10 @@ export interface AskedQuestion {
   questions: { question: string; header: string; multiSelect: boolean; options: { label: string; description: string }[] }[]
   answers?: Record<string, string[]> | null
   stopped?: boolean                                           // the answer ended (Stop, or an error) before the user answered: nothing is waiting any more
+  closed?: string                                             // #310 part 2: the server closed it (My PC went offline, ...): its reason
 }
 /** One call a helper made while it worked on a Task: the nested list on the Task's card. */
-export interface Step { id: string; name: string; arguments?: unknown; state: "running" | "done" | "error"; text?: string }
+export interface Step { id: string; name: string; arguments?: unknown; state: "running" | "done" | "error"; text?: string; machine?: "my"; remote?: "sending" | "running" | "offline" }      // machine, remote (#310 part 2): a step on My PC and its travel there
 export interface ToolCall {
   id: string; name: string; at: number; rat: number
   state: "writing" | "asking" | "running" | "done" | "error" | "skipped"
@@ -39,6 +41,8 @@ export interface ToolCall {
   helper?: { kind: string; description: string; state: "running" | "done" | "failed"; steps: number }      // a Task call: the helper that works on it
   steps?: Step[]                                                                     // and what that helper did, step by step
   server?: string; tool?: string; arguments?: unknown; round?: number
+  machine?: "my"                                                                     // #310 part 2: the call ran on the engineer's own PC (the event's machine)
+  remote?: "sending" | "running" | "offline"                                         // and its travel there, as the server's last `remote` event said
   result?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number | null; open?: boolean
 }
 export interface Attachment { kind: "image" | "file"; name: string; url?: string; text?: string }
@@ -149,7 +153,9 @@ interface ToolEvent {
   state?: string; kind?: string; description?: string; steps?: number; answer?: string; answers?: unknown
   on?: string; hook?: string; command?: string; code?: number | null; blocked?: boolean; timeout?: boolean; error?: string | null
   call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string; questions?: AskedQuestion["questions"]      // the coding tools
+  machine?: string; reason?: string | null                                           // #310 part 2: a call on My PC; why the server closed a card (`state` also carries a `remote` event's step)
 }
+const REMOTE = ["sending", "running", "offline"] as const
 
 // a tool event from the stream (the `strata_mcp` field of a chunk)
 function onTool(m: Message, x: ToolEvent, at = Date.now()) {
@@ -157,12 +163,12 @@ function onTool(m: Message, x: ToolEvent, at = Date.now()) {
   if (x.event === "todos") { if (Array.isArray(x.todos)) m.todos = x.todos; return }
   if (x.event === "answered" || x.event === "question_answered") {                           // a question was answered (by this page, or by another one before a refresh): read again, a card is not left waiting
     for (const c of m.tools || []) {
-      if (x.event === "answered" && c.ask?.id === x.id && !c.ask.answer && (x.answer === "allow" || x.answer === "allow_chat" || x.answer === "deny")) { c.ask.answer = x.answer; if (c.state === "asking") c.state = "running" }
-      if (x.event === "question_answered" && c.question?.id === x.id && c.question.answers === undefined) { c.question.answers = (x.answers as Record<string, string[]> | null | undefined) ?? null; if (c.state === "asking") c.state = "running" }
+      if (x.event === "answered" && c.ask?.id === x.id && !c.ask.answer && (x.answer === "allow" || x.answer === "allow_chat" || x.answer === "deny")) { c.ask.answer = x.answer; if (typeof x.reason === "string" && x.reason) c.ask.closed = x.reason; if (c.state === "asking") c.state = "running" }
+      if (x.event === "question_answered" && c.question?.id === x.id && c.question.answers === undefined) { c.question.answers = (x.answers as Record<string, string[]> | null | undefined) ?? null; if (typeof x.reason === "string" && x.reason) c.question.closed = x.reason; if (c.state === "asking") c.state = "running" }
     }
     return
   }
-  if (x.event === "helper" || x.event === "step" || x.event === "step_result") {            // a helper's work, on the Task call it belongs to
+  if (x.event === "helper" || x.event === "step" || x.event === "step_result" || x.event === "step_remote") {            // a helper's work, on the Task call it belongs to
     const c = (m.tools || []).find((y) => y.id === x.call_id)
     if (!c) return
     if (x.event === "helper") {
@@ -171,7 +177,8 @@ function onTool(m: Message, x: ToolEvent, at = Date.now()) {
       return
     }
     c.steps = c.steps || []
-    if (x.event === "step") { if (c.steps.length < 200) c.steps.push({ id: String(x.id), name: String(x.name ?? ""), arguments: x.arguments, state: "running" }) }
+    if (x.event === "step") { if (c.steps.length < 200) c.steps.push({ id: String(x.id), name: String(x.name ?? ""), arguments: x.arguments, state: "running", ...(x.machine === "my" ? { machine: "my" as const } : {}) }) }
+    else if (x.event === "step_remote") { const s = c.steps.find((y) => y.id === String(x.id)); const st = REMOTE.find((r) => r === x.state); if (s && st) s.remote = st }      // #310 part 2: the step's travel to My PC
     else { const s = c.steps.find((y) => y.id === String(x.id)); if (s) { s.state = x.ok ? "done" : "error"; s.text = typeof x.text === "string" ? x.text : undefined } }
     return
   }
@@ -205,12 +212,18 @@ function onTool(m: Message, x: ToolEvent, at = Date.now()) {
     else if (x.event === "judged" && (x.verdict === "allow" || x.verdict === "block" || x.verdict === "ask")) c.judge = { verdict: x.verdict, severity: x.severity ?? null }
     return
   }
+  if (x.event === "remote") {                                                                // #310 part 2: a call on My PC on its way there (sending, running there, the PC offline): about a call already shown
+    const c = (m.tools || []).find((y) => y.id === x.id)
+    const st = REMOTE.find((r) => r === x.state)
+    if (c && st) c.remote = st
+    return
+  }
   if (x.event !== "start" && x.event !== "call" && x.event !== "result") return                // a kind of event this page does not know
   m.tools = m.tools || []
   let t = m.tools.find((y) => y.id === x.id)
   if (!t) { t = { id: x.id, name: x.name, at: m.text.length, rat: (m.reasoning || "").length, state: "writing" }; m.tools.push(t) }
   if (x.event === "call") {
-    Object.assign(t, { name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running" })
+    Object.assign(t, { name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running" }, x.machine === "my" ? { machine: "my" } : {})
   } else if (x.event === "result") {
     Object.assign(t, { result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, state: x.skipped ? "skipped" : x.ok ? "done" : "error", judging: false, doneAt: at })
   }
@@ -266,7 +279,7 @@ function restore(msgs: Message[]): Message[] {
   return msgs.map((m) => (m.prefill?.state === "reading" ? { ...m, prefill: { ...m.prefill, state: "done" as const, rate: null } } : m))
 }
 
-export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | string[] | null }      // skills: the names of the skills in use, for "/name"
+export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | string[] | null; runner?: string; blocked?: string }      // skills: the names of the skills in use, for "/name"; runner (#310 part 2): the chat is on the engineer's own PC, through this runner
 
 /** An answer that is being written (or a conversation that is being summarised) for one conversation. Several can run at once, each for its own conversation: the page shows one,
  *  and the others go on in the background (the server takes their requests one after the other). `messages` is the live list of that conversation. */
@@ -475,7 +488,8 @@ export class ChatController {
   remove(id: string): boolean {
     if (this.runs.has(id)) return false                       // not while it is being answered
     this.queues.delete(id)
-    forgetCheckpoints(id)                                     // the way back for its files goes with it
+    const project = this.index.items.find((i) => i.id === id)?.project
+    forgetCheckpoints(id, this.machineOf(project) === "my" ? runnerId() || undefined : undefined)       // the way back for its files goes with it (on the machine that kept it)
     const r = removeSession(store, this.index, id)
     this.index = r.index
     if (r.clearedActive) this.messages = []
@@ -485,11 +499,11 @@ export class ChatController {
   rename(id: string, title: string) { this.index = renameSession(this.index, id, title); this.saveIndex() }
   move(id: string, project: string | undefined) { this.index = moveSession(this.index, id, project); this.saveIndex() }
   /** A project needs a folder, and may have more (other worktrees): they are where its chats' coding tools work. Null (and nothing made) without a name or without a folder. */
-  addProject(name: string, folders: string[]): string | null {
+  addProject(name: string, folders: string[], machine?: "my"): string | null {
     if (!folders.some((f) => f.trim())) return null
     const before = this.index.projects.length
     const id = Math.random().toString(36).slice(2, 10)
-    this.index = addProject(this.index, name, id, folders)
+    this.index = addProject(this.index, name, id, folders, machine)
     this.saveIndex()
     return this.index.projects.length > before ? id : null
   }
@@ -497,6 +511,16 @@ export class ChatController {
   removeProject(id: string) { this.index = removeProject(this.index, id); if (this.pendingProject === id) this.pendingProject = null; forgetPerms(store, id); this.saveIndex() }
   setSettings(s: Settings) { this.settings = s; store.set("sampling", s); this.notify() }
   setProjectFolders(id: string, folders: string[]) { this.index = setProjectFolders(this.index, id, folders); this.saveIndex() }
+  /** #310 part 2: moves a project to the other machine; its folders are cleared, they are paths on the machine it was on. */
+  setProjectMachine(id: string, machine: Machine) { this.index = setProjectFolders(setProjectMachine(this.index, id, machine), id, []); this.saveIndex() }
+  /** #310 part 2: whether the server's own coding tools are this page's (GET /agent "allowed"; undefined until it answers); a chat in no project runs there for an owner, else on My PC. */
+  serverAllowed: boolean | undefined = undefined
+  /** #310 part 2: the machine a chat of `project` (none: a chat in no project) works on. */
+  machineOf(project: string | undefined): Machine {
+    return chatMachine({ project: project && this.index.projects.some((p) => p.id === project) ? projectMachine(this.index, project) : undefined, serverAllowed: this.serverAllowed, runner: runnerId() })
+  }
+  /** The machine the open conversation works on. */
+  machine(): Machine { return this.machineOf(this.currentProject()) }
   /** The folders the coding tools work in for the open conversation: its project's (the first is the main one), else the default one (Settings); none when there is none. */
   folders(): string[] {
     const own = foldersOf(this.index, this.currentProject())
@@ -710,9 +734,19 @@ export class ChatController {
   /** Rewrites the prompt at `index`: it and everything after it are replaced by the new prompt (with its own attachments
    *  that are still held) and a new answer. False when it cannot be done: an answer is being written, the message is not a
    *  prompt, or nothing would be sent. */
+  /** #310 part 2: a chat on My PC that cannot reach it (no runner id, or one the server does not know: `ctx.blocked`, its words) is refused while
+   *  the coding tools are on - before anything is changed or sent - and says why. Every way a prompt goes out (send, edit, a queued one) passes
+   *  here, so no prompt silently goes without its tools. True when refused. */
+  refuses(ctx: SendContext): boolean {
+    if (!ctx.blocked || this.settings.agent === false) return false
+    this.onError(t("Your PC cannot be reached"), ctx.blocked)
+    return true
+  }
+
   async edit(index: number, text: string, ctx: SendContext): Promise<boolean> {
     const m = this.messages[index]
     if (this.busy || !m || !isPrompt(m)) return false
+    if (this.refuses(ctx)) return false                     // before the conversation is cut
     const { kept, lost } = attachmentsOf(m)
     if (!text.trim() && !kept.length) return false
     this.messages = this.messages.slice(0, index)
@@ -725,6 +759,7 @@ export class ChatController {
   async send(text: string, attachments: Attachment[], ctx: SendContext) {
     text = text.trim()
     if ((!text && !attachments.length) || this.busy) return
+    if (this.refuses(ctx)) return
     const compactFirst = this.shouldAutoCompact(ctx, text, attachments)       // measured on the conversation so far, before this prompt is part of it
     const before = compactFirst ? this.contextUsed() : 0
     this.messages.push({
@@ -753,7 +788,7 @@ export class ChatController {
     if (s.max) body.max_tokens = +s.max
     if (ctx.projectionLoaded) body.experimental_speed_projection = !!s.esp
     Object.assign(body, mcpRequest(s, ctx.mcp))                            // this server may run MCP tools for it (the ones not switched off)
-    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, id === NEW_KEY ? null : id, permsFor(store, rulesOf(store, id), this.currentProject()), String(um.time)))      // the prompt's time is its checkpoint: the files the tools change in it can be put back      // the coding tools, when they are on and reachable
+    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, id === NEW_KEY ? null : id, permsFor(store, rulesOf(store, id), this.currentProject()), String(um.time), ctx.runner))      // the prompt's time is its checkpoint: the files the tools change in it can be put back      // the coding tools, when they are on and reachable
     const lastPrompt = [...conv].reverse().find((x) => x.role === "user")
     const skill = lastPrompt ? skillOfMessage(lastPrompt.text, ctx.skills ?? []) : null
     if (skill) body.strata_skill = skill                                   // "/name": the server loads that skill for this message

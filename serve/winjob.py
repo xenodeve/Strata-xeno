@@ -45,6 +45,8 @@ if os.name == "nt":
     _k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
     _k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
     _k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    _k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    _k32.CloseHandle.argtypes = (wintypes.HANDLE,)
 
     def _make_job():
         job = _k32.CreateJobObjectW(None, None)     # no security attributes: the handle is not inherited
@@ -95,3 +97,41 @@ def contain(proc) -> bool:
         return bool(_k32.AssignProcessToJobObject(_job, int(proc._handle)))
     except (AttributeError, OSError, ValueError):
         return False
+
+
+def own_job(proc):
+    """A kill-on-close job of `proc`'s own (#314: one per shell command), so `end_job` stops the command and everything
+    it started - also what Git Bash forks through an intermediary that has already exited, which `taskkill /T` cannot
+    find - and a hard end of this process ends them too.  The job's handle, or None (not Windows, or the job could not be
+    made or the process not put in it; then nothing is kept)."""
+    if os.name != "nt" or proc is None:
+        return None
+    job = _make_job()
+    if not job:
+        return None
+    try:
+        if _k32.AssignProcessToJobObject(job, int(proc._handle)):
+            return job
+    except (AttributeError, OSError, ValueError):
+        pass
+    _k32.CloseHandle(job)
+    return None
+
+
+def end_job(job) -> bool:
+    """Stop every process in an `own_job` job and close its handle.  True when the job was terminated."""
+    if os.name != "nt" or not job:
+        return False
+    ok = bool(_k32.TerminateJobObject(job, 1))
+    _k32.CloseHandle(job)
+    return ok
+
+
+def let_go(job) -> None:
+    """Close an `own_job` job's handle without stopping what is in it: the kill-on-close limit is cleared first, so a
+    program the command started on purpose and left running (a dev server, an editor) keeps running, as before #314."""
+    if os.name != "nt" or not job:
+        return
+    info = _ExtendedLimits()                        # LimitFlags 0: no kill on close
+    if _k32.SetInformationJobObject(job, _JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)):
+        _k32.CloseHandle(job)                       # (not cleared: the handle is kept rather than kill what is left)

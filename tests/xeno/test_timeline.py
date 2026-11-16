@@ -271,3 +271,59 @@ def test_split_copies_are_matched_to_the_split_issuer():
     assert r["issue_to_start_ms"]["n"] == 2 and r["issue_to_start_ms"]["max"] == pytest.approx(9.0), r["issue_to_start_ms"]
     assert r["layer_copy_ms"] == {0: pytest.approx(4.0)}   # both copies on layer 0, keyed by layer, not by expert
 
+
+
+def server_file(tmp_path, events, name="t.json"):
+    """serve/server.py's <file>.server.json (serve/timeline.py): its own pid, its thread names "server ..."."""
+    meta = [{"ph": "M", "pid": 9, "tid": t, "name": "thread_name", "args": {"name": f"server Thread-{t}"}} for t in (1, 2)]
+    p = tmp_path / (name + ".server.json")
+    p.write_text("[\n" + "".join(json.dumps(e) + ",\n" for e in meta + [{**e, "pid": 9} for e in events]), encoding="utf-8")
+    return str(tmp_path / name)
+
+
+def test_load_server_file_only(tmp_path):
+    # a mock-engine server writes only <file>.server.json: no engine file beside it, and load() still reads it
+    path = server_file(tmp_path, [X(1, "http request", 0, 5)])
+    assert not os.path.exists(path)
+    t = timeline.load(path)
+    assert [s.name for s in t.lane("server Thread-1")] == ["http request"]
+
+
+def test_runner_report(tmp_path):
+    # #310 part 2: serve/runner_hub.py writes, per job on the calling thread, `runner.call` (queued -> the end; a = the
+    # runner's exec_ms, b = the result's characters) and `runner.call wait` (queued -> picked up), both from the same
+    # start.  Three calls by hand:
+    #   total 10, 20, 40 ms; wait 1, 2, 4 ms; exec 5, 10, 30 ms -> network = total - wait - exec = 4, 8, 6 ms
+    path = server_file(tmp_path, [
+        X(1, "runner.call", 100, 110, 5, 3), X(1, "runner.call wait", 100, 101),
+        X(2, "runner.call", 105, 125, 10, 3), X(2, "runner.call wait", 105, 107),     # another thread, overlapping
+        X(1, "runner.call", 200, 240, 30, 3), X(1, "runner.call wait", 200, 204),
+        X(1, "http request", 90, 250),                                                    # not a runner call
+    ])
+    r = timeline.runner_report(timeline.load(path))
+    assert r["calls"] == 3
+    assert r["total_ms"] == {"min": pytest.approx(10.0), "median": pytest.approx(20.0), "p90": pytest.approx(40.0), "max": pytest.approx(40.0)}
+    assert r["wait_ms"] == {"min": pytest.approx(1.0), "median": pytest.approx(2.0), "p90": pytest.approx(4.0), "max": pytest.approx(4.0)}
+    assert r["exec_ms"] == {"min": pytest.approx(5.0), "median": pytest.approx(10.0), "p90": pytest.approx(30.0), "max": pytest.approx(30.0)}
+    assert r["network_ms"] == {"min": pytest.approx(4.0), "median": pytest.approx(6.0), "p90": pytest.approx(8.0), "max": pytest.approx(8.0)}
+
+
+def test_runner_report_leaves_an_unanswered_call_out_of_exec_and_network(tmp_path):
+    # a job no runner answered (offline, a timeout) has a = -1: its total and wait count, its exec and network do not
+    path = server_file(tmp_path, [
+        X(1, "runner.call", 0, 10, 4, 3), X(1, "runner.call wait", 0, 1),
+        X(1, "runner.call", 20, 80, -1, 0), X(1, "runner.call wait", 20, 80),
+    ])
+    r = timeline.runner_report(timeline.load(path))
+    assert r["calls"] == 2 and r["answered"] == 1
+    assert r["total_ms"]["max"] == pytest.approx(60.0) and r["wait_ms"]["max"] == pytest.approx(60.0)
+    assert r["exec_ms"] == {"min": pytest.approx(4.0), "median": pytest.approx(4.0), "p90": pytest.approx(4.0), "max": pytest.approx(4.0)}
+    assert r["network_ms"]["median"] == pytest.approx(5.0)          # 10 - 1 - 4
+
+
+def test_runner_calls_are_printed(tmp_path, capsys):
+    path = server_file(tmp_path, [X(1, "runner.call", 0, 10, 4, 3), X(1, "runner.call wait", 0, 1)])
+    assert timeline.main([path]) == 0
+    out = capsys.readouterr().out
+    assert "runner calls: 1" in out and "network" in out
+    assert timeline.runner_report(timeline.load(str(tmp_path / "none.json")))["calls"] == 0    # no file, no calls

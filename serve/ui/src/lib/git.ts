@@ -1,6 +1,7 @@
 // The Git state of a project's folder, as the server reads it (serve/gitview.py, read only) and as the Chat's right panel shows it (issue #99).
 import { apiHeaders, url } from "./api"
 import { msg } from "./i18n"
+import { withRunner } from "./runner"
 
 export interface GitFile { path: string; status: string; from?: string }
 export interface GitBranch { name: string; current: boolean; upstream?: string; track?: string }
@@ -16,20 +17,20 @@ export interface GitInfo {
 }
 export type GitResult = GitInfo | { ok: false; error: string } | "unavailable"      // unavailable: the server cannot be asked (another PC, an older server)
 
-/** The state of `folder` (the repository it is in, if any). */
-export async function getGit(folder: string): Promise<GitResult> {
+/** The state of `folder` (the repository it is in, if any). `runner` (#310 part 2): the folder is on the engineer's own PC. */
+export async function getGit(folder: string, runner?: string): Promise<GitResult> {
   try {
-    const r = await fetch(url("agent/git?path=" + encodeURIComponent(folder)), { headers: apiHeaders() })
+    const r = await fetch(url(withRunner("agent/git?path=" + encodeURIComponent(folder), runner)), { headers: apiHeaders() })
     if (!r.ok) return "unavailable"
     return (await r.json()) as GitResult
   } catch { return "unavailable" }
 }
 
 export interface GitDiff { ok: true; diff: string; binary: boolean; truncated: boolean }
-export async function getGitDiff(folder: string, file: string, staged: boolean, untracked: boolean): Promise<GitDiff | { ok: false; error: string } | "unavailable"> {
+export async function getGitDiff(folder: string, file: string, staged: boolean, untracked: boolean, runner?: string): Promise<GitDiff | { ok: false; error: string } | "unavailable"> {
   try {
     const q = `path=${encodeURIComponent(folder)}&file=${encodeURIComponent(file)}${staged ? "&staged=1" : ""}${untracked ? "&untracked=1" : ""}`
-    const r = await fetch(url("agent/git/diff?" + q), { headers: apiHeaders() })
+    const r = await fetch(url(withRunner("agent/git/diff?" + q, runner)), { headers: apiHeaders() })
     if (!r.ok) return "unavailable"
     return (await r.json()) as GitDiff
   } catch { return "unavailable" }

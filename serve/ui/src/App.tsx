@@ -18,6 +18,9 @@ import { PageView } from "./pages"
 import { StatusOrb } from "./components/live"
 import { ToastHost } from "./components/toast"
 import { ReelFilter } from "./components/spin"
+import { DeviceGate } from "./components/DeviceGate"
+import { ApprovalNotice } from "./components/ApprovalNotice"
+import { FreshKeyCard } from "./components/FreshKey"
 
 const NAV: Record<Page, { label: string; icon: IconSvgElement }> = {
   chat: { label: msg("Chat"), icon: Message01Icon },
@@ -194,6 +197,7 @@ function Shell() {
           <AvatarMenu />
           <LangSwitch />
         </div>
+        <ApprovalNotice />                                                                             {/* hangs under the bar, out of the page's flow and scroll (#310) */}
       </header>
       <ToastHost />
       <ReelFilter />
@@ -204,6 +208,8 @@ function Shell() {
   )
 }
 
+// The waiting screen sits above the metrics poll: a device that waits for approval (#310) does not ask for /metrics every second. A new
+// key's text sits above both, so the waiting screen never takes it away before it is copied.
 export function App() {
-  return <MetricsProvider><Shell /></MetricsProvider>
+  return <><FreshKeyCard /><DeviceGate><MetricsProvider><Shell /></MetricsProvider></DeviceGate></>
 }

@@ -2,6 +2,8 @@ import { useEffect, useState } from "react"
 import type { AgentInfo, AgentMode } from "../lib/agent"
 import { msg, t } from "../lib/i18n"
 import { FoldersEditor } from "./FoldersEditor"
+import { MachinePicker, type RunnerState } from "./RunnerSettings"
+import type { Machine } from "../lib/runner"
 import { Button, MiniSwitch, Segmented, inputCls } from "./ui"
 
 // The settings of the chat's coding tools (issue #96): on or off, the mode, the folder they work in, and the rules the user allowed for the
@@ -39,14 +41,21 @@ export interface AgentControlsProps {
   onFolders: (folders: string[]) => void
   onForget: () => void
   permsHref?: string                    // the page of the rules that last (Settings > Permissions)
+  // #310 part 2, only when this browser has a runner: where a project is (My PC or the Server PC, the latter only when the server's coding tools are this
+  // page's), the runner's state, and why the tools cannot be used here (no runner known for a My PC project)
+  machine?: { value: Machine; server: boolean; onPick: (m: Machine) => void; state?: RunnerState; locked?: boolean }      // locked: an answer is being written
+  runner?: string                       // the folders are on the engineer's own PC: listed and checked by its runner
+  blocked?: string                      // the words instead of the usual ones when the tools cannot be used
+  blockedRow?: string                   // the same, short, for the + menu's row
 }
 
 export function AgentControls(p: AgentControlsProps) {
   const one = p.folders[0] ?? ""
   const [draft, setDraft] = useState(one)
   useEffect(() => setDraft(one), [one])
-  if (!p.info.available) return <p className="text-[13px] text-ink-2">{t("The coding tools are switched off on this server (\"agent\": false in the run config).")}</p>
-  if (!p.info.allowed) return <p role="note" className="text-[13px] text-ink-2">{t("The coding tools work only from the PC that runs Strata (or with the API key), because they change files and run commands there.")}</p>
+  const picker = p.machine && p.folderOf.kind === "project" ? <MachinePicker value={p.machine.value} server={p.machine.server} onPick={p.machine.onPick} state={p.machine.state} locked={p.machine.locked} /> : null
+  if (!p.info.available) return <div className="space-y-3">{picker}<p className="text-[13px] text-ink-2">{t("The coding tools are switched off on this server (\"agent\": false in the run config).")}</p></div>
+  if (!p.info.allowed) return <div className="space-y-3">{picker}<p role="note" className="text-[13px] text-ink-2">{p.blocked ?? t("The coding tools work only from the PC that runs Strata (or with the API key), because they change files and run commands there.")}</p></div>
   const changed = draft.trim() !== one
   return (
     <div className="space-y-3" data-agent-controls>
@@ -59,10 +68,11 @@ export function AgentControls(p: AgentControlsProps) {
       </div>
       <div className={p.on ? "" : "pointer-events-none opacity-50"} aria-disabled={!p.on}>
         {p.withMode !== false && <ModePicker mode={p.mode} onMode={p.onMode} />}
+        {picker && <div className={p.withMode !== false ? "mt-3" : ""}>{picker}</div>}
         {p.folderOf.kind === "project" ? (
-          <div className={p.withMode !== false ? "mt-3" : ""}>
+          <div className={p.withMode !== false || picker ? "mt-3" : ""}>
             <span className="mb-1.5 block text-[13px]">{t("Folders")}</span>
-            <FoldersEditor folders={p.folders} onChange={p.onFolders} min={1} />
+            <FoldersEditor key={p.machine?.value} folders={p.folders} onChange={p.onFolders} min={1} runner={p.runner} />
             <span className="mt-1 block text-[12px] text-ink-2">
               {p.folders.length > 0 ? t("The folders of the project \"{name}\". Inside them files are free; outside them everything asks. Commands run in the first one.", { name: p.folderOf.name })
                 : t("The project \"{name}\" has no folder yet, so its chats use the default one. Add its folders here.", { name: p.folderOf.name })}
