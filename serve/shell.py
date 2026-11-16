@@ -92,7 +92,8 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         return
     try:
         if WIN:
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=10)
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=10,
+                           creationflags=subprocess.CREATE_NO_WINDOW)          # no console window flashes
         else:
             import signal
             os.killpg(proc.pid, signal.SIGKILL)
