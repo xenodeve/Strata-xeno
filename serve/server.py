@@ -31,6 +31,7 @@ import codecs
 import heapq
 import itertools
 import ctypes
+import gzip
 import json
 import math
 import os
@@ -521,12 +522,13 @@ def cache_slot(request: dict) -> int:
     return slot
 
 
-class FamilyCacheSlots:
-    """The rule before #321, kept for the A/B (STRATA_CACHE_SLOT_RULE=family).  The server's choice of the engine's
-    cache slot (xeno #49 S7, on upstream PR #175): Claude Code cannot send
+class CacheSlots:
+    """The server's choice of the engine's cache slot (xeno #49 S7, on upstream PR #175): Claude Code cannot send
     strata_cache_slot, and its side requests (the auto-mode classifier, titles) start from their own prompt, so on
     one slot each of them wiped the main session's cache (#50). A prompt family is its first PREFIX tokens; a family
-    keeps its slot, and a new family takes a free slot or the least recently used one."""
+    keeps its slot, and a new family takes a free slot or the least recently used one.  The default rule
+    (STRATA_CACHE_SLOT_RULE unset or "family"); #321's rules "identity" (IdentityCacheSlots) and "continuation"
+    (ContinuationCacheSlots) are chosen by that variable."""
     PREFIX = 512
 
     def __init__(self, n: int):
@@ -535,16 +537,20 @@ class FamilyCacheSlots:
         self.lock = threading.Lock()
         self.last: dict = {}                             # family -> its last prompt's ids (for shared())
 
-    def shared(self, ids):
+    def _family(self, ids, who=None):
+        """The prompt's family: its first PREFIX tokens (who is not part of it here)."""
+        return hash(tuple(ids[:self.PREFIX]))
+
+    def shared(self, ids, who=None):
         """How many leading tokens the prompt shares with the last prompt of its family; None for a new family."""
-        prev = self.last.get(hash(tuple(ids[:self.PREFIX])))
+        prev = self.last.get(self._family(ids, who))
         if prev is None:
             return None
         n = min(len(prev), len(ids))
         return next((i for i in range(n) if prev[i] != ids[i]), n)
 
-    def pick(self, ids) -> int:
-        family = hash(tuple(ids[:self.PREFIX]))
+    def pick(self, ids, who=None) -> int:
+        family = self._family(ids, who)
         with self.lock:
             self.last[family] = list(ids)
             if family in self.families:
@@ -560,13 +566,55 @@ class FamilyCacheSlots:
             self.families[family] = slot
             return slot
 
-    def choose(self, ids):
-        """-> (slot, shared, "family"): shared() and then pick(), as Service.with_slot called them before #321."""
-        shared = self.shared(ids)
-        return self.pick(ids), shared, "family"
+    def choose(self, ids, nearest=None, who=None):
+        """-> (slot, shared, "family"): shared() and then pick(), as Service.with_slot calls them."""
+        shared = self.shared(ids, who)
+        return self.pick(ids, who), shared, "family"
 
     def record(self, slot, ids):
-        """A client's own strata_cache_slot: this rule never saw it."""
+        """A client's own strata_cache_slot: this rule never sees it."""
+
+
+class IdentityCacheSlots(CacheSlots):
+    """#321, STRATA_CACHE_SLOT_RULE=identity: the family rule with the family keyed by who sends the request as well
+    as by its first PREFIX tokens, so two users of one harness (the same system prompt and tools) are two families
+    and never share a slot while a free one exists; with no free slot the least recently used family gives up its
+    slot, as in the family rule.  One identity is exactly the family rule.  Who (Service.with_slot's `who`, from
+    the HTTP handler's _slot_who): the key's name (team mode; outside it every request is "owner") and the device id
+    (X-Strata-Device, else "addr:<address>"; Claude Code sends no device header, so its address decides).  The
+    address is the socket peer, or the client a proxy on this PC named in X-Forwarded-For / Cf-Connecting-Ip /
+    Forwarded (identity.device_addr): cloudflared names it; a reverse proxy that names no one makes every user
+    127.0.0.1, and users behind one NAT address with one key are one identity - the family rule again."""
+
+    def _family(self, ids, who=None):
+        return hash((who, tuple(ids[:self.PREFIX])))
+
+
+_SLOT_TRACE_LOCK = threading.Lock()
+
+
+def slot_trace(path: str, req: dict, ids, who, route: str, info) -> None:
+    """#321: STRATA_SLOT_TRACE=<file.jsonl> (or .jsonl.gz) - one line per request that reaches Service.with_slot, for
+    tools/cacheslots_replay.py to replay every slot rule on a real client's stream: the wall time, the route, who
+    sends it (the key's NAME, never the key; the device id; the address), the prompt's token ids in full, max_tokens,
+    a client's own strata_cache_slot and the engine's cache_slots.  The file holds every prompt's tokens (about 6-7
+    bytes a token as JSON, a third of that gzipped).  A write that fails is reported once a request, never raised."""
+    rec = {"t": round(time.time(), 3), "route": route or None,
+           "who": {k: who.get(k) for k in ("key", "device", "addr")} if isinstance(who, dict) else None,
+           "max_tokens": req.get("max_tokens", req.get("max_completion_tokens")),
+           "pinned": req.get("strata_cache_slot"), "cache_slots": (info or {}).get("cache_slots") if isinstance(
+               info, dict) else None, "n": len(ids), "ids": list(ids)}
+    line = json.dumps(rec, separators=(",", ":")) + "\n"
+    try:
+        with _SLOT_TRACE_LOCK:
+            if path.endswith(".gz"):
+                with gzip.open(path, "at", encoding="utf-8") as f:
+                    f.write(line)
+            else:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line)
+    except OSError as e:
+        print(f"[strata] STRATA_SLOT_TRACE {path}: {e}", flush=True)
 
 
 def _shared_len(a, b, step=4096) -> int:
@@ -584,9 +632,9 @@ def _shared_len(a, b, step=4096) -> int:
     return i
 
 
-class CacheSlots:
-    """The server's choice of the engine's cache slot (#321; the family rule before it: FamilyCacheSlots, xeno #49
-    S7).  Each request goes to the engine as cache_slot=N; the slot holds the KV of its last prompt, and a prompt that
+class ContinuationCacheSlots:
+    """#321, STRATA_CACHE_SLOT_RULE=continuation (opt-in; the default is the family rule, CacheSlots).  The server's
+    choice of the engine's cache slot by continuation.  Each request goes to the engine as cache_slot=N; the slot holds the KV of its last prompt, and a prompt that
     lands in a slot reuses what it shares with that slot's last prompt.  The table keeps each slot's last prompt ids
     and when it was last used, nothing per conversation:
 
@@ -665,7 +713,7 @@ class CacheSlots:
         self.tick += 1
         self.table[slot] = {"ids": list(ids), "used": self.tick}
 
-    def choose(self, ids, nearest=None):
+    def choose(self, ids, nearest=None, who=None):
         """-> (slot, shared, how): how is "continues" (shared = the prefix shared with the slot's last prompt),
         "free" or "evicts" (shared None).  `nearest` (a dict) is filled with the slot sharing the most and its tail
         (its last prompt's tokens past the shared prefix), for the STRATA_DEBUG line."""
@@ -691,14 +739,14 @@ class CacheSlots:
         with self.lock:
             self._put(slot, ids)
 
-    def shared(self, ids):
+    def shared(self, ids, who=None):
         """How many leading tokens the prompt shares with the last prompt of the slot it continues; None if none."""
         ids = ids if isinstance(ids, list) else list(ids)
         with self.lock:
             best, best_sh, _, _ = self._scan(ids)
         return best_sh if best is not None else None
 
-    def pick(self, ids) -> int:
+    def pick(self, ids, who=None) -> int:
         return self.choose(ids)[0]
 
 
@@ -3273,7 +3321,7 @@ class Service:
         messages, tools, kw = anthropic_to_messages(req, vision=False)
         think_budget.side_effort(req, kw)
         ids, thinking, max_new = self.prepare(messages, None, kw, max_tokens, 1)
-        req = self.with_slot(req, ids)
+        req = self.with_slot(req, ids, route="judge")
         opening = forced_opening.required(messages, thinking)
         if opening:
             req = {**req, "_opening": opening}
@@ -3785,19 +3833,27 @@ class Service:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
 
-    def with_slot(self, req: dict, ids) -> dict:
-        """The request with the cache slot CacheSlots picks for its prompt (#321; xeno #49 S7), when the engine has
-        several slots (INFO cache_slots) and the client chose none.  A client's own strata_cache_slot is left as sent
-        and recorded, so the rule knows that slot is taken.  STRATA_CACHE_SLOT_RULE=family: the prompt-family rule
-        before #321 (FamilyCacheSlots), which ignores a client's slot."""
+    SLOT_RULES = {"family": CacheSlots, "identity": IdentityCacheSlots, "continuation": ContinuationCacheSlots}
+
+    def with_slot(self, req: dict, ids, who: dict | None = None, route: str = "") -> dict:
+        """The request with the cache slot of its prompt (xeno #49 S7), when the engine has several slots (INFO
+        cache_slots) and the client chose none.  The rule is STRATA_CACHE_SLOT_RULE (#321): unset or "family" the
+        prompt-family rule (CacheSlots), "identity" the family per sender (IdentityCacheSlots), "continuation" the
+        slot the prompt continues (ContinuationCacheSlots; it also records a client's own strata_cache_slot).  `who`
+        ({"key", "device", "addr"}, the HTTP handler's _slot_who; None for the server's own requests) and `route`
+        ("openai", "anthropic", "judge") go to STRATA_SLOT_TRACE as well."""
+        trace = os.environ.get("STRATA_SLOT_TRACE")
+        if trace:
+            slot_trace(trace, req, ids, who, route, getattr(self.engine, "info", None))
         try:
             n = int((getattr(self.engine, "info", {}) or {}).get("cache_slots", 1))
         except (TypeError, ValueError):
             n = 1
         if n <= 1:
             return req
-        family = os.environ.get("STRATA_CACHE_SLOT_RULE", "").strip().lower() == "family"
-        kind = FamilyCacheSlots if family else CacheSlots
+        name = os.environ.get("STRATA_CACHE_SLOT_RULE", "").strip().lower()
+        kind = self.SLOT_RULES.get(name, CacheSlots)
+        family = kind is not ContinuationCacheSlots
         if getattr(self, "slots", None) is None or self.slots.n != n or type(self.slots) is not kind:
             self.slots = kind(n)
         if "strata_cache_slot" in req:
@@ -3805,13 +3861,16 @@ class Service:
             if isinstance(pinned, int) and not isinstance(pinned, bool) and 0 <= pinned < n:
                 self.slots.record(pinned, ids)
             return req
+        key = (who.get("key"), who.get("device")) if isinstance(who, dict) else None
         nearest = {}
-        slot, shared, how = self.slots.choose(ids) if family else self.slots.choose(ids, nearest)
+        slot, shared, how = self.slots.choose(ids, nearest, who=key)
         if os.environ.get("STRATA_DEBUG"):              # where the prompt leaves its slot's last one, and its turns
             start = self.tok.encode("<|im_start|>", parse_special=True)
             turns = [i for i, t in enumerate(ids) if len(start) == 1 and t == start[0]]
             if family:
                 said = f"slot {slot}: {len(ids)} tokens, shares {shared} with the family's last"
+                if kind is IdentityCacheSlots:
+                    said += f" (sender {key})"
             else:                                       # the nearest slot's tail: what TAIL would have to cover
                 near = (f"; nearest: slot {nearest['slot']} shares {nearest['shared']}, tail {nearest['tail']}"
                         if nearest and how != "continues" else "")
@@ -3820,7 +3879,7 @@ class Service:
                   f"{turns[-3:] if len(turns) > 3 else ''}", flush=True)
         req = {**req, "strata_cache_slot": slot}
         if shared:                                      # the engine keeps a checkpoint there (GEN key ckpt_at): the
-            req["_ckpt_at"] = shared                    # slot's next prompt shares it (a transcript that grows
+            req["_ckpt_at"] = shared                    # family's next prompt shares it (a transcript that grows
         return req                                      # inside one message has no turn start to resume from)
 
     def cjk(self, req: dict, messages) -> dict:
@@ -6009,6 +6068,16 @@ def make_handler(svc: Service):
             before."""
             return True if self.team else self._owner_only(what)
 
+        def _slot_who(self) -> dict:
+            """#321: who sends this request, for the cache-slot rule "identity" and STRATA_SLOT_TRACE: the key's name
+            (never the key; "owner" outside team mode), the device id (X-Strata-Device, else "addr:<address>") and the
+            address (the socket peer, or the client a proxy on this PC named: identity.device_addr)."""
+            peer, h = self._peer(), self.headers
+            addr = identity_mod.device_addr(peer, mcp_admin.is_loopback(peer), h.get("Cf-Connecting-Ip"),
+                                            self._all_lines("X-Forwarded-For"), self._all_lines("Forwarded"))
+            device, _ = identity_mod.device_of(h.get("X-Strata-Device"), None, None, addr)
+            return {"key": self._acting().name, "device": device, "addr": addr}
+
         def _acting(self) -> identity_mod.Identity:
             """Who a run route acts as: the request's identity in team mode; outside it OWNER, whose every run is."""
             return self.identity if self.team else identity_mod.OWNER
@@ -7304,7 +7373,7 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             messages, req, ids, thinking, max_new = svc.prepare_carried(          # #200
                 req, messages, tools, kw, max_new, 0 if req.get("stream") else 1, force=force)
-            req = svc.with_slot(req, ids)                               # xeno #49 S7
+            req = svc.with_slot(req, ids, self._slot_who(), "openai")   # xeno #49 S7, #321
             req = {**req, "_meta": svc.meta_for("openai", messages, tools, self.headers.get("User-Agent"),
                                                who=self._acting().name)}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -7559,7 +7628,7 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             messages, req, ids, thinking, max_new = svc.prepare_carried(          # #200
                 req, messages, tools, kw, max_new, 0 if req.get("stream") else 1, force=force)
-            req = svc.with_slot(req, ids)                               # xeno #49 S7
+            req = svc.with_slot(req, ids, self._slot_who(), "anthropic")   # xeno #49 S7, #321
             req = {**req, "_meta": svc.meta_for("anthropic", messages, tools, self.headers.get("User-Agent"),
                                                who=self._acting().name)}
             budget = think_budget.for_anthropic(req, max_new)         # capped by the max_new the engine gets
