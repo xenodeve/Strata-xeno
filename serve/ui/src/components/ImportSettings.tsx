@@ -11,6 +11,8 @@ import { Collapse } from "./motion"
 import { toast } from "./toast"
 import { Button, MiniSwitch, inputCls } from "./ui"
 import { Windowed } from "./Windowed"
+import { MyPcSkills } from "./RunnerSettings"
+import { runnerId } from "../lib/runner"
 
 // Skills and MCP servers of the other coding apps on this PC (issue #94). Skills are imported automatically and are on until switched off
 // (the whole import, an app, a skill); MCP servers are only listed, by app, and imported by a click: nothing is started until then.
@@ -58,7 +60,13 @@ function Note({ view }: { view: ImportView }) {
   )
 }
 
+/** #310 part 2: with this browser's runner, Skills shows its PC's skills first (read-only), then the Server PC's. */
 export function ImportSettings({ part }: { part: "skills" | "mcp" | "memory" }) {
+  const rid = part === "skills" ? runnerId() : ""
+  return rid ? <><MyPcSkills runner={rid} /><ImportPart part={part} server /></> : <ImportPart part={part} />
+}
+
+function ImportPart({ part, server }: { part: "skills" | "mcp" | "memory"; server?: boolean }) {
   const { view, setView, busy, notice, send, rescan } = useImport()
   const [filter, setFilter] = useState("")
   const [open, setOpen] = useState<string[]>([])               // the apps whose skills are shown
@@ -109,7 +117,7 @@ export function ImportSettings({ part }: { part: "skills" | "mcp" | "memory" }) 
     const matching = filterItems(sk.items, filter, labels)
     return (
       <section>
-        <h2 className="text-[15px] font-semibold">{t("Skills from other apps")}</h2>
+        <h2 className="text-[15px] font-semibold">{server ? t("Skills on the Server PC") : t("Skills from other apps")}</h2>
         <p className="mt-1 text-[13px] text-ink-2">{t("A skill is a set of instructions the model can load when a task fits. The ones found in your other coding apps are imported automatically and stay on until you switch them off here.")}</p>
         <Note view={view} />
         <div className="mt-3 flex items-center justify-between gap-4 border-t border-line py-2.5">

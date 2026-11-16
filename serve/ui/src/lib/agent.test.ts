@@ -16,6 +16,14 @@ describe("agentRequest: what a chat request says about the coding tools", () => 
       strata_agent: { cwd: "C:/work/app", mode: "plan", session: "chat1", allow: ["Bash(git status:*)"] },
     })
   })
+  test("#310 part 2: with a runner id the request names it; without one the object is today's", () => {
+    const today = agentRequest({ agent: true, agentMode: "plan" }, ON, ["C:/work/app", "C:/lib"], "chat1", ["Bash(git status:*)"], "123")
+    expect(agentRequest({ agent: true, agentMode: "plan" }, ON, ["C:/work/app", "C:/lib"], "chat1", ["Bash(git status:*)"], "123", "r0123456789abcdef").strata_agent!.runner).toBe("r0123456789abcdef")
+    expect(agentRequest({ agent: true, agentMode: "plan" }, ON, ["C:/work/app", "C:/lib"], "chat1", ["Bash(git status:*)"], "123", undefined)).toEqual(today)
+    expect(agentRequest({ agent: true, agentMode: "plan" }, ON, ["C:/work/app", "C:/lib"], "chat1", ["Bash(git status:*)"], "123", "")).toEqual(today)
+    expect("runner" in today.strata_agent!).toBe(false)
+    expect(agentRequest({ agent: false }, ON, "C:/w", "c", [], undefined, "r0123456789abcdef")).toEqual({})
+  })
   test("no folder: no cwd", () => {
     const r = agentRequest({ agent: true }, ON, null, "c", []).strata_agent!
     expect("cwd" in r).toBe(false)

@@ -10,7 +10,7 @@ export interface StoredMessage { role: string; text: string; time?: number; comp
 export interface SessionMeta { id: string; title: string; time: number; project?: string; named?: boolean }
 /** folders: where the coding tools of the project's chats work (issue #96). The first is the main one (commands run there, relative paths start there); the others are
  *  the project's other folders, such as other git worktrees of the same repository, where files are as free as in the main one. */
-export interface Project { id: string; name: string; folders?: string[] }
+export interface Project { id: string; name: string; folders?: string[]; machine?: "my" }      // machine (#310 part 2): "my" is the engineer's own PC (its runner); absent is the Server PC, so an old project is unchanged
 export const FOLDERS_MAX = 20
 export interface SessionIndex { active: string | null; items: SessionMeta[]; projects: Project[] }
 export interface Backing { get<T>(k: string, d: T): T; set(k: string, v: unknown): boolean; remove(k: string): void }
@@ -61,7 +61,7 @@ function sanitize(raw: unknown): SessionIndex | null {
   const projects: Project[] = []
   for (const p of Array.isArray(raw.projects) ? raw.projects : []) if (isObj(p) && typeof p.id === "string" && typeof p.name === "string") {
     const folders = cleanFolders(Array.isArray(p.folders) ? p.folders : [p.folder])        // a project made when it had one folder has `folder`
-    projects.push({ id: p.id, name: p.name, ...(folders.length ? { folders } : {}) })
+    projects.push({ id: p.id, name: p.name, ...(folders.length ? { folders } : {}), ...(p.machine === "my" ? { machine: "my" as const } : {}) })
   }
   const active = typeof raw.active === "string" && items.some((i) => i.id === raw.active) ? raw.active : null
   return { active, items, projects }
@@ -156,10 +156,19 @@ export function moveSession(index: SessionIndex, id: string, project: string | u
 }
 
 /** A project is a name and the folders its chats work in (the coding tools). The page asks for at least one; projects made before that have none. */
-export function addProject(index: SessionIndex, name: string, id: string = newId(), folders?: string[]): SessionIndex {
+export function addProject(index: SessionIndex, name: string, id: string = newId(), folders?: string[], machine?: "my"): SessionIndex {
   const n = clean(name, NAME_MAX)
   const f = cleanFolders(folders)
-  return n ? { ...index, projects: [...index.projects, { id, name: n, ...(f.length ? { folders: f } : {}) }] } : index
+  return n ? { ...index, projects: [...index.projects, { id, name: n, ...(f.length ? { folders: f } : {}), ...(machine === "my" ? { machine } : {}) }] } : index
+}
+
+/** The machine a project's chats work on (#310 part 2): "my" for a project on the engineer's own PC, else (an old project, or none) the Server PC. */
+export const projectMachine = (index: SessionIndex, project?: string): "my" | "server" => (project && index.projects.find((p) => p.id === project)?.machine === "my" ? "my" : "server")
+
+/** Moves a project to the other machine; its folders stay (the page asks for the new machine's folders). */
+export function setProjectMachine(index: SessionIndex, id: string, machine: "my" | "server"): SessionIndex {
+  if (!index.projects.some((p) => p.id === id)) return index
+  return { ...index, projects: index.projects.map((p) => { if (p.id !== id) return p; const { machine: _was, ...rest } = p; return machine === "my" ? { ...rest, machine } : rest }) }
 }
 
 export function renameProject(index: SessionIndex, id: string, name: string): SessionIndex {

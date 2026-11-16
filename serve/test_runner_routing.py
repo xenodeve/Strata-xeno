@@ -278,6 +278,22 @@ class Routing(Fixture):
         self.assertEqual(helper_names, ["Read", "Glob", "Grep"])
         self.assertIs(helper_hub, self.offered[0][1])        # the run's own view
 
+    def test_helper_steps_carry_machine_and_remote(self):
+        """Task 7 carry: a helper's step on My PC is marked, and its travel reaches the page as `step_remote` on the Task call."""
+        self.start_routing(tool_call("Task", description="look around", prompt="read a.txt and report", subagent_type="explore"),
+                           tool_call("Read", file_path=CWD + "\\a.txt"), "</think>\n\nReport: it says hello.", DONE,
+                           cfg={"agents": {"on": True}})
+        f = self.fake(self.ann)
+        code, events, text = self.chat(self.ann, {"cwd": CWD, "session": "chat-1", "runner": f.id})
+        self.assertEqual(code, 200, events)
+        task = next(e for e in events if e["event"] == "call" and e["name"] == "Task")
+        step = next(e for e in events if e["event"] == "step")
+        self.assertEqual((step["name"], step["machine"], step["call_id"]), ("Read", "my", task["id"]))
+        travel = [e for e in events if e["event"] == "step_remote"]
+        self.assertEqual([e["state"] for e in travel], ["sending", "running"])
+        self.assertTrue(all(e["id"] == step["id"] and e["call_id"] == task["id"] for e in travel))
+        self.assertEqual([e for e in events if e["event"] == "remote" and e["id"] != task["id"]], [])     # no top-level remote for a helper's call id
+
     def test_runner_goes_offline_during_the_call(self):
         """Review Focus 1 in the stream: sending, running, offline, then a result the model reads; no fallback."""
         self.start_routing(tool_call("Read", file_path=CWD + "\\a.txt"), DONE)

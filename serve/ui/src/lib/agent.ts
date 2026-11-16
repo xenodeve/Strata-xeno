@@ -3,23 +3,24 @@
 // what happened. Nothing here can make a call run without the server's say-so.
 import type { Backing } from "./sessions"
 
-export interface AgentInfo { available: boolean; allowed: boolean; reason?: string; shell: string | null; tools: string[] }
+export interface AgentInfo { available: boolean; allowed: boolean; reason?: string; shell: string | null; tools: string[]; machine?: string; online?: boolean }      // machine, online: GET /agent?runner= (#310 part 2)
 export const NO_AGENT: AgentInfo = { available: false, allowed: false, shell: null, tools: [] }
 export type AgentMode = "ask" | "plan" | "auto"
 export const MODES: AgentMode[] = ["ask", "plan", "auto"]
 
-export interface AgentRequest { cwd?: string; dirs?: string[]; mode: AgentMode; session: string; allow: string[]; deny?: string[]; checkpoint?: string; run?: string }
+export interface AgentRequest { cwd?: string; dirs?: string[]; mode: AgentMode; session: string; allow: string[]; deny?: string[]; checkpoint?: string; run?: string; runner?: string }
 
 /** What a request says: `strata_agent` when the coding tools are on (the default), reachable from here and the server has them; else nothing.
- *  An unknown mode is the default one (the server also ignores it). */
-export function agentRequest(s: { agent?: boolean; agentMode?: string }, info: AgentInfo, folders: string | string[] | null | undefined, session: string | null, rules: string[] | { allow: string[]; deny?: string[] }, checkpoint?: string): { strata_agent?: AgentRequest } {
+ *  An unknown mode is the default one (the server also ignores it). `runner` (#310 part 2): the chat's project is on the engineer's own PC, and
+ *  this is its runner: the tools run there. */
+export function agentRequest(s: { agent?: boolean; agentMode?: string }, info: AgentInfo, folders: string | string[] | null | undefined, session: string | null, rules: string[] | { allow: string[]; deny?: string[] }, checkpoint?: string, runner?: string): { strata_agent?: AgentRequest } {
   if (s.agent === false || !info.available || !info.allowed) return {}
   const mode: AgentMode = s.agentMode === "plan" || s.agentMode === "auto" ? s.agentMode : "ask"
   const list = (Array.isArray(folders) ? folders : [folders]).filter((f): f is string => typeof f === "string" && f.trim().length > 0).map((f) => f.trim())
   const [cwd, ...dirs] = list                                                  // the first is the main folder; the others are the project's other folders
   const allow = (Array.isArray(rules) ? rules : rules.allow).slice(0, 200)
   const deny = (Array.isArray(rules) ? [] : rules.deny ?? []).slice(0, 200)
-  return { strata_agent: { ...(cwd ? { cwd } : {}), ...(cwd && dirs.length ? { dirs } : {}), mode, session: session || "new", allow, ...(deny.length ? { deny } : {}), ...(checkpoint ? { checkpoint } : {}) } }
+  return { strata_agent: { ...(cwd ? { cwd } : {}), ...(cwd && dirs.length ? { dirs } : {}), mode, session: session || "new", allow, ...(deny.length ? { deny } : {}), ...(checkpoint ? { checkpoint } : {}), ...(runner ? { runner } : {}) } }
 }
 
 // ------------------------------------------------------------------------------------------------ the rules of a chat

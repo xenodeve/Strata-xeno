@@ -16,9 +16,9 @@ import { Button, inputCls } from "./ui"
 export type Listing = FolderView | "unknown" | null
 const SUGGEST_MAX = 8                                // the folders offered while a path is typed; "and n more" for the rest
 
-/** The path a typed folder leads to, or why it is not one. */
-export async function checkFolder(path: string): Promise<{ path: string } | { error: string }> {
-  const r = await getFolders(path.trim())
+/** The path a typed folder leads to, or why it is not one. `runner` (#310 part 2): the folder is on the engineer's own PC. */
+export async function checkFolder(path: string, runner?: string): Promise<{ path: string } | { error: string }> {
+  const r = await getFolders(path.trim(), runner)
   if (r === "unknown") return { path: path.trim() }
   if ("error" in r) return { error: t("That is not a folder on this PC.") }
   return { path: r.path }
@@ -41,13 +41,14 @@ export interface FoldersApi {
   focus: () => void
 }
 
-export function FoldersEditor({ folders, onChange, min = 0, onDraft, onSubmit, api }: {
+export function FoldersEditor({ folders, onChange, min = 0, onDraft, onSubmit, api, runner }: {
   folders: string[]
   onChange: (next: string[]) => void
   min?: number                                  // the fewest folders: the last one(s) cannot be taken away
   onDraft?: (text: string) => void              // what is typed in the field, as it is typed
   onSubmit?: () => void                         // Enter in the field with nothing typed
   api?: Ref<FoldersApi>
+  runner?: string                               // #310 part 2: the folders are on the engineer's own PC: listed and checked by its runner
 }) {
   const [draft, setDraftState] = useState("")
   const [browsing, setBrowsing] = useState(false)
@@ -67,7 +68,7 @@ export function FoldersEditor({ folders, onChange, min = 0, onDraft, onSubmit, a
     if (!q) { setSugg(null); return }
     let stale = false
     const timer = setTimeout(async () => {
-      const r = await getFolders(q.base)
+      const r = await getFolders(q.base, runner)
       if (stale) return
       if (r === "unknown" || "error" in r) { setSugg(null); return }
       const names = rank(r.dirs.map((d) => d.name), q.partial)
@@ -86,7 +87,7 @@ export function FoldersEditor({ folders, onChange, min = 0, onDraft, onSubmit, a
   }
 
   const look = async (path: string, follow = true) => {                     // list a folder; the field follows where the list is
-    const r = await getFolders(path)
+    const r = await getFolders(path, runner)
     if (r === "unknown") { setListing("unknown"); return }
     if ("error" in r) { if (path.trim()) return look("", follow); setListing("unknown"); return }
     setListing(r)
@@ -98,7 +99,7 @@ export function FoldersEditor({ folders, onChange, min = 0, onDraft, onSubmit, a
     if (draft.trim()) { void look(draft.trim(), false); return }
     const last = folders.at(-1)
     if (last) {                                                              // another folder next to the last one: start in the folder above it
-      const r = await getFolders(last)
+      const r = await getFolders(last, runner)
       if (r !== "unknown" && !("error" in r) && r.parent !== null) { void look(r.parent, false); return }
     }
     void look("", false)
@@ -109,7 +110,7 @@ export function FoldersEditor({ folders, onChange, min = 0, onDraft, onSubmit, a
     if (!text) return folders
     if (folders.length >= FOLDERS_MAX) { setProblem(t("A project can have up to {n} folders.", { n: FOLDERS_MAX })); return null }
     setChecking(true)
-    const r = await checkFolder(text)
+    const r = await checkFolder(text, runner)
     setChecking(false)
     if ("error" in r) { setProblem(r.error); field.current?.focus(); return null }
     const next = folders.includes(r.path) ? folders : [...folders, r.path]

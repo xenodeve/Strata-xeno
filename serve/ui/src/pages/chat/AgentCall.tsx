@@ -12,6 +12,7 @@ import { fmt } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
 import { msg, t } from "../../lib/i18n"
 import { eventText, noteText, type HookNote } from "../../lib/hooks"
+import { closeReason, machineOf, MACHINE_LABEL, runnerId } from "../../lib/runner"
 
 // A call of the chat's coding tools (issue #96: Read, Write, Edit, Glob, Grep, Bash, ...), shown by what it is: the command and its output,
 // an edit as a diff, a file's lines. When the server asks the user about it, the question is a card on the call: Allow, Allow for this chat,
@@ -44,6 +45,22 @@ const QUESTION: Record<string, string> = {
 }
 
 const str = (x: unknown) => (typeof x === "string" ? x : "")
+
+/** #310 part 2: which machine ran the call, "My PC" or "Server PC" - only in a browser that has a runner (elsewhere every call is the server's, as before). */
+export function MachineMark({ call }: { call: { server?: string; machine?: string } }) {
+  if (!call.server || !runnerId()) return null
+  const m = machineOf(call)
+  return <span data-machine={m} className="shrink-0 rounded-sm bg-fill px-1.5 text-[11px] text-ink-2">{t(MACHINE_LABEL[m])}</span>
+}
+
+/** #310 part 2: a helper's step on My PC while it travels there or runs (the words Task 8's status uses). */
+function stepTravel(s: Step): string | null {
+  if (s.state !== "running") return null                                         // once its result is in, the result says what happened
+  if (s.remote === "offline") return t("Your PC is offline…")
+  if (s.remote === "sending") return t("Sending the call to your PC…")
+  if (s.machine === "my" && s.state === "running") return t("Running {tool} on your PC…", { tool: s.name })
+  return null
+}
 const arg = (call: ToolCall, k: string) => (call.arguments && typeof call.arguments === "object" ? (call.arguments as Record<string, unknown>)[k] : undefined)
 const Out = ({ text }: { text: string }) => <pre className="tool-pre">{text}</pre>
 
@@ -69,7 +86,7 @@ function Ask({ call }: { call: ToolCall }) {
   if (done) {
     return (
       <div className="space-y-1 border-t border-line px-3 py-2 text-[12.5px]" data-asked-answers>
-        {asked.answers === null ? <div className="text-ink-2">{asked.stopped ? t("The answer stopped before you answered.") : t("You skipped the questions.")}</div> : asked.questions.map((q) => (
+        {asked.answers === null ? <div className="text-ink-2" data-closed={asked.closed}>{closeReason(asked.closed) ?? (asked.stopped ? t("The answer stopped before you answered.") : t("You skipped the questions."))}</div> : asked.questions.map((q) => (
           <div key={q.question}><span className="text-ink-2">{q.header}: </span><span className="font-medium">{(asked.answers?.[q.question] ?? []).join(", ") || t("(no answer)")}</span></div>
         ))}
       </div>
@@ -184,9 +201,10 @@ function HelperSteps({ call }: { call: ToolCall }) {
       {hidden > 0 && <div className="text-ink-3">{t("{n} earlier steps", { n: fmt(hidden) })}</div>}
       <ul className="m-0 mt-0.5 list-none space-y-0.5 p-0">
         {shown.map((s) => (
-          <li key={s.id} data-step={s.state} className={cn("flex gap-2", s.state === "error" && "text-bad")}>
+          <li key={s.id} data-step={s.state} data-remote={s.remote} className={cn("flex gap-2", s.state === "error" && "text-bad")}>
             <span aria-hidden className="w-3 shrink-0 text-ink-3">{s.state === "running" ? "…" : s.state === "done" ? "✓" : "✕"}</span>
             <span className="min-w-0 truncate font-mono text-[11.5px]"><span className="font-medium">{s.name}</span> {toolSummary(s.name, s.arguments)}</span>
+            {stepTravel(s) && <span className={cn("shrink-0 text-[11.5px]", s.remote === "offline" ? "text-bad" : "text-ink-3")}>{stepTravel(s)}</span>}
           </li>
         ))}
       </ul>
@@ -239,6 +257,7 @@ export function AgentCall({ call }: { call: ToolCall }) {
         {busy && <Orb design={toolDesign(call.name)} size={20} />}
         <span className={cn("font-medium", busy && "t-shimmer")}>{name}</span>
         <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink-3">{summary}</span>
+        <MachineMark call={call} />
         <span className={cn("shrink-0", call.state === "error" ? "text-bad" : call.state === "asking" ? "font-medium text-ink" : "text-ink-2")}>{t(STATE[call.state])}</span>
         {call.ms != null && call.state !== "skipped" && <span className="num shrink-0 text-ink-3">{fmt(call.ms / 1000, 1)} s</span>}
         <HugeiconsIcon icon={ArrowDown01Icon} size={14} aria-hidden className={cn("shrink-0 text-ink-3 transition-transform duration-200", open && "rotate-180")} />
@@ -248,7 +267,7 @@ export function AgentCall({ call }: { call: ToolCall }) {
       <HookNotes notes={call.hooks} />
       {call.question && <Ask call={call} />}
       {pending && !waiting && <Question call={call} />}
-      {call.ask?.answer && <div className="border-t border-line px-3 py-1.5 text-[12px] text-ink-2">{call.ask.stopped ? t("The answer stopped before you answered.") : call.ask.kept ? keptText(call.ask.kept) : call.ask.answer === "deny" ? t("You did not allow it.") : call.ask.answer === "allow_chat" ? t("You allowed it for this chat.") : t("You allowed it.")}</div>}
+      {call.ask?.answer && <div className="border-t border-line px-3 py-1.5 text-[12px] text-ink-2" data-closed={call.ask.closed}>{closeReason(call.ask.closed) ?? (call.ask.stopped ? t("The answer stopped before you answered.") : call.ask.kept ? keptText(call.ask.kept) : call.ask.answer === "deny" ? t("You did not allow it.") : call.ask.answer === "allow_chat" ? t("You allowed it for this chat.") : t("You allowed it."))}</div>}
       <Collapse open={open && !pending}>
         <div className="space-y-2 border-t border-line px-3 py-2.5"><Body call={call} /></div>
       </Collapse>

@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from "react"
-import { BookOpen01Icon, Brain01Icon, ComputerTerminal01Icon, Shield01Icon, Download04Icon, Key01Icon, PaintBoardIcon, PlugSocketIcon, ServerStack01Icon, WebhookIcon, Globe02Icon, UserGroupIcon, UserLock01Icon } from "@hugeicons/core-free-icons"
+import { BookOpen01Icon, Brain01Icon, ComputerTerminal01Icon, Shield01Icon, Download04Icon, Key01Icon, LaptopIcon, PaintBoardIcon, PlugSocketIcon, ServerStack01Icon, WebhookIcon, Globe02Icon, UserGroupIcon, UserLock01Icon } from "@hugeicons/core-free-icons"
 import { href } from "../lib/router"
 import { msg, t, useLang } from "../lib/i18n"
 import { store } from "../lib/store"
@@ -19,19 +19,21 @@ import { getAgent } from "../lib/api"
 import { refreshTeam } from "../lib/keys"
 import { chat } from "../lib/chat"
 import { NO_AGENT, type AgentInfo } from "../lib/agent"
+import { RunnerSettings, runnerLine, useRunnerAgent } from "../components/RunnerSettings"
+import { chatMachine, runnerId } from "../lib/runner"
 
 // What can be set in the app, apart from what About tells. A menu of sections and topics; the address says which topic shows
 // (#/settings/mcp-servers), so a link can point at one. The status marks and the API key are kept in this browser; the MCP
 // servers and their limits are saved in the run config, from this PC.
-const TOPICS = ["status-marks", "api-key", "keys", "coding-tools", "permissions", "hooks", "web", "helpers", "mcp-servers", "mcp-limits", "import-skills", "import-mcp", "import-memory"] as const
+const TOPICS = ["status-marks", "api-key", "keys", "runner", "coding-tools", "permissions", "hooks", "web", "helpers", "mcp-servers", "mcp-limits", "import-skills", "import-mcp", "import-memory"] as const
 type Topic = (typeof TOPICS)[number]
-const LABEL: Record<Topic, string> = { "status-marks": msg("Status marks"), "api-key": msg("API key"), keys: msg("Keys and devices"), "coding-tools": msg("Coding tools"), permissions: msg("Permissions"), hooks: msg("Hooks"), web: msg("Web access"), helpers: msg("Sub-agents"), "mcp-servers": msg("Servers"), "mcp-limits": msg("Limits"), "import-skills": msg("Skills"), "import-mcp": msg("MCP servers"), "import-memory": msg("Memory") }
+const LABEL: Record<Topic, string> = { "status-marks": msg("Status marks"), "api-key": msg("API key"), keys: msg("Keys and devices"), runner: msg("This browser's runner"), "coding-tools": msg("Coding tools"), permissions: msg("Permissions"), hooks: msg("Hooks"), web: msg("Web access"), helpers: msg("Sub-agents"), "mcp-servers": msg("Servers"), "mcp-limits": msg("Limits"), "import-skills": msg("Skills"), "import-mcp": msg("MCP servers"), "import-memory": msg("Memory") }
 const SECTIONS: { value: string; label: string; topics: Topic[] }[] = [
-  { value: "general", label: msg("General"), topics: ["status-marks", "api-key", "keys", "coding-tools", "permissions", "hooks", "web", "helpers"] },
+  { value: "general", label: msg("General"), topics: ["status-marks", "api-key", "keys", "runner", "coding-tools", "permissions", "hooks", "web", "helpers"] },
   { value: "mcp", label: msg("MCP tools"), topics: ["mcp-servers", "mcp-limits"] },
   { value: "import", label: msg("Import"), topics: ["import-skills", "import-mcp", "import-memory"] },
 ]
-const ICON = { "status-marks": PaintBoardIcon, "api-key": Key01Icon, keys: UserLock01Icon, "coding-tools": ComputerTerminal01Icon, permissions: Shield01Icon, hooks: WebhookIcon, web: Globe02Icon, helpers: UserGroupIcon, "mcp-servers": ServerStack01Icon, "mcp-limits": PlugSocketIcon, "import-skills": BookOpen01Icon, "import-mcp": Download04Icon, "import-memory": Brain01Icon }
+const ICON = { "status-marks": PaintBoardIcon, "api-key": Key01Icon, keys: UserLock01Icon, runner: LaptopIcon, "coding-tools": ComputerTerminal01Icon, permissions: Shield01Icon, hooks: WebhookIcon, web: Globe02Icon, helpers: UserGroupIcon, "mcp-servers": ServerStack01Icon, "mcp-limits": PlugSocketIcon, "import-skills": BookOpen01Icon, "import-mcp": Download04Icon, "import-memory": Brain01Icon }
 
 function ApiKey() {
   const [key, setKey] = useState(() => store.get("apikey", ""))
@@ -59,12 +61,17 @@ function CodingTools() {
   useEffect(() => { void getAgent().then((v) => v && setInfo(v)) }, [])
   useSyncExternalStore(chat.subscribe, chat.getVersion)
   const s = chat.settings
+  // #310 part 2: a chat in no project works on My PC when this page is not the owner's and has a runner: these are that PC's tools
+  const rid = runnerId()
+  const [my] = useRunnerAgent(rid, 0)
+  const onMy = chatMachine({ project: undefined, serverAllowed: info.allowed, runner: rid }) === "my"
+  const shown: AgentInfo = !onMy ? info : typeof my === "object" && my !== null ? { ...my, allowed: true } : { ...NO_AGENT, available: true }
   return (
     <section>
       <h2 className="text-[15px] font-semibold">{t("Coding tools")}</h2>
       <p className="mt-1 mb-3 text-[13px] text-ink-2">{t("The chat can read, search and change files and run commands on this PC with Claude Code's own tools, and asks you before anything that is not plainly safe. Here are the defaults; a project has its own folders, chosen when it is made.")}</p>
       <AgentControls
-        info={info} on={s.agent !== false} mode={s.agentMode === "plan" || s.agentMode === "auto" ? s.agentMode : "ask"} folders={s.agentFolder?.trim() ? [s.agentFolder.trim()] : []} folderOf={{ kind: "default" }} rules={0}
+        info={shown} blocked={onMy ? runnerLine(my) : undefined} on={s.agent !== false} mode={s.agentMode === "plan" || s.agentMode === "auto" ? s.agentMode : "ask"} folders={s.agentFolder?.trim() ? [s.agentFolder.trim()] : []} folderOf={{ kind: "default" }} rules={0}
         onToggle={() => chat.setSettings({ ...s, agent: s.agent === false })} onMode={(m) => chat.setSettings({ ...s, agentMode: m })}
         onFolders={(list) => chat.setSettings({ ...s, agentFolder: list[0]?.trim() ?? "" })} onForget={() => {}}
       />
@@ -97,7 +104,7 @@ export function Settings({ topic }: { topic?: string }) {
           <BranchedMenu startOpen sections={sections} active={active} label={t("Settings sections")} onSelect={(x) => { location.hash = href("settings", x) }} />
         </aside>
         <div key={active} className="panel-in min-w-0 max-w-[65ch] flex-1">
-          {active === "status-marks" ? <Marks /> : active === "api-key" ? <ApiKey /> : active === "keys" ? <KeysSettings /> : active === "coding-tools" ? <CodingTools /> : active === "permissions" ? <PermissionsSettings /> : active === "hooks" ? <HooksSettings /> : active === "web" ? <WebSettings /> : active === "helpers" ? <HelpersSettings /> : active === "import-skills" ? <ImportSettings part="skills" /> : active === "import-mcp" ? <ImportSettings part="mcp" /> : active === "import-memory" ? <ImportSettings part="memory" /> : <McpSettings part={active === "mcp-servers" ? "servers" : "limits"} />}
+          {active === "status-marks" ? <Marks /> : active === "api-key" ? <ApiKey /> : active === "keys" ? <KeysSettings /> : active === "runner" ? <RunnerSettings /> : active === "coding-tools" ? <CodingTools /> : active === "permissions" ? <PermissionsSettings /> : active === "hooks" ? <HooksSettings /> : active === "web" ? <WebSettings /> : active === "helpers" ? <HelpersSettings /> : active === "import-skills" ? <ImportSettings part="skills" /> : active === "import-mcp" ? <ImportSettings part="mcp" /> : active === "import-memory" ? <ImportSettings part="memory" /> : <McpSettings part={active === "mcp-servers" ? "servers" : "limits"} />}
         </div>
       </div>
     </div>

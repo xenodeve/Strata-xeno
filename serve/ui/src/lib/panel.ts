@@ -2,6 +2,7 @@
 // where the panel is left open. Derived from the messages, so a stored conversation has them too.
 import type { Message, Todo } from "./chat"
 import { skillOfMessage } from "./slash"
+import { isSkillsServer } from "./runner"
 
 export type PanelTab = "git" | "plan" | "skills" | "memory" | "context"
 export const PANEL_TABS: PanelTab[] = ["git", "plan", "skills", "memory", "context"]
@@ -37,7 +38,7 @@ export interface SkillCall { kind: "use" | "file" | "find"; name?: string }
 
 /** What a tool call of the skills server is: loading a skill, reading a file of one, or looking for one. Null for any other call. */
 export function skillCall(call: { server?: string; tool?: string; arguments?: unknown }): SkillCall | null {
-  if (call.server !== "skills") return null
+  if (!isSkillsServer(call.server)) return null                                   // the server's skills, or My PC's (#310 part 2)
   const name = call.arguments && typeof call.arguments === "object" && typeof (call.arguments as { name?: unknown }).name === "string" ? (call.arguments as { name: string }).name : undefined
   if (call.tool === "use_skill") return { kind: "use", name }
   if (call.tool === "read_skill_file") return { kind: "file", name }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
-  addProject, cleanFolders, foldersOf, FOLDERS_MAX, loadIndex, moveSession, newSession, openSession, removeProject, removeSession, renameProject, renameSession, saveActive, setProjectFolders, titleOf,
+  addProject, cleanFolders, foldersOf, FOLDERS_MAX, loadIndex, moveSession, newSession, openSession, projectMachine, removeProject, removeSession, renameProject, renameSession, saveActive, setProjectFolders, setProjectMachine, titleOf,
   type Backing, type SessionIndex,
 } from "./sessions"
 
@@ -229,6 +229,31 @@ describe("projects", () => {
     b.set("chats", { active: null, items: [], projects: [{ id: "p1", name: "A", folders: [5, null] }, { id: "p2", name: "B", folders: ["x".repeat(2000)] }, { id: "p3", name: "C", folders: ["C:/ok", 7, "C:/ok"] }] })
     expect(loadIndex(b, 1).projects.map((p) => p.folders)).toEqual([undefined, undefined, ["C:/ok"]])
     expect(setProjectFolders({ active: null, items: [], projects: [{ id: "p1", name: "A" }] }, "p1", ["y".repeat(2000)]).projects[0].folders).toBeUndefined()
+  })
+  test("#310 part 2: a project on My PC keeps its machine through save and load; an old project is on the Server PC", () => {
+    const b = memory()
+    let idx = addProject({ active: null, items: [], projects: [] }, "Mine", "p1", ["C:/w"], "my")
+    idx = addProject(idx, "Old", "p2", ["C:/x"])
+    expect(idx.projects).toEqual([{ id: "p1", name: "Mine", folders: ["C:/w"], machine: "my" }, { id: "p2", name: "Old", folders: ["C:/x"] }])     // no key for the Server PC: an old project is unchanged
+    b.set("chats", idx)
+    const back = loadIndex(b, 1)
+    expect(back.projects[0].machine).toBe("my")
+    expect(projectMachine(back, "p1")).toBe("my")
+    expect(projectMachine(back, "p2")).toBe("server")
+    expect(projectMachine(back, undefined)).toBe("server")
+    expect(projectMachine(back, "nope")).toBe("server")
+    b.set("chats", { active: null, items: [], projects: [{ id: "p3", name: "C", machine: "server" }, { id: "p4", name: "D", machine: 5 }] })
+    expect(loadIndex(b, 1).projects).toEqual([{ id: "p3", name: "C" }, { id: "p4", name: "D" }])         // only "my" is kept
+  })
+  test("#310 part 2: a project's machine can be changed; its folders and name stay", () => {
+    let idx = addProject({ active: null, items: [], projects: [] }, "Work", "p1", ["C:/w"])
+    idx = setProjectMachine(idx, "p1", "my")
+    expect(idx.projects[0]).toEqual({ id: "p1", name: "Work", folders: ["C:/w"], machine: "my" })
+    idx = setProjectMachine(idx, "p1", "server")
+    expect(idx.projects[0]).toEqual({ id: "p1", name: "Work", folders: ["C:/w"] })
+    expect(setProjectMachine(idx, "nope", "my")).toBe(idx)
+    expect(renameProject(setProjectMachine(idx, "p1", "my"), "p1", "Home").projects[0].machine).toBe("my")
+    expect(setProjectFolders(setProjectMachine(idx, "p1", "my"), "p1", ["C:/z"]).projects[0].machine).toBe("my")
   })
   test("renaming a project keeps its folders", () => {
     let idx = setProjectFolders(addProject({ active: null, items: [], projects: [] }, "Work", "p1"), "p1", ["C:/w", "C:/w2"])

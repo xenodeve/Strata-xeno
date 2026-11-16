@@ -2,6 +2,7 @@
 // wrote down (off until switched on). `/init` is the command that has the model write the project's instruction file.
 import { apiHeaders, url } from "./api"
 import { postImport } from "./api"
+import { withRunner } from "./runner"
 
 export interface MemorySource {
   id: string                      // "project:0", "claude:instructions", "claude:memory"
@@ -15,18 +16,19 @@ export interface MemoryList { max: number; sources: MemorySource[] }
 
 const query = (folders: string[]) => `path=${encodeURIComponent(folders[0] ?? "")}${folders.slice(1).map((f) => "&dirs=" + encodeURIComponent(f)).join("")}`
 
-/** The sources there are for a project's folders (the first is the main one); null when the server cannot be asked. */
-export async function getMemory(folders: string[]): Promise<MemoryList | null> {
+/** The sources there are for a project's folders (the first is the main one); null when the server cannot be asked. `runner` (#310 part 2): the
+ *  project is on the engineer's own PC, whose notes are read there. */
+export async function getMemory(folders: string[], runner?: string): Promise<MemoryList | null> {
   try {
-    const r = await fetch(url("agent/memory?" + query(folders)), { headers: apiHeaders() })
+    const r = await fetch(url(withRunner("agent/memory?" + query(folders), runner)), { headers: apiHeaders() })
     return r.ok ? ((await r.json()) as MemoryList) : null
   } catch { return null }
 }
 
 /** The text of one file of a source (`n` is its place in `shown`). */
-export async function getMemoryFile(folders: string[], id: string, n: number): Promise<{ name: string; text: string; cut: boolean } | null> {
+export async function getMemoryFile(folders: string[], id: string, n: number, runner?: string): Promise<{ name: string; text: string; cut: boolean } | null> {
   try {
-    const r = await fetch(url(`agent/memory/file?${query(folders)}&id=${encodeURIComponent(id)}&n=${n}`), { headers: apiHeaders() })
+    const r = await fetch(url(withRunner(`agent/memory/file?${query(folders)}&id=${encodeURIComponent(id)}&n=${n}`, runner)), { headers: apiHeaders() })
     if (!r.ok) return null
     const j = await r.json()
     return j?.ok === true ? { name: String(j.name), text: String(j.text), cut: !!j.cut } : null

@@ -87,7 +87,7 @@ export interface PromptBarProps {
   onSampling: () => void
   agent: AgentControlsProps                  // the coding tools (issue #96): a row in the + menu that opens their switch, mode and folder
   context: { view: ContextView; canCompact: boolean; onCompact: () => void; open: number }      // the context window (issue #99): a chip with the share used, a panel with what it is made of; `open` counts the times /context asked for the panel
-  mention: { folders: string[]; enabled: boolean }          // `@file`: the files of the project's folders are offered while a name is typed after an @ (enabled: this page may read them)
+  mention: { folders: string[]; enabled: boolean; runner?: string }          // `@file`: the files of the project's folders are offered while a name is typed after an @ (enabled: this page may read them)
   skills: Command[]                          // the skills in use: "/" at the start of the message lists them, to be picked by name
   mcp: { servers: McpServer[]; tools: number; on: boolean; off: string[]; onToggleAll: () => void; onToggleServer: (name: string) => void; setupHref: string }      // the MCP tools: a row in the + menu that opens the list of servers, each with its tools and its own switch
   efforts: string[]
@@ -174,7 +174,7 @@ export function PromptBar(p: PromptBarProps) {
   useEffect(() => {
     if (!at) { setFileList([]); return }
     let stale = false
-    const timer = setTimeout(async () => { const r = await getFiles(p.mention.folders, at.query); if (!stale) { setFileList(r ?? []); setFileAt(0) } }, 120)
+    const timer = setTimeout(async () => { const r = await getFiles(p.mention.folders, at.query, p.mention.runner); if (!stale) { setFileList(r ?? []); setFileAt(0) } }, 120)
     return () => { stale = true; clearTimeout(timer) }
   }, [at?.query, at?.start, foldersKey]) // eslint-disable-line react-hooks/exhaustive-deps
   const mentionOpen = !!at && fileList.length > 0 && fileShut !== p.value && menu === null

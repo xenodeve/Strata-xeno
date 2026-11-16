@@ -8,6 +8,8 @@ import { Collapse, Reveal } from "./motion"
 import { StatusLabel } from "./orb"
 import { toast } from "./toast"
 import { Button, Field, Segmented, inputCls } from "./ui"
+import { MyPcMcp } from "./RunnerSettings"
+import { runnerId } from "../lib/runner"
 
 // Setting up MCP servers (issue #79; on the Settings page): the list with each one's state and tools, add / edit / disable / delete, a box for a
 // block pasted from Claude Desktop, and the limits. Each change is saved at once (the server restarts its servers from the
@@ -41,7 +43,8 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
     return () => clearInterval(id)
   }, [starting])
 
-  if (!view) return null
+  const rid = part === "servers" ? runnerId() : ""                         // #310 part 2: this browser's runner: its PC's servers first, read-only
+  if (!view) return rid ? <MyPcMcp runner={rid} /> : null
   const rows = view.servers
   const can = view.editable
   const taken = rows.filter((r) => r.source === "config").map((r) => r.name)
@@ -150,8 +153,10 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
 
   const nTools = view.tools
   return (
+    <>
+    {rid && <MyPcMcp runner={rid} />}
     <section>
-      <h2 className="text-[15px] font-semibold">{t("MCP servers")}</h2>
+      <h2 className="text-[15px] font-semibold">{rid ? t("MCP servers on the Server PC") : t("MCP servers")}</h2>
       <p className="mt-1 text-[13px] text-ink-2">
         {rows.length ? t("{n} tools; the model calls them when it decides to.", { n: fmt(nTools) }) : t("No server is set up yet. A server gives the model tools: files, a browser, a database.")}
       </p>
@@ -269,6 +274,7 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
       </Reveal>
 
     </section>
+    </>
   )
 }
 

@@ -145,8 +145,12 @@ def _forward(parent, e: dict) -> int:
     """A helper's tool activity to the page, on the Task call: its calls and results as steps, its questions as they are; 1 for a step that started."""
     ev = e.get("event")
     if ev == "call":
-        parent._emit({"event": "step", "id": e.get("id"), "name": e.get("tool") or e.get("name"), "arguments": e.get("arguments")})
+        parent._emit({"event": "step", "id": e.get("id"), "name": e.get("tool") or e.get("name"), "arguments": e.get("arguments"),
+                      **({"machine": "my"} if e.get("machine") == "my" else {})})          # #310 part 2: a step on the engineer's own PC
         return 1
+    if ev == "remote":                                                           # #310 part 2: its travel to that PC, under the step (not a call of the run)
+        parent._emit({"event": "step_remote", "id": e.get("id"), "state": e.get("state")})
+        return 0
     if ev == "result":
         parent._emit({"event": "step_result", "id": e.get("id"), "ok": bool(e.get("ok")), "chars": e.get("chars"), "text": str(e.get("text") or "")[:300]})
         return 0

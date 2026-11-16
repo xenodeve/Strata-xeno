@@ -34,6 +34,8 @@ import { SettingsSheet } from "./SettingsSheet"
 import { PanelDock } from "../../components/SidePanel"
 import { ProjectPicker } from "../../components/ProjectPicker"
 import { panelState, type PanelState, type PanelTab } from "../../lib/panel"
+import { runnerId } from "../../lib/runner"
+import { runnerLine, useRunnerAgent } from "../../components/RunnerSettings"
 
 const NO_MCP: McpInfo = { servers: [], tools: 0 }
 
@@ -94,9 +96,21 @@ export function Chat({ id }: { id?: string }) {
   const [agentInfo, setAgentInfo] = useState<AgentInfo>(NO_AGENT)  // the coding tools: does the server have them, and may this page use them
   useEffect(() => {
     let gone = false
-    void getAgent().then((v) => { if (!gone && v) setAgentInfo(v) })
+    void getAgent().then((v) => { if (!gone && v) { setAgentInfo(v); chat.serverAllowed = !!v.allowed; chat.notify() } })      // #310 part 2: a chat in no project runs on the Server PC for an owner
     return () => { gone = true }
   }, [])
+  // #310 part 2: this browser's runner (the engineer's own PC). Its coding tools and its MCP servers, asked again now and then (no job on the PC: the
+  // answer is from its hello), so a runner that comes online is used without a reload. Nothing of this happens without a runner id.
+  const rid = runnerId()
+  const [myAgent] = useRunnerAgent(rid)
+  const myOnline = typeof myAgent === "object" && myAgent !== null && !!myAgent.online
+  const [myMcp, setMyMcp] = useState<McpInfo | null>(null)
+  useEffect(() => {
+    if (!rid) { setMyMcp(null); return }
+    let gone = false
+    void getMcp(rid).then((v) => { if (!gone) setMyMcp(v) })
+    return () => { gone = true }
+  }, [rid, myOnline])
   useEffect(() => {
     let gone = false
     void getImport().then((v) => { if (!gone && v?.available && v.skills?.settings.enabled) setSkills(commandsOf(v.skills.items, Object.fromEntries((v.harnesses ?? []).map((h) => [h.id, h.label])))) })
@@ -114,6 +128,14 @@ export function Chat({ id }: { id?: string }) {
   const input = useRef<HTMLTextAreaElement>(null)
   const pinned = useRef(true)                                   // follow the answer while the reader is at the bottom
   const busy = chat.busy
+  // #310 part 2: the machine the open chat works on, and so which coding tools, which runner, which MCP servers. A My PC chat with a known runner
+  // sends its requests even while the runner is offline: the server answers with the words that say so (409 runner_offline). One with no runner
+  // known sends no coding tools, and the controls say why.
+  const onMy = chat.machine() === "my"
+  const onRunner = onMy && rid ? rid : undefined
+  const coding: AgentInfo = !onMy ? agentInfo : typeof myAgent === "object" && myAgent !== null ? { ...myAgent, allowed: true } : { ...NO_AGENT, available: true }
+  const blocked = !onMy ? undefined : !rid ? t("This project is on My PC, and this browser has no runner. Set it in Settings, under This browser's runner.") : myAgent === undefined ? t("Asking the server…") : runnerLine(myAgent)
+  const chatMcp: McpInfo = onMy && myMcp ? { servers: [...mcp.servers, ...myMcp.servers], tools: mcp.tools + myMcp.tools } : mcp      // a My PC chat may use its PC's MCP servers too
   const { data: metrics, stale } = useMetrics()
   const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
   useEffect(() => { void chat.resumeRuns() }, [])                // an answer that was being written when the page was refreshed went on in the server: it is read again
@@ -253,9 +275,9 @@ export function Chat({ id }: { id?: string }) {
     const typed = !files.length && isInitCommand(text) ? INIT_PROMPT : text, f = files                                    // "/init": the prompt that has the model write the project's CLAUDE.md
     const folders = chat.folders()
     const go = async () => {
-      const found = agentInfo.allowed ? await resolveMentions(folders, typed) : []                                    // the files the prompt mentions with @ go with it
+      const found = coding.allowed ? await resolveMentions(folders, typed, onRunner) : []                                    // the files the prompt mentions with @ go with it
       const all = [...f, ...found.filter((x) => !f.some((y) => y.name === x.name))]
-      const context = { health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: folders }
+      const context = { health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: folders, ...(onRunner ? { runner: onRunner } : {}) }
       if (!busy) void chat.send(typed, all, context)
       else void chat.steer(typed, all, context).then((taken) => { if (!taken && !chat.queue(typed, all, context)) void chat.send(typed, all, context) })        // an agent is working: it reads this at its next step; else it waits in line and goes when the answer ends
     }
@@ -265,7 +287,7 @@ export function Chat({ id }: { id?: string }) {
     setAway(false)
     void go()
   }
-  const ctx = () => ({ health, mcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: agentInfo, folder: chat.folders() })
+  const ctx = () => ({ health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: chat.folders(), ...(onRunner ? { runner: onRunner } : {}) })
   const project = chat.index.projects.find((p) => p.id === chat.currentProject())       // the open conversation's project (or the one a new conversation was started in): its folders are where the coding tools work
   const chatKey = chat.index.active ?? "new"
   const editPrompt = (i: number, t: string) => { pinned.current = true; setAway(false); void chat.edit(i, t, ctx()) }
@@ -376,18 +398,20 @@ export function Chat({ id }: { id?: string }) {
           onNewChat={newChat}
           onSave={download}
           context={{ view: contextView(chat.messages, chat.contextReported(), health.max_context, chat.settings.autoCompact !== false), canCompact: chat.canCompact(), onCompact: () => { void chat.compact(ctx()) }, open: ctxOpen }}
-          mention={{ folders: chat.folders(), enabled: agentInfo.allowed }}
+          mention={{ folders: chat.folders(), enabled: coding.allowed, runner: onRunner }}
           skills={commands}
           agent={{
-            info: agentInfo, on: chat.settings.agent !== false, mode: (chat.settings.agentMode === "plan" || chat.settings.agentMode === "auto" ? chat.settings.agentMode : "ask") as AgentMode,
+            info: coding, on: chat.settings.agent !== false, mode: (chat.settings.agentMode === "plan" || chat.settings.agentMode === "auto" ? chat.settings.agentMode : "ask") as AgentMode,
             folders: project ? project.folders ?? [] : chat.folders(), folderOf: project ? { kind: "project", name: project.name } : { kind: "default" }, rules: rulesOf(store, chatKey).length,
             onToggle: () => chat.setSettings({ ...chat.settings, agent: chat.settings.agent === false }),
             onMode: (m) => chat.setSettings({ ...chat.settings, agentMode: m }),
             onFolders: (list) => (project ? chat.setProjectFolders(project.id, list) : chat.setSettings({ ...chat.settings, agentFolder: list[0]?.trim() ?? "" })),
             onForget: () => { forgetRules(store, chatKey); chat.notify() }, permsHref: href("settings", "permissions"),
+            ...(rid && project ? { machine: { value: onMy ? "my" as const : "server" as const, server: agentInfo.allowed, onPick: (m: "my" | "server") => chat.setProjectMachine(project.id, m), state: myAgent } } : {}),
+            runner: onRunner, blocked,
           }}
           mcp={{
-            servers: mcp.servers, tools: mcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings", "mcp-servers"),
+            servers: chatMcp.servers, tools: chatMcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings", "mcp-servers"),
             onToggleAll: () => chat.setSettings({ ...chat.settings, mcp: chat.settings.mcp === false }),
             onToggleServer: (name) => { const off = Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : []; chat.setSettings({ ...chat.settings, mcpOff: off.includes(name) ? off.filter((n) => n !== name) : [...off, name] }) },
           }}
@@ -422,7 +446,7 @@ export function Chat({ id }: { id?: string }) {
       <SettingsSheet open={sheet} onClose={closeSheet} efforts={choices} mcp={mcp} projectionLoaded={projection} />
     </section>
     <RewindDialog
-      open={rewindAt !== null} prompts={rewindPrompts()} start={rewindAt ?? 0} session={chat.index.active}
+      open={rewindAt !== null} prompts={rewindPrompts()} start={rewindAt ?? 0} session={chat.index.active} runner={onRunner}
       onCancel={() => setRewindAt(null)}
       onDone={(cut) => {
         setRewindAt(null)
@@ -438,7 +462,7 @@ export function Chat({ id }: { id?: string }) {
     <PanelDock
       open={panel.open} tab={panel.tab} onTab={(tab: PanelTab) => keepPanel({ ...panel, tab })} onClose={() => keepPanel({ ...panel, open: false })}
       data={{
-        folders: chat.folders(), allowed: agentInfo.allowed, busy: !!busy, messages: chat.messages, commands, onAsk: (text) => { setText(text); input.current?.focus() },
+        folders: chat.folders(), allowed: coding.allowed, runner: onRunner, busy: !!busy, messages: chat.messages, commands, onAsk: (text) => { setText(text); input.current?.focus() },
         context: contextView(chat.messages, chat.contextReported(), health.max_context, chat.settings.autoCompact !== false), canCompact: chat.canCompact(), onCompact: () => { void chat.compact(ctx()) },
       }}
     />
