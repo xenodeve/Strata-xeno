@@ -593,9 +593,18 @@ class CacheSlots:
     1. Continuation: the slot whose last prompt this one continues - they share at least PREFIX tokens and all of the
        last one but at most its last TAIL tokens; several such slots: the longest shared prefix.
     2. Else a slot never used yet, the lowest first.
-    3. Else evict the slot whose last prompt holds the fewest tokens, the least recently used among equals: a short
-       side request (the auto-mode classifier's fast stage, a title) evicts another short one, not a long
-       conversation, while a short one exists.
+    3. Else evict.  A short prompt (under SIDE_MAX tokens: a side request such as a title or a one-shot check)
+       evicts the least recently used of the slots whose last prompt is short too, if there is one; a long prompt,
+       or a short one with no short slot, evicts the least recently used slot of all.  So a side request takes
+       another side request's slot, not a conversation's, and a new conversation takes the slot used longest ago,
+       which is a finished session's rather than a live one's.  (Evicting the fewest tokens instead, the first form
+       of this rule, kept finished long sessions forever and evicted the live short conversations: a replay of the
+       bench's w2a read 20,509 more tokens than w1 with no side request at all, #321.)
+       SIDE_MAX: the bench's side requests are ~590-600 tokens and Claude Code's titles a few hundred; the bench's
+       shortest first turns are 2,018-2,085 tokens and a Claude Code first turn carries its ~20K-token head, so
+       SIDE_MAX (1,024) sits between them; at 2,048 or 4,096 those first turns count as short and a side request
+       evicts them (the w2s replay in the #321 report).  Claude Code's auto-mode classifier
+       (~30K, its own long root) is a long prompt here: when it is not a continuation it evicts by age.
 
     A shared head alone is no continuation: two users of one harness share its system prompt and tools (the first
     512 tokens and far more), and under the family rule they shared one slot and re-read each other's conversation
@@ -621,12 +630,22 @@ class CacheSlots:
     becomes that slot's last one, so the rule knows the slot is taken."""
     PREFIX = 512
     TAIL = 1024
+    SIDE_MAX = 1024
 
     def __init__(self, n: int):
         self.n = n
         self.lock = threading.Lock()
         self.table: list = [None] * n                    # slot -> {"ids": its last prompt, "used": tick}, or None
         self.tick = 0
+
+    def _evict(self, ids) -> int:
+        """Rule 3 (every slot is in use): a short prompt takes the least recently used short slot, if any; else the
+        least recently used slot of all."""
+        slots = range(self.n)
+        if len(ids) < self.SIDE_MAX:
+            short = [s for s in slots if len(self.table[s]["ids"]) < self.SIDE_MAX]
+            slots = short or slots
+        return min(slots, key=lambda s: self.table[s]["used"])
 
     def _scan(self, ids):
         """-> (continued slot or None, its shared length, nearest slot, its shared length): one pass over the table."""
@@ -663,8 +682,7 @@ class CacheSlots:
                 if free:
                     slot, how = free[0], "free"
                 else:
-                    slot = min(range(self.n), key=lambda s: (len(self.table[s]["ids"]), self.table[s]["used"]))
-                    how = "evicts"
+                    slot, how = self._evict(ids), "evicts"
             self._put(slot, ids)
             return slot, shared, how
 

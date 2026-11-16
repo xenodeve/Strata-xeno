@@ -87,20 +87,45 @@ class SlotRule(unittest.TestCase):
                 self.assertIn(how, ("free", "evicts"))
         self.assertEqual(sorted(main.values()), [0, 2])             # user 1, its side request, user 2
 
-    def test_with_three_users_the_fewest_token_slot_goes(self):
+    def test_with_three_users_a_side_request_takes_a_side_slot(self):
         slots = CacheSlots(4)
-        for user, t in ((1, 0), (2, 1), (3, 2)):    # users of 1,800 / 3,000 / 4,200 tokens
+        for user, t in ((1, 0), (2, 1), (3, 2)):    # users of 1,800 / 3,000 / 4,200 tokens: all over SIDE_MAX
             slots.choose(turn(user, t))
         lens = {s: len(slots.table[s]["ids"]) for s in range(3)}
         self.assertEqual(lens, {0: 1800, 1: 3000, 2: 4200})
+        self.assertTrue(all(n >= CacheSlots.SIDE_MAX for n in lens.values()))
         slot, shared, how = slots.choose(side(0))   # the free slot first
         self.assertEqual((slot, shared, how), (3, None, "free"))
-        slot, _, how = slots.choose(side(1))        # then the fewest tokens: the other side request (400)
-        self.assertEqual((slot, how), (3, "evicts"))
-        slot, _, how = slots.choose(side(2, n=2000))  # 2,000 tokens: evicts the 400-token slot again
-        self.assertEqual((slot, how), (3, "evicts"))
-        slot, _, how = slots.choose(side(5))        # now the 1,800-token user (fewest), not the 2,000-token side
+        for k in (1, 2, 3):                         # then the short slot, though user 1's is the least recently used
+            self.assertEqual(slots.choose(side(k))[::2], (3, "evicts"), k)
+        slot, _, how = slots.choose(turn(4, 0))     # a long new prompt: the least recently used slot of all (user 1)
         self.assertEqual((slot, how), (0, "evicts"))
+        self.assertEqual(slots.choose(side(9))[::2], (3, "evicts"))   # the side slot again, not a user's
+
+    def test_a_short_prompt_with_no_short_slot_takes_the_least_recently_used(self):
+        slots = CacheSlots(2)
+        slots.choose(turn(1, 0))
+        slots.choose(turn(2, 0))
+        slots.choose(turn(1, 1))                    # user 1 is the more recent
+        self.assertEqual(slots.choose(side(0))[::2], (1, "evicts"))
+
+    def test_a_finished_long_session_goes_before_a_live_short_one(self):
+        """The w2a shape that fewest-tokens eviction got wrong (#321 replay): two users each finished a long session
+        and started a shorter one; a new session must evict a finished session's slot (the least recently used), not
+        a live conversation that merely holds fewer tokens."""
+        slots = CacheSlots(4)
+        finished_a, finished_b = turn(1, 20), turn(2, 15)           # 25,800 / 19,800 tokens, nothing continues them
+        live_a, live_b = HEAD + body(3, 3000), HEAD + body(4, 3000)  # 3,600 each
+        for ids in (finished_a, finished_b, live_a, live_b):
+            slots.choose(ids)
+        for t in range(3):                                          # the live ones keep going
+            live_a, live_b = live_a + body(5, 100 * (t + 1)), live_b + body(6, 100 * (t + 1))
+            self.assertEqual(slots.choose(live_a)[::2], (2, "continues"))
+            self.assertEqual(slots.choose(live_b)[::2], (3, "continues"))
+        new_b = HEAD + body(7, 2000)
+        self.assertEqual(slots.choose(new_b)[::2], (0, "evicts"))   # A's finished session, not live A (fewest)
+        self.assertEqual(slots.choose(live_a + [1])[::2], (2, "continues"))
+        self.assertEqual(slots.choose(HEAD + body(8, 2000))[::2], (1, "evicts"))   # then B's finished one
 
     def test_ties_go_to_the_least_recently_used(self):
         slots = CacheSlots(2)
