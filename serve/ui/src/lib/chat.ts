@@ -506,8 +506,8 @@ export class ChatController {
   setProjectFolders(id: string, folders: string[]) { this.index = setProjectFolders(this.index, id, folders); this.saveIndex() }
   /** #310 part 2: moves a project to the other machine; its folders are cleared, they are paths on the machine it was on. */
   setProjectMachine(id: string, machine: Machine) { this.index = setProjectFolders(setProjectMachine(this.index, id, machine), id, []); this.saveIndex() }
-  /** #310 part 2: whether the server's own coding tools are this page's (GET /agent "allowed"); a chat in no project runs there for an owner, else on My PC. */
-  serverAllowed = false
+  /** #310 part 2: whether the server's own coding tools are this page's (GET /agent "allowed"; undefined until it answers); a chat in no project runs there for an owner, else on My PC. */
+  serverAllowed: boolean | undefined = undefined
   /** #310 part 2: the machine a chat of `project` (none: a chat in no project) works on. */
   machineOf(project: string | undefined): Machine {
     return chatMachine({ project: project && this.index.projects.some((p) => p.id === project) ? projectMachine(this.index, project) : undefined, serverAllowed: this.serverAllowed, runner: runnerId() })

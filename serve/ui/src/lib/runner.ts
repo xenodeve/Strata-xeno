@@ -40,10 +40,11 @@ export const isSkillsServer = (server?: string): boolean => server === "skills" 
 
 /** Where a chat's coding tools work. A project keeps its machine (a My PC project is never quietly run with the server's tools). A chat in no
  *  project: the Server PC for an owner (GET /agent `allowed`), else My PC when this browser has a runner; without a runner id, the Server PC
- *  as before. */
-export function chatMachine(c: { project: Machine | undefined; serverAllowed: boolean; runner: string }): Machine {
+ *  as before. `serverAllowed` undefined (GET /agent not answered, or it failed) is the Server PC too: an owner's chat never moves to the other
+ *  machine on a network blip (with no answer the Server PC's tools are not offered either, as before). */
+export function chatMachine(c: { project: Machine | undefined; serverAllowed: boolean | undefined; runner: string }): Machine {
   if (c.project) return c.project
-  return c.runner && !c.serverAllowed ? "my" : "server"
+  return c.runner && c.serverAllowed === false ? "my" : "server"
 }
 
 /** The labels of the two machines. */

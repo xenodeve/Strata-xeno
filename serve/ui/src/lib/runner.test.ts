@@ -95,6 +95,10 @@ describe("chatMachine: where a chat's coding tools work", () => {
     expect(chatMachine({ project: undefined, serverAllowed: true, runner: ID })).toBe("server")
     expect(chatMachine({ project: undefined, serverAllowed: false, runner: ID })).toBe("my")
   })
+  test("not known yet (GET /agent unanswered or failed): the Server PC, never the other machine", () => {
+    expect(chatMachine({ project: undefined, serverAllowed: undefined, runner: ID })).toBe("server")
+    expect(chatMachine({ project: "my", serverAllowed: undefined, runner: ID })).toBe("my")
+  })
 })
 
 describe("closeReason: a card the server closed, in words", () => {

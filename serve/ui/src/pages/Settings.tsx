@@ -58,13 +58,14 @@ function ApiKey() {
 /** The coding tools' settings (the same controls as the panel in the prompt bar): on or off, the mode, the folder for chats that are in no project. */
 function CodingTools() {
   const [info, setInfo] = useState<AgentInfo>(NO_AGENT)
-  useEffect(() => { void getAgent().then((v) => v && setInfo(v)) }, [])
+  const [known, setKnown] = useState(false)
+  useEffect(() => { void getAgent().then((v) => { if (v) { setInfo(v); setKnown(true) } }) }, [])
   useSyncExternalStore(chat.subscribe, chat.getVersion)
   const s = chat.settings
   // #310 part 2: a chat in no project works on My PC when this page is not the owner's and has a runner: these are that PC's tools
   const rid = runnerId()
   const [my] = useRunnerAgent(rid, 0)
-  const onMy = chatMachine({ project: undefined, serverAllowed: info.allowed, runner: rid }) === "my"
+  const onMy = chatMachine({ project: undefined, serverAllowed: known ? info.allowed : undefined, runner: rid }) === "my"
   const shown: AgentInfo = !onMy ? info : typeof my === "object" && my !== null ? { ...my, allowed: true } : { ...NO_AGENT, available: true }
   return (
     <section>
