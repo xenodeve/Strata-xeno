@@ -298,6 +298,10 @@ def test_slot_switch_is_split_into_save_park_wait_load_and_the_offload_beside_th
     ev = [{"ph": "M", "pid": PID, "tid": 9, "name": "thread_name", "args": {"name": "slot offload"}},
           X(1, "slot switch", 0, 1000, 121000, 71000),
           X(1, "slot save", 0, 300, 0, 121000),
+          X(1, "slot save state", 0, 40, 0),
+          X(1, "slot save kv", 40, 300, 0),
+          {"ph": "i", "pid": PID, "tid": 1, "ts": 299 * 1000.0, "name": "slot save kv io", "args": {"a": 60000, "b": 195000}},
+          {"ph": "i", "pid": PID, "tid": 1, "ts": 599 * 1000.0, "name": "slot load kv io", "args": {"a": 50000, "b": 190000}},
           X(1, "slot park wait", 300, 350, 1),
           X(1, "slot load", 350, 1000, 1, 71000),
           X(1, "slot load positional", 350, 600, 1),
@@ -320,6 +324,10 @@ def test_slot_switch_is_split_into_save_park_wait_load_and_the_offload_beside_th
     assert (s["load_positional_ms"], s["load_checkpoints_ms"], s["restore_ms"]) == (
         pytest.approx(250), pytest.approx(300), pytest.approx(50))
     assert s["drop_ms"] == pytest.approx(50)
+    assert (s["save_state_ms"], s["save_kv_ms"]) == (pytest.approx(40), pytest.approx(260))
+    # the K/V's copy and file time, summed over its chunks by the engine (microseconds in the instant)
+    assert (s["save_copy_ms"], s["save_file_ms"]) == (pytest.approx(60), pytest.approx(195))
+    assert (s["load_copy_ms"], s["load_file_ms"]) == (pytest.approx(50), pytest.approx(190))
     assert s["other_ms"] == pytest.approx(0)
     assert s["read_ms"] == pytest.approx(4000)          # 1000-5000, up to the first decode round
     assert s["offload_in_read_ms"] == pytest.approx(1000)   # the offload 300-2000 beside the read 1000-5000

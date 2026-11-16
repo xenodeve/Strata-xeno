@@ -131,6 +131,13 @@ void name_thread(const char* name) {
     const std::string nm = name ? name : "";
     Registry& r = reg();
     std::lock_guard<std::mutex> lk(r.mu);
+    // #321: a pooled thread (std::async on MSVC reuses the process's thread pool) that already holds a named lane and
+    // now runs another job under another name gives that lane back and takes one of the new name.  Renaming the lane
+    // in place filed the new job's spans under the old name, which the file already carries.
+    if (t_holder.l != nullptr && !t_holder.l->name.empty() && t_holder.l->name != nm) {
+        t_holder.l->retired = true;
+        t_holder.l = nullptr;
+    }
     if (t_holder.l == nullptr && !nm.empty())
         for (auto& l : r.lanes)
             if (l->retired && l->name == nm) {
