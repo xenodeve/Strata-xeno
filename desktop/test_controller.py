@@ -582,6 +582,56 @@ def test_remove_a_server_whose_clear_failed_clears_it_first(rig):
     assert r.log.of("clear")[0][1] == URL_B and r.store.injected == []
 
 
+def test_remove_a_listed_server_clears_only_its_origin(rig):
+    """N-1: nothing open, A and B listed: removing B clears B alone."""
+    r = rig(store_kw={"injected": [ORIGIN_A, ORIGIN_B]})
+    r.ctl.remove("B")
+    assert [c[1] for c in r.log.of("clear")] == [URL_B]
+    assert r.store.injected == [ORIGIN_A]
+
+
+def test_remove_a_listed_server_never_touches_the_open_one(rig):
+    """N-1: A is open in the app window and B is listed: removing B leaves A's page, token and runner alone; B stays
+    listed (its address kept) and is cleared when A is left."""
+    r = rig(store_kw={"injected": [ORIGIN_B]}, window_kw={"clear_ok": False})
+    r.ctl.connect("A")                                     # B's clear fails here (its server is down)
+    r.window.clear_ok = True
+    r.emit("online", {"id": RID_1, "who": "ann"})
+    n = len(r.log.calls)
+    r.ctl.remove("B")
+    window_calls = [c[0] for c in r.log.calls[n:] if c[0] in ("clear", "inject", "hide_app", "open_app",
+                                                              "show_servers", "host.stop")]
+    assert window_calls == []
+    assert not r.hosts[0].stopped and r.ctl.state.kind == "online"
+    assert r.store.injected == [ORIGIN_B, ORIGIN_A]
+    r.ctl.quit()
+    assert [c[1] for c in r.log.of("clear")][-2:] == [URL_B, URL_A]     # B at its address, prefix kept
+    assert r.store.injected == []
+
+
+def test_remove_a_listed_server_on_the_connecting_origin_waits(rig):
+    """B shares A's origin (one localStorage): while A is being connected B's clear would take A's token too."""
+    rows = {"A": ServerEntry("A", URL_A, Secret(TOKEN_A)), "A2": ServerEntry("A2", URL_A + "/two", Secret(TOKEN_B))}
+    r = rig(store_kw={"rows": rows, "injected": [ORIGIN_A]}, window_kw={"clear_ok": False})
+    r.ctl.connect("A")
+    r.window.clear_ok = True
+    n = len(r.log.calls)
+    r.ctl.remove("A2")
+    assert [c for c in r.log.calls[n:] if c[0] == "clear"] == []
+    assert not r.hosts[0].stopped
+
+
+def test_two_entries_with_one_address_are_not_both_open(rig):
+    rows = {"A": ServerEntry("A", URL_A, Secret(TOKEN_A)), "A2": ServerEntry("A2", URL_A, Secret(TOKEN_A))}
+    r = rig(store_kw={"rows": rows})
+    r.ctl.connect("A")
+    r.emit("online", {"id": RID_1, "who": "ann"})
+    r.ctl.remove("A2")
+    assert not r.hosts[0].stopped and r.ctl.state.kind == "online"
+    r.ctl.remove("A")
+    assert r.hosts[0].stopped
+
+
 def test_remove_other_server_leaves_the_open_one(rig):
     r = rig()
     r.ctl.connect("A")

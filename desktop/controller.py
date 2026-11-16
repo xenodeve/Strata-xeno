@@ -313,15 +313,16 @@ class Controller:
             listed = list(self._dirty)
         self._store.set_injected(listed)
 
-    def _clear(self) -> None:
-        """Removes the token from every origin that may hold one; the file then lists the origins whose clear failed
-        (their server did not answer).  Never between an inject's record and its end (`_storage`)."""
+    def _clear(self, only: list[str] | None = None) -> None:
+        """Removes the token from every origin that may hold one (or from those of `only` that are listed); the file
+        then lists the origins whose clear failed (their server did not answer).  Never between an inject's record
+        and its end (`_storage`)."""
         with self._storage:
-            self._clear_locked()
+            self._clear_locked(only)
 
-    def _clear_locked(self) -> None:
+    def _clear_locked(self, only: list[str] | None = None) -> None:
         with self._mu:
-            tried = list(self._dirty)
+            tried = [o for o in self._dirty if only is None or o in only]
         failed = []
         for origin in tried:
             ok = False
@@ -546,16 +547,41 @@ class Controller:
                 self._open.name = entry.name
 
     def _is_open(self, name: str) -> bool:
-        """`name` is the server open now: by its name, or by the address the connection was made to (a rename the
-        controller was not told of)."""
+        """`name` is the server open now: by the name it was opened under (renames follow it, `saved`).  Only when
+        that name is gone from the list (a rename the controller was not told of) is the address used, and then only
+        when exactly one entry has it: two entries with one address never both count as the open one."""
         with self._mu:
             conn = self._open
         if conn is None:
             return False
         if conn.name == name:
             return True
+        if self._store.get(conn.name) is not None:
+            return False
         entry = self._store.get(name)
-        return entry is not None and entry.url == conn.base
+        same = [e for e in self._store.entries() if e.url == conn.base]
+        return entry is not None and entry.url == conn.base and len(same) == 1
+
+    def _clear_removed(self, name: str) -> None:
+        """A server that is not open is removed while its origin is still listed (a clear that failed before): its
+        address (path prefix kept) is remembered for later clears, and its origin alone is cleared now - unless that
+        would touch the open server: the app window shows it, or it shares the origin (one localStorage) with it.
+        Then the origin stays listed and is cleared when the open server is left (switch, Quit, next start)."""
+        entry = self._store.get(name)
+        if entry is None:
+            return
+        try:
+            origin = inject.origin(entry.url)
+        except ValueError:
+            return
+        with self._mu:
+            if origin not in self._dirty:
+                return
+            self._bases.setdefault(origin, entry.url)
+            conn = self._open
+            busy = conn is not None and (conn.opened or conn.origin == origin)
+        if not busy:
+            self._clear(only=[origin])
 
     def remove(self, name: str) -> None:
         with self._op:
@@ -568,13 +594,7 @@ class Controller:
                 self._window.hide_app()
                 self._clear()                            # before the entry goes: its address finds the origin
             else:
-                entry = self._store.get(name)
-                try:
-                    dirty = entry is not None and inject.origin(entry.url) in self._dirty
-                except ValueError:
-                    dirty = False
-                if dirty:                                # a clear that failed before: try it while the address
-                    self._clear()                        # (and its path prefix) is still listed
+                self._clear_removed(name)
             self._store.remove(name)
             if is_open:
                 self._set(TrayState("idle"), "")
