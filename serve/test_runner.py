@@ -258,7 +258,7 @@ class Connection(Base):
 
     def test_a_reply_met_by_404_goes_again_once_the_hello_is_answered(self):
         """A reply sent under the old id meets 404; it goes again under the new id as soon as the poll thread's hello
-        is answered (#315: it looked every 0.1 s, so up to 100 ms late)."""
+        is answered (#315: it looked every 0.1 s, so up to 100 ms late; here the look is 10 s, so only the hello can wake it)."""
         calls = []
 
         class Fake:
@@ -286,10 +286,11 @@ class Connection(Base):
             loop._hello()
             answered.append(time.monotonic())
         threading.Thread(target=hello_later, daemon=True).start()
-        self.assertIs(loop._post({"job": "j1", "rid": 1, "result": {}}), True)
+        with mock.patch.object(runner_mod, "STOP_LOOK_S", 10.0):   # only the hello can wake it within the bound
+            self.assertIs(loop._post({"job": "j1", "rid": 1, "result": {}}), True)
         self.assertEqual([c[0] for c in calls], ["r-old", "r-new"])
         wait_for(lambda: answered, 2, 0.001)
-        self.assertLess(calls[1][1] - answered[0], 0.04)
+        self.assertLess(calls[1][1] - answered[0], 1.0)
 
     # ---------------------------------------------------------------------------------------- #313: kept connections
     def hello_info(self, instance="inst-keep-0001"):
@@ -341,6 +342,27 @@ class Connection(Base):
         self.assertEqual(len(got), 2, self.said)
         self.assertEqual(got[0], got[1])
         self.assertEqual(len(made), 2)                          # the first, then one again after the server's close
+
+    def test_a_server_that_closes_every_connection_still_works(self):
+        """A server from before #313 answers every route HTTP/1.0 with Connection: close: the runner keeps nothing."""
+        self.start_routing()
+        made = self.count_connects()
+        c = runner_mod.Client(f"http://127.0.0.1:{self.port}", self.ann, {"id": DEV1, "name": "ann-pc"})
+        self.addCleanup(c.close)
+        got = []
+
+        def go():
+            body = c.hello(self.hello_info())
+            c.on_hello(body)
+            got.append(c.next(body["runner"], "inst-keep-0001", 0))
+            got.append(c.hello(self.hello_info())["runner"])
+        with mock.patch.object(server_mod, "RUNNER_KEEP", set()):
+            t = threading.Thread(target=go, name="keep-test")
+            t.start()
+            t.join(10)
+        self.assertEqual(len(got), 2, self.said)
+        self.assertEqual(len(made), 3)                          # one connection per request, as before
+        self.assertEqual((c._kept, c._poll_kept), ([], None))
 
     def test_abort_poll_cuts_a_held_poll_on_a_kept_connection(self):
         self.start_routing()

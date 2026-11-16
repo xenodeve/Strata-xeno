@@ -5442,8 +5442,8 @@ def make_handler(svc: Service):
 
         def handle_one_request(self):
             # #313: a runner's kept connection brings every one of its requests to this one object: each starts clean
-            self.answer_started = self.body_read = self.team = self.length_sent = False
-            self.record = self.watch_done = self.identity = None
+            self.answer_started = self.body_read = self.body_done = self.team = self.length_sent = False
+            self.record = self.watch_done = self.identity = self.headers = None
             self.device_id, self.status_sent = "", 0
             self.protocol_version = "HTTP/1.0"
             super().handle_one_request()
@@ -5473,14 +5473,15 @@ def make_handler(svc: Service):
 
         def _keeps(self) -> bool:
             """#313: this answer leaves the connection open - a runner route asked over HTTP/1.1 (not `Connection:
-            close`), its body read to the end (or it had none), a Content-Length, and no 5xx."""
+            close`), its body read to the end (`body_done`: not `body_read`, which is set before a read that may
+            fail half way) or none, a Content-Length, and no 5xx."""
             if self.protocol_version != "HTTP/1.1" or self.close_connection or not self.length_sent:
                 return False
             if self.status_sent >= 500:
                 return False
             headers = getattr(self, "headers", None)
             no_body = headers is not None and not self._chunked() and headers.get("Content-Length", "0").strip() == "0"
-            return self.body_read or no_body
+            return self.body_done or no_body
 
         def _chunked(self) -> bool:
             """#893: a body sent as Transfer-Encoding: chunked (a relay or proxy that does not buffer it).  By RFC 9112
@@ -5585,6 +5586,10 @@ def make_handler(svc: Service):
             """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
             (host_allowed).  With a key (the api_key, or team mode's named keys, #310) a rebinding page cannot
             authenticate, so the check is skipped: tunnels and proxies that pass their own name on keep working."""
+            try:
+                self.connection.settimeout(None)             # #313: a kept connection's idle limit (RUNNER_IDLE_S) is
+            except OSError:                                  # for the wait for a request, not for serving it
+                pass
             if not super().parse_request():
                 return False
             host = self.headers.get("Host")
@@ -6841,6 +6846,9 @@ def make_handler(svc: Service):
                     return None
                 self.body_read = True
                 raw = self.rfile.read(n)
+                if len(raw) != n:                            # the client stopped sending: nothing more on this socket
+                    self.close_connection = True
+            self.body_done = not self.close_connection       # #313: read to its end - the connection may be kept
             try:
                 body = json.loads(raw)
             except ValueError:

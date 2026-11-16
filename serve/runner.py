@@ -61,6 +61,8 @@ RUNS_KEPT = 50                  # run keys (one per message of a chat) whose pol
 REPLY_MAX = 32 << 20            # the largest reply the server takes (serve/server.py RUNNER_REPLY_MAX): a larger one is
                                 # not sent (a 413 from the server may come as a reset while it is still being sent)
 REPLY_RETRY_S = 60.0            # how long a reply is tried again after network errors before it is given up
+STOP_LOOK_S = 0.1               # how often a reply waiting for the new hello after a 404 looks at the stop (the hello
+                                # itself wakes it at once, #315)
 STARTING_POLL_S = 1.0           # the poll's wait while an MCP server still starts, so its tools are announced soon
 KEEP_IDLE_S = 60.0              # #313: a kept connection idle longer than this is not used again (the server closes its
                                 # side after serve/server.py RUNNER_IDLE_S, 90 s; a proxy may close sooner)
@@ -935,7 +937,7 @@ class RunnerLoop:
                         left = wait_end - time.monotonic()
                         if left <= 0 or self.stop.is_set():
                             return False
-                        self._said_hello.wait(min(left, 0.1))   # the 0.1 s: how soon a stop is seen
+                        self._said_hello.wait(min(left, STOP_LOOK_S))
             except NetworkError:
                 if time.monotonic() > end or self.stop.is_set():
                     return False

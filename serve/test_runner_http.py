@@ -964,6 +964,43 @@ class KeepAlive(RunnerBase):
         r.read()
         self.assertTrue(r.will_close)
 
+    def test_a_body_that_was_not_read_to_its_end_closes(self):
+        """A malformed chunked reply (400): bytes of it may be left on the socket, so the connection ends."""
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+        self.assertFalse(r.will_close)
+        c.putrequest("POST", "/runner/reply")
+        for k, v in (("Authorization", "Bearer " + self.ann), ("X-Strata-Device", DEV1),
+                     ("Content-Type", "application/json"), ("Transfer-Encoding", "chunked")):
+            c.putheader(k, v)
+        c.endheaders()
+        c.send(b"zz\r\n{}\r\n0\r\n\r\n")                         # not a chunk size
+        r = c.getresponse()
+        r.read()
+        self.assertEqual((r.status, r.will_close), (400, True))
+
+    def test_another_route_on_a_kept_connection_still_closes(self):
+        """A proxy that reuses its connections to the server may send any route on a socket a runner route kept."""
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+        self.assertFalse(r.will_close)
+        r, body = self.ask(c, "GET", "/v1/models")
+        self.assertEqual((r.status, r.version, r.will_close), (200, 10, True), body)
+        self.assertEqual(r.getheader("Connection"), "close")
+
+    def test_the_idle_limit_does_not_bound_the_next_request(self):
+        """The idle limit is for the wait between requests: a poll held longer than it is not cut."""
+        self.team()
+        c = self.kept()
+        with mock.patch.object(server_mod, "RUNNER_IDLE_S", 0.5), mock.patch.object(runner_hub, "POLL_MAX_S", 1.5):
+            r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+            t0 = time.monotonic()
+            r, got = self.ask(c, "GET", f"/runner/next?id={body['runner']}&instance=inst-aaaa&wait=1.5")
+        self.assertEqual((r.status, got), (200, {"messages": []}))
+        self.assertGreater(time.monotonic() - t0, 1.4)
+
     def test_each_request_on_a_kept_connection_is_its_own(self):
         """The handler object serves every request of a kept connection: who sent it is decided again each time."""
         self.team()
