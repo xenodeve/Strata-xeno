@@ -1,7 +1,8 @@
 """Strata Desktop (#310 part 3): `python -m desktop`, and the built `StrataDesktop.exe`.
 
     python -m desktop [--data-dir PATH] [--debug]
-    python -m desktop --selftest --server URL [--data-dir PATH]      (the token in STRATA_DESKTOP_SELFTEST_TOKEN)
+    python -m desktop --selftest --server URL --data-dir PATH        (the token in STRATA_DESKTOP_SELFTEST_TOKEN;
+                                                                      the result in PATH\\selftest.json)
 
 Exit codes: 0 normal (a second start that handed over to the first included), 4 no WebView2 Runtime or .NET 4.6.2
 (after a message box), 5 the selftest failed.
@@ -25,7 +26,7 @@ log = logging.getLogger("strata.desktop")
 EXIT_OK = 0
 EXIT_SELFTEST_FAILED = 5
 SELFTEST_ENV = "STRATA_DESKTOP_SELFTEST_TOKEN"
-APP_NAME = "Strata Desktop"
+APP_NAME = paths.APP_NAME
 
 
 def parse(argv: list[str] | None) -> argparse.Namespace:
@@ -40,6 +41,8 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     a = p.parse_args(argv)
     if a.server and not a.selftest:
         p.error("--server is for --selftest only")
+    if a.selftest and not a.data_dir:              # its own folder: never the real server list, profile or device
+        p.error("--selftest needs --data-dir PATH")
     return a
 
 
@@ -109,9 +112,25 @@ def _run(args: argparse.Namespace, data, instance) -> int:
 
 
 def _selftest(args: argparse.Namespace, data, token: str | None) -> int:
-    """`--selftest`: #310 part 3 task 6 fills this in (desktop/selftest.py)."""
-    log.error("--selftest is not part of this build yet")
-    return EXIT_SELFTEST_FAILED
+    """`--selftest` (desktop/selftest.py): no window, no tray icon, no message box; the result in
+    `<data>\\selftest.json`.  Whatever it raises is exit 5 (a windowed exe would otherwise end in PyInstaller's error
+    box).  No single-instance mutex: the data folder is the selftest's own."""
+    from desktop import selftest
+    result = data / selftest.RESULT_FILE
+    try:
+        if not args.server:
+            return selftest.fail(result, "start", "--selftest needs --server URL")
+        if not token:
+            return selftest.fail(result, "start", f"--selftest takes its token from {SELFTEST_ENV}, which was not set")
+        if webview2.installed() is None:
+            return selftest.fail(result, "webview2", words.t("no_webview2"))
+        if not webview2.dotnet_ok():
+            return selftest.fail(result, "webview2", words.t("no_dotnet"))
+        log.info("Strata Desktop selftest starts against %s (data folder %s)", args.server, data)
+        return selftest.run_hidden(args.server, data, token, result)
+    except Exception as e:  # noqa: BLE001
+        log.error("the selftest raised %s", type(e).__name__, exc_info=True)
+        return selftest.fail(result, "crash", type(e).__name__, keep=True)
 
 
 if __name__ == "__main__":

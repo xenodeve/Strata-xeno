@@ -40,12 +40,82 @@ def test_server_is_for_the_selftest_only(tmp_path):
     assert e.value.code == 2
 
 
-def test_selftest_token_is_popped_at_once(tmp_path, monkeypatch):
+@pytest.fixture
+def hidden_run(monkeypatch):
+    """selftest.run_hidden replaced by a recorder (it would start pywebview); WebView2 reported present."""
+    from desktop import selftest
+    calls = []
+
+    def run_hidden(server, data, token, result):
+        calls.append((server, data, token, result, os.environ.get(app.SELFTEST_ENV)))
+        return 0
+    monkeypatch.setattr(selftest, "run_hidden", run_hidden)
+    monkeypatch.setattr(webview2, "installed", lambda: "157.0.0.0")
+    monkeypatch.setattr(webview2, "dotnet_ok", lambda: True)
+    return calls
+
+
+def test_selftest_token_is_popped_at_once(tmp_path, monkeypatch, hidden_run):
     monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
     code = app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)])
-    assert code == app.EXIT_SELFTEST_FAILED                    # task 6 fills the selftest in
+    assert code == 0
+    assert hidden_run == [("http://127.0.0.1:8099", tmp_path, TOKEN, tmp_path / "selftest.json", None)]
     assert app.SELFTEST_ENV not in os.environ
     assert applog.scrub("x " + TOKEN) == "x ***"
+
+
+def _result(tmp_path) -> dict:
+    import json
+    return json.loads((tmp_path / "selftest.json").read_text(encoding="utf-8"))
+
+
+def test_selftest_without_server_fails_in_its_file(tmp_path, monkeypatch, hidden_run):
+    monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+    assert app.main(["--selftest", "--data-dir", str(tmp_path)]) == app.EXIT_SELFTEST_FAILED
+    doc = _result(tmp_path)
+    assert doc["exit"] == 5 and doc["steps"][0]["step"] == "start" and "--server" in doc["steps"][0]["detail"]
+    assert hidden_run == []
+
+
+def test_selftest_without_token_fails_in_its_file(tmp_path, hidden_run):
+    assert app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)]) == 5
+    assert app.SELFTEST_ENV in _result(tmp_path)["steps"][0]["detail"] and hidden_run == []
+
+
+def test_selftest_without_webview2_fails_with_no_box(tmp_path, monkeypatch, hidden_run, quiet):
+    monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+    monkeypatch.setattr(webview2, "installed", lambda: None)
+    assert app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)]) == 5
+    assert _result(tmp_path)["steps"][0]["step"] == "webview2" and quiet == [] and hidden_run == []
+
+
+def test_selftest_that_raises_is_exit_5(tmp_path, monkeypatch, hidden_run):
+    """A windowed exe must never end in PyInstaller's error box: whatever the selftest raises is exit 5."""
+    from desktop import selftest
+    monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+
+    def boom(*a):
+        raise ImportError("no module named webview")
+    monkeypatch.setattr(selftest, "run_hidden", boom)
+    assert app.main(["--selftest", "--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)]) == 5
+    assert _result(tmp_path)["steps"][-1]["step"] == "crash"
+
+
+def test_selftest_needs_its_own_data_dir(hidden_run, monkeypatch):
+    """Never the real %LOCALAPPDATA%\\StrataDesktop: its server list, its web view profile."""
+    monkeypatch.setenv(app.SELFTEST_ENV, TOKEN)
+    with pytest.raises(SystemExit) as e:
+        app.main(["--selftest", "--server", "http://127.0.0.1:8099"])
+    assert e.value.code == 2 and hidden_run == []
+
+
+def test_a_windowed_exe_without_stderr_still_parses(tmp_path, monkeypatch):
+    """PyInstaller's windowed exe has sys.stderr None: a usage error must exit 2, not raise inside argparse."""
+    import sys
+    monkeypatch.setattr(sys, "stderr", None)
+    with pytest.raises(SystemExit) as e:
+        app.main(["--server", "http://127.0.0.1:8099", "--data-dir", str(tmp_path)])
+    assert e.value.code == 2
 
 
 def test_token_is_popped_on_a_normal_start_too(tmp_path, monkeypatch):

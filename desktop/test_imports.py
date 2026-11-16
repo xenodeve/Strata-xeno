@@ -36,6 +36,6 @@ def test_imports_without_gui_libs():
     assert line.startswith("OK "), out.stdout
     names = line.split()[1].split(",")
     for must in ("applog", "inject", "single", "webview2", "gui", "servers", "probe", "runner_host", "state", "words",
-                 "controller", "tray"):
+                 "controller", "tray", "selftest", "build", "check_selftest"):
         assert must in names, names
     assert line.endswith("LOADED"), line                            # nothing of the GUI libraries came in

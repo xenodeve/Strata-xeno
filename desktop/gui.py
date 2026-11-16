@@ -113,6 +113,12 @@ def install_link_guard(opener: Callable[..., bool] | None = None) -> None:
     webbrowser.open = guard_links(opener or webbrowser.open)
 
 
+def _open_nothing(url, new=0, autoraise=True) -> bool:
+    """The headless Gui's opener: a link is logged by its scheme and never handed to the system browser."""
+    log.info("a link with the scheme %s was not opened: no window in the selftest", _scheme(url))
+    return False
+
+
 def servers_html() -> str:
     """`ui/servers.html` with the words of the current language in place of `/*WORDS*/{}` and its `lang`."""
     text = SERVERS_HTML.read_text(encoding="utf-8")
@@ -215,18 +221,21 @@ class ServersApi:
 
 class Gui:
     """The two windows (desktop/controller.py's WindowPort).  `quitting()` tells the closing handlers whether the
-    controller is quitting; `servers_hidden` keeps the servers window hidden too (the selftest)."""
+    controller is quitting; `servers_hidden` keeps the servers window hidden at its creation (the hidden-window check);
+    `headless` (the selftest) does that and more: no window is ever shown (every `show` is skipped, the app window's
+    too) and no message box is raised - a failure is only logged and returned."""
 
     def __init__(self, data: Path | None, api: ServersApi | None, quitting: Callable[[], bool] = lambda: False, *,
-                 debug: bool = False, servers_hidden: bool = False):
+                 debug: bool = False, servers_hidden: bool = False, headless: bool = False):
         self._data, self._api, self._quitting = data, api, quitting
-        self._debug, self._servers_hidden = debug, servers_hidden
+        self._debug, self._servers_hidden, self._headless = debug, servers_hidden or headless, headless
         self._servers = None
         self._app = None
         self._app_lock = threading.Lock()        # one navigation of the app window at a time
         self._flag_lock = threading.Lock()
         self._show_pending = False               # open_app: show the app window at its next `loaded`
         self._ending = False                     # destroy(): the closing handlers let the windows go
+        self._destroyed = False
         self._failed = False
         self._loads = 0                          # navigate_and_inject's count: each load has its own URL
         self._app_origin: str | None = None      # the only origin the app window may navigate to
@@ -254,8 +263,8 @@ class Gui:
         webview.settings["IGNORE_SSL_ERRORS"] = False    # with it, pywebview accepts any certificate: never
         # A window.open / target=_blank link goes to `webbrowser.open` (OPEN_EXTERNAL_LINKS_IN_BROWSER, on by default;
         # pywebview platforms/edgechromium.py on_new_window_request), which on Windows is os.startfile: any scheme
-        # would reach ShellExecute.  Only plain http(s) addresses get through.
-        install_link_guard()
+        # would reach ShellExecute.  Only plain http(s) addresses get through; headless, none (a browser is a window).
+        install_link_guard(_open_nothing if self._headless else None)
         self._servers = webview.create_window(words.t("servers_title"), html=servers_html(), js_api=self._api,
                                               width=SERVERS_SIZE[0], height=SERVERS_SIZE[1], min_size=SERVERS_MIN,
                                               hidden=self._servers_hidden)
@@ -269,7 +278,8 @@ class Gui:
             if webview.renderer != "edgechromium":
                 log.error("the web view runs on %s, not Edge Chromium", webview.renderer)
                 self._failed = True
-                webview2.message_box(webview2.missing_message())
+                if not self._headless:
+                    webview2.message_box(webview2.missing_message())
                 self.destroy()
                 return
             self._app.events.shown.wait(20)
@@ -281,7 +291,8 @@ class Gui:
                           storage_path=str(paths.webview_dir(self._data)), debug=self._debug)
         except Exception as e:
             log.error("the web view could not start: %s", type(e).__name__, exc_info=True)
-            webview2.message_box(webview2.missing_message())
+            if not self._headless:
+                webview2.message_box(webview2.missing_message())
             return webview2.EXIT_MISSING
         return webview2.EXIT_MISSING if self._failed else 0
 
@@ -335,7 +346,7 @@ class Gui:
     def _on_app_loaded(self) -> None:
         with self._flag_lock:
             show, self._show_pending = self._show_pending, False
-        if show:
+        if show and not self._headless:
             try:
                 self._app.show()
             except Exception as e:
@@ -343,7 +354,8 @@ class Gui:
 
     # ------------------------------------------------------------------ the WindowPort
     def show_servers(self) -> None:
-        self._servers.show()
+        if not self._headless:
+            self._servers.show()
 
     def hide_servers(self) -> None:
         self._servers.hide()
@@ -407,16 +419,33 @@ class Gui:
 
     def show_app(self) -> None:
         """The app window as it is (the tray's Open): no reload, so an answer being written goes on."""
-        self._app.show()
+        if not self._headless:
+            self._app.show()
 
     def hide_app(self) -> None:
         with self._flag_lock:
             self._show_pending = False
         self._app.hide()
 
+    def evaluate(self, which: str, script: str):
+        """`script`'s value in the "app" or the "servers" window, or None when it raised (the selftest's reads; the
+        script is never logged)."""
+        window = self._app if which == "app" else self._servers
+        try:
+            return window.evaluate_js(script)
+        except Exception as e:
+            log.error("a script in the %s window raised %s", which, type(e).__name__)
+            return None
+
+    def wait_app_loaded(self, timeout: float) -> bool:
+        """The app window's page has loaded (`open_app` and `navigate_and_inject` clear the event before they load)."""
+        return bool(self._app.events.loaded.wait(timeout))
+
     def destroy(self) -> None:
-        """Closes both windows (Quit); pywebview's loop then ends and `run` returns."""
-        self._ending = True
+        """Closes both windows (Quit); pywebview's loop then ends and `run` returns.  A second call does nothing."""
+        if self._destroyed:
+            return
+        self._destroyed = self._ending = True
         for w in (self._app, self._servers):
             if w is None:
                 continue

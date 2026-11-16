@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 APP = "StrataDesktop"
+APP_NAME = "Strata Desktop"          # the device's name is "<APP_NAME> on <machine>" (serve.runner.device_label)
 
 
 def data_dir(override: str | None = None) -> Path:

@@ -425,6 +425,38 @@ def test_hide_app_cancels_a_pending_show():
     assert ("show",) not in w.calls
 
 
+def test_headless_never_shows_a_window():
+    """The selftest's Gui: open_app loads the page, but no show() reaches either window, ever."""
+    app_w, servers_w = FakeWindow(loads=False), FakeWindow()
+    g = gui.Gui(data=None, api=None, headless=True)
+    g._app, g._servers, g._nav_guarded = app_w, servers_w, True
+    g._hook_app(app_w)
+    g.show_servers()
+    g.open_app("http://h:1", server="lab")
+    for fn in app_w.events.loaded.handlers:
+        fn()
+    g.show_app()
+    assert ("load_url", "http://h:1/") in app_w.calls
+    assert ("show",) not in app_w.calls and ("show",) not in servers_w.calls
+    assert gui._open_nothing("https://example.com/") is False      # headless: no link reaches a browser window
+
+
+def test_evaluate_and_wait_loaded():
+    app_w, servers_w = FakeWindow(result="A"), FakeWindow(result="S")
+    g = _gui(app_w)
+    g._servers = servers_w
+    assert g.evaluate("app", "1") == "A" and g.evaluate("servers", "2") == "S"
+    assert app_w.scripts == ["1"] and servers_w.scripts == ["2"]
+
+    def boom(script):
+        raise RuntimeError("gone")
+    app_w.evaluate_js = boom
+    assert g.evaluate("app", "1") is None
+    assert g.wait_app_loaded(0.05) is False
+    app_w.events.loaded.set()
+    assert g.wait_app_loaded(0.05) is True
+
+
 def test_closing_hides_unless_quitting():
     quitting = [False]
     g = gui.Gui(data=None, api=None, quitting=lambda: quitting[0])
