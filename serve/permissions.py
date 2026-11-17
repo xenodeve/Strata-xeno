@@ -363,17 +363,19 @@ def is_dangerous(command: str) -> bool:
 
 
 # ------------------------------------------------------------------------------------------------ yolo: what leaves this PC (#329)
-SENDERS = re.compile(r"(^|[\s;&|(`])(curl|wget|scp|sftp|rsync|ssh|nc|ncat|netcat|socat|ftp|tftp|telnet|iwr|irm|invoke-webrequest|invoke-restmethod|"
+SENDERS = re.compile(r"(^|[\s;&|(`/\\\"'])(curl|wget|scp|sftp|rsync|ssh|nc|ncat|netcat|socat|ftp|tftp|telnet|iwr|irm|invoke-webrequest|invoke-restmethod|"
                      r"start-bitstransfer|bitsadmin|certutil|send-mailmessage|sendmail|mail|rclone|gsutil|http|https|xh|"
-                     r"gh\s+(gist|api|issue|pr|release|secret)|aws\s+s3|az\s+storage|git\s+(push|send-email))(\.exe)?(?=\s|$)", re.I)
-SECRET_WORDS = re.compile(r"(^|[\s/\\=@'\"<:])(\.env(\.(?!example\b|sample\b|template\b|dist\b)\w+)?|[\w.-]*\.(pem|key|pfx|p12|jks|keystore)|id_(rsa|ed25519|ecdsa|dsa)(\.pub)?|"
+                     r"gh\s+(gist|api|issue|pr|release|secret)|aws\s+s3|az\s+storage|git\s+(push|send-email))(\.exe)?(?=[\s\"']|$)", re.I)
+SECRET_WORDS = re.compile(r"(^|[\s/\\=@'\"<:`(])(\.env(\.(?!example\b|sample\b|template\b|dist\b)\w+)?|[\w.-]*\.(pem|key|pfx|p12|jks|keystore)|id_(rsa|ed25519|ecdsa|dsa)(\.pub)?|"
                           r"\.ssh|\.aws|\.gnupg|\.kube|\.docker|\.npmrc|\.pypirc|\.netrc|\.git-credentials|credentials(\.\w+)?|secrets?(\.\w+)?|service[-_]account[\w.-]*\.json)"
-                          r"(?=$|[\s/\\'\";|&)>])", re.I)
+                          r"(?=$|[\s/\\'\";|&)>`])", re.I)
 SECRET_VARS = re.compile(r"\$(\{)?(env:)?\w*(key|token|secret|passw(or)?d|credential)\w*", re.I)
 # a key or certificate a sender USES to log in or to check the server is not sent: `ssh -i ~/.ssh/id_rsa`, `curl --cert c.pem --key c.key`
 KEY_USE = re.compile(r"(?<=\s)(-i|-E|--cert|--key|--cacert|--capath|--proxy-cert|--proxy-key|--identity-file)(\s+|=)\S+|-o\s*IdentityFile=\S+", re.I)
-ENV_DUMP = re.compile(r"(^|[\s;&|(])(env|printenv|get-childitem\s+env:|gci\s+env:|dir\s+env:)(?=\s|$|\|)", re.I)
-TOKENS = re.compile(r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}|(AKIA|ASIA)[0-9A-Z]{16}|"
+ENV_DUMP = re.compile(r"(^|[\s;&|(])(env|printenv|set|export\s+-p|declare\s+-p|get-childitem\s+env:|gci\s+env:|dir\s+env:)(?=\s|$|\|)", re.I)
+URLS = re.compile(r"\w+://\S+")                                 # an address's path is not a file of this PC (`.../api/secrets`)
+OUTPUT_ARG = re.compile(r"(?<=\s)(-o|-O|--output|--output-document|-OutFile)(\s+|=)\S+")     # where a download is written: it comes in, not out
+TOKENS = re.compile(r"(?<![A-Za-z0-9])(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}|(AKIA|ASIA)[0-9A-Z]{16}|"
                     r"xox[abposr]-[A-Za-z0-9-]{10,}|hf_[A-Za-z0-9]{30,}|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
 
 
@@ -384,13 +386,17 @@ def leaks(tool: str, args: dict) -> str:
         c = args.get("command")
         if not isinstance(c, str) or not SENDERS.search(c):
             return ""
-        c = KEY_USE.sub(" ", c)
-        if TOKENS.search(c):
-            return "the command sends something that looks like a token off this PC"
-        if SECRET_WORDS.search(c):
-            return "the command sends data off this PC and names a secret file (.env, a key, credentials)"
-        if SECRET_VARS.search(c) or ENV_DUMP.search(c):
-            return "the command sends data off this PC and uses a secret variable (a key, a token, a password) or the whole environment"
+        c = OUTPUT_ARG.sub(" ", KEY_USE.sub(" ", c))
+        c = re.sub(r"(\bgh\s+api\s+)\S+", r"\1", c, flags=re.I)     # `gh api <endpoint>`: a path of the GitHub API, not a file of this PC
+        for part in re.split(r"&&|\|\||;|\n", c):         # one command at a time (`git push && echo $TOKEN_COUNT`); a pipe stays one: it carries data
+            if not SENDERS.search(part):
+                continue
+            if TOKENS.search(part):
+                return "the command sends something that looks like a token off this PC"
+            if SECRET_WORDS.search(URLS.sub(" ", part)):
+                return "the command sends data off this PC and names a secret file (.env, a key, credentials)"
+            if SECRET_VARS.search(part) or ENV_DUMP.search(part):
+                return "the command sends data off this PC and uses a secret variable (a key, a token, a password) or the whole environment"
         return ""
     if tool == "WebFetch" and isinstance(args.get("url"), str) and TOKENS.search(args["url"]):
         return "the address holds something that looks like a token: it would leave this PC"
@@ -399,11 +405,58 @@ def leaks(tool: str, args: dict) -> str:
     return ""
 
 
+def _all_segments(command: str) -> list[list[str]]:
+    """The commands of a line, with what runs in `$( )`, backticks and a shell's `-c` / `-Command` body, one level deep."""
+    segs = parse(command).segments + _inner_commands(command)
+    for w in list(segs):
+        for i, x in enumerate(w[:-1]):
+            if x.lower() in ("-c", "-command", "/c", "/k"):
+                segs += parse(w[i + 1]).segments
+    return segs
+
+
+def _git_push_words(w: list[str]) -> list[str] | None:
+    """The words after `push` when this command is `git [options] push ...` (git named by any path), else None."""
+    if not w or re.split(r"[\\/]", w[0])[-1].lower() not in ("git", "git.exe") or "push" not in w[1:]:
+        return None
+    k = w.index("push")
+    if not all(x.startswith("-") or w[i - 1] in ("-C", "-c") for i, x in enumerate(w[1:k], 1)):
+        return None
+    return w[:k] + ["push"] + w[k + 1:]
+
+
 def pushes(command: str) -> bool:
-    """Whether a command runs `git push` (with or without git's own options before it), so the caller checks what it would send."""
-    return isinstance(command, str) and any(w and w[0].lower() in ("git", "git.exe") and "push" in w[1:] and
-                                            all(x.startswith("-") or w[i - 1] == "-C" or w[i - 1].startswith("-c") for i, x in enumerate(w[1:w.index("push")], 1))
-                                            for w in parse(command).segments)
+    """Whether a command runs `git push` (git by any path, with or without its own options, also inside `$( )` or `bash -c`), so the caller
+    checks what it would send."""
+    return isinstance(command, str) and any(_git_push_words(w) is not None for w in _all_segments(command))
+
+
+def push_remotes(command: str) -> list[str | None] | None:
+    """The remotes the pushes of a command name (None: the default one), or None when what they send cannot be checked from the chat's
+    folder: a push to an address or a path rather than a named remote, `git -C`, or a `cd` / `pushd` / `Set-Location` before it."""
+    segs = _all_segments(command)
+    if any(w and w[0].lower() in ("cd", "pushd", "set-location", "sl", "chdir") for w in segs):
+        return None
+    out: list[str | None] = []
+    for w in segs:
+        words = _git_push_words(w)
+        if words is None:
+            continue
+        k = words.index("push")
+        if "-C" in words[1:k] or any(x.startswith("--repo") for x in words[k + 1:]):
+            return None
+        rest, skip = [], False
+        for x in words[k + 1:]:
+            if skip:
+                skip = False
+            elif x in ("-o", "--push-option", "--receive-pack", "--exec"):
+                skip = True
+            elif not x.startswith("-"):
+                rest.append(x)
+        if rest and ("://" in rest[0] or "@" in rest[0] or "/" in rest[0] or "\\" in rest[0] or rest[0].endswith(".git") or rest[0] in (".", "..")):
+            return None
+        out.append(rest[0] if rest else None)
+    return out
 
 
 def secret_paths(paths: list[str]) -> list[str]:

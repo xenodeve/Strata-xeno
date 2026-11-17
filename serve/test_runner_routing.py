@@ -424,7 +424,7 @@ class Routing(Fixture):
         self.assertFalse([e for e in events if e["event"] == "remote"])
         code, body = self.req("GET", "/agent", key="k", device=DEV0)
         self.assertEqual(code, 200)
-        self.assertEqual(set(body), {"available", "allowed", "reason", "shell", "tools"})
+        self.assertEqual(set(body), {"available", "allowed", "reason", "shell", "tools", "yolo"})      # yolo: #329
 
     # #310 final review I-1: a team guest's WebFetch runs on the server, so it goes through #311's guard (web.public_not_vpn):
     # never this PC, a private network, Tailscale or the Radmin network 26.0.0.0/8 - for her run and its helpers. The owner's
@@ -512,13 +512,14 @@ class Routing(Fixture):
         code, body = self.req("GET", f"/agent?runner={f.id}", key=self.ann, device=DEV1)
         self.assertEqual(code, 200, body)
         self.assertEqual(body, {"available": True, "allowed": True, "reason": "", "shell": "Git Bash",
-                                "tools": CODING_NAMES, "machine": "ann-pc", "online": True})
+                                "tools": CODING_NAMES, "machine": "ann-pc", "online": True, "yolo": True})      # a guest's own PC: YOLO there (#329)
         nobody = self.req("GET", "/agent?runner=r0000000000000000", key=self.ann, device=DEV1)
         self.assertEqual(nobody[0], 404)
         self.assertEqual(self.req("GET", f"/agent?runner={bobs.id}", key=self.ann, device=DEV1), nobody)
         code, body = self.req("GET", "/agent", key=self.ann, device=DEV1)              # without runner=: as before
-        self.assertEqual(set(body), {"available", "allowed", "reason", "shell", "tools"})
+        self.assertEqual(set(body), {"available", "allowed", "reason", "shell", "tools", "yolo"})
         self.assertFalse(body["allowed"])
+        self.assertIs(body["yolo"], False)                                             # a guest, on the server's PC (#329)
         f.stop()
         with mock.patch.object(runner_hub, "OFFLINE_S", 0.2):
             time.sleep(1.5)                                  # the held poll notices the hang-up, then OFFLINE_S

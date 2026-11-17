@@ -68,7 +68,7 @@ export function AgentControls(p: AgentControlsProps) {
         <MiniSwitch on={p.on} label={t("Coding tools")} onClick={p.onToggle} />
       </div>
       <div className={p.on ? "" : "pointer-events-none opacity-50"} aria-disabled={!p.on}>
-        {p.withMode !== false && <ModePicker mode={p.mode} onMode={p.onMode} />}
+        {p.withMode !== false && <ModePicker mode={p.mode} onMode={p.onMode} yolo={p.info.yolo !== false} />}
         {picker && <div className={p.withMode !== false ? "mt-3" : ""}>{picker}</div>}
         {p.folderOf.kind === "project" ? (
           <div className={p.withMode !== false || picker ? "mt-3" : ""}>
