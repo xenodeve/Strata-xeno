@@ -244,7 +244,8 @@ async function removeServer(name) {
   const r = await call(() => api.remove(name));
   if (r && r.error) { $("form-error").textContent = r.error; $("form-error").hidden = false; return; }
   delete results[name];
-  if (editing === name || selected === name) edit(null);
+  if (editing === name) edit(null);                    // a server being typed into the form is left as it is
+  if (selected === name) selected = null;
   refresh();
 }
 
