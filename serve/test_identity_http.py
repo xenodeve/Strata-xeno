@@ -155,11 +155,13 @@ class Identity(Base):
         self.assertIs(body["editable"], False)
         code, body = self.req("GET", "/agent", key=ann, device=DEV1)
         self.assertIs(body["allowed"], False)
+        self.assertIs(body["yolo"], False)                        # #329: a guest's YOLO only on their own PC
         self.assertEqual(self.chat(key=ann, device=DEV1)[0], 200)
         self.svc.peer_override = None                             # the owner, from this PC: implicitly approved
         code, body = self.chat(key="k")
         self.assertEqual(code, 200)
         self.assertIs(self.req("GET", "/agent", key="k")[1]["allowed"], True)
+        self.assertIs(self.req("GET", "/agent", key="k")[1]["yolo"], True)
 
     def test_owner_only_routes(self):
         self.start(api_key="k", peer_override=REMOTE)

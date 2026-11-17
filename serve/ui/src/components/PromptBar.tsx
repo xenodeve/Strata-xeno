@@ -416,7 +416,7 @@ export function PromptBar(p: PromptBarProps) {
       {menu === "mode" && (
         <div className="prompt-bar__menu" role="dialog" aria-label={t("Coding mode")} data-kind="mode" onKeyDown={(e) => { if (e.key === "Escape") { e.preventDefault(); closeMenu(); focusInput() } }}>
           <GlidePanel cap={() => Math.min(innerHeight * 0.6, 420)} inner="px-4 pb-4 pt-3.5">
-            <ModePicker mode={p.agent.mode} onMode={p.agent.onMode} />
+            <ModePicker mode={p.agent.mode} onMode={p.agent.onMode} yolo={p.agent.info.yolo !== false} />
           </GlidePanel>
         </div>
       )}
@@ -606,7 +606,7 @@ export function PromptBar(p: PromptBarProps) {
           {usableAgent && p.agent.on && (
             <button
               type="button"
-              className="prompt-bar__pick"
+              className={`prompt-bar__pick${p.agent.mode === "yolo" ? " text-bad" : ""}`}
               aria-label={t("Coding mode")}
               aria-expanded={menu === "mode"}
               data-on={menu === "mode" ? "" : undefined}

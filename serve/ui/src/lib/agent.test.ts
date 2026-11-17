@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { addRule, agentRequest, diffRows, forgetRules, NO_AGENT, rulesOf, toolSummary, type AgentInfo } from "./agent"
+import { addRule, agentRequest, diffRows, forgetRules, modeOf, MODES, NO_AGENT, rulesOf, toolSummary, type AgentInfo } from "./agent"
 import type { Backing } from "./sessions"
 
 // The page's side of the coding tools (issue #96): what a request says, the rules the user chose "allow for this chat" for, and how a call
@@ -125,5 +125,24 @@ describe("diffRows: an edit as removed and added lines", () => {
     const rows = diffRows(Array.from({ length: 500 }, (_, i) => `o${i}`).join("\n"), "x")
     expect(rows.length).toBeLessThanOrEqual(201)
     expect(rows.at(-1)?.kind).toBe("more")
+  })
+})
+
+describe("YOLO mode (#329)", () => {
+  test("a fourth mode, after the other three", () => {
+    expect(MODES).toEqual(["ask", "plan", "auto", "yolo"])
+  })
+  test("the setting is read as a mode; an unknown one is ask", () => {
+    expect(modeOf("yolo")).toBe("yolo")
+    expect(modeOf("plan")).toBe("plan")
+    expect(modeOf("auto")).toBe("auto")
+    expect(modeOf("bypass")).toBe("ask")
+    expect(modeOf(undefined)).toBe("ask")
+  })
+  test("where the server says this caller may not use it, YOLO is ask - and the request says ask", () => {
+    expect(modeOf("yolo", { yolo: false })).toBe("ask")
+    expect(modeOf("yolo", { yolo: true })).toBe("yolo")
+    expect(agentRequest({ agent: true, agentMode: "yolo" }, ON, "C:/w", "c", []).strata_agent!.mode).toBe("yolo")
+    expect(agentRequest({ agent: true, agentMode: "yolo" }, { ...ON, yolo: false }, "C:/w", "c", []).strata_agent!.mode).toBe("ask")
   })
 })

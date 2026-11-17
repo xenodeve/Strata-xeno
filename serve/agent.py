@@ -53,6 +53,34 @@ def _err(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
+def _yolo_push(cwd: str | None, command) -> "permissions.Decision":
+    """#329: a `git push` in YOLO mode runs only when no local commit (on a branch, a tag or HEAD, detached too) that is not yet on the
+    remote it names adds or changes a secret file (one added and later removed still counts: both commits are sent; a merge counts by
+    its first parent).  A push to an address or a path, from another folder (`git -C`, `cd`), or one git cannot tell about asks the user,
+    as in the default mode."""
+    import subprocess
+    unsure = permissions.Decision("ask", "a git push in YOLO mode: whether its commits hold a secret file could not be checked")
+    remotes = permissions.push_remotes(command)
+    if not cwd or remotes is None:
+        return unsure
+    named = sorted({r for r in remotes if r})
+    base = [f"--remotes={r}" for r in named] if named and None not in remotes else ["--remotes"]
+    cmd = ["git", "-c", "core.quotePath=false", "log", "--branches", "--tags", "HEAD", "--not", *base,
+           "--name-only", "--format=", "--diff-filter=ACMR", "--no-renames", "--diff-merges=first-parent"]
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        r = None
+    if r is None or r.returncode != 0:
+        return unsure
+    found = sorted(set(permissions.secret_paths([x.strip() for x in r.stdout.splitlines()])))
+    if found:
+        return permissions.Decision("deny", "YOLO mode never lets a secret leave this PC: the commits this push would send hold "
+                                    + ", ".join(found[:10]) + ". Take the file out of those commits (and add it to .gitignore) first")
+    return permissions.Decision("allow", "YOLO mode: the commits to push hold no secret file")
+
+
 @dataclass
 class AgentContext:
     """What one request brings: the rules that apply, which chat it is, how to ask the user, and whether the request was cancelled."""
@@ -254,6 +282,8 @@ class AgentServer:
             return _err(f"there is no tool named {tool!r} in the coding tools")
         args = arguments if isinstance(arguments, dict) else {}
         d = permissions.decide(tool, args, ctx.policy)
+        if d.kind == "allow" and ctx.policy.mode == "yolo" and tool == "Bash" and permissions.pushes(args.get("command")):
+            d = _yolo_push(ctx.policy.cwd, args.get("command"))    # #329: what the push would send is read before it runs
         if d.kind == "deny":
             return _err(f"{tool} is denied: {d.why}")
         if ctx.hooks:                                         # a hook can only stop a call, and runs only once the rules have not denied it

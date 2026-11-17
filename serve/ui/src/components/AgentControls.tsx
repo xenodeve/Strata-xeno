@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import type { AgentInfo, AgentMode } from "../lib/agent"
+import { MODES, type AgentInfo, type AgentMode } from "../lib/agent"
 import { msg, t } from "../lib/i18n"
 import { FoldersEditor } from "./FoldersEditor"
 import { MachinePicker, type RunnerState } from "./RunnerSettings"
@@ -9,21 +9,22 @@ import { Button, MiniSwitch, Segmented, inputCls } from "./ui"
 // The settings of the chat's coding tools (issue #96): on or off, the mode, the folder they work in, and the rules the user allowed for the
 // chat. One component for the panel in the prompt bar and for the Settings page. The server decides what may run; these are the user's choices.
 
-const MODE_LABEL: Record<AgentMode, string> = { ask: msg("Ask"), plan: msg("Plan"), auto: msg("Auto") }
+const MODE_LABEL: Record<AgentMode, string> = { ask: msg("Ask"), plan: msg("Plan"), auto: msg("Auto"), yolo: msg("YOLO") }
 const MODE_TEXT: Record<AgentMode, string> = {
   ask: msg("Files inside the folder are free to read and change. Everything else asks you first."),
   plan: msg("Nothing is changed. The model reads, then sends a plan for you to approve."),
   auto: msg("A second check decides what would ask you. What is risky is blocked or asked; dangerous commands and secrets always ask you."),
+  yolo: msg("Nothing asks you: files anywhere, every command, the web. Dangerous commands and anything that would send a secret off this PC are refused. The checks are patterns, not a guarantee."),
 }
 export const modeLabel = (m: AgentMode) => t(MODE_LABEL[m])
 
 /** The three modes and what the one in use means. On the prompt bar it is the chip's menu (the mode is what a chat needs to see and change often);
  *  in Settings it is part of the coding tools' settings. */
-export function ModePicker({ mode, onMode }: { mode: AgentMode; onMode: (m: AgentMode) => void }) {
+export function ModePicker({ mode, onMode, yolo = true }: { mode: AgentMode; onMode: (m: AgentMode) => void; yolo?: boolean }) {
   return (
     <div data-agent-mode-picker>
-      <Segmented label={t("Mode")} value={mode} onChange={onMode} options={(["ask", "plan", "auto"] as AgentMode[]).map((m) => ({ value: m, label: modeLabel(m) }))} />
-      <p className="mt-1.5 text-[12px] text-ink-2" data-agent-mode-text>{t(MODE_TEXT[mode])}</p>
+      <Segmented label={t("Mode")} value={mode} onChange={onMode} options={MODES.filter((m) => m !== "yolo" || yolo).map((m) => ({ value: m, label: modeLabel(m) }))} />
+      <p className={`mt-1.5 text-[12px] ${mode === "yolo" ? "text-bad" : "text-ink-2"}`} data-agent-mode-text>{t(MODE_TEXT[mode])}</p>
     </div>
   )
 }
@@ -67,7 +68,7 @@ export function AgentControls(p: AgentControlsProps) {
         <MiniSwitch on={p.on} label={t("Coding tools")} onClick={p.onToggle} />
       </div>
       <div className={p.on ? "" : "pointer-events-none opacity-50"} aria-disabled={!p.on}>
-        {p.withMode !== false && <ModePicker mode={p.mode} onMode={p.onMode} />}
+        {p.withMode !== false && <ModePicker mode={p.mode} onMode={p.onMode} yolo={p.info.yolo !== false} />}
         {picker && <div className={p.withMode !== false ? "mt-3" : ""}>{picker}</div>}
         {p.folderOf.kind === "project" ? (
           <div className={p.withMode !== false || picker ? "mt-3" : ""}>

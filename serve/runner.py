@@ -631,7 +631,7 @@ class Executor:
         """A message of a chat begins: the real folders, the shell, git, the notes; its policy and checkpoint are kept
         under a new run key (the tools' session state is the chat's, by `session`)."""
         folder, dirs = folders_mod.resolve(msg.get("cwd"), msg.get("dirs"), agent_mod.MAX_DIRS)
-        mode = msg.get("mode") if msg.get("mode") in ("auto", "plan") else None
+        mode = permissions.mode_for(msg.get("mode"), on_runner=True)        # this PC is the user's own: the server already gated a guest's YOLO (#329)
         session = _session(msg.get("session"))
         policy = permissions.Policy(cwd=folder, mode=mode, allow=_rules(msg.get("allow")), deny=_rules(msg.get("deny")),
                                     dirs=dirs, protected=list(self.protected))
@@ -678,7 +678,7 @@ class Executor:
             question = link.question
             if helper:                                  # a helper: its own mode, and nobody to answer it questions
                 policy = copy.copy(policy)
-                policy.mode = msg.get("mode") if msg.get("mode") in ("auto", "plan") else None
+                policy.mode = permissions.mode_for(msg.get("mode"), on_runner=True)
                 # allow / deny stay the run's lists: "allow for this chat" holds for the helper's next calls too,
                 # as on the server (serve/subagent.py)
                 policy.dirs, policy.protected = list(policy.dirs), list(policy.protected)

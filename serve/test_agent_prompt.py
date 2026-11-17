@@ -45,6 +45,10 @@ class Prompt(unittest.TestCase):
         self.assertIn("exitplanmode", self.build(mode="plan", tools=["Read", "ExitPlanMode"]).lower())
         self.assertNotIn("plan mode", self.build(mode=None).lower())
         self.assertIn("auto mode", self.build(mode="auto").lower())
+        y = self.build(mode="yolo").lower()
+        self.assertIn("yolo mode", y)                                                     # #329
+        self.assertIn("secret", y)
+        self.assertNotIn("yolo", self.build(mode=None).lower())
 
     def test_only_the_tools_that_exist_are_described(self):
         p = self.build(tools=["Read", "Glob"])

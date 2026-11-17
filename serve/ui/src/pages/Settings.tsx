@@ -18,7 +18,7 @@ import { AgentControls } from "../components/AgentControls"
 import { getAgent, root } from "../lib/api"
 import { refreshTeam } from "../lib/keys"
 import { chat } from "../lib/chat"
-import { NO_AGENT, type AgentInfo } from "../lib/agent"
+import { modeOf, NO_AGENT, type AgentInfo } from "../lib/agent"
 import { RunnerSettings, runnerLine, useRunnerAgent } from "../components/RunnerSettings"
 import { blockText, chatMachine, myPcCoding, runnerId } from "../lib/runner"
 
@@ -73,7 +73,7 @@ function CodingTools() {
       <h2 className="text-[15px] font-semibold">{t("Coding tools")}</h2>
       <p className="mt-1 mb-3 text-[13px] text-ink-2">{t("The chat can read, search and change files and run commands on this PC with Claude Code's own tools, and asks you before anything that is not plainly safe. Here are the defaults; a project has its own folders, chosen when it is made.")}</p>
       <AgentControls
-        info={shown} blocked={mine?.block ? blockText(mine.block, location.origin + root().replace(/\/$/, "")).full : onMy ? runnerLine(my) : undefined} on={s.agent !== false} mode={s.agentMode === "plan" || s.agentMode === "auto" ? s.agentMode : "ask"} folders={s.agentFolder?.trim() ? [s.agentFolder.trim()] : []} folderOf={{ kind: "default" }} rules={0}
+        info={shown} blocked={mine?.block ? blockText(mine.block, location.origin + root().replace(/\/$/, "")).full : onMy ? runnerLine(my) : undefined} on={s.agent !== false} mode={modeOf(s.agentMode, shown)} folders={s.agentFolder?.trim() ? [s.agentFolder.trim()] : []} folderOf={{ kind: "default" }} rules={0}
         onToggle={() => chat.setSettings({ ...s, agent: s.agent === false })} onMode={(m) => chat.setSettings({ ...s, agentMode: m })}
         onFolders={(list) => chat.setSettings({ ...s, agentFolder: list[0]?.trim() ?? "" })} onForget={() => {}}
       />
