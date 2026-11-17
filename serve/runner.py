@@ -609,7 +609,8 @@ class Executor:
         self.admin = _Admin(self)
         self.on_change: Callable[[dict], None] | None = None   # #338: RunnerLoop's, told {"added", "removed", "changed"}
         self.checkpoints = checkpoints_mod.Checkpoints(self.data_dir / "checkpoints")
-        self.protected = [str(self.config_path), str(self.data_dir / "device.json")]
+        self.protected = [str(self.config_path), str(self.config_path) + ".bak-mcp",       # #338: the web app's first change keeps
+                          str(self.data_dir / "device.json")]                               # a copy beside it (its secrets too)
         self.runs: collections.OrderedDict[str, tuple] = collections.OrderedDict()     # run key -> (Policy, Scope | None)
         self.lock = threading.Lock()
 

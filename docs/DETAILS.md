@@ -1366,6 +1366,8 @@ Settings > General > API key; from any other address the section is a read-only 
   before and keep their own tools; a request to `/v1/chat/completions` opts in with `"strata_mcp": true` (it then
   gets `strata_mcp` tool events in the stream), and `"strata_mcp_off": ["name", ...]` leaves servers out of that request (the
   chat page sends it for the servers switched off in its **+ > MCP tools** list, which shows each server with its tools).
+  `"strata_mcp_runner": "<runner id>"` (#338) adds the MCP servers of the caller's own PC (its Strata Desktop runner, while
+  it is online) to that request as `my_<name>`; they run on that PC, so a browser tool there reaches its `localhost`.
 
 **Security.** MCP tools run on your PC with your user's rights, and **the model decides when to call them** - also
 because of what it reads (a web page or a file can contain instructions). Give a filesystem server only the folders

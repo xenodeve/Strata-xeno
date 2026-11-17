@@ -106,12 +106,15 @@ export function Chat({ id }: { id?: string }) {
   const [myAgent] = useRunnerAgent(rid)
   const myOnline = typeof myAgent === "object" && myAgent !== null && !!myAgent.online
   const [myMcp, setMyMcp] = useState<McpInfo | null>(null)
-  useEffect(() => {
-    if (!rid) { setMyMcp(null); return }
+  const myStarting = !!myMcp?.servers.some((x) => x.status === "starting" || x.status === "idle")
+  useEffect(() => {                                           // asked again on a timer (#338): a server that starts later, or one added in
+    if (!rid) { setMyMcp(null); return }                      // Settings, is offered without a reload; sooner while one is starting
     let gone = false
-    void getMcp(rid).then((v) => { if (!gone) setMyMcp(v) })
-    return () => { gone = true }
-  }, [rid, myOnline])
+    const ask = () => { void getMcp(rid).then((v) => { if (!gone) setMyMcp(v) }) }
+    ask()
+    const id = setInterval(ask, myStarting ? 2000 : 15000)
+    return () => { gone = true; clearInterval(id) }
+  }, [rid, myOnline, myStarting])
   useEffect(() => {
     let gone = false
     void getImport().then((v) => { if (!gone && v?.available && v.skills?.settings.enabled) setSkills(commandsOf(v.skills.items, Object.fromEntries((v.harnesses ?? []).map((h) => [h.id, h.label])))) })
