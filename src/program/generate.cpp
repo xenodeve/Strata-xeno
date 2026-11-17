@@ -14659,11 +14659,14 @@ int main(int argc, char** argv) {
                 }
                 // #321: a slot none of whose resume points (its running state, its checkpoints) is the start of this
                 // prompt is not loaded: the prompt would be read from token 0 anyway, and the load took 0.6-1.8 s for
-                // 46-121K tokens (#318 Phase F).  The slot is this prompt's now, so its old conversation goes either way.
+                // 46-121K tokens (#318 Phase F).  The slot is this prompt's now, so its old conversation goes either way -
+                // except with the RAM conversation cache (--conversation-cache-mib), which parks a loaded slot's old
+                // conversation below (park_current needs it live), so there every slot is still loaded.
                 // Not with STRATA_SLOT_CKPT_MOVE (a batch slot's checkpoint can resume through the live state's cells);
                 // STRATA_SLOT_LOAD_ALL=1 loads every slot as before (the A/B).
                 static const bool load_all = std::getenv("STRATA_SLOT_LOAD_ALL") != nullptr;
-                if (incoming.file && !load_all && !slot_ckpt_move_env() && !incoming.heads.empty()) {
+                if (incoming.file && !load_all && !slot_ckpt_move_env() && !conversations.enabled() &&
+                    !incoming.heads.empty()) {
                     bool usable = false;
                     if (o.prompt_cache > 0)
                         for (const auto& h : incoming.heads)
