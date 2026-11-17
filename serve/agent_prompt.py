@@ -104,6 +104,11 @@ def build(cwd: str | None, shell: str | None, mode: str | None, today: str, plat
         out += ["", "# Plan mode",
                 "You are in plan mode. Do not change anything: read and search to understand the task, then write a plan" + (" and send it with ExitPlanMode so the user can approve it." if "ExitPlanMode" in has else "."),
                 "Writes and commands that are not plain reads are refused until the user approves the plan."]
+    elif mode == "yolo":
+        out += ["", "# YOLO mode",
+                "You are in YOLO mode: your calls run without asking the user. Two kinds are refused, and you are told why: commands that can do harm that is hard "
+                "to undo, and anything that would send a secret (an .env file, a key, a token, credentials) off this PC, including a git push of commits that hold one. "
+                "Do not look for a way round a refusal; choose something safer or tell the user. Work carefully: nobody checks a call before it runs."]
     elif mode == "auto":
         out += ["", "# Auto mode",
                 "You are in auto mode: a second check decides whether a call may run without asking the user. A call it judges too risky is blocked and you are told why; "

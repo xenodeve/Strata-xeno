@@ -3,10 +3,17 @@
 // what happened. Nothing here can make a call run without the server's say-so.
 import type { Backing } from "./sessions"
 
-export interface AgentInfo { available: boolean; allowed: boolean; reason?: string; shell: string | null; tools: string[]; machine?: string; online?: boolean }      // machine, online: GET /agent?runner= (#310 part 2)
+export interface AgentInfo { available: boolean; allowed: boolean; reason?: string; shell: string | null; tools: string[]; machine?: string; online?: boolean; yolo?: boolean }      // machine, online: GET /agent?runner= (#310 part 2); yolo: this caller may pick YOLO here (#329)
 export const NO_AGENT: AgentInfo = { available: false, allowed: false, shell: null, tools: [] }
-export type AgentMode = "ask" | "plan" | "auto"
-export const MODES: AgentMode[] = ["ask", "plan", "auto"]
+export type AgentMode = "ask" | "plan" | "auto" | "yolo"
+export const MODES: AgentMode[] = ["ask", "plan", "auto", "yolo"]
+
+/** The mode a chat's setting means here: an unknown one is "ask", and so is "yolo" where the server said this caller may not use it
+ *  (a team guest whose tools run on the server's PC, #329; the server enforces the same). */
+export function modeOf(raw: string | undefined, info?: Pick<AgentInfo, "yolo">): AgentMode {
+  if (raw === "yolo") return info?.yolo === false ? "ask" : "yolo"
+  return raw === "plan" || raw === "auto" ? raw : "ask"
+}
 
 export interface AgentRequest { cwd?: string; dirs?: string[]; mode: AgentMode; session: string; allow: string[]; deny?: string[]; checkpoint?: string; run?: string; runner?: string }
 
@@ -15,7 +22,7 @@ export interface AgentRequest { cwd?: string; dirs?: string[]; mode: AgentMode; 
  *  this is its runner: the tools run there. */
 export function agentRequest(s: { agent?: boolean; agentMode?: string }, info: AgentInfo, folders: string | string[] | null | undefined, session: string | null, rules: string[] | { allow: string[]; deny?: string[] }, checkpoint?: string, runner?: string): { strata_agent?: AgentRequest } {
   if (s.agent === false || !info.available || !info.allowed) return {}
-  const mode: AgentMode = s.agentMode === "plan" || s.agentMode === "auto" ? s.agentMode : "ask"
+  const mode = modeOf(s.agentMode, info)
   const list = (Array.isArray(folders) ? folders : [folders]).filter((f): f is string => typeof f === "string" && f.trim().length > 0).map((f) => f.trim())
   const [cwd, ...dirs] = list                                                  // the first is the main folder; the others are the project's other folders
   const allow = (Array.isArray(rules) ? rules : rules.allow).slice(0, 200)

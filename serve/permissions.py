@@ -11,7 +11,10 @@ The defaults are the developer's choice for this app:
   * mode "plan" changes nothing (Write, Edit and any command that is not read-only are refused);
   * mode "auto" does not change this function's answer: it marks what a second judgement may settle (`judgeable`) and what never may
     (a dangerous command, a secret, the .git folder) - the caller asks the judge, and the user when the judge is unsure.
-There is no mode that switches the questions off: an unknown mode is the default one.
+  * mode "yolo" (#329, the developer's choice for a model hosted on this PC) asks nothing: deny rules, a dangerous command and a secret
+    leaving this PC (`leaks`, and the caller's check of a `git push`, `pushes` / `secret_paths`) are refused instead.  The leak checks
+    are patterns: they cannot see every way out (a program the model writes and then runs can still send what it reads).
+An unknown mode is the default one.
 
 This module only decides; it reads no file and runs nothing (it looks at where paths lead, with links resolved, and nothing more).
 """
@@ -359,6 +362,55 @@ def is_dangerous(command: str) -> bool:
     return any(rx.search(command) for rx in DANGER)
 
 
+# ------------------------------------------------------------------------------------------------ yolo: what leaves this PC (#329)
+SENDERS = re.compile(r"(^|[\s;&|(`])(curl|wget|scp|sftp|rsync|ssh|nc|ncat|netcat|socat|ftp|tftp|telnet|iwr|irm|invoke-webrequest|invoke-restmethod|"
+                     r"start-bitstransfer|bitsadmin|certutil|send-mailmessage|sendmail|mail|rclone|gsutil|http|https|xh|"
+                     r"gh\s+(gist|api|issue|pr|release|secret)|aws\s+s3|az\s+storage|git\s+(push|send-email))(\.exe)?(?=\s|$)", re.I)
+SECRET_WORDS = re.compile(r"(^|[\s/\\=@'\"<:])(\.env(\.(?!example\b|sample\b|template\b|dist\b)\w+)?|[\w.-]*\.(pem|key|pfx|p12|jks|keystore)|id_(rsa|ed25519|ecdsa|dsa)(\.pub)?|"
+                          r"\.ssh|\.aws|\.gnupg|\.kube|\.docker|\.npmrc|\.pypirc|\.netrc|\.git-credentials|credentials(\.\w+)?|secrets?(\.\w+)?|service[-_]account[\w.-]*\.json)"
+                          r"(?=$|[\s/\\'\";|&)>])", re.I)
+SECRET_VARS = re.compile(r"\$(\{)?(env:)?\w*(key|token|secret|passw(or)?d|credential)\w*", re.I)
+# a key or certificate a sender USES to log in or to check the server is not sent: `ssh -i ~/.ssh/id_rsa`, `curl --cert c.pem --key c.key`
+KEY_USE = re.compile(r"(?<=\s)(-i|-E|--cert|--key|--cacert|--capath|--proxy-cert|--proxy-key|--identity-file)(\s+|=)\S+|-o\s*IdentityFile=\S+", re.I)
+ENV_DUMP = re.compile(r"(^|[\s;&|(])(env|printenv|get-childitem\s+env:|gci\s+env:|dir\s+env:)(?=\s|$|\|)", re.I)
+TOKENS = re.compile(r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}|(AKIA|ASIA)[0-9A-Z]{16}|"
+                    r"xox[abposr]-[A-Za-z0-9-]{10,}|hf_[A-Za-z0-9]{30,}|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
+
+
+def leaks(tool: str, args: dict) -> str:
+    """Why this call would send a secret off this PC ("" when it would not seem to): a command that sends data out and names a secret file,
+    a variable named like a key or the whole environment, or a token-shaped string; a WebFetch URL or WebSearch query holding a token."""
+    if tool == "Bash":
+        c = args.get("command")
+        if not isinstance(c, str) or not SENDERS.search(c):
+            return ""
+        c = KEY_USE.sub(" ", c)
+        if TOKENS.search(c):
+            return "the command sends something that looks like a token off this PC"
+        if SECRET_WORDS.search(c):
+            return "the command sends data off this PC and names a secret file (.env, a key, credentials)"
+        if SECRET_VARS.search(c) or ENV_DUMP.search(c):
+            return "the command sends data off this PC and uses a secret variable (a key, a token, a password) or the whole environment"
+        return ""
+    if tool == "WebFetch" and isinstance(args.get("url"), str) and TOKENS.search(args["url"]):
+        return "the address holds something that looks like a token: it would leave this PC"
+    if tool == "WebSearch" and isinstance(args.get("query"), str) and TOKENS.search(args["query"]):
+        return "the search words hold something that looks like a token: they would leave this PC"
+    return ""
+
+
+def pushes(command: str) -> bool:
+    """Whether a command runs `git push` (with or without git's own options before it), so the caller checks what it would send."""
+    return isinstance(command, str) and any(w and w[0].lower() in ("git", "git.exe") and "push" in w[1:] and
+                                            all(x.startswith("-") or w[i - 1] == "-C" or w[i - 1].startswith("-c") for i, x in enumerate(w[1:w.index("push")], 1))
+                                            for w in parse(command).segments)
+
+
+def secret_paths(paths: list[str]) -> list[str]:
+    """The secret files (as `is_secret` tells them) in a list of paths, e.g. the files of the commits a push would send."""
+    return [p for p in paths if isinstance(p, str) and p.strip() and is_secret(p)]
+
+
 # ------------------------------------------------------------------------------------------------ the decision
 MULTI = {"git", "npm", "pnpm", "yarn", "docker", "kubectl", "cargo", "go", "gh", "pip", "uv", "dotnet", "make"}
 
@@ -430,6 +482,8 @@ def decide(tool: str, args: dict, pol: Policy) -> Decision:
             t, _ = _file_target(tool, args, pol)
             if t and _path_rule_matches(spec, t, pol.cwd):
                 return Decision("deny", f"denied by the rule {rule}", rule=rule)
+    if pol.mode == "yolo":
+        return _yolo(tool, args)
     plan = pol.mode == "plan"
     auto = pol.mode == "auto"
 
@@ -504,3 +558,27 @@ def decide(tool: str, args: dict, pol: Policy) -> Decision:
     if tool in FILE_EDIT and in_git(target, root):
         return ask("a change in .git can run programs (hooks) later", judge=False)
     return Decision("allow", "inside the project folder")
+
+
+def mode_for(raw, *, guest: bool = False, on_runner: bool = False) -> str | None:
+    """The mode a request asked for, as the run will use it: "plan", "auto", "yolo" or None (the default; anything unknown is that).
+    #329: a team guest's YOLO runs only on the guest's own PC (the My PC runner); on this PC it is the default mode."""
+    if raw == "yolo":
+        return "yolo" if (not guest or on_runner) else None
+    return raw if raw in ("auto", "plan") else None
+
+
+def _yolo(tool: str, args: dict) -> Decision:
+    """#329: after the deny rules, nothing asks; what is refused is refused with its reason, for the model to read."""
+    if tool == "ExitPlanMode":
+        return Decision("deny", "not in plan mode: there is no plan to approve")
+    if tool == "Bash":
+        c = args.get("command")
+        if not isinstance(c, str) or not c.strip():
+            return Decision("deny", "the call has no command")
+        if is_dangerous(c):
+            return Decision("deny", "YOLO mode refuses a command that can do harm that is hard to undo", danger=True)
+    why = leaks(tool, args)
+    if why:
+        return Decision("deny", f"YOLO mode never lets a secret leave this PC: {why}")
+    return Decision("allow", "YOLO mode")

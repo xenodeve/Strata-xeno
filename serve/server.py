@@ -3430,7 +3430,7 @@ class Service:
         the run; web access, helpers, vision and the judge stay the server's.  RunnerUnavailable when the job fails (before any run is made).
         `guest`: a team guest's run - its WebFetch (it runs here, for the run and its helpers) reaches only the public internet, never this
         PC, a private network, Tailscale or Radmin's 26.0.0.0/8 (web.public_not_vpn, as #311's image URLs; final review I-1)."""
-        mode = sa.get("mode") if sa.get("mode") in ("auto", "plan") else None
+        mode = permissions.mode_for(sa.get("mode"), guest=guest, on_runner=runner is not None)      # #329: a guest's YOLO only on their own PC
         rules = lambda v: [x for x in v if isinstance(x, str) and 0 < len(x) <= 500][:200] if isinstance(v, list) else []      # noqa: E731
         sid = sa.get("session") if isinstance(sa.get("session"), str) and 0 < len(sa["session"]) <= 80 else "default"
         goal = ""
@@ -6432,10 +6432,11 @@ def make_handler(svc: Service):
                         coding = r.servers().get("my_agent")             # the first coding group, without the tools the server runs
                         return self._json(200, {"available": True, "allowed": online, "reason": "" if online else "your PC is offline",
                                                 "shell": r.info.get("shell"), "tools": [t["name"] for t in coding.tools] if coding else [],
-                                                "machine": r.info.get("machine"), "online": online})
+                                                "machine": r.info.get("machine"), "online": online, "yolo": True})
                     sh = getattr(svc.agent, "shell", None)
                     self._json(200, {"available": svc.agent is not None, "allowed": ok, "reason": "" if ok else why, "shell": shell_mod.describe(sh) if sh else None,
-                                     "tools": [t["name"] for t in svc.agent.tools] if svc.agent else []})
+                                     "tools": [t["name"] for t in svc.agent.tools] if svc.agent else [],
+                                     "yolo": not (self.team and not (self.identity is not None and self.identity.is_owner))})     # #329: a guest's YOLO only on My PC
                 return
             if path == "/agent/hooks":
                 # the user's hooks (serve/hooks.py), read only: they are written in the run config; only who may use the coding tools sees the commands

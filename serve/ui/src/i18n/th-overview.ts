@@ -231,6 +231,8 @@ export const part: Record<string, string> = {
   "Skill from {app} · plugin {plugin}": "Skill จาก {app} · ปลั๊กอิน {plugin}",
   "Ask": "ถาม",
   "Auto": "อัตโนมัติ",
+  "YOLO": "YOLO",
+  "Nothing asks you: files anywhere, every command, the web. Dangerous commands and anything that would send a secret off this PC are refused. The checks are patterns, not a guarantee.": "ไม่ถามอะไรเลย ทั้งไฟล์ทุกที่ ทุกคำสั่ง และเว็บ แต่จะปฏิเสธคำสั่งอันตรายและทุกอย่างที่จะส่ง secret ออกนอกเครื่องนี้ การตรวจนี้ใช้ pattern จึงรับประกันไม่ได้ทุกกรณี",
   "Files inside the folder are free to read and change. Everything else asks you first.": "ไฟล์ในโฟลเดอร์อ่านและแก้ได้เลย อย่างอื่นจะถามคุณก่อน",
   "Nothing is changed. The model reads, then sends a plan for you to approve.": "ไม่มีอะไรถูกแก้ โมเดลจะอ่านแล้วส่งแผนมาให้คุณอนุมัติ",
   "A second check decides what would ask you. What is risky is blocked or asked; dangerous commands and secrets always ask you.": "การตรวจรอบที่สองตัดสินสิ่งที่ปกติจะถามคุณ สิ่งที่เสี่ยงจะถูกบล็อกหรือถามคุณ ส่วนคำสั่งอันตรายและความลับจะถามคุณเสมอ",

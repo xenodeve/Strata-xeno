@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from serve import agent  # noqa: E402
+from serve import agent, shell as shell_mod  # noqa: E402
 from serve.permissions import Policy  # noqa: E402
 
 
@@ -592,6 +592,68 @@ class Todos(Base):
         self.assertTrue(self.call("TodoWrite", {"todos": "x"})["isError"])
         self.assertTrue(self.call("TodoWrite", {"todos": [{"content": "a", "status": "nope", "activeForm": "A"}]})["isError"])
         self.assertTrue(self.call("TodoWrite", {"todos": [{"content": "", "status": "pending", "activeForm": "A"}]})["isError"])
+
+
+@unittest.skipUnless(shell_mod.find_shell(prefer="bash"), "needs a shell")
+class YoloPush(Base):
+    """#329: in YOLO mode a `git push` runs only when the commits it would send hold no secret file."""
+    def git(self, *a, cwd=None):
+        import subprocess
+        return subprocess.run(["git", *a], cwd=str(cwd or self.proj), capture_output=True, text=True, check=True).stdout
+
+    def setUp(self):
+        super().setUp()
+        shell_mod.install(self.srv, shell_mod.find_shell(prefer="bash"))
+        self.addCleanup(self.srv.close)
+        self.remote = self.base / "remote.git"
+        self.git("init", "-q", "--bare", str(self.remote), cwd=self.base)
+        self.git("init", "-q", "-b", "main")
+        for k, v in (("user.email", "t@example.invalid"), ("user.name", "t"), ("commit.gpgsign", "false")):
+            self.git("config", k, v)
+        self.write("src/a.py", "x = 1\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "one")
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("push", "-q", "origin", "main")
+
+    def remote_head(self):
+        return self.git("rev-parse", "main", cwd=self.remote).strip()
+
+    def test_a_push_of_a_commit_holding_a_secret_is_refused(self):
+        before = self.remote_head()
+        self.write(".env", "TOKEN=abc\n")
+        self.git("add", "-f", ".env")
+        self.git("commit", "-q", "-m", "two")
+        r = self.call("Bash", {"command": "git push origin main"}, mode="yolo")
+        self.assertTrue(r.get("isError"), r)
+        self.assertIn(".env", r["content"][0]["text"])
+        self.assertEqual(self.remote_head(), before)
+        self.assertEqual(self.asked, [])
+
+    def test_a_secret_added_then_removed_is_still_refused(self):
+        self.write(".env", "TOKEN=abc\n")
+        self.git("add", "-f", ".env")
+        self.git("commit", "-q", "-m", "two")
+        self.git("rm", "-q", "--cached", ".env")
+        self.git("commit", "-q", "-m", "three")
+        self.assertTrue(self.call("Bash", {"command": "git push"}, mode="yolo").get("isError"))
+
+    def test_a_clean_push_runs_without_asking(self):
+        self.write("src/b.py", "y = 2\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "two")
+        r = self.call("Bash", {"command": "git push -q origin main"}, mode="yolo")
+        self.assertFalse(r.get("isError"), r)
+        self.assertEqual(self.remote_head(), self.git("rev-parse", "HEAD").strip())
+        self.assertEqual(self.asked, [])
+
+    def test_a_push_that_cannot_be_checked_asks(self):
+        (self.proj / ".git" / "HEAD").write_text("not a ref", encoding="utf-8")       # git no longer reads it as a repository
+        self.answer = "deny"
+        r = self.call("Bash", {"command": "git push"}, mode="yolo")
+        self.assertTrue(r.get("isError"))
+        self.assertEqual(len(self.asked), 1)
+        self.assertIn("secret", self.asked[0]["why"])
 
 
 if __name__ == "__main__":

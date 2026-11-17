@@ -22,7 +22,7 @@ import { builtinCommands, commandsOf, type Command } from "../../lib/slash"
 import { compactCommand } from "../../lib/compact"
 import { contextView, isContextCommand } from "../../lib/context"
 import { INIT_PROMPT, isInitCommand, isMemoryCommand } from "../../lib/memory"
-import { forgetRules, NO_AGENT, rulesOf, type AgentInfo, type AgentMode } from "../../lib/agent"
+import { forgetRules, modeOf, NO_AGENT, rulesOf, type AgentInfo } from "../../lib/agent"
 import { store } from "../../lib/store"
 import { SkillsContext } from "../../components/SkillTip"
 import { msg, t } from "../../lib/i18n"
@@ -408,7 +408,7 @@ export function Chat({ id }: { id?: string }) {
           mention={{ folders: chat.folders(), enabled: coding.allowed, runner: onRunner }}
           skills={commands}
           agent={{
-            info: coding, on: chat.settings.agent !== false, mode: (chat.settings.agentMode === "plan" || chat.settings.agentMode === "auto" ? chat.settings.agentMode : "ask") as AgentMode,
+            info: coding, on: chat.settings.agent !== false, mode: modeOf(chat.settings.agentMode, coding),
             folders: project ? project.folders ?? [] : chat.folders(), folderOf: project ? { kind: "project", name: project.name } : { kind: "default" }, rules: rulesOf(store, chatKey).length,
             onToggle: () => chat.setSettings({ ...chat.settings, agent: chat.settings.agent === false }),
             onMode: (m) => chat.setSettings({ ...chat.settings, agentMode: m }),
