@@ -507,4 +507,13 @@ export const part: Record<string, string> = {
   "Steps": "ขั้นตอน",
   "{done} of {n} steps done": "ทำแล้ว {done} จาก {n} ขั้นตอน",
   "The chat can read, search and change files and run commands on this PC with Claude Code's own tools, and asks you before anything that is not plainly safe. Here are the defaults; a project has its own folders, chosen when it is made.": "แชทอ่าน ค้นหา แก้ไฟล์ และรันคำสั่งบนเครื่องนี้ได้ด้วย tool ของ Claude Code เอง และจะถามคุณก่อนทุกอย่างที่ไม่ปลอดภัยชัดเจน ที่นี่คือค่าเริ่มต้น ส่วนโปรเจกต์มีโฟลเดอร์ของตัวเองที่เลือกตอนสร้าง (มีได้หลายโฟลเดอร์)",
+  "It changes Strata's settings: every change asks you, in every mode.": "เป็นการแก้การตั้งค่าของ Strata ทุกครั้งที่แก้จะถามคุณก่อน ไม่ว่าจะอยู่โหมดไหน",
+  "Change this Strata setting?": "แก้การตั้งค่านี้ของ Strata ไหม",
+  "(not set)": "(ยังไม่ได้ตั้ง)",
+  "Setting": "การตั้งค่า",
+  "After the change": "หลังแก้",
+  "Environment variables and headers": "ตัวแปร environment และ header",
+  "changed": "เปลี่ยน",
+  "unchanged": "ไม่เปลี่ยน",
+  "removed": "ลบออก",
 }

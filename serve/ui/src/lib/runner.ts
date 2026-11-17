@@ -38,7 +38,7 @@ export const machineOf = (call: { server?: string; machine?: string }): Machine 
 /** A call of the coding tools: the server's group "agent", or - only when the event says the call ran on My PC (`machine: "my"`) - the runner's
  *  "my_agent" ("my_agent_2" when a server MCP took that name). A server MCP literally named my_agent stays an MCP card: the name never decides alone. */
 export const isCodingCall = (call: { server?: string; machine?: string }): boolean =>
-  call.machine === "my" ? !!call.server && /^my_agent(_\d+)?$/.test(call.server) : call.server === "agent"
+  call.machine === "my" ? !!call.server && /^my_agent(_\d+)?$/.test(call.server) : call.server === "agent" || call.server === "strata"      // #339: Strata's own tools ask on the same card
 /** A call of the skills server of either machine, by the same rule. */
 export const isSkillsCall = (call: { server?: string; machine?: string }): boolean =>
   call.machine === "my" ? !!call.server && /^my_skills(_\d+)?$/.test(call.server) : call.server === "skills"

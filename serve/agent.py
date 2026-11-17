@@ -81,6 +81,34 @@ def _yolo_push(cwd: str | None, command) -> "permissions.Decision":
     return permissions.Decision("allow", "YOLO mode: the commits to push hold no secret file")
 
 
+def gate(tool: str, args: dict, ctx: "AgentContext", card: dict | None = None) -> dict | None:
+    """The permission gate of every call of the chat's tools (the coding tools here, Strata's own in serve/strata_tools.py): the rules
+    (serve/permissions.py), the user's hooks, and the card when the rules ask.  None: the call may run; else the error the model reads.
+    `card`: what the card shows besides the call (#339: a settings change's before/after, and its arguments with secrets masked)."""
+    d = permissions.decide(tool, args, ctx.policy)
+    if d.kind == "allow" and ctx.policy.mode == "yolo" and tool == "Bash" and permissions.pushes(args.get("command")):
+        d = _yolo_push(ctx.policy.cwd, args.get("command"))    # #329: what the push would send is read before it runs
+    if d.kind == "deny":
+        return _err(f"{tool} is denied: {d.why}")
+    if ctx.hooks:                                         # a hook can only stop a call, and runs only once the rules have not denied it
+        stopped = ctx.hooks.before(tool, args)
+        if stopped:
+            return _err(f"{tool} was stopped by a hook: {stopped}")
+    if d.kind == "ask":
+        rule = permissions.rule_for(tool, args)
+        answer = ctx.ask({"tool": tool, "arguments": args, "why": d.why, "danger": d.danger, "judgeable": d.judgeable, "rule": rule, **(card or {})})
+        if answer == "allow_chat":
+            if rule:
+                ctx.policy.allow.append(rule)                    # for the rest of this request; the page remembers it for the chat
+        elif isinstance(answer, str) and answer.startswith("blocked:"):
+            return _err(f"{tool} was blocked: {answer[8:].strip()}. Do not retry it; do something safer or ask the user.")
+        elif answer == "cancelled":
+            return _err("The request was cancelled before the user answered.")
+        elif answer not in ("allow", "allow_chat"):
+            return _err(f"The user did not allow this {tool} call ({d.why}). Do not try the same thing again; ask them what they want instead.")
+    return None
+
+
 @dataclass
 class AgentContext:
     """What one request brings: the rules that apply, which chat it is, how to ask the user, and whether the request was cancelled."""
@@ -96,6 +124,7 @@ class AgentContext:
     web: object | None = None                              # serve/web.py Web: set only when the user switched web access on (WebFetch and WebSearch run only with it)
     spawn: Callable | None = None                          # serve/subagent.py: runs a helper (kind, prompt, description) -> (ok, report); set only when the user switched helpers on
     in_helper: bool = False                                # this call is a helper's: it cannot start a helper
+    guest: bool = False                                    # #339: a team guest's request: Strata's settings are the owner's, so it can neither read nor change them
     run_key: str = ""                                      # #310: the run on the engineer's PC (its runner's `run.start` answer) these calls belong to: it keeps a chat's session, todos, reads and background shells apart there; "" on the server
 
 
@@ -282,27 +311,9 @@ class AgentServer:
         if tool not in self._run:
             return _err(f"there is no tool named {tool!r} in the coding tools")
         args = arguments if isinstance(arguments, dict) else {}
-        d = permissions.decide(tool, args, ctx.policy)
-        if d.kind == "allow" and ctx.policy.mode == "yolo" and tool == "Bash" and permissions.pushes(args.get("command")):
-            d = _yolo_push(ctx.policy.cwd, args.get("command"))    # #329: what the push would send is read before it runs
-        if d.kind == "deny":
-            return _err(f"{tool} is denied: {d.why}")
-        if ctx.hooks:                                         # a hook can only stop a call, and runs only once the rules have not denied it
-            stopped = ctx.hooks.before(tool, args)
-            if stopped:
-                return _err(f"{tool} was stopped by a hook: {stopped}")
-        if d.kind == "ask":
-            rule = permissions.rule_for(tool, args)
-            answer = ctx.ask({"tool": tool, "arguments": args, "why": d.why, "danger": d.danger, "judgeable": d.judgeable, "rule": rule})
-            if answer == "allow_chat":
-                if rule:
-                    ctx.policy.allow.append(rule)                    # for the rest of this request; the page remembers it for the chat
-            elif isinstance(answer, str) and answer.startswith("blocked:"):
-                return _err(f"{tool} was blocked: {answer[8:].strip()}. Do not retry it; do something safer or ask the user.")
-            elif answer == "cancelled":
-                return _err("The request was cancelled before the user answered.")
-            elif answer != "allow":
-                return _err(f"The user did not allow this {tool} call ({d.why}). Do not try the same thing again; ask them what they want instead.")
+        stop = gate(tool, args, ctx)
+        if stop is not None:
+            return stop
         try:
             r = self._with_nested(tool, args, ctx, self._run[tool](args, ctx))
             if ctx.hooks:

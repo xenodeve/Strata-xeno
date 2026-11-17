@@ -65,6 +65,8 @@ describe("machineOf", () => {
 describe("isCodingCall / isSkillsCall: by the event's machine, not the name alone", () => {
   test("the server's coding group, and the runner's only on a call that ran on My PC (also renamed on a clash)", () => {
     expect(isCodingCall({ server: "agent" })).toBe(true)
+    expect(isCodingCall({ server: "strata" })).toBe(true)                     // #339: Strata's own tools ask on the same card
+    expect(isCodingCall({ server: "strata", machine: "my" })).toBe(false)
     expect(isCodingCall({ server: "my_agent", machine: "my" })).toBe(true)
     expect(isCodingCall({ server: "my_agent_2", machine: "my" })).toBe(true)
     expect(isCodingCall({ server: "my_agentx", machine: "my" })).toBe(false)

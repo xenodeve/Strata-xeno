@@ -89,6 +89,7 @@ def execute(svc, parent, kind: str, prompt: str, description: str, run_loop) -> 
     helper = agent_run_mod.AgentRun(policy, parent.ctx.session, parent.broker, parent.goal, parent.side, cancel, parent.timeout, shell=parent.shell, who=parent.who)
     helper.ctx.checkpoint, helper.ctx.hooks, helper.ctx.vision, helper.ctx.web = parent.ctx.checkpoint, parent.ctx.hooks, parent.ctx.vision, parent.ctx.web
     helper.ctx.in_helper = True
+    helper.ctx.guest = parent.ctx.guest                       # #339: a guest's helper is a guest's (it has no Strata tools either way)
     helper.ctx.question = lambda questions: {"answers": None}                  # a helper cannot ask the user
     # #310 part 2: the helper works where its run works - the run's own view of the tool groups and its coding group (a project on the
     # engineer's PC: that PC's runner, never the server's own tools), and the same run key on that PC

@@ -506,6 +506,25 @@ class ServerChat(Base):
         code, body = self.chat(self.ann, {"strata_mcp_runner": 7})
         self.assertEqual((code, body["error"]["type"]), (404, "runner_not_found"))
 
+    def test_the_rules_of_a_server_project_say_where_my_pcs_mcp_tools_run(self):
+        """#339: a Server PC chat that is offered My PC's MCP groups is told they run on that PC (my_...); one without is told every MCP
+        tool runs on the central PC.  The same while the runner is offline (#338 keeps the groups), so the prefix does not move."""
+        self.start_routing(DONE, DONE, DONE, DONE)
+        loop = self.runner("k", device="device-0000", cfg={"mcp_servers": {"fake": FAKE}})
+        self.assertTrue(wait_for(lambda: self.req("GET", f"/mcp?runner={loop.id}", key="k", device="device-0000")[1]["servers"][0]["tools"], 20), self.said)
+        sa = {"cwd": str(self.proj), "session": "chat-1"}
+        prompts = []
+        for extra in ({"strata_mcp_runner": loop.id}, {}, {"strata_mcp_runner": loop.id, "strata_mcp_off": ["my_fake"]}):
+            code, events = self.chat("k", {"strata_agent": sa, **extra}, device="device-0000")
+            self.assertEqual(code, 200, events)
+            prompts.append(self.engine.prompt_text(len(prompts)))
+        self.assertIn(f"An MCP tool whose name starts with my_ (my_<server>__<tool>) runs on the user's PC ({loop.executor.machine})", prompts[0])
+        self.assertIn("run on the central PC (the server), not on the user's PC", prompts[0])
+        self.assertIn("my_fake__echo", prompts[0])                                          # and the tools are offered           # the coding tools: a server project
+        for p in prompts[1:]:
+            self.assertNotIn("starts with my_", p)
+            self.assertIn("The MCP tools run on the central PC", p)
+
     def test_without_a_runner_the_request_is_as_before(self):
         self.start_routing()
         loop = self.runner(self.ann, cfg={"mcp_servers": {"fake": FAKE}})

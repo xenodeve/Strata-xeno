@@ -404,6 +404,16 @@ describe("the coding tools in the chat", () => {
     expect(t.state).toBe("done")                                              // the result came after
   })
 
+  test("#339: a settings change's card carries its before and after", async () => {
+    keep()
+    const change = { setting: "web.on", description: "web access", before: false, after: true }
+    mockFetch([sse(...call(), { strata_mcp: { event: "permission", id: "q1", call_id: "c1", tool: "StrataSettingsChange", arguments: { setting: "web.on", value: true }, why: "w", danger: false, rule: null, change } },
+      ...finish)], [])
+    const c = new ChatController()
+    await c.send("switch web on", [], { ...ctx, agent: ON })
+    expect(c.messages[1].tools![0].ask?.change).toEqual(change)
+  })
+
   test("while it waits the call says so", async () => {
     keep()
     let release!: () => void

@@ -202,7 +202,7 @@ class AgentRun:
             if settled:
                 return settled
         slot = self.broker.open(rid, "permission", self.who)
-        self._emit({"event": "permission", "id": rid, **{k: req.get(k) for k in ("tool", "arguments", "why", "danger", "rule")}})
+        self._emit({"event": "permission", "id": rid, **{k: req.get(k) for k in ("tool", "arguments", "why", "danger", "rule")}, **({"change": req["change"]} if req.get("change") else {})})      # #339: a settings change's before/after
         end = time.monotonic() + self.timeout
         try:
             while not slot["event"].wait(0.25):
