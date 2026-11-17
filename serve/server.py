@@ -64,6 +64,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
 from serve.loop_guard import LoopGuard
 from serve import reasoning_carry
 from serve import cjk_guard, forced_opening, gguf_info, think_budget  # noqa: E402  (xeno #49 S4, S7 follow-up, S3)
+from serve import app_settings, strata_tools  # noqa: E402  (#339: the app's settings writers; Strata's own docs and settings for the chat)
 from serve.timing_line import report as timing_report  # noqa: E402  (xeno #49 S5)
 from serve import timeline  # noqa: E402  (#33: STRATA_TIMELINE, the server's lanes)
 from serve.history import HistoryStore, chunk_stats, prompt_for_keep, request_meta, summary_record, window_rates  # noqa: E402  (xeno UI S3)
@@ -3373,6 +3374,7 @@ class Service:
         self.config_path = None                          # the run config (--config) and the --mcp-config file: where serve/mcp_admin.py
         self.mcp_config_path = None                      # reads and writes the servers the web app sets up
         self.importer = None                             # serve/harness.py's Importer: the other coding apps' skills and MCP servers (#94)
+        self.strata = None                               # serve/strata_tools.py's StrataServer: the chat's StrataDocs / StrataSettings / StrataSettingsChange (#339)
         self.agent = None                                # serve/agent.py's AgentServer: the chat's coding tools (Read, Write, Edit, Bash, ...); None: switched off
         self.broker = agent_run.Broker()                 # the questions the coding tools have asked the page and not had answered yet
         self.runs = runs_mod.RunStore()                  # the answers that use the coding tools: they go on when the page that asked is refreshed or closed (serve/runs.py)
@@ -3422,14 +3424,15 @@ class Service:
             on = []
         return memory_mod.collect(home, folders, on)
 
-    def start_agent_run(self, sa: dict, messages: list, who: str = "owner", runner=None, guest: bool = False):
+    def start_agent_run(self, sa: dict, messages: list, who: str = "owner", runner=None, guest: bool = False, local: bool = False):
         """One request's use of the coding tools: the folder, mode, rules and chat the page named (anything odd is ignored), the rules for the
         AI as a prompt, and auto mode's judge (serve/agent_run.py).  `who`: the identity whose request it is; only it answers what the run asks (#310).
         `runner` (#310 part 2): the serve/runner_hub.py Runner of a project on the engineer's own PC.  Its `run.start` job (the facts job) gives
         the real folders, the shell, the platform, git and the notes, and the server touches none of its own disk, hooks or checkpoints for
         the run; web access, helpers, vision and the judge stay the server's.  RunnerUnavailable when the job fails (before any run is made).
         `guest`: a team guest's run - its WebFetch (it runs here, for the run and its helpers) reaches only the public internet, never this
-        PC, a private network, Tailscale or Radmin's 26.0.0.0/8 (web.public_not_vpn, as #311's image URLs; final review I-1)."""
+        PC, a private network, Tailscale or Radmin's 26.0.0.0/8 (web.public_not_vpn, as #311's image URLs; final review I-1).
+        `local`: the page is open on this PC itself (its rules then say the central PC is the user's own, #339)."""
         mode = permissions.mode_for(sa.get("mode"), guest=guest, on_runner=runner is not None)      # #329: a guest's YOLO only on their own PC
         rules = lambda v: [x for x in v if isinstance(x, str) and 0 < len(x) <= 500][:200] if isinstance(v, list) else []      # noqa: E731
         sid = sa.get("session") if isinstance(sa.get("session"), str) and 0 < len(sa["session"]) <= 80 else "default"
@@ -3464,6 +3467,7 @@ class Service:
             protected = []                                              # the runner keeps its own files from the tools; the server's are not there
         policy = permissions.Policy(cwd=folder, mode=mode, allow=rules(sa.get("allow")), deny=rules(sa.get("deny")), dirs=dirs, protected=protected)
         run = agent_run.AgentRun(policy, sid, self.broker, goal, self.side_request, threading.Event(), shell=shell, who=who)
+        run.ctx.guest = guest                                           # #339: the server's settings are the owner's: a guest reads only the docs
         if facts is None:
             if isinstance(cp, str) and sid != "default":
                 run.ctx.checkpoint = self.checkpoints.scope(sid, cp)              # this prompt's checkpoint: the files the tools change are kept as they were
@@ -3480,14 +3484,20 @@ class Service:
             run.ctx.spawn = lambda kind, prompt, description: subagent_mod.execute(self, run, kind, prompt, description, run_with_mcp)
         else:
             run.hidden |= set(helpers)
+        if guest:
+            run.hidden |= set(strata_tools.OWNER_TOOLS)
+        strata = [t["name"] for t in getattr(self.strata, "tools", None) or [] if t["name"] not in run.hidden]      # #339: Strata's own tools, in the rules' list
         if facts is None:
-            tools = [t["name"] for t in self.agent.tools if (t["name"] != "ExitPlanMode" or mode == "plan") and t["name"] not in run.hidden]
-            run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []))
+            tools = [t["name"] for t in self.agent.tools if (t["name"] != "ExitPlanMode" or mode == "plan") and t["name"] not in run.hidden] + strata
+            run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), sys.platform, git, None, tools, dirs, self.memory_blocks([folder, *dirs] if folder else []),
+                                            same_pc=local)
         else:                                                           # the runner's coding tools, then the server's own that run here
             ours = {t["name"] for t in getattr(self.agent, "tools", None) or []}
             names = [n for n in facts["tools"] if n not in runner_hub.SERVER_TOOLS and runner_hub.plain_name_ok(n)] + [n for n in runner_hub.SERVER_TOOLS if n in ours]
-            tools = [n for n in names if (n != "ExitPlanMode" or mode == "plan") and n not in run.hidden]
-            run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), facts["platform"], git, None, tools, dirs, facts["memory"])
+            tools = [n for n in names if (n != "ExitPlanMode" or mode == "plan") and n not in run.hidden] + strata
+            mine = runner.servers() if hasattr(runner, "servers") else {}
+            run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), facts["platform"], git, None, tools, dirs, facts["memory"],
+                                            machine=runner.info.get("machine") or "?", my_tools=any(n != "my_agent" for n in mine))     # #339: where each tool runs
         run.ctx.vision = self.vision is not None and not self._vision_down()          # Read can give an image to the model only when the vision encoder is there
         if facts is not None:                                           # no hooks for a project on the engineer's PC (v1): the server's run on the server
             return run
@@ -6451,8 +6461,7 @@ def make_handler(svc: Service):
                 if self._authorized():
                     if not self._owner_only("the sub-agent settings can be read"):
                         return
-                    self._json(200, {**subagent_mod.settings(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "helper_tools", ())), "editable": bool(svc.config_path),
-                                     "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
+                    self._json(200, app_settings.helpers_view(svc))
                 return
             if path == "/agent/run":
                 # a run that went on while the page was away (serve/runs.py): its events from number `from` on, as they come; only for who may use the coding tools
@@ -6478,8 +6487,7 @@ def make_handler(svc: Service):
                 if self._authorized():
                     if not self._owner_only("the web access settings can be read"):
                         return
-                    self._json(200, {**web_mod.public_view(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "web_tools", ())), "editable": bool(svc.config_path),
-                                     "config_file": os.path.basename(svc.config_path) if svc.config_path else None})
+                    self._json(200, app_settings.web_view(svc))
                 return
             if path in page_routes.GET_PATHS:
                 # the folders of this PC (the project picker), a folder's Git state (the Chat's right panel), `@file`, and
@@ -6740,15 +6748,7 @@ def make_handler(svc: Service):
                     body = json.loads(raw)
                 except ValueError:
                     return self._json(400, {"error": {"message": "the body is not JSON"}})
-                new, errors = subagent_mod.check_settings(body)
-                if errors:
-                    return self._json(400, {"error": {"message": f"{errors[0]['message']} ({errors[0]['field']})", "fields": errors}})
-                with mcp_admin._lock:
-                    try:
-                        mcp_admin.update_config(svc.config_path, lambda cfg: cfg.__setitem__("agents", new))
-                    except (OSError, ValueError, TypeError) as e:
-                        return self._json(500, {"error": {"message": f"it could not be saved: {e}"}})
-                return self._json(200, {**subagent_mod.settings(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "helper_tools", ())), "editable": True, "config_file": os.path.basename(svc.config_path)})
+                return self._json(*app_settings.save_helpers(svc, body))       # the same writer as the chat's StrataSettingsChange (#339)
             if path == "/agent/web":                         # web access on or off, and the search provider (serve/web.py)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
@@ -6764,15 +6764,7 @@ def make_handler(svc: Service):
                     body = json.loads(raw)
                 except ValueError:
                     return self._json(400, {"error": {"message": "the body is not JSON"}})
-                new, errors = web_mod.check_settings({**web_mod.settings(harness._cfg(svc)), **body} if isinstance(body, dict) else body)
-                if errors:
-                    return self._json(400, {"error": {"message": f"{errors[0]['message']} ({errors[0]['field']})", "fields": errors}})
-                with mcp_admin._lock:
-                    try:
-                        mcp_admin.update_config(svc.config_path, lambda cfg: cfg.__setitem__("web", new))
-                    except (OSError, ValueError, TypeError) as e:
-                        return self._json(500, {"error": {"message": f"it could not be saved: {e}"}})
-                return self._json(200, {**web_mod.public_view(harness._cfg(svc)), "available": svc.agent is not None and bool(getattr(svc.agent, "web_tools", ())), "editable": True, "config_file": os.path.basename(svc.config_path)})
+                return self._json(*app_settings.save_web(svc, body))           # the same writer as the chat's StrataSettingsChange (#339)
             if path == "/agent/hooks":                       # which hooks are switched off (the hooks themselves are written in the run config only)
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n) if 0 <= n <= 100_000 else b""
@@ -7386,13 +7378,10 @@ def make_handler(svc: Service):
                                               "message": 'the body must be {"defaults": {...}} to set them, '
                                                          'or {"defaults": null} to clear them'}})
                     return
-                shared = svc.set_shared(req["defaults"])
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
-            print("[strata] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
-                  if shared else "[strata] other apps use their own settings again", flush=True)
-            self._json(200, {"shared": bool(shared), "defaults": shared})
+            self._json(*app_settings.save_shared(svc, req["defaults"]))     # the same writer as the chat's StrataSettingsChange (#339)
 
         def _sse(self, now: bool = False):
             self._note(http_status=200)
@@ -7486,7 +7475,8 @@ def make_handler(svc: Service):
                     return self._json(409, {"error": {"message": "the coding tools are switched off on this server (\"agent\": false in the run config)"}})
                 guest = self.team and not (self.identity is not None and self.identity.is_owner)     # its WebFetch: never the team's network (I-1)
                 if runner is None:
-                    arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, guest=guest)     # #310: the run and what it asks are this identity's
+                    local = mcp_admin.is_loopback(self._peer()) and mcp_admin.host_is_loopback(self.headers.get("Host", ""))      # #339: the page is on this PC
+                    arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, guest=guest, local=local)     # #310: the run and what it asks are this identity's
                 else:
                     try:                                          # the facts job: up to REQUEST_TIMEOUT_S, on this request's own thread, no lock held
                         arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, runner=runner, guest=guest)
@@ -7528,7 +7518,7 @@ def make_handler(svc: Service):
                 skip = {x for x in off if isinstance(x, str)} if isinstance(off, list) and all(isinstance(x, str) for x in off) else set()
                 subset = arun is not None and arun.runner is not None and svc.agent is not None    # #310 part 2: the view's "agent" is the server's WebFetch / WebSearch / Task
                 if req.get("strata_mcp") is not True:             # (without server coding tools a config server may be called "agent": it is an MCP server then)
-                    keep = {arun.coding} | ({"agent"} if arun.runner is None or subset else set())
+                    keep = {arun.coding, "strata"} | ({"agent"} if arun.runner is None or subset else set())      # #339: Strata's own docs and settings go with the coding tools
                     skip |= {n for n in hub.servers if n not in keep}      # the coding tools alone: no MCP server
                 if arun is None:
                     skip.add("agent")                             # and the coding tools only when the request asks for them
@@ -7537,7 +7527,8 @@ def make_handler(svc: Service):
                     skip |= {n for n in (svc.mcp.servers if svc.mcp is not None else ()) if n not in allowed and not (subset and n == "agent")}
                 if hub is not svc.mcp:                            # #310 part 2: a run on My PC keeps the names it is offered now, for every
                     hub.pin(skip)                                 # call of this request and its helpers; a skipped server is never called
-                extra = hub.template_tools(exclude=own | (arun.hidden if arun is not None else set()), skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
+                hide = (arun.hidden if arun is not None else set()) | (set(strata_tools.OWNER_TOOLS) if allowed is not None or arun is None else set())    # #339: a guest, or a chat without the coding tools (no card to ask on), is not offered the server's settings
+                extra = hub.template_tools(exclude=own | hide, skip_servers=skip)       # the request's own tools win a name clash; the coding tools that are switched off are not offered
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             if force and use_mcp:
@@ -8236,49 +8227,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
     return out
 
 
-SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
-               "experimental_speed_projection")
-
-
-def clean_shared_defaults(d) -> dict:
-    """The Chat settings other apps get (POST /settings): only known keys, each checked; ValueError names a bad one."""
-    if d is None:
-        return {}
-    if not isinstance(d, dict):
-        raise ValueError("defaults must be an object")
-    out = {}
-    for key, value in d.items():
-        if value is None or value == "":
-            continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
-        if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high", "xhigh"):
-                raise ValueError("reasoning_effort: none, low, medium, high or xhigh")
-        elif key == "temperature":
-            if not number or not 0 <= value <= 2:
-                raise ValueError("temperature: 0..2")
-        elif key == "top_p":
-            if not number or not 0 < value <= 1:
-                raise ValueError("top_p: 0 < top_p <= 1")
-        elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise ValueError("top_k: an integer 1..64")
-            value = int(value)
-        elif key in ("seed", "max_tokens"):
-            if not number or value != int(value) or value <= 0:
-                raise ValueError(f"{key}: a positive integer")
-            value = int(value)
-        elif key == "reasoning_budget_tokens":                 # #123: 0 means no budget, so 0 is allowed here
-            if not number or value != int(value) or value < 0:
-                raise ValueError("reasoning_budget_tokens: a whole number of tokens (0: no budget)")
-            value = int(value)
-        elif key == "experimental_speed_projection":
-            if not isinstance(value, bool):
-                raise ValueError("experimental_speed_projection: true or false")
-        else:
-            raise ValueError(f"unknown setting {key!r}")
-        out[key] = float(value) if key in ("temperature", "top_p") else value
-    return out
+from serve.app_settings import SHARED_KEYS, clean_shared_defaults  # noqa: E402,F401  (#339: moved there, beside the writer that uses it)
 
 
 # xeno #49 S8 / story 20: coding presets, chosen in the run config ("sampling": {"preset": "balanced"}) and never
@@ -8562,7 +8511,8 @@ def main() -> int:
         shell_mod.install(agent_server, shell_mod.find_shell())
         web_mod.install(agent_server)                         # WebFetch and WebSearch: offered to a chat only when the user has switched web access on
         subagent_mod.install(agent_server)                    # Task: the same, for helpers
-    hub = hub_from_config(cfg, a.mcp_config, builtins={**importer.builtins(), **({"agent": agent_server} if agent_server else {})})     # before the minutes of loading: a bad entry stops here
+    strata_server = strata_tools.StrataServer()           # #339: Strata's own docs and settings for the chat (its Service is bound below)
+    hub = hub_from_config(cfg, a.mcp_config, builtins={**importer.builtins(), "strata": strata_server, **({"agent": agent_server} if agent_server else {})})     # before the minutes of loading: a bad entry stops here
     placeholder = None
     if a.engine == "strata":
         if not cfg:
@@ -8784,6 +8734,7 @@ def main() -> int:
         except (OSError, ValueError):
             svc.shared = {}
     svc.importer = importer
+    svc.strata, strata_server.svc = strata_server, svc
     skills_in_use = len(importer.skills._skills)
     if skills_in_use:
         print(f"[strata] {skills_in_use} skill{'s' * (skills_in_use != 1)} imported from your other coding apps for the web app's chat "

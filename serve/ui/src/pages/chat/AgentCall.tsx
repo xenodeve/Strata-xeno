@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, CheckmarkCircle02Icon, CircleIcon, Alert02Icon } from "@hugeicons/core-free-icons"
-import { chat, type AskedQuestion, type Step, type Todo, type ToolCall } from "../../lib/chat"
+import { chat, type AskedQuestion, type SettingChange, type Step, type Todo, type ToolCall } from "../../lib/chat"
 import { diffRows, toolSummary } from "../../lib/agent"
 import type { Effect, Scope } from "../../lib/perms"
 import { Collapse } from "../../components/motion"
@@ -36,12 +36,31 @@ const WHY: Record<string, string> = {
   "it writes to a file or hides what runs (a substitution, a redirection)": msg("It writes to a file or hides what runs (a substitution, a redirection)."),
   "this git command can change something": msg("This git command can change something."),
   "approve the plan to leave plan mode": msg("Approve the plan to leave plan mode."),
+  "it changes Strata's settings: every change asks you, in every mode": msg("It changes Strata's settings: every change asks you, in every mode."),
 }
 const why = (s: string) => (WHY[s] ? t(WHY[s]) : s)
 
 const QUESTION: Record<string, string> = {
   Bash: msg("Run this command?"), Read: msg("Read this file?"), Glob: msg("Look for files here?"), Grep: msg("Search here?"),
   Write: msg("Write this file?"), Edit: msg("Change this file?"), NotebookEdit: msg("Change this notebook?"), ExitPlanMode: msg("Approve this plan?"),
+  StrataSettingsChange: msg("Change this Strata setting?"),
+}
+
+/** A value of a setting as the card shows it: a word for nothing, the text itself, or the object laid out. */
+const shown = (v: unknown) => (v === null || v === undefined ? t("(not set)") : typeof v === "string" ? v : JSON.stringify(v, null, 2))
+
+/** #339: a change of Strata's own settings - which setting, its value now and the value it will have (secrets already masked by the server). */
+function ChangeView({ change }: { change: SettingChange }) {
+  return (
+    <div data-setting-change={change.setting} className="space-y-1.5 text-[12.5px]">
+      <div><span className="text-ink-2">{t("Setting")}: </span><span className="font-mono">{change.setting}</span></div>
+      {change.description && <div className="text-[12px] text-ink-3">{change.description}</div>}
+      <div className="grid gap-1.5 sm:grid-cols-2">
+        <div data-before><div className="text-[11.5px] text-ink-2">{t("Now")}</div><pre className="tool-pre bg-bad/5">{shown(change.before)}</pre></div>
+        <div data-after><div className="text-[11.5px] text-ink-2">{t("After the change")}</div><pre className="tool-pre bg-ok/5">{shown(change.after)}</pre></div>
+      </div>
+    </div>
+  )
 }
 
 const str = (x: unknown) => (typeof x === "string" ? x : "")
@@ -147,6 +166,7 @@ function Question({ call }: { call: ToolCall }) {
       {ask.tool === "NotebookEdit" && <div className="font-mono text-[12px] [overflow-wrap:anywhere]">{get("notebook_path")}{get("cell_id") ? ` — ${get("cell_id")}` : ""}</div>}
       {(ask.tool === "Glob" || ask.tool === "Grep") && <div className="font-mono text-[12px] [overflow-wrap:anywhere]">{get("pattern")}{get("path") ? ` — ${get("path")}` : ""}</div>}
       {ask.tool === "ExitPlanMode" && <div className="prose-chat max-h-72 overflow-auto text-[13px]" dangerouslySetInnerHTML={{ __html: markdown(get("plan")) }} />}
+      {ask.change && <ChangeView change={ask.change} />}
       <div className="text-[12px] text-ink-2">{why(ask.why)}</div>
       {ask.danger && <div className="text-[12px] font-medium text-bad">{t("It can do harm that is hard to undo. Only allow it if you meant it.")}</div>}
       <div className="flex flex-wrap items-center gap-2 pt-1">
@@ -242,6 +262,7 @@ function Body({ call }: { call: ToolCall }) {
   if (name === "NotebookEdit") return <div className="space-y-2"><Out text={str(arg(call, "new_source"))} />{result}</div>
   if (name === "Task") return <div className="space-y-2"><Out text={str(arg(call, "prompt"))} />{result}</div>
   if (name === "ExitPlanMode") return <div className="prose-chat text-[13px]" dangerouslySetInnerHTML={{ __html: markdown(str(arg(call, "plan"))) }} />
+  if (name === "StrataSettingsChange" && call.ask?.change) return <div className="space-y-2"><ChangeView change={call.ask.change} />{result}</div>
   if (name === "TodoWrite") return <TodoList todos={Array.isArray(arg(call, "todos")) ? (arg(call, "todos") as Todo[]) : []} />
   return result ?? <Out text={JSON.stringify(call.arguments ?? {}, null, 2)} />
 }

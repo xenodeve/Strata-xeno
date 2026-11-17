@@ -11,6 +11,8 @@ The defaults are the developer's choice for this app:
   * mode "plan" changes nothing (Write, Edit and any command that is not read-only are refused);
   * mode "auto" does not change this function's answer: it marks what a second judgement may settle (`judgeable`) and what never may
     (a dangerous command, a secret, the .git folder) - the caller asks the judge, and the user when the judge is unsure.
+  * a change of Strata's own settings (StrataSettingsChange, #339) asks in every mode, YOLO included, is never judged and has no rule;
+    plan mode refuses it.  Reading Strata's docs and settings (StrataDocs, StrataSettings) is free.
   * mode "yolo" (#329, the developer's choice for a model hosted on this PC) asks nothing: deny rules, a dangerous command and a secret
     leaving this PC (`leaks`, and the caller's check of a `git push`, `pushes` / `secret_paths`) are refused instead.  The leak checks
     are patterns: they cannot see every way out (a program the model writes and then runs can still send what it reads).
@@ -28,8 +30,10 @@ from urllib.parse import urlsplit
 FILE_READ = ("Read", "Glob", "Grep")
 FILE_EDIT = ("Write", "Edit", "NotebookEdit")
 WEB = ("WebFetch", "WebSearch")                                  # they send something off this PC: every call asks, unless the user wrote a rule for it
-KNOWN = FILE_READ + FILE_EDIT + WEB + ("Bash", "TodoWrite", "BashOutput", "KillShell", "ExitPlanMode", "AskUserQuestion", "Task")
-FREE = ("TodoWrite", "BashOutput", "KillShell", "AskUserQuestion", "Task")      # they only act on what the user already allowed in this chat, or only ask the user something
+STRATA_READ = ("StrataDocs", "StrataSettings")                  # #339: Strata's own docs and its settings (no secret): read freely
+STRATA_CHANGE = "StrataSettingsChange"                           # #339: one change of Strata's settings: asks the user in every mode, YOLO too
+KNOWN = FILE_READ + FILE_EDIT + WEB + ("Bash", "TodoWrite", "BashOutput", "KillShell", "ExitPlanMode", "AskUserQuestion", "Task") + STRATA_READ + (STRATA_CHANGE,)
+FREE = ("TodoWrite", "BashOutput", "KillShell", "AskUserQuestion", "Task") + STRATA_READ      # they only act on what the user already allowed in this chat, only ask the user something, or only read Strata's own docs and settings
 
 
 @dataclass
@@ -482,7 +486,7 @@ def rule_for(tool: str, args: dict) -> str | None:
         w = p.segments[0]
         pre = w[0] if len(w) == 1 or w[0] not in MULTI or w[1].startswith("-") else f"{w[0]} {w[1]}"
         return f"Bash({pre}:*)"
-    if tool in KNOWN and tool not in FREE and tool != "ExitPlanMode":
+    if tool in KNOWN and tool not in FREE and tool not in ("ExitPlanMode", STRATA_CHANGE):      # a change of Strata's settings has no rule: it asks every time
         raw = args.get("path") if tool in ("Glob", "Grep") else args.get("notebook_path") if tool == "NotebookEdit" else args.get("file_path")
         if isinstance(raw, str) and raw.strip():
             r = real(raw, None) or (os.path.realpath(os.path.expanduser(raw)) if os.path.isabs(os.path.expanduser(raw)) else None)
@@ -535,6 +539,10 @@ def decide(tool: str, args: dict, pol: Policy) -> Decision:
             t, _ = _file_target(tool, args, pol)
             if t and _path_rule_matches(spec, t, pol.cwd):
                 return Decision("deny", f"denied by the rule {rule}", rule=rule)
+    if tool == STRATA_CHANGE:                                      # #339: before YOLO, the free tools and every allow rule: the user decides each change, no judge does
+        if pol.mode == "plan":
+            return Decision("deny", "plan mode: nothing is changed")
+        return Decision("ask", "it changes Strata's settings: every change asks you, in every mode")
     if pol.mode == "yolo":
         return _yolo(tool, args)
     plan = pol.mode == "plan"

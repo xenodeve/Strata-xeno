@@ -17,7 +17,9 @@ import { slotKey, addProject, loadIndex, moveSession, newSession, openSession, p
 import { chatMachine, runnerId, type Machine } from "./runner"
 
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
-export interface Ask { stopped?: boolean; id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; answer?: "allow" | "allow_chat" | "deny"; kept?: { scope: "project" | "everywhere"; effect: Effect }; closed?: string }      // closed (#310 part 2): the server closed the card (My PC went offline, ...), its reason
+/** #339: a change of Strata's own settings, as its card shows it (the server masks every secret before it sends this). */
+export interface SettingChange { setting: string; description?: string; before: unknown; after: unknown }
+export interface Ask { stopped?: boolean; id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; change?: SettingChange; answer?: "allow" | "allow_chat" | "deny"; kept?: { scope: "project" | "everywhere"; effect: Effect }; closed?: string }      // closed (#310 part 2): the server closed the card (My PC went offline, ...), its reason
 export interface Todo { content: string; status: "pending" | "in_progress" | "completed"; activeForm: string }
 /** What the model asked the user (AskUserQuestion): one to four questions with two to four choices each; `answers` once the user answered (null: skipped). */
 export interface AskedQuestion {
@@ -164,7 +166,7 @@ interface ToolEvent {
   text?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number; skipped?: boolean; max_rounds?: number
   state?: string; kind?: string; description?: string; steps?: number; answer?: string; answers?: unknown
   on?: string; hook?: string; command?: string; code?: number | null; blocked?: boolean; timeout?: boolean; error?: string | null
-  call_id?: string; why?: string; danger?: boolean; rule?: string | null; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string; questions?: AskedQuestion["questions"]      // the coding tools
+  call_id?: string; why?: string; danger?: boolean; rule?: string | null; change?: unknown; verdict?: string; severity?: number | null; todos?: Todo[]; mode?: string; questions?: AskedQuestion["questions"]      // the coding tools
   machine?: string; reason?: string | null                                           // #310 part 2: a call on My PC; why the server closed a card (`state` also carries a `remote` event's step)
 }
 const REMOTE = ["sending", "running", "offline"] as const
@@ -220,7 +222,7 @@ function onTool(m: Message, x: ToolEvent, at = Date.now()) {
     if (!c) return
     if (x.event === "judging") c.judging = true
     else c.judging = false
-    if (x.event === "permission") { c.ask = { id: x.id, tool: String(x.tool ?? c.name), why: x.why ?? "", danger: !!x.danger, rule: x.rule ?? null, arguments: x.arguments }; c.state = "asking" }
+    if (x.event === "permission") { c.ask = { id: x.id, tool: String(x.tool ?? c.name), why: x.why ?? "", danger: !!x.danger, rule: x.rule ?? null, arguments: x.arguments, ...(x.change && typeof x.change === "object" ? { change: x.change as SettingChange } : {}) }; c.state = "asking" }
     else if (x.event === "judged" && (x.verdict === "allow" || x.verdict === "block" || x.verdict === "ask")) c.judge = { verdict: x.verdict, severity: x.severity ?? null }
     return
   }

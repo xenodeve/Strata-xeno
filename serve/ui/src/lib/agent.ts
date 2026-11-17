@@ -90,6 +90,8 @@ export function toolSummary(tool: string, args: unknown): string {
     case "WebSearch": return cut(str(a.query))
     case "BashOutput": return str(a.bash_id)
     case "KillShell": return str(a.shell_id)
+    case "StrataDocs": return cut(str(a.query) || [str(a.page), str(a.section)].filter(Boolean).join("#"))
+    case "StrataSettingsChange": return cut(str(a.setting))
     default: return ""
   }
 }
