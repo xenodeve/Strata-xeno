@@ -5417,6 +5417,21 @@ RUNNER_HELLO_MAX, RUNNER_REPLY_MAX = 4 << 20, 32 << 20
 NO_RUNNER = "there is no such runner (say hello again)"
 RUNNER_REPLACED = {"error": {"type": "runner_replaced", "message": "a newer Strata Desktop runner on this PC took this "
                                                                    "runner's place; this one stops"}}
+# #313: the runner's own requests keep their connection (HTTP/1.1, Content-Length): a new TCP connection per poll and
+# per reply cost 10-14 ms median on this PC (bimodal 0.2-0.5 or 10-25 ms), and 1 RTT more (plus 1-2 for TLS) on a
+# real link.  Every other route stays HTTP/1.0 with Connection: close (end_headers).
+RUNNER_KEEP = {("POST", "/runner/hello"), ("GET", "/runner/next"), ("POST", "/runner/reply")}
+
+
+def route_path(target: str) -> str:
+    """The path do_GET / do_POST route a request target on: the classic app's /classic prefix taken off once, the
+    query cut, trailing slashes dropped.  The keep-alive decision (#313) uses it too, so it keeps exactly the
+    requests the runner's routes answer; a fragment or an absolute-form target ends in the generic 404 and closes."""
+    if target.startswith("/classic/"):
+        target = target[len("/classic"):]
+    return target.split("?")[0].rstrip("/")
+RUNNER_IDLE_S = 90.0            # a kept connection with no next request for this long is closed (the runner's own limit
+                                # is shorter, serve/runner.py KEEP_IDLE_S, so it rarely sends on one the server closed)
 
 
 def make_handler(svc: Service):
@@ -5435,13 +5450,47 @@ def make_handler(svc: Service):
             pass
 
         def handle_one_request(self):
-            self.answer_started = False
+            # #313: a runner's kept connection brings every one of its requests to this one object: each starts clean
+            self.answer_started = self.body_read = self.body_done = self.team = self.length_sent = False
+            self.record = self.watch_done = self.identity = self.headers = None
+            self.device_id, self.status_sent = "", 0
+            self.protocol_version = "HTTP/1.0"
             super().handle_one_request()
             self._drain_body()
+            if not self.close_connection:                    # kept (only the runner's routes are): until its next
+                try:                                         # request, or RUNNER_IDLE_S without one
+                    self.connection.settimeout(RUNNER_IDLE_S)
+                    self.server.keep(self.connection, True)
+                except (OSError, AttributeError):
+                    self.close_connection = True
+
+        def finish(self):
+            keep = getattr(self.server, "keep", None)
+            if keep is not None:
+                keep(self.connection, False)
+            super().finish()
 
         def send_response(self, code, message=None):
             self.answer_started = True                 # a malformed-request answer can only replace one not yet begun
+            self.status_sent = code
             super().send_response(code, message)
+
+        def send_header(self, keyword, value):
+            if keyword.lower() == "content-length":
+                self.length_sent = True
+            super().send_header(keyword, value)
+
+        def _keeps(self) -> bool:
+            """#313: this answer leaves the connection open - a runner route asked over HTTP/1.1 (not `Connection:
+            close`), its body read to the end (`body_done`: not `body_read`, which is set before a read that may
+            fail half way) or none, a Content-Length, and no 5xx."""
+            if self.protocol_version != "HTTP/1.1" or self.close_connection or not self.length_sent:
+                return False
+            if self.status_sent >= 500:
+                return False
+            headers = getattr(self, "headers", None)
+            no_body = headers is not None and not self._chunked() and headers.get("Content-Length", "0").strip() == "0"
+            return self.body_done or no_body
 
         def _chunked(self) -> bool:
             """#893: a body sent as Transfer-Encoding: chunked (a relay or proxy that does not buffer it).  By RFC 9112
@@ -5546,11 +5595,18 @@ def make_handler(svc: Service):
             """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
             (host_allowed).  With a key (the api_key, or team mode's named keys, #310) a rebinding page cannot
             authenticate, so the check is skipped: tunnels and proxies that pass their own name on keep working."""
+            try:
+                self.connection.settimeout(None)             # #313: a kept connection's idle limit (RUNNER_IDLE_S) is
+            except OSError:                                  # for the wait for a request, not for serving it
+                pass
             if not super().parse_request():
                 return False
             host = self.headers.get("Host")
             # svc.allowed_hosts again: a name the config adds after serve() worked out host_names (xeno #71)
             if svc.key_required() or host_allowed(host, svc.host_names | set(svc.allowed_hosts), "*" in svc.allowed_hosts):
+                if self.request_version == "HTTP/1.1" and (self.command, route_path(self.path)) in RUNNER_KEEP:
+                    self.protocol_version = "HTTP/1.1"       # #313: the runner's routes may keep the connection
+                    self.close_connection = (self.headers.get("Connection") or "").strip().lower() == "close"
                 return True
             print(f"[strata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
                   f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
@@ -5588,7 +5644,9 @@ def make_handler(svc: Service):
             # client that pools connections (.NET's SocketsHttpHandler) can put its next request on this socket
             # before the close reaches it, and that request fails with "response ended prematurely" without the
             # server ever reading it (a .NET agent app, 2026-10-03: 25 of ~1000 requests, 1-24 ms after the previous answer).
-            self.send_header("Connection", "close")
+            # The one exception is the runner's own routes over HTTP/1.1 (#313, `_keeps`).
+            if not self._keeps():
+                self.send_header("Connection", "close")
             super().end_headers()
 
         def _watch_client(self, cancel: threading.Event) -> None:
@@ -5596,7 +5654,8 @@ def make_handler(svc: Service):
             until it ends, and a streamed one only a keep-alive per prompt chunk (and the first write after a hang-up
             usually still succeeds), so a dropped request kept the engine busy until its answer or the whole prompt
             was done.  Every 0.5 s: the socket readable with nothing to read (EOF) means the client closed it.  A
-            request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
+            request is fully read here, and no client sends its next request before this one's answer (a runner's kept
+            connection, #313, neither), so no later bytes are expected - data is not a hang-up."""
             done = self.watch_done = threading.Event()
             sock = self.connection
 
@@ -5694,6 +5753,11 @@ def make_handler(svc: Service):
                 return True
             # every key's first use from a new device waits for the owner, the owner's own key too (spec decision 1)
             state = svc.keys.device(ident, self.device_id, label, addr, time.time())
+            if state == "refused":                           # #315: the key renamed between match() and the check -
+                again = svc.keys.match(given)                # its devices went with it, so its new name decides (a
+                if again is not None and again.name != ident.name:     # runner took the old name's "refused" as the
+                    ident = self.identity = again                       # owner's word and stopped for good)
+                    state = svc.keys.device(ident, self.device_id, label, addr, time.time())
             if state == "approved":
                 return True
             if state == "pending":
@@ -5908,9 +5972,10 @@ def make_handler(svc: Service):
             return True
 
         def do_GET(self):
+            target = self.path                               # as it came: _ui_prefix may take /classic off
             if self._ui_prefix():
                 return
-            path = self.path.split("?")[0].rstrip("/")
+            path = route_path(target)
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
@@ -6211,11 +6276,12 @@ def make_handler(svc: Service):
                     self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _do_post(self):
+            target = self.path
             if self.path.startswith("/classic/"):             # the classic app under its prefix (xeno UI S1)
                 self.path = self.path[len("/classic"):]
             if not self._authorized():
                 return
-            path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            path = route_path(target)                    # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
             # #310: what changes the shared engine, every client's settings or what is recorded is an owner key's in
@@ -6686,12 +6752,15 @@ def make_handler(svc: Service):
                     key = svc.keys.create(name, role, by=by, owner_first=True)
                     return self._json(200, {"key": key, "name": name.strip(), "role": role})
                 if action == "rename":
-                    if not svc.keys.rename(name, body.get("to"), by=by):
+                    with svc.runner_hub.names:              # #315: no runner's hello between the key's rename and
+                        renamed = svc.keys.rename(name, body.get("to"), by=by)      # its runners' move
+                        if renamed:
+                            new = body["to"].strip()
+                            svc.runs.move(name, new)        # the holder keeps her runs and prompts; a later key named
+                            svc.broker.move(name, new)      # `name` inherits none of them
+                            svc.runner_hub.move(name, new)  # and her runners (their ids follow the name)
+                    if not renamed:                         # answered after the lock: a slow client holds no hello
                         return self._json(404, missing)
-                    new = body["to"].strip()
-                    svc.runs.move(name, new)                # the holder keeps her runs and prompts; a later key named
-                    svc.broker.move(name, new)              # `name` inherits none of them
-                    svc.runner_hub.move(name, new)          # and her runners (their ids follow the name)
                     return self._json(200, {"ok": True, "name": new})
                 if action == "role":
                     role = body.get("role")
@@ -6790,6 +6859,9 @@ def make_handler(svc: Service):
                     return None
                 self.body_read = True
                 raw = self.rfile.read(n)
+                if len(raw) != n:                            # the client stopped sending: nothing more on this socket
+                    self.close_connection = True
+            self.body_done = not self.close_connection       # #313: read to its end - the connection may be kept
             try:
                 body = json.loads(raw)
             except ValueError:
@@ -6827,7 +6899,12 @@ def make_handler(svc: Service):
             if isinstance(got, str):
                 return self._json(400, {"error": {"message": got}})
             info, groups, skills = got
-            r = svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
+            with svc.runner_hub.names:                      # #315: wholly before or after a rename of the key
+                if self.team:                               # the key's name now, not as it was when the request came
+                    who = svc.keys.match(self._given_key())
+                r = None if who is None else svc.runner_hub.hello(who.name, self._runner_device(), body["instance"], info, groups, skills)
+            if r is None:                                   # revoked meanwhile (answered after the lock)
+                return self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             poll = runner_hub.POLL_MAX_S
             return self._json(200, {"runner": r.id, "who": r.who, "protocol": runner_hub.RUNNER_PROTOCOL,
                                     "poll_s": int(poll) if float(poll).is_integer() else poll, "channel": r.channel})
@@ -6838,7 +6915,8 @@ def make_handler(svc: Service):
             (an ack that names another channel than the runner's is ignored).  A runner that ended while the poll was held is told why: replaced 409, revoked 401, its
             device refused or cleared 404 (a new hello meets the device gate), the server stopping 503."""
             q = parse_qs(urlsplit(self.path).query)
-            r = svc.runner_hub.get_for(q.get("id", [""])[0], self._acting())
+            asked = q.get("id", [""])[0]
+            r = svc.runner_hub.get_for(asked, self._acting())
             if r is None:
                 return self._json(404, {"error": {"message": NO_RUNNER}})
             if r.instance != q.get("instance", [""])[0]:
@@ -6856,11 +6934,13 @@ def make_handler(svc: Service):
             self._watch_client(gone)
             try:
                 messages = r.take(min(max(wait, 0.0), runner_hub.POLL_MAX_S), gone=gone, ack=int(ack),
-                                  channel=q.get("channel", [None])[0])
+                                  channel=q.get("channel", [None])[0], as_id=asked)
             finally:
                 self.watch_done.set()
             if gone.is_set():
                 return                                       # nobody to answer: the messages stay for the next poll
+            if r.ended is None and r.id != asked:            # #315: the key was renamed meanwhile - the runner says
+                return self._json(404, {"error": {"message": NO_RUNNER}})      # hello again now and learns its new id
             if r.ended == "replaced":
                 return self._json(409, RUNNER_REPLACED)
             if r.ended == "revoked":
@@ -7468,11 +7548,31 @@ class Server(ThreadingHTTPServer):
     # (STRATA_HTTP_BACKLOG overrides it)
     request_queue_size = max(5, int(os.environ.get("STRATA_HTTP_BACKLOG") or 256))
 
+    def __init__(self, *args, **kwargs):
+        self._kept: set = set()                     # #313: the runner connections open between two requests
+        self._kept_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def keep(self, sock, kept: bool) -> None:
+        """#313: `sock` is a kept connection (True: from the end of its first kept answer) or is done (False).
+        server_close shuts every one, whether it waits for its next request or is serving one (a stop ends that
+        request too: the runner sees the connection end and connects again), so a stopped server answers no more
+        requests on them."""
+        with self._kept_lock:
+            (self._kept.add if kept else self._kept.discard)(sock)
+
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
 
     def server_close(self):
+        with self._kept_lock:
+            kept, self._kept = list(self._kept), set()
+        for sock in kept:                           # the runner sees the end at once and connects again
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         # the hardware sampler serve() started for this server stops with it (test isolation: every Service a test
         # started used to leave its sampler running, 21 of them after test_responses, which slowed test_parallel's timing)
         tel = getattr(getattr(self, "svc", None), "telemetry", None)
