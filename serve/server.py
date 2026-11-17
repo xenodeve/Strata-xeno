@@ -3472,7 +3472,9 @@ class Service:
         else:                                                           # the runner keeps the checkpoint and found .git
             run.ctx.run_key, run.coding, run.runner, git = facts["run"], "my_agent", runner, facts["git"]
         web = web_mod.settings(conf)
-        run.hidden = set() if web["on"] else set(getattr(self.agent, "web_tools", ()))          # web access is off until the user switches it on: the model is not even offered the tools
+        if guest and not (isinstance(conf, dict) and isinstance(conf.get("web"), dict) and conf["web"].get("on") is True):
+            web = {**web, "on": False}                                  # #337: on by default for the owner; a team guest only when the owner switched it on outright
+        run.hidden = set() if web["on"] else set(getattr(self.agent, "web_tools", ()))          # web access off ("on": false): the model is not even offered the tools
         if web["on"]:                                                   # a guest's fetches leave from this PC: not into the team's own network
             run.ctx.web = web_mod.Web(web, fetcher=web_mod.Fetcher(guard=web_mod.public_not_vpn) if guest else None)
         helpers = getattr(self.agent, "helper_tools", ())
@@ -7562,7 +7564,7 @@ def make_handler(svc: Service):
                                         and getattr(s, "group_kind", "") == "coding"), "my_agent")             # group landed under in the view
                 req = {**req, "messages": agent_prompt.with_system(req.get("messages") or [], arun.prompt)}
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
-            messages, tools, kw = openai_to_messages(req)
+            messages, tools, kw = openai_to_messages(req, vision=svc.vision is not None)       # #334: a scanned PDF page of an attached file is an image only with vision
             req = svc.cjk(req, messages)                                # xeno #49 S4
             if arun is not None:
                 arun.kw, arun.sampling = kw, req                      # a helper (serve/subagent.py) runs with the same settings

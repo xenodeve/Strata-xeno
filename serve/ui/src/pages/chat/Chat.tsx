@@ -444,7 +444,7 @@ export function Chat({ id }: { id?: string }) {
           efforts={choices.map((c) => t(c.label))}
           effort={Math.max(0, choices.findIndex((c) => c.value === chat.settings.thinking))}
           onEffort={(i) => chat.setSettings({ ...chat.settings, thinking: choices[i].value })}
-          attachTitle={health.images ? t("Text files and pictures") : t("Text files")}
+          attachTitle={health.images ? t("Text files, documents and pictures") : t("Text files and documents")}
           dragging={dragging}
         >
           {away && busy && (

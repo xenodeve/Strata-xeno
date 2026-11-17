@@ -85,7 +85,7 @@ export async function postHelpers(on: boolean): Promise<{ view: HelpersView } | 
   } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
 }
 
-export interface WebView { on: boolean; provider: "searxng" | "brave"; searxng_url: string; brave_key_set: boolean; available: boolean; editable: boolean; config_file: string | null }
+export interface WebView { on: boolean; provider: "ddgs" | "searxng" | "brave"; searxng_url: string; brave_key_set: boolean; available: boolean; editable: boolean; config_file: string | null }
 
 /** Web access for the coding tools (serve/web.py): whether it is on, the search provider, whether there is a Brave key (never the key). null when the server cannot be asked (not this PC, no such route). */
 export async function getWeb(): Promise<WebView | null> {
