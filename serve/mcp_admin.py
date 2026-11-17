@@ -25,6 +25,16 @@ NAME = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
 MAX_SERVERS, MAX_ARGS, MAX_TEXT = 50, 64, 4096
 LIMITS = {"timeout_s": (1.0, 600.0), "max_result_chars": (1000, 500000), "max_rounds": (1, 30)}
 RESERVED = ("agent", "skills", "strata")   # the built-in groups' names: a configured server of one of these names would be hidden by the built-in (#339)
+
+
+def name_refused(name) -> str | None:
+    """Why a NEW server of the central PC may not have this name, or None (#339): a built-in group's name, or one that starts with my_,
+    which the chat's rules keep for the MCP servers of the user's own PC (my_<server>__<tool>)."""
+    if name in RESERVED:
+        return f"{name!r} is the name of one of Strata's built-in tool groups: choose another"
+    if isinstance(name, str) and name.lower().startswith("my_"):
+        return f"{name!r} starts with my_, which is kept for the MCP servers of the user's own PC: choose another name"
+    return None
 _lock = threading.Lock()               # one change at a time: a write and the restart of the hub that follows it
 
 
@@ -366,8 +376,9 @@ def apply(svc, body) -> tuple[int, dict]:
         except (OSError, ValueError) as e:
             return 500, {"error": {"message": f"the run config could not be read: {e}"}}
         for name, sent in body["servers"].items():
-            if name in RESERVED and name not in stored:          # a new one only: a server stored under it before #339 can still be saved
-                errors.append({"server": name, **_err("name", f"{name} is the name of one of Strata's built-in tool groups: choose another")})
+            refused = name_refused(name) if name not in stored else None     # a new one only: a server stored under it before #339 can still be saved
+            if refused:
+                errors.append({"server": name, **_err("name", refused)})
                 continue
             if isinstance(sent, dict) and isinstance(name, str):
                 sent = merge_masked(sent, stored.get(name) if isinstance(stored.get(name), dict) else None)

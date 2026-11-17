@@ -3497,7 +3497,7 @@ class Service:
             tools = [n for n in names if (n != "ExitPlanMode" or mode == "plan") and n not in run.hidden] + strata
             mine = runner.servers() if hasattr(runner, "servers") else {}
             run.prompt = agent_prompt.build(folder, shell, mode, time.strftime("%Y-%m-%d"), facts["platform"], git, None, tools, dirs, facts["memory"],
-                                            machine=runner.info.get("machine") or "?", my_tools=any(n != "my_agent" for n in mine))     # #339: where each tool runs
+                                            machine=runner.info.get("machine") or "?", my_tools=any(getattr(g, "group_kind", "") == "mcp" for g in mine.values()))     # #339: where each tool runs
         run.ctx.vision = self.vision is not None and not self._vision_down()          # Read can give an image to the model only when the vision encoder is there
         if facts is not None:                                           # no hooks for a project on the engineer's PC (v1): the server's run on the server
             return run

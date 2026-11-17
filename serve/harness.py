@@ -393,6 +393,8 @@ def import_server(own: dict, harness_id: str, name: str, found: dict, environ=No
     if cand["state"] == "already":
         raise ImportRefused("already", f"Strata already has it, as {cand['already_as']!r}")
     taken = set(own) | set(mcp_admin.RESERVED)                  # #339: never a built-in group's name (Strata's own MCP server is often "strata")
+    if name.lower().startswith("my_"):                           # ... nor my_, kept for the user's own PC's servers
+        name = name[3:] or "server"
     final = _clean_name(name)
     if final in taken:
         base = _clean_name(f"{name}-{harness_id}")

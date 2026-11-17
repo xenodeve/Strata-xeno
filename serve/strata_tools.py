@@ -218,17 +218,84 @@ class Docs:
 
 
 # ------------------------------------------------------------------------------------------------ the settings
+STORED = mcp_admin.MASK + " (unchanged, stored)"          # a value the card does not show: it is the stored one, kept as it is
+SECRET_FLAG = re.compile(r"^--?[\w-]*(key|token|secret|password|passwd|auth|bearer|credential)[\w-]*$", re.I)
+SECRET_PAIR = re.compile(r"^(--?)?([\w.-]*(key|token|secret|password|passwd|auth|bearer|credential)[\w.-]*)([=:])(.+)$", re.I)
+
+
 def _public_server(entry) -> dict:
     return mcp_admin.public_entry(entry) if isinstance(entry, dict) else {}
 
 
-def masked_arguments(args: dict) -> dict:
-    """The call's arguments as the card shows them: an MCP server's env and header values masked."""
-    out = copy.deepcopy(args) if isinstance(args, dict) else {}
-    value = out.get("value")
-    if isinstance(value, dict) and isinstance(value.get("server"), dict):
-        value["server"] = mcp_admin.public_entry(value["server"])
+def _masked_args(args) -> list:
+    """An MCP server's command-line arguments as the model reads them in StrataSettings: the value after a flag named like a secret
+    (--api-key X, --token=X, key=X) and anything shaped like a known token (serve/permissions.py TOKENS) is a mask."""
+    out, hide_next = [], False
+    for a in args if isinstance(args, list) else []:
+        if not isinstance(a, str):
+            out.append(a)
+            continue
+        if hide_next:
+            out.append(mcp_admin.MASK)
+            hide_next = False
+            continue
+        m = SECRET_PAIR.match(a)
+        if m:
+            out.append(a[:len(a) - len(m.group(5))] + mcp_admin.MASK)
+        elif permissions.TOKENS.search(a):
+            out.append(mcp_admin.MASK)
+        else:
+            out.append(a)
+            hide_next = bool(SECRET_FLAG.match(a))
     return out
+
+
+def _masked_url(url):
+    """An address without its query string's values (an API key often travels there)."""
+    if not isinstance(url, str) or "?" not in url:
+        return url
+    head, query = url.split("?", 1)
+    return head + "?" + "&".join(f"{p.split('=', 1)[0]}={mcp_admin.MASK}" if "=" in p else p for p in query.split("&"))
+
+
+def _for_model(row: dict) -> dict:
+    out = {k: v for k, v in row.items() if k != "kind"}
+    if "args" in out:
+        out["args"] = _masked_args(out["args"])
+    if "url" in out:
+        out["url"] = _masked_url(out["url"])
+    if isinstance(out.get("command"), str) and permissions.TOKENS.search(out["command"]):
+        out["command"] = permissions.TOKENS.sub(mcp_admin.MASK, out["command"])
+    return out
+
+
+def card_entry(new: dict, sent: dict | None, old: dict | None) -> tuple[dict, list[dict]]:
+    """An MCP server as its card shows it after the change, and each env / header key with its state.  What the model sends is shown in
+    full (its own words, which a page it read may have put there); a value kept from storage (the model sent the mask) is never shown;
+    a key is new, changed, unchanged or removed."""
+    shown = copy.deepcopy(new) if isinstance(new, dict) else {}
+    sent = sent if isinstance(sent, dict) else {}
+    old = old if isinstance(old, dict) else {}
+    keys = []
+    for field in ("env", "headers"):
+        now = new.get(field) if isinstance(new.get(field), dict) else {}
+        was = old.get(field) if isinstance(old.get(field), dict) else {}
+        typed = sent.get(field) if isinstance(sent.get(field), dict) else {}
+        view = {}
+        for k, v in now.items():
+            kept = typed.get(k) == mcp_admin.MASK
+            value = STORED if kept else v
+            state = "new" if k not in was else "unchanged" if was[k] == v else "changed"
+            view[k] = value
+            keys.append({"field": field, "key": k, "state": state, "value": value})
+        for k in was:
+            if k not in now:
+                keys.append({"field": field, "key": k, "state": "removed", "value": None})
+        if view:
+            shown[field] = view
+        else:
+            shown.pop(field, None)
+    return shown, keys
 
 
 def current(svc) -> dict:
@@ -242,7 +309,7 @@ def current(svc) -> dict:
         "helpers": subagent_mod.settings(cfg),
         "skills": harness.skill_settings(cfg),
         "chat_defaults": dict(getattr(svc, "shared", {}) or {}),
-        "mcp_servers": [{k: v for k, v in s.items() if k not in ("kind",)} for s in mcp_admin.read_view(svc.config_path, svc.mcp_config_path)["servers"]],
+        "mcp_servers": [_for_model(s) for s in mcp_admin.read_view(svc.config_path, svc.mcp_config_path)["servers"]],
     }
     imp = getattr(svc, "importer", None)
     if imp is not None:
@@ -257,13 +324,17 @@ def current(svc) -> dict:
 class Plan:
     """One change, checked: what the card shows (`change`) and how it is written (`apply` -> (status, what the route would send))."""
 
-    def __init__(self, setting: str, before, after, apply, same: bool | None = None):
-        self.setting, self.before, self.after, self.apply = setting, before, after, apply
+    def __init__(self, setting: str, before, after, apply, same: bool | None = None, target: str | None = None, keys: list | None = None, state=None):
+        self.setting, self.before, self.after, self.apply, self.target, self.keys = setting, before, after, apply, target, keys
         self.same = before == after if same is None else same      # nothing would change: refused, so no write and no restart of the MCP servers
+        self.state = (before, after) if state is None else state   # unmasked: what the check after the user's answer compares
 
     @property
     def change(self) -> dict:
-        return {"setting": self.setting, "description": SETTINGS[self.setting], "before": self.before, "after": self.after}
+        out = {"setting": self.setting, "target": self.target, "description": SETTINGS[self.setting], "before": self.before, "after": self.after}
+        if self.keys is not None:
+            out["keys"] = self.keys
+        return out
 
 
 def plan(svc, setting, value) -> Plan | str:
@@ -307,11 +378,12 @@ def _plan_skills(svc, cfg, setting, key, value) -> Plan | str:
     if key == "enabled":
         if not isinstance(value, bool):
             return "the value is true or false"
-        block["enabled"], before, after = value, st["enabled"], value
+        block["enabled"], before, after, target = value, st["enabled"], value, None
     else:
         if not isinstance(value, dict) or value.get("app") not in harness.IDS or not isinstance(value.get("on"), bool):
             return f"the value is {SETTINGS[setting]}"
         app, on = value["app"], value["on"]
+        target = app
         if key == "app":
             before = app not in st["harness_off"]
             block["harness_off"] = [h for h in st["harness_off"] if h != app] + ([] if on else [app])
@@ -321,6 +393,7 @@ def _plan_skills(svc, cfg, setting, key, value) -> Plan | str:
             names = {s["name"] for s in (imp.found.get(app, {}).get("skills", []) if imp is not None else [])}
             if not isinstance(name, str) or name not in names:
                 return f"there is no skill named {name!r} from {app}"
+            target = f"{app} / {name}"
             off = st["off"].get(app, [])
             before = name not in off
             block["off"] = {**st["off"], app: [n for n in off if n != name] + ([] if on else [name])}
@@ -328,7 +401,7 @@ def _plan_skills(svc, cfg, setting, key, value) -> Plan | str:
     _, errors = harness._check_skills(block)
     if errors:
         return f"the value is refused: {errors[0]['message']}"
-    return Plan(setting, before, after, lambda: _route(harness.apply(svc, {"skills": block}), lambda: harness.skill_settings(harness._cfg(svc))))
+    return Plan(setting, before, after, lambda: _route(harness.apply(svc, {"skills": block}), lambda: harness.skill_settings(harness._cfg(svc))), target=target)
 
 
 def _route(result, view) -> tuple[int, dict]:
@@ -348,8 +421,10 @@ def _plan_mcp(svc, cfg, setting, key, value) -> Plan | str:
             new_own, final = harness.import_server(stored, value["app"], value["name"], imp.found, imp.environ)
         except harness.ImportRefused as e:
             return f"it cannot be imported: {e}"
-        return Plan(setting, None, {"name": final, "server": _public_server(new_own[final])},
-                    lambda: _route(harness.apply(svc, {"import_mcp": {"harness": value["app"], "name": value["name"]}}), lambda: {"imported": final}))
+        shown, keys = card_entry(_public_server(new_own[final]), None, None)     # another app's stored values: never shown
+        return Plan(setting, None, {"name": final, "server": shown},
+                    lambda: _route(harness.apply(svc, {"import_mcp": {"harness": value["app"], "name": value["name"]}}), lambda: {"imported": final}),
+                    target=f"{final} (from {value['app']})", keys=keys, state=(None, new_own[final]))
     if not isinstance(value, dict) or not isinstance(value.get("name"), str):
         return f"the value is {SETTINGS[setting]}"
     name = value["name"]
@@ -362,20 +437,23 @@ def _plan_mcp(svc, cfg, setting, key, value) -> Plan | str:
     if key in ("add", "edit"):
         if key == "add" and (name in stored or name in in_file):
             return f"there is already an MCP server named {name!r}: use mcp.edit, or another name"
-        if key == "add" and name in mcp_admin.RESERVED:
-            return f"{name!r} is the name of one of Strata's built-in tool groups: choose another"
-        sent = value.get("server")
-        if not isinstance(sent, dict):
+        if key == "add":
+            why = mcp_admin.name_refused(name)
+            if why:
+                return why
+        typed = value.get("server")
+        if not isinstance(typed, dict):
             return f"the value is {SETTINGS[setting]}"
-        if key == "edit":
-            sent = mcp_admin.merge_masked(sent, stored.get(name) if isinstance(stored.get(name), dict) else None)
+        old = stored.get(name) if key == "edit" and isinstance(stored.get(name), dict) else None
+        sent = mcp_admin.merge_masked(typed, old) if key == "edit" else typed
         entry, errors = mcp_admin.validate_entry(name, sent)
         if errors:
             return f"the server is refused: {errors[0]['message']} ({errors[0]['field']})"
         before = _public_server(stored[name]) if key == "edit" else None
         same = key == "edit" and entry == stored[name]
         servers[name] = entry
-        after = _public_server(entry)
+        after, keys = card_entry(entry, typed, old)
+        raw = (stored.get(name) if key == "edit" else None, entry)
     elif key == "switch":
         on = value.get("on")
         if not isinstance(on, bool):
@@ -390,11 +468,13 @@ def _plan_mcp(svc, cfg, setting, key, value) -> Plan | str:
     else:                                                    # delete
         before, after = _public_server(stored[name]), None
         servers.pop(name)
+    if key not in ("add", "edit"):
+        keys, raw = None, (stored.get(name), servers.get(name))
     if len(servers) > mcp_admin.MAX_SERVERS:
         return f"at most {mcp_admin.MAX_SERVERS} servers"
     return Plan(setting, before, after, lambda: _route(mcp_admin.apply(svc, {"servers": servers}),
                                                        lambda: {"servers": [s["name"] for s in mcp_admin.read_view(svc.config_path, None)["servers"]]}),
-                same=same if key in ("add", "edit") else None)
+                same=same if key in ("add", "edit") else None, target=name, keys=keys, state=raw)
 
 
 # ------------------------------------------------------------------------------------------------ the server
@@ -472,11 +552,11 @@ class StrataServer:
             return _err(p)
         if p.same:
             return _err(f"{p.setting} is already {json.dumps(p.after, ensure_ascii=False)}: nothing to change.")
-        stop = agent_mod.gate(CHANGE, args, ctx, card={"arguments": masked_arguments(args), "change": p.change})
+        stop = agent_mod.gate(CHANGE, args, ctx, card={"change": p.change})          # the arguments are the model's own words: shown in full
         if stop is not None:
             return stop
         again = plan(self.svc, args.get("setting"), args.get("value"))      # the settings as they are now, after the wait
-        if isinstance(again, str) or again.change != p.change:
+        if isinstance(again, str) or again.state != p.state or again.change != p.change:
             return _err("The settings changed while the user was deciding, so nothing was changed. Read them again (StrataSettings) and ask again.")
         code, out = again.apply()
         if code != 200:

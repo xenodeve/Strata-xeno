@@ -127,7 +127,7 @@ class Svc:
         return self.shared
 
 
-class TheTools(unittest.TestCase):
+class ToolsBase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -151,6 +151,8 @@ class TheTools(unittest.TestCase):
     def change(self, setting, value, **kw):
         return self.server.call("StrataSettingsChange", {"setting": setting, "value": value}, ctx=self.ctx(**kw))
 
+
+class TheTools(ToolsBase):
     CASES = [("web.on", True), ("web.provider", "searxng"), ("web.searxng_url", "http://localhost:8080"), ("helpers.on", True),
              ("skills.enabled", False), ("skills.app", {"app": "codex", "on": False}), ("chat.temperature", 0.6), ("chat.reasoning_effort", "low"),
              ("mcp.add", {"name": "new", "server": {"url": "http://127.0.0.1:1/x", "disabled": True}}),
@@ -251,7 +253,7 @@ class TheTools(unittest.TestCase):
         stored = json.loads(self.config.read_text(encoding="utf-8"))["mcp_servers"]["files"]
         self.assertEqual(stored["env"], {"TOKEN": SECRETS[1]})
         self.assertEqual(stored["args"], ["-y", "files2"])
-        self.assertEqual(self.cards[0]["change"]["after"]["env"], {"TOKEN": mcp_admin.MASK})
+        self.assertEqual(self.cards[0]["change"]["after"]["env"], {"TOKEN": strata_tools.STORED})
 
     def test_a_change_made_while_the_user_decides_stops_this_one(self):
         def ask(card):
@@ -268,6 +270,91 @@ class TheTools(unittest.TestCase):
         c.in_helper = True
         self.assertTrue(self.server.call("StrataSettingsChange", {"setting": "web.on", "value": True}, ctx=c)["isError"])
         self.assertEqual(self.cards, [])
+
+
+class TheCard(ToolsBase):
+    """The review of 38920f6f: the card shows what the model sends, in full, and names what it changes."""
+
+    def entries(self):
+        return {(k["field"], k["key"]): k for k in self.cards[0]["change"]["keys"]}
+
+    def test_an_env_value_the_model_changes_is_shown_in_full_and_marked_changed(self):
+        self.change("mcp.edit", {"name": "files", "server": {"command": "npx", "args": ["-y", "files"],
+                                                              "env": {"TOKEN": "--require C:/x/evil.js"}}})
+        card = self.cards[0]
+        keys = self.entries()
+        self.assertEqual(keys[("env", "TOKEN")]["state"], "changed")
+        self.assertEqual(keys[("env", "TOKEN")]["value"], "--require C:/x/evil.js")
+        self.assertIn("--require C:/x/evil.js", json.dumps(card["change"]["after"]))
+        self.assertIn("--require C:/x/evil.js", json.dumps(card["arguments"]))          # the model's own words are not masked
+        self.assertNotIn(SECRETS[1], json.dumps(card))                                     # the stored one never shows
+        self.assertEqual(card["change"]["target"], "files")
+
+    def test_a_value_kept_from_storage_is_masked_and_said_to_be_unchanged_and_a_new_key_is_new(self):
+        self.change("mcp.edit", {"name": "files", "server": {"command": "npx", "args": ["-y", "files"],
+                                                              "env": {"TOKEN": mcp_admin.MASK, "NODE_OPTIONS": "--require x.js"}}})
+        keys = self.entries()
+        self.assertEqual((keys[("env", "TOKEN")]["state"], keys[("env", "TOKEN")]["value"]), ("unchanged", "******** (unchanged, stored)"))
+        self.assertEqual((keys[("env", "NODE_OPTIONS")]["state"], keys[("env", "NODE_OPTIONS")]["value"]), ("new", "--require x.js"))
+        self.assertNotIn(SECRETS[1], json.dumps(self.cards[0]))
+
+    def test_a_key_dropped_is_marked_removed(self):
+        self.change("mcp.edit", {"name": "remote", "server": {"url": "http://127.0.0.1:1/mcp"}})
+        self.assertEqual(self.entries()[("headers", "Authorization")]["state"], "removed")
+        self.assertNotIn(SECRETS[2], json.dumps(self.cards[0]))
+
+    def test_an_added_server_shows_its_values(self):
+        self.change("mcp.add", {"name": "pw", "server": {"command": "npx", "env": {"NODE_OPTIONS": "--require evil.js"}, "disabled": True}})
+        self.assertEqual(self.entries()[("env", "NODE_OPTIONS")], {"field": "env", "key": "NODE_OPTIONS", "state": "new", "value": "--require evil.js"})
+        self.assertEqual(self.cards[0]["change"]["target"], "pw")
+
+    def test_the_card_names_its_target(self):
+        for setting, value, target in (("mcp.switch", {"name": "files", "on": False}, "files"), ("mcp.delete", {"name": "remote"}, "remote"),
+                                       ("skills.app", {"app": "codex", "on": False}, "codex"),
+                                       ("skills.skill", {"app": "codex", "name": "codex-only", "on": False}, "codex / codex-only"),
+                                       ("mcp.import", {"app": "codex", "name": "off-here"}, "off-here (from codex)")):
+            self.config.write_text(json.dumps(CONFIG), encoding="utf-8")
+            self.cards.clear()
+            self.change(setting, value)
+            self.assertEqual(self.cards[0]["change"]["target"], target, setting)
+
+    def test_my_is_kept_for_the_users_pc(self):
+        for name in ("my_files", "MY_x", "My_y"):
+            r = self.change("mcp.add", {"name": name, "server": {"command": "x"}})
+            self.assertTrue(r["isError"])
+            self.assertIn("my_", text_of(r))
+            code, out = mcp_admin.apply(self.svc, {"servers": {**CONFIG["mcp_servers"], name: {"command": "x", "disabled": True}}})
+            self.assertEqual(code, 400, name)
+            self.assertIn("my_", out["error"]["message"])
+        found = {"claude": {"servers": {"my_tools": {"command": "python", "args": ["t.py"]}}}}
+        _, final = harness.import_server({}, "claude", "my_tools", found, {})
+        self.assertFalse(final.lower().startswith("my_"), final)
+        self.assertEqual(self.cards, [])
+
+    def test_the_settings_mask_secrets_in_args_and_addresses(self):
+        cfg = {"mcp_servers": {"a": {"command": "npx", "args": ["srv", "--api-key", "plain-secret-1", "--token=plain-secret-2", "key=plain-secret-3",
+                                                                "ghp_" + "A" * 30, "--port", "8080"]},
+                               "b": {"url": "https://mcp.example.com/mcp?apikey=plain-secret-4&x=1"}}}
+        self.config.write_text(json.dumps(cfg), encoding="utf-8")
+        t = text_of(self.server.call("StrataSettings", {}, ctx=self.ctx()))
+        for secret in ("plain-secret-1", "plain-secret-2", "plain-secret-3", "plain-secret-4", "ghp_" + "A" * 30):
+            self.assertNotIn(secret, t)
+        self.assertIn("8080", t)                                                       # a plain value stays
+        self.assertIn("https://mcp.example.com/mcp?", t)
+
+    def test_the_check_after_the_answer_sees_a_stored_secret_that_changed(self):
+        def ask(card):
+            mcp_admin.update_config(str(self.config), lambda cfg: cfg["mcp_servers"]["files"].__setitem__("env", {"TOKEN": "other-secret"}))
+            return "allow"
+        c = agent.AgentContext(policy=permissions.Policy(cwd=None), session="s", ask=ask)
+        r = self.server.call("StrataSettingsChange", {"setting": "mcp.edit", "value": {"name": "files", "server": {
+            "command": "npx", "args": ["-y", "files2"], "env": {"TOKEN": mcp_admin.MASK}}}}, ctx=c)
+        self.assertIn("changed while", text_of(r))
+
+    def test_a_helper_keeps_the_guest_mark(self):
+        import inspect
+        from serve import subagent
+        self.assertIn("helper.ctx.guest", inspect.getsource(subagent.execute))
 
 
 # ------------------------------------------------------------------------------------------------ the same as the routes
@@ -370,7 +457,7 @@ class InTheChat(Fixture):
         self.assertEqual(len(cards), 1)
         call = [e for e in events if e["event"] == "call"][0]
         self.assertEqual(cards[0]["call_id"], call["id"])                               # the card lands on its call
-        self.assertEqual(cards[0]["change"], {"setting": "helpers.on", "description": strata_tools.SETTINGS["helpers.on"], "before": False, "after": True})
+        self.assertEqual(cards[0]["change"], {"setting": "helpers.on", "target": None, "description": strata_tools.SETTINGS["helpers.on"], "before": False, "after": True})
         self.assertEqual(self.config.read_bytes(), before)
 
     def test_allowed_it_is_written(self):

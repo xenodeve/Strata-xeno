@@ -78,7 +78,7 @@ class Fixture(unittest.TestCase):
 
     def where(self) -> dict:
         """#339: the prompt of a run on My PC says which PC each tool runs on."""
-        return {"machine": "ann-pc", "my_tools": any(n != "my_agent" for n in self.runner.servers())}
+        return {"machine": "ann-pc", "my_tools": any(getattr(g, "group_kind", "") == "mcp" for g in self.runner.servers().values())}
 
     def messages(self, text="fix the bug"):
         return [{"role": "user", "content": text}]
@@ -145,6 +145,11 @@ class OnMyPc(Fixture):
         run = self.svc.start_agent_run(self.sa(), self.messages(), "ann", runner=self.runner)
         self.assertIn("run on the user's PC (ann-pc)", run.prompt)
         self.assertNotIn("starts with my_", run.prompt)                                  # only the coding group: no my_ MCP tool
+        skills = {"name": "skills", "kind": "skills", "status": "ready", "error": None, "tools": [{"name": "find_skills", "description": "x", "inputSchema": {"type": "object"}}]}
+        self.runner = self.hub.hello("ann", "device-0001", "inst-aaaa", dict(INFO), [CODING, skills], [])
+        self.answer(facts())
+        run = self.svc.start_agent_run(self.sa(), self.messages(), "ann", runner=self.runner)
+        self.assertNotIn("starts with my_", run.prompt)                                  # my_skills is not an MCP group
         mcp = {"name": "browser", "kind": "mcp", "status": "ready", "error": None, "tools": [{"name": "open", "description": "x", "inputSchema": {"type": "object"}}]}
         self.runner = self.hub.hello("ann", "device-0001", "inst-aaaa", dict(INFO), [CODING, mcp], [])
         self.answer(facts())

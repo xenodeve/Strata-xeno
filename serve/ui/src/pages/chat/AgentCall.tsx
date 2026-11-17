@@ -50,15 +50,29 @@ const QUESTION: Record<string, string> = {
 const shown = (v: unknown) => (v === null || v === undefined ? t("(not set)") : typeof v === "string" ? v : JSON.stringify(v, null, 2))
 
 /** #339: a change of Strata's own settings - which setting, its value now and the value it will have (secrets already masked by the server). */
+const KEY_STATE: Record<string, string> = { new: msg("new"), changed: msg("changed"), unchanged: msg("unchanged"), removed: msg("removed") }
+
 function ChangeView({ change }: { change: SettingChange }) {
   return (
     <div data-setting-change={change.setting} className="space-y-1.5 text-[12.5px]">
+      {change.target && <div data-change-target className="text-[13.5px] font-semibold [overflow-wrap:anywhere]">{change.target}</div>}
       <div><span className="text-ink-2">{t("Setting")}: </span><span className="font-mono">{change.setting}</span></div>
       {change.description && <div className="text-[12px] text-ink-3">{change.description}</div>}
       <div className="grid gap-1.5 sm:grid-cols-2">
         <div data-before><div className="text-[11.5px] text-ink-2">{t("Now")}</div><pre className="tool-pre bg-bad/5">{shown(change.before)}</pre></div>
         <div data-after><div className="text-[11.5px] text-ink-2">{t("After the change")}</div><pre className="tool-pre bg-ok/5">{shown(change.after)}</pre></div>
       </div>
+      {!!change.keys?.length && (
+        <div data-change-keys className="space-y-0.5">
+          <div className="text-[11.5px] text-ink-2">{t("Environment variables and headers")}</div>
+          {change.keys.map((k) => (
+            <div key={k.field + k.key} data-key-state={k.state} className={cn("flex gap-2 font-mono text-[12px] [overflow-wrap:anywhere]", (k.state === "changed" || k.state === "new") && "font-medium text-bad")}>
+              <span className="shrink-0 rounded-sm bg-fill px-1.5 font-sans text-[11px] text-ink-2">{t(KEY_STATE[k.state] ?? k.state)}</span>
+              <span>{k.field}.{k.key}{k.value != null ? ` = ${k.value}` : ""}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

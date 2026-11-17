@@ -512,4 +512,8 @@ export const part: Record<string, string> = {
   "(not set)": "(ยังไม่ได้ตั้ง)",
   "Setting": "การตั้งค่า",
   "After the change": "หลังแก้",
+  "Environment variables and headers": "ตัวแปร environment และ header",
+  "changed": "เปลี่ยน",
+  "unchanged": "ไม่เปลี่ยน",
+  "removed": "ลบออก",
 }

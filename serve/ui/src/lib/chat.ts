@@ -18,7 +18,11 @@ import { chatMachine, runnerId, type Machine } from "./runner"
 
 /** The question a coding tool has put to the user (a card), and what the user answered; the server runs the call only after "allow". */
 /** #339: a change of Strata's own settings, as its card shows it (the server masks every secret before it sends this). */
-export interface SettingChange { setting: string; description?: string; before: unknown; after: unknown }
+export interface SettingChange {
+  setting: string; target?: string | null; description?: string; before: unknown; after: unknown
+  /** an MCP server's env / header keys: what the model sends is shown in full; a stored value it keeps is never shown */
+  keys?: { field: string; key: string; state: "new" | "changed" | "unchanged" | "removed"; value: string | null }[]
+}
 export interface Ask { stopped?: boolean; id: string; tool: string; why: string; danger: boolean; rule: string | null; arguments?: unknown; change?: SettingChange; answer?: "allow" | "allow_chat" | "deny"; kept?: { scope: "project" | "everywhere"; effect: Effect }; closed?: string }      // closed (#310 part 2): the server closed the card (My PC went offline, ...), its reason
 export interface Todo { content: string; status: "pending" | "in_progress" | "completed"; activeForm: string }
 /** What the model asked the user (AskUserQuestion): one to four questions with two to four choices each; `answers` once the user answered (null: skipped). */
