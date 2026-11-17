@@ -85,6 +85,7 @@
   input:hover { border-color: var(--fill-2); }
   input:focus { border-color: var(--accent); }
   .row-actions, .form-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  li.server .row-actions button.danger { margin-left: auto; }
   .form-actions { margin-top: 16px; }
   button {
     display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 12px;
@@ -228,11 +229,23 @@ function renderList(servers) {
       if (r && r.error) results[s.name] = { error: r.error };
       refresh();
     });
-    actions.append(test, connect);
+    const remove = el("button", "danger", w("button_remove"));         // #332: remove it from the list, not only from the form
+    remove.type = "button";
+    remove.addEventListener("click", (ev) => { ev.stopPropagation(); removeServer(s.name); });
+    actions.append(test, connect, remove);
     li.append(actions);
     li.addEventListener("click", () => edit(s));
     ul.append(li);
   }
+}
+
+async function removeServer(name) {
+  if (!window.confirm(w("confirm_remove", { name: name }))) return;
+  const r = await call(() => api.remove(name));
+  if (r && r.error) { $("form-error").textContent = r.error; $("form-error").hidden = false; return; }
+  delete results[name];
+  if (editing === name || selected === name) edit(null);
+  refresh();
 }
 
 function edit(s) {
@@ -325,14 +338,7 @@ document.addEventListener("DOMContentLoaded", () => {
       $("form-error").hidden = false;
     }
   });
-  $("remove").addEventListener("click", async () => {
-    if (!editing || !window.confirm(w("confirm_remove", { name: editing }))) return;
-    const r = await call(() => api.remove(editing));
-    if (r && r.error) { $("form-error").textContent = r.error; $("form-error").hidden = false; return; }
-    delete results[editing];
-    edit(null);
-    refresh();
-  });
+  $("remove").addEventListener("click", () => { if (editing) removeServer(editing); });
   $("copy").addEventListener("click", async () => {
     const r = await call(() => api.copy_code());
     $("copied").hidden = !(r && r.ok);

@@ -12,8 +12,10 @@ and `PIL` stay in `desktop/tray.py`, also inside functions.
   server at all: the window loads `<origin>/.strata-desktop/clear?n=<nonce>` and answers that one request itself
   (WebView2's WebResourceRequested, `_on_app_request`), so the page commits on the origin, with its localStorage.
 
-Neither window takes a link or a file dropped from outside (`AllowExternalDrop` off, set in pywebview's `before_show`,
-on the UI thread before the first navigation).  Nothing in the app window reaches Windows but a plain http(s)
+The servers window takes no link or file dropped from outside (`AllowExternalDrop` off, set in pywebview's
+`before_show`, on the UI thread before the first navigation).  The app window takes dropped files (#333: the chat's
+attach-by-dropping, as in a browser): a file dropped on the chat reaches the page's drop handler; one dropped anywhere
+else would navigate to a file: address, which `_on_app_navigating` cancels like any address off the server's origin.  Nothing in the app window reaches Windows but a plain http(s)
 address: a new-window link goes through `install_link_guard` (pywebview hands it to `webbrowser.open`, which is
 `os.startfile`), and a top-level navigation of the app window off the open server's origin is cancelled
 (`_on_app_navigating`; a link the user clicked to another http(s) address opens in the system browser).
@@ -142,12 +144,13 @@ def _do_events() -> None:
     WinForms.Application.DoEvents()
 
 
-def _no_drop(control, which: str) -> None:
-    """A link or a file dragged onto the window from outside does nothing (WebView2 would navigate to it)."""
+def _drops(control, which: str, allow: bool) -> None:
+    """Whether the window takes a link or a file dragged onto it from outside.  The servers window does not (WebView2
+    would navigate to it); the app window does (#333), behind its navigation check."""
     try:
-        control.AllowExternalDrop = False
+        control.AllowExternalDrop = allow
     except Exception as e:
-        log.error("the %s window still takes drops from outside (%s)", which, type(e).__name__)
+        log.error("the %s window's drops from outside could not be set (%s)", which, type(e).__name__)
 
 
 # #332: the web app's fonts (serve/ui/src/styles.css, the same OFL files and unicode ranges), inlined as data: fonts
@@ -406,7 +409,7 @@ class Gui:
         check every call of the page is refused (`api_functions`): fail closed."""
         native = getattr(window, "native", None)
         control = getattr(native, "webview", None)
-        _no_drop(control, "servers")
+        _drops(control, "servers", False)
         try:
             control.NavigationStarting += self._on_servers_navigating
             self._servers_guarded = True
@@ -434,10 +437,10 @@ class Gui:
                       type(e).__name__)
 
     def _prepare_app(self, window) -> None:
-        """No drop from outside, the session-end hook, and - once WebView2 has started - the local clear page."""
+        """Files dropped from outside (#333), the session-end hook, and - once WebView2 has started - the local clear page."""
         native = getattr(window, "native", None)
         control = getattr(native, "webview", None)
-        _no_drop(control, "app")
+        _drops(control, "app", True)
         try:
             control.CoreWebView2InitializationCompleted += self._on_app_core_ready
         except Exception as e:
