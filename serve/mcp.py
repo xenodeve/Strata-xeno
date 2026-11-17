@@ -493,6 +493,23 @@ def _clean(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", str(name)) or "x"
 
 
+def _on_users_pc(server) -> bool:
+    """#338: a runner's MCP group (serve/runner_hub.py RunnerGroup, `my_<name>`): an MCP server on the user's own PC."""
+    return getattr(server, "kind", "") == "runner" and getattr(server, "group_kind", "") == "mcp"
+
+
+def place_tag(server) -> str:
+    """#338: what a tool's description starts with when MCP servers of both PCs are offered, so the model does not mix them
+    up: a runner's MCP group runs on the user's PC (localhost there is the user's machine), any other MCP server on the
+    central PC.  The coding tools and the skills (built in, or a runner's coding / skills group) get none."""
+    if _on_users_pc(server):
+        machine = (getattr(server, "info", None) or {}).get("machine") or "?"
+        return f"[Runs on the user's PC ({machine}) — localhost there is the user's machine.]"
+    if getattr(server, "kind", "") in ("runner", "builtin"):
+        return ""
+    return "[Runs on the central PC (the server).]"
+
+
 class McpHub:
     """Every configured server, and the merged, namespaced tool list the model sees."""
 
@@ -576,7 +593,7 @@ class McpHub:
     def template_tools(self, exclude=(), skip_servers=()) -> list[dict]:
         """The tools in the chat template's form ({name, description, parameters}); `exclude`: names the request
         brought itself (those win); `skip_servers`: servers the page switched off for this chat."""
-        out = []
+        out, where = [], []
         for name, (s, tool) in self.routes().items():
             if name in exclude or s.name in skip_servers:
                 continue
@@ -586,6 +603,12 @@ class McpHub:
             schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
             out.append({"name": name, "description": str(t.get("description") or t.get("title") or ""),
                         "parameters": schema or {"type": "object", "properties": {}}})
+            where.append(s)
+        if any(_on_users_pc(s) for s in where):          # #338: where each MCP tool runs, when the user's PC's are offered
+            for item, s in zip(out, where):
+                tag = place_tag(s)
+                if tag:
+                    item["description"] = f"{tag} {item['description']}" if item["description"] else tag
         return out
 
     def openai_tools(self) -> list[dict]:

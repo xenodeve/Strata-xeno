@@ -16,7 +16,7 @@ export interface McpRow extends McpEntry {
   status: string; error: string | null; tools: McpTool[]; info?: { name?: string; version?: string }
 }
 export interface McpLimits { timeout_s: number; max_result_chars: number; max_rounds: number }
-export interface McpConfigView { servers: McpRow[]; editable: boolean; reason: string; settings: McpLimits; config_file: string | null; tools: number }
+export interface McpConfigView { servers: McpRow[]; editable: boolean; reason: string; settings: McpLimits; config_file: string | null; tools: number; machine?: string }      // machine: the runner's PC (#338)
 export interface Problem { field: string; message: string }
 
 export interface Draft { name: string; kind: "program" | "address"; command: string; args: string; env: string; cwd: string; url: string; headers: string }

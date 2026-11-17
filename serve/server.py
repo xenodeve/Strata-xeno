@@ -6159,6 +6159,54 @@ def make_handler(svc: Service):
             res = runner.request("page", {"path": path, "query": query, "body": body, "memory_on": on})
             self._json(*page_routes.relay(res, runner.info.get("machine") or "?"))
 
+        def _mcp_runner_groups(self, rid):
+            """#338: `strata_mcp_runner` of a chat whose project is on the Server PC - this browser's runner, whose MCP
+            servers the chat may use beside the server's (the tools run on the user's PC: a Playwright there reaches the
+            site the user develops on that PC).  Only its MCP groups (`my_<name>`, named as GET /mcp?runner= names them,
+            so the page's switches match): its coding tools and skills stay out, the coding tools of a server project are
+            the server's.  {} when the runner is offline (they are not offered; the page says so).  False after a 404
+            runner_not_found for an id that is not the caller's own runner (RunnerHub.get_for: the same key name exactly,
+            never another identity's, the owner role too) - or, outside team mode, a 403 for a caller who is not the
+            owner (every runner there is the owner's)."""
+            if not self.team and not self._owner_only("a runner can be used"):
+                return False
+            runner = svc.runner_hub.get_for(rid, self._acting()) if isinstance(rid, str) and rid else None
+            if runner is None:
+                self._json(404, {"error": {"type": "runner_not_found", "message": "there is no runner with that id for this key"}})
+                return False
+            if not runner.online():
+                return {}
+            return {n: g for n, g in runner.servers().items() if g.group_kind == "mcp"}
+
+        @staticmethod
+        def _names_runner(raw: bytes) -> dict | None:
+            """#338: a POST /mcp/config or /import body (already read, at most 1 MB) that names a runner (`"runner"` not
+            null): that object; None for any other body, which takes the route's own way."""
+            try:
+                body = json.loads(raw) if raw else None
+            except ValueError:
+                return None
+            return body if isinstance(body, dict) and body.get("runner") is not None else None
+
+        def _runner_mcp(self, q: dict, body, kind: str, payload: dict) -> None:
+            """#338: My PC's MCP servers (GET / POST /mcp/config, GET / POST /import with `runner`): one MCP job on
+            the runner (serve/runner.py Executor._mcp), its answer relayed with the statuses those routes give.  An MCP
+            server is a program that runs on that PC, so only the runner's own identity (RunnerHub.get_for: the same
+            key name exactly - never the owner for a guest's PC: 404 as for an unknown id) and only from the runner's
+            own device (Strata Desktop's page is that device; any other: 403 runner_device) may read how its servers
+            start or change them.  Then 409 runner_offline, 409 runner_outdated (an older Strata Desktop)."""
+            runner = self._runner_param(q, body, online=False)
+            if runner is False or runner is None:
+                return
+            if self._runner_device() != runner.device:
+                return self._json(403, {"error": {"type": "runner_device", "message": (
+                    f"the MCP servers of {runner.info.get('machine') or 'your PC'} start programs there, so they can be "
+                    "changed only from that PC: open the web app in Strata Desktop on it")}})
+            if not runner.online():
+                return self._json(409, self._runner_offline(runner))
+            res = runner.request(kind, payload)
+            self._json(*page_routes.relay(res, runner.info.get("machine") or "?", page_routes.ADMIN_STATUSES))
+
         def _page_here(self, path: str, q: dict, body) -> tuple[int, dict]:
             """A page route on the workstation itself (page_routes.answer): its home and run config for the notes, the
             server's checkpoints for the way back."""
@@ -6500,12 +6548,18 @@ def make_handler(svc: Service):
             if path == "/mcp/config":
                 # the servers as set up (secrets masked), their state, the limits, and whether this caller may change them (#79)
                 if self._authorized():
+                    q = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    if "runner" in q:                        # #338: the caller's own PC's, from its runner.json
+                        return self._runner_mcp(q, None, "mcp.config", {})
                     self._json(200, self._mcp_view())
                 return
             if path == "/import":
                 # the skills and the MCP servers of the other coding apps on this PC, with what may be changed (#94)
                 if self._authorized():
-                    may = self._edit_answer()                     # #310: in team mode only an owner makes the server rescan this PC's apps
+                    q = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    if "runner" in q:                        # #338: the other apps' MCP servers on the caller's own PC
+                        return self._runner_mcp(q, None, "mcp.import.list", {"rescan": q.get("rescan", [""])[0] == "1"})
+                    may = self._edit_answer()                    # #310: in team mode only an owner makes the server rescan this PC's apps
                     self._json(200, harness.view(svc, self._peer(), self.headers.get("Host", ""),
                                                  rescan="rescan=1" in self.path and (not self.team or may[0]), may=may))
                 return
@@ -6630,6 +6684,9 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
                 if not self._own_page("MCP servers can be changed"):
                     return
+                mine = self._names_runner(raw)                   # #338: the servers of the caller's own PC (runner.json)
+                if mine is not None:
+                    return self._runner_mcp({}, mine, "mcp.config.set", {"body": {k: v for k, v in mine.items() if k != "runner"}})
                 if not self._owner_only("MCP servers can be changed"):
                     return
                 if not svc.config_path:
@@ -6803,6 +6860,9 @@ def make_handler(svc: Service):
                 raw = self.rfile.read(n) if 0 <= n <= 1_000_000 else b""
                 if not self._own_page("the import can be changed"):
                     return
+                mine = self._names_runner(raw)                   # #338: an MCP server of another app on the caller's own PC
+                if mine is not None:
+                    return self._runner_mcp({}, mine, "mcp.import.add", {"body": {k: v for k, v in mine.items() if k != "runner"}})
                 if not self._owner_only("the import can be changed"):
                     return
                 if not svc.config_path:
@@ -7518,6 +7578,14 @@ def make_handler(svc: Service):
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             hub = arun.hub if arun is not None and arun.hub is not None else svc.mcp      # #310 part 2: a run on My PC has its own view
+            if "strata_mcp_runner" in req and req.get("strata_mcp") is True and not (arun is not None and arun.runner is not None):
+                mine = self._mcp_runner_groups(req["strata_mcp_runner"])     # #338: My PC's MCP servers in a Server PC chat
+                if mine is False:
+                    return
+                if mine:
+                    hub = (hub if hub is not None else McpHub({})).with_servers(mine)
+                    if arun is not None:
+                        arun.hub = hub                           # its helpers have them too (serve/subagent.py)
             use_mcp = (req.get("strata_mcp") is True or arun is not None) and hub is not None      # the web app's opt-in (serve/mcp.py), or the coding tools
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             if use_mcp:

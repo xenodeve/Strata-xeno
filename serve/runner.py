@@ -17,7 +17,7 @@ again; the id is sha256(identity, device), so it stays the same across restarts.
 
 Files, in `runner_dir()` (%LOCALAPPDATA%\\StrataRunner on Windows, ~/.strata-runner elsewhere): `runner.json` (the run
 config: `mcp_servers` / `mcpServers` and the `import.skills` switches, in the server's format; never the server's
-config), `device.json` (`{"id", "name"}`, made once) and `checkpoints/` (the way back for the files the tools change).
+config; its MCP servers are also set from the web app, #338: `MCP_JOBS`), `device.json` (`{"id", "name"}`, made once) and `checkpoints/` (the way back for the files the tools change).
 
 The key may come from STRATA_RUNNER_KEY (it is then taken out of the environment, so no command or MCP server the
 runner starts inherits it) and is never printed.  Every child process starts with no window (CREATE_NO_WINDOW).
@@ -46,7 +46,7 @@ from typing import Callable
 from urllib.parse import quote, urlsplit
 
 from serve import agent as agent_mod, checkpoints as checkpoints_mod, folders as folders_mod, harness
-from serve import memory as memory_mod, page_routes, permissions, runner_hub, shell as shell_mod
+from serve import mcp_admin, memory as memory_mod, page_routes, permissions, runner_hub, shell as shell_mod
 from serve.mcp import McpCancelled, McpError, hub_from_config
 
 RETRY_MAX_S = 30.0              # the longest wait between tries after a network error (1, 2, 4 ... 30 s)
@@ -546,6 +546,48 @@ def _session(v) -> str:
     return v if isinstance(v, str) and 0 < len(v) <= 80 else "default"
 
 
+# ------------------------------------------------------------------------------------------------ this PC's MCP servers (#338)
+MCP_JOBS = ("mcp.config", "mcp.config.set", "mcp.import.list", "mcp.import.add")
+ANNOUNCE_WAIT_S = 60.0          # after a change of the MCP servers: how long the runner waits for them to start before
+                                # it says hello with their tools (it says hello at once too, with them still starting)
+
+
+def _bad(field: str, message: str, server: str | None = None) -> dict:
+    """A refused change in the server route's shape (serve/mcp_admin.py apply): a 400 with the field errors."""
+    return {"status": 400, "body": {"error": {"message": f"{message} ({server or 'settings'}: {field})",
+                                              "fields": [{"server": server, "field": field, "message": message}]}}}
+
+
+class _Admin:
+    """This runner's own run config as serve/mcp_admin.py and serve/harness.py read a server's (`svc`): `config_path`
+    is runner.json, no --mcp-config, no API key (the server decided who may ask), the PC's importer, and `mcp` - the
+    executor's hub, whose setter drops a server named as the coding tools, as the executor does at start.  No `agent`:
+    mcp_admin.reload_hub would put the coding tools into the hub as an MCP server."""
+
+    api_key = None
+    mcp_config_path = None
+    _mcp_atexit = True                                  # the runner closes its hub itself (Executor.close)
+
+    def __init__(self, executor: "Executor"):
+        self._ex = executor
+
+    @property
+    def config_path(self) -> str:
+        return str(self._ex.config_path)
+
+    @property
+    def importer(self):
+        return self._ex.importer
+
+    @property
+    def mcp(self):
+        return self._ex.hub
+
+    @mcp.setter
+    def mcp(self, hub) -> None:
+        self._ex._take_hub(hub)
+
+
 # ------------------------------------------------------------------------------------------------ the tools of this PC
 class Executor:
     """What runs on this PC: its own coding tools (shell.install only: no web, no Task - those run on the server), its
@@ -560,14 +602,12 @@ class Executor:
         shell_mod.install(self.agent, shell_mod.find_shell())
         self.importer = harness.Importer(home=self.home)
         self.importer.rescan(self.cfg)
-        self.hub = hub_from_config(self.cfg, None, builtins=self.importer.builtins())
+        self.hub = None
+        self._take_hub(hub_from_config(self.cfg, None, builtins=self.importer.builtins()))
         if self.hub is not None:
-            for name in list(self.hub.servers):
-                if name == CODING:
-                    _say(f"[runner] the MCP server {name!r} in {self.config_path} is left out: that name is the coding "
-                         "tools'")
-                    self.hub.servers.pop(name)
             self.hub.start()
+        self.admin = _Admin(self)
+        self.on_change: Callable[[dict], None] | None = None   # #338: RunnerLoop's, told {"added", "removed", "changed"}
         self.checkpoints = checkpoints_mod.Checkpoints(self.data_dir / "checkpoints")
         self.protected = [str(self.config_path), str(self.data_dir / "device.json")]
         self.runs: collections.OrderedDict[str, tuple] = collections.OrderedDict()     # run key -> (Policy, Scope | None)
@@ -584,6 +624,13 @@ class Executor:
         if not isinstance(cfg, dict):
             raise SystemExit(f"[runner] {self.config_path} must be a JSON object")
         return cfg
+
+    def _take_hub(self, hub) -> None:
+        """`hub` (not started yet) becomes this PC's: a server named as the coding tools is left out."""
+        if hub is not None and CODING in hub.servers:
+            _say(f"[runner] the MCP server {CODING!r} in {self.config_path} is left out: that name is the coding tools'")
+            hub.servers.pop(CODING)
+        self.hub = hub
 
     def close(self) -> None:
         """Background commands and MCP servers end with the runner."""
@@ -625,6 +672,8 @@ class Executor:
             return self._tool(msg, link)
         if kind == "page":
             return self._page(msg)
+        if kind in MCP_JOBS:
+            return self._mcp(kind, msg)
         return {"error": "unknown", "message": f"this runner does not know the job {str(kind)[:40]!r}: update Strata Desktop"}
 
     def _run_start(self, msg: dict) -> dict:
@@ -701,6 +750,74 @@ class Executor:
             return _err(str(e))
         return res if isinstance(res, dict) else _err(f"{tool} gave no result")
 
+    # -------------------------------------------------------------------------------------------- MCP servers (#338)
+    def _mcp(self, kind: str, msg: dict) -> dict:
+        """The web app's MCP editor for this PC, in a page job's shape ({"status", "body"}).  `mcp.config` and
+        `mcp.config.set` are GET and POST /mcp/config on runner.json; `mcp.import.list` and `mcp.import.add` are GET and
+        POST /import, for the MCP servers of the other apps on this PC only (their skills and notes are not changed
+        here).  The checks, the masks and the careful write are serve/mcp_admin.py's and serve/harness.py's own."""
+        body = msg.get("body")
+        if kind == "mcp.config":
+            return {"status": 200, "body": self._mcp_view()}
+        if kind == "mcp.import.list":
+            return {"status": 200, "body": self._import_view(rescan=msg.get("rescan") is True)}
+        if kind == "mcp.config.set":
+            if not isinstance(body, dict) or not isinstance(body.get("servers"), dict):
+                return _bad("servers", 'send {"servers": {name: {...}}}')
+            if CODING in body["servers"]:
+                return _bad("name", f"{CODING!r} is the coding tools' name on this PC: give the server another name", CODING)
+            if mcp_admin.GUEST_KEY in body:
+                return _bad(mcp_admin.GUEST_KEY, "guests never use the MCP servers of your PC")
+        elif not isinstance(body, dict) or "import_mcp" not in body or any(k not in ("import_mcp", "rescan") for k in body):
+            return _bad("import_mcp", 'send {"import_mcp": {"harness", "name"}}: only an MCP server is imported here')
+        before = self._stored()
+        self._make_config()
+        if kind == "mcp.config.set":
+            code, out = mcp_admin.apply(self.admin, body)
+        else:
+            code, out = harness.apply(self.admin, body)
+        if code != 200:
+            return {"status": code, "body": out}
+        self.cfg = self._read_config()
+        self._changed(before, self._stored())
+        return {"status": 200, "body": self._mcp_view() if kind == "mcp.config.set" else self._import_view()}
+
+    def _mcp_view(self) -> dict:
+        return {**mcp_admin.view(self.admin, "", "", may=(True, "")), "machine": self.machine}
+
+    def _import_view(self, rescan: bool = False) -> dict:
+        v = harness.view(self.admin, "", "", rescan=rescan, may=(True, ""))
+        return {**{k: v[k] for k in ("available", "editable", "reason", "config_file", "harnesses", "mcp") if k in v},
+                "machine": self.machine}
+
+    def _stored(self) -> dict:
+        """The MCP servers runner.json lists now ({} without one, or one that cannot be read)."""
+        try:
+            return mcp_admin._servers_in(self._read_config())
+        except SystemExit:
+            return {}
+
+    def _make_config(self) -> None:
+        """runner.json for the first change, when there is none yet (the runner runs without one)."""
+        if self.config_path.exists():
+            return
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.config_path.with_name(self.config_path.name + ".new")
+        tmp.write_text("{}\n", encoding="utf-8")
+        os.replace(tmp, self.config_path)
+
+    def _changed(self, before: dict, after: dict) -> None:
+        """Tell the loop what changed: it says hello with the new groups, and Strata Desktop shows a notice."""
+        if self.on_change is None:
+            return
+        change = {"added": sorted(n for n in after if n not in before),
+                  "removed": sorted(n for n in before if n not in after),
+                  "changed": sorted(n for n in after if n in before and after[n] != before[n])}
+        try:
+            self.on_change(change)
+        except Exception as e:  # noqa: BLE001 - the change is made; telling of it must not undo the answer
+            _say(f"[runner] telling of the MCP change raised {type(e).__name__}")
+
     def _page(self, msg: dict) -> dict:
         q = msg.get("query") if isinstance(msg.get("query"), dict) else {}
         query = {k: [x for x in v if isinstance(x, str)] for k, v in q.items() if isinstance(k, str) and isinstance(v, list)}
@@ -719,8 +836,10 @@ class RunnerLoop:
         """`on_state(event, data)` (Strata Desktop's tray, #310 part 3; None for `python -m serve.runner`): "online"
         {"id", "who"} after each hello that succeeds and when a poll works again after network errors; "pending"
         {"code"} on each Pending; "offline" {"message"} (scrubbed) on the first network error of a run of them;
-        "refused" {"kind", "message"} before run returns EXIT_REFUSED; "stopped" {} when run returns 0.  It is called
-        on the poll thread; an exception from it is logged and ignored."""
+        "refused" {"kind", "message"} before run returns EXIT_REFUSED; "stopped" {} when run returns 0; "mcp_changed"
+        {"added", "removed", "changed"} (lists of server names) when the web app changed this PC's MCP servers (#338).
+        It is called on the poll thread (on a job's thread for "mcp_changed"); an exception from it is logged and
+        ignored."""
         self.client, self.executor = client, executor
         self.on_state = on_state
         self.stop = stop or threading.Event()
@@ -737,6 +856,9 @@ class RunnerLoop:
         self._printed: str | None = None
         self._said_hello = threading.Condition()        # notified after each answered hello: a reply that met 404
                                                         # goes again at once under the new id (#315)
+        self._hello_lock = threading.Lock()             # #338: a hello from the poll thread or after an MCP change
+        if hasattr(executor, "on_change"):
+            executor.on_change = self._mcp_changed
 
     # -------------------------------------------------------------------------------------------- hello
     def _info(self) -> tuple[dict, str]:
@@ -745,6 +867,10 @@ class RunnerLoop:
         return {"instance": self.instance, **self.executor.info(), "groups": groups, "skills": skills}, sig
 
     def _hello(self) -> None:
+        with self._hello_lock:
+            self._hello_now()
+
+    def _hello_now(self) -> None:
         info, sig = self._info()
         body = self.client.hello(info)
         if self.client.on_hello(body):
@@ -768,6 +894,26 @@ class RunnerLoop:
             self.on_state(event, data)
         except Exception as e:  # noqa: BLE001 - the app's view of the runner must never stop the runner
             _say(f"[runner] the state callback raised {type(e).__name__} on {event!r}; the runner goes on")
+
+    def _mcp_changed(self, change: dict) -> None:
+        """#338: this PC's MCP servers were changed from the web app (a job's thread): the state callback hears
+        "mcp_changed" {"added", "removed", "changed"} (Strata Desktop's notice), and a thread says hello now - the
+        poll in flight may be held POLL_MAX_S - and again once the new servers started, so the chat offers their tools."""
+        self._state("mcp_changed", change)
+        threading.Thread(target=self._announce, daemon=True, name="runner-announce").start()
+
+    def _announce(self) -> None:
+        end = time.monotonic() + ANNOUNCE_WAIT_S
+        try:
+            while not self.stop.is_set():
+                done = not self.executor.starting() or time.monotonic() > end     # read first: the last hello has it
+                if self.connected.is_set() and self._groups_changed():
+                    self._hello()
+                if done:
+                    return
+                self.stop.wait(0.25)
+        except Exception as e:  # noqa: BLE001 - the poll thread says hello at its next round anyway
+            _say(f"[runner] the hello after the MCP change failed ({type(e).__name__}); the next poll says it")
 
     def _channel_changed(self) -> None:
         """A new registration on the server: the jobs of the old one ended there, so their links are cancelled."""

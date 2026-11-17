@@ -171,6 +171,12 @@ TABLE: dict[str, dict[str, str]] = {
         "en": "{key} on {label} ({addr}), code {code}. Open Strata Desktop, Settings > Keys, to decide.",
         "th": "{key} บน {label} ({addr}) รหัส {code} เปิด Strata Desktop ที่ Settings > Keys เพื่อตัดสิน",
     },
+    # #338: this PC's MCP servers were changed from the web app (the runner's "mcp_changed")
+    "notice_mcp_title": {"en": "MCP servers on this PC changed", "th": "MCP server บนเครื่องนี้ถูกแก้ไข"},
+    "notice_mcp_text": {"en": "From the web app of {server}.", "th": "แก้จากหน้าเว็บของ {server}"},
+    "notice_mcp_added": {"en": "Added: {names}.", "th": "เพิ่ม: {names}"},
+    "notice_mcp_removed": {"en": "Removed: {names}.", "th": "ลบ: {names}"},
+    "notice_mcp_edited": {"en": "Edited: {names}.", "th": "แก้: {names}"},
     # ---------------------------------------------------------------- start-up
     "already_running": {
         "en": "Strata Desktop is already running, started with other rights (as administrator?). Use that one, or "

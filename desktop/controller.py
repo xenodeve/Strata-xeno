@@ -1,5 +1,6 @@
 """What orders Strata Desktop's steps (#310 part 3): connect, switch server, remove, quit, the clean-up a crash left,
-the tray's state and the notice when a device asks to be let in.  No GUI import: the windows and the tray come in
+the tray's state, the notice when a device asks to be let in, and the notice when this PC's MCP servers were
+changed from the web app (#338).  No GUI import: the windows and the tray come in
 through two ports (desktop/gui.py `Gui`, desktop/tray.py `Tray`), so the tests drive it with fakes.
 
 A connect, in order (RF 3):
@@ -102,6 +103,19 @@ def _plain(v, most: int = FIELD_MOST) -> str:
     """Server text for a notice: printable characters only, cut."""
     s = v if isinstance(v, str) else "" if v is None else str(v)
     return "".join(c for c in s if c.isprintable()).strip()[:most]
+
+
+def mcp_notice(server: str, change: dict) -> str:
+    """#338: the notice's text when this PC's MCP servers were changed from the web app ("mcp_changed" {"added",
+    "removed", "changed"}: lists of server names): where from, then what, cleaned and cut to NOTICE_TEXT_MOST."""
+    change = change if isinstance(change, dict) else {}
+    parts = [words.t("notice_mcp_text", server=_plain(server) or "?")]
+    for field, key in (("added", "notice_mcp_added"), ("removed", "notice_mcp_removed"), ("changed", "notice_mcp_edited")):
+        names = [_plain(n, 40) for n in change.get(field) or [] if isinstance(n, str)] if isinstance(change.get(field), list) else []
+        if any(names):
+            parts.append(words.t(key, names=", ".join(n for n in names if n)))
+    text = " ".join(parts)
+    return text if len(text) <= NOTICE_TEXT_MOST else text[:NOTICE_TEXT_MOST - 1] + "…"
 
 
 def code_text(v) -> str:
@@ -390,6 +404,13 @@ class Controller:
         return ticket is not None and ticket is self._ticket and not self._quitting
 
     def _handle(self, ticket, event: str, data: dict) -> None:
+        if event == "mcp_changed":                       # #338: a notice, not a state
+            with self._mu:
+                if not self._current(ticket):
+                    return
+                server = self._open.name if self._open is not None else self._state.server
+            self._notify(words.t("notice_mcp_title")[:NOTICE_TITLE_MOST], mcp_notice(server, data))
+            return
         with self._mu:
             if not self._current(ticket):
                 return

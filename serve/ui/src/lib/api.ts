@@ -39,6 +39,7 @@ export async function serverHasKey(): Promise<boolean | null> {
 export interface McpTool { tool: string; description?: string }
 export interface McpServer {
   name: string; transport: string; status: string; tools: McpTool[]; error?: string; info?: { name?: string; version?: string }
+  machine?: "my"                                                            // #338: the page marks My PC's servers (they run on the runner's PC)
 }
 /** GET /mcp; with `runner=` (#310 part 2) the MCP servers and skills of the engineer's own PC, from its runner's hello, and whether it is online. */
 export interface McpInfo { servers: McpServer[]; tools: number; skills?: { name: string; description?: string; app?: string }[]; machine?: string; online?: boolean }
@@ -148,34 +149,45 @@ export async function postQuestionAnswer(id: string, answers: Record<string, str
   } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
 }
 
-export async function getMcpConfig(): Promise<McpConfigView | null> {
+/** GET /mcp/config; with `runner` (#338) the MCP servers of the engineer's own PC, from its runner.json (only from that PC's own device). */
+export async function getMcpConfig(runner?: string): Promise<{ view: McpConfigView } | { error: string }> {
   try {
-    const r = await fetch(url("mcp/config"), { headers: apiHeaders() })
-    return r.ok ? ((await r.json()) as McpConfigView) : null
-  } catch { return null }
-}
-
-/** Save the MCP servers (and limits); the answer is the new state, or why not (the server names the field it refused). */
-export async function saveMcpConfig(body: unknown): Promise<{ view: McpConfigView } | { error: string }> {
-  try {
-    const r = await fetch(url("mcp/config"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body) })
+    const r = await fetch(url(withRunner("mcp/config", runner)), { headers: apiHeaders() })
     if (r.ok) return { view: (await r.json()) as McpConfigView }
     return { error: await errorMessage(r) }
   } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
 }
 
-/** The skills and MCP servers of the other apps on this PC (issue #94); `rescan` reads their folders again. */
-export async function getImport(rescan = false): Promise<ImportView | null> {
+/** Save the MCP servers (and limits); the answer is the new state, or why not (the server names the field it refused). With `runner` (#338):
+ *  the servers of the engineer's own PC. */
+export async function saveMcpConfig(body: object, runner?: string): Promise<{ view: McpConfigView } | { error: string }> {
   try {
-    const r = await fetch(url("import" + (rescan ? "?rescan=1" : "")), { headers: apiHeaders() })
-    return r.ok ? ((await r.json()) as ImportView) : null
-  } catch { return null }
+    const r = await fetch(url("mcp/config"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(runner ? { ...body, runner } : body) })
+    if (r.ok) return { view: (await r.json()) as McpConfigView }
+    return { error: await errorMessage(r) }
+  } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
 }
 
-/** Change the skill switches, import one MCP server, or rescan; the answer is the new state, or why not. */
-export async function postImport(body: unknown): Promise<{ view: ImportView } | { error: string }> {
+/** The skills and MCP servers of the other apps on this PC (issue #94); `rescan` reads their folders again. With `runner` (#338): the MCP
+ *  servers of the other apps on the engineer's own PC (no skills, no notes); `error` says why that PC could not answer. */
+export async function getImport(rescan = false, runner?: string): Promise<ImportView | null> {
+  const r = await readImport(rescan, runner)
+  return "view" in r ? r.view : null
+}
+
+export async function readImport(rescan = false, runner?: string): Promise<{ view: ImportView } | { error: string }> {
   try {
-    const r = await fetch(url("import"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(body) })
+    const r = await fetch(url(withRunner("import" + (rescan ? "?rescan=1" : ""), runner)), { headers: apiHeaders() })
+    if (r.ok) return { view: (await r.json()) as ImportView }
+    return { error: await errorMessage(r) }
+  } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
+}
+
+/** Change the skill switches, import one MCP server, or rescan; the answer is the new state, or why not. With `runner` (#338): import one
+ *  MCP server on the engineer's own PC. */
+export async function postImport(body: object, runner?: string): Promise<{ view: ImportView } | { error: string }> {
+  try {
+    const r = await fetch(url("import"), { method: "POST", headers: apiHeaders(true), body: JSON.stringify(runner ? { ...body, runner } : body) })
     if (r.ok) return { view: (await r.json()) as ImportView }
     return { error: await errorMessage(r) }
   } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }

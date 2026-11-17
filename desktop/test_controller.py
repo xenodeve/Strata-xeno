@@ -876,8 +876,42 @@ def test_list_carries_the_notice(rig):
     assert api.list()["state"]["notice"] == words.t("unreachable")
 
 
+# ------------------------------------------------------------------------------------------------ MCP change notices (#338)
+def test_mcp_change_gives_a_notice(rig, monkeypatch):
+    monkeypatch.setattr(words, "LANG", "en")
+    r = rig()
+    r.ctl.connect("A")
+    r.emit("online", {"id": RID_1, "who": "ann"})
+    r.emit("mcp_changed", {"added": ["files"], "removed": ["git", "web"], "changed": []})
+    assert r.ctl.wait_idle(5)
+    (_, title, text), = r.log.of("notify")
+    assert title == "MCP servers on this PC changed"
+    assert text == "From the web app of A. Added: files. Removed: git, web."
+    assert r.ctl.state.kind == "online"                           # a notice, not a state
+
+
+def test_mcp_change_notice_is_cut_and_cleaned(rig):
+    r = rig()
+    r.ctl.connect("A")
+    r.emit("online", {"id": RID_1, "who": "ann"})
+    r.emit("mcp_changed", {"added": [f"server-{i}\n" for i in range(60)], "removed": "x", "changed": [3]})
+    assert r.ctl.wait_idle(5)
+    (_, title, text), = r.log.of("notify")
+    assert len(text) <= controller.NOTICE_TEXT_MOST and "\n" not in text
+
+
+def test_mcp_change_of_an_old_runner_gives_no_notice(rig):
+    r = rig()
+    r.ctl.connect("A")
+    old = r.hosts[0]
+    r.ctl.connect("B")
+    old.emit("mcp_changed", {"added": ["files"], "removed": [], "changed": []})
+    assert r.ctl.wait_idle(5)
+    assert r.log.of("notify") == []
+
+
 # ------------------------------------------------------------------------------------------------ device notices
-ROW = {"key": "bob", "device": "ZyXwVuTsRqPoNmLkJiHgFe", "label": "Strata on bob-pc", "addr": "100.64.0.7",
+ROW ={"key": "bob", "device": "ZyXwVuTsRqPoNmLkJiHgFe", "label": "Strata on bob-pc", "addr": "100.64.0.7",
        "code": "Q2W8", "first_seen": 1}
 
 
