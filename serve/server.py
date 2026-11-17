@@ -7502,7 +7502,7 @@ def make_handler(svc: Service):
                                         and getattr(s, "group_kind", "") == "coding"), "my_agent")             # group landed under in the view
                 req = {**req, "messages": agent_prompt.with_system(req.get("messages") or [], arun.prompt)}
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
-            messages, tools, kw = openai_to_messages(req)
+            messages, tools, kw = openai_to_messages(req, vision=svc.vision is not None)       # #334: a scanned PDF page of an attached file is an image only with vision
             req = svc.cjk(req, messages)                                # xeno #49 S4
             if arun is not None:
                 arun.kw, arun.sampling = kw, req                      # a helper (serve/subagent.py) runs with the same settings
