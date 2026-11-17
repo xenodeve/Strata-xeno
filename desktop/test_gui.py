@@ -60,6 +60,31 @@ def test_servers_html_is_self_contained():
     assert "window.render" in html and "pywebviewready" in html
 
 
+def test_servers_html_has_the_web_apps_fonts_and_tokens():
+    """#332: the window follows the web app's design: its fonts inlined as data: fonts (the CSP lets only those in), its
+    tokens, light and dark."""
+    html = gui.servers_html()
+    assert "/*FONTS*/" not in html
+    for family in ("Inter Variable", "Anuphan Variable", "JetBrains Mono Variable"):
+        assert f'font-family: "{family}"' in html, family
+    assert html.count("data:font/woff2;base64,") == len(gui.FONTS)
+    assert "font-src data:" in html
+    for token in ("--ink:", "--surface:", "--ink-2:", "--fill:", "--line:", "--r-1:"):
+        assert token in html, token
+    assert 'id="servers-title"' in html and 'w("servers_heading")' in html
+
+
+def test_a_server_can_be_removed_from_its_row():
+    html = gui.servers_html()
+    assert 'el("button", "danger", w("button_remove"))' in html
+    assert "removeServer(s.name)" in html and "async function removeServer(name)" in html
+
+
+def test_a_missing_font_is_left_out(monkeypatch, tmp_path):
+    monkeypatch.setattr(gui, "UI", tmp_path)
+    assert gui.font_faces() == ""
+
+
 def test_page_words_exist():
     for key in gui.PAGE_WORDS:
         assert key in words.TABLE, key
@@ -827,11 +852,13 @@ def test_servers_navigation_check_fails_closed():
     assert a.Cancel is True
 
 
-def test_app_window_takes_no_drop_and_hooks_its_local_page():
+def test_app_window_takes_dropped_files_and_hooks_its_local_page():
     g = gui.Gui(data=None, api=None)
     w = _prep_window()
+    w.native.webview.AllowExternalDrop = False
     g._prepare_app(w)
-    assert w.native.webview.AllowExternalDrop is False
+    assert w.native.webview.AllowExternalDrop is True            # #333: the chat's attach-by-dropping
+    assert not gui.navigation_ok("file:///C:/Users/me/a.png", "http://127.0.0.1:8091")      # a drop elsewhere goes nowhere
     assert len(w.native.FormClosing.handlers) == 1
     ready, = w.native.webview.CoreWebView2InitializationCompleted.handlers
     assert not g._local_ready.is_set()

@@ -4,6 +4,7 @@ import { afterToolStep, gpuDesign, latticePattern, nextDesign, ORB_DESIGNS, phas
 import { clientName } from "./format"
 import { promptSplit } from "./metrics"
 import { apiMessages, type Message } from "./chat"
+import historyFixture from "./history-thinking.fixture.json"
 import { archOf, parseArch } from "./arch"
 import { markdown } from "./markdown"
 import { attribute, overlapOpportunityMs } from "./stall"
@@ -58,6 +59,27 @@ describe("apiMessages", () => {
   })
   test("a failed answer is not sent back", () => {
     expect(apiMessages([user("q"), { role: "assistant", text: "", time: 2, error: "boom" }]).length).toBe(1)
+  })
+  test("each round's thinking goes back, as the server gave it to the engine (#331)", () => {
+    const fx = historyFixture as unknown as { message: Message; api: unknown[] }
+    expect(apiMessages([fx.message])).toEqual(fx.api as never)
+  })
+  test("an answer without tools carries its thinking; one without thinking carries none", () => {
+    expect(apiMessages([{ role: "assistant", time: 2, text: "Hi.", reasoning: "  greet back \n" }])).toEqual([{ role: "assistant", content: "Hi.", reasoning_content: "greet back" }])
+    expect(apiMessages([{ role: "assistant", time: 2, text: "Hi." }])).toEqual([{ role: "assistant", content: "Hi." }])
+  })
+  test("an answer cut while it thought (thinking, no text) is left out, so the server's reasoning carry puts it back", () => {
+    expect(apiMessages([{ role: "assistant", time: 2, text: "", reasoning: "still thinking" }])).toEqual([])
+    const a: Message = { role: "assistant", time: 2, text: "A", reasoning: "r1\n\nr2", tools: [{ id: "c1", name: "x", at: 1, rat: 2, state: "done", round: 1, result: "o" }] }
+    expect((apiMessages([a]) as { role: string }[]).map((x) => x.role)).toEqual(["assistant", "tool"])      // the cut last round's thinking is not sent as an empty turn
+  })
+  test("two rounds split the thinking where each round's first call began", () => {
+    const a: Message = {
+      role: "assistant", time: 2, text: "A\n\nB\n\nC", reasoning: "r1\n\nr2\n\nr3",
+      tools: [{ id: "c1", name: "x", at: 1, rat: 2, state: "done", round: 1, result: "o1" }, { id: "c2", name: "y", at: 4, rat: 6, state: "done", round: 2, result: "o2" }],
+    }
+    const out = apiMessages([a]) as { role: string; content?: string; reasoning_content?: string }[]
+    expect(out.filter((x) => x.role === "assistant").map((x) => [x.content, x.reasoning_content])).toEqual([["A", "r1"], ["B", "r2"], ["C", "r3"]])
   })
 })
 
