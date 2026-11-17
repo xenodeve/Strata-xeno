@@ -300,6 +300,14 @@ describe("which MCP servers a request uses", () => {
     expect(mcpRequest({ ...DEFAULTS, mcpOff: ["gone", "web"] }, mcp)).toEqual({ strata_mcp: true, strata_mcp_off: ["web"] })
     expect(mcpRequest({ ...DEFAULTS, mcpOff: "web" as unknown as string[] }, mcp)).toEqual({ strata_mcp: true })
   })
+  test("#338: My PC's servers in a Server PC chat: the runner is named, only when one of them may run", () => {
+    const my = { servers: [...mcp.servers, { ...sv("my_play", 4), machine: "my" as const }], tools: 9 }
+    expect(mcpRequest(DEFAULTS, my, "r0123456789abcdef")).toEqual({ strata_mcp: true, strata_mcp_runner: "r0123456789abcdef" })
+    expect(mcpRequest({ ...DEFAULTS, mcpOff: ["my_play"] }, my, "r0123456789abcdef")).toEqual({ strata_mcp: true, strata_mcp_off: ["my_play"] })
+    expect(mcpRequest(DEFAULTS, mcp, "r0123456789abcdef")).toEqual({ strata_mcp: true })        // none of My PC's: no runner
+    expect(mcpRequest({ ...DEFAULTS, mcp: false }, my, "r0123456789abcdef")).toEqual({})
+    expect(mcpRequest(DEFAULTS, my)).toEqual({ strata_mcp: true })                             // no runner given: as before
+  })
   test("no server has tools: nothing", () => {
     expect(mcpRequest(DEFAULTS, { servers: [sv("down", 0, "failed")], tools: 0 })).toEqual({})
   })

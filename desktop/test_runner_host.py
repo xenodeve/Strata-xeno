@@ -183,6 +183,20 @@ class Base(unittest.TestCase):
 
 
 class Connect(Base):
+    def test_mcp_approval_goes_to_the_executor(self):
+        """#338: the servers window's Approve / Reject reach the runner's executor; nothing before it is built."""
+        self.server()
+        h = self.host()
+        self.assertEqual(h.mcp_pending(), [])
+        self.assertFalse(h.mcp_decide("play", True))
+        h.start()
+        self.assertTrue(wait_for(lambda: "online" in self.kinds(h), 10), (h.events, self.said))
+        ex = h._executor
+        self.assertEqual(ex.handle({"kind": "mcp.config.set", "body": {"servers": {"play": {"command": "x"}}}}, None)["status"], 200)
+        self.assertEqual([p["name"] for p in h.mcp_pending()], ["play"])
+        self.assertTrue(h.mcp_decide("play", False))
+        self.assertEqual(h.mcp_pending(), [])
+
     def test_connects_to_real_server(self):
         self.server()
         h = self.host()                                         # the real Executor, its files in a temp folder

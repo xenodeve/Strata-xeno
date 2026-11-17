@@ -26,6 +26,7 @@ PATHS = GET_PATHS + POST_PATHS
 MEMORY_PATHS = ("/agent/memory", "/agent/memory/file")
 MEMORY_FILE_MAX = 200_000           # characters of one note's file the page is shown
 STATUSES = (200, 400, 404)          # the only statuses `answer` gives: a runner's other ones are not passed on
+ADMIN_STATUSES = (200, 400, 404, 409, 422, 500)     # #338: the MCP jobs' (serve/mcp_admin.py and serve/harness.py apply)
 MAX_ANSWER = 2_000_000              # characters of a runner's answer (as JSON): above every answer the routes give
                                     # (the largest, a note's file, is 200,000 characters: 1.2 M at JSON's worst escaping)
 NOT_FOUND = (404, {"error": {"message": "not found"}})
@@ -92,18 +93,21 @@ def answer(path: str, query: dict[str, list[str]], body: dict | None, *, home: s
     return NOT_FOUND
 
 
-def relay(res, machine: str) -> tuple[int, dict]:
-    """The page's answer for a `page` job: `res` is what Runner.request gave - the runner's result {"status", "body"},
-    or its own {"error": "offline" | "timeout", "message"}.  Offline: 409 runner_offline; no answer in time: 504
-    runner_timeout (messages cut at 300 characters); a result that is not a status of `answer`'s with a JSON object, or
-    one larger than MAX_ANSWER characters: 502 runner_answer."""
-    if isinstance(res, dict) and "status" not in res and res.get("error") in ("offline", "timeout"):
+def relay(res, machine: str, statuses: tuple = STATUSES) -> tuple[int, dict]:
+    """The page's answer for a `page` job (or, with `statuses` ADMIN_STATUSES, an MCP job of #338): `res` is what
+    Runner.request gave - the runner's result {"status", "body"}, or its own {"error": "offline" | "timeout",
+    "message"}.  Offline: 409 runner_offline; no answer in time: 504 runner_timeout (messages cut at 300 characters); a
+    runner that does not know the job (an older Strata Desktop answers {"error": "unknown"}): 409 runner_outdated; a
+    result that is not one of `statuses` with a JSON object, or one larger than MAX_ANSWER characters: 502
+    runner_answer."""
+    if isinstance(res, dict) and "status" not in res and res.get("error") in ("offline", "timeout", "unknown"):
         msg = res.get("message") if isinstance(res.get("message"), str) else f"your PC ({machine}) did not answer"
-        kind, code = ("runner_offline", 409) if res["error"] == "offline" else ("runner_timeout", 504)
+        kind, code = {"offline": ("runner_offline", 409), "timeout": ("runner_timeout", 504),
+                      "unknown": ("runner_outdated", 409)}[res["error"]]
         return code, {"error": {"type": kind, "message": msg[:300]}}
     unreadable = (502, {"error": {"type": "runner_answer",
                                   "message": f"your PC's runner ({machine}) sent an answer the server could not read"}})
-    if not isinstance(res, dict) or type(res.get("status")) is not int or res["status"] not in STATUSES \
+    if not isinstance(res, dict) or type(res.get("status")) is not int or res["status"] not in statuses \
             or not isinstance(res.get("body"), dict):
         return unreadable
     try:

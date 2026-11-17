@@ -2,7 +2,8 @@
 tray shows for a state (its tooltip, its icon's colour, its menu).  No GUI import: desktop/gui.py draws it.
 
 Events (desktop/runner_host.py, serve/runner.py RunnerLoop(on_state=)): "connecting", "online" {"id", "who"[,
-"no_shell"]}, "pending" {"code"}, "offline" {"message"}, "refused" {"kind", "message"}, "error" {"message"}, "stopped".
+"no_shell"]}, "pending" {"code"}, "offline" {"message"}, "refused" {"kind", "message"}, "error" {"message"}, "stopped"; and
+"mcp_changed", which is no state: desktop/controller.py turns it into a notice (#338), `step` leaves the state as is.
 "refused" and "error" are end states: only a new "connecting" leaves them.  `server` (the server's name in the list) is
 set by the caller when it makes the state, or by "connecting" {"server"}; every other event keeps it.
 """

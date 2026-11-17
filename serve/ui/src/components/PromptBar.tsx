@@ -12,6 +12,8 @@ import { atQuery, getFiles, pickMention, type FoundFile } from "../lib/mention"
 import type { ContextView } from "../lib/context"
 import { SkillCard } from "./SkillTip"
 import { MiniSwitch } from "./ui"
+import { PlaceBadge } from "./Place"
+import { placeOf } from "../lib/place"
 import { ContextPanel } from "./ContextPanel"
 import { AgentControls, ModePicker, modeLabel, type AgentControlsProps } from "./AgentControls"
 import { GlidePanel } from "./motion"
@@ -89,7 +91,8 @@ export interface PromptBarProps {
   context: { view: ContextView; canCompact: boolean; onCompact: () => void; open: number }      // the context window (issue #99): a chip with the share used, a panel with what it is made of; `open` counts the times /context asked for the panel
   mention: { folders: string[]; enabled: boolean; runner?: string }          // `@file`: the files of the project's folders are offered while a name is typed after an @ (enabled: this page may read them)
   skills: Command[]                          // the skills in use: "/" at the start of the message lists them, to be picked by name
-  mcp: { servers: McpServer[]; tools: number; on: boolean; off: string[]; onToggleAll: () => void; onToggleServer: (name: string) => void; setupHref: string }      // the MCP tools: a row in the + menu that opens the list of servers, each with its tools and its own switch
+  mcp: { servers: McpServer[]; tools: number; on: boolean; off: string[]; onToggleAll: () => void; onToggleServer: (name: string) => void; setupHref: string
+    places?: boolean; myDown?: boolean }      // #338: places - this browser has a runner, so each server says where it runs; myDown - My PC's servers are not offered now (it is offline)      // the MCP tools: a row in the + menu that opens the list of servers, each with its tools and its own switch
   efforts: string[]
   effort: number
   onEffort: (i: number) => void
@@ -447,6 +450,7 @@ export function PromptBar(p: PromptBarProps) {
                   <li key={x.name} className="prompt-bar__mcp-item" data-server={x.name} data-off={on ? undefined : ""}>
                     <div className="prompt-bar__mcp-line">
                       <span className="prompt-bar__mcp-name">{x.name}</span>
+                      {p.mcp.places && <PlaceBadge place={placeOf(x)} />}
                       <span className="prompt-bar__mcp-state" data-bad={x.status === "failed" ? "" : undefined}>{MCP_STATE[x.status] ? t(MCP_STATE[x.status]) : x.status}</span>
                       <MiniSwitch on={on} disabled={!can || !p.mcp.on} label={t("Use {name}", { name: x.name })} onClick={() => p.mcp.onToggleServer(x.name)} />
                     </div>
@@ -461,6 +465,7 @@ export function PromptBar(p: PromptBarProps) {
               })}
             </ul>
           )}
+          {p.mcp.myDown && <p className="prompt-bar__mcp-empty" data-my-down>{t("Your PC is offline: its MCP tools fail until it is back.")}</p>}
           <a className="prompt-bar__mcp-setup" href={p.mcp.setupHref} onClick={closeMenu}>{t("Set up servers")}</a>
         </div>
       )}

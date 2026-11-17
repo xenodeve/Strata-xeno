@@ -106,12 +106,21 @@ export function Chat({ id }: { id?: string }) {
   const [myAgent] = useRunnerAgent(rid)
   const myOnline = typeof myAgent === "object" && myAgent !== null && !!myAgent.online
   const [myMcp, setMyMcp] = useState<McpInfo | null>(null)
-  useEffect(() => {
-    if (!rid) { setMyMcp(null); return }
-    let gone = false
-    void getMcp(rid).then((v) => { if (!gone) setMyMcp(v) })
-    return () => { gone = true }
-  }, [rid, myOnline])
+  const myStarting = !!myMcp?.servers.some((x) => x.status === "starting" || x.status === "idle")
+  useEffect(() => {                                           // asked again on a timer (#338): a server that starts later, or one added in
+    if (!rid) { setMyMcp(null); return }                      // Settings, is offered without a reload; sooner while one is starting.
+    let gone = false, sent = 0, shown = 0                     // In order: an older answer never replaces a newer one; not in a hidden tab
+    const ask = () => {
+      if (typeof document !== "undefined" && document.hidden) return
+      const n = ++sent
+      void getMcp(rid).then((v) => { if (!gone && n > shown && (v || n === sent)) { shown = n; setMyMcp(v) } })
+    }
+    ask()
+    const id = setInterval(ask, myStarting ? 2000 : 15000)
+    const back = () => { if (!document.hidden) ask() }
+    document.addEventListener("visibilitychange", back)
+    return () => { gone = true; clearInterval(id); document.removeEventListener("visibilitychange", back) }
+  }, [rid, myOnline, myStarting])
   useEffect(() => {
     let gone = false
     void getImport().then((v) => { if (!gone && v?.available && v.skills?.settings.enabled) setSkills(commandsOf(v.skills.items, Object.fromEntries((v.harnesses ?? []).map((h) => [h.id, h.label])))) })
@@ -140,7 +149,16 @@ export function Chat({ id }: { id?: string }) {
   const stop = mine?.block ? blockText(mine.block, location.origin + root().replace(/\/$/, "")) : null
   const blocking = !!stop && chat.settings.agent !== false
   const blocked = stop ? stop.full : onMy && myAgent !== undefined ? runnerLine(myAgent) : undefined
-  const chatMcp: McpInfo = onMy && myMcp ? { servers: [...mcp.servers, ...myMcp.servers], tools: mcp.tools + myMcp.tools } : mcp      // a My PC chat may use its PC's MCP servers too
+  // My PC's MCP servers (#338): a My PC chat has its PC's groups as before; a Server PC chat has its PC's MCP servers too (not its coding tools or
+  // skills: those stay the server's) while the runner is online - the server reaches them through `strata_mcp_runner`. Each is marked `machine: "my"`.
+  const myServers = (myMcp?.servers ?? []).map((x) => ({ ...x, machine: "my" as const }))
+  const myMcpOnly = myServers.filter((x) => !/^my_(agent|skills)(_\d+)?$/.test(x.name))
+  const myMcpLive = !onMy && !!rid && myMcpOnly.length > 0      // offered while offline too: the tool block stays, a call says the PC is offline
+  const myMcpDown = myMcpLive && (!myOnline || myMcp?.online === false)
+  const count = (xs: { tools: unknown[] }[]) => xs.reduce((n, x) => n + x.tools.length, 0)
+  const chatMcp: McpInfo = onMy && myMcp ? { servers: [...mcp.servers, ...myServers], tools: mcp.tools + myMcp.tools }
+    : myMcpLive ? { servers: [...mcp.servers, ...myMcpOnly], tools: mcp.tools + count(myMcpOnly) } : mcp
+  const mcpRunner = myMcpLive ? rid : undefined
   const { data: metrics, stale } = useMetrics()
   const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
   useEffect(() => { void chat.resumeRuns() }, [])                // an answer that was being written when the page was refreshed went on in the server: it is read again
@@ -283,7 +301,7 @@ export function Chat({ id }: { id?: string }) {
     const go = async () => {
       const found = coding.allowed ? await resolveMentions(folders, typed, onRunner) : []                                    // the files the prompt mentions with @ go with it
       const all = [...f, ...found.filter((x) => !f.some((y) => y.name === x.name))]
-      const context = { health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: folders, ...(onRunner ? { runner: onRunner } : {}), ...(stop ? { blocked: stop.full } : {}) }
+      const context = { health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: folders, ...(onRunner ? { runner: onRunner } : {}), ...(mcpRunner ? { mcpRunner } : {}), ...(stop ? { blocked: stop.full } : {}) }
       if (!busy) void chat.send(typed, all, context)
       else void chat.steer(typed, all, context).then((taken) => { if (!taken && !chat.queue(typed, all, context)) void chat.send(typed, all, context) })        // an agent is working: it reads this at its next step; else it waits in line and goes when the answer ends
     }
@@ -293,7 +311,7 @@ export function Chat({ id }: { id?: string }) {
     setAway(false)
     void go()
   }
-  const ctx = () => ({ health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: chat.folders(), ...(onRunner ? { runner: onRunner } : {}), ...(stop ? { blocked: stop.full } : {}) })
+  const ctx = () => ({ health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: chat.folders(), ...(onRunner ? { runner: onRunner } : {}), ...(mcpRunner ? { mcpRunner } : {}), ...(stop ? { blocked: stop.full } : {}) })
   const project = chat.index.projects.find((p) => p.id === chat.currentProject())       // the open conversation's project (or the one a new conversation was started in): its folders are where the coding tools work
   const chatKey = chat.index.active ?? "new"
   const editPrompt = (i: number, t: string) => { pinned.current = true; setAway(false); void chat.edit(i, t, ctx()) }
@@ -418,7 +436,7 @@ export function Chat({ id }: { id?: string }) {
             runner: onRunner, blocked, blockedRow: stop?.short,
           }}
           mcp={{
-            servers: chatMcp.servers, tools: chatMcp.tools, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings", "mcp-servers"),
+            servers: chatMcp.servers, tools: chatMcp.tools, places: !!rid, myDown: myMcpDown, on: chat.settings.mcp !== false, off: Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : [], setupHref: href("settings", "mcp-servers"),
             onToggleAll: () => chat.setSettings({ ...chat.settings, mcp: chat.settings.mcp === false }),
             onToggleServer: (name) => { const off = Array.isArray(chat.settings.mcpOff) ? chat.settings.mcpOff : []; chat.setSettings({ ...chat.settings, mcpOff: off.includes(name) ? off.filter((n) => n !== name) : [...off, name] }) },
           }}

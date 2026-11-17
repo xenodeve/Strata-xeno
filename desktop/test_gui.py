@@ -154,6 +154,13 @@ class FakeController:
         self.calls.append(("copy_code",))
         return self.state.kind == "pending"
 
+    def mcp_pending(self):
+        return [{"name": "play"}]
+
+    def mcp_decide(self, name, approve):
+        self.calls.append(("mcp_decide", name, approve))
+        return True
+
 
 def _api(probe_fn=None):
     store, ctl = FakeStore(), FakeController()
@@ -193,7 +200,14 @@ def _exposed(obj) -> set[str]:
 def test_api_exposes_only_its_methods():
     api, *_ = _api()
     assert _exposed(api) == {"list", "warning", "save", "remove", "test", "connect", "open_without_runner",
-                             "copy_code"}
+                             "copy_code", "mcp_approve", "mcp_reject"}
+
+
+def test_mcp_approve_and_reject_reach_the_controller():
+    api, _store, ctl, _ = _api()
+    assert api.mcp_approve("play") == {"ok": True} and api.mcp_reject("x") == {"ok": True}
+    assert ctl.calls[-2:] == [("mcp_decide", "play", True), ("mcp_decide", "x", False)]
+    assert api.list()["state"]["mcp_pending"] == [{"name": "play"}]
 
 
 def test_api_functions_are_plain_and_exact():
@@ -327,7 +341,7 @@ def test_list():
     got = api.list()
     assert got["servers"] == store.public()
     assert got["last"] == "lab"
-    assert got["state"] == gui.state_view(ctl.state)
+    assert got["state"] == gui.state_view(ctl.state, "", [{"name": "play"}])
 
 
 def test_warning():
@@ -1018,3 +1032,13 @@ def test_session_end_without_a_controller_only_lets_go():
     a = CloseArgs("WindowsShutDown")
     g._on_form_closing(None, a)
     assert a.Cancel is False
+
+
+def test_servers_html_has_the_mcp_approval_section():
+    """#338: the servers window lists the MCP servers waiting for approval (from the state's `mcp_pending`), in full,
+    each with Approve / Reject calling the exposed mcp_approve / mcp_reject."""
+    html = gui.servers_html()
+    assert 'id="mcp-wait"' in html and "renderWaiting(" in html
+    assert "api.mcp_approve(x.name)" in html and "api.mcp_reject(x.name)" in html
+    for key in ("mcp_wait_heading", "mcp_wait_approve", "mcp_wait_reject", "mcp_wait_env"):
+        assert key in gui.PAGE_WORDS

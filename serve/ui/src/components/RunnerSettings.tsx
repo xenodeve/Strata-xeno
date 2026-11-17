@@ -4,6 +4,7 @@ import { fmt } from "../lib/format"
 import { msg, t } from "../lib/i18n"
 import { MACHINE_LABEL, runnerId, setRunnerId, type Machine, type RunnerState } from "../lib/runner"
 import { Button, Segmented, inputCls } from "./ui"
+import { placeHeading } from "../lib/place"
 
 // This browser's runner (#310 part 2). The runner is the part of Strata Desktop on the engineer's own PC: it runs the coding tools, the MCP servers
 // and the skills of a project on that PC for the server. The page knows it by its id (`strata.runner`): Strata Desktop sets it, and here it can be
@@ -63,14 +64,19 @@ const myNote = (info: McpInfo | null | undefined) => (
   </p>
 )
 
-/** Settings > MCP servers, above the Server PC's: the MCP servers of the engineer's own PC (GET /mcp?runner=), read-only. */
-export function MyPcMcp({ runner }: { runner: string }) {
+/** Settings > MCP servers, above the Server PC's, when the editor of My PC's servers (McpSettings, #338) could not be had - `why`: that PC
+ *  is offline, its Strata Desktop is older, or this page is not on that PC. The MCP servers of the engineer's own PC as its runner said when
+ *  it connected (GET /mcp?runner=). */
+export function MyPcMcp({ runner, why }: { runner: string; why: string }) {
   const info = useMyMcp(runner)
   const servers = (info?.servers ?? []).filter((s) => !/^my_skills(_\d+)?$/.test(s.name))
   return (
     <section data-my-pc="mcp" className="mb-8">
-      <h2 className="text-[15px] font-semibold">{t("MCP servers on My PC")}</h2>
-      {myNote(info)}
+      <h2 className="text-[15px] font-semibold" data-place-heading="my">{`${t("MCP servers")} · ${placeHeading("my", info?.machine)}`}</h2>
+      <p role="note" className="mt-2 rounded-md bg-fill px-3 py-2 text-[12px] text-ink-2 [overflow-wrap:anywhere]">
+        {info === null ? t("The server could not tell what your PC has: is this browser's runner known for your key?")
+          : t("From the runner on your PC ({name}), as it said when it connected. They cannot be changed from here now: {why}", { name: info?.machine || t(MACHINE_LABEL.my), why })}
+      </p>
       {info && !servers.length && <p className="py-3 text-[13px] text-ink-2">{t("Your PC's runner has no MCP server.")}</p>}
       <ul className="m-0 mt-2 list-none p-0" aria-label={t("MCP servers on My PC")}>
         {servers.map((s) => (
