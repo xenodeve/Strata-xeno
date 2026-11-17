@@ -227,6 +227,27 @@ describe("chat stream", () => {
     expect(c.undoLast()).toMatchObject({ text: "q", attachments: [{ kind: "file", name: "kept.txt", text: "K" }] })
   })
 
+  test("a document goes as a file part, is stored by name only, and is lost on a resend after a reload (#334)", async () => {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 } })], seen)
+    const c = new ChatController()
+    const url = "data:application/pdf;base64,JVBERi0="
+    await c.send("sum it up", [{ kind: "doc", name: "r.pdf", url }], ctx)
+    const sent = (seen[0].messages as { role: string; content: unknown }[]).filter((m) => m.role === "user").pop()!
+    expect(sent.content).toEqual([{ type: "text", text: "sum it up" }, { type: "file", file: { filename: "r.pdf", file_data: url } }])
+    const stored = [...data.entries()].filter(([k]) => k.startsWith("strata.chat")).map(([, v]) => v).join(" ")
+    expect(stored).toContain("r.pdf")
+    expect(stored).not.toContain("JVBERi0")
+    expect(c.undoLast()).toMatchObject({ text: "sum it up", attachments: [{ kind: "doc", name: "r.pdf", url }] })
+    c.messages = [{ role: "user", text: "q", time: 1, files: [{ name: "r.pdf" }] }, { role: "assistant", text: "a", time: 2 }]
+    expect(c.undoLast()).toMatchObject({ text: "q", attachments: [] })
+    ;(globalThis as Record<string, unknown>).localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} }
+  })
+
   test("nothing is undone or edited while an answer is being written", async () => {
     const release = held([delta({ content: "ok" })])
     const c = new ChatController()

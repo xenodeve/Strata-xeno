@@ -45,7 +45,8 @@ export interface ToolCall {
   remote?: "sending" | "running" | "offline"                                         // and its travel there, as the server's last `remote` event said
   result?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number | null; open?: boolean
 }
-export interface Attachment { kind: "image" | "file"; name: string; url?: string; text?: string }
+/** An attachment: a picture (`url`), a text file (`text`) or a document - PDF, Word, Excel, ... - read by the server (`url`, a data: URL; #334). */
+export interface Attachment { kind: "image" | "file" | "doc"; name: string; url?: string; text?: string }
 /** What the line under an answer says, as numbers: it is turned into words by `metaText` when it is shown, so that the line
  *  follows the language in use (a stored answer has no text of its own in either language). */
 export interface Stats { ctx?: number; tokens?: number; tokS?: number | null; stopped?: boolean; tools?: number; limit?: number; projection?: "on" | "off" }
@@ -57,7 +58,7 @@ export interface Message {
   prefill?: Prefill                                              // on a prompt: the speed it was read at
   reasoning?: string; thinkSecs?: number | null; stats?: Stats; meta?: string /* legacy: the line as text, from an older version */
   error?: string; stopped?: boolean; limit?: number
-  images?: { name: string; url?: string }[]; files?: { name: string; text?: string }[]; tools?: ToolCall[]
+  images?: { name: string; url?: string }[]; files?: { name: string; text?: string; url?: string }[]; tools?: ToolCall[]      // a file with `url` is a document (#334)
   todos?: Todo[]                                                 // the coding tools' list of steps, as the model last sent it
   hooks?: HookNote[]                                             // what the user's prompt and stop hooks did (the ones that belong to no call)
   hookRunning?: string | null                                    // one of those is running now (its command)
@@ -138,8 +139,11 @@ export function apiMessages(messages: Message[]): ApiMessage[] {
   for (const m of messages) {
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url)
+      const docs = (m.files || []).filter((f) => f.text == null && f.url)                   // #334: OpenAI's file part; the server reads its text
       const text = userText(m)
-      out.push({ role: "user", content: imgs.length ? [{ type: "text", text }, ...imgs.map((i) => ({ type: "image_url", image_url: { url: i.url } }))] : text })
+      out.push({ role: "user", content: imgs.length || docs.length ? [{ type: "text", text },
+        ...docs.map((f) => ({ type: "file", file: { filename: f.name, file_data: f.url } })),
+        ...imgs.map((i) => ({ type: "image_url", image_url: { url: i.url } }))] : text })
     } else if (!m.error) {
       out.push(...assistantMessages(m))
     }
@@ -270,7 +274,7 @@ function attachmentsOf(m: Message): { kept: Attachment[]; lost: number } {
   const kept: Attachment[] = []
   let lost = 0
   for (const i of m.images || []) i.url ? kept.push({ kind: "image", name: i.name, url: i.url }) : lost++
-  for (const f of m.files || []) f.text != null ? kept.push({ kind: "file", name: f.name, text: f.text }) : lost++
+  for (const f of m.files || []) f.text != null ? kept.push({ kind: "file", name: f.name, text: f.text }) : f.url ? kept.push({ kind: "doc", name: f.name, url: f.url }) : lost++
   return { kept, lost }
 }
 
@@ -765,7 +769,7 @@ export class ChatController {
     this.messages.push({
       role: "user", text, time: this.stamp(),
       images: attachments.filter((a) => a.kind === "image").map((a) => ({ name: a.name, url: a.url })),
-      files: attachments.filter((a) => a.kind === "file").map((a) => ({ name: a.name, text: a.text })),
+      files: attachments.filter((a) => a.kind === "file" || a.kind === "doc").map((a) => (a.kind === "doc" ? { name: a.name, url: a.url } : { name: a.name, text: a.text })),
     })
     const um = this.messages[this.messages.length - 1]
     um.prefill = { state: "reading", rate: null, mean: null, read: null, cached: null }

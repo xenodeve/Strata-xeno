@@ -1,4 +1,5 @@
 """Chat history normalization before rendering the model's prompt."""
+import base64
 import copy
 from pathlib import Path
 import unittest
@@ -86,9 +87,9 @@ class UnreadContentParts(unittest.TestCase):
         tok = ByteTokenizer()
         self.service = Service(MockEngine(tok, "ok"), tok, self.template)
 
-    def test_chat_file_and_audio_parts_are_left_out(self):
-        parts = ({"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}},
-                 {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}})
+    def test_chat_audio_parts_are_left_out(self):
+        # a `file` part is read since #334 (serve/test_frontend.py ChatDocuments)
+        parts = ({"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}},)
         plain = [{"role": "user", "content": "summarize"}, {"role": "user", "content": "this one"}]
         for part in parts:
             with self.subTest(kind=part["type"]):
@@ -180,6 +181,72 @@ class UnreadContentParts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class ChatDocuments(unittest.TestCase):
+    """#334: the web app (and any OpenAI client) attaches a document as OpenAI's `file` part, or an Anthropic-style
+    `document` part; its text is read into the prompt, after the words the user typed."""
+
+    @staticmethod
+    def file_part(name, data: bytes, mime="application/octet-stream"):
+        return {"type": "file", "file": {"filename": name, "file_data": f"data:{mime};base64," + base64.b64encode(data).decode()}}
+
+    def test_a_docx_file_part_is_read_after_the_prompt(self):
+        from serve.test_documents import docx, para
+        messages, _, _ = openai_to_messages({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "summarize"}, self.file_part("r.docx", docx(para("the body")))]}]})
+        self.assertEqual(messages[0]["content"], "summarize\n\n[Document: r.docx]\nthe body")
+
+    def test_a_pdf_file_part_without_a_media_type_is_read_by_its_name(self):
+        from serve.test_media import text_pdf
+        messages, _, _ = openai_to_messages({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "q"}, self.file_part("r.pdf", text_pdf(["pdf words"]), "")]}]})
+        self.assertIn("--- page 1 ---\npdf words", messages[0]["content"])
+        self.assertTrue(messages[0]["content"].startswith("q\n\n[Document: r.pdf, 1 page(s)]"))
+
+    def test_a_scanned_pdf_page_is_an_image_only_with_vision(self):
+        from serve.test_media import text_pdf
+        req = {"messages": [{"role": "user", "content": [{"type": "text", "text": "q"}, self.file_part("s.pdf", text_pdf([None]))]}]}
+        self.assertIsInstance(openai_to_messages(req)[0][0]["content"], str)
+        seen = openai_to_messages(req, vision=True)[0][0]["content"]
+        self.assertEqual([p["type"] for p in seen], ["text", "image"])
+        self.assertTrue(seen[1]["source"].startswith("data:image/png;base64,"))
+
+    def test_a_document_part_and_a_tool_message_are_read_too(self):
+        from serve.test_documents import pptx
+        doc = {"type": "document", "title": "d.pptx", "source": {"type": "base64", "data": base64.b64encode(pptx({1: ["slide words"]})).decode(),
+                                                                "media_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}}
+        messages, _, _ = openai_to_messages({"messages": [
+            {"role": "user", "content": [doc]},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c", "content": [{"type": "text", "text": "result"}, doc]}]})
+        self.assertIn("slide words", messages[0]["content"])
+        self.assertIn("result\n\n[Document: d.pptx]", messages[-1]["content"])
+
+    def test_a_file_part_that_cannot_be_read_says_so(self):
+        for f in ({"file_id": "file-123"}, {"filename": "x.docx", "file_data": "not a data url"},
+                  {"filename": "x.docx", "file_data": "data:;base64,@@@"}, "nonsense"):
+            with self.subTest(f=f):
+                messages, _, _ = openai_to_messages({"messages": [{"role": "user", "content": [{"type": "text", "text": "q"}, {"type": "file", "file": f}]}]})
+                self.assertIn("[Document:", messages[0]["content"])
+
+    def test_a_prompt_of_only_a_document_does_not_start_with_an_empty_line(self):
+        from serve.test_documents import docx, para
+        messages, _, _ = openai_to_messages({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": ""}, self.file_part("r.docx", docx(para("body")))]}]})
+        self.assertEqual(messages[0]["content"], "[Document: r.docx]\nbody")
+
+    def test_a_request_without_a_document_converts_as_before(self):
+        reqs = [{"messages": [{"role": "user", "content": "hi"}]},
+                {"messages": [{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]},
+                {"messages": [{"role": "user", "content": [{"type": "text", "text": "describe"}, {"type": "image_url", "image_url": "image.png"}]}]}]
+        for req in reqs:
+            with self.subTest(req=req):
+                before = openai_to_messages(copy.deepcopy(req))
+                self.assertEqual(openai_to_messages(copy.deepcopy(req), vision=True), before)
+                self.assertEqual(openai_to_messages(copy.deepcopy(req), vision=False), before)
+        self.assertEqual(openai_to_messages(reqs[1])[0][0]["content"], "ab")
 
 
 class EmptyTurnsSwitch(unittest.TestCase):

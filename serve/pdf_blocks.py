@@ -29,14 +29,32 @@ def _header(block, pages = None):
 
 
 def document_parts(block, vision = False):
-    """A list of OpenAI content parts (text and, with vision, image_url) for one block."""
+    """A list of OpenAI content parts (text and, with vision, image_url) for one block.  A base64 source of another
+    type (Word, Excel, PowerPoint, OpenDocument, EPUB, RTF) is read by serve/documents.py (#334)."""
     src = block.get("source") or {}
     if src.get("type") in ("text", "content"):
         return [{"type": "text", "text": _header(block) + "\n" + document_text(block)}]
+    if src.get("type") == "base64" and "pdf" not in (src.get("media_type") or ""):
+        try:
+            data = base64.b64decode(src.get("data") or "")
+        except Exception:
+            data = None
+        from serve import documents
+        if data is not None and documents.kind_of(block.get("title"), src.get("media_type"), data) not in (None, "pdf"):
+            return documents.extract(block.get("title") or "document", src.get("media_type"), data, bool(vision))
     if src.get("type") != "base64" or "pdf" not in (src.get("media_type") or ""):
         return [{"type": "text", "text": _header(block) + f"\n(unsupported document source: {src.get('type')})"}]
     try:
         data = base64.b64decode(src.get("data") or "")
+    except Exception as e:
+        return [{"type": "text", "text": _header(block) + f"\n(the PDF could not be read: {type(e).__name__})"}]
+    return pdf_parts(data, block.get("title") or "document", vision)
+
+
+def pdf_parts(data, title, vision = False):
+    """A PDF's bytes -> its parts under a "[Document: title, n page(s)]" line (also serve/documents.py's PDF reader)."""
+    block = {"title": title}
+    try:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(data))
         texts = [(p.extract_text() or "").strip() for p in reader.pages]

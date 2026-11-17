@@ -15,6 +15,8 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -27,6 +29,7 @@ from pathlib import Path
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from serve import documents
 from serve.pdf_blocks import document_parts
 
 LOGGER = logging.getLogger(__name__)
@@ -455,8 +458,66 @@ def tool_arguments(raw) -> dict:
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
 
 
-def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
-    """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
+DOCUMENT_PARTS = ("file", "document")
+
+
+def _file_part_parts(f, vision: bool) -> list[dict]:
+    """OpenAI's file part ({"filename", "file_data": "data:<mime>;base64,..."}) -> its content parts (#334).  A file
+    sent by id (an upload this server does not keep), or data that is not a base64 data: URL, is a note."""
+    if not isinstance(f, dict):
+        return [{"type": "text", "text": "[Document: file]\n(the file part has no file object)"}]
+    name = str(f.get("filename") or "document")
+    raw = f.get("file_data")
+    if not isinstance(raw, str):
+        why = "a file sent by id cannot be read here: send its data" if f.get("file_id") else "the file part has no data"
+        return [{"type": "text", "text": f"[Document: {name}]\n({why})"}]
+    m = re.match(r"data:([^;,]*)(?:;[^,;]*)*;base64,", raw)
+    if not m:
+        return [{"type": "text", "text": f"[Document: {name}]\n(the file's data is not a base64 data: URL)"}]
+    try:
+        data = base64.b64decode(raw[m.end():], validate=True)
+    except (binascii.Error, ValueError):
+        return [{"type": "text", "text": f"[Document: {name}]\n(the file's data is not valid base64)"}]
+    return documents.extract(name, m.group(1) or None, data, vision)
+
+
+def _with_documents(content, vision: bool):
+    """A user or tool message's content with each file / document part turned into text (and, for a scanned PDF page
+    with vision, image) parts (#334).  Adjacent text parts are joined: a document's own parts by a line break, a
+    document and what is around it by an empty line, the user's own parts as the prompt always joined them (nothing
+    between), so the prompt does not glue the user's words to the file.  Content without such a part comes back as
+    it is: a request without a document converts exactly as before."""
+    if not isinstance(content, list) or not any(isinstance(p, dict) and p.get("type") in DOCUMENT_PARTS for p in content):
+        return content
+    out: list[dict] = []
+    owner: list[int | None] = []                      # the document each part of `out` came from (its index), or None
+    for n, part in enumerate(content):
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "file":
+            new, doc = _file_part_parts(part.get("file"), vision), n
+        elif kind == "document":
+            new, doc = document_parts(part, vision), n
+        else:
+            new, doc = [part], None
+        for p in new:
+            text = p.get("type") in TEXT_PARTS and isinstance(p.get("text"), str)
+            if text and out and out[-1].get("type") in TEXT_PARTS and isinstance(out[-1].get("text"), str):
+                prev = owner[-1]
+                joint = ("" if not out[-1]["text"] else "\n" if doc is not None and prev == doc
+                         else "\n\n" if doc is not None or prev is not None else "")
+                out[-1] = {"type": "text", "text": out[-1]["text"] + joint + p["text"]}
+                owner[-1] = doc
+            else:
+                out.append(p)
+                owner.append(doc)
+    return out
+
+
+def openai_to_messages(req: dict, vision: bool | None = None) -> tuple[list[dict], list[dict] | None, dict]:
+    """OpenAI Chat Completions -> (template messages, template tools, template kwargs).  `vision`: the server reads
+    images, so a document's scanned PDF page is sent as one (#334); otherwise such a page is a note."""
     messages = []
     for i, m in enumerate(_object_list(req.get("messages"), "messages")):
         role = m.get("role")
@@ -464,7 +525,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             role = "system"
         # an image is read in a user, tool or assistant message; the system prompt takes text only, as _text_of reads
         images = role in ("user", "tool", "assistant")
-        content = _check_parts(m.get("content"), f"messages[{i}].content",
+        raw = _with_documents(m.get("content"), bool(vision)) if role in ("user", "tool") else m.get("content")
+        content = _check_parts(raw, f"messages[{i}].content",
                                TEXT_PARTS + IMAGE_PARTS if images else TEXT_PARTS)
         out = {"role": role, "content": _parts_of(content) if images else _text_of(content)}
         if m.get("reasoning_content"):

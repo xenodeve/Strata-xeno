@@ -11,8 +11,10 @@
 # is not in the venv, so serve.server, serve.frontend, serve.identity, serve.web, serve.subagent and serve.agent_run
 # are not in the bundle (build\StrataDesktop\PYZ-00.toc, 2026-11-16).  The app never imports them: every module the
 # runner imports is there.  PyInstaller 6.22.3 says nothing in its log about the ones it leaves out, even with
-# on_error="warn": read PYZ-00.toc after a build to see what came in.  Not bundled either: pypdf and
-# pypdfium2 (optional in serve.media), so a My PC Read of a PDF in the exe takes the "not installed" path.
+# on_error="warn": read PYZ-00.toc after a build to see what came in.  pypdf is bundled (#334: in requirements.txt, and
+# named below, as serve.media and serve.documents import it inside functions), so a My PC Read of a PDF gives its text;
+# Word, Excel, PowerPoint, OpenDocument, EPUB and RTF need only the standard library (serve/documents.py).  Not bundled:
+# pypdfium2 (optional), so a scanned page with no text layer is a note on My PC, not an image.
 # Data: desktop/ui/* (servers.html, icon.png), at desktop/ui, where gui.py and tray.py look for it beside
 # themselves.  The runner's serve modules load no file of their own (only serve/server.py and serve/ui_hash.py use
 # __file__).
@@ -35,7 +37,8 @@ def _desktop(name: str) -> bool:
 
 
 hidden = collect_submodules("serve", filter=_wanted, on_error="warn") + \
-    collect_submodules("desktop", filter=_desktop, on_error="warn")
+    collect_submodules("desktop", filter=_desktop, on_error="warn") + \
+    collect_submodules("pypdf", on_error="warn")
 
 a = Analysis(
     [os.path.join(ROOT, "desktop", "__main__.py")],
