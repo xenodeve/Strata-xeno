@@ -210,7 +210,8 @@ REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their depende
 # xeno #46: serve/pdf_blocks.py reads Anthropic PDF document blocks with these (neither has dependencies on Python
 # 3.11+; pypdf needs typing_extensions below 3.11, pinned too so an install stays reproducible, #214).  Pinned here and
 # added at the pip step until requirements.txt carries them.
-XENO_REQUIREMENTS = ["pypdf==6.19.0", "pypdfium2==5.13.0", 'typing_extensions==4.16.0; python_version < "3.11"']
+XENO_REQUIREMENTS = ["pypdf==6.19.0", "pypdfium2==5.13.0", 'typing_extensions==4.16.0; python_version < "3.11"',
+                     "ddgs==9.16.1"]       # #337: WebSearch with no key, the default provider
 
 MODELS = {
     # the original model only for now: Swift 1.5's Q2_0 files split one layer's experts across the two shards, which
