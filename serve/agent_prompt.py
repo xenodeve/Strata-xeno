@@ -64,10 +64,11 @@ def project_notes(cwd: str | None) -> tuple[str, str] | None:
     return None
 
 
-def where(machine: str | None, my_tools: bool, has: set | frozenset = frozenset(), same_pc: bool = False) -> list[str]:
+def where(machine: str | None, my_tools: bool | str, has: set | frozenset = frozenset(), same_pc: bool = False) -> list[str]:
     """#339: where each kind of tool runs in this run, so the model does not mix up the central PC (the server) and the user's own PC.
     `machine`: the user's PC's name when the project is on it (Strata Desktop's runner), None when the project is on the central PC.
-    `my_tools`: the run has groups of the user's PC (`my_<server>__<tool>`, its MCP servers and skills).
+    `my_tools`: the request offers MCP groups of the user's PC (`my_<server>__<tool>`), in a My PC run or (#338) a Server PC chat; a str
+    names that PC (else `machine` does).  Decided from what the request offers, which stays the same while that PC is offline (#338).
     `same_pc`: the user's page is open on the central PC itself (a project there is then on the user's own computer)."""
     out = ["# Where things run",
            "There are two kinds of machine: the central PC, where the Strata server and the model run, and the user's own PC, which reaches it through Strata Desktop."]
@@ -82,7 +83,8 @@ def where(machine: str | None, my_tools: bool, has: set | frozenset = frozenset(
     if central:
         out.append(f"- {', '.join(central)} always run{'s' if len(central) == 1 else ''} on the central PC.")
     if my_tools:
-        out.append(f"- An MCP tool whose name starts with my_ (my_<server>__<tool>) runs on the user's PC ({machine or 'their PC'}); every other MCP tool runs on the central PC. "
+        pc = my_tools if isinstance(my_tools, str) else machine or "their PC"
+        out.append(f"- An MCP tool whose name starts with my_ (my_<server>__<tool>) runs on the user's PC ({pc}); every other MCP tool runs on the central PC. "
                    "So \"localhost\" in a my_ tool's call is the user's machine, and in any other MCP tool it is the central PC. A browser tool (Playwright, for example) "
                    "that has to open a site the user is developing on their PC must be the my_ one.")
     elif same_pc:
@@ -93,7 +95,7 @@ def where(machine: str | None, my_tools: bool, has: set | frozenset = frozenset(
 
 
 def build(cwd: str | None, shell: str | None, mode: str | None, today: str, platform: str, git: bool, notes: tuple[str, str] | None, tools: list[str], dirs: list[str] | None = None,
-          memory: list[dict] | None = None, machine: str | None = None, my_tools: bool = False, same_pc: bool = False) -> str:
+          memory: list[dict] | None = None, machine: str | None = None, my_tools: bool | str = False, same_pc: bool = False) -> str:
     """`machine` / `my_tools` / `same_pc`: where things run (see `where`); `machine` is None for a project on the central PC."""
     has = set(tools)
     out = [

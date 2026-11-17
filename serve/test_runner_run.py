@@ -101,8 +101,18 @@ class OnMyPc(Fixture):
         self.assertEqual(run.shell, "bash 5")
         self.assertEqual((run.policy.cwd, run.policy.dirs, run.policy.protected), (CWD, [], []))
         self.assertIsNone(run.ctx.checkpoint)
-        self.assertNotIn("WebFetch", run.prompt)        # web access and helpers are off in an empty config: hidden as today
-        self.assertEqual(run.hidden, {"WebFetch", "WebSearch", "Task"})
+        self.assertIn("WebFetch", run.prompt)           # #337: web access is on in an empty config (the owner's run); helpers stay off
+        self.assertEqual(run.hidden, {"Task"})
+
+    def test_a_guest_has_web_access_only_when_the_owner_switched_it_on_outright(self):
+        """#337: on by default for the owner; a team guest's run has WebFetch / WebSearch only with "on": true written."""
+        for cfg, guest_has_it in (({}, False), ({"web": {"provider": "ddgs"}}, False), ({"web": {"on": True}}, True), ({"web": {"on": False}}, False)):
+            with self.subTest(cfg=cfg):
+                self.config(cfg)
+                self.answer(facts())
+                run = self.svc.start_agent_run(self.sa(), self.messages(), "ann", runner=self.runner, guest=True)
+                self.assertEqual("WebFetch" not in run.hidden, guest_has_it)
+                self.assertEqual(run.ctx.web is not None, guest_has_it)
 
     def test_run_start_payload_is_the_servers_sanitised_values(self):
         self.config({"import": {"memory": {"on": ["claude:memory"]}}})

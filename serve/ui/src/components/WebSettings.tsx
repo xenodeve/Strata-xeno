@@ -28,7 +28,7 @@ export function WebSettings() {
   return (
     <section data-web>
       <h2 className="text-[15px] font-semibold">{t("Web access")}</h2>
-      <p className="mt-1 text-[13px] text-ink-2">{t("Lets the model fetch a web page and search the web (the tools WebFetch and WebSearch). It is off by default, because it is the one thing here that sends something off this PC: the address of a page, or your search words, goes to the internet.")}</p>
+      <p className="mt-1 text-[13px] text-ink-2">{t("Lets the model fetch a web page and search the web (the tools WebFetch and WebSearch). It is on by default. It is the one thing here that sends something off this PC: the address of a page, or your search words, goes to the internet.")}</p>
       <p className="mt-2 text-[13px] text-ink-2">{t("Even when it is on, every fetch and every search asks you first and shows what would be sent; \"Always allow this site\" is a rule you can add. Addresses on this PC or on your network are refused, and what a page says is treated as text, never as an order.")}</p>
       {view === undefined ? null : view === null ? (
         <p role="note" className="mt-3 rounded-md bg-fill px-3 py-2 text-[12px] text-ink-2">{t("Web access is shown only on this PC itself, or when Strata has an API key and it is entered in Settings, under API key.")}</p>
@@ -42,9 +42,11 @@ export function WebSettings() {
           <div className={cn("mt-3 space-y-3", !view.on && "opacity-60")} data-web-provider>
             <div>
               <div className="mb-1.5 text-[13px] font-medium">{t("Who sees your searches")}</div>
-              <Segmented label={t("Search provider")} value={view.provider} onChange={(v) => void (can && send({ provider: v }))} options={[{ value: "searxng", label: "SearXNG" }, { value: "brave", label: "Brave Search" }]} />
+              <Segmented label={t("Search provider")} value={view.provider} onChange={(v) => void (can && send({ provider: v }))} options={[{ value: "ddgs", label: "ddgs" }, { value: "searxng", label: "SearXNG" }, { value: "brave", label: "Brave Search" }]} />
             </div>
-            {view.provider === "searxng" ? (
+            {view.provider === "ddgs" ? (
+              <p className="text-[12.5px] text-ink-2">{t("Searches go through ddgs, with no key and nothing to set up: your search words go to Wikipedia and, two at a time, to Brave, DuckDuckGo, Mojeek and Yahoo. It reads their pages, not an API, so it can be slow or refuse at times; SearXNG or Brave Search are steadier.")}</p>
+            ) : view.provider === "searxng" ? (
               <form className="space-y-1.5" onSubmit={(e) => { e.preventDefault(); if (can) void send({ searxng_url: url.trim() }) }}>
                 <label className="block text-[12.5px] text-ink-2" htmlFor="web-searxng">{t("The address of your SearXNG (it can be on your own network; it must offer the JSON format)")}</label>
                 <div className="flex gap-2">
@@ -62,7 +64,7 @@ export function WebSettings() {
                 </div>
               </form>
             )}
-            <p className="text-[12px] text-ink-3">{t("Searching needs one of these: DuckDuckGo is not offered because it turns away programs. Fetching a page needs neither.")}</p>
+            <p className="text-[12px] text-ink-3">{t("Fetching a page needs no provider.")}</p>
           </div>
         </>
       )}

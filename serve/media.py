@@ -1,4 +1,4 @@
-"""serve/media.py - what the Read tool does with an image or a PDF (issue #99), as Claude Code's Read does.
+"""serve/media.py - what the Read tool does with an image, a PDF (issue #99), as Claude Code's Read does, or an office document (#334).
 
 An image is given to the model as an image in its next turn when the server has the vision encoder (it is made smaller first when it is large); without vision the tool says so, and
 never fails silently.  A PDF is read by page range as text (a long one needs `pages`, at most 20 pages at once); a page that has no text layer - a scan - is given as an image when vision is
@@ -22,11 +22,15 @@ WHOLE_PDF_PAGES = 10                             # a longer PDF has to be read b
 MAX_PAGES = 20                                   # pages in one read
 MAX_IMAGE_PAGES = 8                              # scanned pages given as images in one read
 MAX_PDF_TEXT = 60_000                            # characters of text in one read
+READ_ROWS = 100_000                              # rows of one sheet a Read gives (offset and limit read them by lines)
 
 
 def kind_of(path: str) -> str | None:
+    """"image", "pdf", "document" (Word, Excel, PowerPoint, OpenDocument, EPUB, RTF, or an old binary Office file:
+    serve/documents.py, #334), or None for a file read as text."""
+    from serve import documents
     ext = os.path.splitext(path)[1].lower()
-    return "image" if ext in IMAGE_TYPES else "pdf" if ext == ".pdf" else None
+    return "image" if ext in IMAGE_TYPES else "pdf" if ext == ".pdf" else "document" if ext in documents.EXTENSIONS else None
 
 
 def _text(s: str) -> dict:
@@ -90,6 +94,23 @@ def read_image(path: str, name: str, vision: bool) -> dict:
             return _err(f"{name} is not a readable {mime.split('/')[1].upper()} image.")
     about = f"{dims[0]} x {dims[1]} px, " if dims else ""
     return {"content": [_text(f"Image {name}: {about}{size:,} bytes{', made smaller to fit' if smaller else ''}. It is shown to you with this result."), _image_block(data, mime)]}
+
+
+# ------------------------------------------------------------------------------------------------ documents
+def read_document(path: str, name: str) -> tuple[str, str | None]:
+    """(the text of a Word, Excel, PowerPoint, OpenDocument, EPUB or RTF file, None), or ("", why it cannot be read).
+    The Read tool numbers its lines and takes offset and limit, as for a text file (#334).  A sheet gives at most
+    READ_ROWS rows; past that the note says so."""
+    from serve import documents
+    size = os.path.getsize(path)
+    if size > documents.MAX_BYTES:
+        return "", f"The file is {size:,} bytes, more than the {documents.MAX_BYTES:,} that can be read."
+    with open(path, "rb") as f:
+        data = f.read()
+    text, ok = documents.text_of(name, data, max_rows=READ_ROWS)
+    if not ok:
+        return "", text + "."
+    return text, None
 
 
 # ------------------------------------------------------------------------------------------------ PDFs

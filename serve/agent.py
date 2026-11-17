@@ -196,7 +196,8 @@ def _int(v, name: str, low: int) -> tuple[int | None, str]:
 SCHEMAS = {
     "Read": ("Read a file from the project (or another place, if the user allows it). A text file comes back as its lines with their numbers; give an absolute path, or one "
              "relative to the project folder. Long files are cut at 2000 lines: use offset and limit to read a window. Read a file before you Write or Edit it. "
-             "An image (png, jpg, gif, bmp, webp) is shown to you when the server has vision. A PDF is read by pages (give pages, for example \"1-5\"; a PDF of more than 10 pages needs it, at most 20 at a time).",
+             "An image (png, jpg, gif, bmp, webp) is shown to you when the server has vision. A PDF is read by pages (give pages, for example \"1-5\"; a PDF of more than 10 pages needs it, at most 20 at a time). "
+             "A Word, Excel, PowerPoint, OpenDocument, EPUB or RTF file (docx, xlsx, pptx, odt, ods, odp, epub, rtf) comes back as its text, by lines as a text file does: do not write a script or install anything to read one.",
              {"file_path": {"type": "string", "description": "the file to read"}, "offset": {"type": "integer", "description": "the line to start at (1 is the first)"},
               "limit": {"type": "integer", "description": "how many lines to read"}, "pages": {"type": "string", "description": "for a PDF: the pages to read, such as 1-5 or 2,4-6"}}, ["file_path"]),
     "Write": ("Write a whole file (create it, or replace it). To replace an existing file you must have read it first in this chat. To change a part of a file use Edit.",
@@ -374,17 +375,22 @@ class AgentServer:
             return media_mod.read_image(path, os.path.basename(path), ctx.vision)
         if media == "pdf":
             return media_mod.read_pdf(path, os.path.basename(path), a.get("pages"), ctx.vision)
-        if _is_binary(path):
-            return _err("This tool cannot read binary files.")
-        size = os.path.getsize(path)
-        if size > MAX_READ_BYTES and limit is None:
-            return _err(f"The file is {size:,} bytes, more than the {MAX_READ_BYTES:,} that can be read at once. Use offset and limit to read a part of it, or Grep to find what you need.")
-        text, _eol = _read_text(path)
-        st = os.stat(path)
-        s = self.session(ctx.session)
-        s.reads[path] = (st.st_mtime_ns, st.st_size)
-        if path.lower().endswith(".ipynb"):                                    # a notebook is read by its cells, with their outputs
-            return self._read_notebook(text)
+        if media == "document":                                                # #334: its text, by lines; not a read for Edit or Write
+            text, why = media_mod.read_document(path, os.path.basename(path))
+            if why:
+                return _err(why)
+        else:
+            if _is_binary(path):
+                return _err("This tool cannot read binary files.")
+            size = os.path.getsize(path)
+            if size > MAX_READ_BYTES and limit is None:
+                return _err(f"The file is {size:,} bytes, more than the {MAX_READ_BYTES:,} that can be read at once. Use offset and limit to read a part of it, or Grep to find what you need.")
+            text, _eol = _read_text(path)
+            st = os.stat(path)
+            s = self.session(ctx.session)
+            s.reads[path] = (st.st_mtime_ns, st.st_size)
+            if path.lower().endswith(".ipynb"):                                # a notebook is read by its cells, with their outputs
+                return self._read_notebook(text)
         lines = text.splitlines()
         if not lines:
             return _ok("<system-reminder>The file exists but its contents are empty.</system-reminder>")

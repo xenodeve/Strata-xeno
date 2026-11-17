@@ -20,6 +20,7 @@ export interface Candidate {
 }
 export interface MemorySourceInfo { id: string; app: string; label: string; kind: "project" | "instructions" | "memory"; shown: string[]; bytes: number | null; on: boolean }
 export interface ImportView {
+  machine?: string                                              // #338: the runner's PC, for the list of its apps
   available: boolean
   editable?: boolean; reason?: string; config_file?: string | null
   harnesses?: HarnessInfo[]

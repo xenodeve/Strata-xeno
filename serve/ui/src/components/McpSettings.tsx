@@ -10,18 +10,33 @@ import { toast } from "./toast"
 import { Button, Field, Segmented, inputCls } from "./ui"
 import { MyPcMcp } from "./RunnerSettings"
 import { runnerId } from "../lib/runner"
+import { placeHeading } from "../lib/place"
 
 // Setting up MCP servers (issue #79; on the Settings page): the list with each one's state and tools, add / edit / disable / delete, a box for a
 // block pasted from Claude Desktop, and the limits. Each change is saved at once (the server restarts its servers from the
 // file; no restart of Strata). Without the right to change them (not this PC, no API key) it is a list and says so.
+// #338: with this browser's runner, the same editor for "MCP servers on My PC" comes first: it changes the runner's runner.json on the
+// engineer's own PC (the server relays it; only from that PC's own device). When that PC cannot answer, its servers are listed as its runner
+// said when it connected (MyPcMcp), with the reason.
 const STATE: Record<string, string> = {
   ready: msg("Connected"), starting: msg("Starting"), failed: msg("Failed"), stopped: msg("Stopped"), idle: msg("Waiting"), disabled: msg("Disabled"),
+  pending: msg("Waiting for approval on this PC"),
 }
+// #338: a server added, changed or switched on for My PC runs only after the user approves it in Strata Desktop on that PC
+const APPROVE = () => t("It runs after you approve it in Strata Desktop on your PC.")
 const areaCls = "w-full resize-y rounded-sm border border-line bg-surface px-2.5 py-1.5 font-mono text-[12px] leading-snug outline-none transition-colors placeholder:text-ink-3 hover:border-fill-2 focus:border-accent disabled:opacity-50"
 
 type Form = { mode: "new" | "edit"; draft: Draft; problems: Record<string, string>; failure: string | null; moved?: boolean }
 
 export function McpSettings({ part }: { part: "servers" | "limits" }) {
+  const rid = part === "servers" ? runnerId() : ""                         // #310 part 2 / #338: this browser's runner: its PC's servers first
+  return rid ? <><McpEditor part="servers" runner={rid} /><McpEditor part="servers" mine /></> : <McpEditor part={part} />
+}
+
+/** The editor of one PC's MCP servers: the Server PC's (no `runner`; `mine`: this browser also has a runner, so it is named the Server PC),
+ *  or with `runner` the engineer's own PC's (no limits, no guest marks: they are the server's). */
+function McpEditor({ part, runner, mine }: { part: "servers" | "limits"; runner?: string; mine?: boolean }) {
+  const [failed, setFailed] = useState<string | null>(null)
   const [view, setView] = useState<McpConfigView | null>(null)
   const [busy, setBusy] = useState(false)
   const [form, setForm] = useState<Form | null>(null)
@@ -35,16 +50,16 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
     setView(v)
     setLimits((old) => old ?? { timeout_s: String(v.settings.timeout_s), max_result_chars: String(v.settings.max_result_chars), max_rounds: String(v.settings.max_rounds) })
   }, [])
-  useEffect(() => { void getMcpConfig().then((v) => v && show(v)) }, [show])
+  useEffect(() => { void getMcpConfig(runner).then((r) => { if ("view" in r) show(r.view); else if (runner) setFailed(r.error) }) }, [show, runner])
   const starting = view?.servers.some((s) => s.status === "starting") ?? false
   useEffect(() => {                                                           // while a server comes up, look again: its tools appear when it is ready
     if (!starting) return
-    const id = setInterval(() => { void getMcpConfig().then((v) => v && setView(v)) }, 1500)
+    const id = setInterval(() => { void getMcpConfig(runner).then((r) => { if ("view" in r) setView(r.view) }) }, 1500)
     return () => clearInterval(id)
-  }, [starting])
+  }, [starting, runner])
 
-  const rid = part === "servers" ? runnerId() : ""                         // #310 part 2: this browser's runner: its PC's servers first, read-only
-  if (!view) return rid ? <MyPcMcp runner={rid} /> : null
+  if (runner && failed !== null) return <MyPcMcp runner={runner} why={failed} />
+  if (!view) return null
   const rows = view.servers
   const can = view.editable
   const taken = rows.filter((r) => r.source === "config").map((r) => r.name)
@@ -54,7 +69,7 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
   const commit = async (change?: Change | Change[], settings?: Partial<McpLimits>): Promise<string | null> => {
     setBusy(true)
     setNotice(null)
-    const r = await saveMcpConfig(bodyFor(rows, change, settings))
+    const r = await saveMcpConfig(bodyFor(rows, change, settings), runner)
     setBusy(false)
     if ("error" in r) return r.error
     show(r.view)
@@ -71,7 +86,7 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
     const old = rows.find((r) => r.source === "config" && r.name === form.draft.name)
     const err = await commit({ name: form.draft.name, entry: { ...entry, ...(old?.disabled ? { disabled: true } : {}) } })
     if (err) setForm({ ...form, failure: err })
-    else { setForm(null); toast("success", t("Saved"), t("The servers start again; no restart is needed.")) }
+    else { setForm(null); toast("success", t("Saved"), runner ? APPROVE() : t("The servers start again; no restart is needed.")) }
   }
 
   const add = async () => {
@@ -81,7 +96,7 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
     const count = Object.keys(entries).length
     const err = await commit(Object.entries(entries).map(([name, entry]) => ({ name, entry })))
     if (err) setPaste({ ...paste, problem: err })
-    else { setPaste(null); toast("success", t("Saved"), tn(count, "{n} server added.", "{n} servers added.")) }
+    else { setPaste(null); toast("success", t("Saved"), runner ? APPROVE() : tn(count, "{n} server added.", "{n} servers added.")) }
   }
 
   const flip = async (r: McpRow) => {
@@ -152,14 +167,14 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
   }
 
   const nTools = view.tools
+  const where = runner ? placeHeading("my", view.machine) : mine ? placeHeading("server") : ""     // #338: the forms say where it will run
   return (
-    <>
-    {rid && <MyPcMcp runner={rid} />}
-    <section>
-      <h2 className="text-[15px] font-semibold">{rid ? t("MCP servers on the Server PC") : t("MCP servers")}</h2>
+    <section data-my-pc={runner ? "mcp" : undefined} className={runner ? "mb-8" : undefined}>
+      <h2 className="text-[15px] font-semibold" data-place-heading={runner ? "my" : mine ? "server" : undefined}>{runner ? `${t("MCP servers")} · ${placeHeading("my", view.machine)}` : mine ? `${t("MCP servers")} · ${placeHeading("server")}` : t("MCP servers")}</h2>
       <p className="mt-1 text-[13px] text-ink-2">
         {rows.length ? t("{n} tools; the model calls them when it decides to.", { n: fmt(nTools) }) : t("No server is set up yet. A server gives the model tools: files, a browser, a database.")}
       </p>
+      {runner && <p className="mt-1 text-[12px] text-ink-2">{t("They run on your PC, in every chat of this browser while your PC is online. Saved in the runner's own file ({file}) on your PC.", { file: view.config_file ?? "runner.json" })}</p>}
       {readOnly}
       {guests && (
         <p role="note" className="mt-2 rounded-md bg-fill px-3 py-2 text-[12px] text-ink-2">
@@ -217,6 +232,7 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
       <Reveal>
         {form ? (
           <form className="mt-3 rounded-md border border-line p-3" aria-label={form.mode === "new" ? t("Add a server") : t("Edit")} onSubmit={(e) => { e.preventDefault(); void submit() }}>
+            {where && <p className="mb-2 text-[12px] text-ink-2" data-place-note>{where}</p>}
             <Field label={t("Name")} hint={form.problems.name ? <span className="text-bad">{form.problems.name}</span> : t("Letters, digits, dots, dashes and underscores. The model sees it in front of each tool.")}>
               <input className={inputCls} value={form.draft.name} disabled={form.mode === "edit"} aria-label={t("Name")} onChange={(e) => setField("name", e.target.value)} placeholder="files" autoComplete="off" spellCheck={false} />
             </Field>
@@ -261,6 +277,7 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
       <Reveal>
         {paste ? (
           <div className="mt-3 rounded-md border border-line p-3">
+            {where && <p className="mb-2 text-[12px] text-ink-2" data-place-note>{where}</p>}
             <Field label={t("Paste from Claude Desktop")} hint={t("The mcpServers block of claude_desktop_config.json, as it is.")}>
               <textarea className={areaCls} rows={7} value={paste.text} aria-label={t("The block to paste")} onChange={(e) => setPaste({ text: e.target.value, problem: null })} placeholder={'{\n  "mcpServers": {\n    "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/work"] }\n  }\n}'} spellCheck={false} />
             </Field>
@@ -274,7 +291,6 @@ export function McpSettings({ part }: { part: "servers" | "limits" }) {
       </Reveal>
 
     </section>
-    </>
   )
 }
 

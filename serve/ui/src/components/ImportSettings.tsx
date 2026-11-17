@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ArrowDown01Icon, ArrowRight01Icon } from "@hugeicons/core-free-icons"
-import { getImport, postImport } from "../lib/api"
+import { postImport, readImport } from "../lib/api"
 import { fmt } from "../lib/format"
 import { harnessOn, filterItems, itemOn, setHarness, setItem, setMaster, skillSummary, type Candidate, type ImportView, type SkillSettings } from "../lib/importer"
 import { sizeText, withSwitch } from "../lib/memory"
@@ -13,39 +13,41 @@ import { Button, MiniSwitch, inputCls } from "./ui"
 import { Windowed } from "./Windowed"
 import { MyPcSkills } from "./RunnerSettings"
 import { runnerId } from "../lib/runner"
+import { placeHeading } from "../lib/place"
 
 // Skills and MCP servers of the other coding apps on this PC (issue #94). Skills are imported automatically and are on until switched off
 // (the whole import, an app, a skill); MCP servers are only listed, by app, and imported by a click: nothing is started until then.
 // The server reads the other apps' files and decides; secrets never come here. Without the right to change things it is a list.
+// #338: with this browser's runner, MCP servers lists the other apps of the engineer's own PC first, imported into that PC's runner.json.
 const REASON: Record<string, string> = {
   "it speaks SSE only; Strata speaks Streamable HTTP": msg("It speaks SSE only; Strata speaks Streamable HTTP."),
   "no command or address to run": msg("It has no command or address to run."),
   "not a server entry": msg("It is not a server entry."),
 }
 
-function useImport() {
+function useImport(runner?: string) {
   const [view, setView] = useState<ImportView | null>(null)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
-  useEffect(() => { void getImport().then((v) => v && setView(v)) }, [])
+  useEffect(() => { void readImport(false, runner).then((r) => { if ("view" in r) setView(r.view); else if (runner) setNotice(r.error) }) }, [runner])
   /** Send a change; the answer is the new state. On a refusal the page keeps what it had and says why. */
   const send = useCallback(async (body: unknown): Promise<boolean> => {
     setBusy(true)
     setNotice(null)
-    const r = await postImport(body)
+    const r = await postImport(body as object, runner)
     setBusy(false)
     if ("error" in r) { setNotice(r.error); return false }
     setView(r.view)
     return true
-  }, [])
+  }, [runner])
   const rescan = useCallback(async () => {
     setBusy(true)
     setNotice(null)
-    const v = await getImport(true)
+    const r = await readImport(true, runner)
     setBusy(false)
-    if (v) setView(v)
-    else setNotice(t("The folders could not be read again."))
-  }, [])
+    if ("view" in r) setView(r.view)
+    else setNotice(runner ? r.error : t("The folders could not be read again."))
+  }, [runner])
   return { view, setView, busy, notice, send, rescan }
 }
 
@@ -62,15 +64,25 @@ function Note({ view }: { view: ImportView }) {
 
 /** #310 part 2: with this browser's runner, Skills shows its PC's skills first (read-only), then the Server PC's. */
 export function ImportSettings({ part }: { part: "skills" | "mcp" | "memory" }) {
-  const rid = part === "skills" ? runnerId() : ""
-  return rid ? <><MyPcSkills runner={rid} /><ImportPart part={part} server /></> : <ImportPart part={part} />
+  const rid = part !== "memory" ? runnerId() : ""
+  if (rid && part === "skills") return <><MyPcSkills runner={rid} /><ImportPart part={part} server /></>
+  if (rid && part === "mcp") return <><ImportPart part={part} runner={rid} /><ImportPart part={part} server /></>     // #338
+  return <ImportPart part={part} />
 }
 
-function ImportPart({ part, server }: { part: "skills" | "mcp" | "memory"; server?: boolean }) {
-  const { view, setView, busy, notice, send, rescan } = useImport()
+function ImportPart({ part, server, runner }: { part: "skills" | "mcp" | "memory"; server?: boolean; runner?: string }) {
+  const { view, setView, busy, notice, send, rescan } = useImport(runner)
   const [filter, setFilter] = useState("")
   const [open, setOpen] = useState<string[]>([])               // the apps whose skills are shown
 
+  if (!view && runner && notice) {                               // #338: that PC could not answer (offline, an older Strata Desktop, another device)
+    return (
+      <section data-my-pc="import-mcp" className="mb-8">
+        <h2 className="text-[15px] font-semibold" data-place-heading="my">{`${t("MCP servers from other apps")} · ${placeHeading("my")}`}</h2>
+        <p role="note" className="mt-2 rounded-md bg-fill px-3 py-2 text-[12px] text-ink-2 [overflow-wrap:anywhere]">{notice}</p>
+      </section>
+    )
+  }
   if (!view) return null
   if (!view.available) return <section><h2 className="text-[15px] font-semibold">{part === "skills" ? t("Skills from other apps") : part === "memory" ? t("Memory from other apps") : t("MCP servers from other apps")}</h2><p className="mt-1 text-[13px] text-ink-2">{t("Importing from other apps is not available on this server.")}</p></section>
   const can = !!view.editable
@@ -180,13 +192,16 @@ function ImportPart({ part, server }: { part: "skills" | "mcp" | "memory"; serve
   }
 
   const importOne = async (c: Candidate) => {
-    if (await send({ import_mcp: { harness: c.harness, name: c.name } })) toast("success", t("Imported"), t("{name} is now in MCP tools > Servers.", { name: c.name }))
+    if (await send({ import_mcp: { harness: c.harness, name: c.name } })) toast("success", t("Imported"), runner ? t("It runs after you approve it in Strata Desktop on your PC.") : t("{name} is now in MCP tools > Servers.", { name: c.name }))
   }
   const line = (c: Candidate) => [c.command, ...(c.args ?? [])].filter(Boolean).join(" ") || c.url || ""
   return (
-    <section>
-      <h2 className="text-[15px] font-semibold">{t("MCP servers from other apps")}</h2>
-      <p className="mt-1 text-[13px] text-ink-2">{t("Nothing here runs until you import it. Importing copies a server into Strata's own list (MCP tools > Servers), where you can edit it, turn it off or delete it.")}</p>
+    <section data-my-pc={runner ? "import-mcp" : undefined} className={runner ? "mb-8" : undefined}>
+      <h2 className="text-[15px] font-semibold" data-place-heading={runner ? "my" : server ? "server" : undefined}>{runner ? `${t("MCP servers from other apps")} · ${placeHeading("my", view.machine)}` : server ? `${t("MCP servers from other apps")} · ${placeHeading("server")}` : t("MCP servers from other apps")}</h2>
+      {(runner || server) && <p className="mt-1 text-[12px] text-ink-2" data-place-note>{runner ? t("The apps on your own PC; an imported server runs there.") : t("The apps on the central PC; an imported server runs there.")}</p>}
+      <p className="mt-1 text-[13px] text-ink-2">{runner
+        ? t("Nothing here runs until you import it. Importing copies a server into your PC's own list (MCP tools > Servers, on this PC), where you can edit it, turn it off or delete it.")
+        : t("Nothing here runs until you import it. Importing copies a server into Strata's own list (MCP tools > Servers), where you can edit it, turn it off or delete it.")}</p>
       <Note view={view} />
       <div className="mt-3 flex justify-end">{rescanButton}</div>
       {(view.mcp?.harnesses ?? []).length === 0 && <p className="py-3 text-[13px] text-ink-2">{t("No MCP server was found in your other coding apps.")}</p>}

@@ -12,7 +12,8 @@ import { fmt } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
 import { msg, t } from "../../lib/i18n"
 import { eventText, noteText, type HookNote } from "../../lib/hooks"
-import { closeReason, machineOf, MACHINE_LABEL, runnerId } from "../../lib/runner"
+import { closeReason, machineOf, runnerId } from "../../lib/runner"
+import { PlaceBadge } from "../../components/Place"
 
 // A call of the chat's coding tools (issue #96: Read, Write, Edit, Glob, Grep, Bash, ...), shown by what it is: the command and its output,
 // an edit as a diff, a file's lines. When the server asks the user about it, the question is a card on the call: Allow, Allow for this chat,
@@ -79,11 +80,12 @@ function ChangeView({ change }: { change: SettingChange }) {
 
 const str = (x: unknown) => (typeof x === "string" ? x : "")
 
-/** #310 part 2: which machine ran the call, "My PC" or "Server PC" - only in a browser that has a runner (elsewhere every call is the server's, as before). */
+/** #310 part 2: which machine ran the call - a coding tool's or an MCP tool's - in the words Settings and the + menu use (lib/place.ts, #338):
+ *  "This PC" or "Central PC". Only in a browser that has a runner (elsewhere every call is the server's, as before). */
 export function MachineMark({ call }: { call: { server?: string; machine?: string } }) {
   if (!call.server || !runnerId()) return null
   const m = machineOf(call)
-  return <span data-machine={m} className="shrink-0 rounded-sm bg-fill px-1.5 text-[11px] text-ink-2">{t(MACHINE_LABEL[m])}</span>
+  return <PlaceBadge place={m} />
 }
 
 /** #310 part 2: a call whose PC went offline while it was on its way there or running (the server's `remote` event "offline"). It stays after the

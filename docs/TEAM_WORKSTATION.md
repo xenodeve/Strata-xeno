@@ -33,13 +33,21 @@ chat, a command's `localhost` is the central PC: your computer only when you are
 
 ## MCP servers: on My PC or on the central PC
 
-There are two sets of MCP servers:
+There are two sets of MCP servers. Settings > MCP servers lists both, and each server and each call card carries a
+badge with where it runs: **This PC** (yours) or **Central PC**.
 
-- **The central PC's**, set up in **Settings > MCP servers** (the run config). They run on the central PC. The
-  model sees their tools as `<server>__<tool>`.
-- **My PC's**, from the runner's own file (`%LOCALAPPDATA%\StrataRunner\runner.json`; today you edit that file by hand, and an editor in the web app is planned in #338). They run on
-  your PC. The model sees their tools with the prefix `my_`, as `my_<server>__<tool>`, and the skills of your PC as
-  `my_skills`.
+- **The central PC's** servers are part of the run config. Only the owner sets them up. They run on the central PC,
+  and the model sees their tools as `<server>__<tool>`.
+- **My PC's** servers are kept in the runner's own file (`%LOCALAPPDATA%\StrataRunner\runner.json`). You set them up
+  in the same Settings editor, under My PC: add, edit, switch off, delete, paste a block, or import from your other
+  apps. They run on your PC, and the model sees their tools as `my_<server>__<tool>`.
+- **Approval on your PC.** A My PC server that is new, changed or switched back on does not run until you approve it
+  in Strata Desktop on that PC. The page shows "Waiting for approval on this PC". Strata Desktop's servers window
+  shows the waiting server's command line, with Approve and Reject, and a tray notice says one is waiting. Switching
+  a server off or deleting it applies at once. The central PC cannot start a program on your PC without your yes.
+- **Every chat can use them.** A My PC project uses them, and so does a chat whose project is on the central PC, as
+  long as this browser has a runner. If the runner goes offline, its tools stay in the list, and a call says that
+  your PC is offline.
 
 The `my_` prefix is the whole rule, and the chat's rules tell the model about it:
 
@@ -47,6 +55,7 @@ The `my_` prefix is the whole rule, and the chat's rules tell the model about it
 - A browser tool (Playwright, for example) that must open a site you are developing on your PC has to be the `my_` one.
   The central PC's copy cannot reach your PC's `localhost`.
 - A file path in a `my_` tool is a path on your PC. In any other tool it is a path on the central PC.
+- The central PC never takes a server name that starts with `my_`, so the prefix always means your PC.
 
 ## The owner and the guests
 
@@ -58,8 +67,8 @@ A team server gives out named keys, each with a role (Settings > Keys and device
   and cannot run the coding tools in the central PC's folders. A guest sees only the central PC's MCP servers the owner
   marked for guests (`"guest_mcp"` in the run config), the imported skills, and Strata's own docs (StrataDocs).
   StrataSettings and StrataSettingsChange are not offered to a guest, and refuse one.
-- A guest's MCP servers are those of their own PC, set in its runner's file. The owner cannot change a guest's PC. (#338
-  plans an editor for them in the web app, for the PC's own user only.)
+- A guest sets up their own PC's MCP servers (This PC) and approves them in Strata Desktop on that PC. The owner
+  cannot change a guest's PC.
 - A guest's WebFetch reaches only the public internet: never the central PC, a private network, Tailscale or Radmin.
 
 ## YOLO mode on each machine

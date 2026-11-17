@@ -3,6 +3,7 @@
 // pasted one), and a request or page route for a project on that PC names it. Knowing an id grants nothing: the server only routes to a runner
 // of the caller's own key. A page with no runner id behaves as before.
 import { msg, t } from "./i18n"
+import { PLACE_LABEL } from "./place"
 import { store } from "./store"
 import type { AgentInfo } from "./agent"
 
@@ -74,7 +75,7 @@ export function blockText(block: "no-runner" | "unknown", server: string): { ful
 }
 
 /** The labels of the two machines. */
-export const MACHINE_LABEL: Record<Machine, string> = { my: msg("My PC"), server: msg("Server PC") }
+export const MACHINE_LABEL: Record<Machine, string> = PLACE_LABEL       // #338: the same words as Settings, the + menu and the cards
 
 // Why the server closed a card (an approval or the model's questions) during a call on My PC: `answered` / `question_answered` with a `reason`,
 // the card watcher's `abort.why` (serve/runner_hub.py `_card`: `r.ended or "ended"`, "offline", "cancelled"). `Runner.ended` is one of the short

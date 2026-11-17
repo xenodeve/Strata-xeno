@@ -57,6 +57,14 @@ describe("apiMessages", () => {
     expect((out[1] as { content: string }).content).toBe("Looking.")
     expect((out[3] as { content: string }).content).toBe("Found it.")
   })
+  test("a document goes as an OpenAI file part after the text; a prompt without one is a plain string as before", () => {
+    const url = "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,UEs="
+    const m: Message = { ...user("read this"), files: [{ name: "a.md", text: "notes" }, { name: "r.docx", url }] }
+    expect(apiMessages([m])[0]).toEqual({ role: "user", content: [
+      { type: "text", text: "read this\n\nFile: a.md\n```\nnotes\n```" },
+      { type: "file", file: { filename: "r.docx", file_data: url } }] })
+    expect(apiMessages([{ ...user("plain"), files: [{ name: "r.docx" }] }])[0]).toEqual({ role: "user", content: "plain" })
+  })
   test("a failed answer is not sent back", () => {
     expect(apiMessages([user("q"), { role: "assistant", text: "", time: 2, error: "boom" }]).length).toBe(1)
   })

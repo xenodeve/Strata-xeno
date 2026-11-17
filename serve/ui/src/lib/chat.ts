@@ -51,7 +51,8 @@ export interface ToolCall {
   remote?: "sending" | "running" | "offline"                                         // and its travel there, as the server's last `remote` event said
   result?: string; ok?: boolean; chars?: number; truncated?: boolean; ms?: number | null; open?: boolean
 }
-export interface Attachment { kind: "image" | "file"; name: string; url?: string; text?: string }
+/** An attachment: a picture (`url`), a text file (`text`) or a document - PDF, Word, Excel, ... - read by the server (`url`, a data: URL; #334). */
+export interface Attachment { kind: "image" | "file" | "doc"; name: string; url?: string; text?: string }
 /** What the line under an answer says, as numbers: it is turned into words by `metaText` when it is shown, so that the line
  *  follows the language in use (a stored answer has no text of its own in either language). */
 export interface Stats { ctx?: number; tokens?: number; tokS?: number | null; stopped?: boolean; tools?: number; limit?: number; projection?: "on" | "off" }
@@ -63,7 +64,7 @@ export interface Message {
   prefill?: Prefill                                              // on a prompt: the speed it was read at
   reasoning?: string; thinkSecs?: number | null; stats?: Stats; meta?: string /* legacy: the line as text, from an older version */
   error?: string; stopped?: boolean; limit?: number
-  images?: { name: string; url?: string }[]; files?: { name: string; text?: string }[]; tools?: ToolCall[]
+  images?: { name: string; url?: string }[]; files?: { name: string; text?: string; url?: string }[]; tools?: ToolCall[]      // a file with `url` is a document (#334)
   todos?: Todo[]                                                 // the coding tools' list of steps, as the model last sent it
   hooks?: HookNote[]                                             // what the user's prompt and stop hooks did (the ones that belong to no call)
   hookRunning?: string | null                                    // one of those is running now (its command)
@@ -95,13 +96,15 @@ export interface Settings {
   autoCompact: boolean                                          // a conversation that nears the end of the context is summarised before the next prompt (on by default)
 }
 /** What a request says about MCP: nothing when the tools are off (or no server that is not switched off has any), else `strata_mcp`
- *  and, when the + menu's list switched some servers off for this chat, their names. */
-export function mcpRequest(s: Settings, mcp: McpInfo): { strata_mcp?: true; strata_mcp_off?: string[] } {
+ *  and, when the + menu's list switched some servers off for this chat, their names. #338: `runner` - this browser's runner, whose MCP servers
+ *  (`machine: "my"` in the list) a chat on the Server PC may use too: named as `strata_mcp_runner` when one of them is on. */
+export function mcpRequest(s: Settings, mcp: McpInfo, runner?: string): { strata_mcp?: true; strata_mcp_off?: string[]; strata_mcp_runner?: string } {
   if (s.mcp === false) return {}
   const off = (Array.isArray(s.mcpOff) ? s.mcpOff : []).filter((n) => typeof n === "string" && mcp.servers.some((x) => x.name === n))
   const usable = mcp.servers.length ? mcp.servers.filter((x) => !off.includes(x.name) && x.tools.length > 0).length : mcp.tools      // the list may not have arrived: the count says
   if (usable === 0 || (!mcp.servers.length && mcp.tools === 0)) return {}
-  return off.length ? { strata_mcp: true, strata_mcp_off: off } : { strata_mcp: true }
+  const mine = !!runner && mcp.servers.some((x) => x.machine === "my" && !off.includes(x.name) && x.tools.length > 0)
+  return { strata_mcp: true, ...(off.length ? { strata_mcp_off: off } : {}), ...(mine ? { strata_mcp_runner: runner } : {}) }
 }
 export const DEFAULTS: Settings = { thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, mcpOff: [], prefill: true, agent: true, agentMode: "ask", agentFolder: "", autoCompact: true }
 
@@ -156,8 +159,11 @@ export function apiMessages(messages: Message[]): ApiMessage[] {
   for (const m of messages) {
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url)
+      const docs = (m.files || []).filter((f) => f.text == null && f.url)                   // #334: OpenAI's file part; the server reads its text
       const text = userText(m)
-      out.push({ role: "user", content: imgs.length ? [{ type: "text", text }, ...imgs.map((i) => ({ type: "image_url", image_url: { url: i.url } }))] : text })
+      out.push({ role: "user", content: imgs.length || docs.length ? [{ type: "text", text },
+        ...docs.map((f) => ({ type: "file", file: { filename: f.name, file_data: f.url } })),
+        ...imgs.map((i) => ({ type: "image_url", image_url: { url: i.url } }))] : text })
     } else if (!m.error) {
       out.push(...assistantMessages(m))
     }
@@ -288,7 +294,7 @@ function attachmentsOf(m: Message): { kept: Attachment[]; lost: number } {
   const kept: Attachment[] = []
   let lost = 0
   for (const i of m.images || []) i.url ? kept.push({ kind: "image", name: i.name, url: i.url }) : lost++
-  for (const f of m.files || []) f.text != null ? kept.push({ kind: "file", name: f.name, text: f.text }) : lost++
+  for (const f of m.files || []) f.text != null ? kept.push({ kind: "file", name: f.name, text: f.text }) : f.url ? kept.push({ kind: "doc", name: f.name, url: f.url }) : lost++
   return { kept, lost }
 }
 
@@ -297,7 +303,7 @@ function restore(msgs: Message[]): Message[] {
   return msgs.map((m) => (m.prefill?.state === "reading" ? { ...m, prefill: { ...m.prefill, state: "done" as const, rate: null } } : m))
 }
 
-export interface SendContext { health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | string[] | null; runner?: string; blocked?: string }      // skills: the names of the skills in use, for "/name"; runner (#310 part 2): the chat is on the engineer's own PC, through this runner
+export interface SendContext { mcpRunner?: string; health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | string[] | null; runner?: string; blocked?: string }      // skills: the names of the skills in use, for "/name"; runner (#310 part 2): the chat is on the engineer's own PC, through this runner
 
 /** An answer that is being written (or a conversation that is being summarised) for one conversation. Several can run at once, each for its own conversation: the page shows one,
  *  and the others go on in the background (the server takes their requests one after the other). `messages` is the live list of that conversation. */
@@ -783,7 +789,7 @@ export class ChatController {
     this.messages.push({
       role: "user", text, time: this.stamp(),
       images: attachments.filter((a) => a.kind === "image").map((a) => ({ name: a.name, url: a.url })),
-      files: attachments.filter((a) => a.kind === "file").map((a) => ({ name: a.name, text: a.text })),
+      files: attachments.filter((a) => a.kind === "file" || a.kind === "doc").map((a) => (a.kind === "doc" ? { name: a.name, url: a.url } : { name: a.name, text: a.text })),
     })
     const um = this.messages[this.messages.length - 1]
     um.prefill = { state: "reading", rate: null, mean: null, read: null, cached: null }
@@ -805,7 +811,7 @@ export class ChatController {
     if (s.seed) body.seed = +s.seed
     if (s.max) body.max_tokens = +s.max
     if (ctx.projectionLoaded) body.experimental_speed_projection = !!s.esp
-    Object.assign(body, mcpRequest(s, ctx.mcp))                            // this server may run MCP tools for it (the ones not switched off)
+    Object.assign(body, mcpRequest(s, ctx.mcp, ctx.mcpRunner))         // #338: mcpRunner, My PC's MCP servers in a Server PC chat                            // this server may run MCP tools for it (the ones not switched off)
     Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, id === NEW_KEY ? null : id, permsFor(store, rulesOf(store, id), this.currentProject()), String(um.time), ctx.runner))      // the prompt's time is its checkpoint: the files the tools change in it can be put back      // the coding tools, when they are on and reachable
     const lastPrompt = [...conv].reverse().find((x) => x.role === "user")
     const skill = lastPrompt ? skillOfMessage(lastPrompt.text, ctx.skills ?? []) : null

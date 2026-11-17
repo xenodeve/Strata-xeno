@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { MASK, bodyFor, emptyDraft, entryOf, entryFromRow, guestsAfter, limitsOf, marksGuests, parseKv, parsePaste, toDraft, type McpConfigView, type McpRow } from "./mcpconfig"
+import { MASK, bodyFor, emptyDraft, entryOf, entryFromRow, guestsAfter, limitsOf, marksGuests, parseKv, parsePaste, stateOf, toDraft, type McpConfigView, type McpRow } from "./mcpconfig"
 
 const row = (over: Partial<McpRow>): McpRow => ({ name: "fs", kind: "program", command: "npx", disabled: false, source: "config", editable: true, status: "ready", error: null, tools: [], ...over })
 
@@ -93,5 +93,13 @@ describe("servers for guests (#310 R11)", () => {
     expect(guestsAfter(rows, "files", true).sort()).toEqual(["files", "notes"])
     expect(guestsAfter(rows, "notes", false)).toEqual([])
     expect(guestsAfter(rows, "notes", true)).toEqual(["notes"])
+  })
+})
+
+describe("#338: a server of My PC waiting for the approval there", () => {
+  test("its state is pending, and a save sends it as it waits (not switched off)", () => {
+    const r = row({ pending: true, status: "pending" })
+    expect(stateOf(r)).toBe("pending")
+    expect(bodyFor([r])).toEqual({ servers: { fs: { command: "npx" } } })
   })
 })

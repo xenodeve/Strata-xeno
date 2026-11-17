@@ -227,6 +227,27 @@ describe("chat stream", () => {
     expect(c.undoLast()).toMatchObject({ text: "q", attachments: [{ kind: "file", name: "kept.txt", text: "K" }] })
   })
 
+  test("a document goes as a file part, is stored by name only, and is lost on a resend after a reload (#334)", async () => {
+    const data = new Map<string, string>()
+    ;(globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, removeItem: (k: string) => { data.delete(k) },
+    }
+    const seen: Record<string, unknown>[] = []
+    mockFetch([sse(delta({ content: "ok" }), { choices: [], usage: { completion_tokens: 1 } })], seen)
+    const c = new ChatController()
+    const url = "data:application/pdf;base64,JVBERi0="
+    await c.send("sum it up", [{ kind: "doc", name: "r.pdf", url }], ctx)
+    const sent = (seen[0].messages as { role: string; content: unknown }[]).filter((m) => m.role === "user").pop()!
+    expect(sent.content).toEqual([{ type: "text", text: "sum it up" }, { type: "file", file: { filename: "r.pdf", file_data: url } }])
+    const stored = [...data.entries()].filter(([k]) => k.startsWith("strata.chat")).map(([, v]) => v).join(" ")
+    expect(stored).toContain("r.pdf")
+    expect(stored).not.toContain("JVBERi0")
+    expect(c.undoLast()).toMatchObject({ text: "sum it up", attachments: [{ kind: "doc", name: "r.pdf", url }] })
+    c.messages = [{ role: "user", text: "q", time: 1, files: [{ name: "r.pdf" }] }, { role: "assistant", text: "a", time: 2 }]
+    expect(c.undoLast()).toMatchObject({ text: "q", attachments: [] })
+    ;(globalThis as Record<string, unknown>).localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} }
+  })
+
   test("nothing is undone or edited while an answer is being written", async () => {
     const release = held([delta({ content: "ok" })])
     const c = new ChatController()
@@ -278,6 +299,14 @@ describe("which MCP servers a request uses", () => {
   test("a name that is no longer a server is not sent, and a saved value that is not a list is ignored", () => {
     expect(mcpRequest({ ...DEFAULTS, mcpOff: ["gone", "web"] }, mcp)).toEqual({ strata_mcp: true, strata_mcp_off: ["web"] })
     expect(mcpRequest({ ...DEFAULTS, mcpOff: "web" as unknown as string[] }, mcp)).toEqual({ strata_mcp: true })
+  })
+  test("#338: My PC's servers in a Server PC chat: the runner is named, only when one of them may run", () => {
+    const my = { servers: [...mcp.servers, { ...sv("my_play", 4), machine: "my" as const }], tools: 9 }
+    expect(mcpRequest(DEFAULTS, my, "r0123456789abcdef")).toEqual({ strata_mcp: true, strata_mcp_runner: "r0123456789abcdef" })
+    expect(mcpRequest({ ...DEFAULTS, mcpOff: ["my_play"] }, my, "r0123456789abcdef")).toEqual({ strata_mcp: true, strata_mcp_off: ["my_play"] })
+    expect(mcpRequest(DEFAULTS, mcp, "r0123456789abcdef")).toEqual({ strata_mcp: true })        // none of My PC's: no runner
+    expect(mcpRequest({ ...DEFAULTS, mcp: false }, my, "r0123456789abcdef")).toEqual({})
+    expect(mcpRequest(DEFAULTS, my)).toEqual({ strata_mcp: true })                             // no runner given: as before
   })
   test("no server has tools: nothing", () => {
     expect(mcpRequest(DEFAULTS, { servers: [sv("down", 0, "failed")], tools: 0 })).toEqual({})
