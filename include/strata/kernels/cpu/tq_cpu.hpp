@@ -51,6 +51,9 @@ const char* tq_isa_name(TqIsa isa);
 
 /// The 32768 x 4 int16 state table (filled on first use; thread-safe).
 const int16_t* tq_state_table();
+/// #275 (a diagnostic): copy the table into newly allocated pages and make the copy the one the kernels read; returns
+/// it.  Only for a measurement at start-up (STRATA_ARENA_PROBE), before or between decode rounds.
+const int16_t* tq_state_table_relocate();
 /// The 2048-point codebook as int16 pairs at the table's scale and rounding (8 KiB; filled with the table).
 const int16_t* tq_codebook_i16();
 

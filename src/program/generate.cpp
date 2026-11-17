@@ -51,6 +51,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"   // #275 STRATA_ARENA_PROBE: tq_state_table_relocate
 #include "strata/platform/crash_report.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -2217,6 +2218,129 @@ uint64_t private_commit_bytes() {
                              sizeof counters)) return (uint64_t) counters.PrivateUsage;
 #endif
     return 0;
+}
+
+/// #275 STRATA_ARENA_PROBE=1 (a diagnostic, off by default): once the host-owned experts are in RAM, what Windows says
+/// about their pages and how fast the CPU reads them.  Some boots run every CPU expert task 1.1-3.2x slower for the
+/// whole boot (every pool worker and the host alike, with clock, DPC and page faults normal); this prints, for one
+/// boot, the numbers to set a slow boot beside a normal one.  About a second at start; it changes nothing else.
+void arena_probe(const strata::core::ArenaExpertSource& src, int64_t n_layers, int64_t n_expert) {
+#ifdef _WIN32
+    struct Run { const uint8_t* p; uint64_t n; int64_t layer; };
+    std::vector<Run> runs;
+    uint64_t total = 0;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (int64_t l = 0; l < n_layers; ++l) {
+        const uint64_t bytes = lay.blob_bytes(l);
+        for (int64_t e = 0; e < n_expert && bytes > 0; ++e) {
+            const uint8_t* p = src.blob_at(l, e);
+            MEMORY_BASIC_INFORMATION mb{};
+            // only blobs wholly committed: a GPU-owned expert of the placement-first arena is reserved address space,
+            // and reading it would fault
+            if (p == nullptr || VirtualQuery(p, &mb, sizeof mb) == 0 || mb.State != MEM_COMMIT ||
+                (const uint8_t*) mb.BaseAddress + mb.RegionSize < p + bytes)
+                continue;
+            runs.push_back({p, bytes, l});
+            total += bytes;
+        }
+    }
+    // the pages: every 16th 4 KB page of every host-owned blob
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> wi;
+    for (const Run& r : runs)
+        for (uint64_t o = 0; o < r.n; o += 16 * 4096) {
+            PSAPI_WORKING_SET_EX_INFORMATION x{};
+            x.VirtualAddress = (PVOID) (r.p + o);
+            wi.push_back(x);
+        }
+    uint64_t valid = 0, shared = 0, locked = 0, large = 0, node[4] = {0};
+    if (!wi.empty() && QueryWorkingSetEx(GetCurrentProcess(), wi.data(), (DWORD) (wi.size() * sizeof wi[0]))) {
+        for (const auto& x : wi) {
+            const auto& a = x.VirtualAttributes;
+            if (!a.Valid) continue;
+            ++valid;
+            shared += a.Shared;
+            locked += a.Locked;
+            large += a.LargePage;
+            ++node[a.Node & 3];
+        }
+    }
+    // the reads: 5 threads over all of it, twice (the first pass also faults in any page not in the working set), then
+    // one thread over the first GiB
+    auto read = [&](int threads, uint64_t limit) {
+        std::atomic<uint64_t> sink{0};
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::thread> ts;
+        for (int t = 0; t < threads; ++t)
+            ts.emplace_back([&, t] {
+                uint64_t acc = 0, seen = 0;
+                for (size_t i = (size_t) t; i < runs.size(); i += (size_t) threads) {
+                    const uint64_t* w = (const uint64_t*) runs[i].p;
+                    const uint64_t nw = runs[i].n / 8;
+                    for (uint64_t k = 0; k < nw; ++k) acc += w[k];
+                    if ((seen += runs[i].n) >= limit / (uint64_t) threads) break;
+                }
+                sink += acc;
+            });
+        for (auto& th : ts) th.join();
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const uint64_t bytes = std::min(total, limit);
+        return std::pair<double, uint64_t>(s > 0 ? (double) bytes / s / 1e9 : 0.0, sink.load());
+    };
+    const auto p1 = read(5, total), p2 = read(5, total), p3 = read(1, 1ull << 30);
+    const double n = wi.empty() ? 1.0 : (double) wi.size();
+    std::fprintf(stderr, "strata arena probe (#275): %zu host-owned blobs, %.2f GiB; %zu pages sampled: valid %.1f %%, "
+                         "shared %.1f %%, locked %.1f %%, large %.1f %%, "
+                         "node 0-3 [%llu %llu %llu %llu]; read: 5 threads %.1f GB/s then %.1f GB/s, 1 thread %.1f GB/s "
+                         "(sink %llu)\n",
+                 runs.size(), (double) total / 1073741824.0, wi.size(), 100.0 * (double) valid / n,
+                 100.0 * (double) shared / n, 100.0 * (double) locked / n, 100.0 * (double) large / n,
+                 (unsigned long long) node[0],
+                 (unsigned long long) node[1], (unsigned long long) node[2], (unsigned long long) node[3], p1.first,
+                 p2.first, p3.first, (unsigned long long) ((p1.second ^ p2.second ^ p3.second) & 0xff));
+    // The CPU experts' own kernel, one thread, on up to 64 host-owned experts (one token, gate/up then down), with the
+    // trellis state table where it is, then after each of 6 moves of the table to newly allocated pages
+    // (tq_state_table_relocate).  If the time follows the table's pages, the slow boots are the table's placement.
+    if (lay.native && !runs.empty()) {
+        const size_t ne = std::min<size_t>(64, runs.size());
+        std::vector<uint8_t> act, hq;
+        std::vector<float> ff, out;
+        auto time_kernel = [&]() {
+            double best = 1e30;
+            for (int rep = 0; rep < 3; ++rep) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (size_t i = 0; i < ne; ++i) {
+                    const auto& f = lay.fmt[(size_t) runs[i].layer];
+                    act.resize(f.act_bytes + 64, 1);
+                    hq.resize(f.h_bytes + 64, 1);
+                    ff.resize((size_t) f.n_ff);
+                    out.resize((size_t) f.n_embd);
+                    const void* ap[1] = {act.data()};
+                    float* fp[1] = {ff.data()};
+                    const void* hp[1] = {hq.data()};
+                    float* op[1] = {out.data()};
+                    strata::kernels::cpu::native_gu_rows(f, runs[i].p, ap, 1, fp, 0, (int) f.n_ff);
+                    strata::kernels::cpu::native_down_rows(f, runs[i].p, hp, 1, op, 0, (int) f.n_embd);
+                }
+                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                best = std::min(best, 1e6 * s / (double) ne);
+            }
+            return best;
+        };
+        std::string line;
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.1f", time_kernel());
+        line += buf;
+        for (int k = 0; k < 6; ++k) {
+            strata::kernels::cpu::tq_state_table_relocate();
+            std::snprintf(buf, sizeof buf, " %.1f", time_kernel());
+            line += buf;
+        }
+        std::fprintf(stderr, "strata arena probe (#275): one thread, us per expert (best of 3 over %zu experts): table "
+                             "in place, then after each of 6 moves: %s\n", ne, line.c_str());
+    }
+#else
+    (void) src; (void) n_layers; (void) n_expert;
+#endif
 }
 
 /// #463's A/B: STRATA_ADAPT_NOWAIT=1 lets a verify window start before the adaptive tier's copies have landed (0.1.37)
@@ -7922,6 +8046,8 @@ int main(int argc, char** argv) {
                      std::chrono::duration<double>(Clock::now() - tl).count(),
                      (double) commit_before / 1073741824.0, (double) private_commit_bytes() / 1073741824.0);
     }
+    if (const char* e = std::getenv("STRATA_ARENA_PROBE"); e != nullptr && e[0] == '1')   // #275, a diagnostic
+        arena_probe(arena_src, g.n_layers, g.n_expert);
     if (o.exclusive_primary_experts && o.exclusive_mode < 0 && (prefilled <= 0 || xcache.slots() <= 0))
         o.exclusive_primary_experts = false;   // the default only applies where there is a primary tier to own
     if (o.exclusive_primary_experts && !place_first) {
