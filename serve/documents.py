@@ -15,19 +15,23 @@ xml.etree) and pypdf, which the server already has: no new dependency.
 """
 from __future__ import annotations
 
+import collections
+import hashlib
 import html.parser
 import io
 import os
 import posixpath
 import re
+import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
 
 MAX_BYTES = 30_000_000             # the largest file read
-MAX_UNZIPPED = 200_000_000         # bytes read out of one zip, in all its parts
+MAX_UNZIPPED = 100_000_000         # bytes read out of one zip, in all its parts (ET parses each part in memory)
 MAX_ROWS = 2_000                   # rows per sheet given to the chat
 MAX_TEXT = 200_000                 # characters of text given to the chat
+MAX_READ_TEXT = 5_000_000          # characters of text the Read tool takes from one file (it reads them by lines)
 
 OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 KINDS = ("pdf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "rtf", "doc", "xls", "ppt")
@@ -93,15 +97,37 @@ def _zip_kind(data: bytes) -> str | None:
 
 
 # ------------------------------------------------------------------------------------------------ entry points
+CACHE_ENTRIES = 16
+_cache: "collections.OrderedDict[tuple, list[dict]]" = collections.OrderedDict()
+_cache_lock = threading.Lock()
+
+
 def extract(name: str, media_type: str | None, data: bytes, vision: bool) -> list[dict]:
-    """OpenAI content parts for one file: a text part (and, for a PDF with scanned pages and vision, image parts)."""
+    """OpenAI content parts for one file: a text part (and, for a PDF with scanned pages and vision, image parts).
+    The web app sends the file again on every turn, so the last CACHE_ENTRIES results are kept by the file's sha256:
+    a 300-page PDF took 1.9 s to read each turn without it."""
+    key = (hashlib.sha256(data).hexdigest(), name, media_type, bool(vision), MAX_BYTES, MAX_TEXT, MAX_ROWS, MAX_UNZIPPED)
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit is not None:
+            _cache.move_to_end(key)
+            return [dict(p) for p in hit]
+    parts = _extract(name, media_type, data, vision)
+    with _cache_lock:
+        _cache[key] = parts
+        while len(_cache) > CACHE_ENTRIES:
+            _cache.popitem(last=False)
+    return [dict(p) for p in parts]
+
+
+def _extract(name: str, media_type: str | None, data: bytes, vision: bool) -> list[dict]:
     name = name or "document"
     if len(data) > MAX_BYTES:
         return [_note(name, f"(the file is {len(data):,} bytes, more than the {MAX_BYTES:,} that can be read)")]
     kind = kind_of(name, media_type, data)
     if kind == "pdf":
         from serve import pdf_blocks
-        return _capped(pdf_blocks.pdf_parts(data, name, vision), name)
+        return _capped(pdf_blocks.pdf_parts(data, name, vision, max_text=MAX_TEXT), name)
     body, ok = text_of(name, data, media_type=media_type)
     if not ok:
         return [_note(name, f"({body})")]
@@ -138,7 +164,10 @@ def text_of(name: str, data: bytes, max_rows: int | None = None, media_type: str
                     pass
             return f"{name}: this kind of file cannot be read here (it reads PDF, Word, Excel, PowerPoint, OpenDocument, EPUB and RTF)", False
         body = reader(data, max_rows or MAX_ROWS) if kind in ("xlsx", "ods") else reader(data)
-        return _tidy(body), True
+        body = _tidy(body)
+        if len(body) > MAX_READ_TEXT:
+            body = body[:MAX_READ_TEXT] + f"\n[cut here at {MAX_READ_TEXT:,} characters: the rest of {name} is not read]"
+        return body, True
     except _Unreadable as e:
         return f"{name} could not be read: {e}", False
     except Exception as e:  # noqa: BLE001 - a file that cannot be parsed says so; the request goes on
@@ -150,9 +179,10 @@ def _note(name: str, body: str) -> dict:
 
 
 def _capped(parts: list[dict], name: str) -> list[dict]:
-    """A PDF's parts with at most MAX_TEXT characters of text; what is past it is left out, with a note."""
-    out, n = [], 0
-    for p in parts:
+    """A PDF's parts with at most MAX_TEXT characters of page text (the "[Document: ...]" line is not counted);
+    what is past it is left out, with a note."""
+    out, n = parts[:1], 0
+    for p in parts[1:]:
         if p.get("type") == "text":
             t = p["text"]
             if n + len(t) > MAX_TEXT:

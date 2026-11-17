@@ -5,7 +5,7 @@ parts each format needs, as a real office program writes them."""
 from __future__ import annotations
 
 import base64
-import hashlib
+
 import io
 import sys
 import unittest
@@ -128,12 +128,14 @@ class PdfStaysAsItWas(unittest.TestCase):
 
     @unittest.skipIf(pypdf is None, "needs pypdf")
     def test_a_scan_with_vision_is_the_same_image(self):
-        v = pdf_blocks.document_parts(self.block(text_pdf(["first page", None, "third"])), True)
+        data = text_pdf(["first page", None, "third"])
+        v = pdf_blocks.document_parts(self.block(data), True)
         self.assertEqual([p["type"] for p in v], ["text", "text", "text", "image_url", "text"])
         self.assertEqual(v[2]["text"], "--- page 2 (scanned, as an image) ---")
-        self.assertEqual(hashlib.sha256(v[3]["image_url"]["url"].encode()).hexdigest(),
-                         "0806f031cd4211c3587e1a86cfe2a3f851bb9b22a8bd363731ff3f127b8320b9")
+        # the page as the renderer draws it (sha256 0806f031... before the change, with pypdfium2 and Pillow of 2026-11-17)
+        self.assertEqual(v[3]["image_url"]["url"], pdf_blocks._page_image(data, 1))
 
+    @unittest.skipIf(pypdf is None, "needs pypdf")
     def test_the_notes_are_the_same(self):
         bad = {"source": {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(b"%PDF-1.4 junk").decode()}}
         self.assertEqual(pdf_blocks.document_parts(bad), [{"type": "text", "text": "[Document: document]\n(the PDF could not be read: PdfStreamError)"}])
@@ -141,6 +143,41 @@ class PdfStaysAsItWas(unittest.TestCase):
                          [{"type": "text", "text": "[Document: x]\n(unsupported document source: url)"}])
         self.assertEqual(pdf_blocks.document_parts({"title": "x", "source": {"type": "text", "data": "plain"}}),
                          [{"type": "text", "text": "[Document: x]\nplain"}])
+
+
+class ReadOnceForEveryTurn(unittest.TestCase):
+    """The web app sends a file again on every turn: it is read once, and a long PDF only up to the text limit."""
+
+    def test_the_same_file_is_read_once(self):
+        calls = []
+        real = documents._extract
+        documents._extract = lambda *a: calls.append(a) or real(*a)
+        self.addCleanup(setattr, documents, "_extract", real)
+        data = docx(para("cached ", str(id(self))))
+        first = documents.extract("c.docx", None, data, False)
+        first[0]["text"] = "changed by a caller"
+        again = documents.extract("c.docx", None, data, False)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("cached", again[0]["text"])
+        documents.extract("c.docx", None, data, True)                       # another vision setting is another entry
+        self.assertEqual(len(calls), 2)
+
+    @unittest.skipIf(pypdf is None, "needs pypdf")
+    def test_a_long_pdf_stops_reading_at_the_text_limit(self):
+        old = documents.MAX_TEXT
+        documents.MAX_TEXT = 30
+        self.addCleanup(setattr, documents, "MAX_TEXT", old)
+        seen = []
+        real = pdf_blocks.pdf_parts
+        pdf_blocks.pdf_parts = lambda *a, **k: seen.append(k) or real(*a, **k)
+        self.addCleanup(setattr, pdf_blocks, "pdf_parts", real)
+        t = text(documents.extract("long.pdf", None, text_pdf([f"page text number {i}" for i in range(1, 9)]), False))
+        self.assertEqual(seen, [{"max_text": 30}])
+        self.assertIn("[Document: long.pdf, 8 page(s)]", t)              # the count is of all the pages
+        self.assertIn("[cut here", t)
+        self.assertNotIn("number 3", t)
+        whole = pdf_blocks.pdf_parts(text_pdf([f"p{i}" for i in range(1, 4)]), "w.pdf", False)
+        self.assertEqual(len(whole), 4)
 
 
 class OfficeThroughDocumentParts(unittest.TestCase):

@@ -51,16 +51,23 @@ def document_parts(block, vision = False):
     return pdf_parts(data, block.get("title") or "document", vision)
 
 
-def pdf_parts(data, title, vision = False):
-    """A PDF's bytes -> its parts under a "[Document: title, n page(s)]" line (also serve/documents.py's PDF reader)."""
+def pdf_parts(data, title, vision = False, max_text = None):
+    """A PDF's bytes -> its parts under a "[Document: title, n page(s)]" line (also serve/documents.py's PDF reader).
+    `max_text`: stop reading pages once this many characters of text are read (the caller cuts there); None reads all."""
     block = {"title": title}
     try:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(data))
-        texts = [(p.extract_text() or "").strip() for p in reader.pages]
+        texts, total = [], 0
+        for p in reader.pages:
+            texts.append((p.extract_text() or "").strip())
+            total += len(texts[-1])
+            if max_text is not None and total > max_text:
+                break
+        pages = len(reader.pages)
     except Exception as e:
         return [{"type": "text", "text": _header(block) + f"\n(the PDF could not be read: {type(e).__name__})"}]
-    parts = [{"type": "text", "text": _header(block, len(texts))}]
+    parts = [{"type": "text", "text": _header(block, pages)}]
     images = 0
     for i, t in enumerate(texts, 1):
         if t:
