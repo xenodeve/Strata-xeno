@@ -6193,6 +6193,21 @@ def make_handler(svc: Service):
                 return False
             return {n: g for n, g in runner.servers().items() if g.group_kind == "mcp"}
 
+        def _bind_my_pc(self, arun, rid) -> None:
+            """#344: the user's own PC of this chat, whose settings Strata's tools read and change as `my_pc`: the runner of a My PC
+            run, or in a Server PC chat this browser's runner (the page's `strata_agent.my_pc`, or #338's `strata_mcp_runner`).  As the
+            web app's My PC editor has it (`_runner_mcp`): only the caller's own runner (RunnerHub.get_for), and only from that PC's own
+            browser (X-Strata-Device); its approval in Strata Desktop stays the real guard.  Offline is kept: the tools say so."""
+            runner = rid if not isinstance(rid, str) else svc.runner_hub.get_for(rid, self._acting()) if rid and len(rid) <= 200 else None
+            if runner is None:
+                return
+            if self._runner_device() != getattr(runner, "device", None):
+                arun.ctx.my_pc_why = (f"The user's PC ({runner.info.get('machine') or '?'}) is connected, but this message was sent from another "
+                                      "browser: its settings are read and changed only from the web app in Strata Desktop on that PC.")
+                return
+            rid, who = runner.id, self._acting()
+            arun.ctx.my_pc = lambda: svc.runner_hub.get_for(rid, who)     # found again on each use: a restarted Strata Desktop is a new Runner under this id
+
         @staticmethod
         def _my_mcp_offered(req: dict, groups: dict) -> str | bool:
             """#339: the name of the user's PC when this request offers MCP groups of it (`my_<name>`: the web app's MCP opt-in, not
@@ -7566,12 +7581,14 @@ def make_handler(svc: Service):
                             return
                     arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, guest=guest, local=local,
                                                my_mcp=self._my_mcp_offered(req, premine or {}))     # #310: the run and what it asks are this identity's
+                    self._bind_my_pc(arun, sa.get("my_pc") if isinstance(sa.get("my_pc"), str) else req.get("strata_mcp_runner"))      # #344
                 else:
                     try:                                          # the facts job: up to REQUEST_TIMEOUT_S, on this request's own thread, no lock held
                         arun = svc.start_agent_run(sa, req.get("messages") or [], self._acting().name, runner=runner, guest=guest,
                                                    my_mcp=self._my_mcp_offered(req, runner.servers()))
                     except runner_hub.RunnerUnavailable as e:
                         return self._json(409, {"error": {"type": "runner_offline", "message": e.message[:300]}})
+                    self._bind_my_pc(arun, runner)                # #344: the project's PC is the user's PC of this chat
                     base = svc.mcp if svc.mcp is not None else McpHub({})
                     mine = runner.servers()               # my_agent, my_skills, my_<name>: after the server's groups
                     arun.hub = base.with_servers(mine, replace={"agent": runner_hub.agent_subset(svc.agent, runner_hub.SERVER_TOOLS)}

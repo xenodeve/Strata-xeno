@@ -15,19 +15,20 @@ export function modeOf(raw: string | undefined, info?: Pick<AgentInfo, "yolo">):
   return raw === "plan" || raw === "auto" ? raw : "ask"
 }
 
-export interface AgentRequest { cwd?: string; dirs?: string[]; mode: AgentMode; session: string; allow: string[]; deny?: string[]; checkpoint?: string; run?: string; runner?: string }
+export interface AgentRequest { cwd?: string; dirs?: string[]; mode: AgentMode; session: string; allow: string[]; deny?: string[]; checkpoint?: string; run?: string; runner?: string; my_pc?: string }
 
 /** What a request says: `strata_agent` when the coding tools are on (the default), reachable from here and the server has them; else nothing.
  *  An unknown mode is the default one (the server also ignores it). `runner` (#310 part 2): the chat's project is on the engineer's own PC, and
- *  this is its runner: the tools run there. */
-export function agentRequest(s: { agent?: boolean; agentMode?: string }, info: AgentInfo, folders: string | string[] | null | undefined, session: string | null, rules: string[] | { allow: string[]; deny?: string[] }, checkpoint?: string, runner?: string): { strata_agent?: AgentRequest } {
+ *  this is its runner: the tools run there. `myPc` (#344): in a chat whose project is on the central PC, this browser's runner - the user's own PC,
+ *  whose settings Strata's own tools read and change as my_pc (the server checks it is the caller's, from this device). */
+export function agentRequest(s: { agent?: boolean; agentMode?: string }, info: AgentInfo, folders: string | string[] | null | undefined, session: string | null, rules: string[] | { allow: string[]; deny?: string[] }, checkpoint?: string, runner?: string, myPc?: string): { strata_agent?: AgentRequest } {
   if (s.agent === false || !info.available || !info.allowed) return {}
   const mode = modeOf(s.agentMode, info)
   const list = (Array.isArray(folders) ? folders : [folders]).filter((f): f is string => typeof f === "string" && f.trim().length > 0).map((f) => f.trim())
   const [cwd, ...dirs] = list                                                  // the first is the main folder; the others are the project's other folders
   const allow = (Array.isArray(rules) ? rules : rules.allow).slice(0, 200)
   const deny = (Array.isArray(rules) ? [] : rules.deny ?? []).slice(0, 200)
-  return { strata_agent: { ...(cwd ? { cwd } : {}), ...(cwd && dirs.length ? { dirs } : {}), mode, session: session || "new", allow, ...(deny.length ? { deny } : {}), ...(checkpoint ? { checkpoint } : {}), ...(runner ? { runner } : {}) } }
+  return { strata_agent: { ...(cwd ? { cwd } : {}), ...(cwd && dirs.length ? { dirs } : {}), mode, session: session || "new", allow, ...(deny.length ? { deny } : {}), ...(checkpoint ? { checkpoint } : {}), ...(runner ? { runner } : {}), ...(myPc && !runner ? { my_pc: myPc } : {}) } }
 }
 
 // ------------------------------------------------------------------------------------------------ the rules of a chat

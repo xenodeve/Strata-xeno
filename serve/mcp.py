@@ -498,14 +498,22 @@ def _on_users_pc(server) -> bool:
     return getattr(server, "kind", "") == "runner" and getattr(server, "group_kind", "") == "mcp"
 
 
+CENTRAL_TAG = "[Runs on the central PC (the Strata server) — localhost there is the central PC.]"
+
+
 def place_tag(server) -> str:
-    """#338: what the description of a tool of the user's PC (a runner's MCP group) starts with, so the model does not
-    mix it up with the central PC's: localhost there is the user's machine.  Every other tool gets none, so the server's
-    own tool block never changes with the runner's state (its cached prefix stays)."""
-    if not _on_users_pc(server):
-        return ""
-    machine = (getattr(server, "info", None) or {}).get("machine") or "?"
-    return f"[Runs on the user's PC ({machine}) — localhost there is the user's machine.]"
+    """#338, #344: what the description of an MCP or skill tool starts with, so the model does not mix up the two PCs: a
+    runner's MCP or skills group (`my_<name>`, `my_skills`) runs on the user's PC, the server's own MCP servers and skills
+    on the central PC.  Each tag is fixed (it never says whether a runner is online), so the server's own tool block stays
+    the same whatever the runner does (its cached prefix stays).  The coding tools and Strata's own get none."""
+    if getattr(server, "kind", "") == "runner":
+        if getattr(server, "group_kind", "") not in ("mcp", "skills"):
+            return ""
+        machine = (getattr(server, "info", None) or {}).get("machine") or "?"
+        return f"[Runs on the user's PC ({machine}) — localhost there is the user's machine.]"
+    if getattr(server, "kind", "") in ("stdio", "http") or (getattr(server, "kind", "") == "builtin" and getattr(server, "name", "") == "skills"):
+        return CENTRAL_TAG
+    return ""
 
 
 class McpHub:

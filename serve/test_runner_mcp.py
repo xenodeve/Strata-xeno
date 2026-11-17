@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve import mcp_admin, page_routes, runner as runner_mod  # noqa: E402
+from serve import mcp_admin, page_routes, runner as runner_mod, strata_tools  # noqa: E402
 from serve.mcp import McpServer  # noqa: E402
 from serve.identity import OWNER  # noqa: E402
 from serve.test_identity_http import DEV1, DEV2  # noqa: E402
@@ -256,15 +256,18 @@ class PlaceTags(unittest.TestCase):
         from serve.mcp import McpHub
         return McpHub({}).with_servers({s.name: s for s in servers})
 
-    def test_only_the_users_pc_is_tagged(self):
+    def test_each_pcs_mcp_and_skill_tools_are_tagged(self):
+        """#344: the central PC's MCP and skill tools say so too, with a fixed tag; the coding tools and Strata's own get none."""
         mine = self.server("my_play", "runner", group_kind="mcp", info={"machine": "ann-pc"})
-        got = {t["name"]: t["description"] for t in self.hub(self.server("files", "stdio"), mine,
+        got = {t["name"]: t["description"] for t in self.hub(self.server("files", "stdio"), self.server("web", "http"), mine,
                                                               self.server("my_agent_x", "runner", group_kind="coding"),
-                                                              self.server("skills", "builtin")).template_tools()}
-        self.assertEqual(got["my_play__go"], "[Runs on the user's PC (ann-pc) — localhost there is the user's machine.] Does it.")
-        self.assertEqual(got["files__go"], "Does it.")                  # the central PC's: untouched, whatever the runner does
-        self.assertEqual(got["my_agent_x__go"], "Does it.")
-        self.assertEqual(got["skills__go"], "Does it.")
+                                                              self.server("my_skills", "runner", group_kind="skills", info={"machine": "ann-pc"}),
+                                                              self.server("skills", "builtin"), self.server("strata", "builtin")).template_tools()}
+        user = "[Runs on the user's PC (ann-pc) — localhost there is the user's machine.] Does it."
+        central = "[Runs on the central PC (the Strata server) — localhost there is the central PC.] Does it."
+        self.assertEqual((got["my_play__go"], got["my_skills__go"]), (user, user))
+        self.assertEqual((got["files__go"], got["web__go"], got["skills__go"]), (central, central, central))
+        self.assertEqual((got["my_agent_x__go"], got["strata__go"]), ("Does it.", "Does it."))
 
     def test_without_a_runner_group_the_tools_are_byte_identical(self):
         servers = (self.server("files", "stdio"), self.server("web", "http"))
@@ -518,12 +521,33 @@ class ServerChat(Base):
             code, events = self.chat("k", {"strata_agent": sa, **extra}, device="device-0000")
             self.assertEqual(code, 200, events)
             prompts.append(self.engine.prompt_text(len(prompts)))
-        self.assertIn(f"An MCP tool whose name starts with my_ (my_<server>__<tool>) runs on the user's PC ({loop.executor.machine})", prompts[0])
+        self.assertIn(f"An MCP or skill tool whose name starts with my_ (my_<server>__<tool>, my_skills__<tool>) runs on the user's PC ({loop.executor.machine})", prompts[0])
         self.assertIn("run on the central PC (the server), not on the user's PC", prompts[0])
         self.assertIn("my_fake__echo", prompts[0])                                          # and the tools are offered           # the coding tools: a server project
         for p in prompts[1:]:
             self.assertNotIn("starts with my_", p)
-            self.assertIn("The MCP tools run on the central PC", p)
+            self.assertIn("The MCP and skill tools offered here (<server>__<tool>, skills__<tool>) run on the central PC", p)
+
+    def test_strata_settings_see_this_browsers_pc_only_from_its_own_device(self):
+        """#344: Strata's settings tools read the chat's own PC as my_pc - in a My PC run its runner, in a Server PC chat this browser's
+        (`strata_agent.my_pc`) - only when the message comes from that PC's device; from another browser they say why."""
+        self.start_routing(*[x for _ in range(3) for x in (tool_call("StrataSettings"), DONE)], servers={"strata": strata_tools.StrataServer(self.svc)})
+        self.svc.strata = self.svc.mcp.servers["strata"] if self.svc.mcp is not None else None
+        loop = self.runner("k", device="device-0000", cfg={"mcp_servers": {"fake": {**FAKE, "disabled": True}}})
+        self.req("GET", "/props", key="k", device=DEV2)                                  # the owner on a second browser
+        self.assertTrue(self.svc.keys.decide_device("owner", DEV2, True, OWNER))
+        sa = {"cwd": str(self.proj), "session": "chat-1"}
+        got = []
+        for extra, device in (({"strata_agent": {**sa, "my_pc": loop.id}}, "device-0000"),
+                              ({"strata_agent": {**sa, "my_pc": loop.id}}, DEV2),
+                              ({"strata_agent": {"session": "chat-2", "runner": loop.id}}, "device-0000")):
+            code, events = self.chat("k", extra, device=device)
+            self.assertEqual(code, 200, events)
+            got.append(json.loads(next(e for e in events if e["event"] == "result")["text"])["my_pc"])
+        self.assertEqual((got[0]["connected"], got[0]["machine"], [x["name"] for x in got[0]["mcp_servers"]]), (True, loop.executor.machine, ["fake"]))
+        self.assertEqual(got[1]["connected"], False)
+        self.assertIn("another browser", got[1]["note"])
+        self.assertEqual((got[2]["connected"], got[2]["machine"]), (True, loop.executor.machine))
 
     def test_without_a_runner_the_request_is_as_before(self):
         self.start_routing()

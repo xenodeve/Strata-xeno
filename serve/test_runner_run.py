@@ -164,7 +164,7 @@ class OnMyPc(Fixture):
         self.runner = self.hub.hello("ann", "device-0001", "inst-aaaa", dict(INFO), [CODING, mcp], [])
         self.answer(facts())
         run = self.svc.start_agent_run(self.sa(), self.messages(), "ann", runner=self.runner)
-        self.assertIn("starts with my_ (my_<server>__<tool>) runs on the user's PC (ann-pc)", run.prompt)
+        self.assertIn("starts with my_ (my_<server>__<tool>, my_skills__<tool>) runs on the user's PC (ann-pc)", run.prompt)
         self.assertIn("Playwright", run.prompt)
 
     def test_server_without_coding_tools(self):

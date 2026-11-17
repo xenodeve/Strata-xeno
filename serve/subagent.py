@@ -90,6 +90,7 @@ def execute(svc, parent, kind: str, prompt: str, description: str, run_loop) -> 
     helper.ctx.checkpoint, helper.ctx.hooks, helper.ctx.vision, helper.ctx.web = parent.ctx.checkpoint, parent.ctx.hooks, parent.ctx.vision, parent.ctx.web
     helper.ctx.in_helper = True
     helper.ctx.guest = parent.ctx.guest                       # #339: a guest's helper is a guest's (it has no Strata tools either way)
+    helper.ctx.my_pc, helper.ctx.my_pc_why = parent.ctx.my_pc, parent.ctx.my_pc_why      # #344: it reads the same PCs' settings (it changes none)
     helper.ctx.question = lambda questions: {"answers": None}                  # a helper cannot ask the user
     # #310 part 2: the helper works where its run works - the run's own view of the tool groups and its coding group (a project on the
     # engineer's PC: that PC's runner, never the server's own tools), and the same run key on that PC

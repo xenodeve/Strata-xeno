@@ -548,6 +548,7 @@ def _session(v) -> str:
 
 # ------------------------------------------------------------------------------------------------ this PC's MCP servers (#338)
 MCP_JOBS = ("mcp.config", "mcp.config.set", "mcp.import.list", "mcp.import.add")
+SKILL_JOBS = ("skills.config", "skills.config.set")     # #344: this PC's skill switches (runner.json `import.skills`), for the chat's model
 PENDING_KEY = "mcp_pending"     # runner.json: {name: {"entry", "at"}} - a server the web app added, changed or switched on,
                                 # which waits for the user's approval in Strata Desktop on this PC before it runs
 
@@ -746,6 +747,8 @@ class Executor:
             return self._page(msg)
         if kind in MCP_JOBS:
             return self._mcp(kind, msg)
+        if kind in SKILL_JOBS:
+            return self._skills(kind, msg)
         return {"error": "unknown", "message": f"this runner does not know the job {str(kind)[:40]!r}: update Strata Desktop"}
 
     def _run_start(self, msg: dict) -> dict:
@@ -864,7 +867,47 @@ class Executor:
             return {"status": {"missing": 404, "unsupported": 422, "already": 409}[e.code],
                     "body": {"error": {"message": str(e), "code": e.code}}}
         status, out = self._write_servers(servers, {})
-        return {"status": status, "body": out if status != 200 else self._import_view()}
+        if status != 200:
+            return {"status": status, "body": out}
+        got = servers.get(_name) if isinstance(servers.get(_name), dict) else {}
+        return {"status": 200, "body": {**self._import_view(), "imported": _name, "imported_disabled": got.get("disabled") is True}}
+
+    # -------------------------------------------------------------------------------------------- skills (#344)
+    def _skills(self, kind: str, msg: dict) -> dict:
+        """This PC's skill switches, in a page job's shape: `skills.config` -> the switches and every skill found on this
+        PC; `skills.config.set` {"body": {"skills": {"enabled", "harness_off", "off"}}} writes runner.json's
+        `import.skills` (checked as the server's POST /import checks them) and the skills in use follow at once.  A skill
+        is instructions, not a program, so no approval waits for it on this PC: the chat's card is the user's say."""
+        if kind == "skills.config":
+            return {"status": 200, "body": self._skills_view()}
+        body = msg.get("body")
+        if not isinstance(body, dict) or "skills" not in body or any(k != "skills" for k in body):
+            return _bad("skills", 'send {"skills": {"enabled", "harness_off", "off"}}')
+        new, errors = harness._check_skills(body["skills"])
+        if errors:
+            return {"status": 400, "body": {"error": {"message": f"{errors[0]['message']} ({errors[0]['field']})", "fields": errors}}}
+
+        def put(cfg: dict) -> None:
+            block = cfg.get("import") if isinstance(cfg.get("import"), dict) else {}
+            block["skills"] = new
+            cfg["import"] = block
+        with mcp_admin._lock:
+            self._make_config()
+            try:
+                mcp_admin.update_config(self.config_path, put)
+            except (OSError, ValueError, TypeError) as e:
+                return {"status": 500, "body": {"error": {"message": f"the skill switches could not be saved: {e}"}}}
+            self.cfg = self._read_config()
+            self.importer.apply(self.cfg)
+        self._groups_moved()
+        return {"status": 200, "body": self._skills_view()}
+
+    def _skills_view(self) -> dict:
+        st = harness.skill_settings(self.cfg)
+        items = harness.skill_items(self.importer.found, st)
+        return {"settings": st, "apps": {h["id"]: h["label"] for h in harness.HARNESSES},
+                "skills": [{"app": i["harness"], "name": i["name"], "off": i["off"], "used": i["used"]} for i in items],
+                "machine": self.machine}
 
     def _config_now(self) -> tuple[dict, dict]:
         """(the approved MCP servers, the ones waiting for approval) as runner.json has them now."""
