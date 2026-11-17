@@ -121,7 +121,9 @@ const withThinking = (msg: ApiMessage, thinking: string): ApiMessage => (thinkin
 function assistantMessages(m: Message): ApiMessage[] {
   const reasoning = m.reasoning || ""
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped")
-  if (!ran.length) return m.text || reasoning.trim() ? [withThinking({ role: "assistant", content: m.text }, reasoning.trim())] : []
+  // A turn with thinking and no text (an answer cut while it thought) is left out, as before: the server's reasoning
+  // carry (serve/reasoning_carry.py, "history") finds that empty turn and puts the cut thinking back itself.
+  if (!ran.length) return m.text ? [withThinking({ role: "assistant", content: m.text }, reasoning.trim())] : []
   const out: ApiMessage[] = []
   let pos = 0
   let rpos = 0
@@ -139,7 +141,7 @@ function assistantMessages(m: Message): ApiMessage[] {
   }
   const rest = m.text.slice(pos).trim()
   const restThinking = reasoning.slice(rpos).trim()
-  if (rest || restThinking) out.push(withThinking({ role: "assistant", content: rest }, restThinking))
+  if (rest) out.push(withThinking({ role: "assistant", content: rest }, restThinking))
   return out
 }
 

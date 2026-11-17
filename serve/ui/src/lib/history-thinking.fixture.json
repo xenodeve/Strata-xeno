@@ -1,5 +1,5 @@
 {
-  "_comment": "#331: one answer with a tool round, as the page stores it (message), what the page sends back (api), and what the server gave the engine while the answer ran (server). serve/ui/src/lib/chat.test.ts checks message -> api; serve/test_history_thinking.py checks that api renders like server, token for token.",
+  "_comment": "#331: one answer with a tool round, as the page stores it (message), what the page sends back (api), and what the server gave the engine while the answer ran (server). serve/ui/src/lib/lib.test.ts checks message -> api; serve/test_history_thinking.py checks that api renders like server, token for token.",
   "message": {
     "role": "assistant", "time": 0,
     "text": "Let me look.\n\nThe file says hi.",

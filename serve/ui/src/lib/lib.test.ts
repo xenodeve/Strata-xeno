@@ -68,6 +68,11 @@ describe("apiMessages", () => {
     expect(apiMessages([{ role: "assistant", time: 2, text: "Hi.", reasoning: "  greet back \n" }])).toEqual([{ role: "assistant", content: "Hi.", reasoning_content: "greet back" }])
     expect(apiMessages([{ role: "assistant", time: 2, text: "Hi." }])).toEqual([{ role: "assistant", content: "Hi." }])
   })
+  test("an answer cut while it thought (thinking, no text) is left out, so the server's reasoning carry puts it back", () => {
+    expect(apiMessages([{ role: "assistant", time: 2, text: "", reasoning: "still thinking" }])).toEqual([])
+    const a: Message = { role: "assistant", time: 2, text: "A", reasoning: "r1\n\nr2", tools: [{ id: "c1", name: "x", at: 1, rat: 2, state: "done", round: 1, result: "o" }] }
+    expect((apiMessages([a]) as { role: string }[]).map((x) => x.role)).toEqual(["assistant", "tool"])      // the cut last round's thinking is not sent as an empty turn
+  })
   test("two rounds split the thinking where each round's first call began", () => {
     const a: Message = {
       role: "assistant", time: 2, text: "A\n\nB\n\nC", reasoning: "r1\n\nr2\n\nr3",
