@@ -8,7 +8,9 @@ export type Place = "my" | "server"
 /** The place of a server in a list or of a call: `machine: "my"` is this PC; anything else is the central PC. */
 export const placeOf = (x: { machine?: string } | null | undefined): Place => (x?.machine === "my" ? "my" : "server")
 
-const BADGE: Record<Place, string> = { my: msg("This PC"), server: msg("Central PC") }
+/** The places' short names ("This PC" / "Central PC"): the badge, and the project's machine (lib/runner.ts MACHINE_LABEL). */
+export const PLACE_LABEL: Record<Place, string> = { my: msg("This PC"), server: msg("Central PC") }
+const BADGE = PLACE_LABEL
 
 /** The small badge: "This PC" / "Central PC". */
 export const placeBadge = (p: Place): string => t(BADGE[p])

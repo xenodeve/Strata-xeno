@@ -133,6 +133,12 @@
   <div class="row-actions" id="without-row" hidden><button class="quiet" id="without" type="button"></button></div>
 </header>
 
+<section id="mcp-wait" hidden>
+  <h2 id="mcp-wait-title"></h2>
+  <p class="note" id="mcp-wait-hint"></p>
+  <ul id="mcp-wait-list"></ul>
+</section>
+
 <section>
   <h2 id="servers-title"></h2>
   <ul id="servers"></ul>
@@ -285,8 +291,39 @@ async function refresh() {
   if (r.state) window.render(r.state);
 }
 
+// #338: the MCP servers the web app asked to run on this PC, in full, each with Approve / Reject. Nothing runs before.
+function renderWaiting(items) {
+  const ul = $("mcp-wait-list");
+  ul.replaceChildren();
+  $("mcp-wait").hidden = !items.length;
+  for (const x of items) {
+    const li = el("li", "server");
+    li.dataset.mcpWait = x.name;
+    li.append(el("div", "name", x.name));
+    const line = el("div", "muted", x.line || "");
+    line.style.fontFamily = "\"JetBrains Mono Variable\", ui-monospace, monospace";
+    line.style.overflowWrap = "anywhere";
+    li.append(line);
+    if (x.cwd) li.append(el("div", "muted", w("mcp_wait_cwd") + ": " + x.cwd));
+    if (x.env && x.env.length) li.append(el("div", "muted", w("mcp_wait_env") + ": " + x.env.join(", ")));
+    if (x.headers && x.headers.length) li.append(el("div", "muted", w("mcp_wait_headers") + ": " + x.headers.join(", ")));
+    if (x.replaces) li.append(el("div", "muted", w("mcp_wait_replaces")));
+    const actions = el("div", "row-actions");
+    const yes = el("button", "primary", w("mcp_wait_approve"));
+    yes.type = "button";
+    yes.addEventListener("click", async () => { await call(() => api.mcp_approve(x.name)); refresh(); });
+    const no = el("button", "danger", w("mcp_wait_reject"));
+    no.type = "button";
+    no.addEventListener("click", async () => { await call(() => api.mcp_reject(x.name)); refresh(); });
+    actions.append(yes, no);
+    li.append(actions);
+    ul.append(li);
+  }
+}
+
 window.render = function (st) {
   if (!st) return;
+  renderWaiting(Array.isArray(st.mcp_pending) ? st.mcp_pending : []);
   $("dot").className = "dot " + (st.kind || "idle");
   $("state-text").textContent = st.text || "";
   $("notice").textContent = st.notice || "";
@@ -306,6 +343,8 @@ function init() {
 document.addEventListener("DOMContentLoaded", () => {
   $("title").textContent = w("servers_title");
   $("servers-title").textContent = w("servers_heading");
+  $("mcp-wait-title").textContent = w("mcp_wait_heading");
+  $("mcp-wait-hint").textContent = w("mcp_wait_hint");
   $("l-name").textContent = w("label_name");
   $("l-url").textContent = w("label_url");
   $("l-token").textContent = w("label_token");

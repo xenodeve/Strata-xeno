@@ -20,6 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import mcp_admin, page_routes, runner as runner_mod  # noqa: E402
+from serve.mcp import McpServer  # noqa: E402
 from serve.identity import OWNER  # noqa: E402
 from serve.test_identity_http import DEV1, DEV2  # noqa: E402
 from serve.test_harness import tool_call  # noqa: E402
@@ -65,33 +66,90 @@ class Jobs(unittest.TestCase):
         self.assertEqual((body["servers"], body["editable"], body["config_file"]), ([], True, "runner.json"))
         self.assertEqual(set(body["settings"]), {"timeout_s", "max_result_chars", "max_rounds"})
 
-    def test_first_add_makes_runner_json(self):
+    def read(self):
+        return json.loads(self.cfg.read_text(encoding="utf-8"))
+
+    def test_first_add_waits_for_approval_on_this_pc(self):
         ex = self.executor()
         self.assertFalse(self.cfg.exists())
         got = job(ex, "mcp.config.set", body={"servers": {"fake": FAKE}})
         self.assertEqual(got["status"], 200, got)
-        self.assertEqual(json.loads(self.cfg.read_text(encoding="utf-8")), {"mcp_servers": {"fake": FAKE}})
-        self.assertEqual([s["name"] for s in got["body"]["servers"]], ["fake"])
-        self.assertIn("fake", ex.hub.servers)                          # the hub was started again from the file
+        cfg = self.read()
+        self.assertEqual(cfg["mcp_servers"], {})                       # nothing new runs from the server's word alone
+        self.assertEqual(cfg["mcp_pending"]["fake"]["entry"], FAKE)
+        [row] = got["body"]["servers"]
+        self.assertEqual((row["name"], row["pending"], row["status"], row["command"]), ("fake", True, "pending", sys.executable))
+        self.assertNotIn("fake", ex.hub.servers if ex.hub is not None else {})
+        [p] = ex.mcp_pending()
+        self.assertEqual((p["name"], p["command"], p["args"], p["replaces"]), ("fake", sys.executable, [FAKE_MCP], False))
+        self.assertEqual(p["line"], f"{sys.executable} {FAKE_MCP}")
+        self.assertTrue(ex.mcp_decide("fake", True))                    # the user approves it in Strata Desktop
+        self.assertEqual(self.read(), {"mcp_servers": {"fake": FAKE}})
         self.assertTrue(wait_for(lambda: any(g["name"] == "fake" and g["tools"] for g in ex.groups()), 20))
-        self.assertEqual(ex.cfg["mcp_servers"], {"fake": FAKE})        # the executor reads its config again
+        self.assertFalse(ex.mcp_decide("fake", True))                   # nothing waits now
+
+    def test_reject_drops_it_and_keeps_the_approved_one_running(self):
+        ex = self.executor({"mcp_servers": {"fake": FAKE}})
+        running = ex.hub.servers["fake"]
+        changed = {**FAKE, "env": {"X": "1"}}
+        got = job(ex, "mcp.config.set", body={"servers": {"fake": changed}})
+        self.assertEqual(got["status"], 200, got)
+        self.assertEqual(self.read()["mcp_servers"], {"fake": FAKE})    # as approved, still running
+        self.assertIs(ex.hub.servers["fake"], running)
+        self.assertEqual(ex.mcp_pending()[0]["env"], ["X"])             # the names, never the values
+        self.assertTrue(ex.mcp_pending()[0]["replaces"])
+        self.assertTrue(ex.mcp_decide("fake", False))
+        self.assertEqual(self.read(), {"mcp_servers": {"fake": FAKE}})
+        self.assertIs(ex.hub.servers["fake"], running)
+
+    def test_switching_on_waits_but_off_and_delete_do_not(self):
+        off = {**FAKE, "disabled": True}
+        ex = self.executor({"mcp_servers": {"fake": FAKE, "b": {"command": "y"}}})
+        got = job(ex, "mcp.config.set", body={"servers": {"fake": off, "b": {"command": "y"}}})
+        self.assertEqual(got["status"], 200, got)
+        self.assertEqual(self.read(), {"mcp_servers": {"fake": off, "b": {"command": "y"}}})       # off at once
+        self.assertNotIn("fake", ex.hub.servers)
+        job(ex, "mcp.config.set", body={"servers": {"fake": FAKE}})                                 # on again; b deleted
+        cfg = self.read()
+        self.assertEqual(cfg["mcp_servers"], {"fake": off})
+        self.assertEqual(cfg["mcp_pending"]["fake"]["entry"], FAKE)
+
+    def test_a_save_from_the_page_keeps_a_waiting_server_waiting(self):
+        ex = self.executor()
+        job(ex, "mcp.config.set", body={"servers": {"s": {"command": "x", "env": {"T": "secret"}}}})
+        at = self.read()["mcp_pending"]["s"]["at"]
+        view = job(ex, "mcp.config")["body"]
+        self.assertEqual(view["servers"][0]["env"], {"T": mcp_admin.MASK})
+        job(ex, "mcp.config.set", body={"servers": {"s": {"command": "x", "env": {"T": mcp_admin.MASK}}}})
+        self.assertEqual(self.read()["mcp_pending"]["s"], {"entry": {"command": "x", "env": {"T": "secret"}}, "at": at})
+
+    def test_an_edit_restarts_only_the_server_it_changed(self):
+        other = {"command": sys.executable, "args": [FAKE_MCP, "--other"]}
+        ex = self.executor({"mcp_servers": {"fake": FAKE, "other": other}})
+        self.assertTrue(wait_for(lambda: ex.hub.servers["fake"].status == "ready", 20))
+        fake = ex.hub.servers["fake"]
+        job(ex, "mcp.config.set", body={"servers": {"fake": FAKE}})                                 # other deleted
+        self.assertIs(ex.hub.servers["fake"], fake)
+        self.assertEqual(fake.status, "ready")                          # never closed: its sessions go on
+        self.assertNotIn("other", ex.hub.servers)
 
     def test_other_keys_and_the_key_in_use_are_kept(self):
         ex = self.executor({"mcpServers": {"old": {"command": "x"}}, "import": {"skills": {"enabled": False}}})
-        got = job(ex, "mcp.config.set", body={"servers": {"new": {"url": "http://127.0.0.1:9/mcp"}}})
+        got = job(ex, "mcp.config.set", body={"servers": {"old": {"command": "x"}, "new": {"url": "http://127.0.0.1:9/mcp"}}})
         self.assertEqual(got["status"], 200, got)
-        cfg = json.loads(self.cfg.read_text(encoding="utf-8"))
-        self.assertEqual(cfg, {"mcpServers": {"new": {"url": "http://127.0.0.1:9/mcp"}}, "import": {"skills": {"enabled": False}}})
+        cfg = self.read()
+        self.assertEqual(cfg["mcpServers"], {"old": {"command": "x"}})
+        self.assertEqual(cfg["import"], {"skills": {"enabled": False}})
+        self.assertNotIn("mcp_servers", cfg)
 
     def test_secrets_are_masked_and_kept(self):
-        ex = self.executor({"mcp_servers": {"s": {"command": "x", "env": {"TOKEN": "secret"}}}})
+        ex = self.executor({"mcp_servers": {"s": {"command": "x", "env": {"TOKEN": "secret"}, "disabled": True}}})
         body = job(ex, "mcp.config")["body"]
         self.assertEqual(body["servers"][0]["env"], {"TOKEN": mcp_admin.MASK})
         self.assertNotIn("secret", json.dumps(body))
-        got = job(ex, "mcp.config.set", body={"servers": {"s": {"command": "y", "env": {"TOKEN": mcp_admin.MASK}}}})
+        got = job(ex, "mcp.config.set", body={"servers": {"s": {"command": "y", "env": {"TOKEN": mcp_admin.MASK}, "disabled": True}}})
         self.assertEqual(got["status"], 200, got)
-        self.assertEqual(json.loads(self.cfg.read_text(encoding="utf-8"))["mcp_servers"]["s"],
-                         {"command": "y", "env": {"TOKEN": "secret"}})
+        self.assertEqual(self.read()["mcp_servers"]["s"], {"command": "y", "env": {"TOKEN": "secret"}, "disabled": True})
 
     def test_a_bad_change_gives_the_field_errors_and_writes_nothing(self):
         ex = self.executor({"mcp_servers": {}})
@@ -110,7 +168,7 @@ class Jobs(unittest.TestCase):
         got = job(ex, "mcp.config.set", body={"servers": {}, "guest_mcp": []})
         self.assertEqual(got["status"], 400, got)
         self.assertEqual(got["body"]["error"]["fields"][0]["field"], "guest_mcp")
-        self.assertEqual(json.loads(self.cfg.read_text(encoding="utf-8")), {"mcp_servers": {}})
+        self.assertEqual(self.read(), {"mcp_servers": {}})
 
     def test_not_an_object(self):
         ex = self.executor()
@@ -124,6 +182,13 @@ class Jobs(unittest.TestCase):
         self.assertEqual(got["status"], 200, got)
         self.assertNotIn("fake", ex.hub.servers if ex.hub is not None else {})
         self.assertFalse(any(g["name"] == "fake" for g in ex.groups()))
+
+    def test_a_restarting_server_keeps_its_tools_in_the_hello(self):
+        ex = self.executor({"mcp_servers": {"fake": FAKE}})
+        self.assertTrue(wait_for(lambda: any(g["name"] == "fake" and g["tools"] for g in ex.groups()), 20))
+        before = next(g for g in ex.groups() if g["name"] == "fake")["tools"]
+        ex.hub.servers["fake"] = McpServer("fake", FAKE, ex.hub.settings)     # as after a restart: idle, no tools yet
+        self.assertEqual(next(g for g in ex.groups() if g["name"] == "fake")["tools"], before)
 
     def _claude_json(self, servers):
         (self.home / ".claude.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
@@ -141,10 +206,8 @@ class Jobs(unittest.TestCase):
         self.assertEqual((cand["name"], cand["state"], cand["env"]), ("files", "available", {"K": mcp_admin.MASK}))
         got = job(ex, "mcp.import.add", body={"import_mcp": {"harness": "claude", "name": "files"}})
         self.assertEqual(got["status"], 200, got)
-        self.assertEqual(got["body"]["mcp"]["harnesses"][0]["servers"][0]["state"], "already")
-        self.assertEqual(json.loads(self.cfg.read_text(encoding="utf-8"))["mcp_servers"]["files"],
-                         {"command": "npx", "args": ["-y", "fs"], "env": {"K": "v"}})
-        self.assertIn("files", ex.hub.servers)
+        self.assertEqual(self.read()["mcp_pending"]["files"]["entry"], {"command": "npx", "args": ["-y", "fs"], "env": {"K": "v"}})
+        self.assertNotIn("files", ex.hub.servers if ex.hub is not None else {})     # an import waits for approval too
         got = job(ex, "mcp.import.add", body={"import_mcp": {"harness": "claude", "name": "files"}})
         self.assertEqual(got["status"], 409, got)
 
@@ -163,11 +226,13 @@ class Jobs(unittest.TestCase):
         self.assertFalse(self.cfg.exists())
 
     def test_the_change_is_announced(self):
-        ex = self.executor({"mcp_servers": {"a": {"command": "x"}, "b": {"command": "y"}}})
+        ex = self.executor({"mcp_servers": {"a": {"command": "x"}, "b": {"command": "y"}, "d": {"command": "w"}}})
         seen = []
         ex.on_change = seen.append
-        job(ex, "mcp.config.set", body={"servers": {"a": {"command": "x2"}, "c": {"command": "z"}}})
-        self.assertEqual(seen, [{"added": ["c"], "removed": ["b"], "changed": ["a"]}])
+        job(ex, "mcp.config.set", body={"servers": {"a": {"command": "x2"}, "c": {"command": "z"},
+                                                    "d": {"command": "w", "disabled": True}}})
+        self.assertEqual(seen, [{"added": [], "removed": ["b"], "changed": ["d"],
+                                 "pending": [{"name": "a", "line": "x2"}, {"name": "c", "line": "z"}]}])
         job(ex, "mcp.config.set", body={"servers": {"bad name": {}}})
         self.assertEqual(len(seen), 1)                                   # a refused change is no change
 
@@ -191,22 +256,31 @@ class PlaceTags(unittest.TestCase):
         from serve.mcp import McpHub
         return McpHub({}).with_servers({s.name: s for s in servers})
 
-    def test_both_pcs_are_tagged(self):
+    def test_only_the_users_pc_is_tagged(self):
         mine = self.server("my_play", "runner", group_kind="mcp", info={"machine": "ann-pc"})
         got = {t["name"]: t["description"] for t in self.hub(self.server("files", "stdio"), mine,
                                                               self.server("my_agent_x", "runner", group_kind="coding"),
                                                               self.server("skills", "builtin")).template_tools()}
         self.assertEqual(got["my_play__go"], "[Runs on the user's PC (ann-pc) — localhost there is the user's machine.] Does it.")
-        self.assertEqual(got["files__go"], "[Runs on the central PC (the server).] Does it.")
+        self.assertEqual(got["files__go"], "Does it.")                  # the central PC's: untouched, whatever the runner does
         self.assertEqual(got["my_agent_x__go"], "Does it.")
         self.assertEqual(got["skills__go"], "Does it.")
 
     def test_without_a_runner_group_the_tools_are_byte_identical(self):
-        hub = self.hub(self.server("files", "stdio"), self.server("web", "http"), self.server("my_agent", "runner", group_kind="coding"))
-        self.assertEqual([t["description"] for t in hub.template_tools()], ["Does it."] * 3)
-        mine = self.server("my_play", "runner", group_kind="mcp", info={"machine": "ann-pc"})
-        self.assertEqual([t["description"] for t in self.hub(self.server("files", "stdio"), mine).template_tools(skip_servers={"my_play"})],
-                         ["Does it."])                            # switched off: not offered, so no tags either
+        servers = (self.server("files", "stdio"), self.server("web", "http"))
+        from serve.mcp import McpHub
+        plain = McpHub({})
+        plain.servers = {s.name: s for s in servers}
+        self.assertEqual(json.dumps(self.hub(*servers).template_tools()), json.dumps(plain.template_tools()))
+
+    def test_a_restarting_runner_server_keeps_the_tool_block(self):
+        ready = self.server("my_play", "runner", group_kind="mcp", info={"machine": "ann-pc"})
+        restarting = self.server("my_play", "runner", group_kind="mcp", info={"machine": "ann-pc"})
+        restarting.status = "starting"
+        files = self.server("files", "stdio")
+        self.assertEqual(json.dumps(self.hub(files, ready).template_tools()), json.dumps(self.hub(files, restarting).template_tools()))
+        names = [t["name"] for t in self.hub(files, ready).template_tools()]
+        self.assertEqual(names, ["files__go", "my_play__go"])            # the runner's groups come last
 
 
 class Routes(Base):
@@ -229,10 +303,13 @@ class Routes(Base):
         self.assertEqual((code, body["servers"], body["editable"]), (200, [], True), body)
         code, body = self.req("POST", "/mcp/config", {"runner": loop.id, "servers": {"fake": FAKE}}, key=self.ann, device=DEV1)
         self.assertEqual(code, 200, body)
-        self.assertEqual([s["name"] for s in body["servers"]], ["fake"])
-        self.assertEqual(json.loads((loop.dir / "runner.json").read_text(encoding="utf-8")), {"mcp_servers": {"fake": FAKE}})
+        self.assertEqual([(s["name"], s.get("pending")) for s in body["servers"]], [("fake", True)])
+        self.assertEqual(json.loads((loop.dir / "runner.json").read_text(encoding="utf-8"))["mcp_servers"], {})
         self.assertEqual(json.loads(self.cfg_path.read_text(encoding="utf-8")), {})       # the server's own config: untouched
+        wait_for(lambda: False, 1.0)
+        self.assertNotIn("my_fake__echo", self.my_tools(loop))          # waiting for the approval on the PC: not offered
         t0 = time.monotonic()
+        self.assertTrue(loop.executor.mcp_decide("fake", True))
         self.assertTrue(wait_for(lambda: "my_fake__echo" in self.my_tools(loop), 20), self.said)
         self.assertLess(time.monotonic() - t0, runner_mod.runner_hub.POLL_MAX_S + 15)
         code, body = self.req("POST", "/mcp/config", {"runner": loop.id, "servers": {}}, key=self.ann, device=DEV1)
@@ -246,6 +323,7 @@ class Routes(Base):
             wait_for(lambda: False, 2.5)                                   # the runner's poll now waits the long hold
             code, body = self.req("POST", "/mcp/config", {"runner": loop.id, "servers": {"fake": FAKE}}, key=self.ann, device=DEV1)
             self.assertEqual(code, 200, body)
+            self.assertTrue(loop.executor.mcp_decide("fake", True))
             self.assertTrue(wait_for(lambda: "my_fake__echo" in self.my_tools(loop), 10), self.said)
 
     def test_a_bad_change_gives_the_field_errors(self):
@@ -309,7 +387,8 @@ class Routes(Base):
         code, body = self.req("POST", "/import", {"runner": loop.id, "import_mcp": {"harness": "claude", "name": "fake"}},
                               key=self.ann, device=DEV1)
         self.assertEqual(code, 200, body)
-        self.assertEqual(body["mcp"]["harnesses"][0]["servers"][0]["state"], "already")
+        self.assertEqual(json.loads((loop.dir / "runner.json").read_text(encoding="utf-8"))["mcp_pending"]["fake"]["entry"], FAKE)
+        self.assertTrue(loop.executor.mcp_decide("fake", True))
         self.assertEqual(json.loads((loop.dir / "runner.json").read_text(encoding="utf-8")), {"mcp_servers": {"fake": FAKE}})
         self.assertTrue(wait_for(lambda: "my_fake__echo" in self.my_tools(loop), 20), self.said)
 
@@ -342,7 +421,7 @@ class Routes(Base):
         loop.on_state = lambda e, d: events.append((e, d))
         code, body = self.req("POST", "/mcp/config", {"runner": loop.id, "servers": {"s": {"command": "x"}}}, key=self.ann, device=DEV1)
         self.assertEqual(code, 200, body)
-        self.assertTrue(wait_for(lambda: ("mcp_changed", {"added": ["s"], "removed": [], "changed": []}) in events, 5), events)
+        self.assertTrue(wait_for(lambda: ("mcp_changed", {"added": [], "removed": [], "changed": [], "pending": [{"name": "s", "line": "x"}]}) in events, 5), events)
 
 
 
@@ -400,18 +479,23 @@ class ServerChat(Base):
         self.assertEqual(code, 200)
         self.assertNotIn("my_fake__echo", self.offered[0][0] if self.offered else [])     # (the guest has no other server)
 
-    def test_offline_is_not_offered(self):
-        self.start_routing()
+    def test_offline_keeps_the_tool_block_and_a_call_says_so(self):
+        self.start_routing(DONE, tool_call("my_fake__echo", text="hi"), DONE)
         loop = self.runner(self.ann, cfg={"mcp_servers": {"fake": FAKE}})
         self.ready(loop)
+        code, _ = self.chat(self.ann, {"strata_mcp_runner": loop.id})
+        self.assertEqual(code, 200)
+        online = json.dumps(self.offered[0][1].template_tools())
         r = self.svc.runner_hub.get_for(loop.id, SimpleNamespace(name="ann"))
         loop.stop.set()
         loop.thread.join(10)
         with mock.patch.object(runner_mod.runner_hub, "OFFLINE_S", 0.0):
-            wait_for(lambda: not r.online(), 5)
-            code, _ = self.chat(self.ann, {"strata_mcp_runner": loop.id})
-        self.assertEqual(code, 200)
-        self.assertFalse([n for n in (self.offered[0][0] if self.offered else []) if n.startswith("my_")])
+            self.assertTrue(wait_for(lambda: not r.online(), 5))
+            code, events = self.chat(self.ann, {"strata_mcp_runner": loop.id})
+        self.assertEqual(code, 200, events)
+        self.assertEqual(json.dumps(self.offered[1][1].template_tools()), online)    # byte-identical: the prefix stays
+        result = next(e for e in events if e["event"] == "result")
+        self.assertIn("is offline", result["text"])
 
     def test_another_identitys_runner_is_refused(self):
         self.start_routing()

@@ -192,7 +192,7 @@ function ImportPart({ part, server, runner }: { part: "skills" | "mcp" | "memory
   }
 
   const importOne = async (c: Candidate) => {
-    if (await send({ import_mcp: { harness: c.harness, name: c.name } })) toast("success", t("Imported"), t("{name} is now in MCP tools > Servers.", { name: c.name }))
+    if (await send({ import_mcp: { harness: c.harness, name: c.name } })) toast("success", t("Imported"), runner ? t("It runs after you approve it in Strata Desktop on your PC.") : t("{name} is now in MCP tools > Servers.", { name: c.name }))
   }
   const line = (c: Candidate) => [c.command, ...(c.args ?? [])].filter(Boolean).join(" ") || c.url || ""
   return (

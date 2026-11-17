@@ -499,15 +499,13 @@ def _on_users_pc(server) -> bool:
 
 
 def place_tag(server) -> str:
-    """#338: what a tool's description starts with when MCP servers of both PCs are offered, so the model does not mix them
-    up: a runner's MCP group runs on the user's PC (localhost there is the user's machine), any other MCP server on the
-    central PC.  The coding tools and the skills (built in, or a runner's coding / skills group) get none."""
-    if _on_users_pc(server):
-        machine = (getattr(server, "info", None) or {}).get("machine") or "?"
-        return f"[Runs on the user's PC ({machine}) — localhost there is the user's machine.]"
-    if getattr(server, "kind", "") in ("runner", "builtin"):
+    """#338: what the description of a tool of the user's PC (a runner's MCP group) starts with, so the model does not
+    mix it up with the central PC's: localhost there is the user's machine.  Every other tool gets none, so the server's
+    own tool block never changes with the runner's state (its cached prefix stays)."""
+    if not _on_users_pc(server):
         return ""
-    return "[Runs on the central PC (the server).]"
+    machine = (getattr(server, "info", None) or {}).get("machine") or "?"
+    return f"[Runs on the user's PC ({machine}) — localhost there is the user's machine.]"
 
 
 class McpHub:
@@ -578,8 +576,9 @@ class McpHub:
             return self._pinned
         out = {}
         for s in self.servers.values():
-            if s.status not in ("ready", "stopped"):
-                continue
+            if s.status not in ("ready", "stopped") and not (_on_users_pc(s) and s.tools):
+                continue                                 # #338: a runner's MCP server that restarts keeps its last tools
+                                                         # offered (a call waits for it there): the tool block stays as it was
             for t in s.tools:
                 name = (_clean(t["name"]) if getattr(s, "plain_names", False) else f"{_clean(s.name)}__{_clean(t['name'])}")[:64]       # the coding tools keep Claude Code's names
                 n = 2
@@ -604,11 +603,10 @@ class McpHub:
             out.append({"name": name, "description": str(t.get("description") or t.get("title") or ""),
                         "parameters": schema or {"type": "object", "properties": {}}})
             where.append(s)
-        if any(_on_users_pc(s) for s in where):          # #338: where each MCP tool runs, when the user's PC's are offered
-            for item, s in zip(out, where):
-                tag = place_tag(s)
-                if tag:
-                    item["description"] = f"{tag} {item['description']}" if item["description"] else tag
+        for item, s in zip(out, where):                  # #338: the user's PC's MCP tools say where they run
+            tag = place_tag(s)
+            if tag:
+                item["description"] = f"{tag} {item['description']}" if item["description"] else tag
         return out
 
     def openai_tools(self) -> list[dict]:

@@ -6164,7 +6164,8 @@ def make_handler(svc: Service):
             servers the chat may use beside the server's (the tools run on the user's PC: a Playwright there reaches the
             site the user develops on that PC).  Only its MCP groups (`my_<name>`, named as GET /mcp?runner= names them,
             so the page's switches match): its coding tools and skills stay out, the coding tools of a server project are
-            the server's.  {} when the runner is offline (they are not offered; the page says so).  False after a 404
+            the server's.  Offered while the runner is offline too, as it last said hello (a call then fails with "your PC
+            is offline"): the tool block does not change with the runner's state, so the cached prefix stays.  False after a 404
             runner_not_found for an id that is not the caller's own runner (RunnerHub.get_for: the same key name exactly,
             never another identity's, the owner role too) - or, outside team mode, a 403 for a caller who is not the
             owner (every runner there is the owner's)."""
@@ -6174,8 +6175,6 @@ def make_handler(svc: Service):
             if runner is None:
                 self._json(404, {"error": {"type": "runner_not_found", "message": "there is no runner with that id for this key"}})
                 return False
-            if not runner.online():
-                return {}
             return {n: g for n, g in runner.servers().items() if g.group_kind == "mcp"}
 
         @staticmethod
@@ -6192,9 +6191,12 @@ def make_handler(svc: Service):
             """#338: My PC's MCP servers (GET / POST /mcp/config, GET / POST /import with `runner`): one MCP job on
             the runner (serve/runner.py Executor._mcp), its answer relayed with the statuses those routes give.  An MCP
             server is a program that runs on that PC, so only the runner's own identity (RunnerHub.get_for: the same
-            key name exactly - never the owner for a guest's PC: 404 as for an unknown id) and only from the runner's
-            own device (Strata Desktop's page is that device; any other: 403 runner_device) may read how its servers
-            start or change them.  Then 409 runner_offline, 409 runner_outdated (an older Strata Desktop)."""
+            key name exactly - never the owner for a guest's PC: 404 as for an unknown id) may read how its servers
+            start or change them.  The device check (X-Strata-Device must be the runner's: 403 runner_device) only stops
+            a click in the wrong browser - the header can be copied by anyone who holds the key.  The real guard is on
+            the PC: a server added, changed or switched on from here waits for the user's approval in Strata Desktop
+            (serve/runner.py Executor._write_servers).  Then 409 runner_offline, 409 runner_outdated (an older Strata
+            Desktop)."""
             runner = self._runner_param(q, body, online=False)
             if runner is False or runner is None:
                 return

@@ -108,12 +108,18 @@ export function Chat({ id }: { id?: string }) {
   const [myMcp, setMyMcp] = useState<McpInfo | null>(null)
   const myStarting = !!myMcp?.servers.some((x) => x.status === "starting" || x.status === "idle")
   useEffect(() => {                                           // asked again on a timer (#338): a server that starts later, or one added in
-    if (!rid) { setMyMcp(null); return }                      // Settings, is offered without a reload; sooner while one is starting
-    let gone = false
-    const ask = () => { void getMcp(rid).then((v) => { if (!gone) setMyMcp(v) }) }
+    if (!rid) { setMyMcp(null); return }                      // Settings, is offered without a reload; sooner while one is starting.
+    let gone = false, sent = 0, shown = 0                     // In order: an older answer never replaces a newer one; not in a hidden tab
+    const ask = () => {
+      if (typeof document !== "undefined" && document.hidden) return
+      const n = ++sent
+      void getMcp(rid).then((v) => { if (!gone && n > shown && (v || n === sent)) { shown = n; setMyMcp(v) } })
+    }
     ask()
     const id = setInterval(ask, myStarting ? 2000 : 15000)
-    return () => { gone = true; clearInterval(id) }
+    const back = () => { if (!document.hidden) ask() }
+    document.addEventListener("visibilitychange", back)
+    return () => { gone = true; clearInterval(id); document.removeEventListener("visibilitychange", back) }
   }, [rid, myOnline, myStarting])
   useEffect(() => {
     let gone = false
@@ -147,8 +153,8 @@ export function Chat({ id }: { id?: string }) {
   // skills: those stay the server's) while the runner is online - the server reaches them through `strata_mcp_runner`. Each is marked `machine: "my"`.
   const myServers = (myMcp?.servers ?? []).map((x) => ({ ...x, machine: "my" as const }))
   const myMcpOnly = myServers.filter((x) => !/^my_(agent|skills)(_\d+)?$/.test(x.name))
-  const myMcpLive = !onMy && !!rid && myOnline && myMcp?.online !== false && myMcpOnly.length > 0
-  const myMcpDown = !onMy && !!rid && myMcpOnly.length > 0 && !myMcpLive
+  const myMcpLive = !onMy && !!rid && myMcpOnly.length > 0      // offered while offline too: the tool block stays, a call says the PC is offline
+  const myMcpDown = myMcpLive && (!myOnline || myMcp?.online === false)
   const count = (xs: { tools: unknown[] }[]) => xs.reduce((n, x) => n + x.tools.length, 0)
   const chatMcp: McpInfo = onMy && myMcp ? { servers: [...mcp.servers, ...myServers], tools: mcp.tools + myMcp.tools }
     : myMcpLive ? { servers: [...mcp.servers, ...myMcpOnly], tools: mcp.tools + count(myMcpOnly) } : mcp

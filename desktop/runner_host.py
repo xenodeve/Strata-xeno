@@ -135,6 +135,20 @@ class RunnerHost:
             except Exception as e:  # noqa: BLE001 - closing must go on to the end
                 log.warning("closing the runner's executor raised %s", type(e).__name__)
 
+    # -------------------------------------------------------------------------------------------- MCP approvals (#338)
+    def mcp_pending(self) -> list[dict]:
+        """The MCP servers waiting for the user's approval (serve/runner.py Executor.mcp_pending); [] before the
+        executor is built or after it closed."""
+        with self._lock:
+            ex = None if self._closed else self._executor
+        return ex.mcp_pending() if ex is not None and hasattr(ex, "mcp_pending") else []
+
+    def mcp_decide(self, name: str, approve: bool) -> bool:
+        """Approve (start it) or reject (drop it) a waiting MCP server.  False when nothing of that name waits."""
+        with self._lock:
+            ex = None if self._closed else self._executor
+        return bool(ex.mcp_decide(name, approve)) if ex is not None and hasattr(ex, "mcp_decide") else False
+
     # -------------------------------------------------------------------------------------------- stop
     def stop(self, timeout: float = 5.0) -> bool:
         """Stop the runner: its poll, its jobs (and their processes), its thread and its executor, within `timeout`

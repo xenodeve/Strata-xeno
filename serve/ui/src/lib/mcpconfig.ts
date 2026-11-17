@@ -13,6 +13,7 @@ export interface McpRow extends McpEntry {
   name: string; kind: string; source: "config" | "file"; editable: boolean; disabled: boolean
   shadowed?: boolean; overridden?: boolean; file?: string
   guest?: boolean                                                             // team mode, the owner's view only: guests may use it (#310 R11)
+  pending?: boolean                                                           // #338: My PC's, waiting for the user's approval in Strata Desktop there
   status: string; error: string | null; tools: McpTool[]; info?: { name?: string; version?: string }
 }
 export interface McpLimits { timeout_s: number; max_result_chars: number; max_rounds: number }
@@ -143,4 +144,4 @@ export function limitsOf(text: Record<keyof McpLimits, string>): { limits: McpLi
 }
 
 /** A server's state as one word the page has a name for. */
-export const stateOf = (r: McpRow) => (r.disabled ? "disabled" : r.status)
+export const stateOf = (r: McpRow) => (r.pending ? "pending" : r.disabled ? "disabled" : r.status)

@@ -177,6 +177,22 @@ TABLE: dict[str, dict[str, str]] = {
     "notice_mcp_added": {"en": "Added: {names}.", "th": "เพิ่ม: {names}"},
     "notice_mcp_removed": {"en": "Removed: {names}.", "th": "ลบ: {names}"},
     "notice_mcp_edited": {"en": "Edited: {names}.", "th": "แก้: {names}"},
+    "notice_mcp_wait_title": {"en": "An MCP server waits for your approval", "th": "มี MCP server รอให้คุณอนุมัติ"},
+    "notice_mcp_wait_text": {
+        "en": "The web app of {server} asks to run on this PC: {lines}. Open Strata Desktop to approve or reject.",
+        "th": "หน้าเว็บของ {server} ขอรันบนเครื่องนี้: {lines} เปิด Strata Desktop เพื่ออนุมัติหรือปฏิเสธ",
+    },
+    "mcp_wait_heading": {"en": "MCP servers waiting for approval", "th": "MCP server ที่รออนุมัติ"},
+    "mcp_wait_hint": {
+        "en": "The web app asked to run these programs on this PC. They run only after you approve them here.",
+        "th": "หน้าเว็บขอรันโปรแกรมเหล่านี้บนเครื่องนี้ จะรันก็ต่อเมื่อคุณอนุมัติตรงนี้เท่านั้น",
+    },
+    "mcp_wait_approve": {"en": "Approve", "th": "อนุมัติ"},
+    "mcp_wait_reject": {"en": "Reject", "th": "ปฏิเสธ"},
+    "mcp_wait_replaces": {"en": "Replaces the server of this name that runs now.", "th": "แทนที่เซิร์ฟเวอร์ชื่อนี้ที่รันอยู่ตอนนี้"},
+    "mcp_wait_env": {"en": "Environment variables", "th": "ตัวแปรสภาพแวดล้อม"},
+    "mcp_wait_headers": {"en": "Headers", "th": "เฮดเดอร์"},
+    "mcp_wait_cwd": {"en": "Folder", "th": "โฟลเดอร์"},
     # ---------------------------------------------------------------- start-up
     "already_running": {
         "en": "Strata Desktop is already running, started with other rights (as administrator?). Use that one, or "

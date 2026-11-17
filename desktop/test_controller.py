@@ -165,7 +165,17 @@ class FakeHost:
         self.on_state = on_state
         self.hang: threading.Event | None = None          # stop blocks on it when set
         self.stopped = False
+        self.waiting: list[dict] = []                       # #338: the MCP servers waiting for approval on this PC
         log.add("host.made", url)
+
+    def mcp_pending(self):
+        return [dict(x) for x in self.waiting]
+
+    def mcp_decide(self, name, approve):
+        self.log.add("host.decide", name, approve)
+        found = any(x["name"] == name for x in self.waiting)
+        self.waiting = [x for x in self.waiting if x["name"] != name]
+        return found
 
     def start(self):
         self.log.add("host.start", self.url)
@@ -898,6 +908,45 @@ def test_mcp_change_notice_is_cut_and_cleaned(rig):
     assert r.ctl.wait_idle(5)
     (_, title, text), = r.log.of("notify")
     assert len(text) <= controller.NOTICE_TEXT_MOST and "\n" not in text
+
+
+WAITING = {"name": "play", "line": "npx -y @playwright/mcp", "command": "npx", "args": ["-y", "@playwright/mcp"], "cwd": None,
+           "url": None, "env": ["TOKEN"], "headers": [], "replaces": False, "at": 1.0}
+
+
+def test_mcp_waiting_for_approval_opens_the_window_with_the_command_line(rig, monkeypatch, caplog):
+    monkeypatch.setattr(words, "LANG", "en")
+    r = rig()
+    r.ctl.connect("A")
+    r.emit("online", {"id": RID_1, "who": "ann"})
+    r.hosts[0].waiting = [dict(WAITING)]
+    with caplog.at_level("INFO", logger="strata.desktop.controller"):
+        r.emit("mcp_changed", {"added": [], "removed": [], "changed": [], "pending": [{"name": "play", "line": WAITING["line"]}]})
+        assert r.ctl.wait_idle(5)
+    (_, title, text), = r.log.of("notify")
+    assert title == "An MCP server waits for your approval"
+    assert "npx -y @playwright/mcp" in text and "A" in text
+    assert r.log.names()[-1] == "show_servers" or "show_servers" in r.log.names()
+    assert r.ctl.view()["mcp_pending"] == [WAITING]                 # the window lists it in full
+    assert "npx -y @playwright/mcp" in caplog.text                   # the audit line in desktop.log
+
+
+def test_mcp_approve_and_reject_go_to_the_runner(rig):
+    r = rig()
+    r.ctl.connect("A")
+    r.emit("online", {"id": RID_1, "who": "ann"})
+    r.hosts[0].waiting = [dict(WAITING), {**WAITING, "name": "other"}]
+    assert r.ctl.mcp_decide("play", True) is True
+    assert r.ctl.mcp_decide("other", False) is True
+    assert r.ctl.mcp_decide("gone", True) is False
+    assert r.log.of("host.decide") == [("host.decide", "play", True), ("host.decide", "other", False), ("host.decide", "gone", True)]
+    assert r.ctl.view()["mcp_pending"] == []
+
+
+def test_mcp_pending_without_a_runner_is_empty(rig):
+    r = rig()
+    assert r.ctl.view()["mcp_pending"] == []
+    assert r.ctl.mcp_decide("play", True) is False
 
 
 def test_mcp_change_of_an_old_runner_gives_no_notice(rig):

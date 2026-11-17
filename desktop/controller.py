@@ -118,6 +118,14 @@ def mcp_notice(server: str, change: dict) -> str:
     return text if len(text) <= NOTICE_TEXT_MOST else text[:NOTICE_TEXT_MOST - 1] + "…"
 
 
+def mcp_wait_notice(server: str, waiting: list[dict]) -> str:
+    """#338: the notice when the web app asks to run MCP servers on this PC: from where, and each one's command line
+    (cleaned, cut to NOTICE_TEXT_MOST), then where to decide."""
+    lines = "; ".join(f"{_plain(x.get('name'), 40)}: {_plain(x.get('line'), 160)}" for x in waiting[:5])
+    text = words.t("notice_mcp_wait_text", server=_plain(server) or "?", lines=lines)
+    return text if len(text) <= NOTICE_TEXT_MOST else text[:NOTICE_TEXT_MOST - 1] + "\u2026"
+
+
 def code_text(v) -> str:
     """A pending code as it may be copied: letters, digits and `-` only."""
     return "".join(c for c in str(v or "") if c.isascii() and (c.isalnum() or c == "-"))[:CODE_MOST]
@@ -276,7 +284,36 @@ class Controller:
 
     def view(self) -> dict:
         from desktop.gui import state_view          # gui imports no GUI library at module level
-        return state_view(self._state, self._notice)
+        return state_view(self._state, self._notice, self.mcp_pending())
+
+    # ------------------------------------------------------------------ MCP servers waiting for approval (#338)
+    def mcp_pending(self) -> list[dict]:
+        """The MCP servers the web app added, changed or switched on, waiting for the user's approval on this PC (the
+        current runner's runner.json; [] without one).  They are shown in full in the servers window."""
+        with self._mu:
+            host = self._host
+        fn = getattr(host, "mcp_pending", None)
+        if fn is None:
+            return []
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - the window still shows the rest
+            log.warning("reading the MCP servers waiting for approval raised %s", type(e).__name__)
+            return []
+
+    def mcp_decide(self, name: str, approve: bool) -> bool:
+        """The user's Approve / Reject in the servers window: the runner starts the server, or drops the request.
+        Logged (desktop.log), and the window shows what waits now."""
+        with self._mu:
+            host = self._host
+        fn = getattr(host, "mcp_decide", None)
+        if fn is None or not isinstance(name, str):
+            return False
+        done = bool(fn(name, bool(approve)))
+        if done:
+            log.info("the user %s the MCP server %r on this PC", "approved" if approve else "rejected", name)
+        self._show_state()
+        return done
 
     def _set(self, s: TrayState, notice: str | None = None) -> None:
         with self._mu:
@@ -409,7 +446,19 @@ class Controller:
                 if not self._current(ticket):
                     return
                 server = self._open.name if self._open is not None else self._state.server
-            self._notify(words.t("notice_mcp_title")[:NOTICE_TITLE_MOST], mcp_notice(server, data))
+            data = data if isinstance(data, dict) else {}
+            log.info("the web app of %r changed the MCP servers on this PC: %s", server,
+                     json.dumps(data, ensure_ascii=False)[:2000])
+            waiting = [x for x in data.get("pending") or [] if isinstance(x, dict)] if isinstance(data.get("pending"), list) else []
+            if waiting:                                  # a program asks to run here: the window with Approve / Reject
+                self._notify(words.t("notice_mcp_wait_title")[:NOTICE_TITLE_MOST], mcp_wait_notice(server, waiting))
+                self._show_state()
+                try:
+                    self._window.show_servers()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("showing the servers window raised %s", type(e).__name__)
+            if any(data.get(k) for k in ("added", "removed", "changed")):
+                self._notify(words.t("notice_mcp_title")[:NOTICE_TITLE_MOST], mcp_notice(server, data))
             return
         with self._mu:
             if not self._current(ticket):

@@ -20,7 +20,10 @@ import { placeHeading } from "../lib/place"
 // said when it connected (MyPcMcp), with the reason.
 const STATE: Record<string, string> = {
   ready: msg("Connected"), starting: msg("Starting"), failed: msg("Failed"), stopped: msg("Stopped"), idle: msg("Waiting"), disabled: msg("Disabled"),
+  pending: msg("Waiting for approval on this PC"),
 }
+// #338: a server added, changed or switched on for My PC runs only after the user approves it in Strata Desktop on that PC
+const APPROVE = () => t("It runs after you approve it in Strata Desktop on your PC.")
 const areaCls = "w-full resize-y rounded-sm border border-line bg-surface px-2.5 py-1.5 font-mono text-[12px] leading-snug outline-none transition-colors placeholder:text-ink-3 hover:border-fill-2 focus:border-accent disabled:opacity-50"
 
 type Form = { mode: "new" | "edit"; draft: Draft; problems: Record<string, string>; failure: string | null; moved?: boolean }
@@ -83,7 +86,7 @@ function McpEditor({ part, runner, mine }: { part: "servers" | "limits"; runner?
     const old = rows.find((r) => r.source === "config" && r.name === form.draft.name)
     const err = await commit({ name: form.draft.name, entry: { ...entry, ...(old?.disabled ? { disabled: true } : {}) } })
     if (err) setForm({ ...form, failure: err })
-    else { setForm(null); toast("success", t("Saved"), t("The servers start again; no restart is needed.")) }
+    else { setForm(null); toast("success", t("Saved"), runner ? APPROVE() : t("The servers start again; no restart is needed.")) }
   }
 
   const add = async () => {
@@ -93,7 +96,7 @@ function McpEditor({ part, runner, mine }: { part: "servers" | "limits"; runner?
     const count = Object.keys(entries).length
     const err = await commit(Object.entries(entries).map(([name, entry]) => ({ name, entry })))
     if (err) setPaste({ ...paste, problem: err })
-    else { setPaste(null); toast("success", t("Saved"), tn(count, "{n} server added.", "{n} servers added.")) }
+    else { setPaste(null); toast("success", t("Saved"), runner ? APPROVE() : tn(count, "{n} server added.", "{n} servers added.")) }
   }
 
   const flip = async (r: McpRow) => {

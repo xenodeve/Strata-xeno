@@ -105,8 +105,6 @@ export const part: Record<string, string> = {
   "sent by {name}": "ส่งโดย {name}",
 
   // this browser's runner and the two machines (#310 part 2)
-  "My PC": "เครื่องของฉัน",
-  "Server PC": "เครื่องเซิร์ฟเวอร์",
   "This browser's runner": "ตัวรันของเบราว์เซอร์นี้",
   "Runner id": "รหัสตัวรัน",
   "Forget": "ลืม",
@@ -127,7 +125,9 @@ export const part: Record<string, string> = {
   "This PC": "เครื่องนี้",
   "The apps on your own PC; an imported server runs there.": "แอปบนเครื่องของคุณเอง เซิร์ฟเวอร์ที่ import จะรันบนเครื่องนั้น",
   "The apps on the central PC; an imported server runs there.": "แอปบนเครื่องกลาง เซิร์ฟเวอร์ที่ import จะรันบนเครื่องกลาง",
-  "Your PC is offline, so its MCP servers are not offered now.": "เครื่องของคุณออฟไลน์อยู่ ตอนนี้จึงไม่มีเซิร์ฟเวอร์ MCP ของเครื่องนั้นให้ใช้",
+  "Your PC is offline: its MCP tools fail until it is back.": "เครื่องของคุณออฟไลน์อยู่ เครื่องมือ MCP ของเครื่องนั้นจะใช้ไม่ได้จนกว่าเครื่องจะกลับมา",
+  "Waiting for approval on this PC": "รออนุมัติบนเครื่องนี้",
+  "It runs after you approve it in Strata Desktop on your PC.": "จะรันหลังจากคุณอนุมัติใน Strata Desktop บนเครื่องของคุณ",
   "Central PC": "เครื่องกลาง",
   "On this PC": "บนเครื่องนี้",
   "On this PC ({name})": "บนเครื่องนี้ ({name})",

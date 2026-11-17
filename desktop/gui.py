@@ -55,13 +55,16 @@ PAGE_WORDS = (
     "token_missing", "token_unreadable", "token_kept", "token_keep", "button_save", "button_test", "button_connect",
     "button_remove", "button_new", "button_open_without_runner", "menu_copy_code", "copied", "confirm_remove",
     "test_reachable", "role_owner", "role_guest", "engine_down", "pending", "internal_error", "servers_heading",
+    "mcp_wait_heading", "mcp_wait_hint", "mcp_wait_approve", "mcp_wait_reject", "mcp_wait_replaces", "mcp_wait_env",
+    "mcp_wait_headers", "mcp_wait_cwd",
 )
 
 
 WEB_SCHEMES = ("http", "https")
 URL_MOST = 8192
 
-API_NAMES = ("list", "warning", "save", "remove", "test", "connect", "open_without_runner", "copy_code")
+API_NAMES = ("list", "warning", "save", "remove", "test", "connect", "open_without_runner", "copy_code", "mcp_approve",
+             "mcp_reject")
 CLEAR_PATH = inject.CLEAR_PATH
 LOCAL_PAGE = b"<!doctype html><meta charset=utf-8><meta name=strata-desktop content=clear><title>Strata Desktop</title>"
 LOCAL_HEADERS = "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store"
@@ -187,12 +190,13 @@ def servers_html() -> str:
             .replace("/*FONTS*/", font_faces()))
 
 
-def state_view(s: state.TrayState, notice: str = "") -> dict:
+def state_view(s: state.TrayState, notice: str = "", mcp_pending: list | None = None) -> dict:
     """The runner's state as the servers page shows it: the TrayState's fields, the words for it, whether the page
     offers "Open without My PC" (an old server, or the runner could not start), and `notice`: what the last step
     could not do (the server test's words, "the window could not be prepared"), or ""."""
     return {**dataclasses.asdict(s), "text": state.describe(s), "notice": notice or "",
-            "can_open_without_runner": s.kind == "error" or (s.kind == "refused" and s.refused == "runner_protocol")}
+            "can_open_without_runner": s.kind == "error" or (s.kind == "refused" and s.refused == "runner_protocol"),
+            "mcp_pending": list(mcp_pending or [])}     # #338: the MCP servers waiting for the user's approval here
 
 
 class ServersApi:
@@ -224,7 +228,16 @@ class ServersApi:
 
     def list(self) -> dict:
         return self._safe("list", lambda: {"servers": self._store.public(), "last": self._store.last,
-                                           "state": state_view(self._ctl.state, self._ctl.notice)}, self._fail())
+                                           "state": state_view(self._ctl.state, self._ctl.notice,
+                                                               self._ctl.mcp_pending())}, self._fail())
+
+    def mcp_approve(self, name) -> dict:
+        """#338: run the MCP server the web app asked for (shown in full in this window) on this PC."""
+        return self._safe("mcp_approve", lambda: {"ok": bool(self._ctl.mcp_decide(name, True))}, self._fail())
+
+    def mcp_reject(self, name) -> dict:
+        """#338: drop the MCP server the web app asked for; an approved one of that name keeps running."""
+        return self._safe("mcp_reject", lambda: {"ok": bool(self._ctl.mcp_decide(name, False))}, self._fail())
 
     def warning(self, url) -> str | None:
         return self._safe("warning", lambda: urlcheck.plain_http_warning(url), None)

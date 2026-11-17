@@ -465,7 +465,7 @@ export function PromptBar(p: PromptBarProps) {
               })}
             </ul>
           )}
-          {p.mcp.myDown && <p className="prompt-bar__mcp-empty" data-my-down>{t("Your PC is offline, so its MCP servers are not offered now.")}</p>}
+          {p.mcp.myDown && <p className="prompt-bar__mcp-empty" data-my-down>{t("Your PC is offline: its MCP tools fail until it is back.")}</p>}
           <a className="prompt-bar__mcp-setup" href={p.mcp.setupHref} onClick={closeMenu}>{t("Set up servers")}</a>
         </div>
       )}
