@@ -111,25 +111,37 @@ const userText = (m: Message) =>
 
 type ApiMessage = Record<string, unknown>
 
-// An answer that used MCP tools goes back as the model wrote it: per round the text before the calls, the calls and
-// their results (as the model read them), then the rest - so the next question can build on what the tools found.
+// An answer that used MCP tools goes back as the model wrote it: per round the thinking and the text before the calls,
+// the calls and their results (as the model read them), then the rest - so the next question can build on what the
+// tools found. Each round's thinking goes back too (#331): the chat template renders every turn's thinking
+// (preserve_thinking), and the server gave it to the engine while the answer ran, so a history without it differs from
+// the engine's cache at the conversation's first answer and the whole conversation after it is read again.
+const withThinking = (msg: ApiMessage, thinking: string): ApiMessage => (thinking ? { ...msg, reasoning_content: thinking } : msg)
+
 function assistantMessages(m: Message): ApiMessage[] {
+  const reasoning = m.reasoning || ""
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped")
-  if (!ran.length) return m.text ? [{ role: "assistant", content: m.text }] : []
+  // A turn with thinking and no text (an answer cut while it thought) is left out, as before: the server's reasoning
+  // carry (serve/reasoning_carry.py, "history") finds that empty turn and puts the cut thinking back itself.
+  if (!ran.length) return m.text ? [withThinking({ role: "assistant", content: m.text }, reasoning.trim())] : []
   const out: ApiMessage[] = []
   let pos = 0
+  let rpos = 0
   for (const r of [...new Set(ran.map((t) => t.round))]) {
     const calls = ran.filter((t) => t.round === r)
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length)
-    out.push({
+    const rat = Math.min(Math.max(rpos, calls[0].rat || 0), reasoning.length)
+    out.push(withThinking({
       role: "assistant", content: m.text.slice(pos, at).trim(),
       tool_calls: calls.map((t) => ({ id: t.id, type: "function", function: { name: t.name, arguments: JSON.stringify(t.arguments || {}) } })),
-    })
+    }, reasoning.slice(rpos, rat).trim()))
     for (const t of calls) out.push({ role: "tool", tool_call_id: t.id, content: t.result })
     pos = at
+    rpos = rat
   }
   const rest = m.text.slice(pos).trim()
-  if (rest) out.push({ role: "assistant", content: rest })
+  const restThinking = reasoning.slice(rpos).trim()
+  if (rest) out.push(withThinking({ role: "assistant", content: rest }, restThinking))
   return out
 }
 
