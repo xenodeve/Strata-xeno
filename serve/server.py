@@ -3472,7 +3472,9 @@ class Service:
         else:                                                           # the runner keeps the checkpoint and found .git
             run.ctx.run_key, run.coding, run.runner, git = facts["run"], "my_agent", runner, facts["git"]
         web = web_mod.settings(conf)
-        run.hidden = set() if web["on"] else set(getattr(self.agent, "web_tools", ()))          # web access is off until the user switches it on: the model is not even offered the tools
+        if guest and not (isinstance(conf, dict) and isinstance(conf.get("web"), dict) and conf["web"].get("on") is True):
+            web = {**web, "on": False}                                  # #337: on by default for the owner; a team guest only when the owner switched it on outright
+        run.hidden = set() if web["on"] else set(getattr(self.agent, "web_tools", ()))          # web access off ("on": false): the model is not even offered the tools
         if web["on"]:                                                   # a guest's fetches leave from this PC: not into the team's own network
             run.ctx.web = web_mod.Web(web, fetcher=web_mod.Fetcher(guard=web_mod.public_not_vpn) if guest else None)
         helpers = getattr(self.agent, "helper_tools", ())

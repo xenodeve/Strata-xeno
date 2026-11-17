@@ -2024,7 +2024,7 @@ export const checks = [
         await pg.waitForSelector("[data-web]")
         await pg.waitForTimeout(700)
         const sw = pg.getByRole("switch", { name: "Let the model use the web" })
-        t.ok("it is off by default and says nothing leaves the PC", (await sw.getAttribute("aria-checked")) === "false" && (await pg.locator("[data-web]").innerText()).includes("Off: nothing leaves this PC."))
+        t.ok("it is on by default (#337) and says every fetch asks", (await sw.getAttribute("aria-checked")) === "true" && (await pg.locator("[data-web]").innerText()).includes("On: the model can ask to fetch pages and search."))
         t.ok("the page warns that it sends things off this PC", (await pg.locator("[data-web]").innerText()).includes("sends something off this PC"))
         await sw.click()
         await pg.waitForFunction(() => document.querySelector("[role=switch][aria-label='Let the model use the web']")?.getAttribute("aria-checked") === "true")

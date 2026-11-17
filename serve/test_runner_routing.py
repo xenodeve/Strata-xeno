@@ -416,7 +416,7 @@ class Routing(Fixture):
         self.assertEqual(code, 200, events)
         names, hub = self.offered[0]
         self.assertIs(hub, self.svc.mcp)
-        hidden = {"WebFetch", "WebSearch", "Task"}          # web access and helpers are off
+        hidden = {"Task"}                                   # helpers are off; web access is on by default for the owner (#337)
         self.assertEqual(names, [t["name"] for t in self.svc.mcp.template_tools(exclude=hidden, skip_servers=set())])
         self.assertEqual(names[0], "fs__x")
         call = next(e for e in events if e["event"] == "call")

@@ -44,7 +44,8 @@ a = Analysis(
     [os.path.join(ROOT, "desktop", "__main__.py")],
     pathex=[ROOT],
     binaries=[],
-    datas=[(os.path.join(ROOT, "desktop", "ui", "*"), os.path.join("desktop", "ui"))],
+    datas=[(os.path.join(ROOT, "desktop", "ui", "*"), os.path.join("desktop", "ui")),
+           (os.path.join(ROOT, "desktop", "ui", "fonts", "*"), os.path.join("desktop", "ui", "fonts"))],      # #332: the web app's fonts
     hiddenimports=hidden,
     hookspath=[],
     runtime_hooks=[],
