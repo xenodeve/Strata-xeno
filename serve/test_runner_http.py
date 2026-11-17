@@ -6,6 +6,7 @@ mock engine in team mode and outside it; and (task 5) the page routes and GET /m
 """
 from __future__ import annotations
 
+import http.client
 import json
 import queue
 import socket
@@ -20,6 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import agent_run, folders, runner_hub  # noqa: E402
+from serve import server as server_mod  # noqa: E402
 from serve.identity import OWNER  # noqa: E402
 from serve.mcp import McpHub  # noqa: E402
 from serve.permissions import Policy  # noqa: E402
@@ -243,6 +245,99 @@ class Channel(RunnerBase):
         code, body = self.hello(self.ann)
         self.assertEqual((body["runner"], body["who"]), (runner_hub.runner_id("anna", DEV1), "anna"))
         self.assertEqual(len(self.runners(self.ann)), 1)
+
+    def test_rename_answers_a_held_poll_404_at_once(self):
+        """#315: a poll held under the old id ends with 404 at the rename, not after its whole wait."""
+        self.team()
+        rid = self.hello(self.ann)[1]["runner"]
+        r = self.svc.runner_hub.get_for(rid, SimpleNamespace(name="ann"))
+        held = []
+        with mock.patch.object(runner_hub, "POLL_MAX_S", 10.0):
+            t = threading.Thread(target=lambda: held.append((self.poll(self.ann, rid, wait=10), time.monotonic())))
+            t.start()
+            end = time.monotonic() + 5
+            while r._held == 0 and time.monotonic() < end:
+                time.sleep(0.005)
+            t0 = time.monotonic()
+            code, body = self.req("POST", "/keys", {"action": "rename", "name": "ann", "to": "anna"}, key="k", device=DEV0)
+            self.assertEqual(code, 200, body)
+            t.join(10)
+        self.assertEqual(held[0][0][0], 404, held)
+        self.assertLess(held[0][1] - t0, 1.0)
+
+    def test_a_request_checked_across_a_rename_is_the_new_names(self):
+        """#315: the key matched as "ann", and the rename to "anna" came before its device check.  The key is still
+        good and its devices went with it: the request is anna's, not 403 device_refused (which stopped the runner
+        for good: a runner takes device_refused as the owner's decision)."""
+        self.team()
+        keys, real_match, once = self.svc.keys, self.svc.keys.match, []
+
+        def match(given):
+            ident = real_match(given)
+            if ident is not None and ident.name == "ann" and not once:
+                once.append(1)
+                keys.rename("ann", "anna", by=OWNER)            # between match() and the device check
+            return ident
+        with mock.patch.object(keys, "match", match):
+            code, body = self.hello(self.ann)
+        self.assertEqual(once, [1])
+        self.assertEqual(code, 200, body)
+        self.assertEqual((body["who"], body["runner"]), ("anna", runner_hub.runner_id("anna", DEV1)))
+
+    def across_a_rename(self, action):
+        """A hello whose key matched as "ann" with `action(keys)` done before its device check."""
+        keys, real_match, once = self.svc.keys, self.svc.keys.match, []
+
+        def match(given):
+            ident = real_match(given)
+            if ident is not None and ident.name == "ann" and not once:
+                once.append(1)
+                action(keys)
+            return ident
+        with mock.patch.object(keys, "match", match):
+            got = self.hello(self.ann)
+        self.assertEqual(once, [1])
+        return got
+
+    def test_a_key_revoked_between_match_and_the_device_check_stays_refused(self):
+        """#315's re-match never lets in what was refused: a revoked key matches nothing again."""
+        self.team()
+        code, body = self.across_a_rename(lambda k: k.revoke("ann", by=OWNER))
+        self.assertEqual((code, body["error"]["type"]), (403, "device_refused"), body)
+
+    def test_a_refused_device_stays_refused_under_the_new_name(self):
+        """The device record moves with the key: a device the owner refused is refused under the new name too."""
+        self.team()
+        self.assertTrue(self.svc.keys.decide_device("ann", DEV1, False, OWNER))
+        code, body = self.across_a_rename(lambda k: k.rename("ann", "anna", by=OWNER))
+        self.assertEqual((code, body["error"]["type"]), (403, "device_refused"), body)
+
+    def test_a_hello_inside_a_rename_finds_the_moved_runner(self):
+        """#315: a runner that says hello under the new name while the rename is still moving things (its poll met
+        the 404 between the key's rename and the runners' move) gets its own runner, moved - not a second one that
+        the move then ends as replaced (409 runner_replaced stopped the runner for good)."""
+        self.team()
+        code, first = self.hello(self.ann)
+        r = self.svc.runner_hub.get_for(first["runner"], SimpleNamespace(name="ann"))
+        real_move, got = self.svc.broker.move, []
+
+        def move(old, new):                                     # after keys.rename, before runner_hub.move
+            t = threading.Thread(target=lambda: got.append(self.hello(self.ann)))
+            t.start()
+            t.join(1.0)                                         # it may wait for the rename to finish
+            return real_move(old, new)
+        with mock.patch.object(self.svc.broker, "move", move):
+            code, body = self.req("POST", "/keys", {"action": "rename", "name": "ann", "to": "anna"}, key="k", device=DEV0)
+        self.assertEqual(code, 200, body)
+        end = time.monotonic() + 5
+        while not got and time.monotonic() < end:
+            time.sleep(0.01)
+        code, body = got[0]
+        self.assertEqual(code, 200, body)
+        self.assertEqual((body["runner"], body["who"], body["channel"]),
+                         (runner_hub.runner_id("anna", DEV1), "anna", first["channel"]))     # the same registration
+        self.assertIsNone(r.ended)
+        self.assertEqual(self.poll(self.ann, body["runner"])[0], 200)
 
     def test_refused_or_cleared_device_ends_runner(self):
         self.team()
@@ -841,6 +936,150 @@ class PageRoutes(RunnerBase):
             code, body = self.req("GET", f"/agent/mention?path=X&rel=a&runner={fake.id}", key=self.ann, device=DEV1)
             self.assertEqual((code, body["error"]["type"]), (502, "runner_answer"), answer)
             fake.stop()
+
+
+class KeepAlive(RunnerBase):
+    """#313: the runner's routes answer HTTP/1.1 and keep the connection for its next request; every other route still
+    answers HTTP/1.0 and closes (a .NET client put its next request on a socket the server was closing)."""
+
+    def kept(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        self.addCleanup(c.close)
+        return c
+
+    def ask(self, c, method, path, body=None, key=None, ctype="application/json"):
+        h = {"Authorization": "Bearer " + (key or self.ann), "X-Strata-Device": DEV1}
+        data = None
+        if body is not None:
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            h["Content-Type"] = ctype
+        c.request(method, path, body=data, headers=h)
+        r = c.getresponse()
+        raw = r.read()
+        return r, (json.loads(raw) if raw[:1] == b"{" else raw)
+
+    def test_runner_routes_keep_the_connection(self):
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+        self.assertEqual((r.status, r.version, r.will_close), (200, 11, False), body)
+        self.assertIsNotNone(r.getheader("Content-Length"))
+        sock = c.sock
+        r, body = self.ask(c, "GET", f"/runner/next?id={body['runner']}&instance=inst-aaaa&wait=0")
+        self.assertEqual((r.status, r.version, r.will_close), (200, 11, False), body)
+        r, body = self.ask(c, "POST", "/runner/reply", {"id": "nope", "instance": "inst-aaaa", "job": "j", "rid": 1})
+        self.assertEqual((r.status, r.will_close), (404, False), body)
+        self.assertIs(c.sock, sock)                                  # one TCP connection for all three
+
+    def test_other_routes_still_close(self):
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "GET", "/v1/models")
+        self.assertEqual((r.status, r.version, r.will_close), (200, 10, True), body)
+        self.assertEqual(r.getheader("Connection"), "close")
+
+    def test_an_unread_body_or_a_closing_request_ends_the_connection(self):
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+        self.assertFalse(r.will_close)
+        r, body = self.ask(c, "POST", "/runner/reply", b"not json", ctype="text/plain")     # 415: the body not read
+        self.assertEqual((r.status, r.will_close, r.getheader("Connection")), (415, True, "close"), body)
+        c2 = self.kept()
+        c2.request("GET", "/runner/next?id=x&instance=inst-aaaa&wait=0", headers={
+            "Authorization": "Bearer " + self.ann, "X-Strata-Device": DEV1, "Connection": "close"})
+        r = c2.getresponse()
+        r.read()
+        self.assertTrue(r.will_close)
+
+    def test_a_body_that_was_not_read_to_its_end_closes(self):
+        """A malformed chunked reply (400): bytes of it may be left on the socket, so the connection ends."""
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+        self.assertFalse(r.will_close)
+        c.putrequest("POST", "/runner/reply")
+        for k, v in (("Authorization", "Bearer " + self.ann), ("X-Strata-Device", DEV1),
+                     ("Content-Type", "application/json"), ("Transfer-Encoding", "chunked")):
+            c.putheader(k, v)
+        c.endheaders()
+        c.send(b"zz\r\n{}\r\n0\r\n\r\n")                         # not a chunk size
+        r = c.getresponse()
+        r.read()
+        self.assertEqual((r.status, r.will_close), (400, True))
+
+    def test_another_route_on_a_kept_connection_still_closes(self):
+        """A proxy that reuses its connections to the server may send any route on a socket a runner route kept."""
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+        self.assertFalse(r.will_close)
+        r, body = self.ask(c, "GET", "/v1/models")
+        self.assertEqual((r.status, r.version, r.will_close), (200, 10, True), body)
+        self.assertEqual(r.getheader("Connection"), "close")
+
+    def test_a_target_the_runner_routes_do_not_answer_closes(self):
+        """Keep-alive is decided on the routers' own path: a fragment or an absolute-form target of a runner path
+        ends in the generic 404, which is HTTP/1.0 with Connection: close like every other route."""
+        self.team()
+        for method, target, body in (("GET", "/runner/next#x", None), ("POST", "/runner/hello#x", hello_body()),
+                                     ("GET", f"http://127.0.0.1:{self.port}/runner/next", None)):
+            c = self.kept()
+            r, got = self.ask(c, method, target, body)
+            self.assertEqual((r.status, r.version, r.will_close, r.getheader("Connection")), (404, 10, True, "close"),
+                             (target, got))
+        c = self.kept()                                         # a target the router does take as the runner's: kept
+        r, got = self.ask(c, "POST", "/runner/hello/", hello_body())
+        self.assertEqual((r.status, r.version, r.will_close), (200, 11, False), got)
+
+    def test_the_idle_limit_does_not_bound_the_next_request(self):
+        """The idle limit is for the wait between requests: a poll held longer than it is not cut."""
+        self.team()
+        c = self.kept()
+        with mock.patch.object(server_mod, "RUNNER_IDLE_S", 0.5), mock.patch.object(runner_hub, "POLL_MAX_S", 1.5):
+            r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+            t0 = time.monotonic()
+            r, got = self.ask(c, "GET", f"/runner/next?id={body['runner']}&instance=inst-aaaa&wait=1.5")
+        self.assertEqual((r.status, got), (200, {"messages": []}))
+        self.assertGreater(time.monotonic() - t0, 1.4)
+
+    def test_each_request_on_a_kept_connection_is_its_own(self):
+        """The handler object serves every request of a kept connection: who sent it is decided again each time."""
+        self.team()
+        c = self.kept()
+        r, ann = self.ask(c, "POST", "/runner/hello", hello_body())
+        r, bob = self.ask(c, "POST", "/runner/hello", hello_body(instance="inst-bbbb"), key=self.bob)
+        self.assertEqual((r.status, bob["who"]), (200, "bob"), bob)
+        r, body = self.ask(c, "GET", f"/runner/next?id={ann['runner']}&instance=inst-aaaa&wait=0", key=self.bob)
+        self.assertEqual(r.status, 404, body)                        # ann's runner is not bob's
+
+    def test_an_idle_kept_connection_is_closed(self):
+        self.team()
+        c = self.kept()
+        with mock.patch.object(server_mod, "RUNNER_IDLE_S", 0.3):
+            r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+            self.assertFalse(r.will_close)
+            c.sock.settimeout(5)
+            t0 = time.monotonic()
+            self.assertEqual(c.sock.recv(1), b"")                   # the server closed it
+        self.assertLess(time.monotonic() - t0, 3)
+
+    def test_stopping_the_server_ends_its_kept_connections(self):
+        self.team()
+        c = self.kept()
+        r, body = self.ask(c, "POST", "/runner/hello", hello_body())
+        self.assertFalse(r.will_close)
+        self.svc.runner_hub.close()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd = None
+        c.sock.settimeout(5)
+        t0 = time.monotonic()
+        try:
+            self.assertEqual(c.sock.recv(1), b"")
+        except ConnectionError:
+            pass
+        self.assertLess(time.monotonic() - t0, 3)
 
 
 class OutsideTeamMode(RunnerBase):

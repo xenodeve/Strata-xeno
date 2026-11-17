@@ -30,6 +30,13 @@ def job(jid, fail=None):
 INFO = {"machine": "ann-pc", "platform": "win32", "shell": "Git Bash", "home": "C:\\Users\\ann"}
 
 
+def wait_until(cond, timeout=5.0):
+    end = time.monotonic() + timeout
+    while not cond() and time.monotonic() < end:
+        time.sleep(0.005)
+    return cond()
+
+
 class Hub(unittest.TestCase):
     def setUp(self):
         self.hub = runner_hub.RunnerHub()
@@ -137,6 +144,32 @@ class Hub(unittest.TestCase):
         self.assertIs(self.hub.get_for(r.id, Identity("anna", "guest")), r)
         self.assertIs(self.hub.hello("anna", "device-0001", "inst-aaaa", dict(INFO), [], []), r)
         self.assertIsNone(r.ended)                              # a rename keeps the runner and its jobs going
+
+    def test_move_wakes_a_poll_held_under_the_old_id(self):
+        """#315: a poll held when the key is renamed ends at once ([], the route answers 404), so the runner says
+        hello again now and not after the poll's whole wait (POLL_MAX_S, 25 s)."""
+        r = self.hello()
+        old_id, got = r.id, []
+        t = threading.Thread(target=lambda: got.append((r.take(5.0, as_id=old_id), time.monotonic())))
+        t.start()
+        self.assertTrue(wait_until(lambda: r._held == 1))
+        t0 = time.monotonic()
+        self.hub.move("ann", "anna")
+        t.join(5)
+        self.assertEqual(got[0][0], [])
+        self.assertLess(got[0][1] - t0, 0.5)
+        self.assertNotEqual(r.id, old_id)
+
+    def test_a_poll_under_an_id_moved_before_it_waits_ends_at_once(self):
+        """#315: the route found the runner under the old id, and the rename came before the poll began to wait."""
+        r = self.hello()
+        old_id = r.id
+        r.push({"job": "j1", "kind": "page"})
+        self.hub.move("ann", "anna")
+        t0 = time.monotonic()
+        self.assertEqual(r.take(5.0, as_id=old_id), [])          # not handed out under the old id: it stays queued
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertEqual([m["job"] for m in r.take(0, as_id=r.id)], ["j1"])
 
     def test_end_all_and_end_device(self):
         a1 = self.hello(device="device-0001")

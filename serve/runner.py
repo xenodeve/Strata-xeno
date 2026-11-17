@@ -61,7 +61,13 @@ RUNS_KEPT = 50                  # run keys (one per message of a chat) whose pol
 REPLY_MAX = 32 << 20            # the largest reply the server takes (serve/server.py RUNNER_REPLY_MAX): a larger one is
                                 # not sent (a 413 from the server may come as a reset while it is still being sent)
 REPLY_RETRY_S = 60.0            # how long a reply is tried again after network errors before it is given up
+STOP_LOOK_S = 0.1               # how often a reply waiting for the new hello after a 404 looks at the stop (the hello
+                                # itself wakes it at once, #315)
 STARTING_POLL_S = 1.0           # the poll's wait while an MCP server still starts, so its tools are announced soon
+KEEP_IDLE_S = 60.0              # #313: a kept connection idle longer than this is not used again (the server closes its
+                                # side after serve/server.py RUNNER_IDLE_S, 90 s; a proxy may close sooner)
+KEEP_MAX = 4                    # #313: idle connections kept for hellos and replies (replies may go out at once from
+                                # several jobs; more than this are opened as needed and closed after)
 CODING = "agent"                # the coding group's name on the runner (the server calls it my_agent)
 DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
 KEY = re.compile(r"[!-~]{1,4096}")              # printable ASCII, no whitespace: what a header can carry
@@ -214,6 +220,12 @@ def device_label(device: dict, app: str = "Strata runner") -> str:
     return _header(f"{app} on {device.get('name') or machine_name()}")
 
 
+# #313: what a request on a kept connection meets when the server or a proxy closed it while it was kept: a reset or
+# an abort, a FIN where the answer should be, and over TLS a FIN without close_notify (SSLEOFError) or a close_notify
+# (SSLZeroReturnError).  A timeout is not one of them: a request that waited that long is not repeated.
+STALE = (ConnectionError, http.client.RemoteDisconnected, ssl.SSLEOFError, ssl.SSLZeroReturnError)
+
+
 class Client:
     """The runner's side of the channel.  Holds the delivery state of the current registration: `channel`, `ack`
     (the highest seq received on it) and `handled` (the seqs handled on it).  `label`: the device's name for the
@@ -232,9 +244,75 @@ class Client:
         self.channel: str | None = None
         self.ack = 0
         self.handled: set[int] = set()
+        self._ssl = ssl.create_default_context() if self._https else None
         self._poll_lock = threading.Lock()
         self._poll_conn: http.client.HTTPConnection | None = None      # the GET /runner/next in flight
         self._polls_ended = False
+        # #313: kept connections (HTTP/1.1): the poll's own, so a held poll never waits in front of a reply, and up to
+        # KEEP_MAX for hellos and replies; each with the time it was last used
+        self._keep_lock = threading.Lock()
+        self._poll_kept: tuple[http.client.HTTPConnection, float] | None = None
+        self._kept: list[tuple[http.client.HTTPConnection, float]] = []
+        self._closed = False
+
+    def close(self) -> None:
+        """Close the kept connections.  A request after this still works, on a connection of its own."""
+        with self._keep_lock:
+            self._closed = True
+            conns = [c for c, _ in self._kept] + ([self._poll_kept[0]] if self._poll_kept else [])
+            self._kept, self._poll_kept = [], None
+        for c in conns:
+            c.close()
+
+    def _drop_kept(self) -> None:
+        """A kept connection was found closed by the server: so were the other idle ones, most likely (they all go to
+        the same server, and one that stops closes every connection it kept), so none of them is tried."""
+        with self._keep_lock:
+            conns = [c for c, _ in self._kept] + ([self._poll_kept[0]] if self._poll_kept else [])
+            self._kept, self._poll_kept = [], None
+        for c in conns:
+            c.close()
+
+    def _take(self, poll: bool, timeout: float, fresh: bool = False) -> http.client.HTTPConnection:
+        """A kept connection used within KEEP_IDLE_S (the poll's own for a poll), else - or with `fresh` - a new one:
+        its socket is opened by the request."""
+        now, conn, stale = time.monotonic(), None, []
+        with self._keep_lock:
+            if fresh:
+                pass
+            elif poll:
+                if self._poll_kept is not None:
+                    (conn, used), self._poll_kept = self._poll_kept, None
+                    if now - used >= KEEP_IDLE_S:
+                        conn, stale = None, [conn]
+            else:
+                while self._kept and conn is None:
+                    c, used = self._kept.pop()
+                    if now - used < KEEP_IDLE_S:
+                        conn = c
+                    else:
+                        stale.append(c)
+        for c in stale:
+            c.close()
+        if conn is None:
+            conn = (http.client.HTTPSConnection(self._host, self._port, timeout=timeout, context=self._ssl)
+                    if self._https else http.client.HTTPConnection(self._host, self._port, timeout=timeout))
+        conn.timeout = timeout                          # http.client sets a socket's timeout only when it connects
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout)
+        return conn
+
+    def _give_back(self, conn: http.client.HTTPConnection, poll: bool) -> None:
+        """Keep `conn` for the next request, unless the server closes it (its answer said so) or enough are kept."""
+        if conn.sock is not None:
+            with self._keep_lock:
+                if not self._closed and poll and self._poll_kept is None:
+                    self._poll_kept = (conn, time.monotonic())
+                    return
+                if not self._closed and not poll and len(self._kept) < KEEP_MAX:
+                    self._kept.append((conn, time.monotonic()))
+                    return
+        conn.close()
 
     def abort_poll(self) -> None:
         """End the poll in flight now, and every later poll at once, each as an empty poll (Strata Desktop's stop, #310
@@ -268,7 +346,8 @@ class Client:
             if self._polls_ended:
                 raise NetworkError("the runner stopped")
             self._poll_conn = conn
-        conn.connect()
+        if conn.sock is None:                           # a kept connection is open already (#313)
+            conn.connect()
         with self._poll_lock:
             if self._polls_ended:
                 raise NetworkError("the runner stopped")
@@ -276,35 +355,46 @@ class Client:
     def _request(self, method: str, path: str, body: dict | None = None, timeout: float = 60.0,
                  most: int | None = None, poll: bool = False) -> tuple[int, object]:
         """(status, JSON body).  A body over `most` bytes is not sent: it is answered 413 here, as the server would.
-        `poll`: the connection can be cut by `abort_poll`."""
+        `poll`: the connection can be cut by `abort_poll`.  The connection is kept for the next request (#313); one
+        that the server or a proxy closed while it was kept fails at once (STALE), the other kept ones are dropped
+        with it, and the request goes once more on a new connection (safe for every request here: a reply's `rid`,
+        the poll's ack and the hello make a repeat harmless)."""
         data = None
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             if most is not None and len(data) > most:
                 return 413, {"error": {"message": f"send a body of up to {most >> 20} MB"}}
-        if self._https:
-            conn = http.client.HTTPSConnection(self._host, self._port, timeout=timeout, context=ssl.create_default_context())
-        else:
-            conn = http.client.HTTPConnection(self._host, self._port, timeout=timeout)
         headers = dict(self._headers)
         if data is not None:
             headers["Content-Type"] = "application/json"
-        try:
-            if poll:
-                self._track_poll(conn)
-            conn.request(method, self._prefix + path, body=data, headers=headers)
-            r = conn.getresponse()
-            raw = r.read()
-        except (OSError, http.client.HTTPException) as e:
-            raise NetworkError(self.scrub(f"{type(e).__name__}: {e}")) from None
-        except ValueError as e:                         # e.g. a header value http.client refuses: its text holds the
-            raise NetworkError(f"{type(e).__name__} while sending the request") from None     # value, so not shown
-        finally:
-            if poll:
-                with self._poll_lock:
-                    if self._poll_conn is conn:
-                        self._poll_conn = None
-            conn.close()
+        for again in (False, True):
+            conn = self._take(poll, timeout, fresh=again)
+            kept = conn.sock is not None
+            try:
+                if poll:
+                    self._track_poll(conn)
+                conn.request(method, self._prefix + path, body=data, headers=headers)
+                r = conn.getresponse()
+                raw = r.read()
+            except NetworkError:                        # abort_poll came first: the connection is not used again
+                conn.close()
+                raise
+            except (OSError, http.client.HTTPException) as e:
+                conn.close()
+                if kept and not again and isinstance(e, STALE) and not (poll and self._polls_ended):
+                    self._drop_kept()
+                    continue                            # closed while kept: once more, on a new connection
+                raise NetworkError(self.scrub(f"{type(e).__name__}: {e}")) from None
+            except ValueError as e:                     # e.g. a header value http.client refuses: its text holds the
+                conn.close()                            # value, so not shown
+                raise NetworkError(f"{type(e).__name__} while sending the request") from None
+            finally:
+                if poll:
+                    with self._poll_lock:
+                        if self._poll_conn is conn:
+                            self._poll_conn = None
+            self._give_back(conn, poll)
+            break
         try:
             got = json.loads(raw) if raw else None
         except ValueError:
@@ -645,6 +735,8 @@ class RunnerLoop:
         self.connected = threading.Event()              # a hello was answered, and no poll said 404 since
         self._threads: set[threading.Thread] = set()    # the job threads still running
         self._printed: str | None = None
+        self._said_hello = threading.Condition()        # notified after each answered hello: a reply that met 404
+                                                        # goes again at once under the new id (#315)
 
     # -------------------------------------------------------------------------------------------- hello
     def _info(self) -> tuple[dict, str]:
@@ -657,8 +749,10 @@ class RunnerLoop:
         body = self.client.hello(info)
         if self.client.on_hello(body):
             self._channel_changed()
-        self.id, self.who, self._sent_groups = body["runner"], body.get("who"), sig
-        self.connected.set()
+        with self._said_hello:
+            self.id, self.who, self._sent_groups = body["runner"], body.get("who"), sig
+            self.connected.set()
+            self._said_hello.notify_all()
         p = body.get("poll_s")
         self.poll_s = float(p) if isinstance(p, (int, float)) and not isinstance(p, bool) and p > 0 else runner_hub.POLL_MAX_S
         if self._printed != self.id:
@@ -765,6 +859,9 @@ class RunnerLoop:
             threads = list(self._threads)
         for t in threads:
             t.join(max(0.0, end - time.monotonic()))
+        close = getattr(self.client, "close", None)     # the kept connections (#313); a late reply opens its own
+        if close is not None:
+            close()
         with self._lock:
             return not any(t.is_alive() for t in self._threads)
 
@@ -856,9 +953,12 @@ class RunnerLoop:
                 return False
             except Gone:
                 wait_end = time.monotonic() + self.poll_s + 5
-                while not (self.connected.is_set() and self.id != used):
-                    if time.monotonic() > wait_end or self.stop.wait(0.1):
-                        return False
+                with self._said_hello:                  # woken by the hello itself, not a 0.1 s look (#315)
+                    while not (self.connected.is_set() and self.id != used):
+                        left = wait_end - time.monotonic()
+                        if left <= 0 or self.stop.is_set():
+                            return False
+                        self._said_hello.wait(min(left, STOP_LOOK_S))
             except NetworkError:
                 if time.monotonic() > end or self.stop.is_set():
                     return False

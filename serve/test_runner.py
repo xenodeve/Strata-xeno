@@ -224,10 +224,13 @@ class Connection(Base):
         self.assertTrue(any(new in line for line in self.said), self.said)          # the new id is printed
 
     def test_reply_after_a_rename_reaches_the_job(self):
-        """A job running when the key is renamed: its reply under the old id gets 404, and goes again under the new."""
+        """A job running when the key is renamed: the poll held under the old id ends at the rename (#315: not after
+        its whole wait), the runner says hello again, and the job's result reaches the page."""
         self.start_routing()
         loop = self.runner(self.ann)
         old, go, inside = loop.id, threading.Event(), threading.Event()
+        new = runner_hub.runner_id("anna", DEV1)
+        r = self.svc.runner_hub.get_for(old, SimpleNamespace(name="ann"))
         real = runner_mod.page_routes.answer
 
         def answer(*a, **kw):
@@ -240,15 +243,160 @@ class Connection(Base):
                 "GET", f"/agent/folders?runner={old}&path={self.dir}", key=self.ann, device=DEV1)))
             t.start()
             self.assertTrue(inside.wait(10))
+            self.assertTrue(wait_for(lambda: r._held, 5, 0.005))  # the runner's next poll is held on the server
+            t0 = time.monotonic()
             code, body = self.req("POST", "/keys", {"action": "rename", "name": "ann", "to": "anna"}, key="k",
                                   device=DEV0)
             self.assertEqual(code, 200, body)
-            self.assertEqual(loop.id, old)                       # the runner has not met the 404 yet
-            go.set()
+            self.assertTrue(wait_for(lambda: loop.id == new, 5, 0.005), self.said)
+            self.assertLess(time.monotonic() - t0, 1.0)         # the held poll's wait (POLL_MAX_S, 2 s here) is not
+            go.set()                                            # waited out
             t.join(20)
         self.assertEqual(got[0][0], 200, got)
         self.assertIn("proj", [d["name"] for d in got[0][1]["dirs"]])
-        self.assertEqual(loop.id, runner_hub.runner_id("anna", DEV1))
+        self.assertEqual(loop.codes, [])                        # the runner goes on
+
+    def test_a_reply_met_by_404_goes_again_once_the_hello_is_answered(self):
+        """A reply sent under the old id meets 404; it goes again under the new id as soon as the poll thread's hello
+        is answered (#315: it looked every 0.1 s, so up to 100 ms late; here the look is 10 s, so only the hello can wake it)."""
+        calls = []
+
+        class Fake:
+            channel, url = "c1", "http://server"
+
+            def reply(self, rid, instance, msg):
+                calls.append((rid, time.monotonic()))
+                if rid == "r-old":
+                    raise runner_mod.Gone("there is no such runner")
+
+            def hello(self, info):
+                return {"runner": "r-new", "who": "anna", "channel": "c1", "poll_s": 2}
+
+            def on_hello(self, body):
+                return False
+        ex = SimpleNamespace(groups=lambda: [], skills=lambda: [], info=lambda: {}, starting=lambda: False)
+        loop = runner_mod.RunnerLoop(Fake(), ex)
+        loop.id, loop.poll_s = "r-old", 2.0
+        loop.connected.set()
+        answered = []
+
+        def hello_later():
+            wait_for(lambda: calls, 2, 0.001)
+            time.sleep(0.02)
+            loop._hello()
+            answered.append(time.monotonic())
+        threading.Thread(target=hello_later, daemon=True).start()
+        with mock.patch.object(runner_mod, "STOP_LOOK_S", 10.0):   # only the hello can wake it within the bound
+            self.assertIs(loop._post({"job": "j1", "rid": 1, "result": {}}), True)
+        self.assertEqual([c[0] for c in calls], ["r-old", "r-new"])
+        wait_for(lambda: answered, 2, 0.001)
+        self.assertLess(calls[1][1] - answered[0], 1.0)
+
+    # ---------------------------------------------------------------------------------------- #313: kept connections
+    def hello_info(self, instance="inst-keep-0001"):
+        return {"instance": instance, "machine": "ann-pc", "platform": "win32", "shell": None, "home": "C:\\Users\\ann",
+                "groups": [], "skills": []}
+
+    def count_connects(self):
+        """TCP connects made by the runner's threads (its poll thread and its job threads), from now on."""
+        made, real = [], http.client.HTTPConnection.connect
+
+        def connect(conn):
+            if threading.current_thread().name in ("test-runner", "runner-job", "keep-test"):
+                made.append(threading.current_thread().name)
+            return real(conn)
+        p = mock.patch.object(http.client.HTTPConnection, "connect", connect)
+        p.start()
+        self.addCleanup(p.stop)
+        return made
+
+    def test_polls_and_replies_keep_their_connections(self):
+        """Five page jobs: their polls and replies go over the connections the runner already has - no new TCP
+        connection per message (it was two per job: the reply's and the next poll's)."""
+        self.start_routing()
+        (self.proj / "hello.txt").write_text("hi\n", encoding="utf-8")
+        loop = self.runner(self.ann)
+        code, body = self.req("GET", f"/agent/folders?runner={loop.id}&path={self.dir}", key=self.ann, device=DEV1)
+        self.assertEqual(code, 200, body)                       # the first reply opened the reply connection
+        made = self.count_connects()
+        for _ in range(5):
+            code, body = self.req("GET", f"/agent/folders?runner={loop.id}&path={self.dir}", key=self.ann, device=DEV1)
+            self.assertEqual(code, 200, body)
+        self.assertEqual(made, [])
+
+    def test_a_kept_connection_the_server_closed_is_tried_again_once(self):
+        self.start_routing()
+        made = self.count_connects()
+        c = runner_mod.Client(f"http://127.0.0.1:{self.port}", self.ann, {"id": DEV1, "name": "ann-pc"})
+        self.addCleanup(c.close)
+        got = []
+
+        def go():
+            got.append(c.hello(self.hello_info())["runner"])
+            time.sleep(0.6)                                     # the server closes the idle connection meanwhile
+            got.append(c.hello(self.hello_info())["runner"])
+        with mock.patch.object(server_mod, "RUNNER_IDLE_S", 0.2):
+            t = threading.Thread(target=go, name="keep-test")
+            t.start()
+            t.join(10)
+        self.assertEqual(len(got), 2, self.said)
+        self.assertEqual(got[0], got[1])
+        self.assertEqual(len(made), 2)                          # the first, then one again after the server's close
+
+    def test_a_server_that_closes_every_connection_still_works(self):
+        """A server from before #313 answers every route HTTP/1.0 with Connection: close: the runner keeps nothing."""
+        self.start_routing()
+        made = self.count_connects()
+        c = runner_mod.Client(f"http://127.0.0.1:{self.port}", self.ann, {"id": DEV1, "name": "ann-pc"})
+        self.addCleanup(c.close)
+        got = []
+
+        def go():
+            body = c.hello(self.hello_info())
+            c.on_hello(body)
+            got.append(c.next(body["runner"], "inst-keep-0001", 0))
+            got.append(c.hello(self.hello_info())["runner"])
+        with mock.patch.object(server_mod, "RUNNER_KEEP", set()):
+            t = threading.Thread(target=go, name="keep-test")
+            t.start()
+            t.join(10)
+        self.assertEqual(len(got), 2, self.said)
+        self.assertEqual(len(made), 3)                          # one connection per request, as before
+        self.assertEqual((c._kept, c._poll_kept), ([], None))
+
+    def test_abort_poll_cuts_a_held_poll_on_a_kept_connection(self):
+        self.start_routing()
+        c = runner_mod.Client(f"http://127.0.0.1:{self.port}", self.ann, {"id": DEV1, "name": "ann-pc"})
+        self.addCleanup(c.close)
+        body = c.hello(self.hello_info())
+        c.on_hello(body)
+        rid = body["runner"]
+        self.assertEqual(c.next(rid, "inst-keep-0001", 0), [])     # the poll's connection is kept from here
+        r = self.svc.runner_hub.get_for(rid, SimpleNamespace(name="ann"))
+        got = []
+        with mock.patch.object(runner_hub, "POLL_MAX_S", 20.0):
+            t = threading.Thread(target=lambda: got.append((c.next(rid, "inst-keep-0001", 20), time.monotonic())))
+            t.start()
+            self.assertTrue(wait_for(lambda: r._held, 5, 0.005))
+            t0 = time.monotonic()
+            c.abort_poll()
+            t.join(10)
+        self.assertEqual(got[0][0], [])
+        self.assertLess(got[0][1] - t0, 1.0)
+        self.assertEqual(c.next(rid, "inst-keep-0001", 5), [])     # and every later poll at once
+
+    def test_a_poll_stopped_before_it_was_sent_closes_its_kept_connection(self):
+        self.start_routing()
+        c = runner_mod.Client(f"http://127.0.0.1:{self.port}", self.ann, {"id": DEV1, "name": "ann-pc"})
+        self.addCleanup(c.close)
+        body = c.hello(self.hello_info())
+        c.on_hello(body)
+        self.assertEqual(c.next(body["runner"], "inst-keep-0001", 0), [])
+        conn = c._poll_kept[0]
+        c.abort_poll()                                          # no poll in flight: the next one stops before sending
+        with self.assertRaises(runner_mod.NetworkError):
+            c._request("GET", f"/runner/next?id={body['runner']}&instance=inst-keep-0001&wait=0", poll=True)
+        self.assertIsNone(conn.sock)                            # closed, not left to the garbage collector
 
     def test_replies_number_rid_and_answers_match_to(self):
         target = self.dir / "outside.txt"
@@ -418,6 +566,96 @@ class ReviewFixes(Base):
 
     def test_a_result_over_the_limit_is_not_sent(self):
         self.refused_result(mock.patch.object(runner_mod, "REPLY_MAX", 3000))            # checked before sending
+
+
+class KeptConnections(unittest.TestCase):
+    """#313 fix round 1: kept connections the server dropped - a whole pool (a server restart closes every one), and
+    a TLS one closed without close_notify - cost one fresh connection, never a NetworkError."""
+
+    def stub(self, tls=False):
+        """A stdlib HTTP/1.1 server answering every POST with a hello's answer (after `self.delay` s); its accepted
+        sockets in `self.conns`."""
+        import socketserver  # noqa: F401
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        conns, lock, case = [], threading.Lock(), self
+        self.conns, self.delay = conns, 0.0
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def setup(self):
+                super().setup()
+                with lock:
+                    conns.append(self.connection)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                time.sleep(case.delay)
+                b = json.dumps({"runner": "r1", "who": "ann", "channel": "c", "poll_s": 2}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        scheme, ctx = "http", None
+        if tls:
+            from serve.test_runner_state import self_signed
+            import ssl
+            cert, key = self_signed()
+            sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            sctx.load_cert_chain(cert, key)
+            srv.socket = sctx.wrap_socket(srv.socket, server_side=True)
+            scheme, ctx = "https", ssl.create_default_context(cafile=cert)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        c = runner_mod.Client(f"{scheme}://127.0.0.1:{srv.server_address[1]}", "k" * 20, {"id": "dev12345678"})
+        if ctx is not None:
+            c._ssl = ctx
+        self.addCleanup(c.close)
+        return c, lock
+
+    def drop_all(self, lock):
+        """The server ends every connection it has, as server_close does (FIN, no TLS close_notify)."""
+        import socket
+        with lock:
+            for s in self.conns:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                s.close()
+        time.sleep(0.2)
+
+    def test_a_pool_the_server_dropped_goes_on_a_fresh_connection(self):
+        c, lock = self.stub()
+        self.delay = 0.3                                        # three hellos at once: three kept connections
+        ts = [threading.Thread(target=c.hello, args=({},)) for _ in range(3)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertEqual(len(c._kept), 3)
+        self.delay = 0.0
+        self.drop_all(lock)
+        n = len(self.conns)
+        self.assertEqual(c.hello({})["runner"], "r1")         # no NetworkError
+        self.assertEqual(len(self.conns), n + 1)                # one new connection, not another dead one
+        self.assertEqual(len(c._kept), 1)                       # the dead ones went with the first that failed
+
+    def test_a_kept_tls_connection_closed_without_close_notify_is_tried_again(self):
+        c, lock = self.stub(tls=True)
+        self.assertEqual(c.hello({})["runner"], "r1")
+        self.assertEqual(len(c._kept), 1)
+        self.drop_all(lock)                                     # SSLEOFError on the kept connection's next use
+        self.assertEqual(c.hello({})["runner"], "r1")
+        self.assertEqual(len(self.conns), 2)
 
 
 class Hello(unittest.TestCase):

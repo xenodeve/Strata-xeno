@@ -193,7 +193,7 @@ class Runner:
             return True
 
     def take(self, wait: float, gone: threading.Event | None = None, ack: int = 0,
-             channel: str | None = None) -> list[dict]:
+             channel: str | None = None, as_id: str | None = None) -> list[dict]:
         """The messages for this runner.  First every one up to `ack` (the highest `seq` the runner says it received)
         leaves the outbox - unless the poll names another `channel` (its ack counts another registration's seqs), or
         the ack is above every seq given out; then the ones left are answered at once, or the poll waits at most `wait` seconds for a new
@@ -204,7 +204,10 @@ class Runner:
 
         The newest poll wins: a poll still held when a newer one arrives returns [] at once, so a stale connection (the
         runner reconnected after its network dropped) never waits beside the live one.  `gone` is set when the poll's
-        client hung up (the route's watcher): the poll then returns [] at once."""
+        client hung up (the route's watcher): the poll then returns [] at once.  `as_id`: the id the poll was made
+        under; once it no longer names this runner (its key was renamed, `RunnerHub.move`) the poll returns [] at once,
+        before or while it waits, and the route answers 404 so the runner says hello again now (#315: a held poll
+        used to wait out its whole wait, POLL_MAX_S)."""
         deadline = time.monotonic() + max(0.0, wait)
         with self.cond:
             if 0 < ack <= self._seq and channel in (None, self.channel):    # another channel's ack: ignored
@@ -216,7 +219,8 @@ class Runner:
             self._seen = time.monotonic()
             dead = False
             try:
-                while not self._out and self.ended is None and self._poll == mine:
+                moved = lambda: as_id is not None and self.id != as_id      # noqa: E731
+                while not self._out and self.ended is None and self._poll == mine and not moved():
                     if gone is not None and gone.is_set():
                         break
                     left = deadline - time.monotonic()
@@ -224,7 +228,7 @@ class Runner:
                         break
                     self.cond.wait(left if gone is None else min(left, 0.25))
                 dead = gone is not None and gone.is_set()
-                if self.ended is not None or self._poll != mine or dead:
+                if self.ended is not None or self._poll != mine or dead or moved():
                     return []
                 out = list(self._out)
                 now = time.perf_counter()
@@ -677,6 +681,12 @@ class RunnerHub:
         self._lock = threading.Lock()
         self._runners: dict[str, Runner] = {}
         self._closed = False
+        # #315: a key's rename (the keys file, then `move`) and a hello (the key's name, then `hello`) each hold this,
+        # so a hello is wholly before a rename or wholly after it.  A hello in between registered a second runner under
+        # the new name, which `move` then ended as replaced: the runner on the PC stopped for good (409).  Only a
+        # rename takes it: a revoke or a role change does not, so a hello that matched just before a revoke may still
+        # register a runner under the retired name after `end_all` (unusable: no key carries that name again).
+        self.names = threading.Lock()
 
     def hello(self, who: str, device: str, instance: str, info: dict, groups: list, skills: list) -> Runner:
         """Register a runner.  The same id and instance: its facts and lists are updated, nothing else changes.  The
@@ -716,7 +726,9 @@ class RunnerHub:
             for r in mine:
                 del self._runners[r.id]
             for r in mine:
-                r.who, r.id = new, runner_id(new, r.device)
+                with r.cond:                        # a poll held under the old id ends now (take's `as_id`, #315)
+                    r.who, r.id = new, runner_id(new, r.device)
+                    r.cond.notify_all()
                 if (other := self._runners.get(r.id)) is not None:
                     displaced.append(other)
                 self._runners[r.id] = r
