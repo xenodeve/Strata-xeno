@@ -1,15 +1,15 @@
-"""serve/web.py - WebFetch and WebSearch for the chat's coding tools (issue #99).  OFF by default: they send things off this PC, which Strata otherwise never does.
-
-They exist for a chat only when the user has switched web access on (Settings > Web access, `"web": {"on": true}` in the run config) - the model is not even offered them otherwise - and every
-call asks the user first with the address or the search words in front of them (serve/permissions.py; "allow this site" is a rule `WebFetch(domain:example.com)`).
+"""serve/web.py - WebFetch and WebSearch for the chat's coding tools (issue #99).  ON by default since #337 (the developer, 2026-11-17): they send things off this PC, so
+`"web": {"on": false}` in the run config (Settings > Web access) takes them away - the model is not even offered them then.  A team guest has them only when the run config says
+`"on": true` outright (the server's owner chose it for the team; their fetches leave from this PC, to the public internet only).  Every call asks the user first with the address or the search words in front of them (serve/permissions.py; "allow this site" is a rule `WebFetch(domain:example.com)`).
 
 WebFetch gets a page and returns its text: only http and https, no user name in the address, and only public addresses - the name is resolved here, every address it gives must be public, and the
 connection goes to that address (so a name cannot change its answer between the check and the connection); a redirect is checked the same way, at most 5 of them.  Addresses of this PC or of a
 private network (localhost, 10.x, 192.168.x, 169.254.x, a name with no dot or ending in .local) are refused.  The reply is cut at a size and a time limit, and an HTML page becomes readable text.
 Everything that comes back is marked as data from the internet, never instructions.
 
-WebSearch asks the provider the user chose - a SearXNG instance of their own (which may well be on their own network), or Brave's search API with their key - and returns titles, addresses and
-snippets.  (DuckDuckGo's page answers a program with a challenge, so it is not offered.)
+WebSearch asks the provider the user chose - ddgs by default (#337: no key; it sends the words to Wikipedia and, two at a time, Brave, DuckDuckGo, Mojeek and Yahoo), a SearXNG
+instance of their own (which may well be on their own network), or Brave's search API with their key - and returns titles, addresses and snippets.  (DuckDuckGo's page itself answers a
+program with a challenge; ddgs goes round that.)
 """
 from __future__ import annotations
 
@@ -416,16 +416,21 @@ class DdgsEmpty(Exception):
     """ddgs found nothing (its own DDGSException "No results found."): asked once more, then "No results"."""
 
 
+DDGS_TIMEOUT = 8              # seconds ddgs waits on one engine (it asks two at a time; the whole search is bounded by SEARCH_WAIT)
+SEARCH_WAIT = 30.0            # seconds a ddgs search may take in all, retry included, before it is given up
+
+
 def ddgs_search(query: str, n: int) -> list[dict]:
-    """#337: the search with no key and no server of one's own - the `ddgs` package (DuckDuckGo first, then the other
-    engines it knows), imported only when it is used.  Rows of {title, href, body}."""
+    """#337: the search with no key and no server of one's own - the `ddgs` package, imported only when it is used.
+    It asks Wikipedia and, two at a time, Brave, DuckDuckGo, Mojeek and Yahoo (ddgs 9.16 "auto": its own order, the
+    others shuffled): those engines see the search words, not one of them alone.  Rows of {title, href, body}."""
     from ddgs import DDGS
     try:
         from ddgs.exceptions import DDGSException
     except ImportError:                                  # an older layout: the class at the top
         from ddgs import DDGSException
     try:
-        return DDGS(timeout=int(TIMEOUT)).text(query, max_results=n, safesearch="moderate") or []
+        return DDGS(timeout=DDGS_TIMEOUT).text(query, max_results=n, safesearch="moderate") or []
     except DDGSException as e:
         if "no results" in str(e).lower():
             raise DdgsEmpty(str(e)) from None
@@ -437,7 +442,7 @@ def parse_ddgs(rows) -> list[dict]:
             if isinstance(r, dict) and isinstance(r.get("href"), str) and r["href"].startswith(("http://", "https://"))][:MAX_RESULTS]
 
 
-PROVIDER_NAMES = {"brave": "Brave Search", "searxng": "SearXNG", "ddgs": "DuckDuckGo (ddgs)"}
+PROVIDER_NAMES = {"brave": "Brave Search", "searxng": "SearXNG", "ddgs": "ddgs (Wikipedia, Brave, DuckDuckGo, Mojeek, Yahoo)"}
 
 
 def results_text(query: str, provider: str, rows: list[dict]) -> str:
@@ -483,7 +488,7 @@ class Web:
         q = " ".join(query.split())
         provider = self.cfg.get("provider")
         if provider not in ("brave", "searxng"):
-            return self._search_ddgs(q)
+            return self._search_ddgs(q, cancel)
         try:
             if provider == "brave":
                 key = self.cfg.get("brave_key")
@@ -505,17 +510,39 @@ class Web:
             return _err(f"WebSearch failed: {e}")
         return _ok(results_text(q, provider, rows))
 
-    def _search_ddgs(self, q: str) -> dict:
-        """#337: ddgs, asked once more when it finds nothing (it sometimes does on a first try)."""
-        try:
+    def _search_ddgs(self, q: str, cancel=None) -> dict:
+        """#337: ddgs on a thread of its own, so Stop (`cancel`) ends the tool at once and a stalled engine cannot hold the
+        run past SEARCH_WAIT; asked once more when the first try finds nothing or fails (it sometimes does)."""
+        import threading
+        box: dict = {}
+
+        def work():
             try:
-                rows = self.ddgs(q, MAX_RESULTS)
-            except DdgsEmpty:
-                rows = self.ddgs(q, MAX_RESULTS)
+                try:
+                    box["rows"] = self.ddgs(q, MAX_RESULTS)
+                except ImportError:
+                    raise
+                except Exception:  # noqa: BLE001 - nothing found, or an engine refused: one more try
+                    box["rows"] = self.ddgs(q, MAX_RESULTS)
+            except BaseException as e:  # noqa: BLE001 - handed to the caller
+                box["error"] = e
+        t = threading.Thread(target=work, name="ddgs search", daemon=True)
+        t.start()
+        end = time.monotonic() + SEARCH_WAIT
+        while t.is_alive():
+            if cancel is not None and cancel.is_set():
+                return _err("The search was stopped.")
+            if time.monotonic() > end:
+                return _err(f"WebSearch failed: no answer from the search engines in {SEARCH_WAIT:.0f} s")
+            t.join(0.1)
+        try:
+            if "error" in box:
+                raise box["error"]
+            rows = box.get("rows") or []
         except DdgsEmpty:
             rows = []
         except ImportError:
-            return _err("web search goes through DuckDuckGo (ddgs), which is not installed on the server: run setup again, or "
+            return _err("web search goes through ddgs, which is not installed on the server: run setup again, or "
                         "`python -m pip install ddgs` in the server's Python; or choose SearXNG or Brave Search in Settings > Web access")
         except Exception as e:  # noqa: BLE001 - a blocked or failed search says so; it never takes the answer down
             return _err(f"WebSearch failed: {type(e).__name__}: {str(e)[:200]}")

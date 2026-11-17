@@ -42,10 +42,10 @@ export function WebSettings() {
           <div className={cn("mt-3 space-y-3", !view.on && "opacity-60")} data-web-provider>
             <div>
               <div className="mb-1.5 text-[13px] font-medium">{t("Who sees your searches")}</div>
-              <Segmented label={t("Search provider")} value={view.provider} onChange={(v) => void (can && send({ provider: v }))} options={[{ value: "ddgs", label: "DuckDuckGo" }, { value: "searxng", label: "SearXNG" }, { value: "brave", label: "Brave Search" }]} />
+              <Segmented label={t("Search provider")} value={view.provider} onChange={(v) => void (can && send({ provider: v }))} options={[{ value: "ddgs", label: "ddgs" }, { value: "searxng", label: "SearXNG" }, { value: "brave", label: "Brave Search" }]} />
             </div>
             {view.provider === "ddgs" ? (
-              <p className="text-[12.5px] text-ink-2">{t("Searches go to DuckDuckGo (and the other engines it falls back on) through ddgs: no key and nothing to set up. It reads their pages, not an API, so it can be slow or refuse at times; SearXNG or Brave Search are steadier.")}</p>
+              <p className="text-[12.5px] text-ink-2">{t("Searches go through ddgs, with no key and nothing to set up: your search words go to Wikipedia and, two at a time, to Brave, DuckDuckGo, Mojeek and Yahoo. It reads their pages, not an API, so it can be slow or refuse at times; SearXNG or Brave Search are steadier.")}</p>
             ) : view.provider === "searxng" ? (
               <form className="space-y-1.5" onSubmit={(e) => { e.preventDefault(); if (can) void send({ searxng_url: url.trim() }) }}>
                 <label className="block text-[12.5px] text-ink-2" htmlFor="web-searxng">{t("The address of your SearXNG (it can be on your own network; it must offer the JSON format)")}</label>

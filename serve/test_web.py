@@ -363,7 +363,7 @@ class Searching(unittest.TestCase):
         t = text_of(r)
         self.assertFalse(r.get("isError"))
         self.assertEqual(asked, [("how to cook rice", web.MAX_RESULTS)])
-        self.assertIn("through DuckDuckGo (ddgs)", t)
+        self.assertIn("through ddgs (Wikipedia, Brave, DuckDuckGo, Mojeek, Yahoo)", t)          # who sees the words
         self.assertIn("1. First result\n   https://example.org/a\n   A snippet", t)
         self.assertIn("2. Second\n   https://example.net/b", t)
         self.assertNotIn("javascript:", t)
