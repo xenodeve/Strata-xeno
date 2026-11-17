@@ -27,7 +27,7 @@ import re
 import threading
 from pathlib import Path
 
-from serve import agent as agent_mod, app_settings, harness, mcp_admin, permissions, subagent as subagent_mod, web as web_mod
+from serve import agent as agent_mod, app_settings, harness, mcp_admin, page_routes, permissions, subagent as subagent_mod, web as web_mod
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_CHARS = 30_000                     # characters of a page or a section given in one answer
@@ -59,8 +59,21 @@ SETTINGS = {
     "mcp.edit": "replace an MCP server's setup: {\"name\": ..., \"server\": {...}}; a value shown as ******** keeps the stored secret",
     "mcp.switch": "switch an MCP server on or off (it stays set up): {\"name\": ..., \"on\": true or false}",
     "mcp.delete": "delete an MCP server: {\"name\": ...}",
-    "mcp.import": "import an MCP server from another coding app on this PC: {\"app\": the app's id, \"name\": the server's name there}",
+    "mcp.import": "import an MCP server from another coding app on the chosen PC: {\"app\": the app's id, \"name\": the server's name there}",
 }
+# #344: which PC a change is made on.  The central PC is the Strata server's own (where the model runs); my_pc is the user's own PC, connected
+# to this chat through Strata Desktop (its runner).  web, helpers and chat are the server's (they apply to every chat); the MCP servers and
+# the skill switches exist on both PCs, and the model says which one every time.
+PCS = ("central", "my_pc")
+BOTH_PCS = tuple(k for k in SETTINGS if k.startswith(("mcp.", "skills.")))
+ABOUT_CENTRAL = ("The central PC: the Strata server's own PC, where you (the model) run. Web access, helpers and the Chat's defaults are the server's and apply to "
+                 "every chat. Its MCP servers are offered as <server>__<tool> and its skills as skills__<tool> (no my_): they run on the central PC, and "
+                 "\"localhost\" in them is the central PC.")
+ABOUT_MINE = ("The user's own PC ({machine}), connected to this chat through Strata Desktop. Its MCP servers are offered as my_<server>__<tool> and its "
+              "skills as my_skills__<tool>: they run on the user's PC, and \"localhost\" in them is the user's PC. A server added, changed or switched on "
+              "there does not run until the user approves it in Strata Desktop on that PC.")
+NO_MINE = ("No PC of the user's is connected to this chat, so only the central PC's settings can be read and changed. To use their own PC, the user "
+           "opens the web app in Strata Desktop on that PC: it connects the PC (its MCP servers and skills then show here as my_pc).")
 NOT_HERE = {
     "web.brave_key": "the Brave key is a secret: the user types it in Settings > Web access, never in the chat",
 }
@@ -75,7 +88,7 @@ def _err(text: str) -> dict:
 
 
 def _listing() -> str:
-    return "\n".join(f"- {k}: {v}" for k, v in SETTINGS.items())
+    return "\n".join(f"- {k}: {v}" + ("" if k in BOTH_PCS else " (central PC only)") for k, v in SETTINGS.items())
 
 
 # ------------------------------------------------------------------------------------------------ the docs
@@ -298,12 +311,18 @@ def card_entry(new: dict, sent: dict | None, old: dict | None) -> tuple[dict, li
     return shown, keys
 
 
-def current(svc) -> dict:
-    """StrataSettings: what can be changed, as it is now.  No secret: the Brave key is only "set" or not, an MCP server's env and header
-    values are masked, an importable server is named only."""
+def current(svc, ctx=None) -> dict:
+    """StrataSettings (#344): the settings of each PC apart, so the model never mixes them up - `central_pc` (the server's) and `my_pc`
+    (the user's own PC of this chat, through its runner, or why there is none).  No secret: the Brave key is only "set" or not, an MCP
+    server's env and header values are masked, an importable server is named only."""
+    return {"central_pc": central(svc), "my_pc": mine_view(MyPc.of(ctx), getattr(ctx, "my_pc_why", "") if ctx is not None else "")}
+
+
+def central(svc) -> dict:
     cfg = harness._cfg(svc)
     web = web_mod.public_view(cfg)
     out = {
+        "about": ABOUT_CENTRAL,
         "config_file": os.path.basename(svc.config_path) if svc.config_path else None,
         "web": {"on": web["on"], "provider": web["provider"], "searxng_url": web["searxng_url"], "brave_key": "set" if web["brave_key_set"] else "not set"},
         "helpers": subagent_mod.settings(cfg),
@@ -324,27 +343,40 @@ def current(svc) -> dict:
 class Plan:
     """One change, checked: what the card shows (`change`) and how it is written (`apply` -> (status, what the route would send))."""
 
-    def __init__(self, setting: str, before, after, apply, same: bool | None = None, target: str | None = None, keys: list | None = None, state=None):
+    def __init__(self, setting: str, before, after, apply, same: bool | None = None, target: str | None = None, keys: list | None = None, state=None,
+                 mine: "MyPc | None" = None):
         self.setting, self.before, self.after, self.apply, self.target, self.keys = setting, before, after, apply, target, keys
+        self.mine = mine                                         # #344: the user's PC it is made on; None: the central PC
         self.same = before == after if same is None else same      # nothing would change: refused, so no write and no restart of the MCP servers
         self.state = (before, after) if state is None else state   # unmasked: what the check after the user's answer compares
 
     @property
     def change(self) -> dict:
-        out = {"setting": self.setting, "target": self.target, "description": SETTINGS[self.setting], "before": self.before, "after": self.after}
+        out = {"setting": self.setting, "target": self.target, "description": SETTINGS[self.setting], "before": self.before, "after": self.after,
+               "machine": "my" if self.mine is not None else "server", "machine_name": self.mine.machine if self.mine is not None else None}
         if self.keys is not None:
             out["keys"] = self.keys
         return out
 
 
-def plan(svc, setting, value) -> Plan | str:
-    """The change `setting` = `value` against the settings as they are now; a str says why it is refused (and nothing is asked)."""
+def plan(svc, setting, value, pc="central", mine: "MyPc | None" = None, why_not_mine: str = "") -> Plan | str:
+    """The change `setting` = `value` on the PC `pc` against the settings as they are now; a str says why it is refused (and nothing is
+    asked).  `mine`: the user's PC bound to this chat (#344), for pc "my_pc"; `why_not_mine`: why there is none."""
+    if pc not in PCS:
+        return ('say which PC with pc: "central" (the Strata server\'s own PC, where you run: its MCP servers are <server>__<tool>) or "my_pc" '
+                '(the user\'s own PC through Strata Desktop: its MCP servers are my_<server>__<tool>). Read both with StrataSettings.')
     if not isinstance(setting, str) or setting not in SETTINGS:
         why = NOT_HERE.get(setting) if isinstance(setting, str) else None
         return (f"{setting!r} cannot be changed here: {why}." if why else f"{setting!r} is not a setting that can be changed here.") + \
             " These can be changed (one per call):\n" + _listing() + \
             "\nNot the engine's flags (context, parallel, cache slots), team keys, hooks, the API key, hosts and origins, or anything that needs a restart: the user changes those in Settings or the run config."
     group, key = setting.split(".", 1)
+    if pc == "my_pc":
+        if setting not in BOTH_PCS:
+            return f"{setting} is a setting of the central PC only (the server's: it applies to every chat): send it with pc \"central\""
+        if mine is None:
+            return why_not_mine or NO_MINE
+        return _plan_skills_mine(mine, setting, key, value) if group == "skills" else _plan_mcp_mine(mine, setting, key, value)
     if group == "chat":
         now = dict(getattr(svc, "shared", {}) or {})
         new = {**now, key: value}
@@ -373,7 +405,17 @@ def plan(svc, setting, value) -> Plan | str:
 
 
 def _plan_skills(svc, cfg, setting, key, value) -> Plan | str:
-    st = harness.skill_settings(cfg)
+    imp = getattr(svc, "importer", None)
+    names = lambda app: {s["name"] for s in (imp.found.get(app, {}).get("skills", []) if imp is not None else [])}      # noqa: E731
+    got = _skill_change(harness.skill_settings(cfg), names, setting, key, value)
+    if isinstance(got, str):
+        return got
+    block, before, after, target = got
+    return Plan(setting, before, after, lambda: _route(harness.apply(svc, {"skills": block}), lambda: harness.skill_settings(harness._cfg(svc))), target=target)
+
+
+def _skill_change(st: dict, names, setting, key, value) -> tuple | str:
+    """(the new `import.skills` block, before, after, target) of one skill switch, or why it is refused; `names(app)`: the skills found of that app."""
     block = copy.deepcopy(st)
     if key == "enabled":
         if not isinstance(value, bool):
@@ -389,9 +431,7 @@ def _plan_skills(svc, cfg, setting, key, value) -> Plan | str:
             block["harness_off"] = [h for h in st["harness_off"] if h != app] + ([] if on else [app])
         else:
             name = value.get("name")
-            imp = getattr(svc, "importer", None)
-            names = {s["name"] for s in (imp.found.get(app, {}).get("skills", []) if imp is not None else [])}
-            if not isinstance(name, str) or name not in names:
+            if not isinstance(name, str) or name not in names(app):
                 return f"there is no skill named {name!r} from {app}"
             target = f"{app} / {name}"
             off = st["off"].get(app, [])
@@ -401,7 +441,7 @@ def _plan_skills(svc, cfg, setting, key, value) -> Plan | str:
     _, errors = harness._check_skills(block)
     if errors:
         return f"the value is refused: {errors[0]['message']}"
-    return Plan(setting, before, after, lambda: _route(harness.apply(svc, {"skills": block}), lambda: harness.skill_settings(harness._cfg(svc))), target=target)
+    return block, before, after, target
 
 
 def _route(result, view) -> tuple[int, dict]:
@@ -477,6 +517,193 @@ def _plan_mcp(svc, cfg, setting, key, value) -> Plan | str:
                 same=same if key in ("add", "edit") else None, target=name, keys=keys, state=raw)
 
 
+# ------------------------------------------------------------------------------------------------ the user's PC (#344)
+MINE_ROW = ("name", "command", "args", "env", "cwd", "url", "headers", "disabled", "pending", "status", "error")
+ENTRY_KEYS = ("command", "args", "env", "cwd", "url", "headers")
+
+
+class MyPc:
+    """The user's own PC of this chat (serve/runner_hub.py Runner, bound by the server: the same identity and this browser's device), read and
+    changed through the same runner jobs as the web app's My PC editor (#338): its MCP servers (`mcp.config`, `mcp.config.set`, `mcp.import.*`)
+    and its skill switches (`skills.config`, `skills.config.set`).  The runner keeps the secrets and its approval in Strata Desktop."""
+
+    def __init__(self, runner):
+        self.runner = runner
+        self.machine = (getattr(runner, "info", None) or {}).get("machine") or "?"
+
+    @classmethod
+    def of(cls, ctx) -> "MyPc | None":
+        r = getattr(ctx, "my_pc", None) if ctx is not None else None
+        return cls(r) if r is not None else None
+
+    def online(self) -> bool:
+        return bool(self.runner.online())
+
+    def ask(self, kind: str, payload: dict | None = None) -> tuple[int, dict]:
+        """(status, body) of one job, as the web app's routes relay it; an error's message names the PC."""
+        if not self.online():
+            return 409, {"error": {"type": "runner_offline", "message": f"the user's PC ({self.machine}) is offline: Strata Desktop is not running there"}}
+        return page_routes.relay(self.runner.request(kind, payload or {}), self.machine, page_routes.ADMIN_STATUSES)
+
+    def why(self, body: dict) -> str:
+        e = body.get("error") if isinstance(body, dict) else None
+        e = e if isinstance(e, dict) else {}
+        msg = e.get("message") if isinstance(e.get("message"), str) else "it did not answer"
+        if e.get("type") == "runner_outdated":
+            msg = "Strata Desktop on that PC is older than this server and cannot do it: the user installs the new Strata Desktop there"
+        return f"on the user's PC ({self.machine}): {msg}"
+
+
+def _row_for_model(row: dict) -> dict:
+    out = _for_model({k: v for k, v in row.items() if k in MINE_ROW and v is not None and not (k in ("pending", "disabled") and v is False)})
+    if out.get("pending"):
+        out["pending"] = "waits for the user's approval in Strata Desktop on that PC"
+    return out
+
+
+def _entry_of_row(row: dict) -> dict:
+    """An MCP server of the user's PC as its runner's view shows it (secrets masked), as the web app sends it back (mcpconfig.ts entryFromRow)."""
+    out = {k: copy.deepcopy(row[k]) for k in ENTRY_KEYS if row.get(k) is not None}
+    if row.get("disabled") is True:
+        out["disabled"] = True
+    return out
+
+
+def mine_view(mine: "MyPc | None", why: str = "") -> dict:
+    """StrataSettings' `my_pc`."""
+    if mine is None:
+        return {"connected": False, "note": why or NO_MINE}
+    out = {"connected": True, "machine": mine.machine, "about": ABOUT_MINE.format(machine=mine.machine)}
+    if not mine.online():
+        r = mine.runner
+        out["online"] = False
+        out["note"] = "the user's PC is offline (Strata Desktop is not running there): its settings cannot be read in full or changed until it is back. As it last connected:"
+        out["mcp_servers"] = [g["name"] for g in getattr(r, "groups", []) or [] if g.get("kind") == "mcp"]
+        out["skills_in_use"] = [k["name"] for k in getattr(r, "skills", []) or []]
+        return out
+    code, v = mine.ask("mcp.config")
+    if code == 200:
+        out["mcp_servers"] = [_row_for_model(x) for x in v.get("servers") or [] if isinstance(x, dict)]
+    else:
+        out["mcp_servers_error"] = mine.why(v)
+    code, v = mine.ask("mcp.import.list")
+    if code == 200:
+        out["importable_mcp_servers"] = {h["id"]: [{"name": c["name"], "state": c.get("state")} for c in h.get("servers") or []]
+                                         for h in (v.get("mcp") or {}).get("harnesses") or [] if h.get("servers")}
+    code, v = mine.ask("skills.config")
+    if code == 200:
+        out["skills"] = v.get("settings")
+        out["skills_found"] = [{"app": k["app"], "name": k["name"], "on": not k.get("off"), "used": k.get("used")} for k in v.get("skills") or []]
+    else:
+        out["skills_error"] = mine.why(v)
+    return out
+
+
+def _plan_skills_mine(mine: MyPc, setting, key, value) -> Plan | str:
+    code, v = mine.ask("skills.config")
+    if code != 200:
+        return mine.why(v)
+    found = v.get("skills") or []
+    got = _skill_change(v.get("settings") or harness.skill_settings({}), lambda app: {k["name"] for k in found if k.get("app") == app}, setting, key, value)
+    if isinstance(got, str):
+        return got
+    block, before, after, target = got
+
+    def apply():
+        code, out = mine.ask("skills.config.set", {"body": {"skills": block}})
+        return (code, out) if code != 200 else (200, out.get("settings"))
+    return Plan(setting, before, after, apply, target=target, mine=mine)
+
+
+def _plan_mcp_mine(mine: MyPc, setting, key, value) -> Plan | str:
+    code, v = mine.ask("mcp.config")
+    if code != 200:
+        return mine.why(v)
+    rows = [r for r in v.get("servers") or [] if isinstance(r, dict) and isinstance(r.get("name"), str)]
+    stored = {r["name"]: _entry_of_row(r) for r in rows}                # every one, the waiting ones too: the job takes the whole list
+    if key == "import":
+        if not isinstance(value, dict) or not isinstance(value.get("app"), str) or not isinstance(value.get("name"), str):
+            return f"the value is {SETTINGS[setting]}"
+        code, lv = mine.ask("mcp.import.list")
+        if code != 200:
+            return mine.why(lv)
+        apps = {h.get("id"): h.get("servers") or [] for h in (lv.get("mcp") or {}).get("harnesses") or []}
+        cand = next((c for c in apps.get(value["app"], []) if c.get("name") == value["name"]), None)
+        if cand is None:
+            return f"on the user's PC ({mine.machine}) there is no MCP server named {value['name']!r} in {value['app']}; these can be imported: " + \
+                json.dumps({a: [c.get("name") for c in cs] for a, cs in apps.items()}, ensure_ascii=False)
+        if cand.get("state") == "already":
+            return f"{value['name']!r} from {value['app']} is already one of the MCP servers of the user's PC ({mine.machine})"
+        shown = {k: cand[k] for k in ENTRY_KEYS if cand.get(k) is not None}
+
+        def apply_import():
+            code, out = mine.ask("mcp.import.add", {"body": {"import_mcp": {"harness": value["app"], "name": value["name"]}}})
+            return (code, out) if code != 200 else (200, {"imported": value["name"]})
+        return Plan(setting, None, {"name": value["name"], "server": shown}, apply_import, target=f"{value['name']} (from {value['app']})",
+                    state=(None, cand), mine=mine)
+    if not isinstance(value, dict) or not isinstance(value.get("name"), str):
+        return f"the value is {SETTINGS[setting]}"
+    name = value["name"]
+    if key != "add" and name not in stored:
+        return f"the user's PC ({mine.machine}) has no MCP server named {name!r}; its servers are: " + (", ".join(stored) or "(none)")
+    servers = copy.deepcopy(stored)
+    same = None
+    if key in ("add", "edit"):
+        if key == "add":
+            if name in stored:
+                return f"the user's PC ({mine.machine}) already has an MCP server named {name!r}: use mcp.edit, or another name"
+            why = mcp_admin.name_refused(name)
+            if why:
+                return why
+        typed = value.get("server")
+        if not isinstance(typed, dict):
+            return f"the value is {SETTINGS[setting]}"
+        old = stored.get(name) if key == "edit" else None
+        sent = mcp_admin.merge_masked(typed, old) if key == "edit" else typed      # a mask keeps the value its runner stores
+        entry, errors = mcp_admin.validate_entry(name, sent)
+        if errors:
+            return f"the server is refused: {errors[0]['message']} ({errors[0]['field']})"
+        before = old
+        same = key == "edit" and entry == old
+        servers[name] = entry
+        after, keys = card_entry(entry, typed, old)
+        state = (old, entry)
+    elif key == "switch":
+        on = value.get("on")
+        if not isinstance(on, bool):
+            return f"the value is {SETTINGS[setting]}"
+        entry = dict(stored[name])
+        was = entry.pop("disabled", None) is not True
+        if not on:
+            entry["disabled"] = True
+        servers[name] = entry
+        before, after, keys, state = ("on" if was else "off"), ("on" if on else "off"), None, (stored[name], entry)
+    else:                                                    # delete
+        before, after, keys, state = stored[name], None, None, (stored[name], None)
+        servers.pop(name)
+    if len(servers) > mcp_admin.MAX_SERVERS:
+        return f"at most {mcp_admin.MAX_SERVERS} servers"
+
+    def apply():
+        code, out = mine.ask("mcp.config.set", {"body": {"servers": servers}})
+        return (code, out) if code != 200 else (200, {"servers": [r.get("name") for r in out.get("servers") or []]})
+    return Plan(setting, before, after, apply, same=same, target=name, keys=keys, state=state, mine=mine)
+
+
+def _when(p: Plan, value) -> str:
+    """What the model tells the user after a change: when it takes effect, and on the user's PC the approval it still waits for."""
+    if p.mine is None:
+        return "The MCP servers were restarted; their tools come with the user's next message, not in this one." if p.setting.startswith("mcp.") else "It takes effect now."
+    m = p.mine.machine
+    if p.setting.startswith("skills."):
+        return f"The skills of the user's PC ({m}) follow it at once; they come with the user's next message."
+    starts = p.setting in ("mcp.add", "mcp.edit", "mcp.import") or (p.setting == "mcp.switch" and isinstance(value, dict) and value.get("on") is True)
+    if starts:
+        return (f"It does not run yet: the user's PC ({m}) waits for the user to approve it in Strata Desktop there (its tray notice, or the "
+                "servers window). Once approved, its tools (my_<name>__<tool>) come with the user's next message. Tell the user to approve it.")
+    return f"Done at once on the user's PC ({m}); its tools are gone from the user's next message."
+
+
 # ------------------------------------------------------------------------------------------------ the server
 class StrataServer:
     """Looks like an McpServer to the hub (name, kind, status, tools, call, start, close) but has no process and no transport."""
@@ -503,12 +730,19 @@ class StrataServer:
              "inputSchema": obj({"query": {"type": "string", "description": "a few words to search for"},
                                  "page": {"type": "string", "description": "a page to read: " + ", ".join(DOCS)},
                                  "section": {"type": "string", "description": "with page: one section, by its anchor or heading"}}, [])},
-            {"name": "StrataSettings", "description": "Strata's settings that you can change with StrataSettingsChange, as they are now (web access, helpers, MCP servers, "
-                                                      "skill imports, the Chat's shared defaults). Secrets are never shown.",
+            {"name": "StrataSettings", "description": "Strata's settings that you can change with StrataSettingsChange, as they are now, apart for each PC: "
+                                                      "central_pc (the Strata server's own PC, where you run: web access, helpers, the Chat's shared defaults, "
+                                                      "its MCP servers and skill imports) and my_pc (the user's own PC connected to this chat through Strata "
+                                                      "Desktop: its MCP servers and skill imports, or why there is none). Secrets are never shown.",
              "inputSchema": obj({}, [])},
-            {"name": CHANGE, "description": "Change one of Strata's settings when the user asked for it. The user always sees the setting, its value now and the new "
-                                            "value, and decides; nothing changes unless they allow it. One setting per call. Settings:\n" + _listing(),
-             "inputSchema": obj({"setting": {"type": "string", "enum": list(SETTINGS)}, "value": {"description": "the new value (see the setting)"}}, ["setting", "value"])},
+            {"name": CHANGE, "description": "Change one of Strata's settings when the user asked for it, on one PC. The user always sees the PC, the setting, "
+                                            "its value now and the new value, and decides; nothing changes unless they allow it. One setting per call. "
+                                            "pc \"central\" is the Strata server's own PC (its MCP servers are <server>__<tool>); pc \"my_pc\" is the user's "
+                                            "own PC through Strata Desktop (its MCP servers are my_<server>__<tool>, and a server added, changed or switched on "
+                                            "there runs only after the user approves it in Strata Desktop on that PC). Settings:\n" + _listing(),
+             "inputSchema": obj({"pc": {"type": "string", "enum": list(PCS), "description": "the PC whose setting it is: central or my_pc"},
+                                 "setting": {"type": "string", "enum": list(SETTINGS)}, "value": {"description": "the new value (see the setting)"}},
+                                ["pc", "setting", "value"])},
         ]
 
     def start(self) -> bool:
@@ -535,7 +769,7 @@ class StrataServer:
             if stop is not None:
                 return stop
         if tool == "StrataSettings":
-            return _ok(json.dumps(current(self.svc), indent=1, ensure_ascii=False))
+            return _ok(json.dumps(current(self.svc, ctx), indent=1, ensure_ascii=False))
         if args.get("page") not in (None, ""):
             return self.docs.read(args.get("page"), args.get("section"))
         if args.get("query") not in (None, ""):
@@ -547,20 +781,24 @@ class StrataServer:
             return _err("A helper cannot change Strata's settings.")
         if "value" not in args:
             return _err("value is the new value of the setting")
-        p = plan(self.svc, args.get("setting"), args.get("value"))
+        mine = MyPc.of(ctx)
+        again_plan = lambda: plan(self.svc, args.get("setting"), args.get("value"), args.get("pc"), mine, getattr(ctx, "my_pc_why", ""))     # noqa: E731
+        p = again_plan()
         if isinstance(p, str):
             return _err(p)
+        where = f"on the user's PC ({mine.machine})" if p.mine is not None else "on the central PC"
         if p.same:
-            return _err(f"{p.setting} is already {json.dumps(p.after, ensure_ascii=False)}: nothing to change.")
+            return _err(f"{p.setting} {where} is already {json.dumps(p.after, ensure_ascii=False)}: nothing to change.")
         stop = agent_mod.gate(CHANGE, args, ctx, card={"change": p.change})          # the arguments are the model's own words: shown in full
         if stop is not None:
             return stop
-        again = plan(self.svc, args.get("setting"), args.get("value"))      # the settings as they are now, after the wait
+        again = again_plan()                                                     # the settings as they are now, after the wait
         if isinstance(again, str) or again.state != p.state or again.change != p.change:
             return _err("The settings changed while the user was deciding, so nothing was changed. Read them again (StrataSettings) and ask again.")
         code, out = again.apply()
         if code != 200:
+            if p.mine is not None:
+                return _err(f"Nothing was changed: {p.mine.why(out)}")
             msg = (out or {}).get("error", {}).get("message") if isinstance(out, dict) else None
             return _err(f"Nothing was changed: {msg or f'the change failed ({code})'}")
-        when = "The MCP servers were restarted; their tools come with the user's next message, not in this one." if p.setting.startswith("mcp.") else "It takes effect now."
-        return _ok(f"Changed {p.setting}: {json.dumps(p.before, ensure_ascii=False)} -> {json.dumps(p.after, ensure_ascii=False)}. {when}")
+        return _ok(f"Changed {p.setting} {where}: {json.dumps(p.before, ensure_ascii=False)} -> {json.dumps(p.after, ensure_ascii=False)}. {_when(p, args.get('value'))}")

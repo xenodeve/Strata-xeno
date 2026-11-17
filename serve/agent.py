@@ -125,6 +125,8 @@ class AgentContext:
     spawn: Callable | None = None                          # serve/subagent.py: runs a helper (kind, prompt, description) -> (ok, report); set only when the user switched helpers on
     in_helper: bool = False                                # this call is a helper's: it cannot start a helper
     guest: bool = False                                    # #339: a team guest's request: Strata's settings are the owner's, so it can neither read nor change them
+    my_pc: object | None = None                            # #344: the user's own PC of this chat (serve/runner_hub.py Runner: the same identity and this browser's device), whose settings StrataSettings reads and StrataSettingsChange changes as my_pc
+    my_pc_why: str = ""                                    # #344: why there is none, for the model
     run_key: str = ""                                      # #310: the run on the engineer's PC (its runner's `run.start` answer) these calls belong to: it keeps a chat's session, todos, reads and background shells apart there; "" on the server
 
 

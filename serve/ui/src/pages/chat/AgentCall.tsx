@@ -8,6 +8,7 @@ import { Collapse } from "../../components/motion"
 import { Orb } from "../../components/orb"
 import { toolDesign } from "../../lib/orbs"
 import { cn } from "../../lib/cn"
+import { placeHeading, placeOf } from "../../lib/place"
 import { fmt } from "../../lib/format"
 import { markdown } from "../../lib/markdown"
 import { msg, t } from "../../lib/i18n"
@@ -56,6 +57,7 @@ const KEY_STATE: Record<string, string> = { new: msg("new"), changed: msg("chang
 function ChangeView({ change }: { change: SettingChange }) {
   return (
     <div data-setting-change={change.setting} className="space-y-1.5 text-[12.5px]">
+      {change.machine && <div data-change-machine={change.machine} className={cn("text-[12px] font-medium", change.machine === "my" ? "text-accent" : "text-ink-2")}>{placeHeading(placeOf(change), change.machine_name)}</div>}
       {change.target && <div data-change-target className="text-[13.5px] font-semibold [overflow-wrap:anywhere]">{change.target}</div>}
       <div><span className="text-ink-2">{t("Setting")}: </span><span className="font-mono">{change.setting}</span></div>
       {change.description && <div className="text-[12px] text-ink-3">{change.description}</div>}

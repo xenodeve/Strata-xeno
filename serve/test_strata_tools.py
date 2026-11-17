@@ -148,8 +148,8 @@ class ToolsBase(unittest.TestCase):
         c.guest = guest
         return c
 
-    def change(self, setting, value, **kw):
-        return self.server.call("StrataSettingsChange", {"setting": setting, "value": value}, ctx=self.ctx(**kw))
+    def change(self, setting, value, pc="central", **kw):
+        return self.server.call("StrataSettingsChange", {"pc": pc, "setting": setting, "value": value}, ctx=self.ctx(**kw))
 
 
 class TheTools(ToolsBase):
@@ -209,6 +209,9 @@ class TheTools(ToolsBase):
         for s in SECRETS:
             self.assertNotIn(s, t)
         got = json.loads(t)
+        self.assertEqual(set(got), {"central_pc", "my_pc"})
+        self.assertEqual(got["my_pc"]["connected"], False)
+        got = got["central_pc"]
         self.assertEqual(got["web"]["brave_key"], "set")
         self.assertEqual(got["mcp_servers"][0]["env"], {"TOKEN": mcp_admin.MASK})
         self.assertNotIn("engine", got)
@@ -260,7 +263,7 @@ class TheTools(ToolsBase):
             mcp_admin.update_config(str(self.config), lambda cfg: cfg.__setitem__("web", {**cfg["web"], "provider": "searxng"}))
             return "allow"
         c = agent.AgentContext(policy=permissions.Policy(cwd=None), session="s", ask=ask)
-        r = self.server.call("StrataSettingsChange", {"setting": "web.provider", "value": "searxng"}, ctx=c)
+        r = self.server.call("StrataSettingsChange", {"pc": "central", "setting": "web.provider", "value": "searxng"}, ctx=c)
         self.assertTrue(r["isError"])
         self.assertIn("changed while", text_of(r))
 
@@ -268,7 +271,7 @@ class TheTools(ToolsBase):
         self.assertIn("plan mode", text_of(self.change("web.on", True, mode="plan")))
         c = self.ctx()
         c.in_helper = True
-        self.assertTrue(self.server.call("StrataSettingsChange", {"setting": "web.on", "value": True}, ctx=c)["isError"])
+        self.assertTrue(self.server.call("StrataSettingsChange", {"pc": "central", "setting": "web.on", "value": True}, ctx=c)["isError"])
         self.assertEqual(self.cards, [])
 
 
@@ -347,7 +350,7 @@ class TheCard(ToolsBase):
             mcp_admin.update_config(str(self.config), lambda cfg: cfg["mcp_servers"]["files"].__setitem__("env", {"TOKEN": "other-secret"}))
             return "allow"
         c = agent.AgentContext(policy=permissions.Policy(cwd=None), session="s", ask=ask)
-        r = self.server.call("StrataSettingsChange", {"setting": "mcp.edit", "value": {"name": "files", "server": {
+        r = self.server.call("StrataSettingsChange", {"pc": "central", "setting": "mcp.edit", "value": {"name": "files", "server": {
             "command": "npx", "args": ["-y", "files2"], "env": {"TOKEN": mcp_admin.MASK}}}}, ctx=c)
         self.assertIn("changed while", text_of(r))
 
@@ -382,7 +385,7 @@ class SameAsTheRoute(Fixture):
 
     def tool(self, setting, value):
         c = agent.AgentContext(policy=permissions.Policy(cwd=None, mode="yolo"), session="s", ask=lambda card: "allow")
-        r = self.server.call("StrataSettingsChange", {"setting": setting, "value": value}, ctx=c)
+        r = self.server.call("StrataSettingsChange", {"pc": "central", "setting": setting, "value": value}, ctx=c)
         self.assertFalse(r["isError"], text_of(r))
 
     def test_each_change_writes_what_the_route_writes(self):
@@ -449,7 +452,7 @@ class InTheChat(Fixture):
             self.assertIn(name, p)
 
     def test_a_change_in_yolo_still_asks_on_its_call_and_a_no_keeps_the_config(self):
-        self.start(tool_call("StrataSettingsChange", setting="helpers.on", value="true"), DONE)
+        self.start(tool_call("StrataSettingsChange", pc="central", setting="helpers.on", value="true"), DONE)
         before = self.config.read_bytes()
         cards = []
         status, _, events = self.chat(self.body(agent={"mode": "yolo"}), on_event=lambda e: e["event"] == "permission" and (cards.append(e), self.answer(e["id"], "deny")))
@@ -457,11 +460,12 @@ class InTheChat(Fixture):
         self.assertEqual(len(cards), 1)
         call = [e for e in events if e["event"] == "call"][0]
         self.assertEqual(cards[0]["call_id"], call["id"])                               # the card lands on its call
-        self.assertEqual(cards[0]["change"], {"setting": "helpers.on", "target": None, "description": strata_tools.SETTINGS["helpers.on"], "before": False, "after": True})
+        self.assertEqual(cards[0]["change"], {"setting": "helpers.on", "target": None, "description": strata_tools.SETTINGS["helpers.on"], "before": False, "after": True,
+                                              "machine": "server", "machine_name": None})
         self.assertEqual(self.config.read_bytes(), before)
 
     def test_allowed_it_is_written(self):
-        self.start(tool_call("StrataSettingsChange", setting="helpers.on", value="true"), DONE)
+        self.start(tool_call("StrataSettingsChange", pc="central", setting="helpers.on", value="true"), DONE)
         status, _, events = self.chat(on_event=lambda e: e["event"] == "permission" and self.answer(e["id"], "allow"))
         self.assertEqual(status, 200)
         self.assertTrue([e for e in events if e["event"] == "result"][0]["ok"])
@@ -509,7 +513,8 @@ class WhereThingsRun(unittest.TestCase):
         self.assertNotIn("the user's own computer", p.split("\n")[0])
         self.assertIn("run on the central PC (the server), not on the user's PC", p)
         self.assertIn("WebFetch, Strata's own tools always run on the central PC", p)
-        self.assertNotIn("my_", p)
+        self.assertIn("none is offered in this chat", p)
+        self.assertNotIn("runs on the user's PC", p)
 
     def test_a_my_pc_project_names_the_machine_and_the_my_rule(self):
         p = self.build(machine="ann-pc", my_tools=True)

@@ -26,6 +26,8 @@ When you start a chat with a project folder, the web app asks whether the folder
 | The files you mention with `@` | on your PC | on the central PC |
 | WebFetch, WebSearch, Task (helpers) | on the central PC | on the central PC |
 | StrataDocs, StrataSettings, StrataSettingsChange | on the central PC | on the central PC |
+| MCP servers and skills named `my_...` | on your PC | on your PC (when this browser has a runner) |
+| Every other MCP server and skill (`<server>__<tool>`, `skills__<tool>`) | on the central PC | on the central PC |
 | The model itself | on the central PC | on the central PC |
 
 So in a My PC chat, what the tools read on your PC goes to the central PC as part of the conversation. In a Server PC
@@ -49,7 +51,9 @@ badge with where it runs: **This PC** (yours) or **Central PC**.
   long as this browser has a runner. If the runner goes offline, its tools stay in the list, and a call says that
   your PC is offline.
 
-The `my_` prefix is the whole rule, and the chat's rules tell the model about it:
+The `my_` prefix is the whole rule, for MCP servers and for skills (`my_skills__<tool>`), and the chat's rules tell the
+model about it. Each tool's description also starts with where it runs: `[Runs on the user's PC (<name>) ...]` or
+`[Runs on the central PC (the Strata server) ...]`.
 
 - `localhost` in a `my_` tool's call is your machine. In any other MCP tool it is the central PC.
 - A browser tool (Playwright, for example) that must open a site you are developing on your PC has to be the `my_` one.
@@ -86,13 +90,26 @@ YOLO mode (#329) runs the coding tools' calls without asking.
 ## What the chat's model may change in Strata
 
 When you ask the model to change Strata itself, it uses StrataSettingsChange: one setting per call, and a card with the
-value now and the new value, which you allow or refuse. It may change only settings that take effect without a restart:
+PC, the value now and the new value, which you allow or refuse. Every call names the PC: `pc: "central"` or
+`pc: "my_pc"`. StrataSettings shows the two PCs apart, as `central_pc` and `my_pc`, so a server or a skill of one PC is
+never taken for the other's. It may change only settings that take effect without a restart:
 
-- web access and its search provider;
-- helpers;
-- the central PC's MCP servers (add, edit, switch off, delete, import from another app);
-- the skill import switches;
-- the Chat's shared defaults (thinking level, sampling).
+| Setting | On the central PC (`pc: "central"`) | On your PC (`pc: "my_pc"`) |
+|---|---|---|
+| web access and its search provider | yes | (the central PC's only: it applies to every chat) |
+| helpers | yes | (the central PC's only) |
+| the Chat's shared defaults (thinking level, sampling) | yes | (the central PC's only) |
+| MCP servers: add, edit, switch off, delete, import from another app | yes | yes: a new, changed or switched-on server still waits for your approval in Strata Desktop |
+| the skill import switches | yes | yes |
+
+**Your PC is the one this chat comes from.** In a My PC chat it is the project's PC. In a chat whose project is on the
+central PC it is this browser's runner, if it has one. The model can read and change it only when the message is sent
+from that PC's own browser (the web app in Strata Desktop there). From another browser, StrataSettings says why. If
+Strata Desktop on your PC is older than the server, the model says to install the new one.
+
+For example, "add Playwright to my PC so you can open my dev site" makes the model call StrataSettingsChange with
+`pc: "my_pc"`, `setting: "mcp.add"`. You allow the card, then approve the server in Strata Desktop, and from your next
+message the model has `my_playwright__...` tools that reach your PC's `localhost`.
 
 It cannot change the engine's flags (context, parallel requests, cache slots), keys, hooks, the API key, the allowed
 hosts or origins, or the Brave key. You change those in Settings or in the run config.

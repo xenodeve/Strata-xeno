@@ -145,4 +145,10 @@ describe("YOLO mode (#329)", () => {
     expect(agentRequest({ agent: true, agentMode: "yolo" }, ON, "C:/w", "c", []).strata_agent!.mode).toBe("yolo")
     expect(agentRequest({ agent: true, agentMode: "yolo" }, { ...ON, yolo: false }, "C:/w", "c", []).strata_agent!.mode).toBe("ask")
   })
+
+  test("#344: a central-PC chat names this browser's PC as my_pc; a My PC chat does not need it", () => {
+    expect(agentRequest({ agent: true }, ON, "C:/w", "c", [], "1", undefined, "r0123456789abcdef").strata_agent!.my_pc).toBe("r0123456789abcdef")
+    expect(agentRequest({ agent: true }, ON, "C:/w", "c", [], "1", "r0123456789abcdef", "r0123456789abcdef").strata_agent!.my_pc).toBeUndefined()
+    expect(agentRequest({ agent: true }, ON, "C:/w", "c", [], "1").strata_agent!.my_pc).toBeUndefined()
+  })
 })

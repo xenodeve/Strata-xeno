@@ -20,6 +20,8 @@ import { chatMachine, runnerId, type Machine } from "./runner"
 /** #339: a change of Strata's own settings, as its card shows it (the server masks every secret before it sends this). */
 export interface SettingChange {
   setting: string; target?: string | null; description?: string; before: unknown; after: unknown
+  /** #344: the PC it is made on: "my" the user's own PC (machine_name), "server" the central PC */
+  machine?: "my" | "server"; machine_name?: string | null
   /** an MCP server's env / header keys: what the model sends is shown in full; a stored value it keeps is never shown */
   keys?: { field: string; key: string; state: "new" | "changed" | "unchanged" | "removed"; value: string | null }[]
 }
@@ -303,7 +305,7 @@ function restore(msgs: Message[]): Message[] {
   return msgs.map((m) => (m.prefill?.state === "reading" ? { ...m, prefill: { ...m.prefill, state: "done" as const, rate: null } } : m))
 }
 
-export interface SendContext { mcpRunner?: string; health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | string[] | null; runner?: string; blocked?: string }      // skills: the names of the skills in use, for "/name"; runner (#310 part 2): the chat is on the engineer's own PC, through this runner
+export interface SendContext { mcpRunner?: string; myPc?: string; health: Health; mcp: McpInfo; projectionLoaded: boolean; skills?: string[]; agent?: AgentInfo; folder?: string | string[] | null; runner?: string; blocked?: string }      // skills: the names of the skills in use, for "/name"; runner (#310 part 2): the chat is on the engineer's own PC, through this runner
 
 /** An answer that is being written (or a conversation that is being summarised) for one conversation. Several can run at once, each for its own conversation: the page shows one,
  *  and the others go on in the background (the server takes their requests one after the other). `messages` is the live list of that conversation. */
@@ -812,7 +814,7 @@ export class ChatController {
     if (s.max) body.max_tokens = +s.max
     if (ctx.projectionLoaded) body.experimental_speed_projection = !!s.esp
     Object.assign(body, mcpRequest(s, ctx.mcp, ctx.mcpRunner))         // #338: mcpRunner, My PC's MCP servers in a Server PC chat                            // this server may run MCP tools for it (the ones not switched off)
-    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, id === NEW_KEY ? null : id, permsFor(store, rulesOf(store, id), this.currentProject()), String(um.time), ctx.runner))      // the prompt's time is its checkpoint: the files the tools change in it can be put back      // the coding tools, when they are on and reachable
+    Object.assign(body, agentRequest(s, ctx.agent ?? NO_AGENT, ctx.folder, id === NEW_KEY ? null : id, permsFor(store, rulesOf(store, id), this.currentProject()), String(um.time), ctx.runner, ctx.myPc))      // the prompt's time is its checkpoint: the files the tools change in it can be put back      // the coding tools, when they are on and reachable
     const lastPrompt = [...conv].reverse().find((x) => x.role === "user")
     const skill = lastPrompt ? skillOfMessage(lastPrompt.text, ctx.skills ?? []) : null
     if (skill) body.strata_skill = skill                                   // "/name": the server loads that skill for this message

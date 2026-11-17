@@ -159,6 +159,7 @@ export function Chat({ id }: { id?: string }) {
   const chatMcp: McpInfo = onMy && myMcp ? { servers: [...mcp.servers, ...myServers], tools: mcp.tools + myMcp.tools }
     : myMcpLive ? { servers: [...mcp.servers, ...myMcpOnly], tools: mcp.tools + count(myMcpOnly) } : mcp
   const mcpRunner = myMcpLive ? rid : undefined
+  const myPc = !onMy && rid ? rid : undefined      // #344: this browser's PC, whose settings Strata's own tools read and change as my_pc
   const { data: metrics, stale } = useMetrics()
   const live = metrics?.live ?? { state: "idle" as const, queued: 0, tok_s: null }
   useEffect(() => { void chat.resumeRuns() }, [])                // an answer that was being written when the page was refreshed went on in the server: it is read again
@@ -301,7 +302,7 @@ export function Chat({ id }: { id?: string }) {
     const go = async () => {
       const found = coding.allowed ? await resolveMentions(folders, typed, onRunner) : []                                    // the files the prompt mentions with @ go with it
       const all = [...f, ...found.filter((x) => !f.some((y) => y.name === x.name))]
-      const context = { health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: folders, ...(onRunner ? { runner: onRunner } : {}), ...(mcpRunner ? { mcpRunner } : {}), ...(stop ? { blocked: stop.full } : {}) }
+      const context = { health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: folders, ...(onRunner ? { runner: onRunner } : {}), ...(mcpRunner ? { mcpRunner } : {}), ...(myPc ? { myPc } : {}), ...(stop ? { blocked: stop.full } : {}) }
       if (!busy) void chat.send(typed, all, context)
       else void chat.steer(typed, all, context).then((taken) => { if (!taken && !chat.queue(typed, all, context)) void chat.send(typed, all, context) })        // an agent is working: it reads this at its next step; else it waits in line and goes when the answer ends
     }
@@ -311,7 +312,7 @@ export function Chat({ id }: { id?: string }) {
     setAway(false)
     void go()
   }
-  const ctx = () => ({ health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: chat.folders(), ...(onRunner ? { runner: onRunner } : {}), ...(mcpRunner ? { mcpRunner } : {}), ...(stop ? { blocked: stop.full } : {}) })
+  const ctx = () => ({ health, mcp: chatMcp, projectionLoaded: projection, skills: skills.map((c) => c.name), agent: coding, folder: chat.folders(), ...(onRunner ? { runner: onRunner } : {}), ...(mcpRunner ? { mcpRunner } : {}), ...(myPc ? { myPc } : {}), ...(stop ? { blocked: stop.full } : {}) })
   const project = chat.index.projects.find((p) => p.id === chat.currentProject())       // the open conversation's project (or the one a new conversation was started in): its folders are where the coding tools work
   const chatKey = chat.index.active ?? "new"
   const editPrompt = (i: number, t: string) => { pinned.current = true; setAway(false); void chat.edit(i, t, ctx()) }
