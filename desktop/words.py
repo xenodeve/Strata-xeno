@@ -147,6 +147,7 @@ TABLE: dict[str, dict[str, str]] = {
         "th": "ยังไม่มีเซิร์ฟเวอร์ เพิ่มได้ด้วยที่อยู่และโทเค็นของคุณ",
     },
     "button_new": {"en": "Add a server", "th": "เพิ่มเซิร์ฟเวอร์"},
+    "servers_heading": {"en": "Servers", "th": "เซิร์ฟเวอร์"},
     "token_keep": {
         "en": "Leave it empty to keep the saved token.",
         "th": "เว้นว่างไว้เพื่อใช้โทเค็นที่บันทึกไว้เดิม",

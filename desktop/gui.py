@@ -27,6 +27,7 @@ Edge Chromium is missing: `desktop/webview2.py` checks before, and a fallback se
 """
 from __future__ import annotations
 
+import base64
 import dataclasses
 import logging
 import os
@@ -51,7 +52,7 @@ PAGE_WORDS = (
     "servers_title", "servers_empty", "label_name", "label_url", "label_token", "label_model", "token_set",
     "token_missing", "token_unreadable", "token_kept", "token_keep", "button_save", "button_test", "button_connect",
     "button_remove", "button_new", "button_open_without_runner", "menu_copy_code", "copied", "confirm_remove",
-    "test_reachable", "role_owner", "role_guest", "engine_down", "pending", "internal_error",
+    "test_reachable", "role_owner", "role_guest", "engine_down", "pending", "internal_error", "servers_heading",
 )
 
 
@@ -149,11 +150,38 @@ def _no_drop(control, which: str) -> None:
         log.error("the %s window still takes drops from outside (%s)", which, type(e).__name__)
 
 
+# #332: the web app's fonts (serve/ui/src/styles.css, the same OFL files and unicode ranges), inlined as data: fonts
+# because the page is given to the web view as text (`html=`) and has no folder to load a file from.
+LATIN = ("U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2191, "
+         "U+2193, U+2212, U+2215, U+FEFF, U+FFFD")
+FONTS = (("Inter Variable", "100 900", "inter-latin-wght-normal.woff2", LATIN),
+         ("Anuphan Variable", "100 700", "anuphan-thai-wght-normal.woff2", "U+0E01-0E5B, U+200C-200D, U+25CC"),
+         ("Anuphan Variable", "100 700", "anuphan-latin-wght-normal.woff2", LATIN),
+         ("JetBrains Mono Variable", "100 800", "jetbrains-mono-latin-wght-normal.woff2", LATIN))
+
+
+def font_faces() -> str:
+    """The @font-face rules of FONTS with each file as a data: URL; a file that is missing is left out (the page then
+    falls back to the system font, as the web app's stack does)."""
+    out = []
+    for family, weight, name, ranges in FONTS:
+        try:
+            data = base64.b64encode((UI / "fonts" / name).read_bytes()).decode("ascii")
+        except OSError:
+            log.warning("font %s is missing; the window uses the system font", name)
+            continue
+        out.append(f'@font-face {{ font-family: "{family}"; font-style: normal; font-weight: {weight}; font-display: swap; '
+                   f'src: url("data:font/woff2;base64,{data}") format("woff2-variations"); unicode-range: {ranges}; }}')
+    return "\n  ".join(out)
+
+
 def servers_html() -> str:
-    """`ui/servers.html` with the words of the current language in place of `/*WORDS*/{}` and its `lang`."""
+    """`ui/servers.html` with the words of the current language in place of `/*WORDS*/{}`, its `lang`, and the fonts in
+    place of `/*FONTS*/`."""
     text = SERVERS_HTML.read_text(encoding="utf-8")
     table = {k: words.t(k) for k in PAGE_WORDS}
-    return text.replace("/*WORDS*/{}", inject.js_literal(table)).replace("__LANG__", words.LANG)
+    return (text.replace("/*WORDS*/{}", inject.js_literal(table)).replace("__LANG__", words.LANG)
+            .replace("/*FONTS*/", font_faces()))
 
 
 def state_view(s: state.TrayState, notice: str = "") -> dict:

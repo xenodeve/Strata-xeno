@@ -3,82 +3,142 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'unsafe-eval'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data:; script-src 'unsafe-inline' 'unsafe-eval'">
 <title>Strata Desktop</title>
 <style>
+  /* #332: the web app's design language (serve/ui/src/styles.css): near-monochrome ink on neutral surfaces, every level the
+     ink mixed into the surface; Inter and Anuphan (inlined by gui.servers_html), JetBrains Mono; a page head, sections divided
+     by a rule, rows that wash on hover, buttons in ink / fill / quiet; one ease; Thai never tracked. */
+  /*FONTS*/
   :root {
-    color-scheme: light dark;
-    --bg: #f6f7f9; --panel: #ffffff; --text: #16191d; --muted: #5d6670; --line: #dde1e6;
-    --accent: #2459c9; --accent-text: #ffffff; --warn-bg: #fff4d6; --warn-text: #6b4a00; --bad: #b3261e;
-    --good: #1f8a4c; --amber: #c27c0e; --grey: #8a929b; --sel: #e9effc;
+    color-scheme: light;
+    --bg: #f5f5f7; --surface: #ffffff; --ink: #131316; --accent: #0a62d6; --ok: #1a8a4a; --bad: #c6322b; --wait: #b87400;
+    --ease: cubic-bezier(0.23, 1, 0.32, 1);
+    --r-1: 8px; --r-2: 12px; --r-3: 16px;
+    --font-sans: -apple-system, "SF Pro Text", "SF Thai", "Inter Variable", "Anuphan Variable", system-ui, "Segoe UI", sans-serif;
+    --font-mono: "JetBrains Mono Variable", ui-monospace, "Cascadia Mono", Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #15171a; --panel: #1d2024; --text: #e8eaed; --muted: #9aa3ad; --line: #30353b;
-      --accent: #6d9bff; --accent-text: #0e1420; --warn-bg: #3a2f12; --warn-text: #f3d48a; --bad: #ff8a80;
-      --good: #5fd08f; --amber: #f0b44c; --grey: #7d858e; --sel: #24314a;
-    }
+    :root { color-scheme: dark; --bg: #0b0b0d; --surface: #151518; --ink: #f1f1f3; --accent: #5aa2ff; --ok: #4cc380; --bad: #ff7a70; --wait: #f0b44c; }
+  }
+  :root {
+    --ink-2: color-mix(in srgb, var(--ink) 62%, var(--surface));
+    --ink-3: color-mix(in srgb, var(--ink) 40%, var(--surface));
+    --hover: color-mix(in srgb, var(--ink) 8%, transparent);
+    --fill: color-mix(in srgb, var(--ink) 12%, transparent);
+    --fill-2: color-mix(in srgb, var(--ink) 18%, transparent);
+    --line: color-mix(in srgb, var(--ink) 11%, transparent);
   }
   * { box-sizing: border-box; }
+  html { background: var(--bg); }
   body {
-    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
-    font: 14px/1.45 "Segoe UI", "Leelawadee UI", system-ui, sans-serif;
+    margin: 0; padding: 28px 24px 24px; background: var(--bg); color: var(--ink);
+    font: 400 14px/1.5 var(--font-sans); letter-spacing: -0.01em;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
   }
-  h1 { font-size: 17px; margin: 0 0 10px; font-weight: 600; letter-spacing: -0.01em; }
-  h2 { font-size: 14px; margin: 0 0 10px; font-weight: 600; }
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
-  .state { display: flex; gap: 8px; align-items: flex-start; }
-  .dot { flex: none; width: 10px; height: 10px; border-radius: 50%; margin-top: 5px; background: var(--grey); }
-  .dot.online { background: var(--good); } .dot.connecting, .dot.pending, .dot.offline { background: var(--amber); }
+  main { max-width: 640px; margin: 0 auto; animation: sharpen 260ms var(--ease) backwards; }
+  @keyframes sharpen { from { opacity: 0; filter: blur(6px); transform: scale(0.985); } to { opacity: 1; filter: none; transform: none; } }
+  ::selection { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-1); }
+  * { scrollbar-width: thin; scrollbar-color: var(--fill-2) transparent; }
+
+  /* The page head: the title at a confident size, the connection as its one quiet line */
+  .page-title { font-size: 26px; line-height: 1.08; letter-spacing: -0.035em; font-weight: 600; margin: 0; text-wrap: balance; }
+  .state { display: flex; gap: 8px; align-items: baseline; margin-top: 0.55rem; color: var(--ink-2); font-size: 14px; }
+  .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); transform: translateY(-1px); }
+  .dot.online { background: var(--ok); }
+  .dot.connecting, .dot.pending, .dot.offline { background: var(--wait); animation: pulse 1.4s ease-in-out infinite; }
   .dot.refused, .dot.error { background: var(--bad); }
-  .code { font: 600 34px/1.1 "Cascadia Mono", Consolas, monospace; letter-spacing: 0.12em; margin: 10px 0 6px; }
-  .row-actions, .form-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  @keyframes pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+  .notice { color: var(--bad); font-size: 12.5px; margin-top: 6px; }
+
+  /* The device code: the one figure that matters while the owner decides */
+  #pending { margin-top: 18px; padding: 16px; border-radius: var(--r-2); background: var(--hover); }
+  .code { font: 600 32px/1.1 var(--font-mono); letter-spacing: 0.14em; margin: 0 0 12px; font-variant-numeric: tabular-nums; }
+  .copied { color: var(--ink-2); font-size: 12.5px; margin-left: 6px; }
+
+  /* Sections: a rule above, a heading, then rows */
+  section { margin-top: 28px; border-top: 1px solid var(--line); padding-top: 14px; }
+  h2 { font-size: 15px; font-weight: 600; letter-spacing: -0.015em; margin: 0 0 8px; line-height: 1.25; }
   ul { list-style: none; margin: 0; padding: 0; }
-  li.server { border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin-bottom: 8px; cursor: pointer; }
-  li.server.selected { background: var(--sel); border-color: var(--accent); }
-  .name { font-weight: 600; }
-  .muted { color: var(--muted); font-size: 12.5px; word-break: break-all; }
-  .result { font-size: 12.5px; margin-top: 4px; }
+  li.server {
+    padding: 12px 10px; margin: 0 -10px; border-radius: var(--r-1); cursor: pointer;
+    transition: background-color 180ms var(--ease);
+  }
+  li.server + li.server { margin-top: 2px; }
+  li.server:hover { background: var(--hover); }
+  li.server.selected { background: var(--fill); }
+  .name { font-weight: 600; font-size: 14px; }
+  .muted { color: var(--ink-2); font-size: 12.5px; word-break: break-all; }
+  li.server .muted:nth-child(2) { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0; }
+  .result { font-size: 12.5px; margin-top: 4px; color: var(--ink-2); }
   .result.bad { color: var(--bad); }
-  label { display: block; font-size: 12.5px; color: var(--muted); margin: 8px 0 3px; }
+  .empty { color: var(--ink-2); font-size: 13px; margin: 4px 0 0; }
+
+  /* Fields and buttons, as the web app's inputCls and Button */
+  label { display: block; font-size: 12.5px; color: var(--ink-2); margin: 12px 0 5px; }
   input {
-    width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; font: inherit;
-    background: var(--bg); color: var(--text);
+    width: 100%; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: var(--r-1); font: inherit; font-size: 13px;
+    background: var(--surface); color: var(--ink); outline: none; caret-color: var(--accent); transition: border-color 150ms;
   }
-  input:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  input::placeholder { color: var(--ink-3); }
+  input:hover { border-color: var(--fill-2); }
+  input:focus { border-color: var(--accent); }
+  .row-actions, .form-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .form-actions { margin-top: 16px; }
   button {
-    font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel);
-    color: var(--text); cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 12px;
+    border: 0; border-radius: var(--r-1); font: inherit; font-size: 13px; font-weight: 500; letter-spacing: -0.01em;
+    background: var(--fill); color: var(--ink); cursor: pointer; transition: background-color 150ms, opacity 150ms, transform 150ms;
   }
-  button:hover { border-color: var(--accent); }
-  button:active { transform: translateY(1px); }
-  button:disabled { opacity: 0.5; cursor: default; transform: none; }
-  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
-  .warn { background: var(--warn-bg); color: var(--warn-text); border-radius: 6px; padding: 6px 8px; font-size: 12.5px; margin-top: 6px; }
-  .error { color: var(--bad); font-size: 12.5px; margin-top: 6px; }
-  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .note { font-size: 12px; color: var(--muted); }
+  button:hover { background: var(--fill-2); }
+  button:active { transform: scale(0.98); }
+  button:disabled { opacity: 0.4; pointer-events: none; }
+  button.primary { background: var(--ink); color: var(--surface); }
+  button.primary:hover { opacity: 0.9; background: var(--ink); }
+  button.quiet { background: transparent; color: var(--ink-2); }
+  button.quiet:hover { background: var(--hover); color: var(--ink); }
+  button.danger { background: transparent; color: var(--bad); }
+  button.danger:hover { background: color-mix(in srgb, var(--bad) 10%, transparent); }
+  .warn {
+    background: color-mix(in srgb, var(--wait) 14%, transparent); color: var(--ink); border-radius: var(--r-1);
+    padding: 8px 10px; font-size: 12.5px; margin-top: 8px;
+  }
+  .error { color: var(--bad); font-size: 12.5px; margin-top: 8px; }
+  .hint { font-size: 12px; color: var(--ink-3); margin-top: 5px; }
+  .note { font-size: 12px; color: var(--ink-3); margin: 24px 0 0; }
   [hidden] { display: none !important; }
+
+  /* Thai: marks stack above and below the line - no tracking, and room in every tight line */
+  html:lang(th) * { letter-spacing: 0 !important; }
+  html:lang(th) .page-title, html:lang(th) h2 { line-height: 1.35; }
+  html:lang(th) .state { line-height: 1.7; }
+  html:lang(th) .code { letter-spacing: 0.14em !important; }      /* the code is Latin: it keeps its spacing */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition-duration: 0.01ms !important; }
+  }
 </style>
 </head>
 <body>
-<div class="panel" id="state-panel">
-  <h1 id="title"></h1>
+<main>
+<header id="state-panel">
+  <h1 class="page-title" id="title"></h1>
   <div class="state"><span class="dot" id="dot"></span><span id="state-text"></span></div>
-  <div class="error" id="notice" role="status" hidden></div>
+  <div class="notice" id="notice" role="status" hidden></div>
   <div id="pending" hidden>
     <div class="code" id="code"></div>
-    <button id="copy" type="button"></button> <span class="muted" id="copied" hidden></span>
+    <button id="copy" type="button"></button><span class="copied" id="copied" hidden></span>
   </div>
-  <div class="row-actions" id="without-row" hidden><button id="without" type="button"></button></div>
-</div>
+  <div class="row-actions" id="without-row" hidden><button class="quiet" id="without" type="button"></button></div>
+</header>
 
-<div class="panel">
+<section>
+  <h2 id="servers-title"></h2>
   <ul id="servers"></ul>
-  <p class="muted" id="empty" hidden></p>
-</div>
+  <p class="empty" id="empty" hidden></p>
+</section>
 
-<div class="panel">
+<section>
   <h2 id="form-title"></h2>
   <form id="form" autocomplete="off">
     <label for="f-name" id="l-name"></label>
@@ -92,12 +152,13 @@
     <div class="error" id="form-error" hidden></div>
     <div class="form-actions">
       <button class="primary" id="save" type="submit"></button>
-      <button id="remove" type="button" hidden></button>
-      <button id="new" type="button"></button>
+      <button class="quiet" id="new" type="button"></button>
+      <button class="danger" id="remove" type="button" hidden></button>
     </div>
   </form>
-</div>
+</section>
 <p class="note" id="kept"></p>
+</main>
 
 <script>
 "use strict";
@@ -230,6 +291,7 @@ function init() {
 
 document.addEventListener("DOMContentLoaded", () => {
   $("title").textContent = w("servers_title");
+  $("servers-title").textContent = w("servers_heading");
   $("l-name").textContent = w("label_name");
   $("l-url").textContent = w("label_url");
   $("l-token").textContent = w("label_token");
