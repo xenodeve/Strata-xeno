@@ -1,0 +1,23 @@
+{
+  "_comment": "#331: one answer with a tool round, as the page stores it (message), what the page sends back (api), and what the server gave the engine while the answer ran (server). serve/ui/src/lib/chat.test.ts checks message -> api; serve/test_history_thinking.py checks that api renders like server, token for token.",
+  "message": {
+    "role": "assistant", "time": 0,
+    "text": "Let me look.\n\nThe file says hi.",
+    "reasoning": "I should read the file.\n\nIt says hi; answer.",
+    "tools": [
+      { "id": "c1", "name": "Read", "at": 12, "rat": 23, "round": 1, "arguments": { "file_path": "a.txt" }, "result": "hi", "state": "done" }
+    ]
+  },
+  "api": [
+    { "role": "assistant", "content": "Let me look.", "reasoning_content": "I should read the file.",
+      "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "Read", "arguments": "{\"file_path\":\"a.txt\"}" } }] },
+    { "role": "tool", "tool_call_id": "c1", "content": "hi" },
+    { "role": "assistant", "content": "The file says hi.", "reasoning_content": "It says hi; answer." }
+  ],
+  "server": [
+    { "role": "assistant", "content": "Let me look.", "reasoning_content": "I should read the file.",
+      "tool_calls": [{ "function": { "name": "Read", "arguments": { "file_path": "a.txt" } } }] },
+    { "role": "tool", "content": "hi" },
+    { "role": "assistant", "content": "The file says hi.", "reasoning_content": "It says hi; answer." }
+  ]
+}
