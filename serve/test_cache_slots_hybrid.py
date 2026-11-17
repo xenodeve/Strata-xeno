@@ -154,7 +154,7 @@ class WithSlotHybrid(unittest.TestCase):
         self.assertEqual((b["strata_cache_slot"], b["_ckpt_at"]), (0, 28000))
         self.assertEqual(c, {"strata_cache_slot": 3})
         self.assertTrue(svc.slots.table[3]["pinned"])
-        lines = [x.args[0] for x in p.call_args_list]
+        lines = [x.args[0] for x in p.call_args_list if "cache-slot rule" not in x.args[0]]
         self.assertIn("slot 0 (joins): 30000 tokens, shares 28000 of its last 31000", lines[1])
 
 

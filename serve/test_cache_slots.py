@@ -251,7 +251,7 @@ class WithSlot(unittest.TestCase):
             svc.with_slot({}, turn(1, 0))
             svc.with_slot({}, turn(1, 1))
             svc.with_slot({}, turn(2, 0))
-        lines = [c.args[0] for c in p.call_args_list]
+        lines = [c.args[0] for c in p.call_args_list if "cache-slot rule" not in c.args[0]]
         self.assertIn("slot 0 (free): 1800 tokens", lines[0])
         self.assertIn("slot 0 (continues): 3000 tokens, shares 1800", lines[1])
         self.assertIn("slot 1 (free): 1800 tokens", lines[2])
@@ -433,6 +433,30 @@ class SlotTrace(unittest.TestCase):
         got = [(x["route"], x["who"]) for x in self.lines(path)]
         self.assertEqual(got, [("openai", {"key": "owner", "device": "addr:127.0.0.1", "addr": "127.0.0.1"}),
                                ("anthropic", {"key": "owner", "device": "dev-12345678", "addr": "127.0.0.1"})])
+
+
+class RuleName(unittest.TestCase):
+    """#321 review: the server says which cache-slot rule it runs, once, and a name it does not know is said, not
+    silently the family rule."""
+
+    def run_rule(self, value):
+        with mock.patch.dict(os.environ, {"STRATA_CACHE_SLOT_RULE": value}, clear=False), \
+                mock.patch("builtins.print") as out:
+            svc = service()
+            svc.with_slot({}, turn(1, 0))
+            svc.with_slot({}, turn(1, 1))
+        return [" ".join(str(a) for a in c.args) for c in out.call_args_list]
+
+    def test_the_active_rule_is_said_once(self):
+        lines = [x for x in self.run_rule("hybrid") if "cache-slot rule" in x]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("hybrid", lines[0])
+
+    def test_an_unknown_rule_is_said_and_runs_family(self):
+        lines = [x for x in self.run_rule("hybird") if "cache-slot rule" in x]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("hybird", lines[0])
+        self.assertIn("family", lines[0])
 
 
 if __name__ == "__main__":

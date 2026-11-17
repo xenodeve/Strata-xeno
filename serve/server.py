@@ -788,7 +788,7 @@ class HybridCacheSlots:
 
     def _put(self, slot, ids, pinned=False):
         self.tick += 1
-        self.table[slot] = {"ids": ids if isinstance(ids, list) else list(ids), "used": self.tick, "pinned": pinned}
+        self.table[slot] = {"ids": list(ids), "used": self.tick, "pinned": pinned}   # a copy, as the other rules keep
 
     def _place(self, ids):
         """-> (slot, H with its last prompt, how, len of its last prompt); the table is not changed."""
@@ -3942,6 +3942,11 @@ class Service:
         family = kind in (CacheSlots, IdentityCacheSlots)
         if getattr(self, "slots", None) is None or self.slots.n != n or type(self.slots) is not kind:
             self.slots = kind(n)
+            # #321 review: say which rule runs (once, here where it is made); a misspelt name is not silently family
+            said = f"[strata] cache-slot rule: {name or 'family'} ({n} slots)"
+            if name and name not in self.SLOT_RULES:
+                said = f"[strata] cache-slot rule: unknown STRATA_CACHE_SLOT_RULE={name!r}, running family ({n} slots)"
+            print(said, flush=True)
         if "strata_cache_slot" in req:
             pinned = req["strata_cache_slot"]           # a bad one is the request's 400 (cache_slot), not ours
             if isinstance(pinned, int) and not isinstance(pinned, bool) and 0 <= pinned < n:

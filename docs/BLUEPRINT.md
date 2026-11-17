@@ -328,7 +328,7 @@ defaults verified at `generate.cpp:181`, `:237`, `:239`, `:251`, `:258`, `:312`)
 - Exit hang: `STRATA_EXIT_TRACE`, `STRATA_EXP_QUICK_EXIT`.
 - Placement and arena: `STRATA_ARENA_PIN`, `STRATA_HOT_TO_SECONDARY`.
 - Probes: `STRATA_LINK_PROBE`, `STRATA_SECONDARY_POKE`.
-- Server, the cache-slot rule (#321, not yet in the baseline): `STRATA_CACHE_SLOT_RULE` (unset or `family`: the default; `identity`; `continuation`; `hybrid`), and the request recorder `STRATA_SLOT_TRACE=<file.jsonl[.gz]>`.
+- Server, the cache-slot rule (#321, not yet in the baseline): `STRATA_CACHE_SLOT_RULE` (unset or `family`: the default; `identity`; `continuation`; `hybrid`); the server logs `[strata] cache-slot rule: <name> (<n> slots)` once when it makes the table, and an unknown name as `unknown STRATA_CACHE_SLOT_RULE=..., running family`, and the request recorder `STRATA_SLOT_TRACE=<file.jsonl[.gz]>`.
 
 **D2x** (`D:/Github/Strata/strata-flash-next-d2x.json`):
 
