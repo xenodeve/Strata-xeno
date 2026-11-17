@@ -40,7 +40,7 @@ def document_parts(block, vision = False):
         except Exception:
             data = None
         from serve import documents
-        if data is not None and documents.kind_of(block.get("title"), src.get("media_type"), data) not in (None, "pdf"):
+        if data is not None and documents.kind_of(block.get("title"), src.get("media_type"), data) is not None:
             return documents.extract(block.get("title") or "document", src.get("media_type"), data, bool(vision))
     if src.get("type") != "base64" or "pdf" not in (src.get("media_type") or ""):
         return [{"type": "text", "text": _header(block) + f"\n(unsupported document source: {src.get('type')})"}]

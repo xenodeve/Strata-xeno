@@ -235,7 +235,7 @@ class PowerPoint(unittest.TestCase):
         self.assertLess(t.index("--- slide 1 ---"), t.index("one"))
         self.assertLess(t.index("one"), t.index("--- slide 2 ---"))
         self.assertIn("two\nสอง", t)
-        self.assertLess(t.index("two"), t.index("--- slide 10 ---"))
+        self.assertLess(t.index("two"), t.index("--- slide 3 ---"))         # numbered by place in the deck
 
 
 class OpenDocument(unittest.TestCase):
@@ -386,6 +386,114 @@ class OldNamesNewContent(unittest.TestCase):
         self.assertIn("rtf words", text(documents.extract("w.doc", None, rb"{\rtf1\ansi rtf words}", False)))
         self.assertIn("<td>html cell</td>", text(documents.extract("x.xls", None, b"<table><tr><td>html cell</td></tr></table>", False)))
         self.assertIn("zip body", text(documents.extract("z.doc", None, docx(para("zip body")), False)))
+
+
+class Bounded(unittest.TestCase):
+    """Review of #334: a small crafted file must not take the PC's memory or minutes of time.  Each extractor stops
+    once its text passes the limit it was given, while it builds the text."""
+
+    def measure(self, fn):
+        import time
+        import tracemalloc
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        try:
+            out = fn()
+        finally:
+            peak = tracemalloc.get_traced_memory()[1]
+            tracemalloc.stop()
+        return out, time.perf_counter() - t0, peak
+
+    def test_an_ods_repeat_bomb_stops_at_the_text_limit(self):
+        row = ('<table:table-row table:number-rows-repeated="256"><table:table-cell table:number-columns-repeated="256">'
+               f'<text:p>{"x" * 1000}</text:p></table:table-cell></table:table-row>')
+        data = odf("spreadsheet", f'<office:spreadsheet><table:table table:name="s">{row * 4}</table:table></office:spreadsheet>')
+        self.assertLess(len(data), 2000)
+        parts, secs, peak = self.measure(lambda: documents._extract("bomb.ods", None, data, False))
+        t = text(parts)
+        self.assertLess(peak, 50e6)
+        self.assertLess(secs, 5)
+        self.assertIn("[cut here", t)
+        self.assertLess(len(t), documents.MAX_TEXT + 500)
+        body, secs, peak = self.measure(lambda: documents.text_of("bomb.ods", data))      # Read's larger limit, too
+        self.assertLess(peak, 200e6)
+        self.assertLessEqual(len(body[0]), documents.MAX_READ_TEXT + 500)
+
+    def test_odt_spaces_are_capped(self):
+        sp = '<text:s text:c="100000000"/>' * 2000
+        data = odf("text", f"<office:text><text:p>a{sp}b</text:p></office:text>")
+        parts, secs, peak = self.measure(lambda: documents._extract("s.odt", None, data, False))
+        self.assertLess(peak, 50e6)
+        self.assertLess(len(text(parts)), documents.MAX_TEXT + 500)
+
+    def test_a_far_right_xlsx_cell_is_not_thousands_of_tabs(self):
+        rows = "".join(f'<row r="{i}"><c r="A{i}"><v>{i}</v></c><c r="XFD{i}"><v>far</v></c></row>' for i in range(1, 3001))
+        data = xlsx([("S", rows)], [])
+        (body, ok), secs, peak = self.measure(lambda: documents.text_of("far.xlsx", data, max_rows=100_000))
+        self.assertTrue(ok)
+        self.assertLess(secs, 5)
+        self.assertLess(peak, 50e6)
+        self.assertIn("1\tXFD1: far", body)
+        self.assertNotIn("\t\t\t", body)
+
+    def test_a_large_docx_is_parsed_without_holding_the_whole_tree(self):
+        data = docx("<w:p/>" * 1_500_000 + para("the end"))
+        (body, ok), secs, peak = self.measure(lambda: documents.text_of("big.docx", data))
+        self.assertTrue(ok)
+        self.assertIn("the end", body)
+        self.assertLess(peak, 50e6)
+
+    def test_rtf_unicode_out_of_range_is_skipped(self):
+        for raw in (rb"{\rtf1\ansi Hello \u99999999 world\par more}", rb"{\rtf1\ansi Hello \u-99999 world}",
+                    rb"{\rtf1\ansi pair \u-10179?\u-8704? end}"):
+            body, ok = documents.text_of("u.rtf", raw)
+            self.assertTrue(ok, body)
+            self.assertIn("Hello" if b"Hello" in raw else "pair", body)
+            body.encode("utf-8")                                        # no lone surrogate
+        self.assertIn("\U0001f600", documents.text_of("u.rtf", rb"{\rtf1\ansi pair \u-10179?\u-8704? end}")[0])
+
+
+class Structure(unittest.TestCase):
+    def test_pptx_slides_follow_the_presentation_order(self):
+        data = pptx({1: ["I was moved to second"], 2: ["I am shown first"]})
+        buf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(buf, "w") as z:
+            for n in src.namelist():
+                if n != "ppt/presentation.xml":
+                    z.writestr(n, src.read(n))
+            z.writestr("ppt/presentation.xml", f'<p:presentation {P} {R}><p:sldIdLst><p:sldId id="256" r:id="rId3"/>'
+                       '<p:sldId id="257" r:id="rId2"/></p:sldIdLst></p:presentation>')
+            z.writestr("ppt/_rels/presentation.xml.rels",
+                       '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                       '<Relationship Id="rId2" Type="x/slide" Target="slides/slide1.xml"/>'
+                       '<Relationship Id="rId3" Type="x/slide" Target="/ppt/slides/slide2.xml"/></Relationships>')
+        t = documents.text_of("o.pptx", buf.getvalue())[0]
+        self.assertLess(t.index("I am shown first"), t.index("I was moved to second"))
+        self.assertLess(t.index("--- slide 1 ---"), t.index("I am shown first"))
+
+    def test_a_docx_text_box_is_read_once_on_its_own_line(self):
+        mc = 'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"'
+        tb = "<w:txbxContent>" + para("BOX") + "</w:txbxContent>"
+        body = (f'<w:p {mc}><w:r><w:t>Before </w:t></w:r><w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>{tb}'
+                f"</w:drawing></mc:Choice><mc:Fallback><w:pict>{tb}</w:pict></mc:Fallback></mc:AlternateContent></w:r>"
+                "<w:r><w:t>after</w:t></w:r></w:p>")
+        t = documents.text_of("b.docx", docx(body))[0]
+        self.assertEqual(t.count("BOX"), 1)
+        self.assertIn("Before after", t)
+        self.assertIn("\nBOX", t)
+
+    def test_a_nested_table_is_read_once(self):
+        inner = "<w:tbl><w:tr><w:tc>" + para("inner a") + "</w:tc><w:tc>" + para("inner b") + "</w:tc></w:tr></w:tbl>"
+        body = "<w:tbl><w:tr><w:tc>" + para("outer") + inner + "</w:tc><w:tc>" + para("right") + "</w:tc></w:tr></w:tbl>"
+        t = documents.text_of("n.docx", docx(body))[0]
+        self.assertEqual(t.count("inner a"), 1)
+        self.assertIn("right", t)
+
+    @unittest.skipIf(pypdf is None, "needs pypdf")
+    def test_a_pdf_block_without_the_pdf_media_type_is_read(self):
+        block = {"title": "r.pdf", "source": {"type": "base64", "media_type": "application/octet-stream",
+                                              "data": base64.b64encode(text_pdf(["pdf words"])).decode()}}
+        self.assertIn("pdf words", text(pdf_blocks.document_parts(block, False)))
 
 
 class InTheReadTool(unittest.TestCase):
