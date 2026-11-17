@@ -109,6 +109,29 @@ int main() {
           count(second, "\"name\":\"thread_name\""));
     // every record ends with ",\n": closing the array makes it valid JSON (the analyzer does exactly this)
     CHECK(second.size() >= 2 && second.compare(second.size() - 2, 2, ",\n") == 0, "records end with a comma");
+    // #321: a pooled thread (std::async on MSVC) runs one job, then another that names itself differently.  The
+    // second job's spans must land on a lane of its own name, not on the first job's lane (whose name is already in
+    // the file: renaming it in place filed every `slot offload` under "prompt wave lane 2" or "ple read-ahead")
+    std::thread([] {
+        tl::name_thread("pooled job A");
+        tl::complete("job A span", tl::now_us(), tl::now_us() + 1);
+        tl::flush();
+        tl::name_thread("pooled job B");
+        tl::complete("job B span", tl::now_us(), tl::now_us() + 1);
+    }).join();
+    tl::flush();
+    const std::string third = slurp(path);
+    auto tid_of = [&](const std::string& needle) -> std::string {   // the "tid":N of the record holding `needle`
+        const size_t at = third.find(needle);
+        if (at == std::string::npos) return "?";
+        const size_t line = third.rfind('\n', at) + 1;
+        const size_t t = third.find("\"tid\":", line);
+        return third.substr(t, third.find(',', t) - t);
+    };
+    CHECK(count(third, "\"pooled job B\"") == 1, "the second job's lane name is written: %zu",
+          count(third, "\"pooled job B\""));
+    CHECK(tid_of("\"name\":\"job B span\"") == tid_of("\"pooled job B\""), "the second job's span is on its own lane");
+    CHECK(tid_of("\"name\":\"job A span\"") == tid_of("\"pooled job A\""), "the first job's span stays on its lane");
     std::remove(path);
     if (fails == 0) std::printf("timeline_core: ok\n");
     return fails == 0 ? 0 : 1;

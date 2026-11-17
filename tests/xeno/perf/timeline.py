@@ -444,6 +444,56 @@ def server_report(tl: Timeline) -> list[dict]:
     return out
 
 
+def switch_report(tl: Timeline) -> list[dict]:
+    """#321: each cache-slot switch on the main thread ("slot switch", a = outgoing tokens, b = incoming tokens), split
+    into the outgoing save, the wait for the incoming slot's park write and the incoming load (positional state,
+    checkpoints, restore, then the old slot's drop: its file closed and deleted, its RAM freed); then the prompt read that follows it (up to the first decode round) and how much of that
+    read the background "slot offload" writes overlapped."""
+    rounds = [s.t0 for s in tl.find("decode round")]
+    instants = [e for e in tl.instants if e.name in ("slot save kv io", "slot load kv io", "slot save kv chunks")]
+    offloads = tl.find("slot offload")   # by name: before the #321 fix a pooled writer's lane kept another job's name
+    out = []
+    for sw in tl.find("slot switch"):
+        r = {"t0_ms": sw.t0, "out_tokens": sw.a, "in_tokens": sw.b, "switch_ms": sw.dur}
+        kids = {"slot save": "save_ms", "slot park wait": "park_wait_ms", "slot load": "load_ms",
+                "slot load positional": "load_positional_ms", "slot load checkpoints": "load_checkpoints_ms",
+                "slot restore": "restore_ms", "slot drop": "drop_ms", "slot save state": "save_state_ms",
+                "slot save kv": "save_kv_ms"}
+        for k in kids.values():
+            r[k] = 0.0
+        for s in tl.inside(sw.lane, sw.t0, sw.t1):
+            if s.name in kids:
+                r[kids[s.name]] += s.dur
+        r["other_ms"] = sw.dur - r["save_ms"] - r["park_wait_ms"] - r["load_ms"]
+        # the K/V's copy and file time, summed by the engine over its chunks (a, b in microseconds)
+        for k in ("save_copy_ms", "save_file_ms", "load_copy_ms", "load_file_ms", "save_chunk_max_ms"):
+            r[k] = 0.0
+        r["save_chunks"] = 0
+        for e in instants:
+            if sw.t0 - EPS <= e.t0 <= sw.t1 + EPS and e.lane == sw.lane:
+                if e.name == "slot save kv io":
+                    r["save_copy_ms"] += e.a / 1000.0
+                    r["save_file_ms"] += e.b / 1000.0
+                elif e.name == "slot save kv chunks":   # the slowest chunk's write (us) and the chunk count
+                    r["save_chunk_max_ms"] = max(r["save_chunk_max_ms"], e.a / 1000.0)
+                    r["save_chunks"] += e.b
+                elif e.name == "slot load kv io":
+                    r["load_copy_ms"] += e.a / 1000.0
+                    r["load_file_ms"] += e.b / 1000.0
+        i = bisect.bisect_left(rounds, sw.t1 - EPS)
+        end = rounds[i] if i < len(rounds) else float("inf")
+        reads = [s for s in tl.lane(sw.lane) if s.name.startswith("prompt read") and s.t0 >= sw.t1 - EPS
+                 and s.t1 <= end + EPS]
+        r["read_ms"] = union_ms(reads)
+        if reads:
+            lo, hi = min(s.t0 for s in reads), max(s.t1 for s in reads)
+            r["offload_in_read_ms"] = union_ms(offloads, lo, hi)
+        else:
+            r["offload_in_read_ms"] = 0.0
+        out.append(r)
+    return out
+
+
 def startup_report(tl: Timeline) -> list[tuple[str, float]]:
     firsts = [s.t0 for n in ("prefill run", "decode round", "request") for s in tl.find(n)[:1]]
     end = min(firsts) if firsts else float("inf")
@@ -532,6 +582,16 @@ def render(tl: Timeline, top: int) -> str:
             out.append(f"pool: {w['batches']} batches; wake-up mean {w['wake_mean_ms']:.3f} ms (p95 {w['wake_p95_ms']:.3f}, "
                        f"max {w['wake_max_ms']:.3f}); straggler mean {w['straggler_ms']:.3f} ms (p95 "
                        f"{w['straggler_p95_ms']:.3f}); slowest {w.get('slowest_worker')}")
+    sw = switch_report(tl)
+    if sw:
+        out.append(f"\n== cache-slot switches ({len(sw)}, ms; read = the prompt read after it, offload = the "
+                   f"background write beside that read) ==")
+        out.append(table([(f"{r['t0_ms'] / 1000:.1f}", r["out_tokens"], r["in_tokens"], f"{r['switch_ms']:.0f}",
+                           f"{r['save_ms']:.0f}", f"{r['save_file_ms']:.0f}", f"{r['park_wait_ms']:.0f}", f"{r['load_positional_ms']:.0f}",
+                           f"{r['load_checkpoints_ms']:.0f}", f"{r['restore_ms']:.0f}", f"{r['drop_ms']:.0f}", f"{r['other_ms']:.0f}",
+                           f"{r['read_ms']:.0f}", f"{r['offload_in_read_ms']:.0f}") for r in sw],
+                         ("at s", "out tok", "in tok", "switch", "save", "save write", "park wait", "load pos", "load ckpt",
+                          "restore", "drop", "other", "read", "offload")))
     th = thread_report(tl)
     if th:
         out.append("\n== helper threads (each lane's active time, innermost span) ==")
@@ -573,7 +633,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"prefill": prefill_report(tl, a.top), "decode": decode_report(tl), "lanes": utilisation(tl),
-                       "threads": thread_report(tl), "server": server_report(tl)},
+                       "threads": thread_report(tl), "server": server_report(tl), "switches": switch_report(tl)},
                       f, indent=1, default=str)
     if a.perfetto:
         export_perfetto(a.trace, a.perfetto)
