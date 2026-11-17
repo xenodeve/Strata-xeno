@@ -212,7 +212,9 @@ class Connection(Base):
         self.httpd = serve(self.svc, port=self.port)
         self.assertTrue(wait_for(lambda: self.svc.runner_hub.get_for(first, SimpleNamespace(name="ann")), 20), self.said)
         self.assertEqual(loop.id, first)                         # the same id, so the page's stored id keeps working
-        self.assertNotEqual(loop.client.channel, channel)
+        # the server registers the runner before the runner has read the hello's answer: wait for its new channel
+        # (a direct check raced under a loaded full suite, 2026-11-17)
+        self.assertTrue(wait_for(lambda: loop.client.channel != channel, 20), self.said)
 
     def test_rename_says_hello_again(self):
         self.start_routing()
