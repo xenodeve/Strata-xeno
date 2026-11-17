@@ -6205,7 +6205,8 @@ def make_handler(svc: Service):
                 arun.ctx.my_pc_why = (f"The user's PC ({runner.info.get('machine') or '?'}) is connected, but this message was sent from another "
                                       "browser: its settings are read and changed only from the web app in Strata Desktop on that PC.")
                 return
-            arun.ctx.my_pc = runner
+            rid, who = runner.id, self._acting()
+            arun.ctx.my_pc = lambda: svc.runner_hub.get_for(rid, who)     # found again on each use: a restarted Strata Desktop is a new Runner under this id
 
         @staticmethod
         def _my_mcp_offered(req: dict, groups: dict) -> str | bool:

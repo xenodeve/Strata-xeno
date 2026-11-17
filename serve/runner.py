@@ -867,7 +867,10 @@ class Executor:
             return {"status": {"missing": 404, "unsupported": 422, "already": 409}[e.code],
                     "body": {"error": {"message": str(e), "code": e.code}}}
         status, out = self._write_servers(servers, {})
-        return {"status": status, "body": out if status != 200 else self._import_view()}
+        if status != 200:
+            return {"status": status, "body": out}
+        got = servers.get(_name) if isinstance(servers.get(_name), dict) else {}
+        return {"status": 200, "body": {**self._import_view(), "imported": _name, "imported_disabled": got.get("disabled") is True}}
 
     # -------------------------------------------------------------------------------------------- skills (#344)
     def _skills(self, kind: str, msg: dict) -> dict:

@@ -527,17 +527,34 @@ class MyPc:
     changed through the same runner jobs as the web app's My PC editor (#338): its MCP servers (`mcp.config`, `mcp.config.set`, `mcp.import.*`)
     and its skill switches (`skills.config`, `skills.config.set`).  The runner keeps the secrets and its approval in Strata Desktop."""
 
-    def __init__(self, runner):
-        self.runner = runner
-        self.machine = (getattr(runner, "info", None) or {}).get("machine") or "?"
+    def __init__(self, source):
+        """`source`: the Runner, or a function that finds it again (the server binds its id and identity: a Strata Desktop that restarts
+        is a new Runner under the same id, and a card left open across the restart then reaches the new one)."""
+        self._get = source if callable(source) else (lambda: source)
+        self._last = self._get()
+        self.machine = (getattr(self._last, "info", None) or {}).get("machine") or "?"
+
+    @property
+    def runner(self):
+        r = self._get()
+        if r is not None:
+            self._last = r
+        return self._last
 
     @classmethod
     def of(cls, ctx) -> "MyPc | None":
         r = getattr(ctx, "my_pc", None) if ctx is not None else None
-        return cls(r) if r is not None else None
+        if r is None:
+            return None
+        mine = cls(r)
+        return mine if mine._last is not None else None
+
+    def say(self, text: str) -> str:
+        return f"on the user's PC ({self.machine}): {text}"
 
     def online(self) -> bool:
-        return bool(self.runner.online())
+        r = self.runner
+        return r is not None and bool(r.online())
 
     def ask(self, kind: str, payload: dict | None = None) -> tuple[int, dict]:
         """(status, body) of one job, as the web app's routes relay it; an error's message names the PC."""
@@ -621,6 +638,7 @@ def _plan_mcp_mine(mine: MyPc, setting, key, value) -> Plan | str:
         return mine.why(v)
     rows = [r for r in v.get("servers") or [] if isinstance(r, dict) and isinstance(r.get("name"), str)]
     stored = {r["name"]: _entry_of_row(r) for r in rows}                # every one, the waiting ones too: the job takes the whole list
+    waiting = {r["name"] for r in rows if r.get("pending")}
     if key == "import":
         if not isinstance(value, dict) or not isinstance(value.get("app"), str) or not isinstance(value.get("name"), str):
             return f"the value is {SETTINGS[setting]}"
@@ -634,13 +652,13 @@ def _plan_mcp_mine(mine: MyPc, setting, key, value) -> Plan | str:
                 json.dumps({a: [c.get("name") for c in cs] for a, cs in apps.items()}, ensure_ascii=False)
         if cand.get("state") == "already":
             return f"{value['name']!r} from {value['app']} is already one of the MCP servers of the user's PC ({mine.machine})"
-        shown = {k: cand[k] for k in ENTRY_KEYS if cand.get(k) is not None}
+        shown, keys = card_entry({k: cand[k] for k in ENTRY_KEYS if cand.get(k) is not None}, None, None)
 
         def apply_import():
             code, out = mine.ask("mcp.import.add", {"body": {"import_mcp": {"harness": value["app"], "name": value["name"]}}})
-            return (code, out) if code != 200 else (200, {"imported": value["name"]})
+            return (code, out) if code != 200 else (200, {"imported": out.get("imported") or value["name"], "disabled": out.get("imported_disabled") is True})
         return Plan(setting, None, {"name": value["name"], "server": shown}, apply_import, target=f"{value['name']} (from {value['app']})",
-                    state=(None, cand), mine=mine)
+                    keys=keys, state=(None, cand), mine=mine)
     if not isinstance(value, dict) or not isinstance(value.get("name"), str):
         return f"the value is {SETTINGS[setting]}"
     name = value["name"]
@@ -654,7 +672,7 @@ def _plan_mcp_mine(mine: MyPc, setting, key, value) -> Plan | str:
                 return f"the user's PC ({mine.machine}) already has an MCP server named {name!r}: use mcp.edit, or another name"
             why = mcp_admin.name_refused(name)
             if why:
-                return why
+                return mine.say(why)
         typed = value.get("server")
         if not isinstance(typed, dict):
             return f"the value is {SETTINGS[setting]}"
@@ -662,7 +680,7 @@ def _plan_mcp_mine(mine: MyPc, setting, key, value) -> Plan | str:
         sent = mcp_admin.merge_masked(typed, old) if key == "edit" else typed      # a mask keeps the value its runner stores
         entry, errors = mcp_admin.validate_entry(name, sent)
         if errors:
-            return f"the server is refused: {errors[0]['message']} ({errors[0]['field']})"
+            return mine.say(f"the server is refused: {errors[0]['message']} ({errors[0]['field']})")
         before = old
         same = key == "edit" and entry == old
         servers[name] = entry
@@ -672,8 +690,10 @@ def _plan_mcp_mine(mine: MyPc, setting, key, value) -> Plan | str:
         on = value.get("on")
         if not isinstance(on, bool):
             return f"the value is {SETTINGS[setting]}"
+        if name in waiting and on:
+            return mine.say(f"{name!r} is not running yet: it waits for the user's approval in Strata Desktop on that PC. Ask the user to approve it there.")
         entry = dict(stored[name])
-        was = entry.pop("disabled", None) is not True
+        was = entry.pop("disabled", None) is not True and name not in waiting
         if not on:
             entry["disabled"] = True
         servers[name] = entry
@@ -688,6 +708,16 @@ def _plan_mcp_mine(mine: MyPc, setting, key, value) -> Plan | str:
         code, out = mine.ask("mcp.config.set", {"body": {"servers": servers}})
         return (code, out) if code != 200 else (200, {"servers": [r.get("name") for r in out.get("servers") or []]})
     return Plan(setting, before, after, apply, same=same, target=name, keys=keys, state=state, mine=mine)
+
+
+def _model_value(v):
+    """A before / after for the model's text: an MCP server's secret-looking args and URL query values masked, as StrataSettings shows them
+    (the card shows the model's own words in full; this goes back into the conversation)."""
+    if isinstance(v, dict) and isinstance(v.get("server"), dict):
+        return {**v, "server": _for_model(v["server"])}
+    if isinstance(v, dict) and any(k in v for k in ("command", "args", "url")):
+        return _for_model(v)
+    return v
 
 
 def _when(p: Plan, value) -> str:
@@ -788,7 +818,7 @@ class StrataServer:
             return _err(p)
         where = f"on the user's PC ({mine.machine})" if p.mine is not None else "on the central PC"
         if p.same:
-            return _err(f"{p.setting} {where} is already {json.dumps(p.after, ensure_ascii=False)}: nothing to change.")
+            return _err(f"{p.setting} {where} is already {json.dumps(_model_value(p.after), ensure_ascii=False)}: nothing to change.")
         stop = agent_mod.gate(CHANGE, args, ctx, card={"change": p.change})          # the arguments are the model's own words: shown in full
         if stop is not None:
             return stop
@@ -801,4 +831,9 @@ class StrataServer:
                 return _err(f"Nothing was changed: {p.mine.why(out)}")
             msg = (out or {}).get("error", {}).get("message") if isinstance(out, dict) else None
             return _err(f"Nothing was changed: {msg or f'the change failed ({code})'}")
-        return _ok(f"Changed {p.setting} {where}: {json.dumps(p.before, ensure_ascii=False)} -> {json.dumps(p.after, ensure_ascii=False)}. {_when(p, args.get('value'))}")
+        done = f"Changed {p.setting} {where}: {json.dumps(_model_value(p.before), ensure_ascii=False)} -> {json.dumps(_model_value(p.after), ensure_ascii=False)}."
+        if isinstance(out, dict) and isinstance(out.get("imported"), str) and out["imported"] != (args.get("value") or {}).get("name"):
+            done += f" It was imported as {out['imported']!r} (the name was taken)."
+        if isinstance(out, dict) and out.get("disabled") is True:
+            return _ok(done + " It came switched off, as it is in that app: switch it on (mcp.switch) if the user wants it to run.")
+        return _ok(f"{done} {_when(p, args.get('value'))}")

@@ -213,6 +213,52 @@ class TheUsersPc(unittest.TestCase):
         for body in (None, {}, {"skills": {"nope": 1}}, {"skills": {"enabled": False}, "x": 1}):
             self.assertEqual(self.ex.handle({"kind": "skills.config.set", "body": body}, None)["status"], 400, body)
 
+    # ---------------------------------------------------------------------------------------- the review of f8dc0171
+    def test_the_models_text_masks_a_token_in_args_but_the_card_shows_it(self):
+        tok = "sk-ant-api03-" + "a" * 40
+        self.runner_json.write_text(json.dumps({"mcp_servers": {"old": OFF, "k": {"command": "k", "args": ["--api-key", tok], "disabled": True}}}), encoding="utf-8")
+        self.ex.cfg = self.ex._read_config()
+        r = self.change("mcp.delete", {"name": "k"})
+        self.assertFalse(r["isError"], text_of(r))
+        self.assertNotIn(tok, text_of(r))
+        self.assertIn(tok, json.dumps(self.cards[0]["change"]["before"]))          # the user sees what is deleted
+
+    def test_a_server_waiting_for_approval_is_not_on_and_survives_other_changes(self):
+        running = {"command": "never-started", "disabled": True}
+        self.runner_json.write_text(json.dumps({"mcp_servers": {"old": OFF, "run": running},
+                                                "mcp_pending": {"run": {"entry": {"command": "new-run"}, "at": 5}}}), encoding="utf-8")
+        self.ex.cfg = self.ex._read_config()
+        r = self.change("mcp.switch", {"name": "run", "on": True})
+        self.assertIn("waits for the user's approval", text_of(r))
+        self.assertEqual(self.cards, [])
+        self.assertFalse(self.change("mcp.delete", {"name": "old"})["isError"])
+        cfg = self.runner_cfg()
+        self.assertEqual(cfg["mcp_servers"], {"run": running})                     # the approved one keeps running as it was
+        self.assertEqual(cfg["mcp_pending"]["run"], {"entry": {"command": "new-run"}, "at": 5})     # and its replacement still waits
+
+    def test_an_import_whose_name_is_taken_says_the_name_it_got(self):
+        (self.base / "home" / ".claude.json").write_text(json.dumps({"mcpServers": {"old": {"command": "imported-old"}}}), encoding="utf-8")
+        self.ex.importer.rescan(self.ex.cfg)
+        r = self.change("mcp.import", {"app": "claude", "name": "old"})
+        self.assertFalse(r["isError"], text_of(r))
+        self.assertIn("old-claude", text_of(r))
+        self.assertIn("old-claude", self.runner_cfg()["mcp_pending"])
+        self.assertIsNotNone(self.cards[0]["change"].get("keys"))
+
+    def test_a_restarted_strata_desktop_is_found_again(self):
+        first, second = FakeRunner(self.ex), FakeRunner(self.ex)
+        first.up = False                                                              # ended as replaced
+        now = [first]
+        c = self.ctx()
+        c.my_pc = lambda: now[0]
+        self.during = lambda: now.__setitem__(0, second)
+        r = self.server.call("StrataSettingsChange", {"pc": "my_pc", "setting": "mcp.delete", "value": {"name": "old"}}, ctx=c)
+        self.assertIn("offline", text_of(r))                                         # the card is never shown for an offline PC
+        now[0] = second
+        r = self.server.call("StrataSettingsChange", {"pc": "my_pc", "setting": "mcp.delete", "value": {"name": "old"}}, ctx=c)
+        self.assertFalse(r["isError"], text_of(r))
+        self.assertIn("mcp.config.set", second.jobs)
+
 
 if __name__ == "__main__":
     unittest.main()
